@@ -1,1598 +1,1770 @@
-diff --git a/scripts/FOLLOWUP_BOOT_GATE.md b/scripts/FOLLOWUP_BOOT_GATE.md
+diff --git a/engineering/FOLLOWUP-2026-09-02e-machinst-calltyped.md b/engineering/FOLLOWUP-2026-09-02e-machinst-calltyped.md
 new file mode 100644
-index 0000000..73e4e2b
+index 00000000..0ea45875
 --- /dev/null
-+++ b/scripts/FOLLOWUP_BOOT_GATE.md
-@@ -0,0 +1,80 @@
-+# Linux Cachymod 6.18.47 boot-code work — follow-up notes
++++ b/engineering/FOLLOWUP-2026-09-02e-machinst-calltyped.md
+@@ -0,0 +1,124 @@
++# FOLLOWUP 2026-09-02e — MachInst typed direct calls (CallTyped) + xmm scratch relays
 +
-+Date: 2026-09-02.  Goal: build `arch/x86/boot` with lccc + lccc-ld and keep
-+`setup.elf` under the 32 KiB gate (`_end <= 0x8000`).
++Base: `d1dba8d2` (origin/main, PR #354). Session snapshot: **S25**.
++Deliverable: `/home/z/my-project/ms178-1.patch` (APPLIES-CLEAN, verified in a virgin clone at base).
 +
-+## Current gate
-+- lccc (this session): `_end = 0x898c` region; `.text = 23620`, `.bss = 4960`.
-+  Gate FAILS with overflow ~ 2.4 KiB.
-+- GCC oracle: `.text = 10154`, `_end = 0x4200`.
-+- lccc `.text` is ~2.3× GCC. The gap is register-allocation quality, not any
-+  single missing pattern.
++## 1. What was built
 +
-+## What this session changed (i686 text peephole, `src/backend/i686/codegen/peephole.rs`)
-+1. `eliminate_dead_frame_allocation` — remove `subl $N,%esp` / `addl $N,%esp`
-+   for register-only leaves (single alloc, matching deallocs, no frame
-+   pointer / call / push / slot ref / indirect jmp; every body path crosses
-+   the alloc). Wired into Phase 4 after `eliminate_unused_callee_saves`.
-+   Kill switch `CCC_NO_I686_DEAD_FRAME_ELISION`.
-+2. Widen store-forwarding in `forward_slot_loads`: narrower slot store feeding
-+   a wider unsigned reload (`movb %al,slot` / `movl slot,%eax` ->
-+   `movzbl %al,%eax`).
-+3. `forward_immediate_slot_loads` + immediate homes in
-+   `eliminate_never_read_stores_range`: `movl $K,slot` ... `movl slot,%reg`
-+   materializes `$K` directly; never-read immediate stores are deleted.
++### 1.1 `MachInst::CallTyped` — the SysV integer-register call as one atomic machine instruction
 +
-+All 1555 lib unit tests pass. `plain(u16){return (u8)(a+1);}` now compiles to
-+the 4-instruction GCC-shape leaf (`movzwl; incl; movzbl; ret`); `__inb` is a
-+tight 5-instruction frameless function.
++Before: every `Instruction::Call` was a census rejection (500 at -O2 on the regression
++corpus — the largest class, 2.76% of all instructions) and the mature path staged every
++argument through the rax accumulator: a caller-saved-homed argument cost two moves
++(`movq %r11, %rax; movq %r11, %rsi`) where one suffices, and the dead staging move
++survived even the peephole's source rewrite.
 +
-+## Remaining gap — ROOT CAUSES (ranked by expected payoff)
-+All visible in the boot asm (`/tmp/boots3/*.s`).
++Now:
++- **`CallTyped { caller_saves, args, target, ret }`** — caller-save spills, argument
++  moves, the call, the return home, and the restores as ONE machine instruction with
++  declared clobbers (the full SysV caller-clobber set) and declared uses, the way an
++  MIR `CALL` or a Cranelift `call` models it. Atomic under the replay fallback: one IR
++  instruction ↔ one MachInst, so a mid-run fallback re-emits through the mature path
++  without double-emission hazards.
++- **Pure builder** (`isel::build_typed_call`) — consumes pre-resolved argument homes,
++  returns the execution-ordered move plan. Fully unit-testable without codegen state;
++  the full admission/ordering matrix is pinned by tests (see §3).
++- **Topological move ordering** — readers-before-writers per register (a reader must
++  observe the home's original value, so it precedes the writer). The mature path's
++  accumulator staging papers over exactly this ordering problem; the typed layer solves
++  it and refuses register-exchange cycles to the text path (which owns the hazard-spill
++  area machinery).
++- **`xorl` zero arguments** — 3 bytes vs 7 for `movq $0`, the GCC/Clang/ICC form.
++- **Canonical move widths** — narrow C arguments move at their promoted 32-bit width
++  (same doctrine as `narrow_defined_load`); the return home names the sized `%eax`.
++- **`AllocaAddr` arguments** (`f(&local, buf)`) — a separate pre-move
++  (`Mov { AllocaAddr }` → resolver-rendered `leaq slot, %reg` with the frame's
++  addressing mode) before the call; two guards keep it sound: no other argument may
++  source from the register, and the register must not be in the caller-save set (the
++  pre-move precedes the saves).
++- **PLT/version naming** mirrors `emit_call_instruction_impl` (base name in `@PLT`
++  references — GAS 2.47 rejects `sym@ver@PLT`).
++- **Flushing discipline**: the preceding run is drained first, the call is buffered as
++  its own run, and that run is flushed immediately. This reproduces the mature path's
++  program-point semantics exactly (the caller-save interval check runs at the call's own
++  point), keeps the pre-colored argument/return registers conflict-free (no allocated
++  vreg can coexist with the call in the buffer), and its flush tail is precisely
++  `clobber_after_call_like`.
++- **Inline-memcpy precedence preserved**: the dispatch loop's fixed-size memcpy
++  interception keeps winning (`inline_memcpy_len` made `pub(crate)`, single source of
++  truth).
++- **Kill switch**: `CCC_MI_DISABLE_KINDS=call-typed`.
 +
-+1. **Per-value stack spilling (biggest).** The accumulator/regalloc backend
-+   homes nearly every SSA value in a frame slot and reloads it for the next
-+   use, even across a single intervening instruction in the same straight
-+   block: `movl %eax,N(%esp); <one insn>; movl N(%esp),%edi`. GCC keeps the
-+   value in a callee-saved register. `number()` (printf.c) alone has 103
-+   `N(%esp)` refs and is 1148 B vs GCC 600; `set_video` 2478 vs 1204. The
-+   windowed `forward_slot_loads` already folds adjacent pairs; the fix needs a
-+   cross-instruction (still intra-block, barrier-delimited) value-availability
-+   analysis: after `movl %R,slot`, keep `slot = R` until R or the slot is
-+   clobbered or a barrier (call/label/push/indirect) is hit, and rewrite every
-+   same-width reload of `slot` in that range to `%R`. Much of the bookkeeping
-+   already exists in `forward_slot_loads`; its WINDOW=48 stops early on
-+   `LineKind::Label`/`Call` (correct) but also on many harmless straight-line
-+   instructions. Profile why the window terminates early on `number()`.
++### 1.2 xmm0/xmm1 pre-colored float scratch + slot-homed float relays
 +
-+2. **Redundant callee-save push/pop.** `get_cpuflags` does
-+   `pushl %ebx/%esi/%edi/%ebp` with ZERO body uses of any of them (each appears
-+   only in its own push + two epilogue pops). `eliminate_unused_callee_saves`
-+   only acts on single-`subl` framed functions; these bodies have nested
-+   `subl $16` outgoing-arg areas (multi-subl), so the transform is skipped and
-+   all four pairs survive. Extending the envelope proof to multi-alloc
-+   functions (or first eliminating #3) frees the pairs + frame growth.
++- **`XMM0_SCRATCH` (PhysReg 18) / `XMM1_SCRATCH` (19)** — below the allocator's xmm
++  pool (20..=33), so no allocated float home can ever collide with the scratch.
++- **Slot-homed float Store/Load relays**: a spill-slot-homed float value lowers as
++  two FMovs through xmm0 (x86 has no mem-to-mem SSE move); the load is the mirror.
++  D32/D64 carriers ride the same bit-exact SSE moves.
++- **`xmm_scratch_unsafe` guard** — the hazard this session caught *before* the suite
++  did: float parameters are pre-colored to their INCOMING registers, and xmm0/xmm1 ARE
++  incoming registers (PhysReg 18/19). A live parameter home in the scratch refuses the
++  relay to the text path. Exact check: the allocator never assigns 18/19, so any entry
++  is a live incoming param.
++- `reg_name`/`freg_name` know 18/19 (loudly — no fallback); the scratch FMov shapes
++  joined the real-assembler differential corpus.
 +
-+3. **Nested outgoing-argument area per call.** Around every stack-arg call
-+   lccc emits `subl $16,%esp; <leal arg-area>; ...; addl $16,%esp` AND
-+   duplicates the argument staging (values stored to frame slots above, then
-+   reloaded and re-stored into the pushed area:
-+   `movl 32(%esp),%eax; movl %eax,4(%esp)`). ~21 `subl $16` sites in boot.
-+   GCC reserves one outgoing area in the function frame and fills it directly.
-+   This is the interaction that creates the multi-subl shape blocking #2 and
-+   produces the duplicate `movl slot,%eax; movl %eax,slot` chains.
++## 2. Evidence
 +
-+4. Redundant entry `movzwl %ax,%eax` for -m16 regparm u16 args that are
-+   consumed only through `%ax`/`%dx` and never need 32-bit zero-extension in
-+   16-bit context (GCC emits none). `eliminate_redundant_zext_i686` does not
-+   seed a u16 fact for function-entry parameter registers.
++| Check | Result |
++|---|---|
++| census `CCC_ISEL_STATS` (571-file corpus, -O2) | **Call rejections 500 → 28** (−94.4%); coverage 47.08% → 48.46%; every residual Call rejection labeled by reason (`arg-unrepresentable`, `imm-too-wide`, `move-cycle`, `ret-unrepresentable`) |
++| unit `cargo test --lib` | **1558/0/6** (+15: builder matrix, golden stage order, xorl form, sized-rax ret, swap-cycle refusal, self-move elision, imm32 window edges, alloca-addr conflict guard, scratch-name table, relay shapes, relay liveness guard) |
++| regression suite (amd64+ELF32) | **571/0/15, AB-diff 0** (with i686 runner env) |
++| call-site asm (callsite.c) | dead `movq %r11, %rax` staging gone; `movl` canonical widths; arg-move counts **equal to GCC's** per call site |
++| two-TU oracle (opaque callee, -O2) | lccc 29 vs gcc 23 instructions — arg sequences identical in count (6 vs 6); the residual delta is frame layout (`subq` reservation), the BinOp xor tail (accumulator staging, the documented R5 follow-up), and gcc's scheduling — all pass-level, not call-layer |
++| in-TU oracle caveat | gcc's 16-instruction figure exploits IPA-RA (its own callee's register usage); not a call-sequence comparison |
++| assembler differential | CallTyped corpus (6 shapes + void call + xmm scratch FMovs) accepted by the real assembler |
 +
-+## Build / harness facts
-+- Compile lccc: `bash scripts/build_lccc_fast.sh` (-O1 -j2 fastbuild, ~15-30 s
-+  incremental). Tests: `cargo test --profile fastbuild --lib`.
-+- Boot gate: `bash scripts/build_kernel_boot.sh`; read the `32 KiB gate:` line
-+  (script always exits 0). Objects land in `/tmp/bootbuild`.
-+- Snapshot after each validated fix: `bash scripts/lccc-snapshot.sh "<slug>"
-+  "<desc>"`; refreshes `/home/user/ms178-1.patch`.
-+- Do NOT run `cargo fmt` — it reformats the whole tree and pollutes the patch.
-+  Hand-format new code to match surrounding style.
-+- GCC oracle link: `ld.bfd --gc-sections -m elf_i386 -z noexecstack -T
-+  setup-gc.ld <objs>`.
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 89b7932..f6ccbd1 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -217,6 +217,31 @@ fn reg32_name(id: RegId) -> &'static str {
-     }
++## 3. Test matrix (the "brilliant and exhaustive" list)
++
++Builder (pure, no codegen state): readers-before-writers ordering; register-exchange
++cycle refusal; self-move elision; imm32 window edges (i32::MIN/MAX ok, 2^32 refused);
++alloca-addr conflict guard (accepted + refused shapes); rax/rbp defensive refusal;
++return homes (reg / slot / rax-elision / rbp-refusal / void); full six-argument shape
++with cross-register reader/writer constraints asserted positionally.
++
++Emitter golden: full stage order (saves → args → call → ret → reversed restores);
++`xorl` zero form; 32-bit return naming `%eax`.
++
++Corpus: CallTyped (6 argument shapes × mixed widths + void call) and the xmm0/xmm1
++scratch FMov shapes flow through the real-assembler differential, the determinism test,
++and the no-vreg test.
++
++Lowering integration: slot-homed float store relay (two FMovs, xmm0 pinned); float
++load to slot-homed dest (mirror); the liveness-guard refusal when a live param occupies
++xmm0.
++
++## 4. Known traps re-verified this session
++
++- Float parameters live at PhysReg 18/19 (incoming xmm0/xmm1) — "never allocatable"
++  ≠ "never occupied". Any new scratch use MUST run `xmm_scratch_unsafe`.
++- The sandbox's text tools mangle `[h` sequences and phantom-match whitespace regexes;
++  rustc + python byte counts are the authorities (bit this session's `blocks[header]`
++  phantom).
++- Upstream PR #353's `loop_unroll.rs` editor-paste corruption (fixed in S24) is
++  upstream now; the census script (`scripts/isel_census.py`) is the coverage oracle.
++
++## 5. Follow-up backlog (data-driven, ranked by the fresh census)
++
++1. **Memcpy (94)** — typed `Memcpy { dst, src, size }` with inline small-size
++   expansion; needs declared scratch clobbers (rax/rcx are never homes — safe).
++2. **Store(other) (79)** — residual shapes: GEP-folded ptrs and const stores.
++3. **Float-const stores (bulk of Store(float) 123)** — needs a const→rodata-label
++   pre-pass so the isel can emit `movss .LC(%rip), %xmm0` relays.
++4. **VaStart/VaEnd (71 combined)** — small fixed instruction sequences.
++5. **CallIndirect (30)** — the typed call with an indirect target (retpoline-aware).
++6. **Alloca-addr args in caller-save registers (residual 28 Call)** — relax the
++   pre-move/save ordering by emitting saves before the pre-moves (needs the saves to
++   leave CallTyped's atomic scope, or a CallTyped pre-stage).
++7. **BinOp accumulator tail** (`movl %r13d, %r10d; xorl %eax, %r10d; movl %r10d, %eax`
++   → `xorl %ebx, %eax`) — the R5-documented algebraic-fold family; worth 2 instrs per
++   consumed call result at -O2.
++8. **Frame layout** — push-only framing when no spill slots exist (2 instrs/call-heavy
++   function).
+diff --git a/scripts/isel_census.py b/scripts/isel_census.py
+new file mode 100644
+index 00000000..b427c612
+--- /dev/null
++++ b/scripts/isel_census.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""Aggregate the CCC_ISEL_STATS MachInst-coverage census over the regression corpus.
++
++Compiles every tests/regression/*.c with the compiler under test at a given
++optimization level, parses the per-process [ISEL-STATS] census lines from
++stderr, and prints the corpus-wide coverage plus a ranked rejection table.
++
++Usage: CCC_BIN=path/to/lccc [OPT=-O2] [JOBS=N] python3 scripts/isel_census.py
++"""
++import os, re, subprocess, sys, tempfile, collections
++from concurrent.futures import ThreadPoolExecutor
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++BIN = os.environ.get("CCC_BIN", os.path.join(REPO, "target/fastbuild/lccc"))
++OPT = os.environ.get("OPT", "-O2")
++JOBS = int(os.environ.get("JOBS", "8"))
++CORPUS = os.path.join(REPO, "tests/regression")
++
++re_total = re.compile(r"\[ISEL-STATS\] (\d+) of (\d+) instructions lowered through MachInst \(")
++re_kind = re.compile(r"\[ISEL-STATS\]\s+rejected\s+(\d+)\s+(\S+)")
++
++def run_one(path):
++    try:
++        with tempfile.NamedTemporaryFile(suffix=".o", delete=True) as tmp:
++            p = subprocess.run([BIN, OPT, "-c", path, "-o", tmp.name],
++                               capture_output=True, text=True, timeout=60,
++                               env={**os.environ, "CCC_ISEL_STATS": "1"})
++        lowered = rejected = 0
++        kinds = collections.Counter()
++        for line in p.stderr.splitlines():
++            m = re_total.search(line)
++            if m:
++                lowered += int(m.group(1)); rejected += int(m.group(2))
++            m = re_kind.search(line)
++            if m:
++                kinds[m.group(2)] += int(m.group(1))
++        return lowered, rejected, kinds
++    except Exception:
++        return 0, 0, collections.Counter()
++
++def main():
++    files = sorted(f for f in os.listdir(CORPUS) if f.endswith(".c"))
++    tot_l = tot_r = 0
++    kinds = collections.Counter()
++    nfail = 0
++    with ThreadPoolExecutor(max_workers=JOBS) as ex:
++        for l, r, k in ex.map(run_one, [os.path.join(CORPUS, f) for f in files]):
++            tot_l += l; tot_r += r; kinds.update(k)
++            if l == 0 and r == 0:
++                nfail += 1
++    tot = tot_l + tot_r
++    print(f"corpus: {len(files)} files ({nfail} without census), {tot} instructions")
++    print(f"MachInst coverage: {tot_l}/{tot} = {tot_l*100.0/tot:.2f}%")
++    print(f"{'rejected':>10}  {'kind':<28} {'% of all':>8}")
++    for k, n in kinds.most_common(20):
++        print(f"{n:>10}  {k:<28} {n*100.0/tot:>7.2f}%")
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index 5f664799..9f8c4634 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -3331,7 +3331,7 @@ fn clobber_is_frame_pointer(c: &str) -> bool {
+ 
+ /// `__memcpy_chk(dest, src, n, destlen)` may only be inlined when the
+ /// fortify destlen covers `n` (or is `(size_t)-1` / SIZE_MAX).
+-fn destlen_covers_n(destlen: &IrConst, n: i64) -> bool {
++pub(crate) fn destlen_covers_n(destlen: &IrConst, n: i64) -> bool {
+     match destlen.to_i64() {
+         Some(-1) => true,
+         Some(d) if d >= n => true,
+@@ -3340,7 +3340,7 @@ fn destlen_covers_n(destlen: &IrConst, n: i64) -> bool {
  }
  
-+/// Byte/word register name for a family ID, matching the width of `size`
-+/// (B => 8-bit low register, W => 16-bit register). Used by the
-+/// widen-forwarding arm to synthesize `movzbl`/`movzwl`.
-+fn narrow_reg_name(id: RegId, size: MoveSize) -> &'static str {
-+    match (id, size) {
-+        (REG_EAX, MoveSize::B) => "%al",
-+        (REG_ECX, MoveSize::B) => "%cl",
-+        (REG_EDX, MoveSize::B) => "%dl",
-+        (REG_EBX, MoveSize::B) => "%bl",
-+        (REG_ESP, MoveSize::B) => "%spl",
-+        (REG_EBP, MoveSize::B) => "%bpl",
-+        (REG_ESI, MoveSize::B) => "%sil",
-+        (REG_EDI, MoveSize::B) => "%dil",
-+        (REG_EAX, MoveSize::W) => "%ax",
-+        (REG_ECX, MoveSize::W) => "%cx",
-+        (REG_EDX, MoveSize::W) => "%dx",
-+        (REG_EBX, MoveSize::W) => "%bx",
-+        (REG_ESP, MoveSize::W) => "%sp",
-+        (REG_EBP, MoveSize::W) => "%bp",
-+        (REG_ESI, MoveSize::W) => "%si",
-+        (REG_EDI, MoveSize::W) => "%di",
-+        _ => "%???",
-+    }
-+}
-+
- /// Check if a register is caller-saved (clobbered by calls).
- fn is_caller_saved(reg: RegId) -> bool {
-     matches!(reg, REG_EAX | REG_ECX | REG_EDX)
-@@ -1562,7 +1587,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                         let is_incdec = op_s == "incl %eax" || op_s == "decl %eax";
-                         if is_imm_alu || is_incdec {
-                             let mut k = j + 1;
--                            while k < len && (infos[k].is_nop() || is_debug_location(store, infos, k)) {
-+                            while k < len
-+                                && (infos[k].is_nop() || is_debug_location(store, infos, k))
-+                            {
-                                 k += 1;
-                             }
-                             if k < len {
-@@ -1578,7 +1605,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                                         let mut cnt = 0;
-                                         let mut dead = false;
-                                         while m < len && cnt < 24 {
--                                            if infos[m].is_nop() || is_debug_location(store, infos, m) {
-+                                            if infos[m].is_nop()
-+                                                || is_debug_location(store, infos, m)
-+                                            {
-                                                 m += 1;
-                                                 continue;
-                                             }
-@@ -1975,6 +2004,178 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
- // ── Pass: Dead store elimination ─────────────────────────────────────────────
- 
- /// Remove stores to stack slots that are immediately overwritten.
-+// ── Pass: immediate store-to-load forwarding ────────────────────────────────
-+
-+/// Parse `movX $imm, N(%esp|%ebp)` into (immediate value, biased slot, size).
-+/// These immediate homes are emitted by the accumulator backend when it stages
-+/// a constant argument or local initializer into a stack slot; unlike the
-+/// register case (`StoreEbp`) they classify as plain `Other`, so the register
-+/// forwarding pass never sees them.
-+fn parse_immediate_store(s: &str) -> Option<(i64, i32, MoveSize)> {
-+    let (rest, size) = if let Some(r) = s.strip_prefix("movl ") {
-+        (r, MoveSize::L)
-+    } else if let Some(r) = s.strip_prefix("movw ") {
-+        (r, MoveSize::W)
-+    } else if let Some(r) = s.strip_prefix("movb ") {
-+        (r, MoveSize::B)
-+    } else {
-+        return None;
-+    };
-+    let rest = rest.trim();
-+    if !rest.starts_with('$') {
-+        return None;
-+    }
-+    let comma = rest.find(',')?;
-+    let imm = rest[1..comma].trim();
-+    let mem = rest[comma + 1..].trim();
-+    // Plain offset(base) only — no indexed/SIB forms.
-+    let paren = mem.find('(')?;
-+    let base = &mem[paren..];
-+    if base.contains(',') {
-+        return None;
-+    }
-+    if !base.ends_with("(%ebp)") && !base.ends_with("(%esp)") {
-+        return None;
-+    }
-+    let off_str = &mem[..paren];
-+    let off = parse_offset(off_str);
-+    if off == EBP_OFFSET_NONE {
-+        return None;
-+    }
-+    let val: i64 = imm.parse().ok()?;
-+    Some((val, off + slot_bias(mem), size))
-+}
-+
-+/// Forward an immediate store to a stack slot into its later reads:
-+/// `movl $3, slot` … `movzbl slot, %eax` becomes a direct materialization
-+/// (`movl $3, %eax` / `movzbl`-free), mirroring what GCC emits for a constant
-+/// that never needed a home. The register forwarding pass cannot do this:
-+/// `movl $imm, slot` is not a `StoreEbp` (its source is an immediate, not a
-+/// register), so it is invisible there.
-+///
-+/// Soundness is the same store-forwarding-window proof as
-+/// [`forward_slot_loads`]: scan forward over instructions that cannot
-+/// overwrite the slot or the destination register until the slot is overwritten
-+/// or a barrier (call / label / indirect memory / control flow) is hit, and
-+/// rewrite every plain reload of the slot in that window.
-+fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    let len = infos.len();
-+    let mut changed = false;
-+    const WINDOW: usize = 48;
-+
-+    for i in 0..len {
-+        if infos[i].is_nop() || !matches!(infos[i].kind, LineKind::Other { .. }) {
-+            continue;
-+        }
-+        let line = trimmed(store, &infos[i], i);
-+        let Some((val, slot, store_size)) = parse_immediate_store(line) else {
-+            continue;
-+        };
-+
-+        let mut j = i + 1;
-+        let mut count = 0;
-+        while j < len && count < WINDOW {
-+            if infos[j].is_nop() || is_debug_location(store, infos, j) {
-+                j += 1;
-+                continue;
-+            }
-+            if infos[j].is_barrier() {
-+                break;
-+            }
-+
-+            // Another write (register OR immediate) to overlapping slot bytes
-+            // ends the constant's validity.
-+            let mut killed = false;
-+            match infos[j].kind {
-+                LineKind::StoreEbp { offset, size, .. } => {
-+                    if ranges_overlap(slot, store_size.byte_size(), offset, size.byte_size()) {
-+                        killed = true;
-+                    }
-+                }
-+                LineKind::Other { .. } => {
-+                    let t = trimmed(store, &infos[j], j);
-+                    if let Some((_, s2, sz2)) = parse_immediate_store(t) {
-+                        if ranges_overlap(slot, store_size.byte_size(), s2, sz2.byte_size()) {
-+                            killed = true;
-+                        }
-+                    } else if infos[j].has_indirect_mem || infos[j].ebp_offset != EBP_OFFSET_NONE {
-+                        // An indexed/aliased slot access or an unparsed memory
-+                        // operand that might touch the slot: stop.
-+                        if infos[j].has_indirect_mem {
-+                            killed = true;
-+                        } else if infos[j].ebp_offset != EBP_OFFSET_NONE
-+                            && ranges_overlap(slot, store_size.byte_size(), infos[j].ebp_offset, 16)
-+                        {
-+                            killed = true;
-+                        }
-+                    }
-+                }
-+                LineKind::LoadEbp { offset, size, .. } => {
-+                    // Only same-or-wider reloads of exactly the stored bytes
-+                    // can be turned into the constant; a narrower or
-+                    // partial-overlap read is left alone and stops tracking.
-+                    if ranges_overlap(slot, store_size.byte_size(), offset, size.byte_size())
-+                        && offset == slot
-+                        && size.byte_size() >= store_size.byte_size()
-+                    {
-+                        // Rewrite as a direct immediate materialization into
-+                        // the load's destination register. The constant is
-+                        // re-masked to the STORE width: a byte store of $3
-+                        // read as movl is value 3; no extension is needed for
-+                        // a non-negative small constant, and a wider store
-+                        // feeding a narrower load is masked by the register
-+                        // name chosen (movw/movb write the low part).
-+                        if let LineKind::LoadEbp { reg: dst, .. } = infos[j].kind {
-+                            if dst <= REG_GP_MAX {
-+                                let mn = match size {
-+                                    MoveSize::L => "movl",
-+                                    MoveSize::W => "movw",
-+                                    MoveSize::B => "movb",
-+                                };
-+                                let dstname = match size {
-+                                    MoveSize::L => reg32_name(dst).to_string(),
-+                                    MoveSize::W => narrow_reg_name(dst, MoveSize::W).to_string(),
-+                                    MoveSize::B => narrow_reg_name(dst, MoveSize::B).to_string(),
-+                                };
-+                                // Mask the immediate to the STORED width so a
-+                                // negative/wide constant stays correct when
-+                                // the reload is wider than the store.
-+                                let mask: i64 = match store_size {
-+                                    MoveSize::L => 0xFFFF_FFFF,
-+                                    MoveSize::W => 0xFFFF,
-+                                    MoveSize::B => 0xFF,
-+                                };
-+                                let v = val & mask;
-+                                store.replace(j, format!("    {mn} ${v}, {dstname}"));
-+                                infos[j] = classify_line(store.get(j));
-+                                changed = true;
-+                                j += 1;
-+                                count += 1;
-+                                continue;
-+                            }
-+                        }
-+                        killed = true;
-+                    } else {
-+                        killed = true;
-+                    }
-+                }
-+                _ => {}
-+            }
-+            if killed {
-+                break;
-+            }
-+            // Any generic indirect access we did not classify above breaks the
-+            // window (it could write the slot through a pointer).
-+            if infos[j].has_indirect_mem {
-+                break;
-+            }
-+            j += 1;
-+            count += 1;
-+        }
-+    }
-+    changed
-+}
-+
- /// Store-to-load forwarding for stack slots: after `movl %R, N(%esp)`, a
- /// later `movl N(%esp), %R2` in the same window (slot and %R untouched)
- /// becomes `movl %R, %R2` -- 2 bytes instead of 4-7 -- and once every load
-@@ -2047,6 +2248,64 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                         break;
-                     }
-                 }
-+                // Store->load value forwarding across a slot round-trip.
-+                // The accumulator backend homes arguments and asm results in
-+                // stack slots and immediately reads them back, even though
-+                // the stored register still holds the value. Forward the
-+                // value register-to-register and let the dead-store pass drop
-+                // the home slot:
-+                //
-+                //  * SAME-WIDTH store/load (`movl %edx,slot` / `movl slot,%eax`,
-+                //    or `movw %dx,slot`/`movzwl slot,%eax`, …): the reload is
-+                //    a plain copy; emit movl (or movzwl for a word load, which
-+                //    is exactly what the load already implied).
-+                //  * NARROWER store feeding a WIDER unsigned reload
-+                //    (`movb %al,slot` / `movl slot,%eax`): emit the matching
-+                //    movzbl/movzwl so the zero-extension the slot round-trip
-+                //    implied is explicit; the redundant-zext pass then deletes
-+                //    it when the source is already narrow-canonical.
-+                //
-+                // The window proof below guarantees src_reg still holds the
-+                // stored value and the slot bytes are untouched. Byte stores
-+                // feeding WORD loads are not forwarded (the high byte of the
-+                // target word is a DIFFERENT slot byte, not zero-extension).
-+                LineKind::LoadEbp {
-+                    reg: dst_reg,
-+                    offset,
-+                    size: lsize,
-+                } if offset == slot && dst_reg <= REG_GP_MAX => {
-+                    let fwd = match (size, lsize) {
-+                        (MoveSize::L, MoveSize::L) => Some(("movl", reg32_name(src_reg))),
-+                        (MoveSize::W, MoveSize::W) => {
-+                            Some(("movzwl", narrow_reg_name(src_reg, MoveSize::W)))
-+                        }
-+                        (MoveSize::W, MoveSize::L) => {
-+                            Some(("movzwl", narrow_reg_name(src_reg, MoveSize::W)))
-+                        }
-+                        (MoveSize::B, MoveSize::L) => {
-+                            Some(("movzbl", narrow_reg_name(src_reg, MoveSize::B)))
-+                        }
-+                        // A WIDER register store feeding a NARROWER UNSIGNED
-+                        // reload is ONLY forwarded when the reload is itself
-+                        // a zero-extension (movzbl/movzwl classify as LoadEbp
-+                        // of size B/W but their text says movzXl, handled by
-+                        // the widened-slot fold elsewhere). Plain same-width or
-+                        // narrower-with-truncation (`movb slot,%al` from a
-+                        // movl store) reads low bytes the register is NOT
-+                        // proven to hold canonically, so it is left alone.
-+                        _ => None,
-+                    };
-+                    if let Some((mnem, src)) = fwd {
-+                        let dst = reg32_name(dst_reg);
-+                        store.replace(j, format!("    {mnem} {src}, {dst}"));
-+                        infos[j] = classify_line(store.get(j));
-+                        changed = true;
-+                        j += 1;
-+                        count += 1;
-+                        continue;
-+                    }
-+                    break;
-+                }
-                 LineKind::LoadEbp {
-                     offset,
-                     size: lsize,
-@@ -3452,10 +3711,8 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
-                 // can see.  Refuse the fallback for the return registers
-                 // unless the function has no `ret` at all (noreturn tail).
-                 let ret_observes = matches!(dst_reg, REG_EAX | REG_EDX)
--                    && (fs..fe)
--                        .any(|k| infos[k].kind == LineKind::Ret && !infos[k].is_nop());
--                if !ret_observes && census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) == 0
--                {
-+                    && (fs..fe).any(|k| infos[k].kind == LineKind::Ret && !infos[k].is_nop());
-+                if !ret_observes && census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) == 0 {
-                     infos[i].kind = LineKind::Nop;
-                     changed = true;
-                 }
-@@ -3726,19 +3983,45 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-         let m = s.split_whitespace().next().unwrap_or("");
-         matches!(
-             m,
--            "addl" | "addw" | "addb"
--                | "subl" | "subw" | "subb"
--                | "adcl" | "sbbl"
--                | "andl" | "andw" | "andb"
--                | "orl" | "orw" | "orb"
--                | "xorl" | "xorw" | "xorb"
--                | "cmpl" | "cmpw" | "cmpb"
--                | "testl" | "testw" | "testb"
--                | "shll" | "shrl" | "sarl"
--                | "roll" | "rorl" | "rcll" | "rcrl"
--                | "imull" | "mull" | "idivl" | "divl"
--                | "incl" | "decl" | "negl"
--                | "negw" | "negb"
-+            "addl"
-+                | "addw"
-+                | "addb"
-+                | "subl"
-+                | "subw"
-+                | "subb"
-+                | "adcl"
-+                | "sbbl"
-+                | "andl"
-+                | "andw"
-+                | "andb"
-+                | "orl"
-+                | "orw"
-+                | "orb"
-+                | "xorl"
-+                | "xorw"
-+                | "xorb"
-+                | "cmpl"
-+                | "cmpw"
-+                | "cmpb"
-+                | "testl"
-+                | "testw"
-+                | "testb"
-+                | "shll"
-+                | "shrl"
-+                | "sarl"
-+                | "roll"
-+                | "rorl"
-+                | "rcll"
-+                | "rcrl"
-+                | "imull"
-+                | "mull"
-+                | "idivl"
-+                | "divl"
-+                | "incl"
-+                | "decl"
-+                | "negl"
-+                | "negw"
-+                | "negb"
-         )
-     }
-     /// Lines whose EXECUTION READS the flags (jcc/setcc/cmov).
-@@ -3753,7 +4036,10 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-     fn is_flags_reader(kind: LineKind, s: &str) -> bool {
-         matches!(kind, LineKind::CondJmp | LineKind::SetCC { .. })
-             || is_cond_jcc(s)
--            || s.split_whitespace().next().unwrap_or("").starts_with("cmov")
-+            || s.split_whitespace()
-+                .next()
-+                .unwrap_or("")
-+                .starts_with("cmov")
-     }
- 
-     let len = infos.len();
-@@ -4391,10 +4677,7 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                 }
-                 LineKind::Other { dest_reg } => {
-                     // `movl %src, %dst` style: recover the source register.
--                    let rest = text
--                        .strip_prefix("movl ")
--                        .map(|r| r.trim())
--                        .unwrap_or("");
-+                    let rest = text.strip_prefix("movl ").map(|r| r.trim()).unwrap_or("");
-                     if let Some(comma) = rest.find(',') {
-                         let src_name = rest[..comma].trim();
-                         if src_name.starts_with('%') && !src_name.contains('(') {
-@@ -4524,8 +4807,7 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                 continue;
-             }
-             let text_a = trimmed(store, &infos[i], i);
--            let is_marker =
--                text_a == "xorl %edx, %edx" || text_a == "cltd" || text_a == "cdq";
-+            let is_marker = text_a == "xorl %edx, %edx" || text_a == "cltd" || text_a == "cdq";
-             if !is_marker {
-                 i += 1;
-                 continue;
-@@ -5146,8 +5428,19 @@ fn is_order_cond_jcc(s: &str) -> bool {
-     };
-     matches!(
-         m,
--        "je" | "jz" | "jne" | "jnz" | "jb" | "jc" | "jnae" | "jnb" | "jnc" | "jae" | "jbe"
--            | "jna" | "ja" | "jnbe"
-+        "je" | "jz"
-+            | "jne"
-+            | "jnz"
-+            | "jb"
-+            | "jc"
-+            | "jnae"
-+            | "jnb"
-+            | "jnc"
-+            | "jae"
-+            | "jbe"
-+            | "jna"
-+            | "ja"
-+            | "jnbe"
-     )
- }
- 
-@@ -5236,9 +5529,35 @@ fn is_cond_jcc(s: &str) -> bool {
-     };
-     matches!(
-         m,
--        "jo" | "jno" | "js" | "jns" | "je" | "jz" | "jne" | "jnz" | "jb" | "jc" | "jnae"
--            | "jnb" | "jnc" | "jae" | "jbe" | "jna" | "ja" | "jnbe" | "jl" | "jnge" | "jge"
--            | "jnl" | "jle" | "jng" | "jg" | "jnle" | "jp" | "jpe" | "jnp" | "jpo"
-+        "jo" | "jno"
-+            | "js"
-+            | "jns"
-+            | "je"
-+            | "jz"
-+            | "jne"
-+            | "jnz"
-+            | "jb"
-+            | "jc"
-+            | "jnae"
-+            | "jnb"
-+            | "jnc"
-+            | "jae"
-+            | "jbe"
-+            | "jna"
-+            | "ja"
-+            | "jnbe"
-+            | "jl"
-+            | "jnge"
-+            | "jge"
-+            | "jnl"
-+            | "jle"
-+            | "jng"
-+            | "jg"
-+            | "jnle"
-+            | "jp"
-+            | "jpe"
-+            | "jnp"
-+            | "jpo"
-     )
- }
- 
-@@ -5253,8 +5572,7 @@ fn line_writes_reg_purely(line: &str, reg: RegId) -> bool {
-     };
-     let pure_write = matches!(
-         mnem,
--        "movl" | "movw" | "movb" | "movzbl" | "movzwl" | "movsbl" | "movswl" | "leal"
--            | "call"
-+        "movl" | "movw" | "movb" | "movzbl" | "movzwl" | "movsbl" | "movswl" | "leal" | "call"
-     );
-     if !pure_write {
-         return false;
-@@ -5282,10 +5600,7 @@ fn line_writes_reg_purely(line: &str, reg: RegId) -> bool {
- /// silently change the values a `rep movs`/`idivl` consumes.
- fn implicit_reads(line: &str) -> &'static [RegId] {
-     let first = line.split_whitespace().next().unwrap_or("");
--    let second = line
--        .split_whitespace()
--        .nth(1)
--        .unwrap_or("");
-+    let second = line.split_whitespace().nth(1).unwrap_or("");
-     match first {
-         "rep" => match second {
-             "movsb" | "movsl" => &[REG_ECX, REG_ESI, REG_EDI],
-@@ -5412,7 +5727,6 @@ fn census_reg_reads(
-     n
- }
- 
--
- /// Rewrite every branch in `[fstart, fend)` whose target is `from_name` to
- /// target `to_name` instead.  Returns the number of rewritten branches.
- ///
-@@ -5557,8 +5871,7 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
-         let fend = idx;
- 
-         // Label name -> line index, for target-existence checks.
--        let mut labels: std::collections::HashMap<String, usize> =
--            std::collections::HashMap::new();
-+        let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-         for i in fstart..fend {
-             if infos[i].is_nop() || infos[i].kind != LineKind::Label {
-                 continue;
-@@ -5688,9 +6001,7 @@ fn delete_redundant_cond_jumps(store: &mut LineStore, infos: &mut [LineInfo]) ->
-                     .split_whitespace()
-                     .next_back()
-                     .is_some_and(|t| t == target),
--                LineKind::Label => {
--                    trimmed(store, &infos[j], j) == format!("{}:", target)
--                }
-+                LineKind::Label => trimmed(store, &infos[j], j) == format!("{}:", target),
-                 _ => false,
-             };
-             if redundant {
-@@ -5775,13 +6086,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                 if (128..=65535).contains(&imm_text) {
-                     let i1 = next_non_nop(infos, i + 1);
-                     if i1 < fend && is_order_cond_jcc(trimmed(store, &infos[i1], i1)) {
--                        if let Some(def_idx) = canonical_16_def(
--                            store,
--                            infos,
--                            i,
--                            r,
--                            fstart,
--                        ) {
-+                        if let Some(def_idx) = canonical_16_def(store, infos, i, r, fstart) {
-                             let r16 = low_subreg_name(reg32_name(r), 2).unwrap_or("%ax");
-                             let new_cmp = format!("    cmpw ${}, {}", imm_text, r16);
-                             store.replace(i, new_cmp);
-@@ -5971,8 +6276,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                             &[i, j],
-                         )
-                     {
--                        let new_cmp =
--                            format!("    {} ${}, {}", mnem, imm_of(&t), op_src);
-+                        let new_cmp = format!("    {} ${}, {}", mnem, imm_of(&t), op_src);
-                         store.replace(j, new_cmp);
-                         infos[j] = classify_line(store.get(j));
-                         infos[i].kind = LineKind::Nop;
-@@ -6011,8 +6315,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                         // exact string compare against the parsed operand
-                         // text is the right equivalence test here.
-                         let o1 = if other == op_dst { op_src } else { other };
--                        let new_cmp =
--                            format!("    {} {}, {}", mnem, o1, op_src);
-+                        let new_cmp = format!("    {} {}, {}", mnem, o1, op_src);
-                         store.replace(j, new_cmp);
-                         infos[j] = classify_line(store.get(j));
-                         infos[i].kind = LineKind::Nop;
-@@ -6036,14 +6339,23 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-             // deleted under the dominance proof for %B.
-             if let Some((op_src, op_dst)) = parse_mov_reg_reg(&s) {
-                 let i1 = next_non_nop(infos, i + 1);
--                let i2 = if i1 < fend { next_non_nop(infos, i1 + 1) } else { fend };
--                let i3 = if i2 < fend { next_non_nop(infos, i2 + 1) } else { fend };
-+                let i2 = if i1 < fend {
-+                    next_non_nop(infos, i1 + 1)
-+                } else {
-+                    fend
-+                };
-+                let i3 = if i2 < fend {
-+                    next_non_nop(infos, i2 + 1)
-+                } else {
-+                    fend
-+                };
-                 if i3 < fend {
-                     let t1 = trimmed(store, &infos[i1], i1);
-                     let t2 = trimmed(store, &infos[i2], i2);
--                    if let (Some(a), Some(b)) =
--                        (parse_subl_imm_reg(t1, op_dst), parse_cmpl_imm_reg(t2, op_dst))
--                    {
-+                    if let (Some(a), Some(b)) = (
-+                        parse_subl_imm_reg(t1, op_dst),
-+                        parse_cmpl_imm_reg(t2, op_dst),
-+                    ) {
-                         let cond = trimmed(store, &infos[i3], i3);
-                         if is_cond_jcc(cond) {
-                             let fused = a.wrapping_add(b);
-@@ -6057,8 +6369,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                                     &[i, i1, i2],
-                                 )
-                             {
--                                let new_cmp =
--                                    format!("    cmpl ${}, {}", fused, op_src);
-+                                let new_cmp = format!("    cmpl ${}, {}", fused, op_src);
-                                 store.replace(i2, new_cmp);
-                                 infos[i2] = classify_line(store.get(i2));
-                                 infos[i].kind = LineKind::Nop;
-@@ -6102,8 +6413,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                             &[i, j],
-                         )
-                     {
--                        let new_test =
--                            format!("    testl ${}, {}", imm.unwrap(), op_src);
-+                        let new_test = format!("    testl ${}, {}", imm.unwrap(), op_src);
-                         store.replace(j, new_test);
-                         infos[j] = classify_line(store.get(j));
-                         infos[i].kind = LineKind::Nop;
-@@ -6140,7 +6450,8 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-             // proof.
-             if let Some((x, y)) = parse_mov_reg_reg(&s) {
-                 if let Some((add_src, add_dst)) = parse_addl_reg_reg(&t) {
--                    if add_src == y && add_dst == x
-+                    if add_src == y
-+                        && add_dst == x
-                         && staging_reads_safe(
-                             store,
-                             infos,
-@@ -6174,7 +6485,10 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-         {
-             let mut i = fstart;
-             while i < fend {
--                if infos[i].is_nop() || infos[i].kind != LineKind::Label || is_debug_location(store, infos, i) {
-+                if infos[i].is_nop()
-+                    || infos[i].kind != LineKind::Label
-+                    || is_debug_location(store, infos, i)
-+                {
-                     i += 1;
-                     continue;
-                 }
-@@ -6189,7 +6503,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                     match infos[k].kind {
-                         LineKind::Label => break,
-                         // block terminators end the straight-line body
--                        LineKind::Jmp | LineKind::CondJmp | LineKind::Ret
-+                        LineKind::Jmp
-+                        | LineKind::CondJmp
-+                        | LineKind::Ret
-                         | LineKind::JmpIndirect => break,
-                         _ => {}
-                     }
-@@ -6200,10 +6516,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                     i += 1;
-                     continue;
-                 }
--                let jmp_target = match trimmed(store, &infos[k], k)
--                    .split_whitespace()
--                    .next_back()
--                {
-+                let jmp_target = match trimmed(store, &infos[k], k).split_whitespace().next_back() {
-                     Some(t) => t.to_string(),
-                     None => {
-                         i += 1;
-@@ -6230,7 +6543,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                     }
-                     match infos[k2].kind {
-                         LineKind::Label => break,
--                        LineKind::Jmp | LineKind::CondJmp | LineKind::Ret
-+                        LineKind::Jmp
-+                        | LineKind::CondJmp
-+                        | LineKind::Ret
-                         | LineKind::JmpIndirect => break,
-                         _ => {}
-                     }
-@@ -6442,9 +6757,7 @@ fn parse_mov_imm_value(s: &str) -> Option<(&str, &str)> {
-     let dst = dst.trim();
-     let imm = src.strip_prefix('$')?;
-     if imm.is_empty()
--        || imm.contains(|ch: char| {
--            ch.is_whitespace() || matches!(ch, ',' | '(' | ')' | ':' | '+')
--        })
-+        || imm.contains(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '(' | ')' | ':' | '+'))
-         || !dst.starts_with("%e")
-     {
+ /// `Some(n)` if this call is a fixed-size memcpy we may expand inline.
+-fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
++pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
+     if is_variadic || args.len() < 3 {
          return None;
-@@ -6474,9 +6787,7 @@ fn parse_mov_imm_reg(s: &str) -> Option<(&str, &str)> {
- 
- /// Parse `ALU %A, %B` returning ((A, B), B-as-second).
- fn parse_alu_reg_reg(s: &str) -> Option<(&str, (&str, &str))> {
--    for mnem in [
--        "andl", "orl", "xorl", "addl", "subl", "cmpl", "testl",
--    ] {
-+    for mnem in ["andl", "orl", "xorl", "addl", "subl", "cmpl", "testl"] {
-         let rest = s.strip_prefix(mnem).and_then(|r| r.strip_prefix(' '));
-         if let Some(rest) = rest {
-             let (a, b) = rest.split_once(',')?;
-@@ -7065,7 +7376,27 @@ fn eliminate_never_read_stores_range(
-         return;
      }
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index b7f5e13f..51b1821b 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -578,6 +578,10 @@ const MI_FLOAT_MOV: u32 = 1 << 15;
+ /// Scalar float arithmetic (FAlu): float Add/Sub/Mul/Div lowered to the VEX
+ /// three-operand vadd/vsub/vmul/vdiv forms.
+ const MI_FLOAT_ALU: u32 = 1 << 16;
++/// Typed direct calls (CallTyped): SysV integer-register calls lowered as one
++/// atomic machine instruction (caller-save spills + argument moves + call +
++/// return home + restores), replacing the accumulator-staged text sequence.
++const MI_CALL_TYPED: u32 = 1 << 17;
  
--    // Remove stores to slots whose byte range is never overlapped by any load
-+    // Remove stores to slots whose byte range is never overlapped by any load.
-+    // Register stores classify as StoreEbp; immediate homes (`movl $N, slot`)
-+    // classify as Other but are equally dead when the slot is never read —
-+    // the accumulator backend stages a constant into an outgoing-argument or
-+    // local slot that every use then re-materializes directly, leaving the
-+    // store with no reader. Gather them here so the same liveness proof covers
-+    // both shapes.
-+    let imm_stores: Vec<(usize, i32, MoveSize)> = {
-+        let mut v = Vec::new();
-+        for i in start..end {
-+            if infos[i].is_nop() {
-+                continue;
-+            }
-+            if matches!(infos[i].kind, LineKind::Other { .. }) {
-+                if let Some((_, slot, size)) = parse_immediate_store(trimmed(store, &infos[i], i)) {
-+                    v.push((i, slot, size));
-+                }
-+            }
-+        }
-+        v
-+    };
-     for i in start..end {
-         if infos[i].is_nop() {
-             continue;
-@@ -7120,6 +7451,55 @@ fn eliminate_never_read_stores_range(
+ fn parse_machinst_disabled_kinds() -> u32 {
+     std::env::var("CCC_MI_DISABLE_KINDS")
+@@ -602,6 +606,7 @@ fn parse_machinst_disabled_kinds() -> u32 {
+                 "cast-unsigned-source" => MI_CAST_UNSIGNED_SOURCE,
+                 "float-mov" => MI_FLOAT_MOV,
+                 "float-alu" => MI_FLOAT_ALU,
++                "call-typed" => MI_CALL_TYPED,
+                 "all" => u32::MAX,
+                 _ => 0,
              }
+@@ -621,6 +626,7 @@ fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u32 {
+         Instruction::Select { .. } => MI_SELECT,
+         Instruction::GetElementPtr { .. } => MI_GEP,
+         Instruction::Alloca { .. } => MI_ALLOCA,
++        Instruction::Call { .. } => MI_CALL_TYPED,
+         _ => 0,
+     }
+ }
+@@ -4023,6 +4029,19 @@ impl X86Codegen {
+                 && !self.state.is_i128_value(v)
+                 && !self.state.vector_values.contains(&v)
+         };
++        // Spill-slot-homed float value: relayed through the pre-colored xmm0
++        // scratch (PhysReg 18 — the allocator pool starts at xmm2, so the
++        // scratch can never collide with an allocated home). Same value-domain
++        // exclusions as xmm_homed: a vectorizer/i128/accumulator value that
++        // happens to be slot-homed is packed/wide in the mature path's eyes
++        // and must not be moved by a scalar relay.
++        let float_slot_homed = |v: u32| {
++            ra.get(&v).is_none()
++                && self.state.get_slot(v).is_some()
++                && !self.state.is_accumulator_location(v)
++                && !self.state.is_i128_value(v)
++                && !self.state.vector_values.contains(&v)
++        };
+         // Pointer admission mirrors the integer Load/Store ptr gate exactly:
+         // folded GEP/global addresses have NO materialized register (the
+         // producer was skipped -- reading its home is a segfault), and
+@@ -4048,7 +4067,7 @@ impl X86Codegen {
+                 ..
+             } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
+                 *seg_override == AddressSpace::Default
+-                    && matches!(val, Operand::Value(v) if xmm_homed(v.0))
++                    && matches!(val, Operand::Value(v) if xmm_homed(v.0) || float_slot_homed(v.0))
+                     && gpr_ptr(ptr.0)
+             }
+             Instruction::Load {
+@@ -4058,7 +4077,9 @@ impl X86Codegen {
+                 seg_override,
+                 ..
+             } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
+-                *seg_override == AddressSpace::Default && xmm_homed(dest.0) && gpr_ptr(ptr.0)
++                *seg_override == AddressSpace::Default
++                    && (xmm_homed(dest.0) || float_slot_homed(dest.0))
++                    && gpr_ptr(ptr.0)
+             }
+             Instruction::Copy { dest, src } => {
+                 let Operand::Value(src_v) = src else {
+@@ -4111,6 +4132,213 @@ impl X86Codegen {
+             _ => false,
          }
      }
++    /// Typed direct-call lowering: the SysV integer-register subset as one
++    /// atomic [`MachInst::CallTyped`].
++    ///
++    /// Admission contract (everything else keeps the mature path):
++    /// - direct call to a named, non-empty symbol; not variadic, not sret;
++    /// - no struct/i128/F128/x87 arguments; at most six integer/pointer
++    ///   arguments of ABI width 4 or 8 (narrow C arguments are moved at
++    ///   their canonical 32-bit promotion width, per the same convention
++    ///   the load path's `narrow_defined_load` establishes);
++    /// - integer/pointer return (or void) whose destination home is a GPR
++    ///   or a spill slot; dead/accumulator/xmm destinations stay behind;
++    /// - inline-memcpy candidates keep their interception in the dispatch
++    ///   loop (an inlined fixed-size memcpy beats any call sequence);
++    /// - the pure builder must produce an acyclic move plan.
++    ///
++    /// Flushing discipline: the preceding run is drained first, the call is
++    /// buffered as its own run, and that run is flushed immediately. This
++    /// reproduces the mature path's program-point semantics exactly — the
++    /// caller-save interval check runs at the call's own point — and keeps
++    /// the pre-colored argument/return registers conflict-free, since no
++    /// allocated vreg can coexist with the call in the buffer. The flush's
++    /// tail (invalidate_all + pending-vec-store flush + vec-peephole
++    /// invalidation) is precisely `clobber_after_call_like`.
++    fn try_lower_call_typed(
++        &mut self,
++        inst: &crate::ir::reexports::Instruction,
++        func: &str,
++        info: &crate::ir::reexports::CallInfo,
++        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
++    ) -> bool {
++        use super::isel::{build_typed_call, TypedCallSrc};
++        use super::machinst::{CallArgMove, MachInst, MachOperand, MachReg, OpSize};
 +
-+    // Immediate homes: apply the identical function-scoped liveness proof.
-+    // (%esp) immediate stores require the same walk/call discipline the
-+    // register stores need; (%ebp) immediate stores are real frame slots only
-+    // under a frame pointer (otherwise %ebp is a data register and the line
-+    // could be a pointer write — never a dead home).
-+    for (i, offset, size) in imm_stores {
-+        let esp_store = is_esp_biased(offset);
-+        if esp_store {
-+            if !esp_walk_ok || has_call {
-+                continue;
-+            }
-+        } else if !ebp_is_frame {
-+            continue;
++        let _ = folded_global_addrs; // subset needs no fold-map interaction
++
++        if self.machinst_disabled_kinds & MI_CALL_TYPED != 0 {
++            return false;
 +        }
-+        let store_bytes = size.byte_size();
-+        let norm_off = if esp_store {
-+            offset - norm[i - start]
-+        } else {
-+            offset
-+        };
-+        // Top-of-stack immediate store could feed a `ret`/pop architectural
-+        // read, mirroring the register-store guard above.
-+        if esp_store && offset == ESP_SLOT_BIAS && trimmed(store, &infos[i], i).ends_with("(%esp)")
++        // Inline fixed-size memcpy/__memcpy_chk must keep winning over any
++        // call sequence (dispatch-loop interception, mirrored gate).
++        if crate::backend::generation::inline_memcpy_len(func, &info.args, info.is_variadic)
++            .is_some()
 +        {
-+            let mut next = i + 1;
-+            while next < end
-+                && (infos[next].is_nop()
-+                    || matches!(
-+                        infos[next].kind,
-+                        LineKind::Empty | LineKind::Directive | LineKind::Label
-+                    ))
-+            {
-+                next += 1;
-+            }
-+            if next < end
-+                && (matches!(infos[next].kind, LineKind::Pop { .. } | LineKind::Ret)
-+                    || trimmed(store, &infos[next], next).starts_with("ret "))
-+            {
-+                continue;
-+            }
++            return false;
 +        }
-+        let is_read = read_ranges
-+            .iter()
-+            .any(|&(r_off, r_sz)| ranges_overlap(norm_off, store_bytes, r_off, r_sz));
-+        if !is_read {
-+            infos[i].kind = LineKind::Nop;
++        // Direct named target, non-variadic, no sret.
++        if func.is_empty() || info.is_variadic || info.is_sret {
++            return false;
 +        }
-+    }
- }
- 
- // ── Pass: Unused callee-saved register elimination ───────────────────────────
-@@ -7302,8 +7682,8 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
-                     _ => {}
-                 }
-             }
--            let has_jmp_indirect = (start..end)
--                .any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::JmpIndirect);
-+            let has_jmp_indirect =
-+                (start..end).any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::JmpIndirect);
-             let mut envelope_ok = true;
-             if let Some(ld) = last_dealloc {
-                 // 1) Geometry: every %esp engagement must live strictly
-@@ -7398,16 +7778,14 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
-                                 // no edges from the push run itself (only
-                                 // directives/pushes there), so the edge-source
-                                 // test below is the complete proof.
--                                let edge_sources_past_alloc = edges.iter().all(|&(src, name)| {
--                                    match label_pos.get(name) {
-+                                let edge_sources_past_alloc =
-+                                    edges.iter().all(|&(src, name)| match label_pos.get(name) {
-                                         Some(&ti) if ti == k => src > alloc_idx,
-                                         _ => true,
--                                    }
--                                });
-+                                    });
-                                 let interior_label_ok = (!has_jmp_indirect
-                                     && edge_sources_past_alloc)
--                                    && (k > first_dealloc.unwrap_or(usize::MAX)
--                                        || k > alloc_idx);
-+                                    && (k > first_dealloc.unwrap_or(usize::MAX) || k > alloc_idx);
-                                 if !interior_label_ok {
-                                     envelope_ok = false;
-                                     break;
-@@ -7440,9 +7818,8 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
-         } else if subls.is_empty() && addls.is_empty() {
-             // Any %esp engagement (slots or pointer copies) makes depth
-             // shifting observable; frameless candidates must be pure.
--            let any_esp_text = (start..end).any(|i| {
--                !infos[i].is_nop() && trimmed(store, &infos[i], i).contains("%esp")
--            });
-+            let any_esp_text = (start..end)
-+                .any(|i| !infos[i].is_nop() && trimmed(store, &infos[i], i).contains("%esp"));
-             if any_esp_text {
-                 start = end.saturating_add(1);
-                 continue;
-@@ -7560,6 +7937,182 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
-         start = end.saturating_add(1);
-     }
- }
-+/// Remove a function's stack-frame allocation/deallocation when the frame is
-+/// never used. The i686 accumulator backend emits a `subl $N, %esp` prologue
-+/// for almost every function and an `addl $N, %esp` before every return, even
-+/// when the register allocator kept every SSA value in registers and the
-+/// local-frame space is never touched (a typical `-m16 -Os` leaf helper is
-+/// `subl $12, %esp; movzwl %ax,%eax; incl %eax; addl $12, %esp; ret`). Those
-+/// two to four instructions are pure overhead — GCC emits none.
-+///
-+/// Soundness is deliberately conservative. A frame is only elided when ALL of:
-+///   * a single alloc (`subl $K, %esp`, constant immediate) and one or more
-+///     matching deallocs (`addl $K, %esp`, same K, every one at or after the
-+///     alloc position);
-+///   * no frame pointer in use (`movl %esp,%ebp` or any `(%ebp)` reference);
-+///   * no prologue/epilogue callee-save push/pop (those are handled — and
-+///     renumber the frame — by `eliminate_unused_callee_saves`; mixing the two
-+///     transforms here would desync esp math, so functions with pushes are
-+///     skipped and left to that pass);
-+///   * no `call`: a call needs the stack 16-byte aligned (SysV i386) and may
-+///     push/pop outgoing arguments, so a frame can legitimately exist for
-+///     alignment/argument space even with no `(%esp)` data access;
-+///   * no other %esp engagement anywhere — no `N(%esp)` slot access (the frame
-+///     really holds no live data), no register-driven esp adjustment (dynamic
-+///     alloca), no esp copies, no `ret $N` (sret/fastcall pop convention);
-+///   * no jump enters the function at or before the alloc: every body path
-+///     must cross the single alloc, otherwise one side runs with the frame
-+///     open and the other without it.
-+///
-+/// Under those constraints no stack memory is observed while the frame is
-+/// open, the ret pops the return address at the entry esp, and esp-relative
-+/// addressing (prologue parameter captures, which a pure regparm leaf emits
-+/// none of) is unaffected.
-+fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]) {
-+    if std::env::var_os("CCC_NO_I686_DEAD_FRAME_ELISION").is_some() {
-+        return;
-+    }
-+    let len = infos.len();
-+    let mut start = 0usize;
-+    while start < len {
-+        // Find the next function: a non-local label (local basic blocks are
-+        // `.L*`).
-+        while start < len {
-+            if infos[start].kind == LineKind::Label {
-+                let line = trimmed(store, &infos[start], start);
-+                if line.ends_with(':') && !line.starts_with('.') {
-+                    break;
++        // No struct/by-value aggregates (the classification would leave the
++        // integer-register subset).
++        if info.struct_arg_sizes.iter().any(|s| s.is_some()) {
++            return false;
++        }
++        if info.args.len() > super::machinst::SYSCALL_ARG_REGS.len() {
++            return false;
++        }
++        // Integer/pointer domain for every argument and the return.
++        let width_ok = |ty: IrType| {
++            !ty.is_128bit() && !ty.is_float() && !ty.is_long_double() && ty.size() <= 8
++        };
++        if !width_ok(info.return_type) || info.arg_types.iter().any(|t| !width_ok(*t)) {
++            return false;
++        }
++
++        // Canonical move width: never narrower than 32 bits. Narrow C
++        // arguments are passed at their promoted width (the ABI reads the
++        // 32-bit register; a byte/word move would leave the upper bits of
++        // the argument register undefined).
++        let move_width = |ty: IrType| match OpSize::from_ir_type(ty) {
++            OpSize::S8 | OpSize::S16 => OpSize::S32,
++            s => s,
++        };
++
++        let ra = &self.reg_assignments;
++        let state = &self.state;
++        let value_types = &self.value_types;
++
++        // Resolve an argument operand to a typed source. None = the mature
++        // path stages it (accumulator/xmm/alloca-address/rbp homes, dead
++        // values, non-integer constants).
++        let arg_src = |op: &crate::ir::reexports::Operand| -> Option<TypedCallSrc> {
++            match op {
++                crate::ir::reexports::Operand::Const(c) => c.to_i64().map(TypedCallSrc::Imm),
++                crate::ir::reexports::Operand::Value(v) => {
++                    // Address-of-local arguments (`&x`): a separate pre-move
++                    // (Mov { AllocaAddr } → leaq by the resolver) places the
++                    // address into the ABI register before the call. The
++                    // slot must exist for the resolver to render the leaq.
++                    if state.is_alloca(v.0) {
++                        return state
++                            .get_slot(v.0)
++                            .map(|_| TypedCallSrc::AllocaAddr(v.0));
++                    }
++                    if is_mi_unsafe_value(v.0, ra, state, value_types) {
++                        return None;
++                    }
++                    if let Some(&r) = ra.get(&v.0) {
++                        if r.0 >= 20 || r.0 == 0 || r.0 == 6 || r.0 == 7 {
++                            return None; // xmm / rax / rbp / rcx homes
++                        }
++                        return Some(TypedCallSrc::Reg(r));
++                    }
++                    state.get_slot(v.0).map(|slot| TypedCallSrc::Slot(slot.0))
 +                }
 +            }
-+            start += 1;
-+        }
-+        if start >= len {
-+            break;
-+        }
-+        let mut end = start + 1;
-+        while end < len {
-+            let line = trimmed(store, &infos[end], end);
-+            if line == ".cfi_endproc" || line.starts_with(".size ") {
-+                break;
-+            }
-+            end += 1;
-+        }
++        };
 +
-+        // Reject a frame-pointer function: esp-relative accounting differs.
-+        let has_frame_pointer = (start..end).any(|i| {
-+            if infos[i].is_nop() {
++        let arg_srcs: Vec<Option<TypedCallSrc>> = info.args.iter().map(arg_src).collect();
++        let arg_sizes: Vec<OpSize> = info
++            .arg_types
++            .iter()
++            .map(|t| move_width(*t))
++            .collect();
++
++        // Return home (None = void call; a dead destination defers to the
++        // mature path rather than dropping the store).
++        let ret_plan = match &info.dest {
++            None => None,
++            Some(d) => {
++                if state.is_alloca(d.0) || is_mi_unsafe_value(d.0, ra, state, value_types) {
++                    return false;
++                }
++                let src = if let Some(&r) = ra.get(&d.0) {
++                    if r.0 >= 20 || r.0 == 0 || r.0 == 6 {
++                        return false;
++                    }
++                    TypedCallSrc::Reg(r)
++                } else if let Some(slot) = state.get_slot(d.0) {
++                    TypedCallSrc::Slot(slot.0)
++                } else {
++                    return false;
++                };
++                Some((Some(src), move_width(info.return_type)))
++            }
++        };
++
++        let plan = match build_typed_call(&arg_srcs, &arg_sizes, ret_plan) {
++            Ok(p) => p,
++            Err(reason) => {
++                super::isel::stats::note_reject_named(reason.label());
 +                return false;
 +            }
-+            let line = trimmed(store, &infos[i], i);
-+            line.contains("(%ebp)") || line == "movl %esp, %ebp"
-+        });
-+        if has_frame_pointer {
-+            start = end.saturating_add(1);
-+            continue;
++        };
++
++        // Caller-save spills at the call's program point — the same data
++        // and the same point semantics as the mature path's Phase 2b.
++        let point = self.state.current_program_point;
++        let mut caller_saves: Vec<(PhysReg, i64)> = Vec::new();
++        for (&reg_id, &slot) in &self.caller_save_spill_slots {
++            if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
++                if intervals.iter().any(|&(start, end)| start <= point && point <= end) {
++                    caller_saves.push((PhysReg(reg_id), slot.0));
++                }
++            }
 +        }
 +
-+        // Census: frame adjusts, pushes/pops, calls, and other %esp uses.
-+        let mut subls: Vec<(usize, u32)> = Vec::new();
-+        let mut addls: Vec<(usize, u32)> = Vec::new();
-+        let mut has_call = false;
-+        let mut has_push_or_pop = false;
-+        let mut other_esp = false;
-+        for i in start..end {
-+            if infos[i].is_nop() {
-+                continue;
-+            }
-+            let line = trimmed(store, &infos[i], i);
-+            match infos[i].kind {
-+                LineKind::Call => has_call = true,
-+                LineKind::Push { .. } | LineKind::Pop { .. } => has_push_or_pop = true,
-+                _ => {
-+                    if let Some(v) = parse_esp_adjust(line, "subl") {
-+                        subls.push((i, v));
-+                    } else if let Some(v) = parse_esp_adjust(line, "addl") {
-+                        addls.push((i, v));
-+                    } else if infos[i].kind != LineKind::Ret
-+                        && infos[i].kind != LineKind::Label
-+                        && infos[i].kind != LineKind::Directive
-+                        && infos[i].kind != LineKind::Jmp
-+                        && infos[i].kind != LineKind::CondJmp
-+                        && infos[i].kind != LineKind::JmpIndirect
-+                        && line.contains("%esp")
-+                    {
-+                        // Any remaining %esp reference (slot access, esp copy,
-+                        // dynamic alloca, and-l alignment, …) means the frame
-+                        // is observable.
-+                        other_esp = true;
++        // Target naming mirrors emit_call_instruction_impl: versioned
++        // symbols use the base name in @PLT references (GAS 2.47 rejects
++        // `sym@ver@PLT`; the linker resolves the version).
++        let target = if self.state.needs_plt(func) {
++            let n = func.split('@').next().unwrap_or(func);
++            format!("{}@PLT", n)
++        } else {
++            func.to_string()
++        };
++
++        // Split alloca-address arguments into pre-moves. The pre-move
++        // writes the ABI register BEFORE the caller-save spills run, so a
++        // register in the save set would be spilled after being clobbered —
++        // reject that shape (the mature path orders saves before staging).
++        // The builder already guaranteed no other argument sources from the
++        // register, so hoisting all pre-moves to the front of the run is
++        // order-equivalent.
++        let mut pre_moves: Vec<MachInst> = Vec::new();
++        let mut typed_args: Vec<CallArgMove> = Vec::new();
++        for m in plan.args {
++            match &m.src {
++                MachOperand::AllocaAddr(id) => {
++                    if caller_saves.iter().any(|(r, _)| *r == m.dst_reg) {
++                        return false;
 +                    }
++                    pre_moves.push(MachInst::Mov {
++                        src: MachOperand::AllocaAddr(*id),
++                        dst: MachOperand::Reg(MachReg::Phys(m.dst_reg)),
++                        size: OpSize::S64,
++                    });
 +                }
++                _ => typed_args.push(m),
 +            }
 +        }
 +
-+        // Exactly one alloc and ≥1 matching deallocs, no other esp traffic,
-+        // no calls and no callee-save push/pop to renumber.
-+        let shape_ok = subls.len() == 1
-+            && !addls.is_empty()
-+            && addls.iter().all(|&(_, v)| v == subls[0].1)
-+            && addls.iter().all(|&(ai, _)| ai >= subls[0].0)
-+            && !has_call
-+            && !has_push_or_pop
-+            && !other_esp;
-+        if !shape_ok {
-+            start = end.saturating_add(1);
-+            continue;
-+        }
-+        let alloc_idx = subls[0].0;
++        // Drain the preceding run, buffer the call as its own run, flush it.
++        self.flush_machinst();
++        self.machinst_buf.extend(pre_moves);
++        self.machinst_buf.push(MachInst::CallTyped {
++            caller_saves,
++            args: typed_args,
++            target,
++            ret: plan.ret,
++        });
++        self.machinst_buf_ir.push(inst.clone());
++        self.flush_machinst();
++        super::isel::stats::note_lowered();
++        true
++    }
 +
-+        // Control-flow soundness: every body path must cross the alloc. A
-+        // direct jump whose target is a local label at or before the alloc
-+        // enters the body without opening the frame; an indirect jump can
-+        // target anywhere and is unprovable. External (non-`.L*`) jumps are
-+        // tail calls leaving the function and need no label resolution.
-+        let mut labels_after_alloc = std::collections::HashSet::new();
-+        for i in start..end {
-+            if infos[i].kind == LineKind::Label && i > alloc_idx {
-+                let line = trimmed(store, &infos[i], i);
-+                if let Some(name) = line.strip_suffix(':') {
-+                    labels_after_alloc.insert(name.trim().to_string());
-+                }
-+            }
+ }
+ 
+ impl ArchCodegen for X86Codegen {
+@@ -4267,6 +4495,16 @@ impl ArchCodegen for X86Codegen {
+             return false;
+         }
+ 
++        // Typed direct calls (CallTyped): the SysV integer-register subset
++        // lowered as one atomic machine instruction. Everything else —
++        // variadic/sret/struct/i128/F128 calls, stack-overflow arguments,
++        // register-exchange hazard cycles, inline-memcpy candidates — keeps
++        // the mature path, which owns the general contract. See
++        // try_lower_call_typed for the full admission contract.
++        if let crate::ir::reexports::Instruction::Call { func, info } = inst {
++            return self.try_lower_call_typed(inst, func, info, folded_global_addrs);
 +        }
-+        let mut flow_ok = true;
-+        'scan: for i in start..end {
-+            if infos[i].is_nop() {
-+                continue;
-+            }
-+            match infos[i].kind {
-+                LineKind::JmpIndirect => {
-+                    flow_ok = false;
-+                    break 'scan;
-+                }
-+                LineKind::Jmp | LineKind::CondJmp => {
-+                    let line = trimmed(store, &infos[i], i);
-+                    if let Some(target) = line.split_whitespace().next_back() {
-+                        if target.starts_with('.') && !labels_after_alloc.contains(target) {
-+                            flow_ok = false;
-+                            break 'scan;
++
+         // Div/rem pair heads and tails must stay on the classic emitter path:
+         // the fusion (emit_divrem_pair_head) lives there and the MachInst
+         // lowering emits standalone divisions for each side, which would both
+@@ -4418,14 +4656,39 @@ impl ArchCodegen for X86Codegen {
+         // path takes over unchanged.
+         if self.float_typed_candidate(inst, folded_global_addrs) {
+             let mut float_alloca_slots = crate::common::fx_hash::FxHashMap::default();
+-            if let crate::ir::reexports::Instruction::Load { ptr, .. }
+-            | crate::ir::reexports::Instruction::Store { ptr, .. } = inst
+-            {
+-                if self.state.is_alloca(ptr.0) {
+-                    if let Some(slot) = self.state.get_slot(ptr.0) {
+-                        float_alloca_slots.insert(ptr.0, slot.0);
++            // The float arms read the VALUE's spill slot (relay source) and
++            // the DEST's spill slot (relay target) from the same map as the
++            // pointer slot — insert all three shapes the instruction has.
++            match inst {
++                crate::ir::reexports::Instruction::Load { dest, ptr, .. } => {
++                    for v in [ptr.0, dest.0] {
++                        if self.state.is_alloca(v) {
++                            if let Some(slot) = self.state.get_slot(v) {
++                                float_alloca_slots.insert(v, slot.0);
++                            }
++                        }
++                    }
++                    if !self.reg_assignments.contains_key(&dest.0) {
++                        if let Some(slot) = self.state.get_slot(dest.0) {
++                            float_alloca_slots.insert(dest.0, slot.0);
 +                        }
 +                    }
 +                }
++                crate::ir::reexports::Instruction::Store { val, ptr, .. } => {
++                    if self.state.is_alloca(ptr.0) {
++                        if let Some(slot) = self.state.get_slot(ptr.0) {
++                            float_alloca_slots.insert(ptr.0, slot.0);
++                        }
++                    }
++                    if let crate::ir::reexports::Operand::Value(v) = val {
++                        if !self.reg_assignments.contains_key(&v.0) {
++                            if let Some(slot) = self.state.get_slot(v.0) {
++                                float_alloca_slots.insert(v.0, slot.0);
++                            }
++                        }
+                     }
+                 }
 +                _ => {}
-+            }
-+        }
-+        if !flow_ok {
-+            start = end.saturating_add(1);
-+            continue;
-+        }
+             }
+             let lowered = super::isel::lower_instruction_typed(
+                 inst,
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 83733601..fbe6e180 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -32,12 +32,21 @@ fn value_to_reg(v: &Value, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachReg
+ }
+ 
+ /// True when a physical register is an XMM float home (xmm2..xmm15, the
+-/// allocator's float bank; xmm0/xmm1 are text-path scratch and never appear
+-/// as allocator homes). Mirrors `is_xmm_reg` in emit.rs.
++/// allocator's float bank; xmm0/xmm1 can only hold INCOMING float-parameter
++/// homes — see `xmm_scratch_unsafe`). Mirrors `is_xmm_reg` in emit.rs.
+ fn is_xmm_phys(reg: PhysReg) -> bool {
+     reg.0 >= 20 && reg.0 <= 33
+ }
+ 
++/// True when the pre-colored xmm0/xmm1 scratch registers are unsafe to
++/// clobber: float parameters are pre-colored to their INCOMING SysV
++/// registers (xmm0 = PhysReg 18, xmm1 = PhysReg 19), below the allocator's
++/// xmm pool (20..=33). The allocator itself never assigns 18/19, so any
++/// entry there is a live incoming parameter home.
++fn xmm_scratch_unsafe(ra: &FxHashMap<u32, PhysReg>) -> bool {
++    ra.values().any(|r| r.0 == 18 || r.0 == 19)
++}
 +
-+        // All guards passed: drop the alloc and every matching dealloc.
-+        infos[alloc_idx].kind = LineKind::Nop;
-+        for &(ai, _) in &addls {
-+            infos[ai].kind = LineKind::Nop;
-+        }
+ /// Convert an IR Operand to a MachOperand, using physical registers for
+ /// values that already have register assignments from the main allocator.
+ fn lower_operand_with_regs(op: &Operand, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachOperand {
+@@ -1040,6 +1049,227 @@ pub fn can_lower(inst: &Instruction) -> bool {
+     }
+ }
+ 
++// ── Typed direct calls (MachInst::CallTyped) ─────────────────────────────
++//
++// The SysV integer-register call contract, lowered as one atomic machine
++// instruction. The builder below is pure — it consumes pre-resolved
++// argument homes and returns the execution-ordered move plan — so the
++// full admission/ordering matrix is unit-testable without codegen state.
++// The emit-side gate (try_lower_machinst) computes the homes from the
++// allocator + stack-slot state and owns everything the pure builder must
++// not see (caller-save intervals, PLT naming, inline-memcpy interception).
 +
-+        start = end.saturating_add(1);
++/// A pre-resolved argument source for the typed-call builder.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TypedCallSrc {
++    /// imm32 immediate (sign-extended by `movq`; zero emits as `xorl`).
++    Imm(i64),
++    /// GPR home (never rax/rcx/rbp — the emit-side gate rejects those).
++    Reg(PhysReg),
++    /// Spill-slot / stack-slot read at the argument's width.
++    Slot(i64),
++    /// Address of a local alloca (`&x` passed by pointer). Lowered as a
++    /// separate `Mov { src: AllocaAddr, dst: Reg(argreg) }` placed before
++    /// the call (the resolver renders it as `leaq slot(%rbp), %reg` with
++    /// the frame's addressing mode); the argument's own move is elided.
++    /// Two guards make the pre-move sound: no other argument may source
++    /// from the same ABI register, and the register must not be in the
++    /// caller-save set (the pre-move precedes the saves).
++    AllocaAddr(u32),
++}
++
++/// Why a call was refused the typed path (census label + unit-test oracle).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TypedCallReject {
++    /// An argument has no representable home (accumulator, xmm, alloca
++    /// address, rax/rcx/rbp home, …) — the mature path stages it.
++    ArgNotRepresentable(usize),
++    /// An immediate argument does not fit the imm32 `movq` form.
++    ImmTooWide(usize),
++    /// The argument moves form a register-exchange cycle (e.g. both
++    /// arguments homed in each other's ABI registers). The text path
++    /// owns the hazard-spill machinery for this shape.
++    MoveCycle,
++    /// The return home is not a register or slot home.
++    RetNotRepresentable,
++}
++
++impl TypedCallReject {
++    /// Census label for the rejection reason.
++    pub fn label(self) -> &'static str {
++        match self {
++            TypedCallReject::ArgNotRepresentable(_) => "Call(arg-unrepresentable)",
++            TypedCallReject::ImmTooWide(_) => "Call(imm-too-wide)",
++            TypedCallReject::MoveCycle => "Call(move-cycle)",
++            TypedCallReject::RetNotRepresentable => "Call(ret-unrepresentable)",
++        }
 +    }
 +}
 +
- #[allow(dead_code)]
- fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
-     let len = infos.len();
-@@ -7725,11 +8278,10 @@ fn else_hoist_diamonds(asm: String) -> String {
-     fn classify_body_line(l: &str) -> Option<bool> {
-         let (mn, rest) = l.split_once(' ')?;
-         const STORE_OK: &[&str] = &[
--            "movl", "movw", "movb", "movzbl", "movzwl", "movsbl", "movswl", "andl", "andw",
--            "andb", "orl", "orw", "orb", "xorl", "xorw", "xorb", "addl", "addw", "addb",
--            "subl", "subw", "subb", "testl", "testw", "testb", "incl", "incw", "incb",
--            "decl", "decw", "decb", "negl", "negw", "negb", "notl", "notw", "notb", "leal",
--            "leaw",
-+            "movl", "movw", "movb", "movzbl", "movzwl", "movsbl", "movswl", "andl", "andw", "andb",
-+            "orl", "orw", "orb", "xorl", "xorw", "xorb", "addl", "addw", "addb", "subl", "subw",
-+            "subb", "testl", "testw", "testb", "incl", "incw", "incb", "decl", "decw", "decb",
-+            "negl", "negw", "negb", "notl", "notw", "notb", "leal", "leaw",
-         ];
-         if !STORE_OK.contains(&mn) {
-             return None;
-@@ -7804,9 +8356,7 @@ fn else_hoist_diamonds(asm: String) -> String {
-             }
-             match classify_body_line(t) {
-                 Some(true) => {
--                    then_slots.push(
--                        t.rsplit_once(',').unwrap().1.trim().to_string(),
--                    );
-+                    then_slots.push(t.rsplit_once(',').unwrap().1.trim().to_string());
-                     j += 1;
-                 }
-                 Some(false) => j += 1,
-@@ -7876,8 +8426,7 @@ fn else_hoist_diamonds(asm: String) -> String {
-         let span_est = |a: usize, b: usize| -> usize {
-             (a..=b).map(|r| lines[r].trim().len() + 2).sum::<usize>() / 6
-         };
--        if span_est(i + 1, j - 1) + 2 > 120 || span_est(k + 1, *else_stores.last().unwrap()) > 120
--        {
-+        if span_est(i + 1, j - 1) + 2 > 120 || span_est(k + 1, *else_stores.last().unwrap()) > 120 {
-             i += 1;
-             continue;
-         }
-@@ -7909,11 +8458,12 @@ fn else_hoist_diamonds(asm: String) -> String {
-             if t.ends_with(':') || t.is_empty() {
-                 continue;
-             }
--            let is_branch = t.starts_with("j")
--                || t.starts_with("call")
--                || t.starts_with("ret");
-+            let is_branch = t.starts_with("j") || t.starts_with("call") || t.starts_with("ret");
-             if is_branch
--                && t.split_whitespace().next_back().map(|x| x == else_target).unwrap_or(false)
-+                && t.split_whitespace()
-+                    .next_back()
-+                    .map(|x| x == else_target)
-+                    .unwrap_or(false)
-             {
-                 else_refs += 1;
-             }
-@@ -7950,7 +8500,6 @@ fn else_hoist_diamonds(asm: String) -> String {
- /// Run peephole optimization on i686 assembly text.
- /// Returns the optimized assembly string.
- pub fn peephole_optimize(asm: String) -> String {
--
-     if std::env::var_os("CCC_NO_I686_PEEPHOLE").is_some() {
-         return asm;
-     }
-@@ -7980,6 +8529,7 @@ pub fn peephole_optimize(asm: String) -> String {
-     // so freshly exposed store/load pairs are folded in the same phase.
-     let global_changed = propagate_reg_copies(&mut store, &mut infos);
-     let global_changed = global_changed | forward_slot_loads(&mut store, &mut infos);
-+    let global_changed = global_changed | forward_immediate_slot_loads(&mut store, &mut infos);
-     let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
-     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
-     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
-@@ -7998,6 +8548,7 @@ pub fn peephole_optimize(asm: String) -> String {
-             changed2 |= combined_local_pass(&mut store, &mut infos);
-             changed2 |= propagate_reg_copies(&mut store, &mut infos);
-             changed2 |= forward_slot_loads(&mut store, &mut infos);
-+            changed2 |= forward_immediate_slot_loads(&mut store, &mut infos);
-             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
-             changed2 |= eliminate_dead_stores(&store, &mut infos);
-             changed2 |= fuse_setcc_branch(&mut store, &mut infos);
-@@ -8090,6 +8641,7 @@ pub fn peephole_optimize(asm: String) -> String {
-     eliminate_never_read_stores(&store, &mut infos);
-     optimize_cfg_register_liveness(&mut store, &mut infos, true);
-     eliminate_unused_callee_saves(&mut store, &mut infos);
-+    eliminate_dead_frame_allocation(&mut store, &mut infos);
- 
-     // Phase 5: tail-call conversion (after all epilogue-shape rewrites).
-     optimize_tail_calls_i686(&mut store, &mut infos);
-@@ -8243,7 +8795,12 @@ fn try_fold_sext_zext_at(
-     // Fold: replace the sext with the zero-extending load, nop the zext.
-     store.replace(
-         sext_idx,
--        format!("    {} {}, {}", if byte_reg { "movzbl" } else { "movzwl" }, src, zdst),
-+        format!(
-+            "    {} {}, {}",
-+            if byte_reg { "movzbl" } else { "movzwl" },
++/// The lowering plan for one typed call.
++#[derive(Debug, Clone)]
++pub struct TypedCallPlan {
++    /// Argument moves in execution order (self-moves already elided).
++    pub args: Vec<CallArgMove>,
++    /// Return-value move, or None for void calls / rax-homed returns.
++    pub ret: Option<CallRetMove>,
++}
++
++/// Build the argument/return move plan for a typed call.
++///
++/// `args` holds one entry per IR argument (None = not representable);
++/// `arg_sizes` is the parallel ABI move width list; `ret` is the return
++/// home (None = void call) as `Some((dst_source, width))` — the dst is
++/// `Reg` or `Slot` only, `Imm` is meaningless for a destination.
++///
++/// Ordering contract: every move whose source is a register R is ordered
++/// before every move whose destination is R (Kahn topological order over
++/// the ≤6-node dependency graph). A cycle means two arguments live in each
++/// other's ABI registers — the text path's hazard-spill area handles that
++/// shape; the builder refuses it rather than emitting a swap on a register
++/// the ABI does not promise.
++pub fn build_typed_call(
++    args: &[Option<TypedCallSrc>],
++    arg_sizes: &[OpSize],
++    ret: Option<(Option<TypedCallSrc>, OpSize)>,
++) -> Result<TypedCallPlan, TypedCallReject> {
++    debug_assert_eq!(args.len(), arg_sizes.len());
++
++    // 1. Resolve sources; elide self-moves (value already in its ABI reg).
++    struct PendingMove {
++        src: MachOperand,
++        dst_reg: PhysReg,
++        size: OpSize,
++    }
++    let mut pending: Vec<PendingMove> = Vec::with_capacity(args.len());
++    for (i, src) in args.iter().enumerate() {
++        let size = arg_sizes[i];
++        let dst_reg = SYSCALL_ARG_REGS[i];
++        let src = match src {
++            None => return Err(TypedCallReject::ArgNotRepresentable(i)),
++            Some(TypedCallSrc::Imm(v)) => {
++                if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
++                    return Err(TypedCallReject::ImmTooWide(i));
++                }
++                MachOperand::Imm(*v)
++            }
++            Some(TypedCallSrc::Reg(r)) => {
++                // Defensive re-check of the emit-side gate: rax is the
++                // accumulator (not a stable home in this model), rbp is the
++                // frame pointer in frame-based functions.
++                if r.0 == RAX.0 || r.0 == RBP.0 {
++                    return Err(TypedCallReject::ArgNotRepresentable(i));
++                }
++                if *r == dst_reg {
++                    continue; // self-move: value already in place
++                }
++                MachOperand::Reg(MachReg::Phys(*r))
++            }
++            Some(TypedCallSrc::Slot(off)) => MachOperand::StackSlot(*off),
++            Some(TypedCallSrc::AllocaAddr(id)) => {
++                // Guard: no other argument may source from this ABI
++                // register — the pre-move writes it before the call, and
++                // the builder's topological order cannot interleave with
++                // the CallTyped-internal moves.
++                let conflicts = args.iter().enumerate().any(|(j, other)| {
++                    j != i
++                        && matches!(other, Some(TypedCallSrc::Reg(r)) if *r == dst_reg)
++                });
++                if conflicts {
++                    return Err(TypedCallReject::ArgNotRepresentable(i));
++                }
++                MachOperand::AllocaAddr(*id)
++            }
++        };
++        pending.push(PendingMove {
 +            src,
-+            zdst
-+        ),
-     );
-     infos[sext_idx] = classify_line(store.get(sext_idx));
-     infos[zext_idx].kind = LineKind::Nop;
-@@ -8626,10 +9183,10 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
-                 let t = trimmed(store, &infos[i], i);
-                 if !t.starts_with(".L") {
-                     suppress = false; // new function
--                    // Function boundary: known depth again. Any pending
--                    // outer depth is irrelevant here — a global label only
--                    // starts a new translation unit's function stream in
--                    // generated output.
-+                                      // Function boundary: known depth again. Any pending
-+                                      // outer depth is irrelevant here — a global label only
-+                                      // starts a new translation unit's function stream in
-+                                      // generated output.
-                     depth = Some(0);
-                 } else {
-                     // Internal join point: fallthrough or branch target.
-@@ -8670,8 +9227,7 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
-                 } else if let Some(d) = depth.as_mut() {
-                     *d -= 4;
++            dst_reg,
++            size,
++        });
++    }
++
++    // 2. Topologically order the moves. Precedence rule: for every register
++    //    R, every move that READS R must execute before every move that
++    //    WRITES R (the write destroys the home's value). So a move is
++    //    executable exactly when no still-unexecuted move READS its
++    //    destination register — executing it later would destroy that
++    //    reader's source. (A pending *writer* of this move's source does
++    //    NOT block it: this move reads first, the writer clobbers after.)
++    //    A pass with no progress while unexecuted moves remain is a
++    //    register-exchange cycle — refuse it to the text path, which owns
++    //    the hazard-spill machinery.
++    let mut ordered: Vec<CallArgMove> = Vec::with_capacity(pending.len());
++    let mut executed = vec![false; pending.len()];
++    while executed.iter().any(|&e| !e) {
++        let mut progressed = false;
++        for i in 0..pending.len() {
++            if executed[i] {
++                continue;
++            }
++            let dst_writes = pending[i].dst_reg;
++            let blocked = pending.iter().enumerate().any(|(j, m)| {
++                if j == i || executed[j] {
++                    return false;
++                }
++                // AllocaAddr sources read no data register (the address is
++                // frame-relative), so only register sources create edges.
++                matches!(&m.src, MachOperand::Reg(MachReg::Phys(r)) if *r == dst_writes)
++            });
++            if !blocked {
++                let m = &pending[i];
++                ordered.push(CallArgMove {
++                    src: m.src.clone(),
++                    dst_reg: m.dst_reg,
++                    size: m.size,
++                });
++                executed[i] = true;
++                progressed = true;
++            }
++        }
++        if !progressed {
++            return Err(TypedCallReject::MoveCycle);
++        }
++    }
++
++    // 3. Return home.
++    let ret_move = match ret {
++        None => None,
++        Some((src, size)) => match src {
++            None | Some(TypedCallSrc::Imm(_)) | Some(TypedCallSrc::AllocaAddr(_)) => {
++                // A destination receives the return value; an immediate or
++                // an alloca address is not a value home (the emit-side gate
++                // rejects alloca destinations before the builder runs).
++                return Err(TypedCallReject::RetNotRepresentable)
++            }
++            Some(TypedCallSrc::Reg(r)) => {
++                // rax→rax is a no-op; anything else register-hosted is a
++                // legal `mov %rax, %r?` copy — but keep the conservative
++                // contract: only real homes (rbp excluded as for args).
++                if r.0 == RBP.0 {
++                    return Err(TypedCallReject::RetNotRepresentable);
++                }
++                if r.0 == RAX.0 {
++                    None
++                } else {
++                    Some(CallRetMove {
++                        dst: MachOperand::Reg(MachReg::Phys(r)),
++                        size,
++                    })
++                }
++            }
++            Some(TypedCallSrc::Slot(off)) => Some(CallRetMove {
++                dst: MachOperand::StackSlot(off),
++                size,
++            }),
++        },
++    };
++
++    Ok(TypedCallPlan {
++        args: ordered,
++        ret: ret_move,
++    })
++}
++
+ /// Context for ISel: provides slot information for alloca-aware lowering.
+ pub struct ISelContext<'a> {
+     pub reg_assignments: &'a FxHashMap<u32, PhysReg>,
+@@ -1242,48 +1472,73 @@ fn lower_instruction_typed_inner(
+                 return false;
+             }
+             // Scalar float load: mirror of the float store subset. The dest
+-            // must be xmm-homed (xmm2..xmm15); the address a direct alloca
+-            // slot or a GPR-held pointer. Slot-homed dests, constants and
+-            // exotic addressing stay on the mature text path.
++            // must be xmm-homed (direct) or spill-slot-homed (xmm0 scratch
++            // relay); the address a direct alloca slot or a GPR-held pointer.
++            // Constants and exotic addressing stay on the mature text path.
+             if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
+                 if *seg_override != AddressSpace::Default {
+                     return false;
                  }
--            } else if (t.starts_with("subl $") || t.starts_with("addl $"))
--                && t.ends_with(", %esp")
-+            } else if (t.starts_with("subl $") || t.starts_with("addl $")) && t.ends_with(", %esp")
-             {
-                 let num_part = &t["addl $".len()..t.len() - ", %esp".len()];
-                 if let Ok(n) = num_part.parse::<i64>() {
-@@ -8874,9 +9430,18 @@ mod tests {
-         )
-         .to_string();
-         let result = peephole_optimize(asm);
--        assert!(result.contains(".loc 1 42 3"), "debug metadata lost:\n{result}");
--        assert!(result.contains("addl %eax, %ecx"), "load was not forwarded:\n{result}");
--        assert!(!result.contains("8(%esp)"), "dead spill survived:\n{result}");
-+        assert!(
-+            result.contains(".loc 1 42 3"),
-+            "debug metadata lost:\n{result}"
-+        );
-+        assert!(
-+            result.contains("addl %eax, %ecx"),
-+            "load was not forwarded:\n{result}"
-+        );
-+        assert!(
-+            !result.contains("8(%esp)"),
-+            "dead spill survived:\n{result}"
-+        );
-     }
- 
-     #[test]
-@@ -8904,7 +9469,6 @@ mod tests {
-         );
-     }
- 
--
-     #[test]
-     fn fold_reg_copy_test_through_copy() {
-         // `movl %S,%D; testl %S,%D` -> `testl %S,%S`; the dead copy is then
-@@ -8971,11 +9535,59 @@ mod tests {
-             ".cfi_endproc\n",
-             ".size f, .-f\n",
-         )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        // The immediate byte store forwards straight into the widened reload:
-+        // the constant 7 materializes directly (`movl $7,%eax`) and the
-+        // movzbl of the already-byte constant is redundant — strictly better
-+        // than folding the reload into a memory-source movzbl.
-+        assert!(
-+            result.contains("movl $7, %eax"),
-+            "immediate slot store must forward to the widened load:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn forward_immediate_constant_to_reload() {
-+        // A constant staged to a slot and reloaded into a full-width result
-+        // must materialize directly, with no memory reload.
-+        let asm = "f:
-+    subl $12, %esp
-+    movl $3, 8(%esp)
-+    movl 8(%esp), %eax
-+    addl $12, %esp
-+    ret
-+"
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("movl $3, %eax"),
-+            "constant slot reload must fold to an immediate move:\n{result}"
-+        );
-+        // The reload is what mattered: it is gone, replaced by the immediate
-+        // materialization. The now-dead immediate store to the slot is left
-+        // for a dedicated dead-store pass (it writes memory conservatively).
-+        assert!(
-+            !result.contains("8(%esp), %eax"),
-+            "no slot RELOAD may remain for a pure constant:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn forward_immediate_stopped_by_call_barrier() {
-+        let asm = "f:
-+    subl $12, %esp
-+    movl $3, 8(%esp)
-+    call g
-+    movl 8(%esp), %eax
-+    addl $12, %esp
-+    ret
-+"
-         .to_string();
-         let result = peephole_optimize(asm);
-         assert!(
--            result.contains("movzbl 4(%esp), %eax"),
--            "widened slot load must fold:\n{result}"
-+            result.contains("8(%esp)"),
-+            "a call can overwrite the slot; the reload must stay:\n{result}"
-         );
-     }
- 
-@@ -9148,7 +9760,10 @@ mod tests {
-         // After the merge X's `jmp .LY` is a jump-to-next (the bodies and
-         // the dead xors are reclaimed by the dead-move cleanup), so the
-         // control flow collapses to `je .LY` falling straight through.
--        assert!(!result.contains("xorl %eax, %eax\n    xorl %edx, %edx\n    jmp"), "{result}");
-+        assert!(
-+            !result.contains("xorl %eax, %eax\n    xorl %edx, %edx\n    jmp"),
-+            "{result}"
-+        );
-     }
- 
-     #[test]
-@@ -10388,7 +11003,10 @@ mod tests {
-             !result.contains("jmp inc@PLT"),
-             "stack-arg forwarding must not convert:\n{result}"
-         );
--        assert!(result.contains("call inc@PLT"), "call must survive:\n{result}");
-+        assert!(
-+            result.contains("call inc@PLT"),
-+            "call must survive:\n{result}"
-+        );
-     }
- 
-     #[test]
-@@ -10615,15 +11233,19 @@ mod tests {
-             !result.contains("%ebp") && !result.contains("%ebx"),
-             "both unused pairs must be removed:\n{result}"
-         );
--        assert_eq!(
--            result.matches("subl $24, %esp").count(),
--            1,
--            "alloc grows by 8 in lockstep (two pairs):\n{result}"
-+        // FINAL EVOLVED CONTRACT: after both callee-save pairs are removed and
-+        // the never-read 0(%esp) store deleted, the grown frame is referenced
-+        // by nothing. eliminate_dead_frame_allocation then elides it too; the
-+        // guard admits this because the sole internal edge (.Lback -> .Lback)
-+        // targets a label positioned AFTER the alloc, so every body path
-+        // crosses the alloc. End state: no pushes/pops, no frame adjusts.
-+        assert!(
-+            !result.contains("subl") && !result.contains("addl"),
-+            "grown dead frame is elided after pair removal:\n{result}"
-         );
--        assert_eq!(
--            result.matches("addl $24, %esp").count(),
--            1,
--            "dealloc grows by 8 in lockstep:\n{result}"
-+        assert!(
-+            !result.contains("pushl") && !result.contains("popl"),
-+            "no prologue/epilogue traffic may remain:\n{result}"
-         );
-     }
- 
-@@ -10663,8 +11285,13 @@ mod tests {
-             !result.contains("%ebp") && !result.contains("%ebx"),
-             "both unreferenced pairs must go:\n{result}"
-         );
--        assert_eq!(result.matches("subl $24, %esp").count(), 1, "{result}");
--        assert_eq!(result.matches("addl $24, %esp").count(), 1, "{result}");
-+        // FINAL EVOLVED CONTRACT: with the pairs removed and the fully-dead
-+        // body erased, the grown frame is referenced by nothing, so
-+        // eliminate_dead_frame_allocation elides the grown subl/addl too.
-+        assert!(
-+            !result.contains("subl") && !result.contains("addl"),
-+            "grown dead frame is elided after pair removal:\n{result}"
-+        );
-         assert!(
-             !result.contains("pushl") && !result.contains("popl"),
-             "no prologue/epilogue traffic may remain:\n{result}"
-@@ -10879,8 +11506,7 @@ mod tests {
-         // reader, the census-gated dead-move pass correctly deletes the
-         // load before forwarding can see it (nothing in a ret-free
-         // snippet observes %ecx).
--        let asm = "    movl %eax, -8(%ebp)\n    movl -8(%ebp), %ecx\n    pushl %ecx\n"
--            .to_string();
-+        let asm = "    movl %eax, -8(%ebp)\n    movl -8(%ebp), %ecx\n    pushl %ecx\n".to_string();
-         let result = peephole_optimize(asm);
-         assert!(
-             result.contains("movl %eax, %ecx"),
-@@ -11116,7 +11742,9 @@ mod tests {
-         let asm = "    andl $1, %edx\n    je .LBB12\n.LBB11:\n    movl $48, 112(%esp)\n    jmp .LBB13\n.LBB12:\n    movl $32, 112(%esp)\n.LBB13:\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
-         let store = r.find("movl $32, 112(%esp)").expect("else store hoisted");
--        let br = r.find("je .LBB13").expect("branch to join, original polarity");
-+        let br = r
-+            .find("je .LBB13")
-+            .expect("branch to join, original polarity");
-         assert!(store < br, "hoisted store precedes branch: {}", r);
-         assert!(!r.contains("jmp .LBB13"), "jmp deleted: {}", r);
-         assert!(r.contains("movl $48, 112(%esp)"), "then store kept: {}", r);
-@@ -11143,7 +11771,12 @@ mod tests {
-             r
-         );
-         for reg in ["%edi", "%ebp", "%esi"] {
--            assert!(r.contains(&format!("xorl {}, {}", reg, reg)), "{} kept: {}", reg, r);
-+            assert!(
-+                r.contains(&format!("xorl {}, {}", reg, reg)),
-+                "{} kept: {}",
-+                reg,
-+                r
-+            );
-         }
-     }
- 
-@@ -11181,7 +11814,11 @@ mod tests {
-         let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl $7, %eax\n    movl $8, %edx\n    xorl %ecx, %ecx\n.L1:\n    movl %ecx, %eax\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
-         assert!(!r.contains("testl"), "test dropped: {}", r);
--        assert!(r.contains("jne .L1"), "je(sete) -> jne(producer inverted): {}", r);
-+        assert!(
-+            r.contains("jne .L1"),
-+            "je(sete) -> jne(producer inverted): {}",
-+            r
-+        );
-     }
- 
-     // REGRESSION (audit finding): setCC writes only the low BYTE of its
-@@ -11265,7 +11902,11 @@ mod tests {
-     fn const_staging_numeric_folded() {
-         let asm = "f:\n    movl $77, %ebx\n    movl %ebx, %edx\n    pushl %edx\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
--        assert!(r.contains("movl $77, %edx"), "value folds into reader: {}", r);
-+        assert!(
-+            r.contains("movl $77, %edx"),
-+            "value folds into reader: {}",
-+            r
-+        );
-         assert_eq!(r.matches("movl").count(), 1, "staging gone: {}", r);
-     }
- 
-@@ -11293,7 +11934,11 @@ mod tests {
-     fn census_fallback_kills_label_crossing_dead_move() {
-         let asm = "f:\n    movl %eax, %ebx\n    testl %eax, %eax\n    je .L1\n.L1:\n    movl $9, %eax\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
--        assert!(!r.contains("movl %eax, %ebx"), "dead staging deleted: {}", r);
-+        assert!(
-+            !r.contains("movl %eax, %ebx"),
-+            "dead staging deleted: {}",
-+            r
-+        );
-     }
- 
-     #[test]
-@@ -11479,4 +12124,158 @@ mod tests {
-             result
-         );
-     }
-+    // ── Dead frame allocation elision: a `subl $N,%esp`/`addl $N,%esp`
-+    // frame that no instruction ever touches is pure overhead and must be
-+    // removed (GCC emits none for register-only leaves).
-+
-+    #[test]
-+    fn test_dead_frame_elided_plain_leaf() {
-+        // The canonical `-m16 -Os` regparm leaf: the frame space is never
-+        // touched, so both frame adjusts vanish and the body survives.
-+        let asm = "plain:\n    subl $12, %esp\n    movzwl %ax, %eax\n    incl %eax\n    movzbl %al, %eax\n    addl $12, %esp\n    ret\n"
-+            .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            !result.contains("subl $12, %esp") && !result.contains("addl $12, %esp"),
-+            "dead frame adjusts must be elided:\n{result}"
-+        );
-+        assert!(result.contains("incl %eax"), "body must survive:\n{result}");
-+        assert!(result.contains("ret"), "ret must survive:\n{result}");
-+    }
-+
-+    #[test]
-+    fn test_dead_frame_elided_multiple_epilogues() {
-+        // Two equal deallocs on two return paths are both dropped.
-+        let asm = "f:\n    subl $8, %esp\n    testl %eax, %eax\n    je .Lbb1\n    movl $1, %eax\n    addl $8, %esp\n    ret\n.Lbb1:\n    xorl %eax, %eax\n    addl $8, %esp\n    ret\n"
-+            .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            !result.contains("subl $8, %esp") && result.matches("addl $8, %esp").count() == 0,
-+            "alloc and both deallocs must be elided:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_dead_frame_kept_when_slot_accessed() {
-+        // A value spilled to the local frame and reloaded at a DIFFERENT size
-+        // makes the frame live: store-forwarding cannot rewrite a 32-bit
-+        // store feeding a 16-bit load, so the (%esp) slot access survives and
-+        // the frame must not be elided.
-+        // The local slot holds %ecx on one path and %ebx on the other; a join
-+        // load of the slot cannot be store-forwarded (which register? it
-+        // depends on the branch), so the (%esp) memory traffic is genuine and
-+        // the frame must be kept.
-+        let asm = "f:\n    subl $12, %esp\n    testl %edx, %edx\n    je .L1\n    movl %ecx, -4(%esp)\n    jmp .L2\n.L1:\n    movl %ebx, -4(%esp)\n.L2:\n    movl -4(%esp), %eax\n    addl $12, %esp\n    ret\n"
-+            .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("-4(%esp)"),
-+            "diamond slot access must not be forwarded:\n{result}"
-+        );
-+        assert!(
-+            result.contains("subl $12, %esp") && result.contains("addl $12, %esp"),
-+            "frame in use via (%esp) slot must be kept:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_dead_frame_kept_across_call() {
-+        // A call requires the stack alignment/argument space the frame
-+        // provides; never elide without proving the ABI unaffected.
-+        let asm = "f:\n    subl $12, %esp\n    call g\n    addl $12, %esp\n    ret\n".to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("subl $12, %esp") && result.contains("addl $12, %esp"),
-+            "frame across a call must be kept:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_dead_frame_kept_with_callee_save_push() {
-+        // Functions with push/pop callee saves are owned by
-+        // eliminate_unused_callee_saves; this pass must not renumber them.
-+        let asm = "f:\n    pushl %ebx\n    subl $16, %esp\n    addl %ebx, %eax\n    addl $16, %esp\n    popl %ebx\n    ret\n"
-+            .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("pushl %ebx") && result.contains("popl %ebx"),
-+            "callee-save pair must be left intact by this pass:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_dead_frame_kept_with_frame_pointer() {
-+        // The frame-pointer prologue itself disqualifies elision: the
-+        // (%ebp)-based slot is genuine frame memory read back into the return
-+        // register.
-+        let asm = "f:\n    pushl %ebp\n    movl %esp, %ebp\n    subl $8, %esp\n    movl %ecx, -4(%ebp)\n    movl -4(%ebp), %eax\n    leave\n    ret\n"
-+            .to_string();
-+        let result = peephole_optimize(asm);
-+        // The guarantee from THIS pass: a frame-pointer function's alloc is
-+        // never elided (the (%ebp)/push disqualify it). Other passes may
-+        // forward the slot traffic, so assert only the frame machinery.
-+        assert!(
-+            result.contains("subl $8, %esp") && result.contains("leave"),
-+            "frame-pointer function's alloc/epilogue must be kept:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_dead_frame_kept_on_backward_jump_across_alloc() {
-+        // A loop edge that branches backward to a label at/before the alloc
-+        // would re-enter the body without reopening the frame; conservatively
-+        // keep the frame.
-+        let asm = "f:\n.Ltop:\n    subl $12, %esp\n    decl %ecx\n    jnz .Ltop\n    addl $12, %esp\n    ret\n".to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("subl $12, %esp") && result.contains("addl $12, %esp"),
-+            "backward edge across alloc must keep the frame:\n{result}"
-+        );
-+    }
-+
-+    // ── Widen store-forwarding: a narrower slot store feeding a wider
-+    // unsigned reload (`movb %al,slot` / `movl slot,%eax`) forwards to an
-+    // explicit movzbl so the redundant slot round-trip and the (subsequent)
-+    // zero-extension can be deleted.
-+
-+    #[test]
-+    fn test_widen_forward_byte_store_to_l_reload() {
-+        // The `inb` asm-clobber idiom: byte result homed to the slot, then a
-+        // 32-bit reload. Must forward to movzbl %al.
-+        let asm = "f:\n    inb %dx, %al\n    movb %al, 0(%esp)\n    movl 0(%esp), %eax\n    ret\n"
-+            .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            !result.contains("0(%esp)"),
-+            "slot round-trip must be eliminated:\n{result}"
-+        );
-+        assert!(
-+            result.contains("movzbl %al, %eax"),
-+            "byte store must widen-forward to movzbl:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_widen_forward_word_store_to_l_reload() {
-+        let asm = "f:\n    movw %cx, %ax\n    movw %ax, 0(%esp)\n    movl 0(%esp), %edx\n    ret\n"
-+            .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("movzwl %ax, %edx"),
-+            "word store must widen-forward to movzwl:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_widen_forward_blocked_when_source_clobbered() {
-+        // A barrier (call) between store and reload clobbers %al, so the
-+        // stored byte is not provably still in %al: the slot stays.
-+        let asm =
-+            "f:\n    movb %al, 0(%esp)\n    call g\n    movl 0(%esp), %eax\n    ret\n".to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("0(%esp)"),
-+            "clobbered source must keep the slot reload:\n{result}"
-+        );
-+    }
+-                let Some(&dst_reg) = ra.get(&dest.0) else {
+-                    return false;
+-                };
+-                if !is_xmm_phys(dst_reg) {
+-                    return false;
+-                }
+                 let size = if matches!(ty, IrType::F32 | IrType::D32) {
+                     OpSize::S32
+                 } else {
+                     OpSize::S64
+                 };
+-                let dst = MachOperand::Reg(MachReg::Phys(dst_reg));
+-                if let Some(&slot) = alloca_slots.get(&ptr.0) {
+-                    out.push(MachInst::FMov {
+-                        src: MachOperand::StackSlot(slot),
+-                        dst,
+-                        size,
+-                    });
+-                    return true;
+-                }
+-                if let Some(&base) = ra.get(&ptr.0) {
++                // Destination home: xmm register (direct) or spill slot
++                // (store the loaded value from the xmm0 scratch relay).
++                let relay_dest: Option<i64> = match ra.get(&dest.0) {
++                    Some(&dst_reg) if is_xmm_phys(dst_reg) => None,
++                    Some(_) => return false,
++                    None => match alloca_slots.get(&dest.0) {
++                        Some(&dslot) => Some(dslot),
++                        None => return false,
++                    },
++                };
++                // Source address: direct alloca slot or GPR-held pointer.
++                let src = if let Some(&slot) = alloca_slots.get(&ptr.0) {
++                    MachOperand::StackSlot(slot)
++                } else if let Some(&base) = ra.get(&ptr.0) {
+                     if is_xmm_phys(base) {
+                         return false;
+                     }
+-                    out.push(MachInst::FMov {
+-                        src: MachOperand::Mem {
+-                            base: MachReg::Phys(base),
+-                            offset: 0,
+-                        },
+-                        dst,
+-                        size,
+-                    });
+-                    return true;
++                    MachOperand::Mem {
++                        base: MachReg::Phys(base),
++                        offset: 0,
++                    }
++                } else {
++                    return false;
++                };
++                match relay_dest {
++                    None => {
++                        let dst =
++                            MachOperand::Reg(MachReg::Phys(ra.get(&dest.0).copied().unwrap()));
++                        out.push(MachInst::FMov { src, dst, size });
++                    }
++                    Some(dslot) => {
++                        // The relay clobbers xmm0. Float parameters are
++                        // pre-colored to their INCOMING register — xmm0/xmm1
++                        // are PhysReg 18/19, below the allocator pool — so a
++                        // live home there makes the scratch unsafe. Exact
++                        // guard: the allocator never assigns 18/19, so an
++                        // entry means a live incoming-ABI float param.
++                        if xmm_scratch_unsafe(ra) {
++                            return false;
++                        }
++                        // Load into the pre-colored xmm0 scratch, then store
++                        // to the slot-homed destination.
++                        out.push(MachInst::FMov {
++                            src,
++                            dst: MachOperand::Reg(MachReg::Phys(XMM0_SCRATCH)),
++                            size,
++                        });
++                        out.push(MachInst::FMov {
++                            src: MachOperand::Reg(MachReg::Phys(XMM0_SCRATCH)),
++                            dst: MachOperand::StackSlot(dslot),
++                            size,
++                        });
++                    }
+                 }
+-                return false;
++                return true;
+             }
+             if *seg_override != AddressSpace::Default {
+                 return false;
+@@ -1344,10 +1599,11 @@ fn lower_instruction_typed_inner(
+             // Scalar float store (F32/F64 and the D32/D64 bit-carriers).
+             //
+             // Typed subset, mirroring the SSE branch of emit_store_impl: the
+-            // value must already be homed in an xmm allocator register
+-            // (xmm2..xmm15) and the address must be a direct alloca slot or
+-            // a GPR-held pointer. Everything else -- slot-homed values (the
+-            // text path relays through an xmm scratch), constants, xmm-based
++            // value is homed in an xmm allocator register (direct single
++            // move) or in a spill slot (two-move relay through the
++            // pre-colored xmm0 scratch, which no allocator home can occupy),
++            // and the address is a direct alloca slot or a GPR-held pointer.
++            // Everything else -- GPR-homed values, constants, xmm-based
+             // pointers, indexed/folded GEP addressing, F128/x87 -- keeps the
+             // mature emitter.
+             if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
+@@ -1357,43 +1613,67 @@ fn lower_instruction_typed_inner(
+                 let Operand::Value(val_v) = val else {
+                     return false;
+                 };
+-                let Some(&src_reg) = ra.get(&val_v.0) else {
+-                    return false;
+-                };
+-                if !is_xmm_phys(src_reg) {
+-                    return false;
+-                }
+                 let size = if matches!(ty, IrType::F32 | IrType::D32) {
+                     OpSize::S32
+                 } else {
+                     OpSize::S64
+                 };
+-                let src = MachOperand::Reg(MachReg::Phys(src_reg));
+-                if let Some(&slot) = alloca_slots.get(&ptr.0) {
+-                    out.push(MachInst::FMov {
+-                        src,
+-                        dst: MachOperand::StackSlot(slot),
+-                        size,
+-                    });
+-                    return true;
+-                }
+-                if let Some(&base) = ra.get(&ptr.0) {
++                // Value home: an xmm allocator register (direct), or a spill
++                // slot (relayed through the pre-colored xmm0 scratch — x86
++                // has no mem-to-mem SSE move). Anything else stays behind.
++                let relay_slot: Option<i64> = match ra.get(&val_v.0) {
++                    Some(&src_reg) if is_xmm_phys(src_reg) => None,
++                    Some(_) => return false, // GPR-homed float: lowering defect class
++                    None => match alloca_slots.get(&val_v.0) {
++                        Some(&vslot) => Some(vslot),
++                        None => return false,
++                    },
++                };
++                // Destination address: direct alloca slot or GPR-held pointer.
++                let dst = if let Some(&slot) = alloca_slots.get(&ptr.0) {
++                    MachOperand::StackSlot(slot)
++                } else if let Some(&base) = ra.get(&ptr.0) {
+                     // x86 addressing has no xmm base; the text path relays
+                     // such pointers through rcx -- leave that shape there.
+                     if is_xmm_phys(base) {
+                         return false;
+                     }
+-                    out.push(MachInst::FMov {
+-                        src,
+-                        dst: MachOperand::Mem {
+-                            base: MachReg::Phys(base),
+-                            offset: 0,
+-                        },
+-                        size,
+-                    });
+-                    return true;
++                    MachOperand::Mem {
++                        base: MachReg::Phys(base),
++                        offset: 0,
++                    }
++                } else {
++                    return false;
++                };
++                match relay_slot {
++                    None => {
++                        let src = MachOperand::Reg(MachReg::Phys(ra.get(&val_v.0).copied().unwrap()));
++                        out.push(MachInst::FMov { src, dst, size });
++                    }
++                    Some(vslot) => {
++                        // The relay clobbers xmm0 — see the load arm's note:
++                        // a live incoming-ABI float param homed in xmm0/xmm1
++                        // (PhysReg 18/19) makes the scratch unsafe.
++                        if xmm_scratch_unsafe(ra) {
++                            return false;
++                        }
++                        // Load slot → xmm0 scratch, then store scratch → dst.
++                        // xmm0 is never an allocator home (pool starts at
++                        // xmm2), so the pre-colored scratch is conflict-free
++                        // unless a float param lives there.
++                        out.push(MachInst::FMov {
++                            src: MachOperand::StackSlot(vslot),
++                            dst: MachOperand::Reg(MachReg::Phys(XMM0_SCRATCH)),
++                            size,
++                        });
++                        out.push(MachInst::FMov {
++                            src: MachOperand::Reg(MachReg::Phys(XMM0_SCRATCH)),
++                            dst,
++                            size,
++                        });
++                    }
+                 }
+-                return false;
++                return true;
+             }
+             // Narrow stores are ordinary `Mov`s at OpSize::S8/S16 and the
+             // emitter's size tables have always handled both; refusing them
+diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
+index 2d721d23..9820a2ee 100644
+--- a/src/backend/x86/codegen/machinst.rs
++++ b/src/backend/x86/codegen/machinst.rs
+@@ -54,6 +54,27 @@ pub enum FAluOp {
+     Div,
  }
+ 
++/// One register-argument move of a [`MachInst::CallTyped`]: place `src`
++/// (a resolved GPR home, spill-slot read, or immediate) into the SysV
++/// integer argument register `dst_reg`. Self-moves (source already in the
++/// target register) are elided by the lowering, never constructed.
++#[derive(Debug, Clone)]
++pub struct CallArgMove {
++    pub src: MachOperand,
++    pub dst_reg: PhysReg,
++    pub size: OpSize,
++}
++
++/// The return-value move of a [`MachInst::CallTyped`]: copy rax to the
++/// return value's home (register or spill slot) after the call. Emitted
++/// at the return type's width; a width narrower than 8 bytes renders the
++/// 32-bit form (`movl %eax, ...`), matching the mature path and the ABI.
++#[derive(Debug, Clone)]
++pub struct CallRetMove {
++    pub dst: MachOperand,
++    pub size: OpSize,
++}
++
+ /// Shift operation.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum ShiftOp {
+@@ -78,7 +99,7 @@ pub enum CondCode {
+ }
+ 
+ /// An operand in a machine instruction.
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum MachOperand {
+     /// Register operand.
+     Reg(MachReg),
+@@ -305,6 +326,55 @@ pub enum MachInst {
+         target: String,
+     },
+ 
++    /// Fully typed direct call — the SysV integer-register-call contract as
++    /// ONE machine instruction, the way an MIR `CALL` or a Cranelift
++    /// `call` instruction models it: declared clobbers, declared uses,
++    /// atomic under the replay fallback.
++    ///
++    /// Emission order (all stages are part of this instruction):
++    ///   1. `caller_saves`: spill every caller-saved register that holds a
++    ///      value live across the call to its spill slot. Computed by the
++    ///      lowering from the same `caller_save_intervals` data the mature
++    ///      path's Phase 2b consumes, at the call's program point.
++    ///   2. `args`: one move per register argument, placing its (already
++    ///      resolved) source into the SysV integer argument register.
++    ///      Sources are GPR homes, spill-slot reads, or imm32 immediates;
++    ///      a zero immediate emits as `xorl reg, reg` (3 bytes vs 7, the
++    ///      GCC/Clang/ICC form). The moves are execution-ordered by the
++    ///      lowering so no source is clobbered by an earlier move's
++    ///      destination; register-exchange cycles never reach this
++    ///      variant (they are rejected to the text path, which owns the
++    ///      hazard-spill area machinery).
++    ///   3. `call target` — PLT/version decoration is baked into `target`.
++    ///   4. `ret`: copy rax to the return value's home (register or slot).
++    ///      None for void calls.
++    ///   5. `caller_saves` again, reversed direction: restore each spilled
++    ///      register from its slot (the mature path's Phase 2b tail).
++    ///
++    /// Declared clobbers: the six SysV integer argument registers, rax,
++    /// rdx, r8-r11 and every xmm — the full caller-clobber set. Declared
++    /// uses: the argument sources (all read before any clobber) and the
++    /// spill slots (memory, not registers). Because the lowering flushes
++    /// the buffer immediately around the call run, no allocated vreg can
++    /// coexist with this instruction — the pre-colored argument/return
++    /// registers are therefore conflict-free by construction.
++    ///
++    /// The subset that may reach this variant (enforced twice — emit-side
++    /// gate and builder): direct call to a named symbol, non-variadic, no
++    /// sret/struct/i128/F128/x87 arguments, at most six integer/pointer
++    /// arguments of width 4 or 8, integer or pointer return. Everything
++    /// else stays on the mature path, which owns the general contract.
++    CallTyped {
++        /// (register, spill slot offset) pairs saved before / restored after.
++        caller_saves: Vec<(PhysReg, i64)>,
++        /// Register-argument moves in execution order.
++        args: Vec<CallArgMove>,
++        /// Direct call target (PLT decoration already applied).
++        target: String,
++        /// Return-value home: rax is copied here after the call.
++        ret: Option<CallRetMove>,
++    },
++
+     /// Indirect function call: `call *%reg`. Clobbers caller-saved regs.
+     CallIndirect {
+         reg: MachReg,
+@@ -360,6 +430,28 @@ pub const MACHINST_ALLOCATABLE_GPRS: &[PhysReg] = &[
+     R11, R10, R8, R9, RDI, RSI, RDX,
+ ];
+ 
++/// The six SysV AMD64 integer argument registers, in ABI order:
++/// arg0=rdi, arg1=rsi, arg2=rdx, arg3=rcx, arg4=r8, arg5=r9.
++/// IDs follow the codegen convention (calls.rs: rdi=14, rsi=15, rdx=16,
++/// rcx=7, r8=12, r9=13).
++pub const SYSCALL_ARG_REGS: [PhysReg; 6] = [
++    PhysReg(14), // rdi
++    PhysReg(15), // rsi
++    PhysReg(16), // rdx
++    PhysReg(7),  // rcx
++    PhysReg(12), // r8
++    PhysReg(13), // r9
++];
++
++/// xmm0 — pre-colored float scratch. The allocator's XMM pool starts at
++/// xmm2 (PhysReg 20), so xmm0/xmm1 are conflict-free by construction: no
++/// allocated float value can ever live there. Used by the lowering to
++/// relay between two memory operands (x86 has no mem-to-mem SSE move) —
++/// slot-homed float loads/stores and float compare staging.
++pub const XMM0_SCRATCH: PhysReg = PhysReg(18);
++/// xmm1 — second pre-colored float scratch (two-operand compares).
++pub const XMM1_SCRATCH: PhysReg = PhysReg(19);
++
+ impl MachReg {
+     /// Returns true if this is a virtual register (needs allocation).
+     pub fn is_vreg(&self) -> bool {
+diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
+index 40d17293..eaa52e80 100644
+--- a/src/backend/x86/codegen/machinst_emit.rs
++++ b/src/backend/x86/codegen/machinst_emit.rs
+@@ -42,6 +42,8 @@ fn reg_name(reg: PhysReg) -> &'static str {
+         15 => "rsi",
+         16 => "rdx",
+         // XMM registers for F64 allocation
++        18 => "xmm0",
++        19 => "xmm1",
+         20 => "xmm2",
+         21 => "xmm3",
+         22 => "xmm4",
+@@ -255,6 +257,8 @@ fn assert_scratch_free(imm: &MachOperand, other: &MachReg) {
+ /// the wrong operand class.
+ fn freg_name(reg: PhysReg) -> &'static str {
+     match reg.0 {
++        18 => "xmm0",
++        19 => "xmm1",
+         20 => "xmm2",
+         21 => "xmm3",
+         22 => "xmm4",
+@@ -811,6 +815,61 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+             out.emit_fmt(format_args!("    call {}", target));
+         }
+ 
++        MachInst::CallTyped {
++            caller_saves,
++            args,
++            target,
++            ret,
++        } => {
++            // Phase 1: caller-save spills (Phase 2b of the mature path,
++            // typed). Same slot addressing as every other MachOperand —
++            // the StackSlot formatter applies the rsp/rbp frame mode.
++            for (reg, slot) in caller_saves {
++                out.emit_fmt(format_args!(
++                    "    movq {}, {}",
++                    fmt_reg(&MachReg::Phys(*reg), OpSize::S64),
++                    fmt_operand(&MachOperand::StackSlot(*slot), OpSize::S64, out)
++                ));
++            }
++            // Phase 2: argument moves in the lowering's execution order.
++            for m in args {
++                match &m.src {
++                    // Zero immediate: `xorl` zeroes the full register
++                    // (32-bit destination zero-extends) in 3 bytes vs 7
++                    // for `movq $0` — the GCC/Clang/ICC form.
++                    MachOperand::Imm(0) => {
++                        let r = fmt_reg(&MachReg::Phys(m.dst_reg), OpSize::S32);
++                        out.emit_fmt(format_args!("    xorl {}, {}", r, r));
++                    }
++                    _ => out.emit_fmt(format_args!(
++                        "    mov{} {}, {}",
++                        m.size.suffix(),
++                        fmt_operand(&m.src, m.size, out),
++                        fmt_reg(&MachReg::Phys(m.dst_reg), m.size)
++                    )),
++                }
++            }
++            // Phase 3: the call itself.
++            out.emit_fmt(format_args!("    call {}", target));
++            // Phase 4: return home.
++            if let Some(r) = ret {
++                out.emit_fmt(format_args!(
++                    "    mov{} %{}, {}",
++                    r.size.suffix(),
++                    sized_reg_name(RAX, r.size),
++                    fmt_operand(&r.dst, r.size, out)
++                ));
++            }
++            // Phase 5: caller-save restores.
++            for (reg, slot) in caller_saves.iter().rev() {
++                out.emit_fmt(format_args!(
++                    "    movq {}, {}",
++                    fmt_operand(&MachOperand::StackSlot(*slot), OpSize::S64, out),
++                    fmt_reg(&MachReg::Phys(*reg), OpSize::S64)
++                ));
++            }
++        }
++
+         MachInst::CallIndirect { reg } => {
+             let reg_str = fmt_reg(reg, OpSize::S64);
+             out.emit_fmt(format_args!("    call *{}", reg_str));
+diff --git a/src/backend/x86/codegen/machinst_tests.rs b/src/backend/x86/codegen/machinst_tests.rs
+index 01dc4d67..d750cdae 100644
+--- a/src/backend/x86/codegen/machinst_tests.rs
++++ b/src/backend/x86/codegen/machinst_tests.rs
+@@ -499,6 +499,65 @@ fn instruction_corpus() -> Vec<MachInst> {
+     let mut v = Vec::new();
+     let regs = [PhysReg(0), PhysReg(7), PhysReg(15), PhysReg(2), PhysReg(16)];
+ 
++    // CallTyped: every stage and operand shape the lowering can produce —
++    // caller-save spill/restore pairs, zero/imm32/reg/slot arguments, the
++    // sized return home — so the real-assembler differential proves the
++    // whole sequence encodes, not just the call mnemonic.
++    {
++        let abi = [PhysReg(14), PhysReg(15), PhysReg(16), PhysReg(7), PhysReg(12), PhysReg(13)];
++        for (i, dst) in abi.iter().enumerate() {
++            v.push(MachInst::CallTyped {
++                caller_saves: vec![(PhysReg(10), -48), (PhysReg(11), -56)],
++                args: vec![
++                    CallArgMove {
++                        src: MachOperand::Imm(if i % 2 == 0 { 0 } else { 4096 + i as i64 }),
++                        dst_reg: *dst,
++                        size: OpSize::S64,
++                    },
++                    CallArgMove {
++                        src: reg(PhysReg(if i == 5 { 1 } else { 2 })),
++                        dst_reg: PhysReg(if i == 5 { 15 } else { 14 }),
++                        size: OpSize::S32,
++                    },
++                    CallArgMove {
++                        src: MachOperand::StackSlot(-24 - i as i64),
++                        dst_reg: PhysReg(if i == 5 { 16 } else { abi[(i + 1) % 6].0 }),
++                        size: OpSize::S64,
++                    },
++                ],
++                target: "machinst_probe_callee".into(),
++                ret: Some(CallRetMove {
++                    dst: reg(PhysReg((2 + (i % 4)) as u8)),
++                    size: if i % 2 == 0 { OpSize::S32 } else { OpSize::S64 },
++                }),
++            });
++        }
++        // Void call, no saves, no ret.
++        v.push(MachInst::CallTyped {
++            caller_saves: vec![],
++            args: vec![CallArgMove {
++                src: reg(PhysReg(1)),
++                dst_reg: PhysReg(14),
++                size: OpSize::S64,
++            }],
++            target: "machinst_probe_void".into(),
++            ret: None,
++        });
++        // The xmm0/xmm1 pre-colored scratch pair participates in FMov shapes.
++        for (a, b) in [(18u8, 20u8), (20, 18), (19, 21), (21, 19)] {
++            v.push(MachInst::FMov {
++                src: reg(PhysReg(a)),
++                dst: reg(PhysReg(b)),
++                size: OpSize::S64,
++            });
++            v.push(MachInst::FMov {
++                src: reg(PhysReg(a)),
++                dst: MachOperand::StackSlot(-64),
++                size: OpSize::S32,
++            });
++        }
++    }
++
+     // FMov: every xmm allocator home at both scalar widths, plus every
+     // operand pairing the lowering can produce (reg/reg, reg/mem, mem/reg,
+     // reg/slot, slot/reg). The assembler differential proves the xmm8-15
+@@ -2312,3 +2371,455 @@ fn float_binops_lower_with_exact_operand_order() {
+         "integer add produced FAlu: {out:?}"
+     );
+ }
++
++// ── 9. CallTyped: the typed direct-call contract ────────────────────────────
++//
++// The call is the most ABI-exposed instruction in the layer. These tests
++// pin the three invariants that make the atomic form sound:
++//   (a) argument moves execute in an order where every reader of a
++//       register runs before every writer of it (the home is destroyed
++//       by the write);
++//   (b) register-exchange shapes never reach the variant (the text path
++//       owns the hazard-spill machinery);
++//   (c) the emitted sequence is exactly saves → args → call → ret →
++//       restores, with zero-immediate arguments rendered as `xorl`.
++
++mod call_builder {
++    use super::super::isel::{build_typed_call, TypedCallReject, TypedCallSrc};
++    use super::*;
++    use crate::common::types::IrType;
++
++    const RDI: PhysReg = PhysReg(14);
++    const RSI: PhysReg = PhysReg(15);
++    const RDX: PhysReg = PhysReg(16);
++    const RCX: PhysReg = PhysReg(7);
++    const R8: PhysReg = PhysReg(12);
++    const R9: PhysReg = PhysReg(13);
++
++    fn s64() -> OpSize {
++        OpSize::S64
++    }
++
++    /// arg0's source is r8 (arg4's destination): arg0 must execute BEFORE
++    /// arg4, or the write destroys the value it still needs to read.
++    #[test]
++    fn orders_readers_before_writers() {
++        let plan = build_typed_call(
++            &[
++                Some(TypedCallSrc::Reg(R8)),  // arg0: read r8 …
++                Some(TypedCallSrc::Reg(PhysReg(1))), // arg1: rbx → rsi
++                Some(TypedCallSrc::Imm(7)),   // arg2
++                Some(TypedCallSrc::Slot(-8)), // arg3
++                Some(TypedCallSrc::Reg(PhysReg(2))), // arg4: r12 → r8 (writes the arg0 source!)
++                Some(TypedCallSrc::Imm(0)),   // arg5
++            ],
++            &[s64(); 6],
++            None,
++        )
++        .expect("acyclic shape must be accepted");
++        let pos = |want: PhysReg| {
++            plan.args
++                .iter()
++                .position(|m| m.dst_reg == want)
++                .unwrap_or_else(|| panic!("no move writes {:?}", want))
++        };
++        assert!(
++            pos(RDI) < pos(R8),
++            "the r8 reader must be ordered before the r8 writer: {:?}",
++            plan.args
++        );
++    }
++
++    /// f(a, b) with a homed in rsi (arg1's register) and b homed in rdi
++    /// (arg0's register) is a register exchange: no serial order is sound.
++    /// The builder must refuse it so the text path's hazard-spill area
++    /// handles the shape.
++    #[test]
++    fn rejects_register_exchange_cycles() {
++        let err = build_typed_call(
++            &[
++                Some(TypedCallSrc::Reg(RSI)), // a: rsi → rdi
++                Some(TypedCallSrc::Reg(RDI)), // b: rdi → rsi
++            ],
++            &[s64(), s64()],
++            None,
++        )
++        .expect_err("a swap cannot be ordered serially");
++        assert_eq!(err, TypedCallReject::MoveCycle);
++    }
++
++    /// A value already homed in its own ABI register needs no move.
++    #[test]
++    fn elides_self_moves() {
++        let plan = build_typed_call(
++            &[
++                Some(TypedCallSrc::Reg(RDI)), // arg0 already in rdi
++                Some(TypedCallSrc::Reg(PhysReg(1))),
++            ],
++            &[s64(), s64()],
++            None,
++        )
++        .unwrap();
++        assert!(
++            plan.args.iter().all(|m| m.dst_reg != RDI),
++            "self-move must be elided: {:?}",
++            plan.args
++        );
++        assert_eq!(plan.args.len(), 1);
++    }
++
++    #[test]
++    fn rejects_immediates_that_do_not_fit_the_imm32_movq_form() {
++        let err = build_typed_call(
++            &[Some(TypedCallSrc::Imm(0x1_0000_0000))],
++            &[s64()],
++            None,
++        )
++        .expect_err("64-bit immediates need movabsq, which the subset does not model");
++        assert_eq!(err, TypedCallReject::ImmTooWide(0));
++        // The extremes of the imm32 window are fine (movq sign-extends).
++        assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i32::MIN as i64))], &[s64()], None).is_ok());
++        assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i32::MAX as i64))], &[s64()], None).is_ok());
++    }
++
++    /// `&local` arguments lower through a pre-move writing the ABI register.
++    /// Another argument sourcing from that same register would read it
++    /// after the pre-move clobbered it — the builder must refuse.
++    #[test]
++    fn alloca_address_args_conflict_checked() {
++        let ok = build_typed_call(
++            &[
++                Some(TypedCallSrc::AllocaAddr(9)),
++                Some(TypedCallSrc::Reg(PhysReg(1))), // rbx: fine
++            ],
++            &[s64(), s64()],
++            None,
++        )
++        .expect("no other arg reads rdi");
++        assert!(matches!(
++            ok.args.iter().find(|m| m.dst_reg == RDI).map(|m| &m.src),
++            Some(MachOperand::AllocaAddr(9))
++        ));
++
++        let err = build_typed_call(
++            &[
++                Some(TypedCallSrc::AllocaAddr(9)),
++                Some(TypedCallSrc::Reg(RDI)), // reads rdi: the pre-move's victim
++            ],
++            &[s64(), s64()],
++            None,
++        )
++        .expect_err("another argument sources the pre-move's destination");
++        assert_eq!(err, TypedCallReject::ArgNotRepresentable(0));
++    }
++
++    /// The builder's defensive re-check: rax (accumulator) and rbp (frame
++    /// pointer) are never stable homes in this model.
++    #[test]
++    fn rejects_rax_and_rbp_argument_homes() {
++        for bad in [PhysReg(0), PhysReg(6)] {
++            let err = build_typed_call(&[Some(TypedCallSrc::Reg(bad))], &[s64()], None)
++                .expect_err("scratch/frame-pointer homes must be refused");
++            assert_eq!(err, TypedCallReject::ArgNotRepresentable(0));
++        }
++    }
++
++    #[test]
++    fn return_homes() {
++        // Register return.
++        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(1))), s64())))
++            .unwrap();
++        match plan.ret {
++            Some(r) => assert_eq!(r.dst, reg(PhysReg(1))),
++            None => panic!("register return home required"),
++        }
++        // Slot return.
++        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Slot(-16)), s64()))).unwrap();
++        match plan.ret {
++            Some(r) => assert_eq!(r.dst, MachOperand::StackSlot(-16)),
++            None => panic!("slot return home required"),
++        }
++        // rax-homed return: the copy is a no-op.
++        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(0))), s64()))).unwrap();
++        assert!(plan.ret.is_none(), "rax → rax must be elided");
++        // rbp return home: refused.
++        let err = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(6))), s64())))
++            .expect_err("the frame pointer is not a value home");
++        assert_eq!(err, TypedCallReject::RetNotRepresentable);
++        // Void call.
++        assert!(build_typed_call(&[], &[], None).unwrap().ret.is_none());
++    }
++
++    /// Six heterogeneous arguments: the full plan in one assertion, so a
++    /// regression in any position breaks a single test instead of a
++    /// property silently holding for the others. Position in the plan is
++    /// the TOPOLOGICAL order, so assertions are keyed by destination
++    /// register: the plan may legitimately reorder (arg5 reads rdx and
++    /// must precede arg2, which writes it), but every source/dest/width
++    /// binding is fixed.
++    #[test]
++    fn full_six_argument_shape() {
++        let plan = build_typed_call(
++            &[
++                Some(TypedCallSrc::Imm(42)),
++                Some(TypedCallSrc::Slot(-24)),
++                Some(TypedCallSrc::Reg(RCX)), // reads rcx: written by arg3's move
++                Some(TypedCallSrc::Imm(0)),
++                Some(TypedCallSrc::Reg(PhysReg(3))),
++                Some(TypedCallSrc::Reg(RDX)), // reads rdx: written by arg2's move
++            ],
++            &[
++                OpSize::S32,
++                OpSize::S64,
++                OpSize::S64,
++                OpSize::S32,
++                OpSize::S64,
++                OpSize::S32,
++            ],
++            Some((Some(TypedCallSrc::Slot(-32)), OpSize::S32)),
++        )
++        .expect("mixed but conflict-free shape");
++        assert_eq!(plan.args.len(), 6);
++        let by_dst = |want: PhysReg| -> &CallArgMove {
++            plan.args
++                .iter()
++                .find(|m| m.dst_reg == want)
++                .unwrap_or_else(|| panic!("no move for dst {want:?} in {:?}", plan.args))
++        };
++        assert_eq!(by_dst(RDI).src, MachOperand::Imm(42));
++        assert_eq!(by_dst(RDI).size, OpSize::S32);
++        assert_eq!(by_dst(RSI).src, MachOperand::StackSlot(-24));
++        assert_eq!(by_dst(RDX).src, MachOperand::Reg(MachReg::Phys(RCX)));
++        assert_eq!(by_dst(RCX).src, MachOperand::Imm(0));
++        assert_eq!(by_dst(R8).src, MachOperand::Reg(MachReg::Phys(PhysReg(3))));
++        assert_eq!(by_dst(R9).src, MachOperand::Reg(MachReg::Phys(RDX)));
++        assert_eq!(by_dst(R9).size, OpSize::S32);
++        // Reader-before-writer constraints across the plan (a reader must
++        // observe the home's original value, so it precedes the writer):
++        //   rdx: arg5's move reads it, arg2's move writes it.
++        //   rcx: arg2's move reads it, arg3's move writes it.
++        let pos = |want: PhysReg| plan.args.iter().position(|m| m.dst_reg == want).unwrap();
++        assert!(pos(R9) < pos(RDX), "the rdx reader must precede the rdx writer");
++        assert!(pos(RDX) < pos(RCX), "the rcx reader must precede the rcx writer");
++        assert_eq!(plan.ret.as_ref().unwrap().dst, MachOperand::StackSlot(-32));
++        assert_eq!(plan.ret.as_ref().unwrap().size, OpSize::S32);
++    }
++}
++
++// ── 10. CallTyped: golden emission ──────────────────────────────────────────
++
++/// The full stage order is part of the instruction's contract: caller-save
++/// spills, argument moves, the call, the return home, and the restores —
++/// the mature path's Phase 2b → 3 → 4 → 6 → 2b tail, typed end to end.
++#[test]
++fn calltyped_emits_saves_args_call_ret_restores_in_order() {
++    let inst = MachInst::CallTyped {
++        caller_saves: vec![(PhysReg(10), -48), (PhysReg(11), -56)], // r11, r10
++        args: vec![
++            CallArgMove {
++                src: MachOperand::Imm(0),
++                dst_reg: PhysReg(14),
++                size: OpSize::S64,
++            },
++            CallArgMove {
++                src: reg(PhysReg(1)),
++                dst_reg: PhysReg(15),
++                size: OpSize::S32,
++            },
++            CallArgMove {
++                src: MachOperand::StackSlot(-24),
++                dst_reg: PhysReg(16),
++                size: OpSize::S64,
++            },
++        ],
++        target: "mix6@PLT".into(),
++        ret: Some(CallRetMove {
++            dst: reg(PhysReg(2)),
++            size: OpSize::S64,
++        }),
++    };
++    let lines = emit(&inst);
++    assert_eq!(
++        lines,
++        vec![
++            "movq %r11, -48(%rbp)", // save r11
++            "movq %r10, -56(%rbp)", // save r10
++            "xorl %edi, %edi",      // zero immediate: the 3-byte form
++            "movl %ebx, %esi",      // 32-bit arg at its canonical width
++            "movq -24(%rbp), %rdx", // slot-homed arg
++            "call mix6@PLT",
++            "movq %rax, %r12",      // return home
++            "movq -56(%rbp), %r10", // restores in reverse
++            "movq -48(%rbp), %r11",
++        ],
++        "stage order or rendering drifted: {lines:?}"
++    );
++}
++
++/// A 32-bit return home must name %eax (the sub-register), not %rax with
++/// a 32-bit mnemonic — the mismatch the very first smoke test caught.
++#[test]
++fn calltyped_return_home_names_the_sized_rax() {
++    let inst = MachInst::CallTyped {
++        caller_saves: vec![],
++        args: vec![],
++        target: "f".into(),
++        ret: Some(CallRetMove {
++            dst: MachOperand::StackSlot(-8),
++            size: OpSize::S32,
++        }),
++    };
++    let lines = emit(&inst);
++    assert_eq!(
++        lines,
++        vec!["call f", "movl %eax, -8(%rbp)"],
++        "{lines:?}"
++    );
++}
++
++/// The typed call's registers — argument registers, rax — must be covered
++/// by the assembler differential like every other variant: add them to the
++/// corpus.
++#[test]
++fn calltyped_is_in_the_assembler_corpus() {
++    let has_calltyped = instruction_corpus()
++        .iter()
++        .any(|i| matches!(i, MachInst::CallTyped { .. }));
++    assert!(
++        has_calltyped,
++        "CallTyped must be part of instruction_corpus so the real-assembler \
++         differential and the determinism test cover it"
++    );
++}
++
++// ── 11. xmm0/xmm1 scratch: names and the relay liveness guard ───────────────
++
++/// xmm0/xmm1 (PhysReg 18/19) are the pre-colored float scratch pair. The
++/// 64-bit name table must know them (the relay emits them), and the float
++/// name table must agree.
++#[test]
++fn xmm_scratch_registers_emit_their_canonical_names() {
++    for (id, want) in [(18u8, "xmm0"), (19, "xmm1")] {
++        let mut out = AsmOutput::new();
++        emit_machinst(
++            &MachInst::FMov {
++                src: reg(PhysReg(20)),
++                dst: reg(PhysReg(id)),
++                size: OpSize::S32,
++            },
++            &mut out,
++        );
++        assert!(
++            out.buf.contains(&format!("%{want}")),
++            "PhysReg({id}) must render as %{want}: {}",
++            out.buf
++        );
++    }
++}
++
++/// The float store relay moves through xmm0. That is only sound when no
++/// live value is homed there — and float PARAMETERS are pre-colored to
++/// their INCOMING registers (xmm0 = PhysReg 18). A parameter home in the
++/// scratch must refuse the relay to the text path.
++#[test]
++fn float_store_relay_refuses_when_xmm0_holds_a_live_param() {
++    use crate::common::fx_hash::FxHashMap;
++    use crate::common::types::{AddressSpace, IrType};
++    use crate::ir::reexports::{Instruction, Operand, Value};
++
++    // Value 5 lives in xmm0 (PhysReg 18): a float parameter's incoming home.
++    let ra: FxHashMap<u32, PhysReg> = [(5u32, PhysReg(18))].into_iter().collect();
++    // The stored value (7) is slot-homed; the pointer is an alloca (9).
++    let slots: FxHashMap<u32, i64> = [(7u32, -24i64), (9u32, -32i64)].into_iter().collect();
++    let inst = Instruction::Store {
++        val: Operand::Value(Value(7)),
++        ptr: Value(9),
++        ty: IrType::F32,
++        seg_override: AddressSpace::Default,
++        volatile: false,
++    };
++    let mut out = Vec::new();
++    assert!(
++        !super::isel::lower_instruction_typed(&inst, &ra, &slots, None, &mut out),
++        "the relay would clobber the live xmm0 parameter home"
++    );
++}
++
++/// The healthy relay: slot-homed value → xmm0 → destination, two moves.
++#[test]
++fn float_store_relay_lowers_to_two_fmovs_through_xmm0() {
++    use crate::common::fx_hash::FxHashMap;
++    use crate::common::types::{AddressSpace, IrType};
++    use crate::ir::reexports::{Instruction, Operand, Value};
++
++    // No float params: xmm0 is free. A value in xmm2 keeps the direct path
++    // distinct from the relay under test.
++    let ra: FxHashMap<u32, PhysReg> = [(3u32, PhysReg(20))].into_iter().collect();
++    let slots: FxHashMap<u32, i64> = [(7u32, -24i64), (9u32, -32i64)].into_iter().collect();
++    let inst = Instruction::Store {
++        val: Operand::Value(Value(7)), // slot-homed
++        ptr: Value(9),                 // alloca
++        ty: IrType::F64,
++        seg_override: AddressSpace::Default,
++        volatile: false,
++    };
++    let mut out = Vec::new();
++    assert!(super::isel::lower_instruction_typed(&inst, &ra, &slots, None, &mut out));
++    assert_eq!(out.len(), 2, "{out:?}");
++    match (&out[0], &out[1]) {
++        (
++            MachInst::FMov {
++                src: MachOperand::StackSlot(-24),
++                dst: MachOperand::Reg(MachReg::Phys(scratch)),
++                ..
++            },
++            MachInst::FMov {
++                src: MachOperand::Reg(MachReg::Phys(s2)),
++                dst: MachOperand::StackSlot(-32),
++                ..
++            },
++        ) => {
++            assert_eq!(*scratch, PhysReg(18), "relay must use the pre-colored xmm0");
++            assert_eq!(*s2, PhysReg(18));
++        }
++        other => panic!("unexpected relay shape: {other:?}"),
++    }
++}
++
++/// Mirror shape for loads: a slot-homed DESTINATION is written from the
++/// xmm0 scratch after the address is loaded into it.
++#[test]
++fn float_load_to_slot_homed_dest_relays_through_xmm0() {
++    use crate::common::fx_hash::FxHashMap;
++    use crate::common::types::{AddressSpace, IrType};
++    use crate::ir::reexports::{Instruction, Value};
++
++    let ra: FxHashMap<u32, PhysReg> = FxHashMap::default();
++    let slots: FxHashMap<u32, i64> = [(1u32, -40i64), (2u32, -48i64)].into_iter().collect();
++    let inst = Instruction::Load {
++        dest: Value(2), // slot-homed destination
++        ptr: Value(1),  // alloca
++        ty: IrType::F64,
++        seg_override: AddressSpace::Default,
++        volatile: false,
++    };
++    let mut out = Vec::new();
++    assert!(super::isel::lower_instruction_typed(&inst, &ra, &slots, None, &mut out));
++    assert_eq!(out.len(), 2, "{out:?}");
++    assert!(matches!(
++        &out[0],
++        MachInst::FMov {
++            src: MachOperand::StackSlot(-40),
++            dst: MachOperand::Reg(MachReg::Phys(PhysReg(18))),
++            ..
++        }
++    ));
++    assert!(matches!(
++        &out[1],
++        MachInst::FMov {
++            src: MachOperand::Reg(MachReg::Phys(PhysReg(18))),
++            dst: MachOperand::StackSlot(-48),
++            ..
++        }
++    ));
++}
