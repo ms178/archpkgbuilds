@@ -1,273 +1,753 @@
+diff --git a/engineering/FOLLOWUP-2026-09-02-iv-widen-agentb-audit.md b/engineering/FOLLOWUP-2026-09-02-iv-widen-agentb-audit.md
+index 96b8967..60183ca 100644
+--- a/engineering/FOLLOWUP-2026-09-02-iv-widen-agentb-audit.md
++++ b/engineering/FOLLOWUP-2026-09-02-iv-widen-agentb-audit.md
+@@ -133,6 +133,17 @@ branch-bound so it stays at ratio 1.000.
+ 
+ ## 5. Remaining follow-up (prioritized)
+ 
++> **Status update (later session, 2026-09-02b):** items 2 and 4 are DONE —
++> see `FOLLOWUP-2026-09-02b-agentb-rebase-and-lea-base-fold.md`. Item 2:
++> `prove_counted_bound` accepts runtime invariant bounds and the
++> `MemberKind::CrossCast` port unlocked the cross-sign shapes
++> (`unsigned i; a[i>>1]`), pinned by
++> `tests/regression/iv_widen_unsigned_runtime_bound.c`. Item 4: the
++> `fold_copy_into_lea_base` peephole coalesces `leaq D(%rA),%rB; mov %rB,%rA`
++> into `leaq D(%rA),%rA` (−16 static insns on 9 corpus kernels; GCC parity on
++> the `shift_half` oracle). Items 1 and 3 remain open (re-prioritized in the
++> newer doc's §7).
++
+ 1. **Real i8/i16 widening** needs a no-wrap proof at the narrow width: the
+    promoted latch `trunc(Add(phi,1):I32)` wraps *defined* at 8/16 bits, so
+    widening requires proving the IV provably stays in `[MIN, MAX]` (a counted
+diff --git a/engineering/FOLLOWUP-2026-09-02b-agentb-rebase-and-lea-base-fold.md b/engineering/FOLLOWUP-2026-09-02b-agentb-rebase-and-lea-base-fold.md
+new file mode 100644
+index 0000000..7b1daf5
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-02b-agentb-rebase-and-lea-base-fold.md
+@@ -0,0 +1,208 @@
++# Follow-up: Agent B patch rebase onto main, vectorizer dispatcher guards, and the loop-latch LEA fold
++
++Session date: 2026-09-02 (second session of the day; supersedes nothing — this
++is the continuation of `FOLLOWUP-2026-09-02-iv-widen-agentb-audit.md`)
++Base: `ms178/lccc` main @ `dcf673db` (Agent B synthesis merge, PR #349, `4c7e534`)
++Deliverable: `ms178-1.patch` (workspace root); snapshots `S01`+ with the
++machine-readable ledger under `/home/user/artifacts/SNAPSHOT_LEDGER.md`.
++
++---
++
++## 1. Situation: the attached patch vs. main
++
++The attached `ms178-1.patch` (Agent B, second revision — the "g4 battery"
++work) was written against the tree BEFORE PR #349. Meanwhile main had already
++merged the synthesis (`4c7e534`), which independently adopted large parts of
++Agent B's revision in a different shape. The rebase was therefore a SEMANTIC
++diff, not a textual one. Item-by-item verdict:
++
++| Agent B patch item | Status on main @ dcf673d | Action taken |
++|---|---|---|
++| Narrow constant-count shifts as closure members | Already in main as `MemberKind::ShiftConst` (count left narrow — strictly better than Agent B's widened-count `BinOpConst`) | none (main wins) |
++| `escape_read_needs_narrow(Copy) = true` | already in main | none |
++| Candidacy restricted to `I32`/`U32` | already in main | none |
++| `FxHashMap` use map | already in main | none |
++| `binop_range` `Shl` arm | main computes the shifted range inline in the shift arm (count < 32, so no i128 overflow — equivalent) | none |
++| **`CrossCast` (cross-sign widening casts)** | **MISSING** — `U32→I64` fell into the `NarrowCast` arm, whose dest is never enqueued, so the wide `Shl`+GEP below the cast were never scanned, `has_addressing` stayed false, and every `unsigned i; a[i>>1]` loop declined (verified: 32-bit counter survived at -O2) | **ported** (§2) |
++| **Unsigned IVs with RUNTIME trip bounds** | the counted-bound proof (`prove_counted_bound`) already accepted loop-invariant runtime bounds — but was unreachable for the cross-sign shapes above | unlocked by the CrossCast port; pinned by tests (§3) |
++| **Vectorizer narrow-IV guard** | **MISSING — bug reproduced on main**: `unsigned char i; for (i=0;i<120;i++) s+=a[i]` vectorized into a U8 counter stepping 16 toward byte-limit 480 → wraps at 256 → **infinite loop** (GCC: 7140) | **ported** (§4) |
++| **Vectorizer const-zero-init guard** | **MISSING — bug reproduced on main TWICE**: `for (i=5;i<60;i++) s+=a[i]` returned 31708938240 (int/AVX2 path) and 30702305280 (long/SSE2 path); GCC: 1760 both. Agent B's guard sat ONLY in `transform_reduction_avx2` — the SSE2 path stayed broken | **ported and moved into the DISPATCHER** (both transforms gated; both are called only from there) (§4) |
++| `tests/regression/iv_widen_derived_closure.c` | already on main (identical minus 3 header lines) | none |
++| `tests/regression/iv_widen_latch_bound_soundness.c` | main's twin `iv_widen_latch_and_bound.c` had the **out-of-bounds defect Agent B's header called out**: `runtime_derived(a, N - 1)` with `N=400` reads `a[i*3]` up to `a[1194]` on a 400-element array — UB, GCC differential vacuous | **fixed in place** (`N=420`, call `N/3`, max index 417) |
++| `tests/regression/iv_widen_unsigned_runtime_bound.c` | missing | **added** |
++| `tests/regression/vectorize_narrow_iv_reduction.c` | missing | **added, extended** with the non-zero-start int/long/dot cases the SSE2 repro exposed |
++| Unit tests (cross-sign chain, shl-wrap bail, foreign-sign bail, runtime-bound accum) | missing | **ported** (4 tests, adapted to the synthesis architecture) |
++
++## 2. `MemberKind::CrossCast` (src/passes/iv_widen.rs)
++
++* Admission is EXACT-pair: `(U32→I64) | (I32→U64)`. Members are always 32-bit,
++  so these are the only cross-sign widening integer casts; the exact match
++  keeps float casts (`U32→F64`, handled by the same-sign/`NarrowCast` arms
++  with source-signedness extension semantics) and pointer casts out of the
++  arm by construction. (Agent B's `size>=8 && !same_sign` condition would
++  also have captured `U32→F64`; that happens to be value-correct under the
++  retype, but exactness removes the argument entirely.)
++* The dest is enqueued as a chain value (`queue.push((dest, false))`), which
++  is the actual fix: the wide scaling ops and the GEP that set
++  `has_addressing` live BELOW the cast.
++* Apply retypes `from_ty` to the wide type — a same-size `U64→I64` /
++  `I64→U64` reinterpretation, a backend no-op.
++* Soundness: a cast extends per its 32-bit source's signedness, which is
++  exactly the member's `ext`; the no-wrap domain (signed-overflow-is-UB, or
++  the counted bound for unsigned) makes the wide member bit-identical to the
++  narrow one on every executed iteration.
++
++Result on the oracle shape (`unsigned i; s += a[i>>1]`, `-O3 -march=x86-64-v3`):
++the 32-bit counter with per-iteration re-extension became a clean 64-bit
++loop; instruction count **17 → 16 = GCC 16.2 parity** (clang23.1: 46,
++icc 2021.10: 30, icx-latest: 63).
++
++## 3. Runtime-bound unsigned IVs — pinned
++
++`prove_counted_bound` already accepted runtime invariant bounds (unit step +
++strict `Ult`/`Slt` exit ⇒ body ≤ n-1, latch ≤ n — no wrap by construction,
++any seed). With CrossCast in place, the full g4 shape (`unsigned i; i<n;
++s += a[i>>1]` with runtime `n`) widens. Pinned by
++`tests/regression/iv_widen_unsigned_runtime_bound.c` (differential vs GCC,
++bit-exact: 7383068127934110950) and unit test
++`test_runtime_bound_cross_cast_accum`.
++
++## 4. Vectorizer dispatcher guards (src/passes/vectorize.rs)
++
++One block in `vectorize_with_analysis_mode`, ahead of both
++`transform_reduction_sse2` and `transform_reduction_avx2` (the only two call
++sites), rejecting:
++
++1. **narrow IVs** (`I8/U8/I16/U16` induction phis) — both addressing schemes
++   rescale the counter's unit past a narrow domain (byte-stride stepping and
++   byte-scaled limits wrap the counter; the remainder resume
++   `iv_final >> log2(elem)` starts wrong);
++2. **non-const-zero IV starts** — the limit rescale assumes an element-0
++   start; `c != 0` (or dynamic) starts silently drop/misread elements. The
++   SSE2 reproduction is why this lives in the dispatcher and not, as in
++   Agent B's patch, only inside the AVX2 transform.
++
++These loops stay scalar — correct and tight for their (small) trip counts.
++Re-enabling vectorization for them is follow-up work (§6.3/§6.4).
++
++## 5. NEW: `fold_copy_into_lea_base` — the loop-latch coalescing fold
++
++Closes item 4 of the previous audit (`leaq -1(%rbx),%r10; movq %r10,%rbx`
++surviving regalloc). Neither existing relay pass can take this shape:
++
++* `eliminate_move_relays` rewrites uses of the copy DEST — live across the
++  back edge, never dead;
++* `retarget_producer_into_copy` needs the producer reg dead after the copy —
++  it feeds the exit `cmp`.
++
++The new pass (src/backend/x86/codegen/peephole/passes/relay_and_lea.rs,
++gated `CCC_PEEPHOLE_SKIP=lea_base_fold`) folds
++
++```text
++    leaq D(%rA), %rB        leaq D(%rA), %rA
++    movq %rB, %rA      ->
++    <reads of %rB>          <same reads, renamed to %rA>
++```
++
++Soundness contract (all three are enforced, or the candidate rolls back):
++
++1. x86 `lea` reads all sources before writing dest — aliasing dest with the
++   base is a well-defined increment; flags untouched.
++2. Rename window: reads of `%rB` are renamed to `%rA` up to the first write
++   of either family or a barrier; inside the window `%rA == %rB ==` producer
++   value, so the rename is value-preserving (including RMW-of-`%rA` lines).
++   RMW of `%rB`, memory-operand mentions of `%rB`, and implicit-usage lines
++   abort the candidate.
++3. `provably_dead_lv` (FileLiveness dataflow ∪ two syntactic proofs) must
++   show `%rB` dead after the fold on the REWRITTEN text; failure restores
++   every original line.
++
++**Trap found during bring-up** (pinned by
++`latch_fold_settled_by_dataflow_when_family_reused_in_loop`): the deadness
++query must be anchored at the LEA line, not at the copy — the copy is
++NOP-marked by then, and `FileLiveness` only marks real instructions as
++`known`, so a query at the NOP index answers `None` and silently degrades
++the proof to its syntactic fallbacks (which fail whenever the producer
++family is reused elsewhere in the loop — the common `movq %rbx,%r11; shrq`
++shift-copy shape).
++
++Measured (this sandbox, no PMU — static counts + same-window timing):
++
++* Static: **−16 instructions across 9 of 33 corpus kernels**
++  (double_reduction −4, loop_patterns −3, reduction_vecreg −2,
++  vector_remainder −2, gzip_crc32/histogram/nbody/sieve/global_addr_pressure
++  −1 each); zero kernels grew (the fold only ever deletes the mov). The
++  deleted instruction is the loop-latch increment — hot by construction.
++* Runtime (same-window median-of-9, taskset-pinned, output-equal):
++  double_reduction 0.989, gzip_crc32 0.994, nbody 0.995, reduction_vecreg
++  0.999, everything else 1.000 — flat-to-slightly-better, no regression;
++  on this 2-core VM the per-iteration save is sub-noise for most kernels.
++* `shift_half` oracle: 17 → **16 = GCC 16.2 parity**.
++
++## 6. Validation matrix (all gates green, fastbuild profile, -j2, 4G swap)
++
++| Gate | Result |
++|---|---|
++| `cargo build --profile fastbuild` + `-D warnings` | clean |
++| `cargo test --lib` | **1517 passed / 0 failed / 6 ignored** (32 iv_widen, 19 relay_and_lea) |
++| `run_regression_suite.sh` (GCC differential + small-slots A/B) | **PASS=567 FAIL=0 SKIP=15** |
++| `check_benchmark_outputs.sh` (INF-BENCHGATE-1) | **PASS=152 FAIL=0** |
++| `ir_verify_sweep.py` | **1134 configs, 0 violations** |
++| Agent B batteries vs GCC (`-O2`, runtime output) | 4/4 bit-exact |
++| Miscompile repros (narrow-IV hang, start-5 int/long) | fixed, match GCC (7140 / 1760 / 1760) |
++| Godbolt oracle `shift_half` (lccc/gcc16.2/clang23.1/icc/icx) | **16 / 16 / 46 / 30 / 63** |
++| IV-widen runtime A/B (`bench_iv_widen_ab.sh`, N=9) | sieve **0.755**, tls_seg_access 0.920, arith_loop 0.979, loop_patterns 0.988, histogram/sqlite_varint/adler32 1.000, nbody 1.010 (noise band) — no regression |
++| Fold runtime A/B (skip-gate, median-of-9, output-equal) | 0.989–1.000 across the 9 affected kernels — no regression |
++
++## 7. Remaining follow-up (prioritized)
++
++1. **Real i8/i16 IV widening** (item 1 of the previous audit, unchanged):
++   needs the narrow-width no-wrap proof (counted bound ≤ 2^(w-1) signed /
++   ≤ 2^w−1 unsigned) plus recognition of the promoted latch shape
++   `trunc(Add(sext(phi),1):I32)`. Precisely specified; rare in real code —
++   medium value, medium cost.
++2. **`loop_memory_promote` + TBAA** (previous item 3, unchanged): the
++   biggest remaining `stencil`-vs-GCC gap; orthogonal to this session.
++3. **Vectorizer: SUPPORT non-zero const starts instead of declining.** The
++   Max reduction already carries c-aware remainder math (`max_shift` in
++   `insert_reduction_remainder_loop`); generalizing the limit rescale to
++   `(n - c)` and the remainder resume to the c-aware form would re-enable
++   vectorization for `for (i = c; ...)` sum/dot loops. The dispatcher guard
++   is the safe floor; this is the win above it.
++4. **Vectorizer: SUPPORT narrow IVs by widening the counter to I32 first**
++   (a pre-vectorization IV widen), instead of declining. Small trip counts
++   keep the value low; only worth it if a real workload shows the shape.
++5. `fold_copy_into_lea_base` extensions (all conservative today):
++   rename `%rB` mentions inside memory operands (base/index) in the window;
++   handle RMW-of-`%rB` by keeping the result in `%rB` and renaming only the
++   source reads; both need the same deadness proof and rollback skeleton
++   that already exists.
++6. Emitter cosmetics: conditional jumps are emitted at column 0
++   (`jae .LBB3`) while instructions carry 4-space indent — harmless, but
++   inconsistent with GCC-style output and mildly confusing in diffs.
++
++## 8. Environment notes for the next session
++
++* Swap is MANDATORY and wiped between sessions: `sudo fallocate -l 4G
++  /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo
++  swapon /swapfile` (or `scripts/ensure_swap.sh`, which the build wrappers
++  call).
++* Build with `scripts/build_lccc_fast.sh` (fastbuild profile: -O1, no LTO,
++  incremental, -j2). rustup 1.98.0 lives under `/home/user/.cargo` /
++  `/home/user/.rustup` — re-install after a wipe (`rustup -y --profile
++  minimal --default-toolchain stable`; `rust-toolchain.toml` pins 1.98.0).
++* Godbolt oracle: `scripts/godbolt.py compare <file> --local
++  target/fastbuild/lccc --oracles gcc16.2,clang23.1,icc,icx-latest
++  --function <fn>`; cache under `.godbolt-cache`. `DEFAULT_ORACLES` is
++  already pinned to the project's version policy (GCC 16.2 = `cg162`,
++  Clang 23.1.0 = `cclang2310`, ICC 2021.10 = `cicc2021100`, ICX =
++  `cicxlatest` with the resolved id recorded in every manifest) — verified
++  this session, no change needed. A dedicated LINKER oracle (lccc-ld vs
++  mold 2.42 / lld 23.1 / bfd 2.47 link-time + layout comparison) does not
++  exist yet in `scripts/`; neither mold nor lld is installed in this
++  sandbox, so it could not be exercised here — build wrapper
++  (`build_lccc_fast.sh`) already honors the mold preference when present.
++  Candidate for a future session.
++* Snapshot after EVERY validated fix: `/home/user/lccc-snapshot.sh <slug>
++  "<desc>"` refreshes `/home/user/ms178-1.patch` atomically and verifies it
++  applies clean to the recorded base.
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index 32c7eb9..ed60359 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -554,6 +554,14 @@ pub fn peephole_optimize(mut asm: String) -> String {
+         if !sk("producer_retarget") {
+             changed |= relay_and_lea::retarget_producer_into_copy(&mut store, &mut infos);
+         }
++        // Loop-latch shape the two passes above decline: the copy dest is
++        // live across the back edge and the producer reg is read after the
++        // copy. Retargets `lea D(%rA), %rB; mov %rB, %rA` into
++        // `lea D(%rA), %rA` with a liveness-proved, rollback-guarded rename
++        // of the following %rB reads.
++        if !sk("lea_base_fold") {
++            changed |= relay_and_lea::fold_copy_into_lea_base(&mut store, &mut infos);
++        }
+         if !sk("copy_add_lea") {
+             changed |= flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
+         }
+diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+index ce41c69..e98eddb 100644
+--- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
++++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+@@ -781,6 +781,247 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
+     changed
+ }
+ 
++/// Fold the loop-latch increment / pointer-bump shape that neither relay
++/// pass can touch:
++///
++/// ```text
++///     leaq 1(%rbx), %r11        leaq 1(%rbx), %rbx
++///     movq %r11, %rbx      ->
++///     cmpq %rdx, %r11           cmpq %rdx, %rbx
++///     jb  .LBB2                 jb  .LBB2
++/// ```
++///
++/// Why the existing passes decline it:
++/// * `eliminate_move_relays` rewrites *uses of the copy destination* to the
++///   copy source — here `%rbx` is live across the back edge, so it is never
++///   dead and the rewrite cannot fire;
++/// * `retarget_producer_into_copy` requires the producer's register to be
++///   dead after the copy — here `%r11` feeds the loop-exit `cmp`.
++///
++/// The transform retargets the LEA's destination to the copy's destination
++/// (the LEA's own base) and renames reads of the producer register inside
++/// the following barrier-delimited region. Soundness:
++///
++/// 1. x86 `lea` reads all source operands before writing its destination, so
++///    aliasing the destination with the base (`leaq 1(%rbx), %rbx`) is a
++///    well-defined increment; neither `lea` nor `mov` touches flags.
++/// 2. From the copy's position up to the first write of either family,
++///    `%rA == %rB ==` the producer value at every point, so renaming reads
++///    of `%rB` to `%rA` inside that region is value-preserving — including
++///    lines whose destination is `%rA` (both operands hold the same value).
++///    Read-modify-writes of `%rB` would land their result in the wrong
++///    register and abort the candidate, as do memory-operand mentions of
++///    `%rB` (only plain-register mentions are renamed).
++/// 3. After the last rewrite, `%rB` must be provably dead
++///    (`provably_dead_lv`: the `FileLiveness` dataflow answer or one of the
++///    two syntactic proofs) — no path may read `%rB` again without an
++///    intervening write, back edges, `call` argument registers and `ret`
++///    included. If the proof fails, every rewrite is rolled back textually
++///    and the original pair stays.
++///
++/// Only copies whose destination family is referenced by the LEA's source
++/// are handled here; the unaliased producer+copy case belongs to
++/// `retarget_producer_into_copy`.
++pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let len = store.len();
++    let mut lv = FileLiveness::new(store, infos);
++    let mut changed = false;
++    let mut i = 0;
++    while i < len {
++        let li = i;
++        i += 1;
++        if infos[li].is_nop() || infos[li].pinned || infos[li].is_barrier() {
++            continue;
++        }
++        let lea = infos[li].trimmed(store.get(li)).to_string();
++        let (lea_rest, prod_w) = if let Some(r) = lea.strip_prefix("leaq ") {
++            (r, 64u8)
++        } else if let Some(r) = lea.strip_prefix("leal ") {
++            (r, 32u8)
++        } else {
++            continue;
++        };
++        if has_implicit_reg_usage(&lea) {
++            continue;
++        }
++        let Some((lea_src, lea_dst)) = split_two_operands(lea_rest) else {
++            continue;
++        };
++        if !lea_src.contains('(') {
++            continue;
++        }
++        let Some(b_fam) = plain_gp_operand(lea_dst) else {
++            continue;
++        };
++        if !is_relayable_family(b_fam) {
++            continue;
++        }
++        // The adjacent (NOPs apart) copy of the LEA result.
++        let mut j = li + 1;
++        while j < len && infos[j].is_nop() {
++            j += 1;
++        }
++        if j >= len || infos[j].pinned || infos[j].is_barrier() {
++            continue;
++        }
++        let copy = infos[j].trimmed(store.get(j)).to_string();
++        let (copy_w, copy_rest) = if let Some(r) = copy.strip_prefix("movq ") {
++            (64u8, r)
++        } else if let Some(r) = copy.strip_prefix("movl ") {
++            (32u8, r)
++        } else {
++            continue;
++        };
++        let Some((copy_src, copy_dst)) = split_two_operands(copy_rest) else {
++            continue;
++        };
++        // The copy must read exactly the LEA's destination family and write
++        // a different relayable family that the LEA's source references
++        // (the aliased case — unaliased retargeting is the other pass's job).
++        if register_family_fast(copy_src) != b_fam || plain_gp_operand(copy_src).is_none() {
++            continue;
++        }
++        let Some(a_fam) = plain_gp_operand(copy_dst) else {
++            continue;
++        };
++        if a_fam == b_fam || !is_relayable_family(a_fam) {
++            continue;
++        }
++        // A 64-bit LEA under a 32-bit copy would drop the copy's truncation:
++        // later 64-bit reads of %rB could not be renamed to the 32-bit
++        // (zero-extended) %rA.
++        if prod_w == 64 && copy_w == 32 {
++            continue;
++        }
++        if !line_refs_family(lea_src, a_fam) {
++            continue;
++        }
++        let new_dst_name = REG_NAMES[usize::from(prod_w == 32)][a_fam as usize];
++        let new_lea = format!(
++            "    {} {}, {}",
++            if prod_w == 64 { "leaq" } else { "leal" },
++            lea_src,
++            new_dst_name
++        );
++
++        // --- rename window: reads of %rB until the first write of either
++        // --- family or a barrier. Collect rewrites; abort on any shape we
++        // --- cannot rename (RMW of %rB, memory mention, implicit usage).
++        let b_mask = 1u16 << b_fam;
++        let mut rewrites: Vec<(usize, String, String)> = Vec::new(); // (idx, orig, new)
++        let mut abort = false;
++        let mut k = j + 1;
++        while k < len {
++            if infos[k].is_nop() {
++                k += 1;
++                continue;
++            }
++            if infos[k].pinned || has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
++                abort = true;
++                break;
++            }
++            if infos[k].is_barrier() {
++                break; // downstream paths are the deadness proof's job
++            }
++            let t = infos[k].trimmed(store.get(k)).to_string();
++            if infos[k].reg_refs & b_mask == 0 {
++                // A write of %rA closes the window (its value diverges from
++                // %rB's); a later %rB read then fails the deadness proof and
++                // rolls the candidate back.
++                if get_dest_reg(&infos[k]) == a_fam {
++                    break;
++                }
++                k += 1;
++                continue;
++            }
++            // %rB redefined without reading itself: later reads see the new
++            // def, not our value — the window ends.
++            if is_full_write(&infos[k], &t, b_fam) {
++                break;
++            }
++            // A read-modify-write of %rB would leave its result in the wrong
++            // register after a rename.
++            if get_dest_reg(&infos[k]) == b_fam {
++                abort = true;
++                break;
++            }
++            let Some(new_t) = rename_plain_family_reads(&t, b_fam, a_fam) else {
++                abort = true;
++                break;
++            };
++            rewrites.push((k, t, new_t));
++            k += 1;
++        }
++        if abort {
++            continue;
++        }
++
++        // --- apply, prove, or roll back -----------------------------------
++        let orig_lea = store.get(li).to_string();
++        let orig_copy = store.get(j).to_string();
++        replace_line(store, &mut infos[li], li, new_lea);
++        mark_nop(&mut infos[j]);
++        for &(idx, _, ref new_t) in &rewrites {
++            replace_line(store, &mut infos[idx], idx, new_t.clone());
++        }
++        let lv2 = FileLiveness::new(store, infos);
++        // The deadness query is anchored at the LEA line, NOT at the copy:
++        // the copy is NOP-marked at this point and `FileLiveness` only marks
++        // real instructions as known, so a query at its index would answer
++        // `None` and silently degrade the proof to its syntactic fallbacks.
++        // Every line between `li` and `j` is a NOP, so "dead after the LEA"
++        // is exactly "dead after the (deleted) copy" on the rewritten text.
++        if provably_dead_lv(&lv2, store, infos, li, b_fam, &[li, j]) {
++            lv = lv2;
++            changed = true;
++            i = j + 1;
++        } else {
++            replace_line(store, &mut infos[li], li, orig_lea);
++            replace_line(store, &mut infos[j], j, orig_copy);
++            for (idx, orig, _) in rewrites {
++                replace_line(store, &mut infos[idx], idx, orig);
++            }
++            // `lv` still describes the restored text.
++        }
++    }
++    changed
++}
++
++/// Rename every PLAIN-REGISTER mention of family `from` to the same-width
++/// register of family `to` inside one instruction's text. Returns `None`
++/// when `from` appears anywhere this routine cannot rewrite (a memory
++/// operand base/index, or an unknown width spelling), so the caller can
++/// abort conservatively. Valid for read-only mentions and for `cmp`/`test`
++/// (whose "destination" is flags); callers must have excluded RMW and
++/// full-write lines before calling.
++fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> {
++    let trimmed = t.trim_start();
++    let sp = trimmed.find(' ')?;
++    let (mnemonic, rest) = trimmed.split_at(sp);
++    let rest = rest.trim_start();
++    let (s0, s1) = split_two_operands(rest)?;
++    let ren = |op: &str| -> Option<String> {
++        if let Some(f) = plain_gp_operand(op) {
++            if f != from {
++                return Some(op.to_string());
++            }
++            for row in REG_NAMES.iter() {
++                if row[from as usize] == op {
++                    return Some(row[to as usize].to_string());
++                }
++            }
++            return None; // unknown width spelling
++        }
++        if line_refs_family(op, from) {
++            return None; // memory mention — not renamable here
++        }
++        Some(op.to_string())
++    };
++    let n0 = ren(s0)?;
++    let n1 = ren(s1)?;
++    Some(format!("    {} {}, {}", mnemonic, n0, n1))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::super::super::peephole_optimize;
+@@ -1026,4 +1267,158 @@ mod tests {
+         assert!(out.contains("leaq 1(%rbx), %r10"), "{out}");
+         assert!(out.contains("movzbl 8(%r10), %r14d"), "{out}");
+     }
++
++    /// The loop-latch increment: the copy dest is live across the back edge
++    /// and the producer reg feeds the exit cmp, so neither relay pass fires.
++    /// The LEA must be retargeted onto its own base and the cmp renamed.
++    #[test]
++    fn latch_increment_folds_into_lea_base() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movl %esi, %edx\n",
++            "    xorl %r8d, %r8d\n",
++            "    xorl %ebx, %ebx\n",
++            ".LBB1:\n",
++            "    cmpq %rdx, %rbx\n",
++            "    jae .LBB3\n",
++            ".LBB2:\n",
++            "    movslq (%rdi,%rbx,4), %r9\n",
++            "    leaq (%r8,%r9,1), %r8\n",
++            "    leaq 1(%rbx), %r11\n",
++            "    movq %r11, %rbx\n",
++            "    cmpq %rdx, %r11\n",
++            "    jb .LBB2\n",
++            ".LBB3:\n",
++            "    movq %r8, %rax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("leaq 1(%rbx), %rbx"), "{out}");
++        assert!(out.contains("cmpq %rdx, %rbx"), "{out}");
++        assert!(!out.contains("%r11"), "{out}");
++    }
++
++    /// The real `a[i>>1]` accumulate shape: the producer family `%r11` is
++    /// ALSO used by the shift copy at the top of the loop, so neither
++    /// syntactic proof applies and only the `FileLiveness` dataflow answer
++    /// can settle the fold. Pins the proof anchor at the LEA line: querying
++    /// the (NOP-marked) copy's index would answer `None` — FileLiveness only
++    /// marks real instructions as known — and silently decline the fold.
++    #[test]
++    fn latch_fold_settled_by_dataflow_when_family_reused_in_loop() {
++        let out = run(concat!(
++            "shift_half:\n",
++            ".cfi_startproc\n",
++            "    pushq %rbx\n",
++            "    .cfi_def_cfa_offset 16\n",
++            "    movl %esi, %edx\n",
++            "    xorl %r8d, %r8d\n",
++            "    xorl %ebx, %ebx\n",
++            ".LBB1:\n",
++            "    cmpq %rdx, %rbx\n",
++            "jae .LBB3\n",
++            ".LBB2:\n",
++            "    movq %rbx, %r11\n",
++            "    shrq $1, %r11\n",
++            "    movslq (%rdi, %r11, 4), %r9\n",
++            "    leaq (%r8, %r9, 1), %r8\n",
++            "    leaq 1(%rbx), %r11\n",
++            "    movq %r11, %rbx\n",
++            "    cmpq %rdx, %r11\n",
++            "jb .LBB2\n",
++            ".LBB3:\n",
++            "    movq %r8, %rax\n",
++            "    popq %rbx\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("leaq 1(%rbx), %rbx"), "{out}");
++        assert!(out.contains("cmpq %rdx, %rbx"), "{out}");
++        // The shift copy legitimately keeps %r11 (shr is destructive).
++        assert!(out.contains("movq %rbx, %r11"), "{out}");
++    }
++
++    /// 32-bit latch: same fold at `leal`/`movl` width.
++    #[test]
++    fn latch_increment_folds_at_32_bit_width() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    xorl %ebx, %ebx\n",
++            ".LBB1:\n",
++            "    movslq (%rdi,%rbx,4), %r9d\n",
++            "    leal 1(%ebx), %r10d\n",
++            "    movl %r10d, %ebx\n",
++            "    cmpl %esi, %r10d\n",
++            "    jb .LBB1\n",
++            "    movl %ebx, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("leal 1(%ebx), %ebx"), "{out}");
++        assert!(!out.contains("%r10d"), "{out}");
++    }
++
++    /// The producer register is read AFTER the loop: the rename window ends
++    /// at the conditional jump, the deadness proof must fail, and the whole
++    /// candidate must roll back (no partial rewrite may survive).
++    #[test]
++    fn lea_base_fold_rolls_back_when_producer_live_out() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    xorl %ebx, %ebx\n",
++            ".LBB1:\n",
++            "    leaq 1(%rbx), %r11\n",
++            "    movq %r11, %rbx\n",
++            "    cmpq %rdx, %r11\n",
++            "    jb .LBB1\n",
++            "    movl %r11d, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("leaq 1(%rbx), %r11"), "{out}");
++        assert!(out.contains("movq %r11, %rbx"), "{out}");
++        assert!(out.contains("movl %r11d, %eax"), "{out}");
++    }
++
++    /// A store of the producer register inside the window is renamed with
++    /// the same value-equivalence argument as the cmp.
++    #[test]
++    fn lea_base_fold_renames_store_of_producer() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    leaq 8(%rbx), %r11\n",
++            "    movq %r11, %rbx\n",
++            "    movq %r11, (%r13)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("leaq 8(%rbx), %rbx"), "{out}");
++        assert!(out.contains("movq %rbx, (%r13)"), "{out}");
++        assert!(!out.contains("%r11"), "{out}");
++    }
++
++    /// A read-modify-write of the producer register inside the window would
++    /// land its result in the wrong register after a rename: decline.
++    #[test]
++    fn lea_base_fold_declines_rmw_of_producer() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    xorl %ebx, %ebx\n",
++            ".LBB1:\n",
++            "    leaq 1(%rbx), %r11\n",
++            "    movq %r11, %rbx\n",
++            "    addq %r11, %r11\n",
++            "    cmpq %rdx, %r11\n",
++            "    jb .LBB1\n",
++            "    movl %ebx, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("leaq 1(%rbx), %r11"), "{out}");
++    }
+ }
 diff --git a/src/passes/iv_widen.rs b/src/passes/iv_widen.rs
-index 45e963d..b2e6537 100644
+index 21ccb6c..11e6ba5 100644
 --- a/src/passes/iv_widen.rs
 +++ b/src/passes/iv_widen.rs
-@@ -72,21 +72,47 @@
+@@ -56,8 +56,11 @@
+ //!    unsigned IV may be widened only when the loop provably terminates
+ //!    inside the type's range: an exit test `i < n` with a unit step (body
+ //!    values `≤ n-1 ≤ 2^w-2`, latch result `≤ 2^w-1` — no wrap anywhere), or
+-//!    `i > bound` with step `-1`. This is the same discipline SCEV-based
+-//!    compilers apply.
++//!    `i > bound` with step `-1`. The bound may be a RUNTIME loop-invariant
++//!    value — the no-wrap argument is by construction (any seed `< n`,
++//!    unit steps, exit at `≥ n` — every executed value is `< 2^w`), not by
++//!    constant folding. This is the same discipline SCEV-based compilers
++//!    apply.
  //!
- //! # Supported shapes (beyond the plain `Cast → GEP` chain)
+ //! # Provenance
  //!
--//! - `i8`/`i16`/`i32` IVs, signed and unsigned, incrementing and
--//!   decrementing (`Add`/`Sub` latches, both operand orders).
-+//! - `I32`/`U32` IVs, signed and unsigned, incrementing and decrementing
-+//!   (`Add`/`Sub` latches, both operand orders).
- //! - Const-offset addressing: `a[i+1]`, `a[i-1]`, `a[i*3]`, `a[i&7]`,
- //!   `a[(i&7)+1]`, `s[i-1] = s[i] + p` (the closure shapes that previously
- //!   kept `movslq` on the carried path).
-+//! - Narrow constant-count shifts `a[i<<1]`, `a[i>>2]`: `Shl` (both
-+//!   signednesses, unsigned with a non-wrapping range proof), `AShr` on
-+//!   signed IVs and `LShr` on unsigned IVs commute with the extension; the
-+//!   member and the op are retyped to wide (the constant count is widened
-+//!   with the op — semantically identical for counts in `[0, width)`).
+@@ -81,6 +84,12 @@
+ //! - Narrow constant-count shifts `a[i<<1]` (`Shl` both signednesses, `AShr`
+ //!   signed, `LShr` unsigned): the shift count is a shift AMOUNT and is never
+ //!   widened; only the member and the op's type are retyped.
 +//! - Signedness-changing widening casts (`U32→I64` / `I32→U64`), which the
 +//!   C frontend emits for unsigned index chains (`unsigned i; a[i>>1]`):
-+//!   the zext/sext value equals the widened member on every executed
-+//!   iteration, so the cast is retained as a same-size bitcast of the wide
-+//!   value and the chain below it is classified normally (CrossCast).
-+//! - Unsigned unit-step `Ult`-exit loops with a RUNTIME invariant bound:
-+//!   the body visits `p..n-1` and the latch reaches `n` at most — all
-+//!   < 2^32 — so no-wrap holds by construction and the bound needs no
-+//!   constant fold (g4 battery: `unsigned i; for (; i<n; i++) s+=a[i>>1]`).
++//!   the cast value equals the widened member on every executed iteration,
++//!   so it is retained as a same-size reinterpretation of the wide value and
++//!   the chain below it is enqueued and classified normally (`CrossCast`) —
++//!   that is where the I64 scaling and the GEP live.
  //! - Same-width casts (C's `int < unsigned` promotion) are retained as
  //!   truncations rather than widened, keeping the mixed-signedness cmp exact.
  //! - Rotated self-loops (header == latch) are widenable when a preheader
- //!   exists for the hoists.
-+//! - Loop-exit comparisons that cannot be safely widened (incompatible
-+//!   predicate or a loop-variant other operand) keep a narrow cmp fed by one
-+//!   truncation instead of aborting the whole widening.
- //!
- //! Out-of-scope (the pass declines the IV):
-+//! - `I8`/`I16`/`U8`/`U16` IVs: the C frontend computes narrow-IV latches at
-+//!   the promoted `I32` width and truncates back
-+//!   (`trunc(add(sext(phi), 1):I32):I8`), so the 8/16-bit wrap of the
-+//!   truncation is DEFINED and widening the phi would change it unless a
-+//!   narrow-width no-wrap bound is proven. The promoted shape never matches
-+//!   direct-narrow-latch candidacy anyway, so real narrow loops are simply
-+//!   left scalar (extending them requires the no-wrap proof, see
-+//!   engineering/FOLLOWUP-2026-09-02-iv-widen-agentb-audit.md §5).
+@@ -93,9 +102,9 @@
+ //! - `i8`/`i16` IVs: the C int-promotion latch is `trunc(add(phi, 1):I32)`,
+ //!   not a narrow `add`, and widening it would change the DEFINED 8/16-bit
+ //!   wrap of the truncation unless a no-wrap bound is proven (see
+-//!   engineering/FOLLOWUP-2026-09-02-iv-widen-audit.md, §5). Candidacy is
+-//!   therefore restricted to `I32`/`U32`; extending it requires a narrow-width
+-//!   no-wrap bound proof first.
++//!   engineering/FOLLOWUP-2026-09-02-iv-widen-agentb-audit.md, §5). Candidacy
++//!   is therefore restricted to `I32`/`U32`; extending it requires a
++//!   narrow-width no-wrap bound proof first.
  //! - loop-variant latch steps (an invariant step is cast once in the
  //!   preheader; a variant step cannot be hoisted);
--//! - narrow `Shl`/`AShr`/`LShr` (not extension-transparent — element scaling
--//!   is handled at wide type on the chain instead);
-+//! - narrow shifts with a non-constant or out-of-range count, `AShr` on
-+//!   unsigned IVs and `LShr` on signed IVs (the mismatched cases are not
-+//!   extension-transparent);
- //! - `Sub(step, phi)` latches (not an induction recurrence);
- //! - IVs used in `Select` *conditions* or other narrow in-loop arithmetic;
- //! - exit-merge phis (a phi operand is evaluated on the edge, so its
-@@ -97,9 +123,7 @@
- //! widening candidates) and BEFORE loop_rotate (so the rotated form sees the
- //! widened phi and emits `addq` directly).
- 
--use std::collections::HashMap;
--
--use crate::common::fx_hash::FxHashSet;
-+use crate::common::fx_hash::{FxHashMap, FxHashSet};
- use crate::common::types::IrType;
- use crate::ir::analysis::{CfgAnalysis, FlatAdj};
- use crate::ir::constants::IrConst;
-@@ -177,11 +201,16 @@ fn is_unsigned_ty(ty: IrType) -> bool {
-     matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64)
- }
- 
-+/// Widening-candidate types. Restricted to `I32`/`U32`: the C frontend
-+/// computes narrow-IV latches at the promoted `I32` width and truncates back
-+/// (`trunc(add(sext(phi), 1):I32):I8`), and that truncation wraps with
-+/// DEFINED semantics at 8/16 bits — widening such a phi would change the
-+/// wrap unless a narrow-width no-wrap bound is proven first. The promoted
-+/// shape never matches the direct-narrow-latch candidacy anyway, so the
-+/// restriction costs nothing on real code and keeps the synthetic shape (which
-+/// a future IR producer could emit) from being widened unsoundly.
- fn is_narrow_int(ty: IrType) -> bool {
--    matches!(
--        ty,
--        IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
--    )
-+    matches!(ty, IrType::I32 | IrType::U32)
- }
- 
- fn ext_kind_for(ty: IrType) -> ExtKind {
-@@ -293,6 +322,17 @@ enum MemberKind {
-     /// Dropped after its uses are redirected to the underlying member's wide
-     /// value.
-     WidenCast { operand: Value },
-+    /// A size-widening cast of a member that *changes* signedness
-+    /// (`U32→I64`, `I32→U64` — the C frontend produces these when an unsigned
-+    /// index feeds a signed-width GEP chain, e.g. `unsigned i; a[i>>1]`).
-+    /// The extension value (`zext` for unsigned seeds, `sext` for signed
-+    /// seeds) equals the widened member on every executed iteration (the
-+    /// no-wrap domain: a signed member that wrapped would be UB; an unsigned
-+    /// member is covered by the counted-loop bound). The cast is therefore
-+    /// retained and retyped to a same-size `wide_ty → to_ty` cast — a pure
-+    /// bitcast the backends emit as a no-op — so the downstream chain keeps
-+    /// its original signed type and stays well-typed.
-+    CrossCast { operand: Value },
-     /// A narrowing, same-width or pointer cast of a member. Retained and
+ //! - narrow shifts with a non-constant or out-of-range count, `AShr` on
+@@ -313,6 +322,20 @@ enum MemberKind {
      /// retyped to a truncation of the wide value (`from_ty = wide`), so its
      /// consumers keep reading the exact narrow bits.
-@@ -612,10 +652,10 @@ fn plan_step_operand(
- 
- /// `value_id -> [(block_idx, instruction_idx)]`; a terminator use is recorded
- /// with `instruction_idx == usize::MAX`.
--type UseMap = HashMap<u32, Vec<(usize, usize)>>;
-+type UseMap = FxHashMap<u32, Vec<(usize, usize)>>;
- 
- fn build_use_map(func: &IrFunction) -> UseMap {
--    let mut map: UseMap = HashMap::new();
-+    let mut map: UseMap = FxHashMap::default();
-     for (bi, b) in func.blocks.iter().enumerate() {
-         for (ii, inst) in b.instructions.iter().enumerate() {
-             inst.for_each_used_value(|id| {
-@@ -958,9 +998,138 @@ fn analyze_iv(
-                             }
-                             narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-                         }
-+                        IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
-+                            // The member is the shifted value (lhs); the count
-+                            // must be a constant on the rhs. A shift whose
-+                            // count is not a constant would need a per-iteration
-+                            // truncation to stay narrow — no win.
-+                            if !cur_lhs || !matches!(other, Operand::Const(_)) {
-+                                narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-+                                continue;
-+                            }
-+                            let count = match other {
-+                                Operand::Const(c) => c,
-+                                _ => unreachable!(),
-+                            };
-+                            let Some(cnt) = widen_const(*count, *ty).to_i64() else {
-+                                narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-+                                continue;
-+                            };
-+                            // Counts outside [0, width) are UB in C and
-+                            // nonsensical for a width-preserving member.
-+                            let width = narrow_bit_width(*ty) as i64;
-+                            if cnt < 0 || cnt >= width {
-+                                narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-+                                continue;
-+                            }
-+                            // Soundness by operation:
-+                            //  - Shl  (signed): `x << c` is UB unless x >= 0 and
-+                            //    the product fits the narrow type (C11 6.5.7p4),
-+                            //    so sext(x << c) == (sext x) << c on every
-+                            //    defined execution. Unsigned Shl is defined
-+                            //    wrapping, so a range proof is required.
-+                            //  - AShr (signed): arithmetic shift commutes with
-+                            //    sign extension for every value: sext(x >> c)
-+                            //    == (sext x) >> c. Unsigned arithmetic shifts
-+                            //    cannot arise from C, and zext does NOT commute
-+                            //    (the sign bit would be reintroduced), so
-+                            //    unsigned AShr is rejected.
-+                            //  - LShr (unsigned): logical shift commutes with
-+                            //    zero extension: zext(x >> c) == (zext x) >> c.
-+                            //    Signed logical shifts cannot arise from C and
-+                            //    are rejected.
-+                            match op {
-+                                IrBinOp::Shl if cur_is_unsigned => {
-+                                    let Some(r) = member_range(&members, cur) else {
-+                                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-+                                        continue;
-+                                    };
-+                                    let Some(cr) = const_as_range(*count, *ty) else {
-+                                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-+                                        continue;
-+                                    };
-+                                    let Some(nr) = binop_range(*op, r, cr) else {
-+                                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-+                                        continue;
-+                                    };
-+                                    if !nr.within(*ty) {
-+                                        // Bits would be shifted out: the
-+                                        // wrapped narrow value differs from the
-+                                        // wide shift. Decline.
-+                                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-+                                        continue;
-+                                    }
-+                                    members.push(Member::of(
-+                                        *dest,
-+                                        MemberKind::BinOpConst {
-+                                            op: *op,
-+                                            operand: cur,
-+                                            c: *count,
-+                                            const_is_lhs: false,
-+                                        },
-+                                        *ty,
-+                                        ext,
-+                                        Some(nr),
-+                                    ));
-+                                    queue.push((*dest, true));
-+                                    continue;
-+                                }
-+                                IrBinOp::Shl => {
-+                                    // Signed: UB theorem — admitted, no range.
-+                                    members.push(Member::of(
-+                                        *dest,
-+                                        MemberKind::BinOpConst {
-+                                            op: *op,
-+                                            operand: cur,
-+                                            c: *count,
-+                                            const_is_lhs: false,
-+                                        },
-+                                        *ty,
-+                                        ext,
-+                                        None,
-+                                    ));
-+                                    queue.push((*dest, true));
-+                                    continue;
-+                                }
-+                                IrBinOp::AShr if !cur_is_unsigned => {
-+                                    members.push(Member::of(
-+                                        *dest,
-+                                        MemberKind::BinOpConst {
-+                                            op: *op,
-+                                            operand: cur,
-+                                            c: *count,
-+                                            const_is_lhs: false,
-+                                        },
-+                                        *ty,
-+                                        ext,
-+                                        None,
-+                                    ));
-+                                    queue.push((*dest, true));
-+                                    continue;
-+                                }
-+                                IrBinOp::LShr if cur_is_unsigned => {
-+                                    members.push(Member::of(
-+                                        *dest,
-+                                        MemberKind::BinOpConst {
-+                                            op: *op,
-+                                            operand: cur,
-+                                            c: *count,
-+                                            const_is_lhs: false,
-+                                        },
-+                                        *ty,
-+                                        ext,
-+                                        None,
-+                                    ));
-+                                    queue.push((*dest, true));
-+                                    continue;
-+                                }
-+                                _ => {
-+                                    narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-+                                }
-+                            }
-+                        }
-                         _ => {
--                            // Shl/AShr/LShr, division, BitTest: not
--                            // extension-transparent.
-+                            // Division, BitTest: not extension-transparent.
-                             narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
-                         }
-                     }
-@@ -975,6 +1144,22 @@ fn analyze_iv(
+     NarrowCast { operand: Value },
++    /// A size-widening cast of a member that *changes* signedness
++    /// (`U32→I64` / `I32→U64` — the C frontend produces these when an
++    /// unsigned index feeds a signed-width GEP chain, e.g. `unsigned i;
++    /// a[i>>1]`, and for `(unsigned long)i` index expressions). The cast's
++    /// value equals the widened member on every executed iteration (the
++    /// extension semantics follow the 32-bit source's signedness, which is
++    /// exactly the member's `ext`; the no-wrap domain — signed-overflow-is-UB
++    /// for signed seeds, the counted bound for unsigned seeds — makes the
++    /// wide member bit-identical to the narrow one). The cast is therefore
++    /// retained and retyped to a same-size `wide_ty → to_ty` cast — a pure
++    /// reinterpretation the backend emits as a no-op — and its dest is
++    /// enqueued as a chain value so the wide chain below it (the I64 index
++    /// scaling and the GEP) is classified and can set `has_addressing`.
++    CrossCast { operand: Value },
+     /// `y = copy(x)`.
+     Copy { operand: Value },
+     /// `y = select(cond, a, b)` where `a` is a member and `b` is a const or a
+@@ -1067,6 +1090,31 @@ fn analyze_iv(
                          continue;
                      }
                      let same_sign = is_unsigned_ty(*to_ty) == is_unsigned_ty(*from_ty);
-+                    // Cross-sign widening cast (U32→I64 / I32→U64): the zext /
-+                    // sext value equals the widened member on every executed
-+                    // iteration, so retain the cast as a same-size bitcast of
-+                    // the wide value and keep classifying below it (the chain
-+                    // ops stay at the cast's own signed type).
-+                    if to_ty.size() >= 8 && !same_sign && *to_ty != IrType::Ptr {
++                    // Cross-sign widening cast (U32→I64 / I32→U64). Members
++                    // are always 32-bit, so these two pairs are the complete
++                    // set of cross-sign widening integer casts. The cast's
++                    // value equals the widened member bit-for-bit on every
++                    // executed iteration (see MemberKind::CrossCast), so it
++                    // is retained as a same-size reinterpretation and the
++                    // chain below it is enqueued for classification — the
++                    // wide scaling ops and the GEP that set has_addressing
++                    // live BELOW the cast, so without the enqueue the whole
++                    // `unsigned i; a[i>>1]` family declines (verified on
++                    // main @ dcf673d: 32-bit counter survived at -O2).
++                    if matches!(
++                        (*from_ty, *to_ty),
++                        (IrType::U32, IrType::I64) | (IrType::I32, IrType::U64)
++                    ) {
 +                        members.push(Member::of(
 +                            *dest,
 +                            MemberKind::CrossCast { operand: cur },
@@ -281,26 +761,7 @@ index 45e963d..b2e6537 100644
                      if to_ty.size() >= 4 && *to_ty != IrType::Ptr && same_sign {
                          // Widening cast (i8→i32, i32→i64, ...): the dest
                          // becomes wide; drop it and alias its uses to the
-@@ -1230,6 +1415,18 @@ fn binop_range(op: IrBinOp, a: Range, b: Range) -> Option<Range> {
-             lo: a.lo.max(b.lo),
-             hi: a.hi.max(b.hi),
-         }),
-+        IrBinOp::Shl => {
-+            // `a << c` (unsigned member, const count): non-negative operand
-+            // and count; the caller rejects the result unless it stays within
-+            // the narrow domain, which proves no bits are shifted out.
-+            if a.lo < 0 || b.lo < 0 || a.hi >> 62 != 0 {
-+                return None;
-+            }
-+            Some(Range {
-+                lo: a.lo << b.lo,
-+                hi: a.hi << b.lo,
-+            })
-+        }
-         _ => None,
-     }
- }
-@@ -1424,7 +1621,9 @@ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
+@@ -1537,7 +1585,9 @@ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
                      return false;
                  }
              }
@@ -311,7 +772,7 @@ index 45e963d..b2e6537 100644
                  let Instruction::Cast { src, .. } = inst else {
                      return false;
                  };
-@@ -1573,8 +1772,10 @@ fn apply_widen(
+@@ -1686,8 +1736,10 @@ fn apply_widen(
              | MemberKind::Copy { .. } => {
                  // Seed/latch handled above; casts/copies are dropped later.
              }
@@ -319,36 +780,25 @@ index 45e963d..b2e6537 100644
 -                // Retain the cast as a truncation of the wide value.
 +            MemberKind::NarrowCast { operand } | MemberKind::CrossCast { operand } => {
 +                // Retain the cast as a conversion of the wide value: a
-+                // truncation for NarrowCast, a same-size bitcast for
++                // truncation for NarrowCast, a same-size reinterpretation for
 +                // CrossCast (U64→I64 / I64→U64 emit as no-ops).
                  if let Some((bi, ii)) = find_def_mut(func, m.value) {
                      if let Instruction::Cast {
                          src, from_ty, ..
-@@ -2043,7 +2244,13 @@ fn escape_read_needs_narrow(inst: &Instruction, member: Value) -> bool {
-             ty.size() < 8 && (reads(lhs) || reads(rhs))
-         }
-         Instruction::Cmp { .. } => false,
--        Instruction::Cast { .. } | Instruction::Copy { .. } => false,
-+        Instruction::Cast { .. } => false,
-+        // A Copy of a narrow member carries a narrow dest: it must read the
-+        // truncation, not the wide value. (Copy-prop normally folds post-loop
-+        // copies into direct reads before this pass runs, but a surviving Copy
-+        // would otherwise feed a narrow-typed dest from a wide operand — a
-+        // type hazard that later unsigned consumers could misread.)
-+        Instruction::Copy { .. } => true,
-         Instruction::Select { ty, true_val, false_val, .. } => {
-             ty.size() < 8 && (reads(true_val) || reads(false_val))
-         }
-@@ -2685,6 +2892,78 @@ mod tests {
-         check(&mut func, 0);
+@@ -3470,4 +3522,337 @@ mod tests {
+             |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 5)
+         ));
      }
- 
++
 +    /// Cross-sign zext chain: `unsigned i; s += a[i >> 1]`. The frontend
 +    /// emits `LShr(U32) → Cast(U32→I64) → Shl(I64) → GEP`, and the
-+    /// signedness-changing cast used to stop the closure dead (no addressing
-+    /// member, no widening). The cast is a zext, which equals the widened
-+    /// U64 member on every executed iteration, so it is retained as a
-+    /// same-size U64→I64 bitcast (a no-op on x86) and the chain below it is
++    /// signedness-changing cast used to stop the closure dead: the cast dest
++    /// was never enqueued, so the wide scaling op and the GEP below it were
++    /// never scanned, `has_addressing` stayed false, and the IV declined
++    /// (verified: the 32-bit counter survived at -O2 on main @ dcf673d). The
++    /// cast value is a zext, which equals the widened U64 member on every
++    /// executed iteration, so it is retained as a same-size U64→I64
++    /// reinterpretation (a no-op on x86) and the chain below it is
 +    /// classified normally.
 +    #[test]
 +    fn test_cross_sign_zext_chain_widens() {
@@ -383,6 +833,14 @@ index 45e963d..b2e6537 100644
 +            gep_inst(13, 12, IrType::I8),
 +        ];
 +        let mut func = counting_loop("xzext", IrType::U32, IrBinOp::Add, body, Some(cmp));
++        // The latch const must be U32-typed.
++        func.blocks[3].instructions[0] = Instruction::BinOp {
++            dest: Value(5),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(1)),
++            rhs: Operand::Const(IrConst::I32(1)),
++            ty: IrType::U32,
++        };
 +        check(&mut func, 1);
 +        assert!(matches!(
 +            &func.blocks[1].instructions[0],
@@ -415,151 +873,17 @@ index 45e963d..b2e6537 100644
 +        ));
 +    }
 +
-     /// Unsigned IV with a signed-predicate cmp: the cmp must be kept narrow
-     /// via a truncation, not widened (zext is not order-preserving for
-     /// signed comparisons).
-@@ -2953,6 +3232,13 @@ mod tests {
-     /// `i8` IVs widen like i32 (movsbl on the carried path is the target).
-     #[test]
-     fn test_i8_iv() {
-+        // `i8`/`i16` IVs are DECLINED: widening would change the DEFINED
-+        // 8/16-bit wrap of the latch truncation
-+        // (`trunc(add(sext(phi), 1):I32):I8`), and the signed-overflow-is-UB
-+        // theorem does not cover promoted-narrow wrap. (The C frontend never
-+        // emits a direct narrow `Add` latch anyway — the promoted shape does
-+        // not match the candidacy — so this pins the decision on the
-+        // synthetic shape, which a future IR producer could emit.)
-         let body = vec![
-             Instruction::Cast {
-                 dest: Value(10),
-@@ -2974,11 +3260,11 @@ mod tests {
-             rhs: Operand::Const(IrConst::I8(1)),
-             ty: IrType::I8,
-         };
--        check(&mut func, 1);
-+        check(&mut func, 0);
-         assert!(matches!(
-             &func.blocks[1].instructions[0],
-             Instruction::Phi {
--                ty: IrType::I64,
-+                ty: IrType::I8,
-                 ..
-             }
-         ));
-@@ -3263,4 +3549,447 @@ mod tests {
-             |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 5)
-         ));
-     }
-+
-+    /// `a[i << 1]`: the narrow `Shl` on a signed IV is a closure member. The
-+    /// member is retyped to I64 so the address uses 64-bit arithmetic with no
-+    /// per-iteration `movslq` of the index.
-+    #[test]
-+    fn test_widen_shl_member() {
-+        let body = vec![
-+            Instruction::BinOp {
-+                dest: Value(10),
-+                op: IrBinOp::Shl,
-+                lhs: Operand::Value(Value(1)),
-+                rhs: Operand::Const(IrConst::I32(1)),
-+                ty: IrType::I32,
-+            },
-+            gep_inst(11, 10, IrType::I8),
-+        ];
-+        let mut func = counting_loop("shlmem", IrType::I32, IrBinOp::Add, body, None);
-+        check(&mut func, 1);
-+        assert!(func.blocks[2].instructions.iter().any(|i| {
-+            matches!(
-+                i,
-+                Instruction::BinOp {
-+                    op: IrBinOp::Shl,
-+                    ty: IrType::I64,
-+                    ..
-+                }
-+            )
-+        }));
-+        assert!(func.blocks[2].instructions.iter().any(
-+            |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 10)
-+        ));
-+    }
-+
-+    /// `a[i >> 2]` (signed): arithmetic shift commutes with sign extension —
-+    /// the member widens unconditionally.
-+    #[test]
-+    fn test_widen_ashr_member() {
-+        let body = vec![
-+            Instruction::BinOp {
-+                dest: Value(10),
-+                op: IrBinOp::AShr,
-+                lhs: Operand::Value(Value(1)),
-+                rhs: Operand::Const(IrConst::I32(2)),
-+                ty: IrType::I32,
-+            },
-+            gep_inst(11, 10, IrType::I8),
-+        ];
-+        let mut func = counting_loop("ashrmem", IrType::I32, IrBinOp::Add, body, None);
-+        check(&mut func, 1);
-+        assert!(func.blocks[2].instructions.iter().any(|i| {
-+            matches!(
-+                i,
-+                Instruction::BinOp {
-+                    op: IrBinOp::AShr,
-+                    ty: IrType::I64,
-+                    ..
-+                }
-+            )
-+        }));
-+    }
-+
-+    /// `u[i >> 1]` (unsigned): logical shift commutes with zero extension.
-+    #[test]
-+    fn test_widen_unsigned_lshr_member() {
-+        let cmp = Instruction::Cmp {
-+            dest: Value(99),
-+            op: IrCmpOp::Ult,
-+            lhs: Operand::Value(Value(1)),
-+            rhs: Operand::Const(IrConst::I32(64)),
-+            ty: IrType::U32,
-+        };
-+        let body = vec![
-+            Instruction::BinOp {
-+                dest: Value(10),
-+                op: IrBinOp::LShr,
-+                lhs: Operand::Value(Value(1)),
-+                rhs: Operand::Const(IrConst::I32(1)),
-+                ty: IrType::U32,
-+            },
-+            gep_inst(11, 10, IrType::I8),
-+        ];
-+        let mut func = counting_loop("ulshrmem", IrType::U32, IrBinOp::Add, body, Some(cmp));
-+        func.blocks[3].instructions[0] = Instruction::BinOp {
-+            dest: Value(5),
-+            op: IrBinOp::Add,
-+            lhs: Operand::Value(Value(1)),
-+            rhs: Operand::Const(IrConst::I32(1)),
-+            ty: IrType::U32,
-+        };
-+        check(&mut func, 1);
-+        assert!(matches!(
-+            &func.blocks[1].instructions[0],
-+            Instruction::Phi {
-+                ty: IrType::U64,
-+                ..
-+            }
-+        ));
-+    }
-+
 +    /// Unsigned `Shl` whose range proof shows bits would be shifted out: the
 +    /// member must be declined (wrapped narrow != wide shift), not widened.
 +    #[test]
-+    fn test_widen_unsigned_shl_wrap_bails() {
++    fn test_unsigned_shl_wrap_bails() {
 +        // Bound 0xC0000000: the seed range [0, 0xC0000000) shifted left by 1
 +        // reaches 0x180000000, outside u32 — the wrap proof must reject.
 +        let cmp = Instruction::Cmp {
 +            dest: Value(99),
 +            op: IrCmpOp::Ult,
 +            lhs: Operand::Value(Value(1)),
-+            rhs: Operand::Const(IrConst::I32(-0x4000_0000)),  // u32 bit pattern 0xC0000000
++            rhs: Operand::Const(IrConst::I32(-0x4000_0000)), // u32 bits 0xC0000000
 +            ty: IrType::U32,
 +        };
 +        let body = vec![
@@ -586,7 +910,7 @@ index 45e963d..b2e6537 100644
 +    /// Unsigned `AShr` cannot arise from C and does not commute with zext:
 +    /// declined. Signed `LShr` cannot arise from C: declined.
 +    #[test]
-+    fn test_widen_shift_foreign_sign_bails() {
++    fn test_shift_foreign_sign_bails() {
 +        let body_u = vec![
 +            Instruction::BinOp {
 +                dest: Value(10),
@@ -627,167 +951,43 @@ index 45e963d..b2e6537 100644
 +        let mut func = counting_loop("slshr", IrType::I32, IrBinOp::Add, body_s, None);
 +        check(&mut func, 0);
 +    }
-+}
 +
-+#[cfg(test)]
-+mod debug_g4 {
-+    use super::*;
-+    use crate::common::types::AddressSpace;
-+    use crate::ir::*;
-+
-+    fn check(func: &mut IrFunction, expected_widened: usize) {
-+        let n = widen_ivs_in_function(func);
-+        assert_eq!(n, expected_widened, "function {:?}", func.name);
-+        let mut violations = Vec::new();
-+        crate::passes::verify::verify_function(func, "iv_widen_g4", &mut violations);
-+        assert!(violations.is_empty(), "verify violations: {:?}", violations);
-+    }
-+
-+    fn counting_loop_u32(body_insts: Vec<Instruction>) -> IrFunction {
-+        let mut func = IrFunction::new("g4".to_string(), IrType::I64, vec![], false);
-+        // B0 preheader: init i = 0 (value 0); also a U32 param-ish copy
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(0)),
-+            }],
-+            terminator: Terminator::Branch(BlockId(1)),
-+            source_spans: Vec::new(),
-+        });
-+        let cmp = Instruction::Cmp {
-+            dest: Value(99),
-+            op: IrCmpOp::Ult,
-+            lhs: Operand::Value(Value(1)),
-+            rhs: Operand::Const(IrConst::I32(64)),
-+            ty: IrType::U32,
-+        };
-+        let mut header_insts = vec![Instruction::Phi {
-+            dest: Value(1),
-+            ty: IrType::U32,
-+            incoming: vec![
-+                (Operand::Value(Value(0)), BlockId(0)),
-+                (Operand::Value(Value(5)), BlockId(3)),
-+            ],
-+        }];
-+        header_insts.push(cmp);
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(1),
-+            instructions: header_insts,
-+            terminator: Terminator::CondBranch {
-+                cond: Operand::Value(Value(99)),
-+                true_label: BlockId(2),
-+                false_label: BlockId(4),
-+            },
-+            source_spans: Vec::new(),
-+        });
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(2),
-+            instructions: body_insts,
-+            terminator: Terminator::Branch(BlockId(3)),
-+            source_spans: Vec::new(),
-+        });
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(3),
-+            instructions: vec![Instruction::BinOp {
-+                dest: Value(5),
-+                op: IrBinOp::Add,
-+                lhs: Operand::Value(Value(1)),
-+                rhs: Operand::Const(IrConst::I32(1)),
-+                ty: IrType::U32,
-+            }],
-+            terminator: Terminator::Branch(BlockId(1)),
-+            source_spans: Vec::new(),
-+        });
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(4),
-+            instructions: vec![],
-+            terminator: Terminator::Return(None),
-+            source_spans: Vec::new(),
-+        });
-+        func.next_value_id = 100;
-+        func
-+    }
-+
++    /// Unsigned IV with a RUNTIME trip bound and a full accumulate body
++    /// (`for (i = 0; i < n; i++) s += a[i>>1]`, all runtime): the counted
++    /// bound needs no constant fold — any seed < n with unit steps exits at
++    /// ≤ n, so no executed value wraps u32. The cross-sign zext chain widens
++    /// and the accumulator phi / exit conversion stay untouched.
 +    #[test]
-+    fn g4_lshr_zext_shl_gep() {
-+        // %10 = LShr %1, 1 (U32); %11 = zext %10 (U64); %12 = Shl %11, 2 (I64);
-+        // GEP offset %12
-+        let body = vec![
-+            Instruction::BinOp {
-+                dest: Value(10),
-+                op: IrBinOp::LShr,
-+                lhs: Operand::Value(Value(1)),
-+                rhs: Operand::Const(IrConst::I32(1)),
-+                ty: IrType::U32,
-+            },
-+            Instruction::Cast {
-+                dest: Value(11),
-+                src: Operand::Value(Value(10)),
-+                from_ty: IrType::U32,
-+                to_ty: IrType::U64,
-+            },
-+            Instruction::BinOp {
-+                dest: Value(12),
-+                op: IrBinOp::Shl,
-+                lhs: Operand::Value(Value(11)),
-+                rhs: Operand::Const(IrConst::I64(2)),
-+                ty: IrType::I64,
-+            },
-+            Instruction::GetElementPtr {
-+                dest: Value(13),
-+                base: Value(50),
-+                offset: Operand::Value(Value(12)),
-+                ty: IrType::I8,
-+            },
-+        ];
-+        let mut func = counting_loop_u32(body);
-+        check(&mut func, 1);
-+        assert!(matches!(
-+            &func.blocks[1].instructions[0],
-+            Instruction::Phi {
-+                ty: IrType::U64,
-+                ..
-+            }
-+        ));
-+        assert!(func.blocks[2].instructions.iter().any(|i| {
-+            matches!(
-+                i,
-+                Instruction::BinOp {
-+                    op: IrBinOp::LShr,
-+                    ty: IrType::U64,
-+                    ..
-+                }
-+            )
-+        }));
-+    }
-+
-+    #[test]
-+    fn g4_runtime_bound_load_accum() {
-+        // Full g4d.c shape: U32 IV v28, U32 accumulator v27, runtime bound
-+        // param v3, body = LShr -> zext -> Shl -> GEP -> Load -> Add(s,load)
-+        // -> Add(i,1), all in the latch/body block B2.
-+        let mut func = IrFunction::new("g4".to_string(), IrType::I64, vec![], false);
-+        // B0 preheader: param n = v3 (U32), base = v2 (Ptr), accum init v0, iv init v1
++    fn test_runtime_bound_cross_cast_accum() {
++        let mut func = IrFunction::new("rtb".to_string(), IrType::I64, vec![], false);
++        // B0 preheader: base ptr v2 = param 0, bound v3 = param 1 (U32),
++        // accumulator init v0, IV init v1.
 +        func.blocks.push(BasicBlock {
 +            label: BlockId(0),
 +            instructions: vec![
-+                Instruction::ParamRef { dest: Value(2), param_idx: 0, ty: IrType::Ptr },
-+                Instruction::ParamRef { dest: Value(3), param_idx: 1, ty: IrType::U32 },
-+                Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I64(0)) },
-+                Instruction::Copy { dest: Value(1), src: Operand::Const(IrConst::I64(0)) },
++                Instruction::ParamRef {
++                    dest: Value(2),
++                    param_idx: 0,
++                    ty: IrType::Ptr,
++                },
++                Instruction::ParamRef {
++                    dest: Value(3),
++                    param_idx: 1,
++                    ty: IrType::U32,
++                },
++                Instruction::Copy {
++                    dest: Value(0),
++                    src: Operand::Const(IrConst::I64(0)),
++                },
++                Instruction::Copy {
++                    dest: Value(1),
++                    src: Operand::Const(IrConst::I32(0)),
++                },
 +            ],
 +            terminator: Terminator::Branch(BlockId(1)),
 +            source_spans: Vec::new(),
 +        });
-+        // B1 header: accum phi v27, IV phi v28, cmp Ult(v28, v3)
-+        let cmp = Instruction::Cmp {
-+            dest: Value(12),
-+            op: IrCmpOp::Ult,
-+            lhs: Operand::Value(Value(28)),
-+            rhs: Operand::Value(Value(3)),
-+            ty: IrType::U32,
-+        };
++        // B1 header: accumulator phi v27, IV phi v28, cmp Ult(v28, v3).
 +        func.blocks.push(BasicBlock {
 +            label: BlockId(1),
 +            instructions: vec![
@@ -796,7 +996,7 @@ index 45e963d..b2e6537 100644
 +                    ty: IrType::U32,
 +                    incoming: vec![
 +                        (Operand::Value(Value(0)), BlockId(0)),
-+                        (Operand::Value(Value(22)), BlockId(2)),
++                        (Operand::Value(Value(22)), BlockId(3)),
 +                    ],
 +                },
 +                Instruction::Phi {
@@ -804,10 +1004,16 @@ index 45e963d..b2e6537 100644
 +                    ty: IrType::U32,
 +                    incoming: vec![
 +                        (Operand::Value(Value(1)), BlockId(0)),
-+                        (Operand::Value(Value(24)), BlockId(2)),
++                        (Operand::Value(Value(24)), BlockId(3)),
 +                    ],
 +                },
-+                cmp,
++                Instruction::Cmp {
++                    dest: Value(12),
++                    op: IrCmpOp::Ult,
++                    lhs: Operand::Value(Value(28)),
++                    rhs: Operand::Value(Value(3)),
++                    ty: IrType::U32,
++                },
 +            ],
 +            terminator: Terminator::CondBranch {
 +                cond: Operand::Value(Value(12)),
@@ -816,7 +1022,7 @@ index 45e963d..b2e6537 100644
 +            },
 +            source_spans: Vec::new(),
 +        });
-+        // B2 body+latch
++        // B2 body: LShr -> zext -> Shl -> GEP -> Load -> accum Add.
 +        func.blocks.push(BasicBlock {
 +            label: BlockId(2),
 +            instructions: vec![
@@ -860,18 +1066,24 @@ index 45e963d..b2e6537 100644
 +                    rhs: Operand::Value(Value(20)),
 +                    ty: IrType::U32,
 +                },
-+                Instruction::BinOp {
-+                    dest: Value(24),
-+                    op: IrBinOp::Add,
-+                    lhs: Operand::Value(Value(28)),
-+                    rhs: Operand::Const(IrConst::I32(1)),
-+                    ty: IrType::U32,
-+                },
 +            ],
++            terminator: Terminator::Branch(BlockId(3)),
++            source_spans: Vec::new(),
++        });
++        // B3 latch.
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::BinOp {
++                dest: Value(24),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(28)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::U32,
++            }],
 +            terminator: Terminator::Branch(BlockId(1)),
 +            source_spans: Vec::new(),
 +        });
-+        // B4 exit
++        // B4 exit: zext the accumulator for the return.
 +        func.blocks.push(BasicBlock {
 +            label: BlockId(4),
 +            instructions: vec![Instruction::Cast {
@@ -892,56 +1104,124 @@ index 45e963d..b2e6537 100644
 +                ..
 +            }
 +        ));
++        // The accumulator phi must stay U32 (it is not part of the closure).
++        assert!(matches!(
++            &func.blocks[1].instructions[0],
++            Instruction::Phi {
++                ty: IrType::U32,
++                ..
++            }
++        ));
++        // The cross-sign cast survives as a same-size U64→I64 conversion.
++        assert!(func.blocks[2].instructions.iter().any(|i| matches!(
++            i,
++            Instruction::Cast {
++                from_ty: IrType::U64,
++                to_ty: IrType::I64,
++                ..
++            }
++        )));
 +    }
  }
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 42a38b2..a8a8681 100644
+index 42a38b2..ce16ed0 100644
 --- a/src/passes/vectorize.rs
 +++ b/src/passes/vectorize.rs
-@@ -269,6 +269,52 @@ fn vectorize_with_analysis_mode(
+@@ -269,6 +269,103 @@ fn vectorize_with_analysis_mode(
                  continue;
              }
  
-+            // IV-WIDTH PRECONDITION -- only 32-bit induction variables may
-+            // become the vector loop's counter. Both addressing schemes
-+            // rescale the counter's unit past its narrow domain:
-+            //   - byte-offset IV: the IV steps `byte_stride` (w * elem_size)
-+            //     per iteration and the limit is multiplied by `byte_stride`,
-+            //     so an I8/U8/I16/U16 counter wraps once the byte range
-+            //     exceeds its width. Verified: `unsigned char i;
-+            //     for (i = 0; i < n; i++) s += a[i];` with n = 120 vectorized
-+            //     into a U8 counter stepped by 16 against a byte-limit of
-+            //     480 -- the counter wraps at 256 and the loop spins forever
-+            //     at -O2 (GCC terminates).
-+            //   - element-index IV: the limit is divided by w, which keeps the
-+            //     trip count small, but the transform selects the byte-offset
-+            //     scheme whenever the GEP offset is `iv * elem_size` (the
-+            //     common case), and the remainder resumes at
-+            //     `iv_final >> log2(elem)` -- a narrow counter makes both the
-+            //     vector coverage and the remainder start wrong once the
-+            //     scaled range exceeds its domain.
-+            // A narrow-IV reduction therefore stays scalar; its trip counts
-+            // are small and the scalar form is already tight. Checked at the
-+            // dispatcher so both the SSE2 and the AVX2 transforms are gated.
++            // IV PRECONDITIONS — gate BOTH the SSE2 and the AVX2 reduction
++            // transform (both are called only from this dispatcher).
++            //
++            // (1) IV-WIDTH: only 32-bit-or-wider induction variables may
++            //     become the vector loop's counter. Both addressing schemes
++            //     rescale the counter's unit past a narrow domain:
++            //       - byte-offset IV: the IV steps `byte_stride`
++            //         (w * elem_size) per iteration and the limit is
++            //         multiplied by `byte_stride`, so an I8/U8/I16/U16
++            //         counter wraps once the byte range exceeds its width.
++            //         Reproduced on main @ dcf673d, -O2: `unsigned char i;
++            //         for (i = 0; i < n; i++) s += a[i];` with n = 120
++            //         vectorized into a U8 counter stepped by 16 against a
++            //         byte-limit of 480 — the counter wraps at 256 and the
++            //         loop spins forever (GCC terminates and prints 7140).
++            //       - element-index IV: the limit is divided by w, which
++            //         keeps the trip count small, but the transform selects
++            //         the byte-offset scheme whenever the GEP offset is
++            //         `iv * elem_size` (the common case), and the remainder
++            //         resumes at `iv_final >> log2(elem)` — a narrow counter
++            //         makes both the vector coverage and the remainder start
++            //         wrong once the scaled range exceeds its domain.
++            //     A narrow-IV reduction therefore stays scalar; its trip
++            //     counts are small and the scalar form is already tight.
++            //
++            // (2) IV-START: only constant-zero-init reductions may vectorize.
++            //     Both addressing schemes assume the IV starts at element 0:
++            //       - byte-offset IV: the limit is rescaled to
++            //         `(n / w) * byte_stride` but the IV keeps its original
++            //         preheader value, so with `for (i = c; i < n; i++)
++            //         s += a[i]`, c != 0, the vector loop walks byte offsets
++            //         [c, (n/w)*byte_stride) in `byte_stride` steps and the
++            //         remainder resumes at `iv_final >> log2(elem)` — a
++            //         misaligned, truncated run that silently drops
++            //         elements.
++            //       - element-index IV: the limit is divided to `n / w` but
++            //         the IV starts at c, so the vector loop exits after
++            //         covering only [c, c + w*floor(n/w)) and the remainder
++            //         resumes at `iv_final * w`, far past the loop's actual
++            //         range.
++            //     Reproduced on main @ dcf673d, -O2 (GCC 14.2 prints 1760):
++            //       `int`  accumulator, i = 5, n = 60 -> 31708938240 (AVX2)
++            //       `long` accumulator, i = 5, n = 60 -> 30702305280 (SSE2)
++            //     The SSE2 breakage is why this precondition lives in the
++            //     dispatcher and not only inside the AVX2 transform. A
++            //     DYNAMIC start (the preheader incoming is a Value) is
++            //     rejected by the same check — no const exists to inspect.
++            //     The Max reduction carries c-aware remainder math
++            //     (max_shift in insert_reduction_remainder_loop) but it only
++            //     reads CONST starts and no c != 0 Max shape the detector
++            //     accepts currently vectorizes; rejecting everything but
++            //     const-zero-init keeps every scheme provably correct and
++            //     costs nothing on the supported set.
 +            {
-+                let narrow_iv = func.blocks[red_pattern.header_idx]
-+                    .instructions
-+                    .iter()
-+                    .any(|inst| {
-+                        if let Instruction::Phi { dest, ty, .. } = inst {
-+                            *dest == red_pattern.iv
-+                                && matches!(
-+                                    ty,
-+                                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-+                                )
-+                        } else {
-+                            false
++                let hdr = &func.blocks[red_pattern.header_idx];
++                let latch_label = func.blocks[red_pattern.latch_idx].label;
++                let mut narrow_iv = false;
++                let mut const_zero_init = false;
++                for inst in &hdr.instructions {
++                    if let Instruction::Phi {
++                        dest,
++                        ty,
++                        incoming,
++                        ..
++                    } = inst
++                    {
++                        if *dest != red_pattern.iv {
++                            continue;
 +                        }
-+                    });
++                        narrow_iv = matches!(
++                            ty,
++                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
++                        );
++                        const_zero_init = incoming.iter().any(|(op, lbl)| {
++                            *lbl != latch_label
++                                && matches!(op, Operand::Const(c) if c.to_i64() == Some(0))
++                        });
++                    }
++                }
 +                if narrow_iv {
 +                    if debug {
 +                        eprintln!(
 +                            "[VEC] Skip reduction: induction variable is narrower than 32 bits (stays scalar)"
++                        );
++                    }
++                    continue;
++                }
++                if !const_zero_init {
++                    if debug {
++                        eprintln!(
++                            "[VEC] Skip reduction: induction variable does not start at a constant 0 (limit rescale + remainder math assume an element-0 start)"
 +                        );
 +                    }
 +                    continue;
@@ -951,350 +1231,51 @@ index 42a38b2..a8a8681 100644
              // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
              let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
              let vec_width: i64 = if use_sse2 { 2 } else { 4 };
-@@ -8807,6 +8853,51 @@ fn transform_reduction_avx2(
-         }
-     }
+diff --git a/tests/regression/iv_widen_latch_and_bound.c b/tests/regression/iv_widen_latch_and_bound.c
+index 8c56147..90d2ea3 100644
+--- a/tests/regression/iv_widen_latch_and_bound.c
++++ b/tests/regression/iv_widen_latch_and_bound.c
+@@ -83,7 +83,11 @@ __attribute__((noinline)) static long countdown(const int *a, int n) {
+     return s;
+ }
  
-+    // IV-START PRECONDITION -- only constant-zero-init reductions may
-+    // vectorize (checked BEFORE any IR is touched, in the same spirit as the
-+    // contiguity precondition above).
-+    //
-+    // Both addressing schemes assume the IV starts at element 0:
-+    //   - byte-offset IV: the limit is rescaled to `(n / w) * byte_stride`
-+    //     but the IV keeps its original preheader value, so with
-+    //     `for (i = c; i < n; i++) s += a[i]`, c != 0 the vector loop walks
-+    //     byte offsets [c, (n/w)*byte_stride) in `byte_stride` steps and the
-+    //     remainder resumes at `iv_final >> log2(elem)` -- a misaligned,
-+    //     truncated run that silently drops elements.
-+    //   - element-index IV: the limit is divided to `n / w` but the IV
-+    //     starts at c, so the vector loop exits after covering only
-+    //     [c, c + w*floor(n/w)) and the remainder resumes at `iv_final * w`,
-+    //     far past the loop's actual range.
-+    // Verified: with c = 5 and n = 60, `sum += a[i]` returned the sum of
-+    // elements [5, 17) instead of [5, 60) at -O2 (GCC 16.2 returns [5, 60)).
-+    // The same breakage occurs for a DYNAMIC start (the IV phi's preheader
-+    // incoming is then a Value, and no const exists to inspect).
-+    // The Max reduction carries c-aware remainder math (max_shift in
-+    // insert_reduction_remainder_loop) but it only reads CONST starts and no
-+    // c != 0 Max shape the detector accepts currently vectorizes; rejecting
-+    // everything but const-zero-init keeps every scheme provably correct and
-+    // costs nothing on the supported set.
-+    {
-+        let latch_label = func.blocks[pattern.latch_idx].label;
-+        let const_zero_init = func.blocks[pattern.header_idx]
-+            .instructions
-+            .iter()
-+            .any(|inst| {
-+                if let Instruction::Phi { dest, incoming, .. } = inst {
-+                    if *dest == pattern.iv {
-+                        return incoming.iter().any(|(op, lbl)| {
-+                            *lbl != latch_label
-+                                && matches!(op, Operand::Const(c) if c.to_i64() == Some(0))
-+                        });
-+                    }
-+                }
-+                false
-+            });
-+        if !const_zero_init {
-+            return 0;
-+        }
-+    }
-+
-     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-     let mut changes = 0;
- 
-diff --git a/tests/regression/iv_widen_derived_closure.c b/tests/regression/iv_widen_derived_closure.c
-new file mode 100644
-index 0000000..241f56f
---- /dev/null
-+++ b/tests/regression/iv_widen_derived_closure.c
-@@ -0,0 +1,120 @@
-+/* IV-widening of the counter's DERIVED CLOSURE (Agent A v2 battery, adopted
-+ * after audit — in-bounds differential, ASAN-clean). See the file body for
-+ * the shape-by-shape rationale. */
-+/* Induction-variable widening of the counter's DERIVED CLOSURE.
-+ *
-+ * `iv_widen` widens an I32 counter to I64 so the backend stops re-emitting
-+ * `movslq` after every 32-bit `addl`. The original pass only admitted a bare
-+ * `Cast(I32->I64)->GEP` use, so every counter with *derived* addressing
-+ * values -- `s[i-1]`, `s[(i&7)+1]`, `s[i*3]` -- kept a per-iteration
-+ * `movslq`, one of them on the loop-carried dependency path.
-+ *
-+ * This pass now widens the counter's whole derived closure: every value
-+ * reachable from the phi through a width-preserving op (`Add`/`Sub`/`And`/
-+ * `Or`/`Xor`/`Shl`/`Mul` with a constant, plus transparent `Copy`s) is
-+ * retyped to I64 with the phi.
-+ *
-+ * SOUNDNESS is not a probabilistic argument. `ext(a op c) == ext(a) op_ext c`
-+ * (ext = sext for I32 / zext for U32) must hold on every defined execution:
-+ *   * SIGNED counter: signed overflow is UB, so the narrow op cannot wrap on
-+ *     any defined execution — `Add`/`Sub`/`SubConst`/`Mul`/`Shl`/`AShr`
-+ *     admit unconditionally (no range proof needed, and a runtime trip bound
-+ *     is fine).
-+ *   * UNSIGNED counter: unsigned ops wrap DEFINED, so `Add`/`Sub`/`Mul`/`Shl`
-+ *     need a proven parent range whose image stays in [0, u32::MAX] (from the
-+ *     trip bound); `And`/`Or`/`Xor`/`LShr` with a constant commute with zext
-+ *     unconditionally and always admit.
-+ * Every member records which closure value it derives from (explicit
-+ * provenance) and that provenance is debug_assert-ed; the previous design
-+ * admitted ops whose operand was never in the closure and shipped a
-+ * sqlite_varint miscompile.
-+ *
-+ * Expected output (GCC oracle): 435130 68 5641461920691080488
-+ */
-+#include <stdio.h>
-+
-+__attribute__((noinline)) static long stencil(int *s, long p, long *acc) {
-+    for (int i = 2; i <= 64; i++) {
-+        s[i] = s[i - 1] + (int)p;
-+        *acc ^= s[(i & 7) + 1];
-+    }
-+    return *acc;
-+}
-+
-+__attribute__((noinline)) static long mask_off(const int *a, int n) {
-+    long s = 0;
-+    for (int i = 0; i < n; i++) {
-+        s += a[(i & 15) + 3];
-+    }
-+    return s;
-+}
-+
-+__attribute__((noinline)) static long stride3(const int *a, int n) {
-+    long s = 0;
-+    for (int i = 0; i < n; i++) {
-+        s += a[i * 3];
-+    }
-+    return s;
-+}
-+
-+__attribute__((noinline)) static long countdown(const int *a, int n) {
-+    long s = 0;
-+    for (int i = n - 1; i >= 1; i--) {
-+        s += a[i - 1];
-+    }
-+    return s;
-+}
-+
-+__attribute__((noinline)) static unsigned umask(const unsigned *a, unsigned n) {
-+    unsigned s = 0;
-+    for (unsigned i = 0; i < n; i++) {
-+        s += a[(i & 7) + 1];
-+    }
-+    return s;
-+}
-+
-+__attribute__((noinline)) static long shift2(const int *a, int n) {
-+    long s = 0;
-+    for (int i = 0; i < n; i++) {
-+        s += a[i << 1];
-+    }
-+    return s;
-+}
-+
-+/* Soundness pin: a RUNTIME trip bound is fine for the SIGNED counter
-+ * (`i + 1` is admissible via the signed-overflow-is-UB argument), and the
-+ * bitwise `(i & 7) + 1` is admissible regardless. The function must simply
-+ * stay correct. */
-+__attribute__((noinline)) static long runtime_bound(const int *a, int n) {
-+    long s = 0;
-+    for (int i = 0; i < n; i++) {
-+        s += a[i + 1] + a[(i & 7) + 1];
-+    }
-+    return s;
-+}
-+
-+int main(void) {
-+    enum { N = 300 };
-+    static int a[N];
-+    static unsigned u[N];
-+    long acc = 0x99;
-+    for (int i = 0; i < N; i++) {
-+        a[i] = (i * 17 + 3) % 1000;
-+        u[i] = (unsigned)(i * 13 + 7) % 1000;
-+    }
-+    long r = 0;
-+    r += stencil(a, 7, &acc);
-+    r += mask_off(a, N);
-+    r += stride3(a, 100);
-+    r += countdown(a, N);
-+    r += umask(u, N);
-+    r += shift2(a, 150);
-+    r += runtime_bound(a, N - 1);
-+    long ck = 0;
-+    for (int i = 0; i < N; i++) {
-+        ck = ck * 31 + a[i];
-+        ck ^= u[i];
-+    }
-+    printf("%ld %ld %ld\n", r, acc, ck);
-+    return 0;
-+}
-\ No newline at end of file
-diff --git a/tests/regression/iv_widen_latch_bound_soundness.c b/tests/regression/iv_widen_latch_bound_soundness.c
-new file mode 100644
-index 0000000..6374859
---- /dev/null
-+++ b/tests/regression/iv_widen_latch_bound_soundness.c
-@@ -0,0 +1,149 @@
-+/* IV-widening: latch operand sides, loop-variant steps, non-constant trip
-+ * bounds, and mixed-signedness compares. Coverage drawn from the Agent A v2
-+ * audit battery (latch_and_bound), with all index ranges kept inside the
-+ * array bounds so the GCC differential is meaningful (the original battery
-+ * read `a[i*3]` up to index ~3n on a 400-element array — a silent
-+ * out-of-bounds read that passed vacuously).
-+ *
-+ *   1. `Add(step, phi)` — the latch recurrence written with the step on the
-+ *      LEFT. The pass must either rewrite the correct operand or bail;
-+ *      overwriting `rhs` unconditionally used to corrupt the latch into an
-+ *      infinite loop.
-+ *   2. Loop-VARIANT step — `i += step` where `step` changes inside the loop.
-+ *      Hoisting the preheader extend of such a step is a use-before-def
-+ *      (invalid SSA). The pass must validate invariance before any IR
-+ *      mutation and decline.
-+ *   3. Header-computed trip bound — `i < n - 1`: loop-invariant in VALUE but
-+ *      defined in the header (does not dominate the preheader). The widened
-+ *      compare must extend it in the header, not the preheader.
-+ *   4. Decrementing latch — `i--` widens to a wide `subq`; the index is used
-+ *      directly with no per-iteration re-extension.
-+ *   5. Derived addressing with a RUNTIME bound (signed counter: admissible
-+ *      via signed-overflow-is-UB; unsigned counters still need the counted
-+ *      bound).
-+ *   6. Signedness of the compare — a signed IV vs an unsigned bound (C
-+ *      converts to unsigned -> Ult) and an unsigned IV vs a signed bound
-+ *      stay bit-exact.
-+ */
-+#include <stdio.h>
-+
-+/* (1) latch Add(step, phi): step on the left. */
-+__attribute__((noinline)) static int lhs_step(const int *a, int n, int k) {
-+    int s = 0;
-+    for (int i = 0; i < n; i = k + i) {
-+        s += a[i];
-+    }
-+    return s;
-+}
-+
-+/* (2) loop-variant step: `step` is redefined inside the body. */
-+__attribute__((noinline)) static int variant_step(const int *a, int n) {
-+    int s = 0;
-+    int step = 1;
-+    for (int i = 0; i < n; i += step) {
-+        s += a[i];
-+        step += 2;
-+    }
-+    return s;
-+}
-+
-+/* (3) header-computed bound `n - 1` with `a[i + 1]`. */
-+__attribute__((noinline)) static long plus1_hoisted_bound(const int *a, int n) {
-+    long s = 0;
-+    for (int i = 0; i < n - 1; i++) {
-+        s += a[i + 1];
-+    }
-+    return s;
-+}
-+
-+/* (3b) header-computed bound `n + 1` with `a[i - 1]`. */
-+__attribute__((noinline)) static long minus1_hoisted_bound(const int *a, int n) {
-+    long s = 0;
-+    for (int i = 1; i < n + 1; i++) {
-+        s += a[i - 1];
-+    }
-+    return s;
-+}
-+
-+/* (4) decrementing latch, Sub(phi, step). */
-+__attribute__((noinline)) static long countdown(const int *a, int n) {
-+    long s = 0;
-+    for (int i = n - 1; i >= 0; i--) {
-+        s += a[i];
-+    }
-+    return s;
-+}
-+
+-/* (5) derived addressing with a RUNTIME bound (signed: admissible). */
 +/* (5) derived addressing with a RUNTIME bound (signed: admissible).
-+ * In-bounds: caller guarantees n <= N/3 so i*3 < N. */
-+__attribute__((noinline)) static long runtime_derived(const int *a, int n) {
-+    long s = 0;
-+    for (int i = 0; i < n; i++) {
-+        s += a[i + 1] + a[i << 1] + a[i * 3];
-+    }
-+    return s;
-+}
-+
-+/* (6) signed IV vs unsigned bound (Ult). */
-+__attribute__((noinline)) static int signed_iv_ult(const int *a, int n) {
-+    int s = 0;
-+    for (int i = 0; i < (unsigned)n; i++) {
-+        s += a[i];
-+    }
-+    return s;
-+}
-+
-+/* (6b) unsigned IV vs signed bound (cast forces the signed cmp). */
-+__attribute__((noinline)) static int unsigned_iv_slt(const int *a, unsigned n) {
-+    int s = 0;
-+    for (unsigned i = 0; i < (int)n; i++) {
-+        s += a[i];
-+    }
-+    return s;
-+}
-+
-+/* (6c) signed IV near the i32 boundary (must not mis-widen the cmp). */
-+__attribute__((noinline)) static long high_bit(const int *a, int n) {
-+    long s = 0;
-+    for (int i = n - 5; i < n; i++) {
-+        s += a[i & 0x7fffffff];
-+    }
-+    return s;
-+}
-+
-+/* (6d) unsigned IV with high values and a masked, offset index. */
-+__attribute__((noinline)) static unsigned umask_hi(const unsigned *a, unsigned n) {
-+    unsigned s = 0;
-+    for (unsigned i = 0; i < n; i++) {
-+        s += a[(i & 0x80000007u) + 1];
-+    }
-+    return s;
-+}
-+
-+int main(void) {
++ * In-bounds: the caller passes n <= N/3 so i*3 < N. (The original battery
++ * called this with N-1, reading `a[i*3]` up to index ~3(N-1) on an
++ * N-element array — a silent out-of-bounds read that made the GCC
++ * differential vacuous. Caught in the Agent B audit.) */
+ __attribute__((noinline)) static long runtime_derived(const int *a, int n) {
+     long s = 0;
+     for (int i = 0; i < n; i++) {
+@@ -129,7 +133,7 @@ __attribute__((noinline)) static unsigned umask_hi(const unsigned *a, unsigned n
+ }
+ 
+ int main(void) {
+-    enum { N = 400 };
 +    enum { N = 420 };
-+    static int a[N];
-+    static unsigned u[N];
-+    for (int i = 0; i < N; i++) {
-+        a[i] = (i * 7 - 3) % 1000;
-+        u[i] = (unsigned)(i * 11 + 5) % 1000;
-+    }
-+    long r = 0;
-+    r += lhs_step(a, N, 2);
-+    r += variant_step(a, N);
-+    r += plus1_hoisted_bound(a, N);
-+    r += minus1_hoisted_bound(a, N);
-+    r += countdown(a, N);
+     static int a[N];
+     static unsigned u[N];
+     for (int i = 0; i < N; i++) {
+@@ -142,7 +146,7 @@ int main(void) {
+     r += plus1_hoisted_bound(a, N);
+     r += minus1_hoisted_bound(a, N);
+     r += countdown(a, N);
+-    r += runtime_derived(a, N - 1);
 +    r += runtime_derived(a, N / 3); /* in-bounds: 3*i <= 3*(N/3-1) < N */
-+    r += signed_iv_ult(a, N);
-+    r += unsigned_iv_slt(a, N);
-+    r += high_bit(a, N);
-+    r += umask_hi(u, N);
-+    long ck = 0;
-+    for (int i = 0; i < N; i++) {
-+        ck = ck * 31 + a[i];
-+        ck ^= u[i];
-+    }
-+    printf("%ld %ld\n", r, ck);
-+    return 0;
-+}
+     r += signed_iv_ult(a, N);
+     r += unsigned_iv_slt(a, N);
+     r += high_bit(a, N);
 diff --git a/tests/regression/iv_widen_unsigned_runtime_bound.c b/tests/regression/iv_widen_unsigned_runtime_bound.c
 new file mode 100644
-index 0000000..48e87ee
+index 0000000..10bc679
 --- /dev/null
 +++ b/tests/regression/iv_widen_unsigned_runtime_bound.c
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,87 @@
 +/* IV-widening of UNSIGNED counters with RUNTIME trip bounds and
 + * signedness-changing index chains.
 + *
-+ * The C frontend promotes `unsigned i` arithmetic to U32 and sign-casts the
++ * The C frontend promotes `unsigned i` arithmetic to U32 and zero-extends the
 + * index to the 64-bit GEP width (`Cast(U32->I64)`). `iv_widen` may only
 + * widen such an IV when the loop provably cannot wrap in U32 — which holds
 + * BY CONSTRUCTION for a unit-step `i < n` (Ult) loop with any init and any
@@ -1306,6 +1287,11 @@ index 0000000..48e87ee
 + * widens to 64-bit arithmetic (no per-iteration `movslq`/re-extension).
 + *
 + * Every function below is differential-tested against GCC by the harness.
++ *
++ * Ported from the Agent B g4 battery; the CrossCast member kind (the
++ * signedness-changing U32->I64 cast retained as a same-size reinterpretation
++ * of the widened member, with the chain below it enqueued) is what unlocks
++ * these shapes — see MemberKind::CrossCast in src/passes/iv_widen.rs.
 + */
 +#include <stdio.h>
 +
@@ -1375,22 +1361,36 @@ index 0000000..48e87ee
 +}
 diff --git a/tests/regression/vectorize_narrow_iv_reduction.c b/tests/regression/vectorize_narrow_iv_reduction.c
 new file mode 100644
-index 0000000..3af63ee
+index 0000000..8aaed53
 --- /dev/null
 +++ b/tests/regression/vectorize_narrow_iv_reduction.c
-@@ -0,0 +1,96 @@
-+/* Vectorizer guard: reduction over NARROW induction variables.
+@@ -0,0 +1,149 @@
++/* Vectorizer guards: reduction loops whose induction variable is NARROW
++ * (8/16-bit) or does not start at a constant zero.
 + *
-+ * Reduction vectorization of a loop whose induction variable is 8/16-bit
-+ * (`unsigned char`, `signed char`, `unsigned short`, `signed short`) used
-+ * to retype the narrow counter into a vectorized byte/word step of 16
-+ * against a byte-scaled trip limit — e.g. `unsigned char i; for (i = 0;
-+ * i < n; i++) s += a[i]` with n = 120 became a U8 counter stepping 16
-+ * toward byte-limit 480, wrapping at 256 and looping forever at -O2.
++ * (1) NARROW IV — reduction vectorization of a loop whose induction
++ *     variable is 8/16-bit (`unsigned char`, `signed char`,
++ *     `unsigned short`, `signed short`) used to retype the narrow counter
++ *     into a vectorized byte/word step of 16 against a byte-scaled trip
++ *     limit — e.g. `unsigned char i; for (i = 0; i < n; i++) s += a[i]`
++ *     with n = 120 became a U8 counter stepping 16 toward byte-limit 480,
++ *     wrapping at 256 and looping forever at -O2 (reproduced on main @
++ *     dcf673d; GCC terminates and prints 7140).
++ *
++ * (2) NON-ZERO IV START — both reduction addressing schemes rescale the
++ *     trip limit but keep the IV's original preheader value, so a start of
++ *     `c != 0` made the vector loop cover [c, c + w*floor((n-c')/w)) with a
++ *     remainder resuming at a rescaled IV — silently dropping or misreading
++ *     elements. Reproduced on main @ dcf673d, -O2 (GCC prints 1760):
++ *       `int`  accumulator, i = 5, n = 60 -> 31708938240 (AVX2 4-wide path)
++ *       `long` accumulator, i = 5, n = 60 -> 30702305280 (SSE2 2-wide path)
++ *     The SSE2 breakage is why the guard lives in the reduction DISPATCHER
++ *     (both transforms are gated), not only inside the AVX2 transform.
 + *
 + * The vectorizer now requires the loop's induction phi to be I32/U32-wide
-+ * before it applies either the SSE2 or AVX2 reduction transform. These
-+ * loops must compile, terminate, and stay bit-exact against GCC.
++ * AND to start at a constant 0 before it applies either the SSE2 or the
++ * AVX2 reduction transform. These loops must compile, terminate, and stay
++ * bit-exact against GCC.
 + *
 + * Trip counts stay inside each narrow type's domain (where the C program is
 + * defined and terminating): 8-bit counters below 128/256, 16-bit below
@@ -1443,13 +1443,46 @@ index 0000000..3af63ee
 +    return s;
 +}
 +
++/* (2) Non-zero constant start, I32 accumulator (AVX2 4-wide path). */
++__attribute__((noinline)) static long start5_int(const int *a, int n) {
++    long s = 0;
++    for (int i = 5; i < n; i++) {
++        s += a[i];
++    }
++    return s;
++}
++
++/* (2) Non-zero constant start, I64 accumulator + elements (SSE2 2-wide
++ * path — the transform the AVX2-only guard would have missed). */
++__attribute__((noinline)) static long start5_long(const long *a, int n) {
++    long s = 0;
++    for (int i = 5; i < n; i++) {
++        s += a[i];
++    }
++    return s;
++}
++
++/* (2) Non-zero start with a dot-product body (two-array reduction). */
++__attribute__((noinline)) static long start3_dot(const int *a, const int *b,
++                                                 int n) {
++    long s = 0;
++    for (int i = 3; i < n; i++) {
++        s += a[i] * b[i];
++    }
++    return s;
++}
++
 +int main(void) {
 +    enum { N = 300 };
 +    enum { NBIG = 66000 };
 +    static int a[N + 4];
++    static long al[N];
 +    static int big[NBIG];
 +    for (int i = 0; i < N + 4; i++) {
 +        a[i] = (i * 17 - 5) % 700 - 350;
++    }
++    for (int i = 0; i < N; i++) {
++        al[i] = (long)(i * 31 - 11) % 9000 - 4500;
 +    }
 +    for (int i = 0; i < NBIG; i++) {
 +        big[i] = (i * 13 - 7) % 900 - 450;
@@ -1472,6 +1505,12 @@ index 0000000..3af63ee
 +    h = h * 31 + u8red(a, 250);    /* inside 8-bit domain but > 128 */
 +    h = h * 31 + u16red(big, 60000);
 +    h = h * 31 + s16red(big, 30000);
++    /* Non-zero-start reductions (must stay scalar, stay exact). */
++    h = h * 31 + start5_int(a, 60);
++    h = h * 31 + start5_int(a, 297);
++    h = h * 31 + start5_long(al, 60);
++    h = h * 31 + start5_long(al, 297);
++    h = h * 31 + start3_dot(a, big, 297);
 +    printf("%ld\n", h);
 +    return 0;
 +}
