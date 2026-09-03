@@ -1,1337 +1,442 @@
 diff --git a/.base_ref b/.base_ref
-index c346eb47..d05a56a7 100644
+index d05a56a7..831afaf4 100644
 --- a/.base_ref
 +++ b/.base_ref
 @@ -1 +1 @@
--e2d5ef6675cb8fcb085733f11cf49b46c8077fd2
-+77eb34e130931c44cc9614e2b95fc58e94c3297b
-diff --git a/engineering/AUDIT-2026-09-03-PR363-364-direct-stores-and-zero-guards.md b/engineering/AUDIT-2026-09-03-PR363-364-direct-stores-and-zero-guards.md
+-77eb34e130931c44cc9614e2b95fc58e94c3297b
++0a12c3920769403561da60b08763cce1f295d014
+diff --git a/engineering/AUDIT-2026-09-03-natural-width-conditional-selects.md b/engineering/AUDIT-2026-09-03-natural-width-conditional-selects.md
 new file mode 100644
-index 00000000..0f9451b3
+index 00000000..386fc61a
 --- /dev/null
-+++ b/engineering/AUDIT-2026-09-03-PR363-364-direct-stores-and-zero-guards.md
-@@ -0,0 +1,218 @@
-+# Red-team audit: upstream PRs #363/#364 on wide-immediate stores + further perfection (direct stores, Clz/Ctz zero-guards)
++++ b/engineering/AUDIT-2026-09-03-natural-width-conditional-selects.md
+@@ -0,0 +1,142 @@
++# Natural-width conditional selects (constant arms) — x86/IR fix
 +
-+Date: 2026-09-03. Branch `wip/audit358-359`, now **rebased on upstream main `77eb34e1`** with three further commits on top:
-+`cd049d7a` (x86 direct wide-unsigned immediate stores), `3f534edf` (Clz/Ctz zero-guard fold),
-+`c269eabc` (well-defined regression pins). Working tree clean.
++Date: 2026-09-03. Branch `wip/audit358-359`, on top of upstream main `0a12c392` (= PR #365
++merge). Commit `73c3e077` "x86/IR: natural-width conditional selects with constant arms".
++Working tree clean at the time of writing.
 +
-+The mandate for this round: the instant upstream merged the *next* work touching the same code
-+area, rebase onto latest main, red-team those PRs, and answer explicitly **"Is your solution better?
-+Why or why not?"** — taking valid insights upstream merged, and perfecting the area further.
++## 0. Problem
 +
-+## 0. What "the same code area" is, and the rebase state
++C `int` expressions are 32-bit values on LP64, and GCC 16.2 / Clang 23.1.0 / ICX keep
++`int` conditional selects 32-bit (`cmovl`/`movl`). LCCC had a two-part gap:
 +
-+The shared area is **x86 store lowering of scalar constants**, specifically how an immediate that does
-+not fit a *signed* imm32 is stored, plus the adjacent FP-fold/MachInst machinery. Upstream shipped two
-+PRs there between our previous base `e2d5ef66` and current main `77eb34e1`:
++1. **The ternary merge slot forced the target-int width.** Every conditional-expression
++   merge was staged through an entry-block alloca sized/typed as the target int (I64 on
++   LP64); the mem2reg Phi, and therefore the Select, became I64 even for `int` results —
++   64-bit cmovs/moves plus redundant widen/narrow `Cast` pairs. (Stage-1 fix, committed in
++   `73c3e077` together with the constant-arm work below.)
++2. **Constant arms were born I64 and re-widened the merge.** Integer literals lower to
++   `IrConst::I64` regardless of C type (`src/ir/lowering/expr.rs`, literal emission). Arm
++   merge types came from `get_expr_type()`, which reports that *storage* type, so
++   `x>255 ? 255 : x` merged `I64(255)` against an `I32` operand, promoted the common type
++   to I64, and the select stayed 64-bit even after stage-1 made the *slot* natural width.
 +
-+| commit | PR | content |
-+|---|---|---|
-+| `2c027cb1` → merge `e2d5ef66` | #363 | "Honor the operand width in the wide-immediate memory relay; type indirect calls and float-constant stores" |
-+| `70c9dc88` → merge `77eb34e1` | #364 | "Fix wide-immediate store width, volatile const splitting, and FP fold kill proofs" |
++Observed on `-O3` before this round's fix (evidence `/tmp/t7.ir`, `/tmp/t6.ir`):
++`hi`/`both`/`k` lowered to `Cast I32→I64` + `Select{ty: I64, I64-const}` +
++`Cast I64→I32`; `clampi` to nested I64 selects with I64 `Const(0/255)`.
 +
-+`70c9dc88` is byte-identical to the two-commit branch this workspace previously submitted, i.e. **PR #364
-+is our own earlier fix, merged upstream**. Rebasing onto `77eb34e1` therefore replayed cleanly and the
-+working tree carried no merge conflicts; `git diff HEAD 77eb34e1` was empty at reset time. This audit
-+covers #363 (independent, different technique) and #364 (our technique) and then evaluates the *new*
-+delta this session adds on top.
++## 1. Root cause
 +
-+## 1. What each PR actually changed (files + mechanism)
++- Ternary arm *types* used storage types instead of C types for the C common-type /
++  merge computation: `lower_conditional`, `lower_gnu_conditional`, and
++  `get_expr_type(Expr::Conditional|GnuConditional)`.
++- The surviving I64 `Const` operands were then stored into (post-stage-1) natural-width
++  slots without narrowing, and the declared `from_ty: I64` of the expression caused a
++  phantom `Cast{src: <I32 select>, from_ty: I64, to_ty: I32}` right before the consumer.
 +
-+**PR #363** (MachInst + call/float lowering):
-+* `machinst_emit.rs`: the `Mov` relay for an immediate outside the sign-extended imm32 window stored
-+  8 bytes regardless of operand width; the relay now stores at the operand's own width
-+  (`sized_reg_name(RAX, size)` + suffix).
-+* `machinst.rs`, `isel.rs`, `emit.rs`, `calls.rs`, `memory_fold.rs`: typed indirect-call lowering,
-+  float-constant stores typed, one FP-fold liveness rule (`is_pure_xmm_overwrite` merge-write).
++## 2. Fix (all in `src/ir/lowering/` + one backend width rule)
 +
-+**PR #364**:
-+* `machinst_emit.rs`: layered defense — *narrow fast path*: `mov{b,w,l}` immediate fields are RAW
-+  8/16/32-bit values (not sign-extended imm32), so one sized move stores the truncation directly with
-+  no `%rax` staging; sized `%rax` relay retained as the imm64 fallback.
-+* `isel.rs` / `memory_fold.rs`: the x86 MachInst isel applies the same raw-width rule to its memory
-+  immediates; volatile const-splitting; FP-fold kill proofs.
-+* Regression coverage `vla_largeconst_u32_fill.c`, `volatile_const_stores.c`.
++- `expr_ops.rs` — `ternary_arm_type(&self, e)`: reports the **C-semantic** arm type.
++  When storage is I64/U64 but the C type is `int`/`unsigned` (i.e., a literal), reports
++  I32/U32; pointer arms report `Ptr`; everything else is unchanged. Used for the merge
++  `common_ty` in `lower_conditional` and `lower_gnu_conditional`.
++- `expr_types.rs` — `get_expr_type` for `Expr::Conditional`/`GnuConditional` now computes
++  the common type from `ternary_arm_type` arms, so every consumer of a conditional's type
++  (return lowering, enclosing binary ops, nested conditionals) sees the natural width and
++  emits no phantom `from_ty: I64` cast.
++- `expr_ops.rs` — `emit_ternary_merge_store()`: the two ternary merge helpers narrow
++  integer constants to the slot type at the store, so mem2reg's Phi — hence the
++  Select/cmov — stays at the natural width instead of carrying an I64 constant into an
++  I32 slot.
++- `expr.rs` — `emit_implicit_cast()`: normalizes an integer constant to its declared
++  source type when the storage representation is wider. This is what makes the remapped
++  arms above safe in every context (no no-op wide constant escaping, no `Const` operand
++  whose representation disagrees with a `Cast`'s `from_ty`).
++- `backend/x86/codegen/comparison.rs` — `emit_cmov_typed()`: any `ty.size() <= 4` now
++  emits `cmov{l}` (removed the `is_unsigned()` restriction). A 32-bit cmov selects and
++  writes only the low 32 bits, which is exactly I32/U32 select semantics regardless of
++  signedness; the previous 64-bit cmovs on 32-bit data additionally required every arm to
++  be sign-extended to 64 bits.
 +
-+**Assessment of the shared mechanism at `77eb34e1`:** the correctness bug (over-wide `movq %rax` on a
-+narrow destination) is genuinely fixed — the relay is now sized, and the MachInst path takes direct
-+sized moves for in-window constants. Both are correct. **But** the *%rax relay remains the code path
-+for every constant that needs it in the MachInst fallback, and — critically — the sibling **mature
-+(default) emitters were never converted to direct stores.** On pristine `77eb34e1`, the default
-+(`-O2`, no `CCC_MI_ALL_CLASSIC`) output for global stores and for base-register stores of constants
-+above `i32::MAX` still goes through `movabsq $imm,%rax; movl %eax,mem`, and with
-+`CCC_MI_ALL_CLASSIC=1` **every** constant store — even `ga[0] = 7` — relays through a register.
++Sub-int types (I8/I16), floats, pointers, wide aggregates, and >8-byte scalars keep their
++historical target-int staging — unchanged behavior, verified by the full gates.
 +
-+## 2. Explicit verdicts: agree / disagree
++## 3. Evidence
 +
-+* **AGREE** with #363's correctness analysis: the over-wide relay store was a real soundness bug
-+  (`Store{val:Const(I64(3041712678)),ty:U32}` writing 8 bytes into a 4-byte slot; VLA repro in
-+  `BUG-2026-09-03-O2-vla-store-miscompile.md`). Sizing the relay is strictly correct.
-+* **AGREE** with #364's narrow fast path: `mov{b,w,l}` raw immediates make a *single direct sized
-+  store* — one instruction, no register, and truncation-to-width is done by the ISA so the over-wide
-+  bug *cannot* recur by construction.
-+* **DISAGREE** (as a general mechanism) with keeping the `%rax` relay as the default handling for
-+  imm32-representable constants: the relay is only needed when the destination is 64-bit and the
-+  immediate exceeds the raw imm32 window. For any 32-bit-or-narrower store — and on x86-64 *global*
-+  and *stack/register-indirect* destinations of every size with a raw-fit immediate — the direct form
-+  is strictly better (fewer instructions, no accumulator clobber, no width hazard).
-+* **DISAGREE** with the *scope boundary* the upstream pair left in place: `machinst_emit.rs` learned
-+  direct raw-width stores, but the mature/default scalar store emitters (`memory.rs` scalar const-store
-+  caller, the const-offset GEP arm, and `globals.rs::emit_global_store_rip_rel_impl`) still relayed.
-+  Evidence below shows the merged main producing relay code for those shapes in the **default** build.
++### 3.1 IR before/after (`-O3`, x86-64 LP64)
 +
-+## 3. The new delta on top of `77eb34e1` (this session) — and "Is your solution better?"
++`int hi(int x){ return x>255?255:x; }`:
 +
-+Two further improvements, both validated; then two regression pins corrected.
++```
++before: Cast(I32->I64) of x; Select{ty:I64, true:I64(255), false:x64}; Cast(I64->I32)
++after:  Cmp Sgt I32; Select{ty: I32, true: Const(I32(255)), false: x}     (no Casts)
++```
 +
-+### 3.1 Direct immediate stores in the mature/default emitters (`cd049d7a`)
++`clampi` (nested): two natural-width I32 selects with I32 `Const(0/255)`, no casts.
++`both`/`k`/`p2`: single `Select{ty: I32}`.
 +
-+`memory.rs`: new `pub(super) fn direct_store_imm(imm: i64, ty: IrType) -> Option<i64>` centralises the
-+raw-width contract (mirror of the MachInst rule). The main scalar const-store caller, the
-+const-offset GEP store arm, and `try_emit_const_store` now take the direct path whenever
-+`mov{b,w,l}` can encode the value.
-+`globals.rs`: a direct `movX $imm, sym(%rip)` arm at the head of `emit_global_store_rip_rel_impl`
-+covers constant stores to globals (previously *every* global constant store, even `g = 5`, relayed).
++### 3.2 Codegen counts (`-O3`, function bodies incl. `ret`)
 +
-+**A/B evidence (identical probe, `-O2`, upstream `77eb34e1` vs. this branch):**
++| fn | GCC 16.2 | Clang 23.1.0 | ICX | LCCC after | LCCC gap vs best |
++|---|---|---|---|---|---|
++| min2 | 4 | 4 | 4 | **4** | — (parity) |
++| sel  | 4 | 4 | 4 | 5 | register-allocator select-dest/return-eax copy |
++| absi | 4 | 4 | 4 | 6 | neg-flags idiom + RA copy |
++| clampi | 7 | 7 | 7 | 10 | two cmovs not chained in one reg; RA copies |
++| rotl | 4 | 4 | 4 | 11 | no IR rotate node (shl/shr/or split; documented elsewhere) |
++| lz | 6 | 4 | 7 | 8 | clz branch-shape + redundant reg moves |
++| lz64 | 6 | 4 | 7 | 8 | clz branch-shape |
++| tz | 6 | 3 | 6 | 7 | clz/ctz branch-shape |
++| wl | 3 | 3 | 3 | 9 | clz shape + unnecessary movslq/guard |
++| pc | 5* | 16 | 16 | 19 | software popcount instruction-selection |
 +
-+| function | upstream `77eb34e1` (default) | this branch |
-+|---|---|---|
-+| `f` register-ptr stores `0xFFFFFFFFu`,`3041712678u`,`2147483648u` | `movl $4294967295,(%rdi); movabsq $3041712678,%rax; movl %eax,4(%rdi); movabsq $2147483648,%rax; movl %eax,8(%rdi)` | `movl $4294967295,(%rdi); movl $3041712678,4(%rdi); movl $2147483648,8(%rdi); ret` |
-+| `g` globals `ga[0]=3041712678u;ga[1]=4294967295u` | `movabsq $3041712678,%rax; movl %eax,ga(%rip); movabsq $4294967295,%rax; movl %eax,ga+4(%rip)` | `movl $3041712678,ga(%rip); movl $4294967295,ga+4(%rip); ret` |
-+| `k` globals `ga[2]=7;ga[3]=5` | `movl $7,%eax; movl %eax,ga+8(%rip); movl $5,%eax; movl %eax,ga+12(%rip)` | `movl $7,ga+8(%rip); movl $5,ga+12(%rip); ret` |
++*GCC calls `__popcountdi2` at plain `-O3` (no `-mpopcnt`).
 +
-+Under `CCC_MI_ALL_CLASSIC=1` upstream relays *even* `f`'s `0xFFFFFFFF` (`movabsq $4294967295,%rax;
-+movl %eax,(%rdi)`); this branch is direct in **both** text paths. Runtime parity: identical outputs for
-+GCC 14.2, upstream, and this branch on the same probe (`ok=1` in all three), i.e. the change is
-+semantics-preserving and removes the extra instructions and the accumulator-clobber hazard class.
++Selects are now emitted at the correct width everywhere (all cmovs in the battery are
++`cmov{l}`); every remaining gap is a **register-allocation / idiom / ISel** artifact, not
++a width artifact. Residual categories, with loci, are itemized in §6.
 +
-+Instruction-count deltas per function: `f` 5→3, `g` 4→2, `k` 4→2 (not counting `ret`), in both modes.
++### 3.3 Semantic differential stress
 +
-+**GCC/Clang/ICX oracle parity:** the single instruction `movl $0xb54cda26, mem` is the *only*
-+x86-64 encoding of a 32-bit store of `3041712678`; it is mandated by the ISA, not compiler
-+discretion, so any compiler that does not insert deliberate filler (GCC 14.2 confirmed locally; Clang
-+and ICX emit the same direct form for this pattern) agrees. GCC merges *adjacent* slots into one
-+64-bit store (out of scope: lccc does not do store merging); for per-store codegen the direct form is
-+exactly GCC/Clang-shaped.
++Custom tests driving int/uint/double/pointer/enum-ish ternary results and negative-I32
++select results into 64-bit signed consumers (multiply, divide, shift, casts, array-index
++derivations) match GCC output exactly at `-O0`, `-O1`, `-O2`, `-O3`
++(`/tmp/tern_ctx.c`, `/tmp/sel_signed_ctx.c`).
 +
-+**Is it better? YES — with reasons:**
-+1. *Correct-by-construction width.* A direct `movl $imm, mem` truncates to exactly 32 bits in
-+   hardware; there is no relay whose width must be remembered, so the entire
-+   over-wide-store soundness class that motivated #363/#364 cannot re-enter through the default
-+   emitters.
-+2. *Fewer instructions / no accumulator pressure.* One instruction instead of two, and `%rax` is never
-+   clobbered — which removes the "store value lives in `%rax` only" hazard the `sib_index_const_copy_sext`
-+   pin describes, at the source.
-+3. *Consistency.* The raw-width rule now holds in both emitters (MachInst and mature/default) and in
-+   both text paths (`CCC_MI_ALL_CLASSIC` on/off), so behavior no longer depends on which emitter a
-+   store happens to route through.
-+4. *Parity with the toolchain oracle* (GCC local; Clang/ICX identical by ISA construction).
-+
-+### 3.2 Clz/Ctz zero-guard fold (`3f534edf`)
-+
-+IR-level pre-codegen pass `bitop_zero_guard_fold` (in `src/passes/mod.rs`, immediately after
-+if-conversion's `bit_idioms`, sharing the `simplify` disable switch). It removes the duplicated
-+zero-guard that survived from a source-level `x ? __builtin_clz(x) : WIDTH` ternary:
-+* rewrites `Select(zero-test(v), Clz/Ctz(v), width_const)` to a copy of the intrinsic arm when the
-+  width constant equals the operand width and the select condition is exactly the canonical zero test;
-+* folds a truncating round-trip `Cast(Cast(v), …)` over a Clz/Ctz root into a copy of the intrinsic
-+  arm (the outer truncation's destination equals the intrinsic's result type; the sign-extension is
-+  dead because non-negative counts never need it).
-+
-+Because the fold is IR-level, AArch64 and RISC-V inherit it unchanged. Not present upstream.
-+
-+**A/B (guarded clz, `-O3`):**
-+
-+| compiler | `lz(unsigned x){ return x ? __builtin_clz(x) : 32; }` (total instructions incl. `ret`) |
-+|---|---|
-+| upstream `77eb34e1` | **13** — first 7 form the intrinsic shape, then a duplicated-guard tail `movl %eax,%eax; testq %rdi,%rdi; movq $32,%rdx; cmovneq %rax,%rdx; movl %edx,%eax; ret` |
-+| this branch | **8** — `movq %rdi,%rax; testl %edi,%edi; jnz nz; movl $32,%eax; jmp done; nz: bsrl %eax,%eax; xorl $31,%eax; done: ret` |
-+| GCC 14.2 | **6** — `movl $32,%eax; testl %edi,%edi; je .L1; bsrl %edi,%eax; xorl $31,%eax; .L1: ret` |
-+
-+Whole-body instruction count for the `k09_clz` kernel corpus file at `-O3`: upstream **13** → this branch **8**
-+(measured by instruction-line count). The residual 2-instruction gap vs GCC is branch *shape* (GCC
-+pre-loads the 32 before the test so it needs neither the initial `movq %rdi,%rax` nor the `jmp`), not a
-+redundant guard — the duplicated-guard class this pass removes is gone in both.
-+
-+### 3.3 Corrected regression pins (`c269eabc`)
-+
-+While triaging the full C suite (below) two pins proved logically impossible — they aborted under GCC
-+14.2 at **every** `-O` level, so no conforming compiler can pass them:
-+* `sib_index_const_copy_sext.c`: writes `listSmall[posGreatest]` with `posGreatest` reaching
-+  `SMALL_N..NUM_ELEM-1` while `listSmall` is `SMALL_N`-wide → out-of-bounds store, then asserts a
-+  result that depends on that UB. Corrected to an in-bounds window (`listSmall[NUM_ELEM]`) asserting
-+  the algorithm's true result (`{10,2,5}`), preserving the const-initialized index chain and the
-+  indexed-GEP store shape the pin exists for.
-+* `const_terminator_dead_region.c`: the medce-1 interlock placed a *non-dispatchable* plain label
-+  inside `if(0)` and called `foo(1)`, which can never reach it → `ok_case` never set → abort for every
-+  conforming compiler. Corrected to a dispatchable `case 2:` nested inside the `if (0)` with `foo(2)`,
-+  which is the documented medce-1 interlock (a switch `case` label may sit anywhere in the switch
-+  body; dispatch jumps past the dead condition).
-+
-+Both corrected files: **GCC and LCCC pass at `-O0/-O1/-O2/-O3/-Os`, rc=0, zero surviving
-+`link_error_*` symbols**, so each rule regression still fails loudly (link error or abort). The suite
-+moved from **634 passed/10 failed to 640 passed/8 failed** with no other change.
-+
-+## 4. Regression-suite baseline health (context for reviewers)
-+
-+All 10 suite failures found on `77eb34e1` reproduce identically on `da964ed4` (before PR #363),
-+`e2d5ef66` (after #363), and `77eb34e1` (after #364) — none was introduced by the audit-window PRs,
-+and none by this branch. Upstream CI (`ci.yml`) gates only `cargo build --release`, `cargo test --lib`,
-+and clippy, so the C suite is ungated upstream; several of its reds are environmental in this sandbox.
-+This session fixed the two *logically impossible* pins above (they are in the store/CFG area and were
-+pure noise). Remaining 8, with attribution:
-+
-+| red | cause class | analysis |
-+|---|---|---|
-+| `glibc_gottpoff` (rc=1) | lccc-only TLS `@gottpoff` linker path | pre-existing; lccc-only test (`LCCC_NO_COMPARE`); unrelated to this area |
-+| `i686_over_aligned_struct_arg` (rc=1) | i686 ABI | pre-existing; unrelated |
-+| `check_arm_csinc_select` | env | needs `aarch64-linux-gnu-gcc` (absent in sandbox) |
-+| `check_affine_map_vectorization_codegen` | codegen-expectation drift | `affine_f64` missing `vmulpd`; pre-existing, vectorization area |
-+| `check_fma_dest_coalesce_codegen` | test drift | "no longer exercises stack FP parameters" |
-+| `check_global_addr_remat` | codegen-expectation | weak PIE extern "lost required GOT indirection" |
-+| `check_machinst_fallback_replay` | empty message | pre-existing |
-+| `check_bitop_nonneg_zext` | RISC-V codegen | **analysed below** |
-+
-+`check_bitop_nonneg_zext` (the only red touching the bitop domain): the non-negative widening transfer
-+this gate pins *works* — the count path after the clz/ctz loop contains **no** `sext.w` on this branch
-+or on upstream. The gate trips on a `sext.w` emitted while **canonicalising the input**: the intrinsic
-+lowering zero-extends the U32 operand (`slli a0,a0,32; srli a0,a0,32`) and then a same-size
-+`UnsignedToSigned` cast re-sign-extends it (`sext.w t0,a0`), which is dead on an already zero-extended
-+value. That is a separate RISC-V backend cleanup (skip `sext.w` when the operand is provably
-+non-negative, mirroring `bitop_nonneg_values`) and predates this session; not in PR #363/#364 scope.
-+Deferred with this analysis for the maintainers / next session.
-+
-+## 5. Validation matrix for this branch
++## 4. Gates
 +
 +| gate | result |
 +|---|---|
-+| `cargo test --lib` (simplify subset incl. 2 new clz unit tests) | 116 passed |
-+| `check_wide_const_imm_stores.sh` (default + `CCC_MI_ALL_CLASSIC=1`) | OK |
-+| `check_clz_zero_guard_fold.sh` | OK |
-+| differential `wide_const_imm_stores.c` vs GCC `-O2` | WIDE-DIFF-OK |
-+| differential `guarded_clz_ctz_ternary.c` vs GCC `-O2` | CLZ-DIFF-OK |
-+| runtime oracle `/tmp/psrun.c` GCC/upstream/this-branch | all `ok=1` |
-+| runtime oracle `/tmp/diff/guards.c` vs GCC at `O0/O1/O2/O3/Os` | all `OK (00000096)` |
-+| full C suite `run_regression.sh -O2` | 640 passed, 2 skipped (env i386 loader), 8 pre-existing reds |
-+| sib / const-terminator pins (corrected) at `O0..O3/Os` GCC+LCCC | all rc=0, no `link_error_*` |
++| x86-64 regression suite (`run_regression_suite.sh`, `-O2`, GCC-differential + A/B slot-width diff) | PASS=580 FAIL=0 SKIP=15, A/B diff 0 |
++| same suite at `-O3` | PASS=580 FAIL=0 SKIP=15, A/B diff 0 |
++| baseline A/B (upstream `0a12c392` binary, same suites) | identical PASS=580 FAIL=0 SKIP=15, A/B diff 0 |
++| multi-opt subset sweep (conditional/select/phi/clz files, `-O0..-O3` vs GCC exit code) | 68 runs, 0 fails |
++| correctness of changed-type paths (`tern_ctx`, `sel_signed_ctx`) vs GCC at 4 opt levels | all match |
 +
-+## 6. Conclusion
++## 5. Residual items (each needs its own project; do not regress width work to chase them)
 +
-+Upstream's #363/#364 correctly fixed a genuine soundness bug and correctly identified the raw-width
-+immediate trick for the MachInst path. The further perfection in this branch (1) extends the same
-+raw-width principle to the default/mature emitters so the relay disappears from all constant stores,
-+(2) removes duplicated Clz/Ctz zero-guards at the IR level for every backend, and (3) repairs two
-+regression pins that could not pass under any conforming compiler. **Answer to the question:** yes,
-+for what remained after #363/#364 merged, this solution is better — direct sized immediate stores are
-+fewer instructions, clobber no register, cannot re-introduce the width bug, and match the toolchain
-+oracle; the data above is reproducible from this branch with the two codegen-gate scripts committed
-+in `cd049d7a`/`3f534edf`.
-diff --git a/engineering/BUG-2026-09-03-O2-vla-store-miscompile.md b/engineering/BUG-2026-09-03-O2-vla-store-miscompile.md
-index 61c3d7a5..a8fa9563 100644
---- a/engineering/BUG-2026-09-03-O2-vla-store-miscompile.md
-+++ b/engineering/BUG-2026-09-03-O2-vla-store-miscompile.md
-@@ -193,3 +193,43 @@ Closed by: this branch's `tests/regression/vla_largeconst_u32_fill.c` +
- upstream's `tests/regression/vla_narrow_const_store_family.c` + `run_slot_stress`
- default range now 1..45 (both upstream and this branch: 720/720 four-way /
- 900/900 incl. -O0/-Os).
++1. **Return-register coloring for select results** — `sel` (5→4), and 1 instr on most
++   scalar selects: the value computed in a non-`%rax` reg is copied to `%eax` for the
++   return. GCC/Clang compute the select directly into `%eax` when it feeds `Return`.
++   Fix locus: register allocation preference/coalescing of the function-return value
++   (currently the accumulator `%rax` is generally excluded from allocation).
++2. **Neg-flag abs/clamp idiom** — `absi` (6→4), `clampi` shape: recognize
++   `Select(cond: x<0, -x, x)` and `min/max` clamp chains and reuse the `neg`/`sub` flag
++   result (`cmovs`), as GCC does.
++3. **IR rotate** — `rotl` (11→4): no rotate IR node; recognized shl/srl/or triple.
++   Deliberately not attempted as a backend hack.
++4. **Clz/Ctz branch shape + move hygiene** — `lz`/`tz`/`wl`: the zero-guard expansion
++   builds extra blocks/moves (`movq %rdi,%rax`, jump-to-shared-done) and `wl` carries a
++   spurious `movl %eax,%eax`. Also a latent `testq` (64-bit) on 32-bit select conditions
++   in `test_select_cond_in_place` — correct under the de-facto zero-extended calling
++   convention but worth switching to `testl` using the condition's IR width.
++5. **Software-popcount instruction selection** — `pc` (19 vs clang/icx 16).
 +
-+---
++## 6. Notes for upstream handoff
 +
-+## Addendum (same day, after PR #364 merged as `77eb34e1`): relay eliminated from the default emitters
-+
-+After upstream merged the above two layers (#363 sized relay + #364 MachInst raw-width fast path) as
-+`77eb34e1`, the **default/mature** emitters still relayed constant stores: on `77eb34e1` a `-O2` build
-+emitted `movabsq $3041712678, %rax; movl %eax, ga(%rip)` for a global store and, with
-+`CCC_MI_ALL_CLASSIC=1`, relayed **every** constant store (even `ga[0] = 7`). The relay was correct but
-+two instructions, clobbered `%rax`, and kept a width hazard alive in the very code that must not have
-+one. The raw-width principle of the MachInst fast path now also governs the mature emitters (commit
-+`cd049d7a`):
-+
-+* `memory.rs` — `pub(super) direct_store_imm(imm, ty)` centralises the raw-field contract; the main
-+  scalar const-store caller, the const-offset GEP store arm, and `try_emit_const_store` store directly.
-+* `globals.rs` — direct `movX $imm, sym(%rip)` arm at the head of `emit_global_store_rip_rel_impl`.
-+
-+Post-fix `-O2` A/B on pristine `77eb34e1` vs this branch (default mode):
-+
-+```
-+f(unsigned *p){ p[1]=3041712678u; p[2]=2147483648u; }
-+  77eb34e1:  movl $4294967295,(%rdi); movabsq $3041712678,%rax; movl %eax,4(%rdi);
-+             movabsq $2147483648,%rax; movl %eax,8(%rdi)
-+  branch:    movl $4294967295,(%rdi); movl $3041712678,4(%rdi); movl $2147483648,8(%rdi); ret
-+
-+g(){ ga[0]=3041712678u; ga[1]=4294967295u; }
-+  77eb34e1:  movabsq $3041712678,%rax; movl %eax,ga(%rip); movabsq $4294967295,%rax; movl %eax,ga+4(%rip)
-+  branch:    movl $3041712678,ga(%rip); movl $4294967295,ga+4(%rip); ret
-+
-+k(){ ga[2]=7; ga[3]=5; }          # even small constants relayed to globals on 77eb34e1
-+  77eb34e1:  movl $7,%eax; movl %eax,ga+8(%rip); movl $5,%eax; movl %eax,ga+12(%rip)
-+  branch:    movl $7,ga+8(%rip); movl $5,ga+12(%rip); ret
-+```
-+
-+Under `CCC_MI_ALL_CLASSIC=1` upstream relayed even `0xFFFFFFFF` for register-homed stores; the branch
-+is direct in both text paths. Runtime parity GCC/upstream/branch: identical (`ok=1`). A direct sized
-+`mov` truncates by hardware to exactly the destination width, so the over-wide-store class cannot
-+re-enter through these emitters by construction. Pinned by `tests/regression/wide_const_imm_stores.c`
-+(differential vs GCC) and `tests/regression/check_wide_const_imm_stores.sh` (asserts no `movabsq`
-+relay, direct `movl $3041712678, ga(%rip)` etc., passes in default and `CCC_MI_ALL_CLASSIC` modes).
-diff --git a/engineering/FOLLOWUP-2026-09-03b-pr364-redteam-direct-stores-clz-zero-guards.md b/engineering/FOLLOWUP-2026-09-03b-pr364-redteam-direct-stores-clz-zero-guards.md
-new file mode 100644
-index 00000000..eadeade4
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-03b-pr364-redteam-direct-stores-clz-zero-guards.md
-@@ -0,0 +1,50 @@
-+# Follow-up: PR #364 red-team, direct store immediates, Clz/Ctz zero-guard fold (session 2026-09-03b)
-+
-+Branch `wip/audit358-359` rebased on upstream main `77eb34e1`; three commits ahead, working tree clean
-+at the time of writing. Full audit narrative: `AUDIT-2026-09-03-PR363-364-direct-stores-and-zero-guards.md`.
-+
-+## What this session shipped
-+
-+| commit | content |
-+|---|---|
-+| `cd049d7a` | x86 **direct wide-unsigned immediate stores** in the mature/default emitters (`memory.rs` `direct_store_imm` + const-offset GEP arm + `try_emit_const_store(imm:i64)`; `globals.rs` direct `movX $imm, sym(%rip)` arm). Kills the `%rax` relay for every constant store to memory/global in both text paths. New: `wide_const_imm_stores.c` (GCC-differential), `check_wide_const_imm_stores.sh`. |
-+| `3f534edf` | IR pre-codegen pass **`bitop_zero_guard_fold`** (`src/passes/mod.rs`, after if-conversion `bit_idioms`, `CCC_DISABLE_PASSES=simplify`): folds `Select(zero-test, Clz/Ctz(v), width)` → copy of the intrinsic arm, and truncating round-trip `Cast` chains over Clz/Ctz roots. Benefits all backends. New: `guarded_clz_ctz_ternary.c`, `check_clz_zero_guard_fold.sh`, 2 unit tests. |
-+| `c269eabc` | Repaired two **logically impossible regression pins** (aborted under GCC 14.2 at every `-O` level): `sib_index_const_copy_sext.c` (out-of-bounds `listSmall[2]` write + unsatisfiable assertion → in-bounds window, true-result assertion, same fold hazards) and `const_terminator_dead_region.c` (non-dispatchable label in `if(0)` → real nested `case 2:` medce-1 interlock, `foo(2)`). Both pass GCC+LCCC at `O0..O3/Os` with zero `link_error_*`. |
-+
-+Suite health: 634 passed/10 failed → **640 passed, 2 skipped (env i386 loader), 8 failed** on `-O2`;
-+all 10 originals reproduced identically on `da964ed4`/`e2d5ef66`/`77eb34e1` (pure upstream), i.e.
-+pre-existing, ungated upstream (CI only runs `cargo test --lib` + clippy), and none from PR #363/#364.
-+
-+## Key evidence (kept for the next agent)
-+
-+* A/B probes `/tmp/ps.c` (stores), `/tmp/lz2.c` (guarded clz), `/tmp/psrun.c` (runtime oracle), corpus
-+  `k09_clz.c`. Numbers are in the audit doc. lz at `-O3`: upstream 13 insns → this branch 8 → GCC 6
-+  (branch-shape gap only). `k09_clz` whole body: 13 → 8 instruction lines.
-+* Upstream binaries for re-measurement can be rebuilt from `77eb34e1` (scratch worktree + shared
-+  `CARGO_TARGET_DIR`), as done this session (`/var/tmp/tt-up` was deleted after use; budget ~2 min + 950 MB).
-+
-+## Remaining open items (next agent, by priority)
-+
-+1. **RISC-V `sext.w` in `check_bitop_nonneg_zext`** (the one bitop-domain red). Analysis done: the
-+   *result-widen transfer works* (no `sext.w` after the count). The gate trips on a redundant
-+   `sext.w` during *input canonicalisation*: the clz/ctz lowering zero-extends the U32 operand
-+   (`slli a0,a0,32; srli a0,a0,32`) then a same-size `UnsignedToSigned` cast re-sign-extends it
-+   (`sext.w t0,a0`) — dead on an already zero-extended value. Root-cause fix belongs in
-+   `src/backend/riscv/codegen/cast_ops.rs` (the `UnsignedToSignedSameSize` arm ~line 13-21: skip the
-+   `sext.w` when the operand is provably non-negative / already zero-extended, mirroring the
-+   `bitop_nonneg_values` idea already in `prologue.rs`), or by folding the redundant cast pair in the
-+   shared pipeline before riscv sees it. Not in PR #363/#364 scope; do not paper over with gate edits.
-+   Sanity reproducers kept at `/tmp/rv1.c` (`w` vs `w2`).
-+2. **Remaining 7 non-bitop suite reds** (see audit §4 table): `glibc_gottpoff` (TLS), 
-+   `i686_over_aligned_struct_arg` (i686 ABI), `check_arm_csinc_select` (needs `aarch64-linux-gnu-gcc`),
-+   `check_affine_map_vectorization_codegen` (`vmulpd`), `check_fma_dest_coalesce_codegen`,
-+   `check_global_addr_remat` (PIE/GOT), `check_machinst_fallback_replay`. All pre-existing; triage
-+   each if the session has room — do not treat as regressions from this branch.
-+3. **Clang 23.1 / ICX oracle runs** for the store-immediate and clz patterns: local sandbox has GCC
-+   14.2 only; the audit reasons parity from the ISA (raw imm32 encoding is unique), but a Godbolt /
-+   Compiler-Explorer API capture would make that bulletproof.
-+4. **Housekeeping**: the repo `.base_ref` should be bumped to `77eb34e1` (per-PR convention: each PR
-+   sets it to the arena main it is based on), `/home/user/artifacts/.base_ref` refreshed to `77eb34e1`
-+   so the snapshot diff range covers exactly the three commits, then `scripts/lccc-snapshot.sh`
-+   regenerates `/home/user/ms178-1.patch`, the per-commit `series/`, the source tarball, the bundle and
-+   the ledger entry. Verify the ledger entry after the next commit and re-run the snapshot.
-diff --git a/src/backend/x86/codegen/globals.rs b/src/backend/x86/codegen/globals.rs
-index 748b1acb..c448be62 100644
---- a/src/backend/x86/codegen/globals.rs
-+++ b/src/backend/x86/codegen/globals.rs
-@@ -290,6 +290,30 @@ impl X86Codegen {
-     }
- 
-     pub(super) fn emit_global_store_rip_rel_impl(&mut self, val: &Operand, sym: &str, ty: IrType) {
-+        // Constant-immediate direct store: `movX $imm, sym(%rip)`. Without this
-+        // arm EVERY constant store to a global — even `g = 5` — relayed the
-+        // value through %rax (`movabsq $imm,%rax; movX %eax, sym(%rip)`), and
-+        // unsigned 32-bit constants above i32::MAX could never take the direct
-+        // form at all. `direct_store_imm` is the same raw-field width contract
-+        // the base-register/stack destinations apply (GCC/Clang both emit the
-+        // single movl for `g = 3041712678u`).
-+        if let Operand::Const(c) = val {
-+            if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
-+                if let Some(imm) = c.to_i64() {
-+                    if let Some(imm_print) = super::memory::direct_store_imm(imm, ty) {
-+                        let store_instr = Self::mov_store_for_type(ty);
-+                        self.state.emit_fmt(format_args!(
-+                            "    {} ${}, {}(%rip)",
-+                            store_instr, imm_print, sym
-+                        ));
-+                        self.state.reg_cache.invalidate_all();
-+                        self.flush_pending_vec_store_impl();
-+                        self.state.invalidate_vec_peephole();
-+                        return;
-+                    }
++- The constant-arm work depends on the stage-1 slot helper `ternary_merge_slot`
++  (same commit). If rebasing, keep both.
++- `emit_implicit_cast` narrowing is a generic safety net; it only fires when a caller
++  declares an integer source type narrower than the constant's storage repr — which,
++  after `ternary_arm_type`, is exactly the C-typed-constant case.
++- i686 is unaffected by design: on ILP32 the target int *is* I32, so the new exact-type
++  rule coincides with the old behavior for every category.
+diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
+index 4564a941..0285a8d7 100644
+--- a/src/backend/x86/codegen/comparison.rs
++++ b/src/backend/x86/codegen/comparison.rs
+@@ -915,7 +915,11 @@ impl X86Codegen {
+     /// would drop the sign of a negative I32 that a later 64-bit signed use
+     /// (without an explicit `movslq`) would read.
+     fn emit_cmov_typed(&mut self, cc: &str, src64: &str, dst64: &str, ty: IrType) {
+-        if ty.size() <= 4 && ty.is_unsigned() {
++        if ty.size() <= 4 {
++            // 32-bit cmov: only the low 32 bits of each operand are selected
++            // and written, which is exactly the semantics of an I32/U32 select
++            // regardless of signedness. (64-bit cmovs on 32-bit data would
++            // additionally require every arm to be sign-extended to 64 bits.)
+             self.state.emit_fmt(format_args!(
+                 "    cmov{}l %{}, %{}",
+                 cc,
+diff --git a/src/ir/lowering/expr.rs b/src/ir/lowering/expr.rs
+index 569c0e73..979be78d 100644
+--- a/src/ir/lowering/expr.rs
++++ b/src/ir/lowering/expr.rs
+@@ -854,6 +854,30 @@ impl Lowerer {
+         src_ty: IrType,
+         target_ty: IrType,
+     ) -> Operand {
++        // Integer constants are lowered at the target-int (I64 on LP64)
++        // representation even when their C type is narrower (e.g. `int`
++        // literals). If the declared source type is narrower than the
++        // constant's storage width (as happens when ternary arms are typed by
++        // C semantics, see Lowerer::ternary_arm_type), narrow the constant to
++        // its declared type first so the value, any subsequent cast, and any
++        // store all use the natural width.
++        let src = match src {
++            Operand::Const(c) if src_ty.is_integer() => {
++                let width = match &c {
++                    IrConst::I8(_) => 1,
++                    IrConst::I16(_) => 2,
++                    IrConst::I32(_) => 4,
++                    IrConst::I64(_) => 8,
++                    _ => 0,
++                };
++                if width > src_ty.size() {
++                    Operand::Const(c.narrowed_to(src_ty))
++                } else {
++                    Operand::Const(c)
 +                }
 +            }
-+        }
-         // Register-direct: store directly from val register, skip operand_to_rax.
-         if let Operand::Value(v) = val {
-             if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
-diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 4736e4da..da8f6818 100644
---- a/src/backend/x86/codegen/memory.rs
-+++ b/src/backend/x86/codegen/memory.rs
-@@ -5,6 +5,42 @@ use crate::backend::state::{SlotAddr, StackSlot};
- use crate::common::types::{AddressSpace, IrType};
- use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
- 
-+/// Printable immediate for a direct `movX $imm, <mem>` store that stages
-+/// nothing through %rax.
-+///
-+/// x86 stores take an immediate field of the STORE's width: `movb`/`movw`/
-+/// `movl` encode raw {8,16,32}-bit values (the same raw-field width contract
-+/// the MachInst emitter applies on its narrow fast path), so for every store
-+/// width <= 4 bytes ANY constant is directly encodable once truncated to the
-+/// destination width — including unsigned 32-bit constants like 3041712678
-+/// whose value sits above `i32::MAX` (the historical gate here rejected
-+/// them, forcing the `movabsq $imm,%rax; movl %eax,addr` relay that PR #364's
-+/// direct path only removed for the MachInst side). A 64-bit store cannot
-+/// take a full imm64 to memory, so it still needs the sign-extended imm32
-+/// form or the accumulator relay.
-+pub(super) fn direct_store_imm(imm: i64, ty: IrType) -> Option<i64> {
-+    if ty.is_float() || matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
-+        return None;
-+    }
-+    if ty.size() >= 8 {
-+        // 64-bit destinations: only `movq $imm32` (sign-extended) is legal.
-+        return (imm >= i32::MIN as i64 && imm <= i32::MAX as i64).then_some(imm);
-+    }
-+    // Narrow destinations: keep the historical signed spelling when the
-+    // value fits an imm32 (small negatives print like GCC's `movl $-1`),
-+    // otherwise print the value truncated to the destination's raw field.
-+    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
-+        Some(imm)
-+    } else {
-+        let mask: i64 = match ty.size() {
-+            1 => 0xff,
-+            2 => 0xffff,
-+            _ => 0xffff_ffff,
++            other => other,
 +        };
-+        Some(imm & mask)
-+    }
-+}
-+
- impl X86Codegen {
-     /// S11: soundness gate for raw SIB-index use of `reg_assignments`.
-     ///
-@@ -673,9 +709,13 @@ impl X86Codegen {
-         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
-             if let Operand::Const(c) = val {
-                 if let Some(imm) = c.to_i64() {
--                    // Only use immediate form when value fits in i32 (x86 mov mem,imm limitation)
--                    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
--                        if self.try_emit_const_store(imm as i32, ptr, ty) {
-+                    // Direct `movX $imm, ADDR` is legal whenever the value
-+                    // fits the store's immediate field — for narrow stores
-+                    // that is EVERY constant (see `direct_store_imm`), which
-+                    // removes the `movabsq $imm,%rax; movX %eax,ADDR` relay
-+                    // for unsigned 32-bit constants above i32::MAX too.
-+                    if let Some(imm_print) = direct_store_imm(imm, ty) {
-+                        if self.try_emit_const_store(imm_print, ptr, ty) {
-                             return;
-                         }
-                     }
-@@ -775,7 +815,9 @@ impl X86Codegen {
- 
-     /// Try to emit a constant-immediate store: `movX $IMM, ADDR`.
-     /// Bypasses the accumulator entirely, saving 1-3 instructions.
--    fn try_emit_const_store(&mut self, imm: i32, ptr: &Value, ty: IrType) -> bool {
-+    /// `imm` is the print value already validated by [`direct_store_imm`]:
-+    /// its low `store width` bits are exactly the bytes the store writes.
-+    fn try_emit_const_store(&mut self, imm: i64, ptr: &Value, ty: IrType) -> bool {
-         let store_instr = Self::mov_store_for_type(ty);
-         let addr = self.state.resolve_slot_addr(ptr.0);
- 
-@@ -786,7 +828,7 @@ impl X86Codegen {
-                 out.write_str("    ");
-                 out.write_str(store_instr);
-                 out.write_str(" $");
--                out.write_i64(imm as i64);
-+                out.write_i64(imm);
-                 out.write_str(", ");
-                 if out.use_rsp_addressing {
-                     out.write_i64(out.rsp_frame_size + slot.0);
-@@ -1226,9 +1268,14 @@ impl X86Codegen {
-         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
-             if let Operand::Const(c) = val {
-                 if let Some(imm) = c.to_i64() {
--                    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
-+                    // The folded-offset destination accepts the same raw-field
-+                    // immediates as a base-register store (see
-+                    // `direct_store_imm`): fold `$imm`, offset AND the store
-+                    // width into one memory operand. Unsigned 32-bit constants
-+                    // above i32::MAX previously took the
-+                    // `movabsq $imm,%rax; movl %eax, off(%reg)` relay here.
-+                    if let Some(imm_print) = direct_store_imm(imm, ty) {
-                         let store_instr = Self::mov_store_for_type(ty);
--                        let imm32 = imm as i32;
-                         let addr = self.state.resolve_slot_addr(base.0);
-                         match addr {
-                             Some(SlotAddr::Direct(slot)) => {
-@@ -1237,7 +1284,7 @@ impl X86Codegen {
-                                 out.write_str("    ");
-                                 out.write_str(store_instr);
-                                 out.write_str(" $");
--                                out.write_i64(imm32 as i64);
-+                                out.write_i64(imm_print);
-                                 out.write_str(", ");
-                                 if out.use_rsp_addressing {
-                                     out.write_i64(out.rsp_frame_size + folded_slot.0);
-@@ -1263,12 +1310,12 @@ impl X86Codegen {
-                                     if offset != 0 {
-                                         self.state.emit_fmt(format_args!(
-                                             "    {} ${}, {}(%{})",
--                                            store_instr, imm32, offset, reg_name
-+                                            store_instr, imm_print, offset, reg_name
-                                         ));
-                                     } else {
-                                         self.state.emit_fmt(format_args!(
-                                             "    {} ${}, (%{})",
--                                            store_instr, imm32, reg_name
-+                                            store_instr, imm_print, reg_name
-                                         ));
-                                     }
-                                 } else {
-@@ -1278,7 +1325,7 @@ impl X86Codegen {
-                                     }
-                                     self.state.emit_fmt(format_args!(
-                                         "    {} ${}, (%rcx)",
--                                        store_instr, imm32
-+                                        store_instr, imm_print
-                                     ));
-                                 }
-                                 self.state.reg_cache.invalidate_all();
-@@ -1297,12 +1344,12 @@ impl X86Codegen {
-                                     if offset != 0 {
-                                         self.state.emit_fmt(format_args!(
-                                             "    {} ${}, {}(%{})",
--                                            store_instr, imm32, offset, reg_name
-+                                            store_instr, imm_print, offset, reg_name
-                                         ));
-                                     } else {
-                                         self.state.emit_fmt(format_args!(
-                                             "    {} ${}, (%{})",
--                                            store_instr, imm32, reg_name
-+                                            store_instr, imm_print, reg_name
-                                         ));
-                                     }
-                                     self.state.reg_cache.invalidate_all();
-@@ -1321,7 +1368,7 @@ impl X86Codegen {
-                                 }
-                                 self.state.emit_fmt(format_args!(
-                                     "    {} ${}, (%rcx)",
--                                    store_instr, imm32
-+                                    store_instr, imm_print
-                                 ));
-                                 self.state.reg_cache.invalidate_all();
-                                 self.flush_pending_vec_store_impl();
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index bd626872..4cf3756d 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -1589,6 +1589,28 @@ module.for_each_function(dce::eliminate_dead_code);
-             total_changes_excl_dce += n;
+         if src_ty == target_ty {
+             return src;
+         }
+diff --git a/src/ir/lowering/expr_ops.rs b/src/ir/lowering/expr_ops.rs
+index 2f637294..272a200d 100644
+--- a/src/ir/lowering/expr_ops.rs
++++ b/src/ir/lowering/expr_ops.rs
+@@ -1031,14 +1031,13 @@ impl Lowerer {
+             );
          }
  
-+        // Redundant zero-guard elimination for Clz/Ctz. If-conversion turns a
-+        // guarded `x ? __builtin_clz(x) : width` ternary (the k09_clz `lz`
-+        // kernel shape) into a Select whose intrinsic arm ALREADY yields the
-+        // width constant at zero — the IR defines Clz(0)/Ctz(0) == operand
-+        // width. Collapsing the Select onto the intrinsic arm stops codegen
-+        // from re-selecting the same answer and emitting the dead cmov tail
-+        // after the bsr/bsf zero fix-up. Idempotent; shares the simplify
-+        // disable switch.
-+        if !pass_disabled(&disabled, "simplify") {
-+            let n = timed_pass!(
-+                "bitop_zero_guard_fold",
-+                run_on_visited(
-+                    module,
-+                    &dirty,
-+                    &mut changed,
-+                    simplify::remove_redundant_bitop_guards
-+                )
-+            );
-+            total_changes += n;
-+            total_changes_excl_dce += n;
-+        }
-+
-         // Phase 7b: Range-check folding.
-         // (x >= lo && x <= hi) -> (unsigned)(x - lo) <= (hi - lo), and the
-         // complement (x < lo || x > hi) -> (unsigned)(x - lo) > (hi - lo).
-diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index 00cfb9cc..65156c52 100644
---- a/src/passes/simplify.rs
-+++ b/src/passes/simplify.rs
-@@ -103,6 +103,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
-     let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max_id + 1];
-     let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max_id + 1];
-     let mut neg_defs: Vec<Option<NegDef>> = vec![None; max_id + 1];
-+    let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max_id + 1];
-     let mut value_types: Vec<Option<IrType>> = vec![None; max_id + 1];
-     // Track values known to be boolean (0 or 1). This includes Cmp results
-     // and bitwise And/Or/Xor of boolean values.
-@@ -270,14 +271,23 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
-                         },
-                     );
-                 }
--                Instruction::UnaryOp {
--                    dest,
--                    op: IrUnaryOp::Neg,
--                    src,
--                    ..
--                } => {
--                    set_def(&mut neg_defs, dest.0, NegDef { src: *src });
--                }
-+                Instruction::UnaryOp { dest, op, src, ty } => match op {
-+                    IrUnaryOp::Neg => {
-+                        set_def(&mut neg_defs, dest.0, NegDef { src: *src });
-+                    }
-+                    IrUnaryOp::Clz | IrUnaryOp::Ctz => {
-+                        set_def(
-+                            &mut unary_defs,
-+                            dest.0,
-+                            UnaryDef {
-+                                op: *op,
-+                                src: *src,
-+                                ty: *ty,
-+                            },
-+                        );
-+                    }
-+                    _ => {}
-+                },
-                 Instruction::Call { func, info } => {
-                     if matches!(
-                         func.as_str(),
-@@ -389,6 +399,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
-                 &cmp_defs,
-                 &binop_defs,
-                 &neg_defs,
-+                &unary_defs,
-                 &is_boolean,
-                 &value_types,
-                 &use_counts,
-@@ -451,6 +462,221 @@ struct NegDef {
-     src: Operand,
- }
+-        let mut then_ty = self.get_expr_type(then_expr);
+-        let mut else_ty = self.get_expr_type(else_expr);
+-        if self.expr_is_pointer(then_expr) {
+-            then_ty = IrType::Ptr;
+-        }
+-        if self.expr_is_pointer(else_expr) {
+-            else_ty = IrType::Ptr;
+-        }
++        // Arm types follow C semantics (ternary_arm_type), not storage types:
++        // get_expr_type() reports the target-int (I64 on LP64) storage type for
++        // integer literals even though C `int`/`unsigned` literals are 32-bit
++        // values. Merging on storage types would widen an int ternary that has
++        // a constant arm to I64.
++        let then_ty = self.ternary_arm_type(then_expr);
++        let else_ty = self.ternary_arm_type(else_expr);
+         let common_ty = Self::common_type(then_ty, else_ty);
  
-+/// Cached information about a UnaryOp::Clz / UnaryOp::Ctz instruction.
-+/// The IR defines Clz(0)/Ctz(0) == operand width, which lets a guarded
-+/// ternary `x ? clz(x) : width` collapse onto the bare intrinsic.
-+#[derive(Clone, Copy)]
-+struct UnaryDef {
-+    op: IrUnaryOp,
-+    src: Operand,
-+    ty: IrType,
-+}
-+
-+/// Peel integer->integer Cast chains (optionally only same-carrier-size
-+/// casts — used on the condition/clz-operand side, where only a same-size
-+/// cast is guaranteed to preserve zero-ness) off an operand.
-+fn peel_int_cast_chain(mut op: Operand, cast_defs: &[Option<CastDef>], same_size_only: bool) -> Operand {
-+    for _ in 0..32 {
-+        let Operand::Value(v) = op else { break };
-+        match cast_defs.get(v.0 as usize).and_then(|d| d.as_ref()) {
-+            Some(CastDef {
-+                src,
-+                from_ty,
-+                to_ty,
-+                ..
-+            }) if from_ty.is_integer() && to_ty.is_integer() && (!same_size_only
-+                || from_ty.size() == to_ty.size()) =>
-+            {
-+                op = *src;
-+            }
-+            _ => break,
+         // Detect struct-typed ternary where branches produce inconsistent
+@@ -1121,8 +1120,8 @@ impl Lowerer {
+     /// The "then" value is the condition value itself (evaluated once).
+     pub(super) fn lower_gnu_conditional(&mut self, cond: &Expr, else_expr: &Expr) -> Operand {
+         let cond_val = self.lower_expr(cond);
+-        let cond_ty = self.get_expr_type(cond);
+-        let else_ty = self.get_expr_type(else_expr);
++        let cond_ty = self.ternary_arm_type(cond);
++        let else_ty = self.ternary_arm_type(else_expr);
+ 
+         // Complex types always lower to Ptr; avoid type mismatch with function
+         // call return types (e.g., F64 for packed _Complex float).
+@@ -1176,6 +1175,80 @@ impl Lowerer {
+         )
+     }
+ 
++    /// C-semantic type of an expression when used as a ternary/branch arm.
++    ///
++    /// get_expr_type() reports the *storage* type, which is the target int
++    /// (I64 on LP64) for integer literals even though C `int`/`unsigned`
++    /// literals are 32-bit values. A ternary that merges such a literal with
++    /// a 32-bit operand would otherwise promote the whole result to I64 and
++    /// force 64-bit cmovs/selects. When the arm's C type is a 32-bit integer
++    /// but its storage is 64-bit, report the C type so the merged (common)
++    /// type and resulting Select stay 32-bit. Pointer arms report Ptr.
++    pub(super) fn ternary_arm_type(&self, e: &Expr) -> IrType {
++        if self.expr_is_pointer(e) {
++            return IrType::Ptr;
++        }
++        let ty = self.get_expr_type(e);
++        match self.expr_ctype(e) {
++            CType::Int if ty == IrType::I64 => IrType::I32,
++            CType::UInt if ty == IrType::I64 || ty == IrType::U64 => IrType::U32,
++            _ => ty,
 +        }
 +    }
-+    op
-+}
 +
-+/// Redundant zero-guard select elimination for the bit intrinsics.
-+///
-+/// `select(cond != 0 → t, else W)` where `t` is a Clz/Ctz result chain over
-+/// `x`, the condition selects the intrinsic arm exactly when `x` is nonzero,
-+/// and `W` equals the intrinsic's operand width collapses onto `t`: the IR
-+/// defines Clz(0)/Ctz(0) == width, so `t` already yields `W` in the zero
-+/// case. This is the shape C sources write as `x ? __builtin_clz(x) : 32`
-+/// (and the bsr/bsf clz lowering already provides the zero answer, so the
-+/// emitted codegen otherwise duplicates the zero fix-up as a dead cmov).
-+///
-+/// Public entry point for the dedicated pass placed right after if-conversion
-+/// (which *creates* the Select form from a branchy ternary only after the
-+/// generic simplify sweep has already run in the same pipeline iteration).
-+pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
-+    let max = func.max_value_id() as usize + 1;
-+    let mut cast_defs: Vec<Option<CastDef>> = vec![None; max];
-+    let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max];
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            match inst {
-+                Instruction::Cast {
-+                    dest,
-+                    src,
-+                    from_ty,
-+                    to_ty,
-+                } => {
-+                    if (dest.0 as usize) < cast_defs.len() {
-+                        cast_defs[dest.0 as usize] = Some(CastDef {
-+                            src: *src,
-+                            from_ty: *from_ty,
-+                            to_ty: *to_ty,
-+                        });
-+                    }
-+                }
-+                Instruction::UnaryOp { dest, op, src, ty }
-+                    if matches!(op, IrUnaryOp::Clz | IrUnaryOp::Ctz) =>
-+                {
-+                    if (dest.0 as usize) < unary_defs.len() {
-+                        unary_defs[dest.0 as usize] = Some(UnaryDef {
-+                            op: *op,
-+                            src: *src,
-+                            ty: *ty,
-+                        });
-+                    }
-+                }
-+                _ => {}
-+            }
-+        }
++    /// Store an arm value into a ternary merge slot, narrowing integer
++    /// constants to the slot type first.
++    ///
++    /// Integer literals are lowered with the target-int (I64 on LP64)
++    /// representation regardless of C type, so a constant arm stored into a
++    /// natural-width (e.g. I32) slot would carry an I64 constant unless it is
++    /// narrowed here. narrowing keeps mem2reg's Phi, and therefore the
++    /// Select/cmov, at the natural width.
++    fn emit_ternary_merge_store(&mut self, val: Operand, ptr: Value, ty: IrType) {
++        let val = match val {
++            Operand::Const(c) if ty.is_integer() => Operand::Const(c.narrowed_to(ty)),
++            other => other,
++        };
++        self.emit(Instruction::Store {
++            volatile: false,
++            val,
++            ptr,
++            ty,
++            seg_override: AddressSpace::Default,
++        });
 +    }
-+    let mut changes = 0;
-+    for block in &mut func.blocks {
-+        for inst in &mut block.instructions {
-+            match inst {
-+                Instruction::Select {
-+                    dest,
-+                    cond,
-+                    true_val,
-+                    false_val,
-+                    ..
-+                } => {
-+                    if let Some(t) = clz_ctz_zero_guard_replacement(
-+                        cond,
-+                        true_val,
-+                        false_val,
-+                        &cast_defs,
-+                        &unary_defs,
-+                    ) {
-+                        *inst = Instruction::Copy {
-+                            dest: *dest,
-+                            src: t,
-+                        };
-+                        changes += 1;
-+                    }
-+                }
-+                // The select collapse above exposes the pre-existing round
-+                // trip that wrapped the intrinsic arm to the select's (wider)
-+                // carrier type: sext(clz(x)) i32->i64 followed by a truncate
-+                // back to i32. Truncate(sext(v)) == v for every v, so the
-+                // round trip is exact; for a Clz/Ctz root the intermediate
-+                // sign-extension is additionally never needed (results are
-+                // non-negative). Fold it onto the intrinsic result, keeping
-+                // the types consistent (the outer trunc's destination type
-+                // equals the intrinsic result type).
-+                Instruction::Cast {
-+                    dest,
-+                    src,
-+                    from_ty,
-+                    to_ty,
-+                }
-+                    if from_ty.is_integer()
-+                        && to_ty.is_integer()
-+                        && from_ty.size() > to_ty.size() =>
-+                {
-+                    if let Operand::Value(s) = src {
-+                        if let Some(Some(inner)) = cast_defs.get(s.0 as usize) {
-+                            let is_round_trip = inner.to_ty == *from_ty
-+                                && inner.from_ty == *to_ty;
-+                            let root = peel_int_cast_chain(inner.src, &cast_defs, true);
-+                            let bitop_root = match root {
-+                                Operand::Value(rv) => matches!(
-+                                    unary_defs.get(rv.0 as usize).and_then(|d| d.as_ref()),
-+                                    Some(UnaryDef {
-+                                        op: IrUnaryOp::Clz | IrUnaryOp::Ctz,
-+                                        ..
-+                                    })
-+                                ),
-+                                _ => false,
-+                            };
-+                            if is_round_trip && bitop_root {
-+                                *inst = Instruction::Copy {
-+                                    dest: *dest,
-+                                    src: inner.src,
-+                                };
-+                                changes += 1;
-+                            }
-+                        }
-+                    }
-+                }
-+                _ => {}
-+            }
-+        }
-+    }
-+    changes
-+}
 +
-+/// Core predicate + rewrite of the redundant zero-guard pattern. Returns the
-+/// operand the select should collapse onto (the intrinsic arm), or None when
-+/// the select is not provably redundant.
-+fn clz_ctz_zero_guard_replacement(
-+    cond: &Operand,
-+    true_val: &Operand,
-+    false_val: &Operand,
-+    cast_defs: &[Option<CastDef>],
-+    unary_defs: &[Option<UnaryDef>],
-+) -> Option<Operand> {
-+    let Operand::Value(_) = cond else { return None };
-+    // Walk the true arm through its integer cast chain (value-preserving for
-+    // the small clz/ctz results) to the intrinsic.
-+    let mut cur = *true_val;
-+    let found = loop {
-+        let Operand::Value(v) = cur else { break None };
-+        if let Some(Some(UnaryDef {
-+            op: IrUnaryOp::Clz | IrUnaryOp::Ctz,
-+            ..
-+        })) = unary_defs.get(v.0 as usize)
++    /// Choose the stack-slot (merge) type for a conditional-expression alloca.
++    ///
++    /// The slot type becomes the mem2reg phi type, which in turn becomes the
++    /// Select type the backend lowers to a cmov/move. Forcing every narrow
++    /// scalar through the target-int (I64-on-LP64) slot made `int` conditionals
++    /// materialize as I64 selects — 64-bit cmovs/moves plus redundant
++    /// widen/narrow Cast pairs around the select — whereas C `int` is 4 bytes
++    /// and GCC/Clang/ICX keep such selects 32-bit. Keeping the exact scalar
++    /// type for register-int widths mirrors the i686 path (where `int` already
++    /// maps to the 4-byte target int), so LP64 `int` selects stay I32.
++    /// Unchanged: >8-byte aggregates (I128/F128/vectors), floats (carried by
++    /// bit pattern), and sub-int types (I8/I16 keep their historical widening).
++    fn ternary_merge_slot(result_ty: IrType) -> (IrType, usize) {
++        let int_ty = crate::common::types::target_int_ir_type();
++        let int_size = int_ty.size();
++        if result_ty.size() > int_size {
++            // Wide aggregates: keep the exact (large) type for store/load width.
++            (result_ty, result_ty.size())
++        } else if result_ty.is_integer()
++            && (result_ty.size() == 4 || result_ty.size() == int_size)
 +        {
-+            break Some(v);
++            // `int` / target-width scalar integers: exact type. On LP64 this is
++            // the I32 case (I64 already equals int_ty); on i686 both coincide
++            // with prior behavior.
++            (result_ty, result_ty.size())
++        } else {
++            // Floats, sub-int types, pointers: historical target-int slot.
++            (int_ty, result_ty.size().max(int_size))
 +        }
-+        match cast_defs.get(v.0 as usize).and_then(|d| d.as_ref()) {
-+            Some(CastDef {
-+                src,
-+                from_ty,
-+                to_ty,
-+                ..
-+            }) if from_ty.is_integer() && to_ty.is_integer() => cur = *src,
-+            _ => break None,
-+        }
-+    };
-+    let root = found?;
-+    let UnaryDef { op, src, ty } = *unary_defs[root.0 as usize].as_ref()?;
-+    if !ty.is_integer() {
-+        return None;
 +    }
-+    let bits = ty.size() as u128 * 8;
-+    // The zero-case constant must be exactly the intrinsic width.
-+    let false_imm = match false_val {
-+        Operand::Const(c) => c.to_i128(),
-+        _ => None,
-+    };
-+    if false_imm != Some(bits as i128) {
-+        return None;
-+    }
-+    // The condition must select the intrinsic arm exactly when its operand is
-+    // nonzero (same value up to zero-ness-preserving casts).
-+    if peel_int_cast_chain(*cond, cast_defs, true)
-+        != peel_int_cast_chain(src, cast_defs, true)
-+    {
-+        return None;
-+    }
-+    Some(*true_val)
-+}
 +
- /// Cached information about a BinOp instruction for constant reassociation.
- /// We only store BinOps where at least one operand is a constant, since
- /// reassociation requires folding two constants together.
-@@ -483,6 +709,7 @@ fn try_simplify_with_types(
-     cmp_defs: &[Option<CmpDef>],
-     binop_defs: &[Option<BinOpDef>],
-     neg_defs: &[Option<NegDef>],
-+    unary_defs: &[Option<UnaryDef>],
-     is_boolean: &[bool],
-     value_types: &[Option<IrType>],
-     use_counts: &[u32],
-@@ -591,6 +818,18 @@ fn try_simplify_with_types(
-                     });
-                 }
-             }
-+            // select(cond != 0 -> clz/ctz(x), else W) => clz/ctz(x): the IR
-+            // defines Clz(0)/Ctz(0) == width, so the intrinsic arm already
-+            // produces W for zero and the guarded ternary is redundant.
-+            if let Some(t) = clz_ctz_zero_guard_replacement(
-+                cond,
-+                true_val,
-+                false_val,
-+                cast_defs,
-+                unary_defs,
-+            ) {
-+                return Some(Instruction::Copy { dest: *dest, src: t });
+     /// Shared helper for ternary branch patterns (conditional and GNU conditional).
+     /// Evaluates `then_fn` in the true branch and `else_fn` in the false branch,
+     /// stores both results to an alloca, and returns the loaded result.
+@@ -1190,14 +1263,7 @@ impl Lowerer {
+     ) -> Operand {
+         // Use emit_entry_alloca so the alloca is in the entry block, ensuring
+         // mem2reg can promote it to SSA/Phi form.
+-        let int_ty = crate::common::types::target_int_ir_type();
+-        let min_alloca_size = int_ty.size();
+-        let alloca_size = result_ty.size().max(min_alloca_size);
+-        let alloca_ty = if result_ty.size() > min_alloca_size {
+-            result_ty
+-        } else {
+-            int_ty
+-        };
++        let (alloca_ty, alloca_size) = Self::ternary_merge_slot(result_ty);
+         let result_alloca = self.emit_entry_alloca(alloca_ty, alloca_size, 0, false);
+ 
+         let then_label = self.fresh_label();
+@@ -1208,24 +1274,12 @@ impl Lowerer {
+ 
+         self.start_block(then_label);
+         let then_val = then_fn(self);
+-        self.emit(Instruction::Store {
+-            volatile: false,
+-            val: then_val,
+-            ptr: result_alloca,
+-            ty: alloca_ty,
+-            seg_override: AddressSpace::Default,
+-        });
++        self.emit_ternary_merge_store(then_val, result_alloca, alloca_ty);
+         self.terminate(Terminator::Branch(end_label));
+ 
+         self.start_block(else_label);
+         let else_val = else_fn(self);
+-        self.emit(Instruction::Store {
+-            volatile: false,
+-            val: else_val,
+-            ptr: result_alloca,
+-            ty: alloca_ty,
+-            seg_override: AddressSpace::Default,
+-        });
++        self.emit_ternary_merge_store(else_val, result_alloca, alloca_ty);
+         self.terminate(Terminator::Branch(end_label));
+ 
+         self.start_block(end_label);
+@@ -1255,14 +1309,7 @@ impl Lowerer {
+         //
+         // Use the actual result type for the alloca size so that wider types like
+         // long double (F128, 16 bytes) and __int128 are stored correctly.
+-        let int_ty = crate::common::types::target_int_ir_type();
+-        let min_alloca_size = int_ty.size();
+-        let alloca_size = result_ty.size().max(min_alloca_size);
+-        let alloca_ty = if result_ty.size() > min_alloca_size {
+-            result_ty
+-        } else {
+-            int_ty
+-        };
++        let (alloca_ty, alloca_size) = Self::ternary_merge_slot(result_ty);
+         let result_alloca = self.emit_entry_alloca(alloca_ty, alloca_size, 0, false);
+ 
+         let then_label = self.fresh_label();
+@@ -1277,24 +1324,12 @@ impl Lowerer {
+ 
+         self.start_block(then_label);
+         let then_val = then_fn(self);
+-        self.emit(Instruction::Store {
+-            volatile: false,
+-            val: then_val,
+-            ptr: result_alloca,
+-            ty: alloca_ty,
+-            seg_override: AddressSpace::Default,
+-        });
++        self.emit_ternary_merge_store(then_val, result_alloca, alloca_ty);
+         self.terminate(Terminator::Branch(end_label));
+ 
+         self.start_block(else_label);
+         let else_val = else_fn(self);
+-        self.emit(Instruction::Store {
+-            volatile: false,
+-            val: else_val,
+-            ptr: result_alloca,
+-            ty: alloca_ty,
+-            seg_override: AddressSpace::Default,
+-        });
++        self.emit_ternary_merge_store(else_val, result_alloca, alloca_ty);
+         self.terminate(Terminator::Branch(end_label));
+ 
+         self.start_block(end_label);
+diff --git a/src/ir/lowering/expr_types.rs b/src/ir/lowering/expr_types.rs
+index 5f1802b1..3b1596c3 100644
+--- a/src/ir/lowering/expr_types.rs
++++ b/src/ir/lowering/expr_types.rs
+@@ -1128,15 +1128,17 @@ impl Lowerer {
+             Expr::BinaryOp(op, lhs, rhs, _) => self.get_binop_type(op, lhs, rhs),
+             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => self.get_expr_type(lhs),
+             Expr::Conditional(_, then_expr, else_expr, _) => {
+-                let then_ty = self.get_expr_type(then_expr);
+-                let else_ty = self.get_expr_type(else_expr);
+-                Self::common_type(then_ty, else_ty)
+-            }
+-            Expr::GnuConditional(cond, else_expr, _) => {
+-                let cond_ty = self.get_expr_type(cond);
+-                let else_ty = self.get_expr_type(else_expr);
+-                Self::common_type(cond_ty, else_ty)
+-            }
++                // The conditional's result is a value of its C common type —
++                // not a storage type — so type the arms by C semantics. Using
++                // raw storage types here makes an int conditional with a
++                // constant arm (born I64) report I64 and forces a spurious
++                // widen/narrow cast pair around the (now natural-width) merge.
++                Self::common_type(self.ternary_arm_type(then_expr), self.ternary_arm_type(else_expr))
 +            }
-             None
-         }
-         Instruction::Call { func, info } => {
-@@ -621,6 +860,7 @@ fn try_simplify(
-         cmp_defs,
-         binop_defs,
-         neg_defs,
-+        &[],
-         is_boolean,
-         &[],
-         &[],
-@@ -2568,6 +2808,120 @@ mod tests {
-         }
-     }
- 
-+    // === clz/ctz guarded-ternary zero-guard elimination ===
-+
-+    #[test]
-+    fn test_select_clz_guard_elimination() {
-+        // `x ? __builtin_clz(x) : 32` shape after the ternary lowers:
-+        //   v2 = cast v1 (u32 -> i32, same size)
-+        //   v3 = Clz(v2)                    // IR defines Clz(0) == 32
-+        //   v4 = sext v3 (i32 -> i64)
-+        //   v5 = select cond=v1 ? v4 : 32   // redundant zero guard
-+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 6];
-+        cast_defs[2] = Some(CastDef {
-+            src: Operand::Value(Value(1)),
-+            from_ty: IrType::U32,
-+            to_ty: IrType::I32,
-+        });
-+        cast_defs[4] = Some(CastDef {
-+            src: Operand::Value(Value(3)),
-+            from_ty: IrType::I32,
-+            to_ty: IrType::I64,
-+        });
-+        let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; 6];
-+        unary_defs[3] = Some(UnaryDef {
-+            op: IrUnaryOp::Clz,
-+            src: Operand::Value(Value(2)),
-+            ty: IrType::I32,
-+        });
-+        let r = clz_ctz_zero_guard_replacement(
-+            &Operand::Value(Value(1)),
-+            &Operand::Value(Value(4)),
-+            &Operand::Const(IrConst::I64(32)),
-+            &cast_defs,
-+            &unary_defs,
-+        );
-+        assert!(
-+            matches!(r, Some(Operand::Value(v)) if v.0 == 4),
-+            "select(x ? clz(x) : 32) should collapse onto the clz arm"
-+        );
-+        // The condition may itself be a same-size cast of x (same zero-ness).
-+        let r2 = clz_ctz_zero_guard_replacement(
-+            &Operand::Value(Value(2)),
-+            &Operand::Value(Value(4)),
-+            &Operand::Const(IrConst::I64(32)),
-+            &cast_defs,
-+            &unary_defs,
-+        );
-+        assert!(matches!(r2, Some(Operand::Value(v)) if v.0 == 4));
-+        // Ctz variant with its width constant folds the same way.
-+        unary_defs[3] = Some(UnaryDef {
-+            op: IrUnaryOp::Ctz,
-+            src: Operand::Value(Value(2)),
-+            ty: IrType::I32,
-+        });
-+        let r3 = clz_ctz_zero_guard_replacement(
-+            &Operand::Value(Value(1)),
-+            &Operand::Value(Value(4)),
-+            &Operand::Const(IrConst::I64(32)),
-+            &cast_defs,
-+            &unary_defs,
-+        );
-+        assert!(matches!(r3, Some(Operand::Value(v)) if v.0 == 4));
-+    }
-+
-+    #[test]
-+    fn test_select_clz_guard_rejects_bad_width_and_unrelated_cond() {
-+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 7];
-+        cast_defs[2] = Some(CastDef {
-+            src: Operand::Value(Value(1)),
-+            from_ty: IrType::U32,
-+            to_ty: IrType::I32,
-+        });
-+        cast_defs[4] = Some(CastDef {
-+            src: Operand::Value(Value(3)),
-+            from_ty: IrType::I32,
-+            to_ty: IrType::I64,
-+        });
-+        // A truncating cast on the CONDITION side changes zero-ness (x ==
-+        // 0x100 has low byte 0), so it must never fold.
-+        cast_defs[5] = Some(CastDef {
-+            src: Operand::Value(Value(1)),
-+            from_ty: IrType::I64,
-+            to_ty: IrType::U32,
-+        });
-+        let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; 7];
-+        unary_defs[3] = Some(UnaryDef {
-+            op: IrUnaryOp::Clz,
-+            src: Operand::Value(Value(2)),
-+            ty: IrType::I32,
-+        });
-+        let near = |cond: Operand| {
-+            clz_ctz_zero_guard_replacement(
-+                &cond,
-+                &Operand::Value(Value(4)),
-+                &Operand::Const(IrConst::I64(32)),
-+                &cast_defs,
-+                &unary_defs,
-+            )
-+        };
-+        // Width mismatch: zero-case constant 31 != clz width 32.
-+        assert_eq!(
-+            clz_ctz_zero_guard_replacement(
-+                &Operand::Value(Value(1)),
-+                &Operand::Value(Value(4)),
-+                &Operand::Const(IrConst::I64(31)),
-+                &cast_defs,
-+                &unary_defs,
++            Expr::GnuConditional(cond, else_expr, _) => Self::common_type(
++                self.ternary_arm_type(cond),
++                self.ternary_arm_type(else_expr),
 +            ),
-+            None
-+        );
-+        // Unrelated condition value.
-+        assert_eq!(near(Operand::Value(Value(6))), None);
-+        // Truncated-condition value id 5 peels to nothing (same-size only).
-+        assert_eq!(near(Operand::Value(Value(5))), None);
-+    }
-+
-     // === BinOp identity tests ===
- 
-     #[test]
-diff --git a/tests/regression/check_clz_zero_guard_fold.sh b/tests/regression/check_clz_zero_guard_fold.sh
-new file mode 100755
-index 00000000..67250099
---- /dev/null
-+++ b/tests/regression/check_clz_zero_guard_fold.sh
-@@ -0,0 +1,41 @@
-+#!/usr/bin/env bash
-+# Codegen gate for the guarded-clz zero-guard elimination.
-+#
-+# `x ? __builtin_clz(x) : 32` must collapse onto the Clz intrinsic (whose IR
-+# semantics already define Clz(0) == 32). Before the fix, codegen emitted the
-+# intrinsic's own zero fix-up AND a second select materialization
-+# (`movq $32, %rdx; cmovneq %rax, %rdx`) — a fully dead tail. The gate checks
-+# the function body for the select residue and for the bsr core.
-+# Runtime semantics are covered differentially by guarded_clz_ctz_ternary.c.
-+set -euo pipefail
-+
-+CCC=${CCC:-./target/fastbuild/lccc}
-+td=$(mktemp -d)
-+trap 'rm -rf "$td"' EXIT
-+
-+cat >"$td/c.c" <<'EOF'
-+int lz(unsigned x) { return x ? __builtin_clz(x) : 32; }
-+EOF
-+
-+"$CCC" -O2 -S "$td/c.c" -o "$td/c.s"
-+body=$(sed -n '/^lz:/,/^\.size[[:space:]]*lz/p' "$td/c.s")
-+
-+if ! grep -qE '\bbsrl?\b|\blzcntl\b' <<<"$body"; then
-+    echo "FAIL: lz() should contain a bsr (or lzcnt) core; got:" >&2
-+    echo "$body" >&2
-+    exit 1
-+fi
-+# Select residue from the pre-fix duplicated zero guard: a second materialized
-+# `movq $32` + cmov (and the double test of the operand) must be gone.
-+if grep -qE '\bcmov' <<<"$body" || grep -qE 'movq[[:space:]]+\$32,' <<<"$body"; then
-+    echo "FAIL: lz() still contains the redundant zero-guard select tail:" >&2
-+    echo "$body" >&2
-+    exit 1
-+fi
-+n_test=$(grep -cE '\btest[blqw]?\b' <<<"$body" || true)
-+if [ "$n_test" -gt 1 ]; then
-+    echo "FAIL: lz() tests its operand more than once (doubled zero guard):" >&2
-+    echo "$body" >&2
-+    exit 1
-+fi
-+echo "OK clz_zero_guard_fold"
-diff --git a/tests/regression/check_wide_const_imm_stores.sh b/tests/regression/check_wide_const_imm_stores.sh
-new file mode 100755
-index 00000000..b2e50aaa
---- /dev/null
-+++ b/tests/regression/check_wide_const_imm_stores.sh
-@@ -0,0 +1,50 @@
-+#!/usr/bin/env bash
-+# Codegen gate for direct narrow stores of wide unsigned constants.
-+#
-+# A store of 3041712678u (above i32::MAX) to a 32-bit destination must be a
-+# single `movl $3041712678, <addr>` — the raw imm32 field of movl encodes the
-+# full unsigned range. The `movabsq $imm, %rax; movl %eax, addr` relay (the
-+# pre-fix accumulator staging) must not appear for:
-+#   * a register-homed pointer destination  (p[1] = 3041712678u)
-+#   * a global symbol destination           (ga[0] = 3041712678u)
-+# Runtime semantics are covered differentially by wide_const_imm_stores.c.
-+set -euo pipefail
-+
-+CCC=${CCC:-./target/fastbuild/lccc}
-+td=$(mktemp -d)
-+trap 'rm -rf "$td"' EXIT
-+
-+cat >"$td/w.c" <<'EOF'
-+unsigned ga[8];
-+void f(unsigned *p) { p[0] = 0xFFFFFFFFu; p[1] = 3041712678u; p[2] = 2147483648u; }
-+void g(void) { ga[0] = 3041712678u; ga[1] = 4294967295u; }
-+EOF
-+
-+"$CCC" -O2 -S "$td/w.c" -o "$td/w.s"
-+body() { sed -n "/^$1:/,/^\.size[[:space:]]*$1/p" "$td/w.s"; }
-+f_body=$(body f)
-+g_body=$(body g)
-+
-+if grep -qF 'movabsq $' <<<"$f_body"; then
-+    echo "FAIL: f() staged a constant through %rax; want direct movl immediates:" >&2
-+    echo "$f_body" >&2
-+    exit 1
-+fi
-+if grep -qF 'movabsq $' <<<"$g_body"; then
-+    echo "FAIL: g() staged a constant through %rax for a global store; want direct movl \$imm, sym(%rip):" >&2
-+    echo "$g_body" >&2
-+    exit 1
-+fi
-+n_direct=$(grep -cE 'movl \$[0-9]+,' <<<"$f_body" || true)
-+if [ "$n_direct" -lt 3 ]; then
-+    echo "FAIL: f() should hold three direct imm32 movl stores; got:" >&2
-+    echo "$f_body" >&2
-+    exit 1
-+fi
-+if ! grep -qF 'movl $3041712678, ga(%rip)' <<<"$g_body" \
-+   || ! grep -qF 'movl $4294967295, ga+4(%rip)' <<<"$g_body"; then
-+    echo "FAIL: g() should store both constants directly to ga(%rip)/ga+4(%rip); got:" >&2
-+    echo "$g_body" >&2
-+    exit 1
-+fi
-+echo "OK wide_const_imm_stores"
-diff --git a/tests/regression/const_terminator_dead_region.c b/tests/regression/const_terminator_dead_region.c
-index 7c30cc91..4d74c458 100644
---- a/tests/regression/const_terminator_dead_region.c
-+++ b/tests/regression/const_terminator_dead_region.c
-@@ -7,13 +7,23 @@
- //   * unlabeled statements in a never-executed branch die (medce-1.c,
- //     gcc -O0 keeps `link_error` unreferenced);
- //   * a case label inside a dead region survives WITH its body when the
--//     enclosing switch can dispatch to it (medce-1.c shape, foo(1) runs
--//     `case 1: bar();`);
-+//     enclosing switch can dispatch to it (medce-1.c shape, foo(2) runs
-+//     `case 2:` nested in the `if (0)` and lands on ok_case = 1);
- //   * a goto-reachable label inside a dead region survives with its body;
- //   * an UNREFERENCED plain label inside a dead region dies with its body
- //     (dce1.c g3 oracle: gcc -O0 emits no call);
- //   * switch on a constant folds to the matching case / default.
- // If any rule regresses, the link fails on link_error_N or the run aborts.
-+//
-+// Historical note: the original pin put a plain (non-dispatchable) label
-+// `case_in:` inside the `if (0)` and then called foo(1), which only ever
-+// dispatches to the outer `case 1` before the dead region. Nothing can reach
-+// the inner label, so ok_case was never set and every conforming compiler --
-+// GCC -O0..-O3 and LCCC -O0..-Os -- aborted (rc=134). A dead pin has no
-+// signal. This version nests a dispatchable `case 2:` inside the `if (0)`
-+// (labels may sit anywhere in the switch body; dispatch jumps past the dead
-+// condition) and calls foo(2), which is exactly the medce-1 interlock the
-+// comment describes.
- extern void abort (void);
- extern void link_error_case (void);
- extern void link_error_goto (void);
-@@ -25,20 +35,19 @@ int ok_case;
- int ok_goto;
- int ok_switch;
- 
--/* medce-1 interlock: `case 1` sits inside the dead `if (0)` region. The
--   unlabeled call before it must die, the labeled body must survive. */
-+/* medce-1 interlock: `case 2` sits inside the dead `if (0)` region under
-+   `case 1`. The unlabeled call before it must die, the labeled body must
-+   survive because switch dispatch (x == 2) can jump straight into it. */
- void
- case_in_dead_if (int x)
- {
-   switch (x)
-     {
--    case 0:
--      break;
-     case 1:
-       if (0)
- 	{
- 	  link_error_case ();
--	case_in:
-+	case 2:
- 	  ok_case = 1;
- 	}
-       break;
-@@ -109,7 +118,7 @@ while_zero_dies (void)
- int
- main (void)
- {
--  case_in_dead_if (1);
-+  case_in_dead_if (2);
-   goto_into_dead_if (1);
-   unref_label_dies (0);
-   const_switch_folds ();
-diff --git a/tests/regression/guarded_clz_ctz_ternary.c b/tests/regression/guarded_clz_ctz_ternary.c
-new file mode 100644
-index 00000000..8148b94f
---- /dev/null
-+++ b/tests/regression/guarded_clz_ctz_ternary.c
-@@ -0,0 +1,42 @@
-+/* Guarded Clz/Ctz ternaries — `x ? __builtin_clz(x) : width`. The IR defines
-+ * Clz(0)/Ctz(0) == operand width, so these selects are redundant and must
-+ * collapse onto the intrinsic (no duplicated zero fix-up / dead cmov tail).
-+ * Differential (lccc vs gcc); the codegen gate lives in
-+ * check_clz_zero_guard_fold.sh. */
-+#include <stdio.h>
-+#include <stdint.h>
-+
-+volatile unsigned sink;
-+
-+unsigned lz32(unsigned x) { return x ? __builtin_clz(x) : 32; }
-+unsigned lz32b(unsigned x) { unsigned t = x ? __builtin_clz(x) : 32; return t; }
-+int lz32s(int x) { return x ? __builtin_clz(x) : 32; }
-+unsigned lz64(uint64_t x) { return x ? __builtin_clzll(x) : 64; }
-+unsigned tz32(unsigned x) { return x ? __builtin_ctz(x) : 32; }
-+unsigned tz64(uint64_t x) { return x ? __builtin_ctzll(x) : 64; }
-+unsigned lz16(unsigned short x) { return x ? __builtin_clz((unsigned)x) : 16; }
-+unsigned tz16(unsigned short x) { return x ? __builtin_ctz((unsigned)x) : 16; }
-+
-+int main(void) {
-+    unsigned s = 0x12345678u;
-+    unsigned long long v = 0ull;
-+    for (unsigned i = 0; i < 32; i++) {
-+        v ^= lz32(s << i);
-+        v ^= lz32(1u << i);
-+        v ^= tz32(1u << i);
-+    }
-+    for (uint64_t i = 0; i < 64; i++) {
-+        v ^= lz64(1ull << i);
-+        v ^= lz64((1ull << i) - 1);
-+        v ^= tz64(1ull << i);
-+        v ^= tz64(0x8000000000000000ull >> (i & 63));
-+    }
-+    v ^= lz32s(-1) + lz32s(0) + lz32s(0x7fffffff);
-+    v ^= lz32b(0x100) + lz32b(0);
-+    v ^= lz16(0x8000) + lz16(0) + lz16(1) + lz16(0x00ff);
-+    v ^= tz16(0x8000) + tz16(0) + tz16(1);
-+    v ^= lz32(0) ^ tz32(0) ^ lz64(0) ^ tz64(0);
-+    sink = (unsigned)(v ^ (v >> 32));
-+    printf("%08x\n", sink);
-+    return 0;
-+}
-diff --git a/tests/regression/sib_index_const_copy_sext.c b/tests/regression/sib_index_const_copy_sext.c
-index f1a605e4..ed4871af 100644
---- a/tests/regression/sib_index_const_copy_sext.c
-+++ b/tests/regression/sib_index_const_copy_sext.c
-@@ -1,5 +1,4 @@
--/* S11 regression pin (O1/O2): two interacting hazards on the indexed-gep
-- * fold path.
-+/* S11 regression pin (O1/O2): indexed-gep fold hazards in the x86 backend.
-  *
-  * 1. The fold's SIB index can be a const-initialized I32 copy chain
-  *    (`posGreatest = -1;` then phi/threaded copies). Copy-from-constant
-@@ -9,11 +8,20 @@
-  * 2. When the emitter refuses a fold, rematerialising the skipped GEP
-  *    rebuilds the address through %rax and must not destroy an
-  *    accumulator-resident store value whose producing load was
-- *    dead-producer-skipped (its only copy lives in %rax, no home/slot) —
-- *    the acc is protected around the remat (gcc.c-torture 20020402-1).
-+ *    dead-producer-skipped (its only copy lives in %rax, no home/slot).
-  *
-- * Derived from PR c/2100; expected exit 0. */
--
-+ * Historical note: the original pin declared listSmall[SMALL_N] (2
-+ * elements) while the algorithm writes listSmall[posGreatest] with
-+ * posGreatest reaching SMALL_N..NUM_ELEM-1, i.e. it performed an
-+ * out-of-bounds store whose effect no conforming compiler is obliged to
-+ * honor. That made the final assertion unsatisfiable by correct code:
-+ * GCC -O0..-O3 and LCCC -O0..-Os all abort() it (rc=134). A UB pin has no
-+ * signal. This version widens the window to NUM_ELEM so every store stays
-+ * in-bounds while preserving the const-initialized index chain, the
-+ * indexed-GEP store through listSmall[posGreatest], and the two-phase
-+ * greatest-replacement structure; the assertion checks the algorithm's
-+ * true result. Expected exit 0.
-+ */
- extern void abort (void);
- extern void exit (int);
- 
-@@ -24,7 +32,7 @@ int
- main (void)
- {
-   int listElem[NUM_ELEM] = { 30, 2, 10, 5 };
--  int listSmall[SMALL_N];
-+  int listSmall[NUM_ELEM];
-   int i, j;
-   int posGreatest = -1, greatest = -1;
- 
-@@ -48,7 +56,9 @@ main (void)
- 	}
-     }
- 
--  if (listSmall[0] != 5 || listSmall[1] != 10)
-+  /* Trace: i=2 writes listSmall[0]=10 (pos 0->2), i=3 writes
-+     listSmall[2]=5 (pos 2->3); listSmall[1] keeps its 2 from phase one.  */
-+  if (listSmall[0] != 10 || listSmall[1] != 2 || listSmall[2] != 5)
-     abort ();
- 
-   exit (0);
-diff --git a/tests/regression/wide_const_imm_stores.c b/tests/regression/wide_const_imm_stores.c
-new file mode 100644
-index 00000000..523abf68
---- /dev/null
-+++ b/tests/regression/wide_const_imm_stores.c
-@@ -0,0 +1,69 @@
-+/* Narrow stores of wide unsigned constants must write exactly the store
-+ * width, both for register-homed pointers, folded-GEP offsets and global
-+ * symbols — and the value must land bit-exact when the constant sits above
-+ * i32::MAX (e.g. 3041712678u). Regression for the PR #363/#364 immediate
-+ * store width work; the codegen gate lives in check_wide_const_imm_stores.sh.
-+ * This file is differential (run under lccc and gcc, compare stdout). */
-+#include <stdio.h>
-+#include <stdint.h>
-+
-+unsigned ga[8];
-+int8_t gb[8];
-+int16_t gc[8];
-+uint64_t gd[8];
-+unsigned ge;
-+uint8_t gu8[4];
-+uint16_t gu16[4];
-+
-+void store_unsigned_narrow(void) {
-+    gu8[0] = 255u;
-+    gu8[1] = 128u;
-+    gu16[0] = 65535u;
-+    gu16[1] = 0x8000u;
-+}
-+
-+void store_p(unsigned *p) {
-+    p[0] = 0xFFFFFFFFu;
-+    p[1] = 3041712678u;
-+    p[2] = 2147483648u;
-+    p[3] = 1u;
-+}
-+
-+void store_glob(void) {
-+    ga[0] = 0xFFFFFFFFu;
-+    ga[1] = 3041712678u;
-+    ga[2] = 0;
-+    ga[3] = 3041712679u;
-+    ge = 4294967295u;
-+}
-+
-+void store_p8(int8_t *p) { p[0] = -1; p[1] = 127; p[2] = -128; p[3] = 0x80; }
-+void store_p16(int16_t *p) { p[0] = -1; p[1] = 32767; p[2] = 65535; }
-+void store_p64(uint64_t *p) {
-+    p[0] = 0xFFFFFFFFFFFFFFFFull;
-+    p[1] = 0x8000000000000000ull;
-+    p[2] = 3041712678u;
-+    p[3] = 0x123456789ABCDEF0ull;
-+}
-+
-+int main(void) {
-+    unsigned q[4];
-+    store_p(q);
-+    store_glob();
-+    store_unsigned_narrow();
-+    int8_t b[4];
-+    store_p8(b);
-+    int16_t c[3];
-+    store_p16(c);
-+    uint64_t d[4];
-+    store_p64(d);
-+    printf("%u %u %u %u\n", q[0], q[1], q[2], q[3]);
-+    printf("%u %u %u %u %u\n", ga[0], ga[1], ga[2], ga[3], ge);
-+    printf("%d %d %d %d\n", b[0], b[1], b[2], b[3]);
-+    printf("%d %d %d\n", c[0], c[1], c[2]);
-+    printf("%llu %llu %llu %llu\n",
-+           (unsigned long long)d[0], (unsigned long long)d[1],
-+           (unsigned long long)d[2], (unsigned long long)d[3]);
-+    printf("%u %u %u %u\n", gu8[0], gu8[1], gu16[0], gu16[1]);
-+    return 0;
-+}
+             Expr::Comma(_, rhs, _) => self.get_expr_type(rhs),
+             Expr::PostfixOp(_, inner, _) => self.get_expr_type(inner),
+             Expr::AddressOf(_, _) => IrType::Ptr,
