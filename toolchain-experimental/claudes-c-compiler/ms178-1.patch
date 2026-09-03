@@ -1,3 +1,10 @@
+diff --git a/.base_ref b/.base_ref
+index ec107a49..c346eb47 100644
+--- a/.base_ref
++++ b/.base_ref
+@@ -1 +1 @@
+-4762fea131266dbc9af3331361e9f0f45af84af1
++e2d5ef6675cb8fcb085733f11cf49b46c8077fd2
 diff --git a/engineering/AUDIT-2026-09-03-PR359-fp-folds.md b/engineering/AUDIT-2026-09-03-PR359-fp-folds.md
 new file mode 100644
 index 00000000..403b5cff
@@ -165,8 +172,125 @@ index 00000000..403b5cff
 +   is a block-local forward state machine; it was not part of #359 and was not
 +   re-audited here beyond reading (its label/call/branch/ret clearing is
 +   control-flow aware by construction).
+diff --git a/engineering/AUDIT-2026-09-03-PR363-and-rebase.md b/engineering/AUDIT-2026-09-03-PR363-and-rebase.md
+new file mode 100644
+index 00000000..ca868821
+--- /dev/null
++++ b/engineering/AUDIT-2026-09-03-PR363-and-rebase.md
+@@ -0,0 +1,111 @@
++# Red-team audit of upstream PR #363 + rebase of PR #358/#359 fixes onto it
++
++Context: upstream merged PR #363 (`2c027cb1` → `e2d5ef66`) on top of
++`da964ed4`, the base of this audit branch (`wip/audit358-359`). #363 is the
++*next upstream work touching the same code area* — it fixes the same
++wide-immediate-store bug as our `b10ef6c0`, plus adjacent FP-peephole and
++typed-lowering work. This branch was rebased onto `e2d5ef66` (all three prior
++commits replayed and reconciled) and #363 itself was red-teamed.
++
++## What #363 contains (summary)
++
++1. **Wide-immediate memory relay honors operand width** (`machinst_emit.rs`).
++   Independent fix for the same VLA over-wide-store miscompile our `b10ef6c0`
++   fixes, using a different technique: relay through `%rax` at the operand's
++   own width (`movabsq $imm,%rax` + `movl %eax,mem`) instead of a single
++   direct sized move.
++2. **`is_pure_xmm_overwrite` merge-write rule** (`memory_fold.rs`). A reg-reg
++   scalar `movsd`/`movss` preserves the destination's upper bits (SDM merge),
++   so it is not a full overwrite; only memory-source scalar forms define the
++   whole register. Real, previously-unfound bug in the same PR #359 machinery
++   we audited.
++3. **Hoist quality fixes**: dedupe same-line double uses; `movss`
++   materialization for single-precision-only sites.
++4. **Float-constant stores take immediate forms** (isel/emit typed path).
++5. **Indirect calls join the typed contract**; **wide-imm call arguments**
++   stage via movabsq.
++
++## Verdicts
++
++### 1. Wide-immediate relay fix — CORRECT but not optimal; ours is strictly better
++
++The two fixes agree on the width contract (a store whose immediate is outside
++the imm32 window must still write `size` bytes) and both close the VLA
++miscompile. Differences, measured on the exact reproducer
++(`tests/bugs/o2_vla_fill.c`, the unrolled `b[]` 4× `u32` fill of 3041712678u+i):
++
++| | #363 sized relay | this branch (b10ef6c0 + #363) |
++|---|---|---|
++| `b[]` fill instructions | 8 (`movabsq`+`movl` ×4) | **4** (`movl $imm` ×4) |
++| `%rax` clobbers | 4 | **0** |
++| register-dest narrow | `movabsq` (10 B) | `movl` (5 B, zero-extends) |
++| rationale | relay is a 2-instruction idiom | mov{b,w,l} imm field is a RAW {8,16,32}-bit value; the truncated constant stores directly |
++
++The direct form is sound because the immediate field of `mov` (unlike the
++ALU/compare imm32 forms) is not sign-extended into the store — the memory
++destination takes exactly `size` bytes of the raw field, and a narrow register
++destination takes the sized `movl` (zero-extending) / `movb`/`movw` forms.
++Upstream's own `vla_narrow_const_store_family.c` passes with our path active;
++their regression is a compatible second gate. Both are kept in the merged tree
++(narrow fast path first; the sized relay remains the S64>i32 path and a
++defense-in-depth net), and the emitter comment now records both.
++
++### 2. Merge-write rule — AGREE, adopt (it is in the base now)
++
++The counterexample is airtight: a deleted memory-source `movsd` zeroed bits
++[127:64]; a later reg-reg `vmovsd` merges (preserves) those zeroed bits from
++the *destination*, and a packed `vmovapd` then observes them. Our control-flow
++barrier (`is_cf_transfer`, 9236df3d) and their dataflow rule (merge-writes are
++not kills) are orthogonal necessary conditions for the same "the loaded value
++is dead" proof; both are required and both are now in force. Six tests pin the
++accept side (mem-source scalar, straight-line reuse) and the reject sides
++(reg-reg merge, rmw, store, partial write, branch-skipped kill).
++
++### 3. Hoist dedupe + movss width — AGREE (quality fixes)
++
++The same-line double-use threshold bug is exactly the in-place-rmw case our
++own audit flagged; the adjacent-dedup fix is minimal and correct (sites are
++pushed in ascending line order). The `movss` materialization reads the op
++width, which is the correct invariant (an op reads only its own width from the
++pool address).
++
++### 4. Float-constant immediate stores — mostly right; ONE defect found
++
++Immediate forms are a genuine improvement (no rodata entry, no xmm load, no
++partial-register dependency) and the `as i32` half-spelling correctly stays
++inside the imm32 window. **Defect (fixed in this branch, `5ef2ea30`):** an
++F64/D64 constant that needs the two-`movl`-half split was applied to C
++`volatile` stores. A volatile store is one abstract access (C11 5.1.2.3); two
++4-byte stores expose a torn state to signal handlers/concurrent readers that
++the abstract machine forbids — gcc/clang/icc emit a single pool+movsd for a
++volatile wide double. The typed lowering now refuses the split when the Store
++is `volatile` (single-access immediate forms for F32 and for fitting F64 bit
++patterns remain allowed). Demonstrated before/after on
++`volatile double t; t = 1.5e300;` (was `movl`+`movl`, now one `movsd`), pinned
++by 3 isel unit tests + `tests/regression/volatile_const_stores.c`.
++
++### 5. Indirect calls / wide call args — out of the audited area; spot-checked
++
++Mechanism (single atomic CallTyped, r10/r11 staging with topological
++reader-before-writer protection) is consistent with the architecture this
++branch audited earlier; left for the area owner. No defect found in the
++read-through.
++
++## A/B isolation (how the comparison above was measured)
++
++`b10ef6c0`'s direct-immediate block was temporarily removed from the merged
++tree (upstream relay alone active), `o2_vla_fill.c` compiled, and the `b[]`
++fill counted: 8 instructions with 4 `%rax` clobbers. Restoring the block: 4
++single `movl`s. The final tree keeps the fast path and passes every oracle
++(`vla_largeconst_u32_fill.c`, `vla_narrow_const_store_family.c`,
++`o2_vla_fill.c`) at -O2/-O3.
++
++## Combined branch state after the rebase
++
++```
++e2d5ef66 (upstream main; merged PR #363)
++  f016149e machinst: fix narrow stores of large immediates (b10ef6c0 replayed)
++  9236df3d peephole: close control-flow gap in the FP fold liveness refinement
++  f766a4da docs: resolve VLA store-width BUG doc; PR #359 red-team verdict
++  5ef2ea30 isel: never split a volatile F64/D64 const store into two movl halves
++```
 diff --git a/engineering/BUG-2026-09-03-O2-vla-store-miscompile.md b/engineering/BUG-2026-09-03-O2-vla-store-miscompile.md
-index ec97a9de..c82fadbb 100644
+index f39e7291..61c3d7a5 100644
 --- a/engineering/BUG-2026-09-03-O2-vla-store-miscompile.md
 +++ b/engineering/BUG-2026-09-03-O2-vla-store-miscompile.md
 @@ -1,9 +1,16 @@
@@ -190,7 +314,7 @@ index ec97a9de..c82fadbb 100644
  
  ## Symptom
  
-@@ -60,17 +67,89 @@ CCC_NO_BIT_IDIOMS / CCC_NO_IF_CONVERT.
+@@ -60,42 +67,129 @@ CCC_NO_BIT_IDIOMS / CCC_NO_IF_CONVERT.
    need alias follow-up. No single removed store has been conclusively pinned
    yet.
  
@@ -208,6 +332,31 @@ index ec97a9de..c82fadbb 100644
 -3. Do not add the failing cases to tests/regression until fixed (they are
 -   intentionally absent). Keep the run_slot_stress default range at 1..20
 -   (upstream's committed gate), which passes 400/400.
+-
+-## RESOLUTION (2026-09-03, red-team audit session)
+-
+-FIXED — and the root cause is NOT in the layout, contrary to the "candidate
+-defects" above. A/B builds of the exact upstream commits isolate it:
+-
+-- `c8683317` (PR #362) still reproduces both failures at -O2/-O3.
+-- upstream + the S26 MachInst commit (wide-imm memory-relay operand-size
+-  hardening) passes both, matching gcc.
+-
+-Root cause: a 32-bit constant outside the signed imm32 window (b[3] =
+-3041712681) is staged with `movabsq $imm, %rax` and stored by the wide-imm
+-memory relay at its DEFAULT S64 width (`movq`), writing 4 bytes past the
+-16-byte VLA — exactly a[0]'s low half on the shipped stack ordering. The
+-checksum chain amplifies the erased 32 bits by 33^3, matching the observed
+-delta (75045033622640 / 33^3 = 2.088e9 = a[0]'s lost low half). This is the
+-integer twin of the S26 float-relay defect; the shared-relay hardening fixes
+-both. Layout knobs could never mask it (over-wide STORE, not a sharing
+-collision); no IR pass knob can mask it (the wrong instruction is emitted for
+--O2-unrolled straight-line VLA stores).
+-
+-Closed: tests/regression/vla_narrow_const_store_family.c (verified failing on
+-c8683317, passing on the fixed tree), slot-stress default range extended to
+-1..45 (720/720 four-way). Full analysis:
+-engineering/AUDIT-2026-09-03-pr359-362-redteam.md.
 +## Root cause & fix (2026-09-03) — MachInst store width contract
 +
 +The IR that triggered seed 32 / `o2_vla_fill.c` is a **narrow store of a
@@ -294,12 +443,52 @@ index ec97a9de..c82fadbb 100644
 +cases are in the suite (`tests/regression/vla_largeconst_u32_fill.c`,
 +`tests/bugs/o2_vla_fill.c`) and upstream's committed gate range stays valid.
 +
++## RESOLUTION — the two independent fixes, merged (2026-09-03)
++
++This defect was found and fixed **independently in two places**; after the
++rebase onto upstream main `e2d5ef66` both fixes coexist in one tree:
++
++1. **This branch, commit `b10ef6c0` — direct sized immediate (primary).** A
++   narrow store (`size` S8/S16/S32) of a constant outside the signed-32-bit
++   range truncates to the destination width and emits a SINGLE sized move:
++   `movl $3041712678, (%rax)` (memory/stack-slot dest) or `movl $3041712678,
++   %eax` (register dest; `movl` zero-extends). This is sound because the
++   mov{b,w,l} immediate field is a RAW {8,16,32}-bit value encoding the full
++   unsigned range (unlike the sign-extended imm32 of the ALU ops) — one
++   instruction, no `%rax` staging, no temporary clobber.
++2. **Upstream PR #363 (merged `e2d5ef66`) — sized relay (defense in depth).**
++   The wide-immediate memory relay now stores at the operand's own width
++   (`movabsq $imm, %rax` + `mov{suffix} %{rax_sized}, dst`), fixing the same
++   VLA overrun and its float twin (an S32 hi-half store with the sign bit set,
++   0xE0000000, that crashed fp_arith at -O2). The relay remains reachable for
++   S64 >i32 destinations (which cannot take a direct imm) and stays as a
++   safety net beneath the narrow fast path.
++
++Both agree on the root cause: **an over-wide STORE, not a layout or IR-pass
++defect** — which is why no `CCC_*` layout knob or IR-pass kill switch could
++mask it and the original bisection stalled across all four "fully
++conservative" configurations. The checksum chain amplifies the erased 32 bits
++by 33^3, matching the observed delta exactly
++(75045033622640 / 33^3 = 2.088e9 = a[0]'s lost low half).
++
++**The direct form is the better fix** for the narrow case (1 instruction and
++no `%rax` dependency vs the relay's 2 instructions + a temporary), and the
++registers-destination width contract it pins (`movl` zero-extends; `movb`/
++`movw` write the low lane; never `movabsq` leaking a >u{size} constant into a
++64-bit register read) is not expressible with the relay alone. The relay fix
++is kept as the general S64 path and the emitter-defined fallback.
++
++Closed by: this branch's `tests/regression/vla_largeconst_u32_fill.c` +
++`tests/bugs/o2_vla_fill.c` + 7 golden emitter tests (`b10ef6c0`), and
++upstream's `tests/regression/vla_narrow_const_store_family.c` + `run_slot_stress`
++default range now 1..45 (both upstream and this branch: 720/720 four-way /
++900/900 incl. -O0/-Os).
 diff --git a/engineering/FOLLOWUP-2026-09-03-pr358-359-redteam-fp-fold-gap.md b/engineering/FOLLOWUP-2026-09-03-pr358-359-redteam-fp-fold-gap.md
 new file mode 100644
-index 00000000..e08cc01e
+index 00000000..44911492
 --- /dev/null
 +++ b/engineering/FOLLOWUP-2026-09-03-pr358-359-redteam-fp-fold-gap.md
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,164 @@
 +# Session follow-up — PR #358/#359 red-team, VLA store-width root cause, FP-fold soundness gap
 +
 +Date: 2026-09-03. Branch `wip/audit358-359` on `ms178/lccc` main `da964ed4`
@@ -395,6 +584,75 @@ index 00000000..e08cc01e
 +  (`b10ef6c0`, `722f7c3c` on `da964ed4`); `.base_ref` pinned to `da964ed4`.
 +- 12 GiB swapfile is active (do not remove); builds use `--profile fastbuild
 +  -j2`; snapshots exclude `target/` — rebuild after any `target/` wipe.
++
++---
++
++## Addendum (same day, second session) — rebase onto PR #363 + new audit
++
++Upstream merged PR #363 (`2c027cb1` → `e2d5ef66`) on top of `da964ed4` before
++this branch was delivered. Per the standing rule, the branch was **rebased
++onto the new main** and #363 was red-teamed (it touches the same code area and
++independently fixed the same wide-immediate-store bug). Three of the four prior
++commits were replayed and conflict-resolved onto `e2d5ef66`:
++
++```
++e2d5ef66  upstream main (PR #363 merged)
++  f016149e  machinst: fix narrow stores of large immediates (was b10ef6c0)
++  9236df3d  peephole: close control-flow gap in FP fold liveness (was 722f7c3c)
++  f766a4da  docs (was 7f66e5ae)
++  5ef2ea30  isel: never split a volatile F64/D64 const store (NEW, red-team of #363)
++```
++
++### Is our solution better than upstream's for the same bug? Yes — measured.
++
++#363 fixed the VLA over-wide store with a sized `%rax` relay
++(`movabsq $imm,%rax` + `movl %eax,mem`); `b10ef6c0` uses a single direct sized
++move (mov imm field is a raw width-truncatable value). A/B on the exact
++reproducer (`o2_vla_fill.c` `b[]` 4-store fill): upstream relay = 8
++instructions and 4 `%rax` clobbers; our fast path = 4 single `movl $imm`.
++Both pass all oracles; ours is structurally shorter and register-free. The
++merged tree keeps both (fast path first, sized relay as the S64>i32 path and
++defense-in-depth).
++
++### What we adopted from #363 (valid new insights)
++
++- `is_pure_xmm_overwrite` **merge-write rule** (reg-reg scalar movsd/movss
++  preserve upper bits; only memory-source forms are full defines) — a real
++  second soundness hole in the PR #359 machinery that our control-flow barrier
++  is orthogonal to. Both conditions now gate the folds.
++- Hoist **site dedup** (in-place rmw double-count) and **movss** materialization.
++
++### Defect found in #363 (fixed in `5ef2ea30`)
++
++The immediate-form float-constant store lowering split a `volatile` F64/D64
++store into two 4-byte `movl` halves, violating C11 single-access volatile
++semantics (torn state observable by signal handlers/concurrent readers).
++gcc/clang/icc emit one pool+movsd. Fix: refuse the split for volatile stores
++(single-access immediate forms still allowed). Demonstrated before/after on
++`volatile double t; t = 1.5e300;`, pinned by 3 isel unit tests +
++`tests/regression/volatile_const_stores.c`.
++
++### Verification (all gates on e2d5ef66 + 4 commits)
++
++- unit suite `cargo test --profile fastbuild --lib`: **1664/0**
++- regression suite: **PASS=577 FAIL=0 SKIP=15** (round 1) / re-run with the
++  new volatile regression pending at write time
++- slot stress seeds 1..45 × {-O0..-Os}: **900/0**
++- FP differential (PR #359 paths) seeds 1..60 × {-O1..-O3}: **180/0**
++- VLA oracles (`vla_largeconst_u32_fill`, `vla_narrow_const_store_family`,
++  `o2_vla_fill`) at -O2/-O3: byte-exact vs gcc
++
++### Open items (carried)
++
++1. Re-run regression suite with the volatile regression; then deliver a fresh
++   PR against latest main (this branch), i.e. rebase (already current) and
++   push.
++2. Classic-path (global / Value-staged) narrow stores of >i32 immediates still
++   emit the `movabsq`+`movl` relay (2 insns) where `movl $imm, sym(%rip)` would
++   do (1 insn, gcc parity). Correct today; a codegen follow-up.
++3. Indirect-call typed staging (#363 §4) left to its area owner; FP
++   vectorization gap for dot8d remains the biggest structural item.
++4. Refresh snapshot + canonical patch after the final regression run.
 diff --git a/scripts/gen_fp_stress.py b/scripts/gen_fp_stress.py
 new file mode 100755
 index 00000000..4dab0af6
@@ -493,38 +751,93 @@ index 00000000..4dab0af6
 +if __name__ == "__main__":
 +    seed = int(sys.argv[1])
 +    print(gen(seed))
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 2df17a6c..0e8d8429 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -1679,7 +1679,7 @@ fn lower_instruction_typed_inner(
+             ptr,
+             ty,
+             seg_override,
+-            ..
++            volatile,
+         } => {
+             if ty.is_128bit() || ty.is_long_double() {
+                 return false;
+@@ -1781,6 +1781,20 @@ fn lower_instruction_typed_inner(
+                         });
+                         return true;
+                     }
++                    // A C `volatile` store is ONE abstract access to the
++                    // object (C11 5.1.2.3); splitting an 8-byte double into
++                    // two 4-byte stores makes a torn intermediate state
++                    // observable to a signal handler or a concurrent reader
++                    // that the abstract machine forbids. The single-instruction
++                    // immediate forms above (movl for F32/D32, movq $0 /
++                    // movq $imm32 for F64/D64 that fit) are each a single
++                    // access of the object's own width and stay allowed; only
++                    // the two-half split is refused for volatile destinations.
++                    // The mature path then emits the pool+movsd form (one
++                    // store), matching gcc/clang/icc.
++                    if *volatile {
++                        return false;
++                    }
+                     // Both halves MUST be spelled as sign-extended imm32
+                     // (`as i32`): the C7 /0 id store form takes a 32-bit
+                     // operand and writes exactly 32 bits. Spelling the raw
 diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
-index eaa52e80..9b934f85 100644
+index d2d311a7..35a56f41 100644
 --- a/src/backend/x86/codegen/machinst_emit.rs
 +++ b/src/backend/x86/codegen/machinst_emit.rs
-@@ -391,10 +391,61 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+@@ -391,18 +391,74 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                      return;
                  }
              }
 -            // Large immediates (>i32): use movabsq for register dest,
--            // or relay through rax for memory dest.
-+            // Large immediates (>i32): use movabsq for a 64-bit register dest,
-+            // or relay through rax for a 64-bit memory dest.
+-            // or relay through rax for memory dest. The relay's store
+-            // honors the OPERAND size: a 64-bit immediate with an S32
+-            // destination must store 4 bytes (`movl %eax`), never the
+-            // 8-byte `movq %rax` — the wide-imm memory relay predates the
+-            // float-const lowering, where an S32 half-store with a
+-            // sign-bit-set immediate (hi half 0xE0000000) would otherwise
+-            // clobber the 4 bytes after the destination (fp_arith, -O2).
+-            // Typed IR never produces a legitimate wide S8/S16/S32 store,
+-            // but the emitter defines the behavior instead of trusting it.
++            // WIDTH CONTRACT (2026-09-03, VLA fill-store corruption; found
++            // independently here and upstream as PR #363): a store whose
++            // immediate lies outside the sign-extended imm32 window must
++            // still write exactly `size` bytes. The IR that reaches here is
++            // e.g. `Store { val: Const(I64(3041712678)), ty: U32 }` (an
++            // unsigned 32-bit value held in an i64 constant); the store
++            // semantics are "write the low `size` bits". Emitting `movq %rax`
++            // for such a store writes 8 bytes, so the last element of a
++            // 4-byte-strided VLA overran its allocation and clobbered the
++            // adjacent frame slot (a[0]'s low word in the o2_vla_fill.c repro;
++            // the saved VLA base pointer → SIGSEGV in the minimal case), or —
++            // on the float side — an S32 hi-half store with the sign bit set
++            // (0xE0000000) clobbered the 4 bytes after its destination.
 +            //
-+            // WIDTH CONTRACT (2026-09-03, VLA fill-store corruption): a narrow
-+            // store (`size` S8/S16/S32) of a constant outside the signed-32-bit
-+            // range must NOT be emitted as `movq %rax, dst`. The IR that
-+            // reaches here is e.g. `Store { val: Const(I64(3041712678)), ty:
-+            // U32 }` (an unsigned 32-bit value held in an i64 constant); the
-+            // store semantics are "write the low `size` bits". `movq` writes
-+            // 8 bytes, so the last element of a 4-byte-strided VLA overran its
-+            // allocation and clobbered the adjacent frame slot (a[0]'s low
-+            // word in the o2_vla_fill.c repro; the saved VLA base pointer →
-+            // SIGSEGV in the minimal case). Two facts make the narrow case
-+            // cheaper than a relay:
-+            //   * mov{b,w,l} immediate fields are RAW {8,16,32}-bit values —
-+            //     they encode the full unsigned range, unlike the imm32
-+            //     sign-extended form of the ALU ops — so the truncated
-+            //     constant stores directly to memory with no register staging;
-+            //   * a narrow *register* dest must take the move at its own
-+            //     width from %rax (movl zero-extends, movb/movw write the low
-+            //     lane), never movabsq, which would leak upper bits of a
-+            //     >u{size} constant into a register later read at 64-bit.
++            // Two layered defenses, cheapest first:
++            //   * NARROW FAST PATH (S8/S16/S32): mov{b,w,l} immediate fields
++            //     are RAW {8,16,32}-bit values — they encode the full unsigned
++            //     range, unlike the sign-extended imm32 form of the ALU ops —
++            //     so the constant truncates to the destination width and a
++            //     single sized move stores it directly, with no %rax staging:
++            //         movl $3041712678, (%rax)      (mem / stack-slot dest)
++            //         movl $3041712678, %eax        (reg dest: movl
++            //                                        zero-extends into the
++            //                                        full register)
++            //     This is one instruction and touches no temporary register,
++            //     where the relay below needs two instructions and clobbers
++            //     %rax.  (Upstream PR #363 fixed the same defect with the
++            //     relay alone; the direct form is strictly shorter.)
++            //   * WIDE RELAY (S64 >i32, and any residual path): a 64-bit
++            //     destination cannot take a direct imm, so stage through rax
++            //     and store at the operand's OWN width (`sized_reg_name`) —
++            //     never the 8-byte default. This is the emitter defining the
++            //     behavior instead of trusting typed IR never to produce a
++            //     wide store, and stays as defense in depth beneath the fast
++            //     path.
              if let MachOperand::Imm(v) = src {
                  if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
 +                    if matches!(size, OpSize::S8 | OpSize::S16 | OpSize::S32) {
@@ -562,7 +875,7 @@ index eaa52e80..9b934f85 100644
                          out.emit_fmt(format_args!("    movabsq ${}, %{}", v, reg_name(*r)));
                      } else {
 diff --git a/src/backend/x86/codegen/machinst_tests.rs b/src/backend/x86/codegen/machinst_tests.rs
-index d750cdae..5780a3e2 100644
+index c6c45d60..fbe8570d 100644
 --- a/src/backend/x86/codegen/machinst_tests.rs
 +++ b/src/backend/x86/codegen/machinst_tests.rs
 @@ -318,7 +318,106 @@ fn a_rip_relative_symbol_emits_the_rip_form() {
@@ -673,8 +986,85 @@ index d750cdae..5780a3e2 100644
  
  #[test]
  fn every_alu_operation_emits_its_mnemonic() {
+@@ -2927,6 +3026,76 @@ mod float_const_stores {
+         }
+     }
+ 
++    fn volatile_store(val: Operand, ptr: u32, ty: IrType) -> Instruction {
++        Instruction::Store {
++            val,
++            ptr: Value(ptr),
++            ty,
++            seg_override: AddressSpace::Default,
++            volatile: true,
++        }
++    }
++
++    /// A C `volatile` store is ONE abstract access (C11 5.1.2.3): splitting
++    /// an 8-byte double into two 4-byte movl halves would make a torn state
++    /// observable to a signal handler / concurrent reader that the abstract
++    /// machine forbids.  The typed lowering must REFUSE the two-half split
++    /// for volatile destinations (the mature pool+movsd path then emits a
++    /// single store, like gcc/clang/icc).
++    #[test]
++    fn volatile_wide_f64_const_store_is_refused_not_split() {
++        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
++        let mut out = Vec::new();
++        // 1.5 = 0x3FF8000000000000: does not fit a sign-extended imm32, so a
++        // non-volatile store splits into two movl halves.
++        let lowered = super::super::isel::lower_instruction_typed(
++            &volatile_store(Operand::Const(IrConst::F64(1.5)), 9, IrType::F64),
++            &FxHashMap::default(),
++            &slots,
++            None,
++            &mut out,
++        );
++        assert!(
++            !lowered,
++            "volatile 8-byte store must not be split: {out:?}"
++        );
++    }
++
++    /// A volatile F32/D32 store is a single 4-byte access and MAY take the
++    /// one-instruction immediate form (the object's own width, one store).
++    #[test]
++    fn volatile_f32_const_store_still_lowers_to_one_movl() {
++        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
++        let out = lower(
++            &volatile_store(Operand::Const(IrConst::F32(3.5)), 9, IrType::F32),
++            &FxHashMap::default(),
++            &slots,
++        );
++        assert_eq!(out.len(), 1, "{out:?}");
++        assert!(matches!(
++            &out[0],
++            MachInst::Mov { src: MachOperand::Imm(v), size: OpSize::S32, .. } if *v == 0x40600000u32 as i32 as i64
++        ));
++    }
++
++    /// A volatile F64 whose bit pattern fits a sign-extended imm32 (e.g. the
++    /// smallest denormal, bits == 1) stays a SINGLE movq $imm32 store — one
++    /// 8-byte access, still one abstract store.
++    #[test]
++    fn volatile_f64_fitting_imm32_still_lowers_to_one_movq() {
++        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
++        let out = lower(
++            &volatile_store(Operand::Const(IrConst::D64(1)), 9, IrType::D64),
++            &FxHashMap::default(),
++            &slots,
++        );
++        assert_eq!(out.len(), 1, "{out:?}");
++        assert!(matches!(
++            &out[0],
++            MachInst::Mov { src: MachOperand::Imm(1), size: OpSize::S64, .. }
++        ));
++    }
++
+     fn lower(inst: &Instruction, ra: &FxHashMap<u32, PhysReg>, slots: &FxHashMap<u32, i64>) -> Vec<MachInst> {
+         let mut out = Vec::new();
+         assert!(
 diff --git a/src/backend/x86/codegen/peephole/passes/memory_fold.rs b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
-index 93390f6c..524b2fe8 100644
+index 48faad7f..32932983 100644
 --- a/src/backend/x86/codegen/peephole/passes/memory_fold.rs
 +++ b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
 @@ -20,6 +20,22 @@ use super::helpers::{
@@ -743,7 +1133,7 @@ index 93390f6c..524b2fe8 100644
                      break;
                  }
                  total += m;
-@@ -1788,7 +1816,13 @@ pub(super) fn fold_zero_addend_fma213_to_132(
+@@ -1843,7 +1871,13 @@ pub(super) fn fold_zero_addend_fma213_to_132(
                  break;
              }
              if !infos[m].is_nop() && mentions_token(t, &b_tok) > 0 {
@@ -758,7 +1148,7 @@ index 93390f6c..524b2fe8 100644
                  break;
              }
              m += 1;
-@@ -2405,6 +2439,26 @@ mod fma_mem_fold_tests {
+@@ -2476,6 +2510,26 @@ mod fma_mem_fold_tests {
          );
          assert!(!changed, "label breaks adjacency");
      }
@@ -785,7 +1175,7 @@ index 93390f6c..524b2fe8 100644
  }
  
  #[cfg(test)]
-@@ -2581,6 +2635,26 @@ mod fma132_reuse_tests {
+@@ -2652,6 +2706,26 @@ mod fma132_reuse_tests {
          );
          assert!(!changed, "rmw reads the loaded value");
      }
@@ -812,9 +1202,17 @@ index 93390f6c..524b2fe8 100644
  }
  
  #[cfg(test)]
-@@ -2653,6 +2727,24 @@ mod fp_reg_load_tests {
-         );
+@@ -2725,6 +2799,7 @@ mod fp_reg_load_tests {
          assert!(!changed, "rmw reads the loaded value before writing");
+     }
+ 
++
+     /// RED-TEAM REGRESSION (PR #359 follow-up): a reg-reg scalar `vmovsd`
+     /// is a MERGE write — it preserves bits 64:127 of the destination.
+     /// Here those preserved bits come from the load being deleted (a
+@@ -2777,6 +2852,24 @@ mod fp_reg_load_tests {
+         );
+         assert_eq!(out[1], "vmulsd 32(%rsi), %xmm2, %xmm2", "{out:?}");
      }
 +
 +    /// A BRANCH between the consumer and the pure overwrite invalidates the
@@ -890,4 +1288,56 @@ index 00000000..b8fffa84
 +    unsigned int b3 = b[3];
 +    printf("vla_largeconst acc=%llu a0=%llu b3=%u\n", acc, a0, b3);
 +    return (acc == 0) ? 1 : 0;
++}
+diff --git a/tests/regression/volatile_const_stores.c b/tests/regression/volatile_const_stores.c
+new file mode 100644
+index 00000000..5bb036d0
+--- /dev/null
++++ b/tests/regression/volatile_const_stores.c
+@@ -0,0 +1,46 @@
++/* Volatile 64-bit float/double constant stores must remain a SINGLE store
++ * access.  PR #363's immediate-form float-constant lowering split an
++ * 8-byte F64/D64 constant that does not fit a sign-extended imm32 into two
++ * 4-byte `movl` halves.  A C `volatile` store is one abstract access
++ * (C11 5.1.2.3): a signal handler or a concurrent reader may legally
++ * observe the object between two halves, so the split is forbidden there
++ * (the mature pool+movsd form is used instead, as gcc/clang/icc do).
++ *
++ * This oracle pins the runtime results of the split-susceptible shapes
++ * (volatile double/float locals and through-pointer stores of constants
++ * whose bit patterns do not fit imm32, plus 0.0 / -0.0 / fitting values
++ * which the typed path may still emit as single immediate stores).  The
++ * single-access property itself is pinned by the isel unit tests
++ * (volatile_wide_f64_const_store_is_refused_not_split & friends); the
++ * suite would not otherwise observe the two-store form, so both gates are
++ * needed.
++ */
++#include <stdio.h>
++
++volatile double gd;
++volatile float gf;
++volatile double g_neg0, g_zero;
++
++static double wide1 = 1.5e300;   /* hi half 0x7E5E...  sign bit CLEAR */
++static float  fwide = -1.75e30f; /* F32 pattern 0xF8...  (sign bit set)  */
++
++int main(void) {
++    volatile double t;
++    volatile float f;
++    /* wide double const into a volatile local: single-store required */
++    t = 1.5e300;
++    gd = t;
++    /* wide float const (sign bit set in the imm32 window) */
++    f = -1.75e30f;
++    gf = f;
++    /* exact-zero and negative-zero bit patterns */
++    g_zero = 0.0;
++    g_neg0 = -0.0;
++    /* through-pointer volatile store of a wide double */
++    { volatile double *p = &gd; *p = wide1; }
++    printf("%d %d %d %d %d\n",
++           gd == 1.5e300, gf == fwide, g_zero == 0.0,
++           g_neg0 != g_zero /* -0.0 != +0.0 under == */,
++           gd == wide1);
++    return 0;
 +}
