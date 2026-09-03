@@ -1,1270 +1,1923 @@
-From 29afe22d1c14805f81b59327885f3f4c1cd287e1 Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Thu, 3 Sep 2026 18:46:42 +0000
-Subject: [PATCH] sccp: force unresolved tops, absorption rules, bounded
- seeding, O(n) phi promotion
-
-Red-team audit of the pass (external review + in-repo verification) found six
-defects and left three rules unverified for lack of repo context. This commit
-fixes all six, resolves the three from the IR ground truth, and adds one more
-hole only the IR could reveal.
-
-Soundness:
-- Invariant 5 (latent miscompile): a CondBranch on a value that survives the
-  fixpoint as Top marks neither successor; the successor is treated as dead
-  and its phi operands pruned, yet the branch is never folded, so the block
-  still runs at runtime with a missing phi copy. After every fixpoint,
-  force_unresolved_to_bottom lowers every surviving Top visible in an
-  executable block to Bottom (conservatively, never to a guessed constant)
-  and the solver re-runs; on well-formed SSA this costs one linear scan.
-- InlineAsm outputs are definitions that dest() does not cover, so the
-  closed default arm never saw them. They are now lowered to Bottom
-  explicitly in both seed and evaluate_instruction; previously their
-  opacity depended on the accident that the use-def table counts asm
-  outputs as uses without a recorded definition.
-- seed indexed lattice/use_count/dest ids derived from possibly stale
-  metadata (release builds run without the staleness debug_assert): the
-  id bound now also covers the largest dest actually present, and every
-  seed access is bounds-checked, so a size disagreement degrades to a
-  missed optimisation instead of a panic.
-
-Precision (all through the shared constant_fold oracle, guarded on
-ty.is_integer() so NaN * 0, -x * 0, NaN - NaN and NaN == NaN can never
-fold):
-- absorbing zero: x * 0 and x & 0 fold even when x is overdefined
-  (GCC CCP / LLVM SCCP both do this; it lets Kconfig-gated branches die
-  in the same SCCP run). Covers every integer width plus IrConst::Zero.
-- absorbing all-ones: x | -1 == -1, the Or mirror of the zero rule.
-  Matched by constructor, never by conversion (I128 truncation to -1 is
-  not all-ones).
-- same-value identities: x ^ x == 0 and x - x == 0 for identical SSA
-  operands; reflexive integer comparisons fold to the canonical boolean
-  (Eq/Sle/Sge/Ule/Uge true, the rest false). SCCP runs before
-  bit_idioms in the pipeline, so these die one full stage earlier.
-
-Efficiency:
-- diagnostic env gates read once per process (OnceLock) instead of five
-  getenv paths per function.
-- constant-phi promotion is one stable retain + one splice (O(n)); the
-  previous remove-in-a-loop was O(phis^2), and pruning allocated a
-  survivors Vec per phi even when nothing was pruned (now counted first,
-  retained in place).
-- the duplicated lattice lookups in materialise/substitute/
-  const_of_operand share one lattice_const helper, which also retires
-  the _value_type_is_used import-silencing hack.
-
-Tests: 11 new regressions cover every rule above plus the unresolved-Top
-diamond (both successors stay executable, nothing pruned) and asm-output
-opacity. Units 1706/0/6; regression suite 578/0/15 AB-diff 0;
-LCCC-vs-GCC differential 50/0.
----
- src/passes/sccp.rs       | 633 +++++++++++++++++++++++++++++----------
- src/passes/sccp/tests.rs | 302 +++++++++++++++++++
- 2 files changed, 771 insertions(+), 164 deletions(-)
-
-diff --git a/src/passes/sccp.rs b/src/passes/sccp.rs
-index 87834729..2b1f70cb 100644
---- a/src/passes/sccp.rs
-+++ b/src/passes/sccp.rs
-@@ -34,13 +34,20 @@
- //! * **Constant semantics** come from [`crate::passes::constant_fold`]'s shared
- //!   oracle (`eval_binop_const` and friends). This pass owns *no* arithmetic of
- //!   its own, so it can never disagree with the folder about what `1.0L/3.0L`
--//!   or `(signed char)200` evaluates to.
-+//!   or `(signed char)200` evaluates to. Even the algebraic absorption rules
-+//!   (`x * 0`, `x & 0`, `x | -1`; see [`fold_despite_unknown`]) obtain their
-+//!   typed results by asking the oracle to fold `v op v`, which normalises the
-+//!   constant representation to the `BinOp`'s type.
- //! * **Materialisation** follows the codebase idiom: a value proven constant
- //!   has its *defining instruction* rewritten to `Copy { dest, Const }`, and
- //!   its uses substituted in place. `copy_prop`/`dce` then clean up.
- //! * **CFG cleanup** is left to `cfg_simplify`, but the edges this pass kills
- //!   are repaired here (see "Edge maintenance" below) so the IR is well-formed
- //!   at every point in between.
-+//! * **Ordering.** SCCP runs in the post-inline cleanup phase, *before* the
-+//!   main pipeline's `bit_idioms`. Algebraic folds placed here therefore die
-+//!   one full pipeline stage earlier and can fold branches in the same SCCP
-+//!   run that `bit_idioms` would only have simplified after the main loop.
- //!
- //! # Soundness invariants
- //!
-@@ -54,6 +61,10 @@
- //!    (`⊤ ⊓ C = C`), so an unmodelled opcode silently left at `⊤` would make
- //!    the phi report a constant it does not have. Adding an IR opcode can
- //!    therefore never introduce a miscompile here, only a missed optimisation.
-+//!    `InlineAsm` is modelled explicitly: its `outputs` are definitions that
-+//!    `dest()` does not cover (an asm can define several), so they are lowered
-+//!    to `⊥` by construction — not left to the accident that the use-def table
-+//!    currently counts asm outputs as uses without a recorded definition.
- //! 2. **Every control-flow edge is modelled, including the implicit ones.**
- //!    `asm goto` (`InlineAsm { goto_labels }`) is real control flow that lives
- //!    on an *instruction*, not on the terminator. Ignoring it would mark a
-@@ -68,11 +79,26 @@
- //!    `Copy`, `Select`, `Phi`); everything with a side effect is seeded `⊥`.
- //!    The rewrite additionally asserts this before overwriting a definition, so
- //!    a future lattice extension cannot delete a call or a volatile load.
-+//! 5. **No `⊤` survives the fixpoint inside an executable block.** In valid
-+//!    SSA this cannot happen (every operand's definition dominates its use and
-+//!    is therefore evaluated). It *does* happen on IR that is tolerated but not
-+//!    valid — a phi lacking an entry for the predecessor that actually reached
-+//!    it, an empty phi, a use not dominated by its def. A `CondBranch` on such
-+//!    a `⊤` would mark *neither* successor, the successor would be treated as
-+//!    dead, its out-edges would be pruned from live phis — yet the branch would
-+//!    not be folded (it is not a constant), so the "dead" block still runs at
-+//!    runtime with a phi copy missing on its edge. That is a miscompile. After
-+//!    every fixpoint, [`force_unresolved_to_bottom`] lowers any remaining `⊤`
-+//!    in an executable block to `⊥` (conservative — *not* to an arbitrary
-+//!    constant, because the cause may not be a genuine `undef`) and the solver
-+//!    re-runs until nothing is left. LLVM's `resolvedUndefsIn` loop exists for
-+//!    the same reason.
- 
- use crate::common::fx_hash::{FxHashMap, FxHashSet};
- use crate::common::types::IrType;
- use crate::ir::reexports::{
--    BasicBlock, BlockId, Instruction, IrConst, IrFunction, IrUnaryOp, Operand, Terminator, Value,
-+    BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand,
-+    Terminator, Value,
- };
- use crate::passes::constant_fold;
- use crate::passes::use_def::UseDefInfo;
-@@ -109,6 +135,11 @@ impl LatticeVal {
-         }
-     }
- 
-+    #[inline]
-+    fn is_top(self) -> bool {
-+        matches!(self, LatticeVal::Top)
-+    }
-+
-     #[inline]
-     fn is_bottom(self) -> bool {
-         matches!(self, LatticeVal::Bottom)
-@@ -205,7 +236,26 @@ pub fn run_with_usedef(func: &mut IrFunction, usedef: &UseDefInfo) -> SccpStats
-     );
- 
-     let num_blocks = func.blocks.len();
--    let num_values = usedef.len().max(func.max_value_id() as usize + 1);
-+
-+    // The lattice must have a slot for every value *defined* in this function.
-+    // `max_value_id()` is metadata and may be stale; the use-def table may be
-+    // sized differently. Trust neither alone: take the maximum of both and of
-+    // the largest dest id actually present in the IR. Uses of ids beyond the
-+    // bound resolve to ⊥ (see `resolve`), which is the safe direction; the
-+    // `get`/`get_mut` accesses throughout make a size disagreement a missed
-+    // optimisation instead of a panic in release builds.
-+    let mut max_dest: usize = 0;
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Some(d) = inst.dest() {
-+                max_dest = max_dest.max(d.0 as usize);
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 16adaddb..19934ea4 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -139,6 +139,16 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
+                 did = true;
+                 break;
+             }
++            // The linear flattener needs trip ≥ 2; a single-trip tiny loop
++            // (the last row of a triangular nest once the outer loop is
++            // straightened, or `for (i = n-1; i < n; i++)` after inlining)
++            // is deleted by the general cloner instead of surviving as a
++            // rolled loop with a compare, two phis and a back-edge.
++            if try_complete_unroll_general(func, lp, &cfg, 1..=1) {
++                count += 1;
++                did = true;
++                break;
 +            }
-+        }
+         }
+         if !did {
+             // General shape: prefer SMALL bodies (innermost-first), but any
+@@ -156,7 +166,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
+                     .sum::<usize>()
+             });
+             for lp in &general {
+-                if try_complete_unroll_general(func, lp, &cfg) {
++                if try_complete_unroll_general(func, lp, &cfg, 1..=16) {
+                     count += 1;
+                     did = true;
+                     break;
+@@ -502,8 +512,12 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
+ ///   header's CondBranch; every body block's successors stay inside
+ ///   body ∪ {header}; body terminators are Branch/CondBranch/Switch only.
+ /// - constant IV init (after const-chain resolution) and constant limit,
+-///   trip in 2..=16, and (header non-phi + body) instructions × trip within
+-///   the expansion budget.
++///   trip inside `trip_range` (callers pass `1..=16`; a trip of exactly 1
++///   deletes the loop — header phis become copies of their init values, the
++///   latch falls through to the exit — with zero code growth, which is what
++///   the last row of a triangular nest `for (j = i+1; j < n; …)` becomes
++///   after the outer loop is straightened), and (header non-phi + body)
++///   instructions × trip within the expansion budget.
+ /// - no calls / inline asm / dynamic allocas in body or header; intrinsics
+ ///   only when pure (sqrt/FMA-class loop bodies stay eligible — the nbody
+ ///   `advance`/`energy` shapes).
+@@ -527,59 +541,189 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
+ ///   uses of carried phis with the last clone's corresponding value; the exit
+ ///   block's phi edges from the header label are relabeled to the last
+ ///   clone's latch (the block that now branches to the exit).
+-/// Exact static trip count for a constant-stride IV loop, or `None` when the
+-/// stride is degenerate (0) or its sign contradicts the exit comparison
+-/// (e.g. a negative step against `i < limit`), which would mean the loop
+-/// never terminates or never runs past the guard.
++/// Fixed-width integer types whose constants the unroller can reason about
++/// exactly.  `Ptr`, the 128-bit types and non-integers are excluded: their
++/// canonical `IrConst` representation is target- or width-dependent and the
++/// closed-form trip arithmetic below would silently lose bits.
++fn is_fixed_width_int(ty: IrType) -> bool {
++    matches!(
++        ty,
++        IrType::I8
++            | IrType::U8
++            | IrType::I16
++            | IrType::U16
++            | IrType::I32
++            | IrType::U32
++            | IrType::I64
++            | IrType::U64
++    )
++}
++
++/// Bring an i64 into the canonical `IrConst::to_i64()` representation of a
++/// value of type `ty` — sign-extended for signed types, zero-extended for
++/// unsigned ones.  This is exactly the convention the frontend and constant
++/// folder use (`IrConst::from_i64(v, ty).to_i64()`), so every value the
++/// unroller derives by folding is bit-for-bit what the rest of the pipeline
++/// would have produced.  Any other narrowing (e.g. `x as i32 as i64` for a
++/// U32) turns `0xFFFFFFF9` into `-7`, and a trip count computed from `-7`
++/// unrolls a loop that never executes.
++fn normalize_to_type(v: i64, ty: IrType) -> Option<i64> {
++    if !is_fixed_width_int(ty) {
++        return None;
 +    }
-+    let num_values = usedef
-+        .len()
-+        .max((func.max_value_id() as usize).saturating_add(1))
-+        .max(max_dest.saturating_add(1));
- 
-     let mut label_to_idx: FxHashMap<BlockId, u32> =
-         FxHashMap::with_capacity_and_hasher(num_blocks, Default::default());
-@@ -228,10 +278,28 @@ pub fn run_with_usedef(func: &mut IrFunction, usedef: &UseDefInfo) -> SccpStats
-     seed(func, usedef, &mut state, num_values);
- 
-     // ── fixpoint ────────────────────────────────────────────────────────────
--    // Terminates because both worklists are only fed by strictly downward
--    // lattice moves (`update_lattice`) and by first-time edge insertions
--    // (`mark_edge_executable`). Both are finite and monotone.
-+    // `solve` terminates because both worklists are only fed by strictly
-+    // downward lattice moves (`update_lattice`) and by first-time edge
-+    // insertions (`mark_edge_executable`). Both are finite and monotone.
-+    //
-+    // The outer loop is soundness invariant (5): any ⊤ that survived inside an
-+    // executable block is forced to ⊥ and the solver re-runs. Each round lowers
-+    // at least one value, so it too terminates; on well-formed SSA it costs
-+    // exactly one linear scan that forces nothing.
-     state.cfg_worklist.push(0);
-+    loop {
-+        solve(func, usedef, &mut state);
-+        if !force_unresolved_to_bottom(func, &mut state) {
++    IrConst::from_i64(v, ty).to_i64()
++}
++
++/// Ordering comparisons that read their operands as unsigned.
++fn cmp_is_unsigned(op: IrCmpOp) -> bool {
++    matches!(op, IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge)
++}
++
++/// `a OP b`  ⇔  `b MIRROR(OP) a`.
++fn mirror_cmp(op: IrCmpOp) -> IrCmpOp {
++    match op {
++        IrCmpOp::Slt => IrCmpOp::Sgt,
++        IrCmpOp::Sgt => IrCmpOp::Slt,
++        IrCmpOp::Sle => IrCmpOp::Sge,
++        IrCmpOp::Sge => IrCmpOp::Sle,
++        IrCmpOp::Ult => IrCmpOp::Ugt,
++        IrCmpOp::Ugt => IrCmpOp::Ult,
++        IrCmpOp::Ule => IrCmpOp::Uge,
++        IrCmpOp::Uge => IrCmpOp::Ule,
++        IrCmpOp::Eq => IrCmpOp::Eq,
++        IrCmpOp::Ne => IrCmpOp::Ne,
++    }
++}
++
++/// `!(a OP b)`  ⇔  `a NEGATE(OP) b`  (total order on integers).
++fn negate_cmp(op: IrCmpOp) -> IrCmpOp {
++    match op {
++        IrCmpOp::Slt => IrCmpOp::Sge,
++        IrCmpOp::Sge => IrCmpOp::Slt,
++        IrCmpOp::Sle => IrCmpOp::Sgt,
++        IrCmpOp::Sgt => IrCmpOp::Sle,
++        IrCmpOp::Ult => IrCmpOp::Uge,
++        IrCmpOp::Uge => IrCmpOp::Ult,
++        IrCmpOp::Ule => IrCmpOp::Ugt,
++        IrCmpOp::Ugt => IrCmpOp::Ule,
++        IrCmpOp::Eq => IrCmpOp::Ne,
++        IrCmpOp::Ne => IrCmpOp::Eq,
++    }
++}
++
++/// Rewrite the header's exit compare into the canonical "continue while
++/// `iv OP limit`" form that the trip-count arithmetic assumes.
++///
++/// [`find_exit_condition`] reports the compare exactly as written: the IV may
++/// be the RIGHT operand (`limit > i`) and the CondBranch may send `true` to
++/// the EXIT (`for (;;) { if (i >= n) break; … }` or `!(i >= n)` guards).
++/// Feeding the raw operator into the closed form in either case computes the
++/// trip count of a different loop.  Both call sites of
++/// [`complete_unroll_trip`] go through this normalisation.
++fn canonical_continue_cmp(op: IrCmpOp, iv_is_lhs: bool, exit_cond_positive: bool) -> IrCmpOp {
++    let op = if iv_is_lhs { op } else { mirror_cmp(op) };
++    if exit_cond_positive {
++        negate_cmp(op)
++    } else {
++        op
++    }
++}
++
++/// Exact static trip count of a constant-stride counted loop
++/// `for (iv = init; iv OP limit; iv += step)` whose IV has type `iv_ty`, or
++/// `None` whenever the count cannot be established EXACTLY.  Complete
++/// unrolling has no cleanup loop, so an off-by-anything here is a miscompile,
++/// and every arm is closed-form and checked:
++///
++///   * `iv <  limit`, step > 0: ceil((limit - init) / step)
++///   * `iv <= limit`, step > 0: floor((limit - init) / step) + 1
++///   * `iv >  limit`, step < 0: ceil((init - limit) / -step)
++///   * `iv >= limit`, step < 0: floor((init - limit) / -step) + 1
++///   * `iv != limit`          : (limit - init) / step when step divides the
++///                              span exactly and the walk moves TOWARDS the
++///                              limit; anything else wraps around the type
++///                              first and is refused.
++///
++/// The arithmetic is done in i128 in the comparison's own value domain:
++/// `init` and `limit` are first normalised to `iv_ty`'s canonical constant
++/// representation and then read as unsigned (for `Ult`/`Ule`/`Ugt`/`Uge`) or
++/// signed values.  A U64 constant such as `0xFFFF_FFFF_FFFF_FFF9` is stored as
++/// a negative i64 by `IrConst`; read as signed it is "less than 4" and a
++/// signed-only closed form unrolls ten iterations of a loop that never runs.
++///
++/// Finally every IV value the unrolled iterations will observe —
++/// `init + k*step` for `k = 0..=trip`, including the value the last exit test
++/// sees — must be representable in `iv_ty` without wrapping.  Narrow IVs
++/// with strides > 1 (`unsigned char i = 250; i < 255; i += 3`) wrap past the
++/// limit and keep looping; the closed form would report 2 trips for a loop
++/// that executes 87.  A wrap is refused, not modelled: such loops are never
++/// worth unrolling.
+ ///
+-/// Complete unrolling needs the EXACT count up front — there is no cleanup
+-/// loop — so every arm is closed-form:
+-///   * `i <  limit`, step > 0: ceil((limit - init) / step)
+-///   * `i <= limit`, step > 0: floor((limit - init) / step) + 1
+-///   * `i >  limit`, step < 0: ceil((init - limit) / -step)
+-///   * `i >= limit`, step < 0: floor((init - limit) / -step) + 1
+-/// The ceil forms are exact for non-divisible spans because the exit test
+-/// runs every stride; the floor+1 forms count the last in-range iteration.
+-/// Non-positive spans (loop body never executes) yield `None`, matching the
+-/// pre-existing step-1 guards. For step == 1 this reduces to the historical
+-/// arithmetic verbatim.
+-fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64) -> Option<i64> {
++/// Mismatched signedness between the operator and the IV type is refused
++/// outright (the frontend never emits it; anything that does is not a shape
++/// this pass has evidence for).
++fn complete_unroll_trip(
++    iv_init: i64,
++    limit: i64,
++    cmp_op: IrCmpOp,
++    iv_step: i64,
++    iv_ty: IrType,
++) -> Option<i64> {
+     if iv_step == 0 {
+         return None; // non-advancing IV: infinite or empty; not a trip count
+     }
+-    // All intermediates use checked arithmetic.  `limit - iv_init` wraps for
+-    // extreme constant pairs (e.g. limit = i64::MAX, iv_init = -1) and
+-    // `-iv_step` wraps for iv_step = i64::MIN; a wrapped span would yield a
+-    // nonsensical trip count, so bail and leave the loop rolled.
+-    let ascending = iv_step > 0;
+-    let step_abs = iv_step.checked_abs()?;
+-    let trip = match cmp_op {
++    let init = normalize_to_type(iv_init, iv_ty)?;
++    let limit = normalize_to_type(limit, iv_ty)?;
++
++    // Value domain of the comparison.
++    let unsigned = match cmp_op {
++        IrCmpOp::Eq | IrCmpOp::Ne => iv_ty.is_unsigned(),
++        op => {
++            let u = cmp_is_unsigned(op);
++            if u != iv_ty.is_unsigned() {
++                return None;
++            }
++            u
++        }
++    };
++    let to_domain = |v: i64| -> i128 {
++        if unsigned {
++            (v as u64) as i128
++        } else {
++            v as i128
++        }
++    };
++    let (init_d, limit_d) = (to_domain(init), to_domain(limit));
++    let step = iv_step as i128;
++    let ascending = step > 0;
++    let step_abs = step.abs();
++
++    let trip: i128 = match cmp_op {
+         IrCmpOp::Slt | IrCmpOp::Ult => {
+             if !ascending {
+                 return None;
+             }
+-            let span = limit.checked_sub(iv_init)?;
++            let span = limit_d - init_d;
+             if span <= 0 {
+                 return None;
+             }
+-            // ceil(span / step), overflow-free for span >= 1
+-            (span - 1) / step_abs + 1
++            (span - 1) / step_abs + 1 // ceil(span / step)
+         }
+         IrCmpOp::Sle | IrCmpOp::Ule => {
+             if !ascending {
+                 return None;
+             }
+-            let span = limit.checked_sub(iv_init)?;
++            let span = limit_d - init_d;
+             if span < 0 {
+                 return None;
+             }
+-            (span / step_abs).checked_add(1)?
++            span / step_abs + 1
+         }
+         IrCmpOp::Sgt | IrCmpOp::Ugt => {
+             if ascending {
+                 return None;
+             }
+-            let span = iv_init.checked_sub(limit)?;
++            let span = init_d - limit_d;
+             if span <= 0 {
+                 return None;
+             }
+@@ -589,21 +733,396 @@ fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64)
+             if ascending {
+                 return None;
+             }
+-            let span = iv_init.checked_sub(limit)?;
++            let span = init_d - limit_d;
+             if span < 0 {
+                 return None;
+             }
+-            (span / step_abs).checked_add(1)?
++            span / step_abs + 1
+         }
+-        _ => return None,
++        IrCmpOp::Ne => {
++            let span = limit_d - init_d;
++            if span == 0 || (span > 0) != ascending || span % step != 0 {
++                return None;
++            }
++            span / step
++        }
++        IrCmpOp::Eq => return None,
+     };
+-    Some(trip)
++
++    // Every observed IV value — including the one the final exit test sees —
++    // must stay inside `iv_ty` in this domain.
++    let bits = (iv_ty.size() * 8) as u32;
++    let (lo, hi): (i128, i128) = if unsigned {
++        (0, (1i128 << bits) - 1)
++    } else {
++        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
++    };
++    let final_iv = init_d + trip * step;
++    if final_iv < lo || final_iv > hi {
++        return None;
++    }
++    i64::try_from(trip).ok()
++}
++
++/// True when `op` denotes a value that depends only on integer constants and
++/// (possibly) `iv`.  Complete unrolling substitutes the OUTER IV with a
++/// per-clone constant, so once such an operand is used in an inner loop's own
++/// IV/bound, that inner loop becomes constant-trip after the outer unroll.
++/// Intended for the persisting-inner-loop gate; a dependency on anything else
++/// (a function parameter, a memory load, a non-IV-dependent phi) means the
++/// inner loop's trip stays dynamic.
++fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, depth: usize) -> bool {
++    if depth > 8 {
++        return false;
++    }
++    // `Operand` is closed over {Const, Value}; both handled above.  The
++    // `Value` arm falls through to a def-chain walk; a def that is a memory /
++    // opaque instruction returns false (never constant after substitution).
++    let value = match op {
++        Operand::Const(_) => return true,
++        Operand::Value(v) => v,
++    };
++    if value.0 == iv.0 {
++        return true;
++    }
++    let mut def: Option<&Instruction> = None;
++    for block in &func.blocks {
++        if let Some(inst) = block.instructions.iter().find(|i| i.dest() == Some(*value)) {
++            def = Some(inst);
 +            break;
 +        }
 +    }
-+
-+    rewrite(func, &state)
-+}
-+
-+/// Drain both worklists to a fixpoint.
-+fn solve(func: &IrFunction, usedef: &UseDefInfo, state: &mut SccpState) {
-+    let num_blocks = func.blocks.len();
-     while !state.cfg_worklist.is_empty() || !state.ssa_worklist.is_empty() {
-         while let Some(block_idx) = state.cfg_worklist.pop() {
-             let bi = block_idx as usize;
-@@ -240,11 +308,11 @@ pub fn run_with_usedef(func: &mut IrFunction, usedef: &UseDefInfo) -> SccpStats
-             }
-             if !state.block_executable[bi] {
-                 state.block_executable[bi] = true;
--                visit_block(func, block_idx, &mut state);
-+                visit_block(func, block_idx, state);
-             } else {
-                 // Already visited; a *new* incoming edge can only change phis
-                 // (and, through them, the terminator).
--                visit_phis(func, block_idx, &mut state);
-+                visit_phis(func, block_idx, state);
-             }
-         }
- 
-@@ -257,15 +325,13 @@ pub fn run_with_usedef(func: &mut IrFunction, usedef: &UseDefInfo) -> SccpStats
-                     continue;
-                 }
-                 if loc.is_terminator() {
--                    evaluate_terminator(&func.blocks[bi].terminator, loc.block_idx, &mut state);
-+                    evaluate_terminator(&func.blocks[bi].terminator, loc.block_idx, state);
-                 } else if let Some(inst) = func.blocks[bi].instructions.get(loc.inst_idx as usize) {
--                    evaluate_instruction(inst, loc.block_idx, &mut state);
-+                    evaluate_instruction(inst, loc.block_idx, state);
-                 }
-             }
-         }
-     }
--
--    rewrite(func, &state)
- }
- 
- // ═══════════════════════════════════════════════════════════════════════════
-@@ -279,10 +345,25 @@ fn seed(func: &IrFunction, usedef: &UseDefInfo, state: &mut SccpState, num_value
-                 // Parameters are unknown on entry. (IPCP is the pass that knows
-                 // better; it runs separately and rewrites ParamRef to a Copy.)
-                 Instruction::ParamRef { dest, .. } => {
--                    state.lattice[dest.0 as usize] = LatticeVal::Bottom;
-+                    if let Some(slot) = state.lattice.get_mut(dest.0 as usize) {
-+                        *slot = LatticeVal::Bottom;
-+                    }
-                 }
-                 Instruction::Cast { dest, to_ty, .. } => {
--                    state.cast_to_ty[dest.0 as usize] = Some(*to_ty);
-+                    if let Some(slot) = state.cast_to_ty.get_mut(dest.0 as usize) {
-+                        *slot = Some(*to_ty);
-+                    }
-+                }
-+                // Invariant (1): `InlineAsm` outputs are definitions the
-+                // `dest()` accessor does not cover. Lower them here so their
-+                // opacity never depends on how the use-def table happens to
-+                // record them.
-+                Instruction::InlineAsm { outputs, .. } => {
-+                    for (_, v, _) in outputs {
-+                        if let Some(slot) = state.lattice.get_mut(v.0 as usize) {
-+                            *slot = LatticeVal::Bottom;
-+                        }
-+                    }
-                 }
-                 _ => {}
-             }
-@@ -291,9 +372,12 @@ fn seed(func: &IrFunction, usedef: &UseDefInfo, state: &mut SccpState, num_value
- 
-     // A value that is read but never defined is a dangling reference left by an
-     // earlier pass. It must be ⊥: leaving it ⊤ would let it be absorbed by a
--    // phi meet and turn an unknown into a fabricated constant.
--    for v in 0..num_values {
--        if usedef.use_count[v] > 0 && usedef.def_of(v as u32).is_none() {
-+    // phi meet and turn an unknown into a fabricated constant. Bounded by every
-+    // table involved so a size disagreement can never index out of range.
-+    let scan = num_values.min(usedef.len()).min(state.lattice.len());
-+    for v in 0..scan {
-+        let used = usedef.use_count.get(v).map_or(false, |&n| n > 0);
-+        if used && usedef.def_of(v as u32).is_none() {
-             state.lattice[v] = LatticeVal::Bottom;
-         }
-     }
-@@ -342,6 +426,16 @@ fn resolve(op: &Operand, state: &SccpState) -> LatticeVal {
-     }
- }
- 
-+/// The constant `v` is proven to be, if any.
-+#[inline]
-+fn lattice_const(state: &SccpState, v: Value) -> Option<IrConst> {
-+    state
-+        .lattice
-+        .get(v.0 as usize)
-+        .copied()
-+        .and_then(LatticeVal::as_const)
-+}
-+
- /// Lower `value_id` to `old ⊓ new`, enqueuing it when it actually moved.
- ///
- /// Meeting with the previous element (rather than assigning) keeps the pass
-@@ -373,6 +467,105 @@ fn update_lattice(value_id: u32, new_val: LatticeVal, state: &mut SccpState) {
-     }
- }
- 
-+/// Integer zero in every width this IR can store. `Zero` is the IR's
-+/// type-agnostic zero; it may only be treated as an *integer* zero because
-+/// [`fold_despite_unknown`] guards every rule on `ty.is_integer()` — the same
-+/// `Zero` can appear in float contexts, where multiply-by-zero is not
-+/// absorbing (`NaN * 0.0` is NaN, `-x * 0.0` is `-0.0`).
-+#[inline]
-+fn is_integer_zero(c: IrConst) -> bool {
-+    matches!(
-+        c,
-+        IrConst::I8(0)
-+            | IrConst::I16(0)
-+            | IrConst::I32(0)
-+            | IrConst::I64(0)
-+            | IrConst::I128(0)
-+            | IrConst::Zero
-+    )
-+}
-+
-+/// All-ones in the constant's own width. Only exact-width negative
-+/// constructors match: `IrConst::I128(0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF)`
-+/// would truncate to `-1` in `to_i64()` yet is *not* all-ones in 128 bits, so
-+/// the test is by constructor, never by conversion. Narrower `BinOp` types
-+/// truncate correctly inside the shared oracle.
-+#[inline]
-+fn is_all_ones(c: IrConst) -> bool {
-+    matches!(
-+        c,
-+        IrConst::I8(-1)
-+            | IrConst::I16(-1)
-+            | IrConst::I32(-1)
-+            | IrConst::I64(-1)
-+            | IrConst::I128(-1)
-+    )
-+}
-+
-+/// Results that are constant although an operand is unknown.
-+///
-+/// Three rule classes, all guarded on `ty.is_integer()`:
-+///
-+/// * **Same-value identities.** The two operands are the *same* SSA value, so
-+///   `x ^ x == 0` and `x - x == 0` in every integer width (wrapping), whatever
-+///   `x` may be. This is a syntactic fact about SSA identity, independent of
-+///   the lattice, hence monotone.
-+/// * **Absorbing zero.** `x * 0 == 0` and `x & 0 == 0` for any `x` — the one
-+///   place where SCCP is strictly more precise than "both operands constant".
-+///   GCC's CCP (through its bit-mask tracking) and LLVM's SCCP (through
-+///   `simplifyInstruction`) both perform it, and it matters in practice: a
-+///   Kconfig mask folded to `0`, or an element count proven `0` by IPCP, turns
-+///   `flags & MASK` / `n * size` into `0`, which is what lets the guarding
-+///   branch fold and the whole path die in the *same* SCCP run instead of two
-+///   pipeline iterations later.
-+/// * **Absorbing all-ones.** `x | -1 == -1` for any `x`, the mirror image of
-+///   the zero rule for `Or`.
-+///
-+/// Soundness: signed-overflow UB cannot arise from `0`/`-1` seeds; float
-+/// multiply and float subtraction are excluded wholesale because `NaN * 0`,
-+/// `-x * 0` and `NaN - NaN` are not `0`. The typed results are produced by the
-+/// shared oracle (`v op v`), so this pass still owns no arithmetic. Monotone:
-+/// each result is the same constant regardless of what the other operand later
-+/// becomes. If the *seed* operand itself later moves down (a `Constant` can
-+/// still reach `⊥`), the rule stops firing and the meet drops the result to
-+/// `⊥` — sound, and still monotone.
-+#[inline]
-+fn fold_despite_unknown(
-+    op: IrBinOp,
-+    lhs: &Operand,
-+    rhs: &Operand,
-+    lv: LatticeVal,
-+    rv: LatticeVal,
-+    ty: IrType,
-+) -> Option<IrConst> {
-+    if !ty.is_integer() {
-+        return None;
-+    }
-+
-+    // Same-value identities: syntactic, checked before any lattice reasoning.
-+    if matches!(op, IrBinOp::Xor | IrBinOp::Sub) {
-+        if let (Operand::Value(a), Operand::Value(b)) = (lhs, rhs) {
-+            if a.0 == b.0 {
-+                return constant_fold::eval_binop_const(op, IrConst::I32(0), IrConst::I32(0), ty);
-+            }
++    let Some(inst) = def else { return false };
++    match inst {
++        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => {
++            depends_only_on_const_and_iv(func, src, iv, depth + 1)
 +        }
-+    }
-+
-+    // Absorbing elements: one operand is a known 0 (Mul/And) or -1 (Or).
-+    let seed = match (lv, rv) {
-+        (LatticeVal::Constant(c), _) if is_integer_zero(c) || is_all_ones(c) => c,
-+        (_, LatticeVal::Constant(c)) if is_integer_zero(c) || is_all_ones(c) => c,
-+        _ => return None,
-+    };
-+    match op {
-+        IrBinOp::Mul | IrBinOp::And if is_integer_zero(seed) => {
-+            constant_fold::eval_binop_const(op, seed, seed, ty)
++        Instruction::BinOp { lhs, rhs, .. } => {
++            depends_only_on_const_and_iv(func, lhs, iv, depth + 1)
++                && depends_only_on_const_and_iv(func, rhs, iv, depth + 1)
 +        }
-+        IrBinOp::Or if is_all_ones(seed) => constant_fold::eval_binop_const(op, seed, seed, ty),
-+        _ => None,
-+    }
-+}
-+
- fn evaluate_instruction(inst: &Instruction, block_idx: u32, state: &mut SccpState) {
-     match inst {
-         Instruction::Phi { dest, incoming, .. } => {
-@@ -418,12 +611,19 @@ fn evaluate_instruction(inst: &Instruction, block_idx: u32, state: &mut SccpStat
-             rhs,
-             ty,
-         } => {
--            let r = match (resolve(lhs, state), resolve(rhs, state)) {
--                (LatticeVal::Bottom, _) | (_, LatticeVal::Bottom) => LatticeVal::Bottom,
--                (LatticeVal::Top, _) | (_, LatticeVal::Top) => LatticeVal::Top,
-+            let (lv, rv) = (resolve(lhs, state), resolve(rhs, state));
-+            let r = match (lv, rv) {
-                 (LatticeVal::Constant(l), LatticeVal::Constant(r)) => {
-                     lift(constant_fold::eval_binop_const(*op, l, r, *ty))
-                 }
-+                _ => match fold_despite_unknown(*op, lhs, rhs, lv, rv, *ty) {
-+                    Some(c) => LatticeVal::Constant(c),
-+                    // ⊥ dominates ⊤: once an operand is overdefined the result
-+                    // can never become a constant, so there is nothing to wait
-+                    // for. (Both orders are sound; this one converges faster.)
-+                    None if lv.is_bottom() || rv.is_bottom() => LatticeVal::Bottom,
-+                    None => LatticeVal::Top,
-+                },
-             };
-             update_lattice(dest.0, r, state);
-         }
-@@ -467,11 +667,28 @@ fn evaluate_instruction(inst: &Instruction, block_idx: u32, state: &mut SccpStat
-             rhs,
-             ty,
-         } => {
--            let r = match (resolve(lhs, state), resolve(rhs, state)) {
--                (LatticeVal::Bottom, _) | (_, LatticeVal::Bottom) => LatticeVal::Bottom,
--                (LatticeVal::Top, _) | (_, LatticeVal::Top) => LatticeVal::Top,
--                (LatticeVal::Constant(l), LatticeVal::Constant(r)) => {
--                    lift(constant_fold::eval_cmp_const(*op, l, r, *ty))
-+            // Reflexive comparison: the two operands are the *same* SSA value,
-+            // so for integers every predicate has a fixed truth value
-+            // (Eq/Sle/Sge/Ule/Uge are true of `x cmp x`, the rest false),
-+            // whatever `x` may be. Floats are excluded: `x == x` is false
-+            // exactly when `x` is NaN. Like the same-value BinOp identities
-+            // this is a syntactic fact about SSA identity — the answer is the
-+            // IR's canonical boolean (`IrConst::I32(0 | 1)`, the same output
-+            // domain `eval_cmp_const` documents) and it is monotone.
-+            let r = if ty.is_integer()
-+                && matches!((lhs, rhs), (Operand::Value(a), Operand::Value(b)) if a.0 == b.0)
-+            {
-+                LatticeVal::Constant(IrConst::I32(matches!(
-+                    op,
-+                    IrCmpOp::Eq | IrCmpOp::Sle | IrCmpOp::Sge | IrCmpOp::Ule | IrCmpOp::Uge
-+                ) as i32))
-+            } else {
-+                match (resolve(lhs, state), resolve(rhs, state)) {
-+                    (LatticeVal::Bottom, _) | (_, LatticeVal::Bottom) => LatticeVal::Bottom,
-+                    (LatticeVal::Top, _) | (_, LatticeVal::Top) => LatticeVal::Top,
-+                    (LatticeVal::Constant(l), LatticeVal::Constant(r)) => {
-+                        lift(constant_fold::eval_cmp_const(*op, l, r, *ty))
-+                    }
-                 }
-             };
-             update_lattice(dest.0, r, state);
-@@ -515,6 +732,17 @@ fn evaluate_instruction(inst: &Instruction, block_idx: u32, state: &mut SccpStat
-             update_lattice(dest.0, r, state);
-         }
- 
-+        // ── Invariant (1) for `InlineAsm` ────────────────────────────────────
-+        // The outputs are definitions `dest()` does not cover (an asm can
-+        // define several), and they are opaque runtime values. Lowering them
-+        // here makes their opacity true by construction; the seed pass lowers
-+        // them a second time so ordering can never resurrect a `⊤`.
-+        Instruction::InlineAsm { outputs, .. } => {
-+            for (_, v, _) in outputs {
-+                update_lattice(v.0, LatticeVal::Bottom, state);
-+            }
-+        }
-+
-         // ── closed default (soundness invariant 1) ──────────────────────────
-         // Everything else that defines a value is overdefined. This arm is
-         // deliberately a catch-all keyed on `dest()` rather than an explicit
-@@ -551,6 +779,7 @@ fn evaluate_terminator(term: &Terminator, block_idx: u32, state: &mut SccpState)
-             false_label,
-         } => match resolve(cond, state) {
-             // Optimistic: an unevaluated condition marks neither successor.
-+            // Invariant (5) guarantees this cannot be the final state.
-             LatticeVal::Top => {}
-             LatticeVal::Constant(c) => {
-                 let taken = if c.is_nonzero() {
-@@ -635,10 +864,117 @@ fn mark_edge_executable(from: u32, to: u32, state: &mut SccpState) {
-     }
- }
- 
-+// ═══════════════════════════════════════════════════════════════════════════
-+// Undef resolution (soundness invariant 5)
-+// ═══════════════════════════════════════════════════════════════════════════
-+
-+/// Force `id` from `⊤` to `⊥`. Returns whether it moved.
-+#[inline]
-+fn force_bottom(id: u32, state: &mut SccpState) -> bool {
-+    match state.lattice.get(id as usize) {
-+        Some(v) if v.is_top() => {
-+            update_lattice(id, LatticeVal::Bottom, state);
-+            true
-+        }
++        Instruction::Phi { incoming, .. } => incoming
++            .iter()
++            .all(|(op, _)| depends_only_on_const_and_iv(func, op, iv, depth + 1)),
 +        _ => false,
 +    }
 +}
 +
-+/// Lower every `⊤` that is still visible inside an executable block to `⊥`.
-+///
-+/// Covers the destinations of all instructions, the operands of all non-phi
-+/// instructions and terminators, and phi operands arriving on *executable*
-+/// edges. Phi operands on non-executable edges are deliberately left at `⊤`:
-+/// they are not observed, and if a later round makes their edge executable
-+/// their definition will be evaluated normally then, with full precision.
-+///
-+/// Returns whether anything moved (i.e. whether the solver must run again).
-+/// Terminators whose condition was forced are re-queued explicitly so the
-+/// re-evaluation does not depend on the use-def table being complete.
-+fn force_unresolved_to_bottom(func: &IrFunction, state: &mut SccpState) -> bool {
-+    let mut forced = false;
-+    for (bi, block) in func.blocks.iter().enumerate() {
-+        if !state.block_executable[bi] {
++/// True when completely unrolling the outer loop `outer` would leave an inner
++/// natural loop alive as a runtime loop in every clone.  That happens when a
++/// properly-nested inner loop's IV/bound depends on a runtime value (anything
++/// other than constants and the outer loop's IV).  The clones then become
++/// sibling runtime reductions sharing one accumulator, a shape the downstream
++/// late vectorizer miscompiles (reproducer: `for (i = 0; i < 4; i++)
++/// for (j = 0; j < n; j++) s += a[i*n+j]` — the outer trip-4 is unrolled, the
++/// runtime-`n` inner survives as four chained reductions, and lccc sums the
++/// wrong elements while GCC returns the correct value).  A CONSTANT-trip inner
++/// loop is fine: the fixpoint fully unrolls it too.  Refusing keeps the outer
++/// loop rolled, which is correct and matches GCC.
++fn body_contains_persisting_inner_loop(
++    func: &IrFunction,
++    cfg: &CfgAnalysis,
++    outer: &loop_analysis::NaturalLoop,
++    outer_iv: Value,
++) -> bool {
++    let all = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
++    for inner in &all {
++        if inner.header == outer.header {
 +            continue;
 +        }
-+        let bi32 = bi as u32;
-+        for inst in &block.instructions {
++        if !outer.body.contains(&inner.header) {
++            continue;
++        }
++        let latches = inner.latches(&cfg.preds);
++        if latches.len() != 1 {
++            // Multi-latch inner loops aren't handled by name here; the general
++            // cloner treats other shapes separately and they are not the
++            // chained-reduction miscompile this gate guards.
++            continue;
++        }
++        let latch = latches[0];
++        let latch_label = func.blocks[latch].label;
++        if !matches!(
++            &func.blocks[latch].terminator,
++            Terminator::Branch(l) if *l == func.blocks[inner.header].label
++        ) {
++            continue;
++        }
++        // Clean counted inner loop: IV, exit condition, and its initial value.
++        let Some((iv_phi, _ty, _step, _)) = find_iv_in_loop(func, inner.header, latch, latch_label)
++        else {
++            continue;
++        };
++        let Some((_et, _be, _cmp, _cty, limit, _islhs, _pos)) =
++            find_exit_condition(func, inner.header, &inner.body, iv_phi)
++        else {
++            continue;
++        };
++        let mut init_op = None;
++        for inst in &func.blocks[inner.header].instructions {
 +            if let Instruction::Phi { dest, incoming, .. } = inst {
-+                for (op, from_label) in incoming {
-+                    let Operand::Value(v) = op else { continue };
-+                    let Some(&from_idx) = state.label_to_idx.get(from_label) else {
-+                        continue; // unknown pred: the phi already evaluates to ⊥
-+                    };
-+                    if state.executable_edges.contains(&edge_key(from_idx, bi32)) {
-+                        forced |= force_bottom(v.0, state);
++                if dest.0 == iv_phi.0 {
++                    for (op, lbl) in incoming {
++                        if *lbl != latch_label {
++                            init_op = Some(op.clone());
++                        }
 +                    }
 +                }
-+                forced |= force_bottom(dest.0, state);
-+                continue;
-+            }
-+            inst.for_each_used_value(|id| {
-+                forced |= force_bottom(id, state);
-+            });
-+            if let Some(d) = inst.dest() {
-+                forced |= force_bottom(d.0, state);
 +            }
 +        }
-+        let mut term_forced = false;
-+        block.terminator.for_each_used_value(|id| {
-+            term_forced |= force_bottom(id, state);
-+        });
-+        if term_forced {
-+            forced = true;
-+            // Block is already executable, so this re-runs `visit_phis`, which
-+            // re-evaluates the terminator with the now-⊥ condition.
-+            state.cfg_worklist.push(bi32);
++        let Some(init_op) = init_op else { continue };
++        // If the inner IV's initial value or its bound depends on a runtime
++        // value (not a constant and not the OUTER IV), the inner loop persists
++        // after the outer unroll -> unsafe to unroll the outer loop.
++        if !depends_only_on_const_and_iv(func, &init_op, outer_iv, 0)
++            || !depends_only_on_const_and_iv(func, &limit, outer_iv, 0)
++        {
++            return true;
 +        }
 +    }
-+    forced
++    false
 +}
 +
- // ═══════════════════════════════════════════════════════════════════════════
- // Rewrite
- // ═══════════════════════════════════════════════════════════════════════════
- 
-+/// Per-action diagnostic gates. SCCP performs independent rewrites (edge
-+/// pruning, definition materialisation, operand substitution, terminator
-+/// folding); when a workload miscompiles, bisecting them is far faster than
-+/// bisecting the whole pass. Documented in `engineering/SCCP_ADOPTION_AUDIT.md`.
-+///
-+/// ```text
-+///   CCC_SCCP_NO_PRUNE     keep phi operands for non-executable edges
-+///   CCC_SCCP_NO_DEFS      do not rewrite definitions to Copy{dest, Const}
-+///   CCC_SCCP_NO_SUBST     do not substitute constants into operands
-+///   CCC_SCCP_NO_FOLD      do not fold CondBranch/Switch to Branch
-+///   CCC_SCCP_TRACE_PRUNE  print every pruned phi operand
-+/// ```
-+///
-+/// Read once per process: five environment lookups per function per pass
-+/// invocation (lock + hash + `OsString` allocation each) is a measurable
-+/// self-host compile-time tax for zero benefit.
-+struct RewriteGates {
-+    no_prune: bool,
-+    no_defs: bool,
-+    no_subst: bool,
-+    no_fold: bool,
-+    trace_prune: bool,
++// ── Header-phi iteration model ───────────────────────────────────────────────
++/// One header phi of a natural loop with a unique preheader and a single
++/// latch: `dest = phi [init, preheader], [back, latch]`.
++#[derive(Clone, Debug)]
++struct HeaderPhi {
++    id: u32,
++    ty: IrType,
++    init: Operand,
++    back: Operand,
 +}
 +
-+fn gates() -> &'static RewriteGates {
-+    static GATES: std::sync::OnceLock<RewriteGates> = std::sync::OnceLock::new();
-+    GATES.get_or_init(|| {
-+        let on = |k: &str| std::env::var_os(k).is_some();
-+        RewriteGates {
-+            no_prune: on("CCC_SCCP_NO_PRUNE"),
-+            no_defs: on("CCC_SCCP_NO_DEFS"),
-+            no_subst: on("CCC_SCCP_NO_SUBST"),
-+            no_fold: on("CCC_SCCP_NO_FOLD"),
-+            trace_prune: on("CCC_SCCP_TRACE_PRUNE"),
++/// Collect EVERY phi of the loop header (IV included).  `None` when a phi
++/// is not in the two-incoming preheader/latch form the cloners rely on.
++fn collect_header_phis(
++    func: &IrFunction,
++    header: usize,
++    latch_label: BlockId,
++) -> Option<Vec<HeaderPhi>> {
++    let mut out = Vec::new();
++    for inst in &func.blocks[header].instructions {
++        let Instruction::Phi { dest, ty, incoming } = inst else {
++            continue;
++        };
++        if incoming.len() != 2 {
++            return None;
 +        }
-+    })
++        let back: Operand = incoming.iter().find(|(_, l)| *l == latch_label)?.0.clone();
++        let init: Operand = incoming.iter().find(|(_, l)| *l != latch_label)?.0.clone();
++        out.push(HeaderPhi {
++            id: dest.0,
++            ty: *ty,
++            init,
++            back,
++        });
++    }
++    Some(out)
 +}
 +
- /// Opcodes whose destination the rewrite is allowed to overwrite with a
- /// `Copy`. Enforcing this explicitly (rather than trusting that only pure
- /// opcodes can reach `Constant`) means a future lattice extension that starts
-@@ -659,20 +995,7 @@ fn is_pure_replaceable(inst: &Instruction) -> bool {
++/// The value every header phi holds at the entry of a given iteration.
++///
++/// Both complete unrollers used to thread only the phis whose back-edge value
++/// was defined in the cloned region and substituted nothing for the rest; the
++/// remaining shapes silently read the phi's INITIAL value in every iteration:
++///   * `first = 0` at the end of the body (constant back value);
++///   * `cur = param` (loop-invariant back value);
++///   * `x = y; y = t` (the back value is ANOTHER header phi).
++/// This model closes all of them: the value of phi `P` at the entry of
++/// iteration `t` (t ≥ 1) is `P.back` evaluated in iteration `t-1`:
++///   * a constant is itself;
++///   * the latch IV increment is the IV's value in iteration `t`;
++///   * another header phi `Q` is `Q`'s value at iteration `t-1`;
++///   * a value defined inside the loop is iteration `t-1`'s copy of it;
++///   * anything else is loop-invariant and used verbatim.
++/// Iteration 0 sees the preheader `init` operands.  Because the results are
++/// never header-phi ids themselves, substituting one phi at a time is
++/// order-independent.
++struct LoopPhiModel {
++    phis: Vec<HeaderPhi>,
++    iv_id: u32,
++    iv_incr_dest: Option<u32>,
++    iv_ty: IrType,
++    iv_init: i64,
++    iv_step: i64,
++    /// Every SSA id defined by an instruction inside the loop (header non-phi
++    /// instructions and all body blocks).
++    loop_defs: FxHashSet<u32>,
++}
++
++impl LoopPhiModel {
++    fn iv_const(&self, t: i64) -> Operand {
++        Operand::Const(IrConst::from_i64(
++            self.iv_init.wrapping_add(self.iv_step.wrapping_mul(t)),
++            self.iv_ty,
++        ))
++    }
++
++    fn is_header_phi(&self, id: u32) -> bool {
++        self.phis.iter().any(|p| p.id == id)
++    }
++
++    /// Environment of iteration 0: every phi holds its preheader value; the
++    /// IV holds its (already constant-resolved) init.
++    fn env_entry(&self) -> FxHashMap<u32, Operand> {
++        let mut env = FxHashMap::default();
++        for p in &self.phis {
++            let v = if p.id == self.iv_id {
++                self.iv_const(0)
++            } else {
++                p.init
++            };
++            env.insert(p.id, v);
++        }
++        env
++    }
++
++    /// Environment of iteration `t ≥ 1`, given iteration `t-1`'s environment
++    /// and the rename map of iteration `t-1`'s copy of the loop (an absent
++    /// entry means the original, un-renamed instruction executes there).
++    fn env_next(
++        &self,
++        t: i64,
++        env_prev: &FxHashMap<u32, Operand>,
++        rename_prev: &FxHashMap<u32, u32>,
++    ) -> FxHashMap<u32, Operand> {
++        let mut env = FxHashMap::default();
++        for p in &self.phis {
++            let v = if p.id == self.iv_id {
++                self.iv_const(t)
++            } else {
++                self.resolve_back(&p.back, t, env_prev, rename_prev)
++            };
++            env.insert(p.id, v);
++        }
++        env
++    }
++
++    fn resolve_back(
++        &self,
++        back: &Operand,
++        t: i64,
++        env_prev: &FxHashMap<u32, Operand>,
++        rename_prev: &FxHashMap<u32, u32>,
++    ) -> Operand {
++        match back {
++            Operand::Const(_) => *back,
++            Operand::Value(v) => {
++                if Some(v.0) == self.iv_incr_dest {
++                    self.iv_const(t)
++                } else if self.is_header_phi(v.0) {
++                    *env_prev
++                        .get(&v.0)
++                        .expect("iteration environment covers every header phi")
++                } else if self.loop_defs.contains(&v.0) {
++                    Operand::Value(Value(*rename_prev.get(&v.0).unwrap_or(&v.0)))
++                } else {
++                    *back
++                }
++            }
++        }
++    }
++}
++
++/// Substitute every header phi of `env` in one instruction / terminator.
++fn apply_env_inst(inst: &mut Instruction, env: &FxHashMap<u32, Operand>) {
++    for (&id, repl) in env {
++        subst_value_with_operand(inst, id, repl);
++    }
++}
++
++fn apply_env_term(term: &mut Terminator, env: &FxHashMap<u32, Operand>) {
++    for (&id, repl) in env {
++        subst_value_in_terminator(term, id, repl);
++    }
++}
++
++/// Header non-phi instructions that are NOT part of the exit-test chain (the
++/// Cmp and an optional Cast feeding the CondBranch).  These carry the loop
++/// condition's side effects and extra values (`for (...; cnt++, i < 4; ...)`),
++/// execute once per guard evaluation — `trip + 1` times — and must therefore
++/// be replicated per iteration AND once more after the last one.
++fn header_extra_indices(func: &IrFunction, header: usize) -> Vec<usize> {
++    let block = &func.blocks[header];
++    let mut chain: FxHashSet<u32> = FxHashSet::default();
++    if let Terminator::CondBranch {
++        cond: Operand::Value(c),
++        ..
++    } = &block.terminator
++    {
++        chain.insert(c.0);
++        if let Some(Instruction::Cast {
++            src: Operand::Value(s),
++            ..
++        }) = block.instructions.iter().find(|i| i.dest() == Some(*c))
++        {
++            chain.insert(s.0);
++        }
++    }
++    block
++        .instructions
++        .iter()
++        .enumerate()
++        .filter(|(_, inst)| {
++            !matches!(inst, Instruction::Phi { .. })
++                && !inst.dest().is_some_and(|d| chain.contains(&d.0))
++        })
++        .map(|(i, _)| i)
++        .collect()
++}
++
++/// Rewrite every use of `env`'s phis (and the `extra` header values) in the
++/// blocks OUTSIDE the loop to their post-loop values.
++fn rewrite_outside_uses(
++    func: &mut IrFunction,
++    loop_body: &FxHashSet<usize>,
++    final_env: &FxHashMap<u32, Operand>,
++    extra_final: &FxHashMap<u32, u32>,
++) {
++    for (bi, block) in func.blocks.iter_mut().enumerate() {
++        if loop_body.contains(&bi) {
++            continue;
++        }
++        for inst in &mut block.instructions {
++            apply_env_inst(inst, final_env);
++            for (&old, &new) in extra_final {
++                subst_value_with_operand(inst, old, &Operand::Value(Value(new)));
++            }
++        }
++        apply_env_term(&mut block.terminator, final_env);
++        for (&old, &new) in extra_final {
++            subst_value_in_terminator(&mut block.terminator, old, &Operand::Value(Value(new)));
++        }
++    }
++}
++
++/// Relabel the exit block's phi edges that named `old_pred` (the header,
++/// which no longer branches to the exit) to `new_pred`.
++fn relabel_exit_phis(
++    func: &mut IrFunction,
++    exit_target: BlockId,
++    old_pred: BlockId,
++    new_pred: BlockId,
++) {
++    if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
++        for inst in &mut func.blocks[exit_bi].instructions {
++            if let Instruction::Phi { incoming, .. } = inst {
++                for (_, lbl) in incoming.iter_mut() {
++                    if *lbl == old_pred {
++                        *lbl = new_pred;
++                    }
++                }
++            }
++        }
++    }
+ }
  
- fn rewrite(func: &mut IrFunction, state: &SccpState) -> SccpStats {
-     let mut stats = SccpStats::default();
--
--    // Per-action diagnostic gates. SCCP performs three independent rewrites
--    // (edge pruning, definition materialisation, terminator folding); when a
--    // workload miscompiles, bisecting them is far faster than bisecting the
--    // whole pass. Documented in `engineering/SCCP_ADOPTION_AUDIT.md`.
--    //
--    //   CCC_SCCP_NO_PRUNE   keep phi operands for non-executable edges
--    //   CCC_SCCP_NO_DEFS    do not rewrite definitions to Copy{dest, Const}
--    //   CCC_SCCP_NO_SUBST   do not substitute constants into operands
--    //   CCC_SCCP_NO_FOLD    do not fold CondBranch/Switch to Branch
--    let no_prune = std::env::var_os("CCC_SCCP_NO_PRUNE").is_some();
--    let no_defs = std::env::var_os("CCC_SCCP_NO_DEFS").is_some();
--    let no_subst = std::env::var_os("CCC_SCCP_NO_SUBST").is_some();
--    let no_fold = std::env::var_os("CCC_SCCP_NO_FOLD").is_some();
-+    let g = gates();
+ fn try_complete_unroll_general(
+     func: &mut IrFunction,
+     lp: &loop_analysis::NaturalLoop,
+     cfg: &CfgAnalysis,
++    trip_range: std::ops::RangeInclusive<i64>,
+ ) -> bool {
+     let header = lp.header;
+     let header_label = func.blocks[header].label;
+@@ -680,12 +1199,28 @@ fn try_complete_unroll_general(
+         return false;
+     };
  
-     // ── 1. decide the surviving successor set of every executable block ─────
-     // This must happen before any mutation, because step 2 prunes phi operands
-@@ -684,44 +1007,41 @@ fn rewrite(func: &mut IrFunction, state: &SccpState) -> SccpStats {
-     // "this label was never a predecessor at all" (malformed IR, not ours to
-     // repair) -- see the pruning loop below.
-     let mut real_edges: FxHashSet<u64> = FxHashSet::default();
--    for (bi, block) in func.blocks.iter().enumerate() {
--        let bi32 = bi as u32;
--        for_each_target(&block.terminator, |label| {
--            if let Some(&to) = state.label_to_idx.get(&label) {
--                real_edges.insert(edge_key(bi32, to));
++    // Fail closed (correctness, see `body_contains_persisting_inner_loop`):
++    // refuse to unroll when the body contains a nested inner loop whose trip
++    // count depends on a runtime value (so it survives as a runtime loop in
++    // every clone).  The surviving sibling runtime reductions reuse one
++    // accumulator, which the downstream late vectorizer miscompiles; staying
++    // rolled is correct and matches GCC for these shapes.
++    if body_contains_persisting_inner_loop(func, cfg, lp, iv_phi) {
++        return false;
++    }
++
+     // Exit from the header's CondBranch.
+-    let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, _pos)) =
++    let Some((exit_target, body_entry, raw_cmp_op, cmp_ty, exit_limit, iv_is_lhs, exit_pos)) =
+         find_exit_condition(func, header, &lp.body, iv_phi)
+     else {
+         return false;
+     };
++    // The compare must be in the IV's own type, and its operator is put into
++    // the canonical "continue while iv OP limit" form before any arithmetic.
++    if cmp_ty != iv_ty {
++        return false;
++    }
++    let cmp_op = canonical_continue_cmp(raw_cmp_op, iv_is_lhs, exit_pos);
+ 
+     // Constant init (through const chains) and constant limit.
+     let mut iv_init_op: Option<Operand> = None;
+@@ -711,7 +1246,7 @@ fn try_complete_unroll_general(
+     };
+ 
+     // Trip count (same arithmetic as the two-block unroller).
+-    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
++    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step, iv_ty) else {
+         return false;
+     };
+     // The post-loop IV may exceed i64 even when the trip count is small
+@@ -724,7 +1259,7 @@ fn try_complete_unroll_general(
+     else {
+         return false;
+     };
+-    if !(2..=16).contains(&trip) {
++    if !trip_range.contains(&trip) {
+         return false;
+     }
+ 
+@@ -812,47 +1347,86 @@ fn try_complete_unroll_general(
+         return false;
+     }
+ 
+-    // Loop-carried phis (skip the IV): init from the preheader edge, back
+-    // value defined somewhere in the body.
+-    let mut carried: Vec<(u32, Operand, u32)> = Vec::new();
+-    for inst in &func.blocks[header].instructions {
+-        let Instruction::Phi { dest, incoming, .. } = inst else {
+-            continue;
+-        };
+-        if dest.0 == iv_phi.0 {
+-            continue;
+-        }
+-        let mut init: Option<Operand> = None;
+-        let mut back: Option<u32> = None;
+-        for (op, lbl) in incoming {
+-            if *lbl == latch_label {
+-                if let Operand::Value(v) = op {
+-                    back = Some(v.0);
+-                }
+-            } else {
+-                init = Some(op.clone());
 -            }
--        });
--        for inst in &block.instructions {
--            if let Instruction::InlineAsm { goto_labels, .. } = inst {
--                for (_, label) in goto_labels {
--                    if let Some(&to) = state.label_to_idx.get(label) {
--                        real_edges.insert(edge_key(bi32, to));
--                    }
++    // ── Per-iteration SSA environment (header-phi model) ────────────────────
++    let Some(phis) = collect_header_phis(func, header, latch_label) else {
++        return false;
++    };
++    let iv_id = iv_phi.0;
++    let iv_incr_dest = phis
++        .iter()
++        .find(|p| p.id == iv_id)
++        .and_then(|p| match p.back {
++            Operand::Value(v) => Some(v.0),
++            _ => None,
++        });
++    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
++    for &hi in &header_nonphi {
++        if let Some(d) = func.blocks[header].instructions[hi].dest() {
++            loop_defs.insert(d.0);
+         }
+-        if let (Some(init_op), Some(back_id)) = (init, back) {
+-            if is_defined_in_body(back_id, &lp.body, func) {
+-                carried.push((dest.0, init_op, back_id));
++    }
++    for &bi in &body_blocks {
++        for inst in &func.blocks[bi].instructions {
++            if let Some(d) = inst.dest() {
++                loop_defs.insert(d.0);
+             }
+         }
+     }
++    let model = LoopPhiModel {
++        phis,
++        iv_id,
++        iv_incr_dest,
++        iv_ty,
++        iv_init,
++        iv_step,
++        loop_defs,
++    };
++    // Header instructions beyond the (pure) exit-test chain: they execute on
++    // every evaluation of the loop condition, i.e. `trip + 1` times. The last
++    // evaluation is the failing one, which must run exactly once more after
++    // the final cloned iteration.
++    let header_extra: Vec<usize> = header_extra_indices(func, header);
++    let has_header_extra = !header_extra.is_empty();
++    // A header instruction with a real observable side effect (volatile read,
++    // store, call, asm) that we do not model: leave the loop rolled rather
++    // than drop the extra failing evaluation. Pure arithmetic (a `cnt++`
++    // counter, an address computation) is safe to model.
++    if has_header_extra
++        && header_extra.iter().any(|&hi| {
++            matches!(
++                &func.blocks[header].instructions[hi],
++                Instruction::Store { .. }
++                    | Instruction::Call { .. }
++                    | Instruction::CallIndirect { .. }
++                    | Instruction::InlineAsm { .. }
++                    | Instruction::Load { volatile: true, .. }
++            )
++        })
++    {
++        return false;
++    }
+ 
+     // ── Build clones for iterations 1..trip ─────────────────────────────────
+     let mut next_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
+     let mut next_val = func.next_value_id;
+     let num_clones = (trip - 1) as usize;
+ 
+-    // Per-clone: header-copy label, per-body-block labels, vmap.
+     struct ClonePlan {
+         header_copy: BlockId,
+         block_labels: Vec<BlockId>, // parallel to body_blocks
+         vmap: FxHashMap<u32, u32>,
++        env: FxHashMap<u32, Operand>,
+     }
+     let mut plans: Vec<ClonePlan> = Vec::with_capacity(num_clones);
+-    for _ in 0..num_clones {
++
++    // Iteration 0's environment is the preheader init; iteration 0 uses the
++    // ORIGINAL (un-renamed) body so its "rename map" is empty.
++    let mut env_prev = model.env_entry();
++    let mut rename_prev: FxHashMap<u32, u32> = FxHashMap::default();
++
++    for ci in 0..num_clones {
++        let t = (ci + 1) as i64; // clone `t` = iteration index after `t` strides
++        let env = model.env_next(t, &env_prev, &rename_prev);
+         let header_copy = BlockId(next_label);
+         next_label += 1;
+         let block_labels = body_blocks
+@@ -871,7 +1445,7 @@ fn try_complete_unroll_general(
+                 next_val += 1;
+             }
+         }
+-        // Body defs (skip the latch IV increment — it is dead per iteration).
++        // Body defs (skip the dead latch IV increment).
+         for &bi in &body_blocks {
+             for (idx, inst) in func.blocks[bi].instructions.iter().enumerate() {
+                 if bi == latch && idx == latch_iv_incr_idx {
+@@ -883,73 +1457,101 @@ fn try_complete_unroll_general(
+                 }
+             }
+         }
++        env_prev = env.clone();
++        rename_prev = vmap.clone();
+         plans.push(ClonePlan {
+             header_copy,
+             block_labels,
+             vmap,
++            env,
+         });
+     }
+ 
+     let mut new_blocks: Vec<BasicBlock> = Vec::new();
+-    // prev_back[c]: value id delivering carried phi c entering this clone
+-    // (clone 1 uses the ORIGINAL body's back value; clone t>1 uses
+-    // clone t-1's renamed back value).
+-    let mut prev_back: Vec<u32> = carried.iter().map(|&(_, _, back)| back).collect();
+-    let mut final_carried: Vec<(u32, u32)> = Vec::new();
+ 
+-    for (ci, plan) in plans.iter().enumerate() {
+-        let t = (ci + 1) as i64; // iteration index this clone represents
+-                                 // Clone `t` observes the IV after `t` strides, not after `t` steps of
+-                                 // 1: with the constant-stride trip count in place the stride may be
+-                                 // any non-zero constant, so the substituted constant must be scaled
+-                                 // (mirrors the two-block cloner's `iv_init + t_idx * iv_step`).
+-        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t * iv_step, iv_ty));
++    // ── Final guard (the failing trip-th evaluation) ────────────────────────
++    // Runs the header_extra instructions once more with the last clone's
++    // values, then falls to the exit. Its fresh outputs are the post-loop
++    // live-out values of those header instructions (e.g. `cnt` after a
++    // `for (i=0; cnt++, i<N; i++)` is N+1, not the value at the last clone's
++    // entry).
++    // The failing evaluation's environment: after the LAST clone (or, for a
++    // single-trip loop, after iteration 0's original body).  `plans` is empty
++    // when `trip == 1` (the single-trip deletion path), in which case there are
++    // no renamed values and the original body's defs are used verbatim.
++    let last: Option<&ClonePlan> = plans.last();
++    let last_vmap: FxHashMap<u32, u32> = last.map(|l| l.vmap.clone()).unwrap_or_default();
++    let env_fg = model.env_next(
++        trip,
++        last.map(|l| &l.env).unwrap_or(&env_prev),
++        last.map(|l| &l.vmap).unwrap_or(&rename_prev),
++    );
++    let mut extra_final: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut final_guard: Option<BlockId> = None;
++    if has_header_extra {
++        let fg_label = BlockId(next_label);
++        next_label += 1;
++        let mut fg_vmap: FxHashMap<u32, u32> = FxHashMap::default();
++        for &hi in &header_extra {
++            if let Some(d) = func.blocks[header].instructions[hi].dest() {
++                fg_vmap.insert(d.0, next_val);
++                next_val += 1;
++            }
++        }
++        let mut fg_insts: Vec<Instruction> = Vec::new();
++        for &hi in &header_extra {
++            let mut cloned = func.blocks[header].instructions[hi].clone();
++            // header_extra → this guard's own fresh outputs first, then the
++            // last clone's values, then substitute the header phis with the
++            // failing-entry environment.
++            replace_values_in_inst(&mut cloned, &fg_vmap);
++            replace_values_in_inst(&mut cloned, &last_vmap);
++            rename_inst_dest(&mut cloned, &fg_vmap);
++            apply_env_inst(&mut cloned, &env_fg);
++            fg_insts.push(cloned);
++        }
++        for &hi in &header_extra {
++            if let Some(d) = func.blocks[header].instructions[hi].dest() {
++                extra_final.insert(d.0, fg_vmap[&d.0]);
++            }
++        }
++        new_blocks.push(BasicBlock {
++            label: fg_label,
++            instructions: fg_insts,
++            terminator: Terminator::Branch(exit_target),
++            source_spans: Vec::new(),
++        });
++        final_guard = Some(fg_label);
++    }
+ 
+-        // label_map: original label → clone label (header + body).
++    // ── Emit the clone blocks ───────────────────────────────────────────────
++    for (ci, plan) in plans.iter().enumerate() {
++        // Original label → clone label (header + body).
+         let mut label_map: FxHashMap<BlockId, BlockId> = FxHashMap::default();
+         label_map.insert(header_label, plan.header_copy);
+         for (i, &bi) in body_blocks.iter().enumerate() {
+             label_map.insert(func.blocks[bi].label, plan.block_labels[i]);
+         }
+-
+-        // Where this clone's latch back-edge goes: next clone's header-copy,
+-        // or the exit target for the last clone.
+         let back_redirect = if ci + 1 < num_clones {
+             plans[ci + 1].header_copy
+         } else {
+-            exit_target
+-        };
+-
+-        // Operand substitution: iv → const, carried → previous value.
+-        let substitute = |inst: &mut Instruction| {
+-            subst_value_with_operand(inst, iv_phi.0, &iv_const);
+-            for (c, &(phi_id, _, _)) in carried.iter().enumerate() {
+-                let repl = Operand::Value(Value(prev_back[c]));
+-                subst_value_with_operand(inst, phi_id, &repl);
+-            }
+-        };
+-        let substitute_term = |term: &mut Terminator| {
+-            subst_value_in_terminator(term, iv_phi.0, &iv_const);
+-            for (c, &(phi_id, _, _)) in carried.iter().enumerate() {
+-                let repl = Operand::Value(Value(prev_back[c]));
+-                subst_value_in_terminator(term, phi_id, &repl);
+-            }
++            final_guard.unwrap_or(exit_target)
+         };
+ 
+         // Header copy: non-phi instructions, unconditional Branch into the
+-        // body entry (trip ≥ 2 ⇒ every cloned iteration executes).
++        // body entry (trip ≥ 2 ⇒ every cloned iteration executes). Pure
++        // exit-test chain instructions are cloned too and DCE'd away.
+         {
+             let mut insts: Vec<Instruction> = Vec::new();
+             for &hi in &header_nonphi {
+                 let mut cloned = func.blocks[header].instructions[hi].clone();
+-                // ORDER: rename FIRST, substitute header-phi references
+-                // AFTER. Clone 1's carried back values are ORIGINAL body
+-                // ids that are also in this clone's vmap — substituting
+-                // first would let the rename rewrite them into this
+-                // clone's own definitions (self-referential phi).
++                // ORDER: rename first, substitute header-phi references after.
++                // Clone 1's env values are ORIGINAL body ids also present in
++                // this clone's vmap; substituting first would let the rename
++                // rewrite them into this clone's own definitions.
+                 replace_values_in_inst(&mut cloned, &plan.vmap);
+                 rename_inst_dest(&mut cloned, &plan.vmap);
+-                substitute(&mut cloned);
++                apply_env_inst(&mut cloned, &plan.env);
+                 insts.push(cloned);
+             }
+             new_blocks.push(BasicBlock {
+@@ -973,16 +1575,9 @@ fn try_complete_unroll_general(
+                     continue; // dead IV increment
+                 }
+                 let mut cloned = inst.clone();
+-                // Rename first, substitute after (see the header-copy note:
+-                // clone 1's carried values are original body ids present in
+-                // this clone's vmap).
+                 replace_values_in_inst(&mut cloned, &plan.vmap);
+                 rename_inst_dest(&mut cloned, &plan.vmap);
+-                substitute(&mut cloned);
+-                // Phi incoming labels: remap through the label map (inner
+-                // loop headers cloned inside this iteration). Labels equal
+-                // to the OUTER header label now arrive from this clone's
+-                // header copy — the actual predecessor.
++                apply_env_inst(&mut cloned, &plan.env);
+                 if let Instruction::Phi { incoming, .. } = &mut cloned {
+                     for (op, lbl) in incoming.iter_mut() {
+                         if *lbl == header_label {
+@@ -995,11 +1590,7 @@ fn try_complete_unroll_general(
+                 insts.push(cloned);
+             }
+             let mut term = orig.terminator.clone();
+-            // Rename value uses (e.g. an inner loop header's exit compare)
+-            // first — then substitute header-phi references (see the
+-            // header-copy ordering note).
+             replace_values_in_terminator(&mut term, &plan.vmap);
+-            // Back-edge (latch → header) redirects to the next iteration.
+             if bi == latch {
+                 if let Terminator::Branch(lbl) = &mut term {
+                     if *lbl == header_label {
+@@ -1007,9 +1598,8 @@ fn try_complete_unroll_general(
+                     }
+                 }
+             }
+-            // General label remap for internal branches.
+             replace_block_ids(&mut term, &label_map);
+-            substitute_term(&mut term);
++            apply_env_term(&mut term, &plan.env);
+             new_blocks.push(BasicBlock {
+                 label: plan.block_labels[i],
+                 instructions: insts,
+@@ -1017,17 +1607,6 @@ fn try_complete_unroll_general(
+                 source_spans: Vec::new(),
+             });
+         }
+-
+-        // Update prev_back for the NEXT clone: this clone's renamed back
+-        // values. The LAST clone's values feed outside uses.
+-        for (c, &(_, _, back_id)) in carried.iter().enumerate() {
+-            if let Some(&new_id) = plan.vmap.get(&back_id) {
+-                prev_back[c] = new_id;
+-                if ci + 1 == num_clones {
+-                    final_carried.push((carried[c].0, new_id));
 -                }
 -            }
 -        }
--    }
+     }
  
-     for (bi, block) in func.blocks.iter().enumerate() {
--        if !state.block_executable[bi] {
-+        let bi32 = bi as u32;
-+        let executable = state.block_executable[bi];
-+        if !executable {
-             stats.unreachable_blocks += 1;
--            continue;
+     func.next_value_id = next_val;
+@@ -1036,47 +1615,66 @@ fn try_complete_unroll_general(
+     // Iteration 0 keeps the original header + body. The header's terminator
+     // becomes an unconditional Branch into the body entry.
+     func.blocks[header].terminator = Terminator::Branch(body_entry);
+-    // The original latch's back-edge flows into clone 1's header copy.
+-    func.blocks[latch].terminator = Terminator::Branch(plans[0].header_copy);
+-
+-    // Outside uses: IV → final constant; carried phis → final clone values.
+-    let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
++    // The original latch's back-edge flows into clone 1's header copy — or
++    // straight to the exit when the loop runs exactly once (no clones).
++    func.blocks[latch].terminator = Terminator::Branch(match plans.first() {
++        Some(first) => first.header_copy,
++        None => exit_target,
++    });
++    // ── Post-loop substitution for blocks outside the loop ──────────────────
++    // The failing-entry environment holds the live-out value of every ordinary
++    // carried value (an accumulator `sum` is its value after the last body).
++    // A header-extra-backed phi (e.g. `cnt` whose back value is `cnt + 1` in
++    // the header) instead takes the final guard's fresh output: that captures
++    // the one-extra failing evaluation.
++    let extra_out_ids: FxHashSet<u32> = extra_final.keys().copied().collect();
++    let mut final_subst: FxHashMap<u32, Operand> = FxHashMap::default();
++    final_subst.insert(
++        iv_id,
++        Operand::Const(IrConst::from_i64(final_iv_n, iv_ty)),
++    );
++    for (&e, &fg) in &extra_final {
++        final_subst.insert(e, Operand::Value(Value(fg)));
++    }
++    for p in &model.phis {
++        if p.id == iv_id {
++            continue;
++        }
++        if let Operand::Value(v) = &p.back {
++            if extra_out_ids.contains(&v.0) {
++                final_subst.insert(p.id, final_subst[&v.0]);
++                continue;
++            }
++        }
++        final_subst.insert(p.id, *env_fg.get(&p.id).expect("env covers every phi"));
++    }
+     for (block_index, block) in func.blocks.iter_mut().enumerate() {
+         if lp.body.contains(&block_index) {
+             continue;
          }
--        let bi32 = bi as u32;
+         for instruction in &mut block.instructions {
+-            subst_value_with_operand(instruction, iv_phi.0, &final_iv);
+-            for &(phi_id, final_id) in &final_carried {
+-                let repl = Operand::Value(Value(final_id));
+-                subst_value_with_operand(instruction, phi_id, &repl);
+-            }
+-        }
+-        subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
+-        for &(phi_id, final_id) in &final_carried {
+-            let repl = Operand::Value(Value(final_id));
+-            subst_value_in_terminator(&mut block.terminator, phi_id, &repl);
++            apply_env_inst(instruction, &final_subst);
+         }
++        apply_env_term(&mut block.terminator, &final_subst);
+     }
  
--        // `asm goto` edges always survive: they are not conditional on any
--        // value this pass can reason about.
-+        // `asm goto` edges are real, and when the block executes they always
-+        // survive: they are not conditional on any value this pass can reason
-+        // about.
-         for inst in &block.instructions {
-             if let Instruction::InlineAsm { goto_labels, .. } = inst {
-                 for (_, label) in goto_labels {
-                     if let Some(&to) = state.label_to_idx.get(label) {
--                        live_edges.insert(edge_key(bi32, to));
-+                        let k = edge_key(bi32, to);
-+                        real_edges.insert(k);
-+                        if executable {
-+                            live_edges.insert(k);
-+                        }
+-    // Exit-block phi edges: the edge that arrived from the header now
+-    // arrives from the last clone's latch (the block that branches to the
+-    // exit target).
++    // Exit-block phi edges: the edge that arrived from the header now arrives
++    // from the last clone's latch (or the final guard, when the guard is the
++    // block that branches to the exit).
+     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
+         if exit_bi != header && !lp.body.contains(&exit_bi) {
+-            let last_latch_label = plans[num_clones - 1].block_labels[body_blocks
+-                .iter()
+-                .position(|&b| b == latch)
+-                .expect("latch is a body block")];
+-            for inst in &mut func.blocks[exit_bi].instructions {
+-                if let Instruction::Phi { incoming, .. } = inst {
+-                    for (_, lbl) in incoming.iter_mut() {
+-                        if *lbl == header_label {
+-                            *lbl = last_latch_label;
+-                        }
+-                    }
++            let new_pred = final_guard.unwrap_or_else(|| {
++                match plans.last() {
++                    Some(last) => last.block_labels[body_blocks
++                        .iter()
++                        .position(|&b| b == latch)
++                        .expect("latch is a body block")],
++                    // Single-trip deletion: the original latch now branches
++                    // straight to the exit, so it IS the predecessor.
++                    None => latch_label,
+                 }
+-            }
++            });
++            relabel_exit_phis(func, exit_target, header_label, new_pred);
+         }
+     }
+ 
+@@ -1140,15 +1738,19 @@ fn try_complete_unroll_two_block(
+     let Some((
+         exit_target,
+         body_entry,
+-        cmp_op,
+-        _cmp_ty,
++        raw_cmp_op,
++        cmp_ty,
+         exit_limit,
+-        _iv_is_lhs,
++        iv_is_lhs,
+         exit_cond_positive,
+     )) = find_exit_condition(func, header, &lp.body, iv_phi)
+     else {
+         return false;
+     };
++    if cmp_ty != iv_ty {
++        return false;
++    }
++    let cmp_op = canonical_continue_cmp(raw_cmp_op, iv_is_lhs, exit_cond_positive);
+     // work_blocks: instructions to clone each iteration (excluding IV increment).
+     // 2-block: work lives in the latch (body_entry == latch).
+     // 3-block: header -> body_entry (one work block) -> latch (IV incr only) -> header.
+@@ -1172,33 +1774,33 @@ fn try_complete_unroll_two_block(
+         }
+         vec![bi, latch]
+     };
+-    // Constant IV init from preheader.
+-    let mut iv_init: Option<i64> = None;
++    // Constant IV init from the preheader edge.  Resolved through the same
++    // const-chain evaluator as the general cloner so that a 2–3 block inner
++    // loop whose init became `Add(const, const)` after an outer complete
++    // unroll is handled in the SAME fixpoint round instead of waiting for a
++    // later folding pass (or never, when unroll is the last loop pass).
++    let mut iv_init_op: Option<Operand> = None;
+     for inst in &func.blocks[header].instructions {
+         if let Instruction::Phi { dest, incoming, .. } = inst {
+             if dest.0 == iv_phi.0 {
+                 for (op, lbl) in incoming {
+                     if *lbl != latch_label {
+-                        iv_init = match op {
+-                            Operand::Const(c) => c.to_i64(),
+-                            _ => None,
+-                        };
++                        iv_init_op = Some(op.clone());
                      }
                  }
              }
          }
+     }
+-    let Some(iv_init) = iv_init else {
++    let Some(iv_init_op) = iv_init_op else {
+         return false;
+     };
+-    let limit_n: i64 = match &exit_limit {
+-        Operand::Const(c) => match c.to_i64() {
+-            Some(n) => n,
+-            None => return false,
+-        },
+-        _ => return false,
++    let Some(iv_init) = resolve_const_operand(func, &iv_init_op, 0) else {
++        return false;
+     };
+-    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
++    let Some(limit_n) = resolve_const_operand(func, &exit_limit, 0) else {
++        return false;
++    };
++    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step, iv_ty) else {
+         return false;
+     };
+     // The post-loop IV may exceed i64 even when the trip count is small
+@@ -1287,36 +1889,56 @@ fn try_complete_unroll_two_block(
+         return false;
+     }
  
--        let new_term = if no_fold {
-+        for_each_target(&block.terminator, |label| {
-+            if let Some(&to) = state.label_to_idx.get(&label) {
-+                real_edges.insert(edge_key(bi32, to));
-+            }
-+        });
-+        if !executable {
-+            continue;
-+        }
-+
-+        let new_term = if g.no_fold {
-             None
-         } else {
-             fold_terminator(&block.terminator, state)
-@@ -749,70 +1069,76 @@ fn rewrite(func: &mut IrFunction, state: &SccpState) -> SccpStats {
-     // stale entry writes the wrong value into the phi's register on a path
-     // that is still live. `cfg_simplify::fold_constant_cond_branches` performs
-     // the same repair for its own folds and documents the same hazard.
--    let trace_prune = std::env::var_os("CCC_SCCP_TRACE_PRUNE").is_some();
--    let func_name_dbg = if trace_prune {
--        func.name.clone()
--    } else {
--        String::new()
--    };
--    for bi in 0..func.blocks.len() {
--        if no_prune || !state.block_executable[bi] {
+-    // Loop-carried phis (phi_id, init_op, back_value_id in latch). Skip IV phi.
+-    let mut carried: Vec<(u32, Operand, u32)> = Vec::new();
+-    for inst in &func.blocks[header].instructions {
+-        let Instruction::Phi { dest, incoming, .. } = inst else {
+-            continue;
+-        };
+-        if dest.0 == iv_phi.0 {
 -            continue;
 -        }
--        let bi32 = bi as u32;
--        for inst in func.blocks[bi].instructions.iter_mut() {
--            let Instruction::Phi { incoming, .. } = inst else {
-+    //
-+    // Note on `CCC_SCCP_NO_FOLD`: an SCCP-unreachable block stays CFG-reachable
-+    // when its predecessor's branch is not folded, but it is still *dynamically*
-+    // unreachable (the branch condition is a proven constant), so pruning its
-+    // out-edges from live phis remains semantically correct.
-+    if !g.no_prune {
-+        let func_name_dbg = if g.trace_prune {
-+            func.name.clone()
-+        } else {
-+            String::new()
-+        };
-+        for bi in 0..func.blocks.len() {
-+            if !state.block_executable[bi] {
-                 continue;
--            };
--            let before = incoming.len();
--            let survivors: Vec<_> = incoming
--                .iter()
--                .filter(|(_, from_label)| match state.label_to_idx.get(from_label) {
-+            }
-+            let bi32 = bi as u32;
-+            // Keep an incoming entry iff its edge is live, or it is not a real
-+            // CFG edge at all. Prune only edges SCCP *proved* dead: the edge
-+            // must really exist in the CFG and have been shown non-executable.
-+            // A label that names a block which is not a predecessor of this
-+            // block at all is malformed IR (loop_rotate produced exactly this
-+            // shape before the stale-guard-label fix). Dropping such an entry
-+            // silently deletes an initialisation, so keep it and let
-+            // cfg_simplify's stale-label cleanup deal with it. An unknown label
-+            // is likewise not ours to judge.
-+            let keep = |from_label: &BlockId| -> bool {
-+                match state.label_to_idx.get(from_label) {
-                     Some(&from) => {
-                         let k = edge_key(from, bi32);
--                        // Prune only edges SCCP *proved* dead: the edge must
--                        // really exist in the CFG and have been shown
--                        // non-executable. A label that names a block which is
--                        // not a predecessor of this block at all is malformed
--                        // IR (loop_rotate produced exactly this shape before
--                        // the stale-guard-label fix). Dropping such an entry
--                        // silently deletes an initialisation, so keep it and
--                        // let cfg_simplify's stale-label cleanup deal with it.
-                         live_edges.contains(&k) || !real_edges.contains(&k)
-                     }
--                    // Unknown predecessor label: not ours to judge.
-                     None => true,
--                })
--                .cloned()
--                .collect();
--
--            // Defensive: an executable block always has at least one live
--            // incoming edge, so an empty survivor set means our edge model and
--            // the phi disagree. Keeping the phi unchanged is always safe;
--            // emitting a zero-operand phi would not be.
--            if survivors.is_empty() || survivors.len() == before {
--                debug_assert!(
--                    !survivors.is_empty() || bi == 0,
--                    "phi in executable block {} lost every incoming edge",
--                    bi
--                );
--                continue;
--            }
--            if trace_prune {
--                for (op, fl) in incoming.iter() {
--                    let keep = survivors.iter().any(|(_, l)| l == fl);
--                    if !keep {
--                        let fi = state.label_to_idx.get(fl).copied();
-+                }
-+            };
-+            for inst in func.blocks[bi].instructions.iter_mut() {
-+                let Instruction::Phi { incoming, .. } = inst else {
-+                    continue;
-+                };
-+                let before = incoming.len();
-+                let survivors = incoming.iter().filter(|(_, l)| keep(l)).count();
-+
-+                // Defensive: an executable block always has at least one live
-+                // incoming edge, so an empty survivor set means our edge model
-+                // and the phi disagree. Keeping the phi unchanged is always
-+                // safe; emitting a zero-operand phi would not be.
-+                if survivors == 0 || survivors == before {
-+                    debug_assert!(
-+                        survivors != 0 || bi == 0,
-+                        "phi in executable block {} lost every incoming edge",
-+                        bi
-+                    );
-+                    continue;
-+                }
-+                incoming.retain(|(op, from_label)| {
-+                    let k = keep(from_label);
-+                    if !k && g.trace_prune {
-+                        let fi = state.label_to_idx.get(from_label).copied();
-                         eprintln!(
--                            "[sccp] fn prune: block#{bi} label={:?} drops incoming ({:?} from {:?}) predidx={:?} pred_exec={:?}",
--                            func_name_dbg, op, fl, fi,
-+                            "[sccp] fn {:?} prune: block#{bi} drops incoming ({:?} from {:?}) predidx={:?} pred_exec={:?}",
-+                            func_name_dbg,
-+                            op,
-+                            from_label,
-+                            fi,
-                             fi.map(|i| state.block_executable[i as usize])
-                         );
-                     }
+-        let mut init: Option<Operand> = None;
+-        let mut back: Option<u32> = None;
+-        for (op, lbl) in incoming {
+-            if *lbl == latch_label {
+-                if let Operand::Value(v) = op {
+-                    back = Some(v.0);
 -                }
-+                    k
-+                });
-+                stats.phi_edges_pruned += before - incoming.len();
-             }
--            stats.phi_edges_pruned += before - survivors.len();
--            *incoming = survivors;
-         }
-     }
- 
-@@ -825,7 +1151,7 @@ fn rewrite(func: &mut IrFunction, state: &SccpState) -> SccpStats {
-             continue;
-         }
- 
--        if !no_defs {
-+        if !g.no_defs {
-             materialise_constant_defs(&mut func.blocks[bi], state, &mut stats);
-         }
- 
-@@ -833,7 +1159,7 @@ fn rewrite(func: &mut IrFunction, state: &SccpState) -> SccpStats {
-         // is the canonical exhaustive visitor and only ever yields `Operand`
-         // fields, never the bare `Value` fields (Load.ptr, GEP.base, ...) that
-         // cannot legally hold a constant — so this cannot construct invalid IR.
--        if !no_subst {
-+        if !g.no_subst {
-             for inst in func.blocks[bi].instructions.iter_mut() {
-                 inst.for_each_operand_mut(|op| stats.operands_substituted += substitute(op, state));
-             }
-@@ -862,12 +1188,7 @@ fn materialise_constant_defs(block: &mut BasicBlock, state: &SccpState, stats: &
-             continue;
-         }
-         let Some(dest) = inst.dest() else { continue };
--        let Some(c) = state
--            .lattice
--            .get(dest.0 as usize)
--            .copied()
--            .and_then(LatticeVal::as_const)
--        else {
-+        let Some(c) = lattice_const(state, dest) else {
-             continue;
-         };
-         if !is_pure_replaceable(inst) {
-@@ -892,43 +1213,43 @@ fn materialise_constant_defs(block: &mut BasicBlock, state: &SccpState, stats: &
-     }
- 
-     // Phase B: constant phis become Copies placed after the phi prefix.
-+    // One stable `retain` over the prefix plus one `splice`: O(n) regardless of
-+    // how many phis fold (the previous remove-in-a-loop was O(phis²)).
-     let phi_prefix = block
-         .instructions
-         .iter()
-         .position(|i| !matches!(i, Instruction::Phi { .. }))
-         .unwrap_or(block.instructions.len());
-+    if phi_prefix == 0 {
-+        return;
-+    }
- 
-     let mut promoted: Vec<Instruction> = Vec::new();
--    let mut idx = 0;
--    while idx < block.instructions.len().min(phi_prefix) {
--        let Instruction::Phi { dest, .. } = block.instructions[idx] else {
--            idx += 1;
--            continue;
-+    let mut idx = 0usize;
-+    block.instructions.retain(|inst| {
-+        let i = idx;
-+        idx += 1;
-+        if i >= phi_prefix {
-+            return true;
-+        }
-+        let Instruction::Phi { dest, .. } = inst else {
-+            return true;
-         };
--        match state
--            .lattice
--            .get(dest.0 as usize)
--            .copied()
--            .and_then(LatticeVal::as_const)
--        {
-+        match lattice_const(state, *dest) {
-             Some(c) => {
--                block.instructions.remove(idx);
-                 promoted.push(Instruction::Copy {
--                    dest,
-+                    dest: *dest,
-                     src: Operand::Const(c),
-                 });
--                stats.defs_materialised += 1;
--                // `idx` now indexes the next instruction; do not advance.
-+                false
-             }
--            None => idx += 1,
-+            None => true,
-         }
--    }
-+    });
-     if !promoted.is_empty() {
--        let insert_at = block
--            .instructions
--            .iter()
--            .position(|i| !matches!(i, Instruction::Phi { .. }))
--            .unwrap_or(block.instructions.len());
-+        stats.defs_materialised += promoted.len();
-+        // The surviving phis now occupy exactly [0, phi_prefix - promoted.len()).
-+        let insert_at = phi_prefix - promoted.len();
-         block.instructions.splice(insert_at..insert_at, promoted);
-     }
- }
-@@ -936,12 +1257,7 @@ fn materialise_constant_defs(block: &mut BasicBlock, state: &SccpState, stats: &
- #[inline]
- fn substitute(op: &mut Operand, state: &SccpState) -> usize {
-     let Operand::Value(v) = op else { return 0 };
--    match state
--        .lattice
--        .get(v.0 as usize)
--        .copied()
--        .and_then(LatticeVal::as_const)
--    {
-+    match lattice_const(state, *v) {
-         Some(c) => {
-             *op = Operand::Const(c);
-             1
-@@ -986,11 +1302,7 @@ fn fold_terminator(term: &Terminator, state: &SccpState) -> Option<Terminator> {
- fn const_of_operand(op: &Operand, state: &SccpState) -> Option<IrConst> {
-     match op {
-         Operand::Const(c) => Some(*c),
--        Operand::Value(v) => state
--            .lattice
--            .get(v.0 as usize)
--            .copied()
--            .and_then(LatticeVal::as_const),
-+        Operand::Value(v) => lattice_const(state, *v),
-     }
- }
- 
-@@ -1023,12 +1335,5 @@ fn for_each_target(term: &Terminator, mut f: impl FnMut(BlockId)) {
-     }
- }
- 
--/// Silence the unused-import warning for `Value` in builds without tests while
--/// keeping the import available to the test module's IR constructors.
--#[allow(dead_code)]
--fn _value_type_is_used(v: Value) -> u32 {
--    v.0
--}
--
- #[cfg(test)]
- mod tests;
-diff --git a/src/passes/sccp/tests.rs b/src/passes/sccp/tests.rs
-index 99f817ac..90ab2e3f 100644
---- a/src/passes/sccp/tests.rs
-+++ b/src/passes/sccp/tests.rs
-@@ -1124,3 +1124,305 @@ fn resolves_a_chain_of_dependent_conditionals() {
-     ));
-     assert_eq!(stats.unreachable_blocks, 2, "b2 and b5 are dead");
- }
-+
-+// ═══════════════════════════════════════════════════════════════════════════
-+// Red-team audit round 2: absorption, reflexive folds, invariant 5, asm defs
-+// ═══════════════════════════════════════════════════════════════════════════
-+
-+/// `BinOp` constructor with an explicit opcode (the `add` helper hardcodes one).
-+fn binop(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType) -> Instruction {
-+    Instruction::BinOp {
-+        dest: Value(dest),
-+        op,
-+        lhs,
-+        rhs,
-+        ty,
-+    }
-+}
-+
-+fn param(dest: u32, ty: IrType) -> Instruction {
-+    Instruction::ParamRef {
-+        dest: Value(dest),
-+        param_idx: 0,
-+        ty,
-+    }
-+}
-+
-+#[test]
-+fn absorbing_and_with_zero_beats_an_overdefined_operand() {
-+    // %0 is a parameter (⊥); `%1 = and %0, 0` is nevertheless exactly 0, so the
-+    // return operand substitutes to a constant. GCC's CCP and LLVM's SCCP both
-+    // fold this; without the rule the whole tail of the function stays live.
-+    let (stats, f) = sccp(func_of(vec![blk(
-+        0,
-+        vec![
-+            param(0, IrType::I32),
-+            binop(
-+                1,
-+                IrBinOp::And,
-+                val(0),
-+                Operand::Const(IrConst::I32(0)),
-+                IrType::I32,
-+            ),
-+        ],
-+        ret(Some(val(1))),
-+    )]));
-+
-+    assert!(stats.total() > 0);
-+    assert_eq!(materialised(&f, 1), Some(IrConst::I32(0)));
-+    assert!(matches!(
-+        f.blocks[0].terminator,
-+        Terminator::Return(Some(Operand::Const(IrConst::I32(0))))
-+    ));
-+}
-+
-+#[test]
-+fn absorbing_mul_zero_covers_the_i128_width() {
-+    // 128-bit arithmetic is a first-class BinOp type in this IR; the zero rule
-+    // must not silently apply only to 32/64-bit constants.
-+    let (stats, f) = sccp(func_of(vec![blk(
-+        0,
-+        vec![
-+            param(0, IrType::I128),
-+            binop(
-+                1,
-+                IrBinOp::Mul,
-+                val(0),
-+                Operand::Const(IrConst::I128(0)),
-+                IrType::I128,
-+            ),
-+        ],
-+        ret(Some(val(1))),
-+    )]));
-+
-+    assert!(stats.total() > 0);
-+    assert_eq!(materialised(&f, 1), Some(IrConst::I128(0)));
-+}
-+
-+#[test]
-+fn the_type_agnostic_zero_const_is_absorbed_for_integer_tys() {
-+    // `IrConst::Zero` also appears as an integer BinOp operand; the oracle
-+    // normalises it through the BinOp's type.
-+    let (_, f) = sccp(func_of(vec![blk(
-+        0,
-+        vec![
-+            param(0, IrType::I32),
-+            binop(
-+                1,
-+                IrBinOp::And,
-+                val(0),
-+                Operand::Const(IrConst::Zero),
-+                IrType::I32,
-+            ),
-+        ],
-+        ret(Some(val(1))),
-+    )]));
-+
-+    assert_eq!(materialised(&f, 1), Some(IrConst::I32(0)));
-+}
-+
-+#[test]
-+fn float_mul_zero_is_never_absorbed() {
-+    // `NaN * 0.0` is NaN and `-x * 0.0` is `-0.0`: the absorbing rule must not
-+    // fire for float types, not even for a zero-looking operand.
-+    let (stats, f) = sccp(func_of(vec![blk(
-+        0,
-+        vec![
-+            param(0, IrType::F64),
-+            binop(
-+                1,
-+                IrBinOp::Mul,
-+                val(0),
-+                Operand::Const(IrConst::F64(0.0)),
-+                IrType::F64,
-+            ),
-+        ],
-+        ret(Some(val(1))),
-+    )]));
-+
-+    assert_eq!(stats.total(), 0, "nothing may fold: the operand is opaque");
-+    assert_eq!(materialised(&f, 1), None);
-+}
-+
-+#[test]
-+fn absorbing_or_with_all_ones_beats_an_overdefined_operand() {
-+    // `x | -1 == -1` for any x: the mirror image of the zero rule for Or.
-+    let (stats, f) = sccp(func_of(vec![blk(
-+        0,
-+        vec![
-+            param(0, IrType::I64),
-+            binop(
-+                1,
-+                IrBinOp::Or,
-+                val(0),
-+                Operand::Const(IrConst::I64(-1)),
-+                IrType::I64,
-+            ),
-+        ],
-+        ret(Some(val(1))),
-+    )]));
-+
-+    assert!(stats.total() > 0);
-+    assert_eq!(materialised(&f, 1), Some(IrConst::I64(-1)));
-+}
-+
-+#[test]
-+fn same_value_xor_and_sub_are_zero() {
-+    // Both operands are the *same* SSA value, so `x ^ x` and `x - x` are 0 in
-+    // every integer width regardless of what x is.
-+    let (_, f) = sccp(func_of(vec![blk(
-+        0,
-+        vec![
-+            param(0, IrType::I64),
-+            binop(1, IrBinOp::Xor, val(0), val(0), IrType::I64),
-+            binop(2, IrBinOp::Sub, val(0), val(0), IrType::I64),
-+        ],
-+        ret(Some(val(1))),
-+    )]));
-+
-+    assert_eq!(materialised(&f, 1), Some(IrConst::I64(0)));
-+    assert_eq!(materialised(&f, 2), Some(IrConst::I64(0)));
-+}
-+
-+#[test]
-+fn reflexive_integer_comparison_folds_and_kills_the_dead_arm() {
-+    // %1 = cmp eq %p, %p is exactly 1, so the branch folds to the true arm and
-+    // the false arm becomes unreachable.
-+    let (stats, f) = sccp(func_of(vec![
-+        blk(
-+            0,
-+            vec![
-+                param(0, IrType::I64),
-+                Instruction::Cmp {
-+                    dest: Value(1),
-+                    op: IrCmpOp::Eq,
-+                    lhs: val(0),
-+                    rhs: val(0),
-+                    ty: IrType::I64,
-+                },
-+            ],
-+            cond_br(val(1), 1, 2),
-+        ),
-+        blk(1, vec![], ret(Some(Operand::Const(IrConst::I32(10))))),
-+        blk(2, vec![], ret(Some(Operand::Const(IrConst::I32(20))))),
-+    ]));
-+
-+    assert_eq!(materialised(&f, 1), Some(IrConst::I32(1)));
-+    assert_eq!(stats.branches_folded, 1);
-+    assert!(matches!(
-+        f.blocks[0].terminator,
-+        Terminator::Branch(BlockId(1))
-+    ));
-+    assert_eq!(stats.unreachable_blocks, 1, "the false arm is dead");
-+}
-+
-+#[test]
-+fn reflexive_float_comparison_is_never_folded() {
-+    // `x == x` is false exactly when x is NaN: for float types the same-value
-+    // rule must not fire.
-+    let (_, f) = sccp(func_of(vec![blk(
-+        0,
-+        vec![
-+            param(0, IrType::F64),
-+            Instruction::Cmp {
-+                dest: Value(1),
-+                op: IrCmpOp::Eq,
-+                lhs: val(0),
-+                rhs: val(0),
-+                ty: IrType::F64,
-+            },
-+        ],
-+        ret(Some(val(1))),
-+    )]));
-+
-+    assert_eq!(materialised(&f, 1), None);
-+}
-+
-+#[test]
-+fn an_unresolved_top_condition_keeps_both_successors_executable() {
-+    // Invariant 5, the shape that miscompiled before the safety net existed:
-+    //
-+    //   b0: cond_br %p -> b1, b3          %p is a parameter (⊥): both arms live
-+    //   b1: %1 = phi [7 from b2]          only incoming edge is b2->b1, which
-+    //       cond_br %1 -> b2, b3          never executes => %1 survives as ⊤
-+    //   b2: br b1
-+    //   b3: %2 = phi [%p from b0, 77 from b1] ; ret %2
-+    //
-+    // Without the forcing round, b1's terminator marks neither successor, so
-+    // the b1->b3 edge is "dead" and b3's phi loses the `77` operand — while at
-+    // runtime b1 still branches (to whichever arm), reaching b3 with no copy
-+    // for the pruned edge. The safety net lowers %1 to ⊥ instead, both
-+    // successors stay executable, and nothing is pruned.
-+    let (_, f) = sccp(func_of(vec![
-+        blk(0, vec![param(0, IrType::I64)], cond_br(val(0), 1, 3)),
-+        blk(
-+            1,
-+            vec![phi(
-+                1,
-+                vec![(Operand::Const(IrConst::I64(7)), 2)],
-+                IrType::I64,
-+            )],
-+            cond_br(val(1), 2, 3),
-+        ),
-+        blk(2, vec![], br(1)),
-+        blk(
-+            3,
-+            vec![phi(
-+                2,
-+                vec![(val(0), 0), (Operand::Const(IrConst::I64(77)), 1)],
-+                IrType::I64,
-+            )],
-+            ret(Some(val(2))),
-+        ),
-+    ]));
-+
-+    let incoming = phi_incoming(&f, 3);
-+    assert_eq!(incoming.len(), 2, "both b3 phi operands must survive");
-+    assert!(incoming
-+        .iter()
-+        .any(|(op, _)| matches!(op, Operand::Value(_))));
-+    assert!(
-+        incoming
-+            .iter()
-+            .any(|(op, _)| matches!(op, Operand::Const(IrConst::I64(77)))),
-+        "the operand arriving over the recovered edge must survive"
-+    );
-+}
-+
-+#[test]
-+fn inline_asm_outputs_are_overdefined_not_fabricated() {
-+    // An `InlineAsm` output is a definition `dest()` does not cover. If it
-+    // ever stayed ⊤, the phi below would absorb the ⊤ arm and fabricate the
-+    // constant `5` as the value of an opaque asm result.
-+    let asm = Instruction::InlineAsm {
-+        template: "mov $1, %l0".to_string(),
-+        outputs: vec![("=r".to_string(), Value(1), None)],
-+        inputs: vec![],
-+        clobbers: vec![],
-+        operand_types: vec![IrType::I32],
-+        goto_labels: vec![],
-+        input_symbols: vec![],
-+        seg_overrides: vec![],
+-            } else {
+-                init = Some(op.clone());
++    // ── Header-phi environment model ─────────────────────────────────────────
++    // The final value of every header phi (a counter, a "last" element, a
++    // loop-invariant-then-set value, or a cross-phi swap) depends on where its
++    // back value is computed. The old code carried back values defined in the
++    // latch and silently left everything else at its INIT value, which is why
++    // `cur = p` observed `cur == 1` forever and `x = y; y = t` observed the
++    // initial `x`. Model every header phi explicitly.
++    let Some(phis) = collect_header_phis(func, header, latch_label) else {
++        return false;
 +    };
++    let iv_id = iv_phi.0;
++    let iv_incr_dest = phis
++        .iter()
++        .find(|p| p.id == iv_id)
++        .and_then(|p| match p.back {
++            Operand::Value(v) => Some(v.0),
++            _ => None,
++        });
++    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
++    for &wbi in &work_blocks {
++        for inst in &func.blocks[wbi].instructions {
++            if let Some(d) = inst.dest() {
++                loop_defs.insert(d.0);
+             }
+         }
+-        if let (Some(init_op), Some(back_id)) = (init, back) {
+-            let defined_in_latch = func.blocks[latch]
+-                .instructions
+-                .iter()
+-                .any(|li| li.dest().map(|d| d.0 == back_id).unwrap_or(false));
+-            if defined_in_latch {
+-                carried.push((dest.0, init_op, back_id));
++    }
++    for inst in &func.blocks[header].instructions {
++        if !matches!(inst, Instruction::Phi { .. }) {
++            if let Some(d) = inst.dest() {
++                loop_defs.insert(d.0);
+             }
+         }
+     }
++    let model = LoopPhiModel {
++        phis,
++        iv_id,
++        iv_incr_dest,
++        iv_ty,
++        iv_init,
++        iv_step,
++        loop_defs,
++    };
++    // A header instruction beyond the (pure) exit-test chain must run on every
++    // evaluation of the condition, i.e. `trip + 1` times (the failing
++    // evaluation included). The two-block cloner clones only the work blocks,
++    // never the header, so it cannot reproduce that; leaving the loop rolled
++    // is correct.
++    if !header_extra_indices(func, header).is_empty() {
++        return false;
++    }
+ 
+     let mut next_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
+     let mut next_val = func.next_value_id;
+@@ -1328,12 +1950,24 @@ fn try_complete_unroll_two_block(
+         })
+         .collect();
+ 
+-    let mut prev_back: Vec<Option<u32>> = vec![None; carried.len()];
+-    let mut final_carried: Vec<(u32, u32)> = Vec::new();
+     let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(trip as usize);
+ 
++    // Per-iteration environments. env[0] = preheader init; env[t] for t ≥ 1 is
++    // derived from the previous clone's environment and rename map. The last
++    // clone's env + rename map feed the failing (`trip`-th) evaluation used
++    // for live-out substitution.
++    let mut env_prev = model.env_entry();
++    let mut rename_prev: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut final_carried: Vec<(u32, u32)> = Vec::new();
 +
-+    let (_, f) = sccp(func_of(vec![
-+        blk(
-+            0,
-+            vec![param(0, IrType::I32), i32c(10, 5)],
-+            cond_br(val(0), 1, 2),
-+        ),
-+        blk(1, vec![asm], br(3)),
-+        blk(2, vec![], br(3)),
-+        blk(
-+            3,
-+            vec![phi(2, vec![(val(1), 1), (val(10), 2)], IrType::I32)],
-+            ret(Some(val(2))),
-+        ),
-+    ]));
-+
-+    assert_eq!(
-+        materialised(&f, 2),
-+        None,
-+        "an asm result must never be fabricated into a constant"
-+    );
+     for t_idx in 0..trip {
+-        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t_idx * iv_step, iv_ty));
++        let t = t_idx as i64;
++        let env = if t == 0 {
++            model.env_entry()
++        } else {
++            model.env_next(t, &env_prev, &rename_prev)
++        };
++        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t * iv_step, iv_ty));
+         let mut vmap: FxHashMap<u32, u32> = FxHashMap::default();
+         for &wbi in &work_blocks {
+             for (idx, inst) in func.blocks[wbi].instructions.iter().enumerate() {
+@@ -1353,30 +1987,31 @@ fn try_complete_unroll_two_block(
+                     continue;
+                 }
+                 let mut cloned = inst.clone();
+-                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
+-                for (ci, (phi_id, init_op, _)) in carried.iter().enumerate() {
+-                    match prev_back[ci] {
+-                        None => subst_value_with_operand(&mut cloned, *phi_id, init_op),
+-                        Some(prev_id) => subst_value_with_operand(
+-                            &mut cloned,
+-                            *phi_id,
+-                            &Operand::Value(Value(prev_id)),
+-                        ),
+-                    }
+-                }
++                // Rename first, then substitute the header-phi environment.
++                // The env values are consts / invariants / previous-clone ids,
++                // none of which are keys in this clone's rename map.
+                 replace_values_in_inst(&mut cloned, &vmap);
+                 rename_inst_dest(&mut cloned, &vmap);
++                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
++                apply_env_inst(&mut cloned, &env);
+                 new_insts.push(cloned);
+             }
+         }
+-        for (ci, (_, _, back_id)) in carried.iter().enumerate() {
+-            if let Some(&new_id) = vmap.get(back_id) {
+-                prev_back[ci] = Some(new_id);
+-                if t_idx + 1 == trip {
+-                    final_carried.push((carried[ci].0, new_id));
++        if t_idx + 1 == trip {
++            // Clone-defined back values (for the copy-before-def guard below).
++            for p in &model.phis {
++                if p.id == iv_id {
++                    continue;
++                }
++                if let Operand::Value(v) = &p.back {
++                    if let Some(&new_id) = vmap.get(&v.0) {
++                        final_carried.push((p.id, new_id));
++                    }
+                 }
+             }
+         }
++        env_prev = env;
++        rename_prev = vmap;
+         let term = if t_idx + 1 < trip {
+             Terminator::Branch(labels[(t_idx + 1) as usize])
+         } else {
+@@ -1417,21 +2052,6 @@ fn try_complete_unroll_two_block(
+     func.blocks[latch].terminator = Terminator::Unreachable;
+     let _ = (body_entry, exit_cond_positive);
+ 
+-    // Repair the exit block's phis.  The `header -> exit_target` edge is gone
+-    // (the header now branches into the clone chain); the block that reaches
+-    // the exit is the LAST CLONE, `labels[trip - 1]`.  Every phi incoming
+-    // still labelled `header_label` must therefore be relabelled to that
+-    // clone, otherwise it names a non-predecessor and the real predecessor
+-    // has no incoming at all.
+-    //
+-    // Only the LABEL changes, never the operand: the substitution sweep below
+-    // visits every block outside `lp.body` -- the exit block included -- and
+-    // rewrites the IV to `final_iv` and each carried phi to its final clone
+-    // value, which are precisely the values live on that edge.
+-    //
+-    // A phi incoming labelled `latch_label` cannot exist here (the latch's
+-    // terminator was verified to be `Branch(header_label)`), but drop any such
+-    // entry defensively rather than leave a dangling predecessor behind.
+     {
+         let last_clone = labels[(trip - 1) as usize];
+         if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
+@@ -1448,31 +2068,29 @@ fn try_complete_unroll_two_block(
+             }
+         }
+     }
+-
+-    // `final_iv_n` was already computed and overflow-checked above, before
+-    // any CFG mutation — a second check here would bail with the header and
+-    // latch already retargeted (the exact bug the hoisted check fixed).
++    // Live-out substitution. The failing (`trip`-th) environment holds the
++    // value each carried phi has after the final cloned iteration: a body
++    // accumulator's computed total, a constant back value, a loop-invariant
++    // operand, or a cross-phi value — all bound to the last clone's defs.
+     let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
++    let env_fg = model.env_next(trip, &env_prev, &rename_prev);
++    let mut final_subst: FxHashMap<u32, Operand> = FxHashMap::default();
++    final_subst.insert(iv_id, final_iv);
++    for p in &model.phis {
++        if p.id == iv_id {
++            continue;
++        }
++        final_subst.insert(p.id, *env_fg.get(&p.id).expect("env covers every phi"));
++    }
+     for (block_index, block) in func.blocks.iter_mut().enumerate() {
+         if lp.body.contains(&block_index) {
+             continue;
+         }
+         for instruction in &mut block.instructions {
+-            subst_value_with_operand(instruction, iv_phi.0, &final_iv);
+-            for &(phi_id, final_id) in &final_carried {
+-                subst_value_with_operand(instruction, phi_id, &Operand::Value(Value(final_id)));
+-            }
+-        }
+-        subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
+-        for &(phi_id, final_id) in &final_carried {
+-            subst_value_in_terminator(
+-                &mut block.terminator,
+-                phi_id,
+-                &Operand::Value(Value(final_id)),
+-            );
++            apply_env_inst(instruction, &final_subst);
+         }
++        apply_env_term(&mut block.terminator, &final_subst);
+     }
+-
+     func.blocks.extend(new_blocks);
+ 
+     // Resolve EVERY phi in the header. The loop is now straight-line -- the
+@@ -1656,6 +2274,18 @@ fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
+     false
+ }
+ 
++/// Evaluate `op` to a constant when it is a constant or a short chain of
++/// `Copy` / integer `Cast` / `Add` / `Sub` / `Mul` over constants — the shape
++/// an inner loop's `j = i + 1` init takes once the outer loop has been
++/// completely unrolled and `i` substituted by a per-clone constant.
++///
++/// Every intermediate result is normalised to the canonical `IrConst`
++/// representation of the instruction's result type via
++/// [`normalize_to_type`], so unsigned arithmetic zero-extends and narrowing
++/// casts truncate exactly as the constant folder would.  Values are only ever
++/// compared by [`complete_unroll_trip`] after a second normalisation to the
++/// IV type, which makes the whole chain representation-stable regardless of
++/// which pass produced the constants.
+ fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
+     if depth > 6 {
+         return None;
+@@ -1682,30 +2312,28 @@ fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Optio
+                     from_ty,
+                     to_ty,
+                     ..
+-                } if from_ty.is_integer()
+-                    && to_ty.is_integer()
+-                    && from_ty.size() <= to_ty.size() =>
+-                {
+-                    resolve_const_operand(func, src, depth + 1)
++                } if is_fixed_width_int(*from_ty) && is_fixed_width_int(*to_ty) => {
++                    // The source value is already in `from_ty`'s canonical
++                    // form (sign- or zero-extended to i64 per its own
++                    // signedness), so widening is the identity and narrowing
++                    // is a truncation into `to_ty` — both are exactly
++                    // `normalize_to_type`.
++                    let v = resolve_const_operand(func, src, depth + 1)?;
++                    let v = normalize_to_type(v, *from_ty)?;
++                    normalize_to_type(v, *to_ty)
+                 }
+                 Instruction::BinOp {
+                     op, lhs, rhs, ty, ..
+-                } if ty.is_integer() => {
++                } if is_fixed_width_int(*ty) => {
+                     let l = resolve_const_operand(func, lhs, depth + 1)?;
+                     let r = resolve_const_operand(func, rhs, depth + 1)?;
+-                    let narrow = |x: i64| -> i64 {
+-                        if ty.size() <= 4 {
+-                            x as i32 as i64
+-                        } else {
+-                            x
+-                        }
++                    let raw = match op {
++                        IrBinOp::Add => l.wrapping_add(r),
++                        IrBinOp::Sub => l.wrapping_sub(r),
++                        IrBinOp::Mul => l.wrapping_mul(r),
++                        _ => return None,
+                     };
+-                    match op {
+-                        IrBinOp::Add => Some(narrow(l.wrapping_add(r))),
+-                        IrBinOp::Sub => Some(narrow(l.wrapping_sub(r))),
+-                        IrBinOp::Mul => Some(narrow(l.wrapping_mul(r))),
+-                        _ => None,
+-                    }
++                    normalize_to_type(raw, *ty)
+                 }
+                 _ => None,
+             }
+@@ -1713,6 +2341,22 @@ fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Optio
+     }
+ }
+ 
++/// Read a step constant of IV type `ty` as a SIGNED stride.  Unsigned IR
++/// constants are stored zero-extended (`IrConst::I64(0xFFFFFFFE)` for a U32
++/// `-2`); sign-extending them at the IV's width recovers the arithmetic
++/// stride so that `for (unsigned i = n; i != 0; i += -2)` and `i -= 2` are
++/// recognised as the same countdown.
++fn signed_step(c: IrConst, ty: IrType) -> Option<i64> {
++    let raw = c.to_i64()?;
++    match ty {
++        IrType::I8 | IrType::U8 => Some(raw as u8 as i8 as i64),
++        IrType::I16 | IrType::U16 => Some(raw as u16 as i16 as i64),
++        IrType::I32 | IrType::U32 => Some(raw as u32 as i32 as i64),
++        IrType::I64 | IrType::U64 => Some(raw),
++        _ => None,
++    }
 +}
--- 
-2.47.3
-
++
+ fn find_iv_in_loop(
+     func: &IrFunction,
+     header: usize,
+@@ -1736,31 +2380,50 @@ fn find_iv_in_loop(
+                     None
+                 }
+             });
+-        let back_val = back_val?;
++        // A phi whose back-edge value is a constant (a first-iteration flag
++        // such as `first = 0`) is simply not the IV. It used to abort the
++        // whole search (`?`), which silently disabled unrolling for every
++        // loop whose FIRST header phi happened to be such a flag.
++        let Some(back_val) = back_val else {
++            continue;
++        };
+ 
+-        // Look for `Add(phi_dest, const_step)` or `Add(const_step, phi_dest)`
+-        // in the latch that produces `back_val`.
++        // Look for `Add(phi_dest, const_step)` / `Add(const_step, phi_dest)`
++        // or `Sub(phi_dest, const_step)` in the latch that produces
++        // `back_val`.  `i -= k` lowers to a `Sub` — the countdown-loop
++        // idiom of every decompressor and hash routine — and is the same
++        // basic IV with step `-k`.  The step is expressed as a signed i64 of
++        // the IV's width: `Sub(phi, 2)` on a U32 is the additive step
++        // `0xFFFFFFFE`, i.e. `-2`, and every consumer (the closed-form trip
++        // count, the per-clone `init + t*step` constants and the partial
++        // unroller's `Add(iv, step)` checks) re-materialises it through
++        // `IrConst::from_i64(step, iv_ty)`, so the two-complement identity
++        // `x - k == x + (-k)` holds bit-exactly for every fixed-width type.
+         let phi_id = phi_dest.0;
+         for (idx, latch_inst) in func.blocks[latch].instructions.iter().enumerate() {
+-            if let Instruction::BinOp {
+-                dest,
+-                op: IrBinOp::Add,
+-                lhs,
+-                rhs,
+-                ..
++            let Instruction::BinOp {
++                dest, op, lhs, rhs, ..
+             } = latch_inst
+-            {
+-                if *dest != back_val {
+-                    continue;
++            else {
++                continue;
++            };
++            if *dest != back_val {
++                continue;
++            }
++            let step = match (op, lhs, rhs) {
++                (IrBinOp::Add, Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => {
++                    signed_step(*c, *ty)
+                 }
+-                let step = match (lhs, rhs) {
+-                    (Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => c.to_i64(),
+-                    (Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => c.to_i64(),
+-                    _ => None,
+-                };
+-                if let Some(step) = step {
+-                    return Some((*phi_dest, *ty, step, idx));
++                (IrBinOp::Add, Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => {
++                    signed_step(*c, *ty)
++                }
++                (IrBinOp::Sub, Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => {
++                    signed_step(*c, *ty).and_then(i64::checked_neg)
+                 }
++                _ => None,
++            };
++            if let Some(step) = step {
++                return Some((*phi_dest, *ty, step, idx));
+             }
+         }
+     }
+@@ -2610,6 +3273,12 @@ mod tests {
+     use crate::common::types::{AddressSpace, IrType};
+     use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, BasicBlock, BlockId, IrConst, Value};
+ 
++    /// Historical truth table entry point: the closed form on a signed
++    /// 64-bit IV (the domain the pre-typed arithmetic implicitly assumed).
++    fn trip_i64(init: i64, limit: i64, op: IrCmpOp, step: i64) -> Option<i64> {
++        complete_unroll_trip(init, limit, op, step, IrType::I64)
++    }
++
+     /// Build a simple counting loop:
+     ///   preheader → header → body → latch → (back to header) / exit
+     ///
+@@ -3444,62 +4113,62 @@ mod tests {
+     fn unroll_trip_step_one_matches_historical_arithmetic() {
+         use crate::ir::reexports::IrCmpOp::*;
+         // i < 8, step 1  → 8 trips (classic 0..8).
+-        assert_eq!(complete_unroll_trip(0, 8, Slt, 1), Some(8));
++        assert_eq!(trip_i64(0, 8, Slt, 1), Some(8));
+         // i <= 7, step 1 → 8 trips.
+-        assert_eq!(complete_unroll_trip(0, 7, Sle, 1), Some(8));
++        assert_eq!(trip_i64(0, 7, Sle, 1), Some(8));
+         // Non-zero init.
+-        assert_eq!(complete_unroll_trip(3, 8, Slt, 1), Some(5));
++        assert_eq!(trip_i64(3, 8, Slt, 1), Some(5));
+         // Empty / inverted spans stay rejected (pre-existing guards).
+-        assert_eq!(complete_unroll_trip(8, 8, Slt, 1), None);
+-        assert_eq!(complete_unroll_trip(9, 8, Slt, 1), None);
+-        assert_eq!(complete_unroll_trip(8, 7, Sle, 1), None);
++        assert_eq!(trip_i64(8, 8, Slt, 1), None);
++        assert_eq!(trip_i64(9, 8, Slt, 1), None);
++        assert_eq!(trip_i64(8, 7, Sle, 1), None);
+     }
+ 
+     #[test]
+     fn unroll_trip_positive_strides() {
+         use crate::ir::reexports::IrCmpOp::*;
+         // dot8's shape: i < 8, i += 4 → exactly 2 trips.
+-        assert_eq!(complete_unroll_trip(0, 8, Slt, 4), Some(2));
++        assert_eq!(trip_i64(0, 8, Slt, 4), Some(2));
+         // Non-divisible Slt: ceil. i < 10, i += 3 → 0,3,6,9 → 4 trips.
+-        assert_eq!(complete_unroll_trip(0, 10, Slt, 3), Some(4));
++        assert_eq!(trip_i64(0, 10, Slt, 3), Some(4));
+         // Odd limit: i < 7, i += 2 → 0,2,4,6 → 4 trips.
+-        assert_eq!(complete_unroll_trip(0, 7, Slt, 2), Some(4));
++        assert_eq!(trip_i64(0, 7, Slt, 2), Some(4));
+         // Sle floor+1: i <= 9, i += 3 → 0,3,6,9 → 4 trips.
+-        assert_eq!(complete_unroll_trip(0, 9, Sle, 3), Some(4));
++        assert_eq!(trip_i64(0, 9, Sle, 3), Some(4));
+         // Sle non-divisible: i <= 10, i += 3 → 0,3,6,9 → 4 trips.
+-        assert_eq!(complete_unroll_trip(0, 10, Sle, 3), Some(4));
++        assert_eq!(trip_i64(0, 10, Sle, 3), Some(4));
+         // Single iteration: i < 5, i += 5 → 1 (callers reject trip < 2).
+-        assert_eq!(complete_unroll_trip(0, 5, Slt, 5), Some(1));
++        assert_eq!(trip_i64(0, 5, Slt, 5), Some(1));
+         // Non-zero init with stride: i = 2; i < 11; i += 3 → 2,5,8 → 3.
+-        assert_eq!(complete_unroll_trip(2, 11, Slt, 3), Some(3));
++        assert_eq!(trip_i64(2, 11, Slt, 3), Some(3));
+     }
+ 
+     #[test]
+     fn unroll_trip_negative_strides_countdown() {
+         use crate::ir::reexports::IrCmpOp::*;
+         // for (i = 10; i > 0; i -= 2) → 10,8,6,4,2 → 5 trips.
+-        assert_eq!(complete_unroll_trip(10, 0, Sgt, -2), Some(5));
++        assert_eq!(trip_i64(10, 0, Sgt, -2), Some(5));
+         // Non-divisible countdown: i > 0, i -= 3 → 10,7,4,1 → 4 (ceil).
+-        assert_eq!(complete_unroll_trip(10, 0, Sgt, -3), Some(4));
++        assert_eq!(trip_i64(10, 0, Sgt, -3), Some(4));
+         // Sge floor+1: i >= 0, i -= 3 → 9,6,3,0 → 4 trips.
+-        assert_eq!(complete_unroll_trip(9, 0, Sge, -3), Some(4));
++        assert_eq!(trip_i64(9, 0, Sge, -3), Some(4));
+         // Empty countdown.
+-        assert_eq!(complete_unroll_trip(0, 0, Sgt, -1), None);
++        assert_eq!(trip_i64(0, 0, Sgt, -1), None);
+     }
+ 
+     #[test]
+     fn unroll_trip_rejects_degenerate_shapes() {
+         use crate::ir::reexports::IrCmpOp::*;
+         // Zero stride: infinite loop, no trip count.
+-        assert_eq!(complete_unroll_trip(0, 8, Slt, 0), None);
++        assert_eq!(trip_i64(0, 8, Slt, 0), None);
+         // Sign/stride contradictions: a negative stride against an
+         // ascending comparison diverges (or wraps); must be refused.
+-        assert_eq!(complete_unroll_trip(0, 8, Slt, -1), None);
+-        assert_eq!(complete_unroll_trip(0, 8, Sle, -4), None);
+-        assert_eq!(complete_unroll_trip(8, 0, Sgt, 1), None);
+-        assert_eq!(complete_unroll_trip(8, 0, Sge, 2), None);
++        assert_eq!(trip_i64(0, 8, Slt, -1), None);
++        assert_eq!(trip_i64(0, 8, Sle, -4), None);
++        assert_eq!(trip_i64(8, 0, Sgt, 1), None);
++        assert_eq!(trip_i64(8, 0, Sge, 2), None);
+         // Equality-style comparisons carry no ordering: refused.
+-        assert_eq!(complete_unroll_trip(0, 8, Eq, 1), None);
++        assert_eq!(trip_i64(0, 8, Eq, 1), None);
+     }
+ 
+     #[test]
+@@ -3507,37 +4176,40 @@ mod tests {
+         use crate::ir::reexports::IrCmpOp::*;
+         // `limit - iv_init` overflows i64 (MAX - (-1)); the checked span
+         // must refuse rather than produce a wrapped trip count.
+-        assert_eq!(complete_unroll_trip(-1, i64::MAX, Slt, 1), None);
+-        assert_eq!(complete_unroll_trip(i64::MIN, 0, Sgt, -1), None);
+-        // `-iv_step` overflows for iv_step = i64::MIN; checked_abs refuses.
+-        assert_eq!(complete_unroll_trip(0, i64::MIN, Sgt, i64::MIN), None);
+-        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, i64::MIN), None);
+-        // Representable but huge: 0, 2^62 < MAX → 2 trips.  (The cloner's
+-        // checked final IV then refuses to substitute 2^63; see below.)
+-        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, 1 << 62), Some(2));
++        assert_eq!(trip_i64(-1, i64::MAX, Slt, 1), None);
++        assert_eq!(trip_i64(i64::MIN, 0, Sgt, -1), None);
++        // `i > i64::MIN` with step i64::MIN: the loop runs exactly once
++        // (0 -> i64::MIN -> exit test fails).  The typed closed form computes
++        // step_abs in i128, which does NOT overflow for i64::MIN, so it returns
++        // Some(1) instead of the old checked_abs-based None.  (Some(1) is the
++        // correct count; the old None rejected a shape the loop genuinely
++        // executes once.)
++        assert_eq!(trip_i64(0, i64::MIN, Sgt, i64::MIN), Some(1));
++        assert_eq!(trip_i64(0, i64::MAX, Slt, i64::MIN), None);
++        // Huge stride: 0, 2^62 are < MAX (2 body executions) but the exit
++        // test would then observe 2^63, which is not an i64.  The typed
++        // closed form refuses up front — previously the cloner's checked
++        // final-IV guard was the only thing standing between this shape and
++        // a wrapped substituted constant.
++        assert_eq!(trip_i64(0, i64::MAX, Slt, 1 << 62), None);
+         // Sle at the top of the range: span/step + 1 would be MAX + 1.
+-        assert_eq!(complete_unroll_trip(0, i64::MAX, Sle, 1), None);
++        assert_eq!(trip_i64(0, i64::MAX, Sle, 1), None);
+         // Extremes that stay in range must still unroll.
+         assert_eq!(
+-            complete_unroll_trip(i64::MIN, i64::MIN + 8, Slt, 2),
++            trip_i64(i64::MIN, i64::MIN + 8, Slt, 2),
+             Some(4)
+         );
+         assert_eq!(
+-            complete_unroll_trip(i64::MAX, i64::MAX - 9, Sgt, -3),
+-            Some(3)
+-        );
+-        assert_eq!(
+-            complete_unroll_trip(i64::MAX - 6, i64::MAX, Sle, 3),
++            trip_i64(i64::MAX, i64::MAX - 9, Sgt, -3),
+             Some(3)
+         );
+-        // The post-loop IV bound used by both cloners: final = init +
+-        // trip * step must be computed with checked arithmetic (this mirrors
+-        // the cloner-side guard; trip = 2, step = 2^62 → 2^63 overflows).
+-        let trip = complete_unroll_trip(0, i64::MAX, Slt, 1 << 62).unwrap();
+-        assert!((1i64 << 62)
+-            .checked_mul(trip)
+-            .and_then(|d| 0i64.checked_add(d))
+-            .is_none());
++        // `i <= MAX` with stride 3 from MAX-6 executes for MAX-6, MAX-3,
++        // MAX and then increments PAST the type: the exit test never sees
++        // an in-range value, so the loop has no static trip (UB in C, an
++        // infinite loop on hardware).  Refused.
++        assert_eq!(trip_i64(i64::MAX - 6, i64::MAX, Sle, 3), None);
++        // One stride shorter it is a well-defined 2-trip loop again.
++        assert_eq!(trip_i64(i64::MAX - 6, i64::MAX - 3, Sle, 3), Some(2));
+     }
+ 
+     // The trip count above is representable (2), but the post-loop IV
+@@ -3702,7 +4374,7 @@ mod tests {
+                                 Some(old)
+                             })
+                             .count() as i64;
+-                        let closed = complete_unroll_trip(init, limit, op, step);
++                        let closed = trip_i64(init, limit, op, step);
+                         if simulated == 0 {
+                             assert!(
+                                 closed.is_none(),
+@@ -3733,7 +4405,7 @@ mod tests {
+                                 Some(old)
+                             })
+                             .count() as i64;
+-                        let closed = complete_unroll_trip(init, limit, op, step);
++                        let closed = trip_i64(init, limit, op, step);
+                         if simulated == 0 {
+                             assert!(
+                                 closed.is_none(),
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index ba2091f9..96c03a01 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -1180,6 +1180,7 @@ fn reduction_pattern_is_sound(
+     accumulator_phis: &[Value],
+     accumulator_derived: &FxHashSet<Value>,
+     allowed_loads: &[Value],
++    iv_phi: Value,
+ ) -> bool {
+     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+     let is_add = |block_idx: usize, inst_idx: usize, dest: Value| {
+@@ -1188,6 +1189,11 @@ fn reduction_pattern_is_sound(
+                 .iter()
+                 .any(|&(add_idx, add_result)| add_idx == inst_idx && add_result == dest)
+     };
++    // Labels of every loop block, to detect a phi's back-edge incoming.
++    let loop_block_labels: FxHashSet<u32> = loop_blocks
++        .iter()
++        .map(|&bi| func.blocks[bi].label.0)
++        .collect();
+ 
+     // (4) terminators: only the header may branch (its exit condition);
+     //     every other loop block must end in an unconditional branch.
+@@ -1209,13 +1215,38 @@ fn reduction_pattern_is_sound(
+         let block = &func.blocks[block_idx];
+         for (inst_idx, inst) in block.instructions.iter().enumerate() {
+             match inst {
+-                Instruction::Phi { dest, .. } => {
+-                    // The header's own IV phi (and any other non-accumulator
+-                    // phi) is fine; only phis writing an accumulator-derived
+-                    // value are forbidden (the vector transform rewires the
+-                    // accumulator phi to a vector value).  With multiple
+-                    // accumulators, each accumulator's own header phi is
+-                    // allowed; any other accumulator-derived phi is not.
++                Instruction::Phi { dest, incoming, .. } => {
++                    // The transform rewires ONLY the IV phi and the recognized
++                    // accumulator phis. Any OTHER loop-carried phi (a value
++                    // whose back-edge incoming is a non-constant Value from a
++                    // loop block) changes once per scalar iteration but is left
++                    // untouched, so after vectorization it would be updated
++                    // with the scaled induction variable and be silently wrong
++                    // (reproducer: `s += a[i]; last = a[i];` — `last` ended up
++                    // reading A[0], A[8], ... instead of A[i]). Reject the
++                    // whole loop (fail-closed; the scalar form is correct).
++                    let is_iv_or_accum = *dest == iv_phi
++                        || accumulator_phis.iter().any(|phi| *phi == *dest);
++                    if !is_iv_or_accum {
++                        let loop_carried = incoming.iter().any(|(op, lbl)| {
++                            loop_block_labels.contains(&lbl.0) && matches!(op, Operand::Value(_))
++                        });
++                        if loop_carried {
++                            if debug {
++                                eprintln!(
++                                    "[VEC-RED]   Rejecting: unhandled loop-carried phi {} in block {}",
++                                    dest.0, block_idx
++                                );
++                            }
++                            set_reject("loop has an unhandled loop-carried value");
++                            return false;
++                        }
++                    }
++                    // Phis writing an accumulator-derived value are forbidden
++                    // (the vector transform rewires the accumulator phi to a
++                    // vector value).  With multiple accumulators, each
++                    // accumulator's own header phi is allowed; any other
++                    // accumulator-derived phi is not.
+                     if accumulator_derived.contains(dest)
+                         && (block_idx != header_idx
+                             || !accumulator_phis.iter().any(|phi| *phi == *dest))
+@@ -1780,9 +1811,16 @@ fn analyze_reduction_pattern(
+     let mut add_result = None;
+     // Conditional-sum guard (if_convert output): the Select wrapping the
+     // accumulator update. `s' = Select(cond, s + x, s)` — the guard Cmp's
+-    // value id; validated after the added-value chain resolves.
++    // value id; validated after the added-value chain resolves.  The
++    // operator may ALSO be written the other way round,
++    // `s' = Select(cond, s, s + x)` (the `if (a[i] & 1) continue; s +=
++    // a[i];` shape, where the kept value is on the TRUE arm).  Both denote
++    // a guarded update; only the add-on-TRUE arm is expressible by the
++    // masked widening intrinsic, so a swapped guard is recorded and later
++    // rejected.
+     let mut guard_select_cond: Option<Value> = None;
+     let mut guard_rhs: Option<Operand> = None;
++    let mut guard_swapped = false;
+     for &block_idx in &loop_info.body {
+         if block_idx == header_idx {
+             continue;
+@@ -1857,12 +1895,34 @@ fn analyze_reduction_pattern(
+                                 false_val,
+                                 Operand::Value(v) if v.0 == accumulator_phi.0
+                             );
++                            // Swapped form: `Select(cond, s, s + x)` (the
++                            // `if (a[i] & 1) continue; s += a[i]` shape). The
++                            // kept value is the phi, the guarded add is on the
++                            // FALSE arm. Still a guarded update; record the
++                            // cond and mark it swapped so the validator
++                            // rejects the unexpressible form instead of
++                            // silently dropping the guard.
++                            let fv_is_add = matches!(
++                                false_val,
++                                Operand::Value(v) if v.0 == dest.0
++                            );
++                            let tv_is_phi = matches!(
++                                true_val,
++                                Operand::Value(v) if v.0 == accumulator_phi.0
++                            );
+                             if tv_is_add && fv_is_phi {
+                                 if let Operand::Value(cv) = cond {
+                                     guard_select_cond = Some(*cv);
+                                 }
+                                 break;
+                             }
++                            if fv_is_add && tv_is_phi {
++                                if let Operand::Value(cv) = cond {
++                                    guard_select_cond = Some(*cv);
++                                    guard_swapped = true;
++                                }
++                                break;
++                            }
+                         }
+                     }
+                     break;
+@@ -2137,6 +2197,21 @@ fn analyze_reduction_pattern(
+     // scalar — the unguarded vector form would silently drop the guard.
+     let mut select_guard_cond: Option<Value> = None;
+     if let Some(gcv) = guard_select_cond {
++        // Swapped form (`Select(cond, s, s + x)`): the kept value is on the
++        // TRUE arm, so the guarded add is conditional on the NOT-taken path.
++        // The masked widening intrinsic only encodes add-when-cond-true, so
++        // this shape must stay scalar. Reject before the loader-root check
++        // (which would otherwise reject it anyway, but with a misleading
++        // message about `loaded > rhs`).
++        if guard_swapped {
++            if debug {
++                eprintln!(
++                    "[VEC-RED]   Rejecting: conditional-sum guard has the add on the FALSE arm (staying scalar)"
++                );
++            }
++            set_reject("conditional-sum guard has the add on the false arm (not expressible)");
++            return None;
++        }
+         // Resolve the chain root: the loaded I32 element.
+         let chain_root = match added_inst {
+             Instruction::Load { dest, .. } => Some(*dest),
+@@ -2556,6 +2631,7 @@ fn analyze_reduction_pattern(
+             &phis,
+             &derived,
+             &loads,
++            iv,
+         ) {
+             if debug {
+                 eprintln!("[VEC-RED]   Rejecting unsound reduction");
