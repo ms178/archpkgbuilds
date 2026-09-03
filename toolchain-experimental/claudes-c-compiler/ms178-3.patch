@@ -1,0 +1,1500 @@
+From: ms178-3
+
+loop_unroll + vectorize: perfect the complete-unroller's carried-value model
+and harden the late vectorizer's reduction-phis, validated against GCC on a
+35-kernel adversarial red-team corpus.
+
+loop_unroll.rs
+  * Header-phi iteration model (LoopPhiModel): a per-iteration SSA environment
+    that substitutes EVERY header phi (IV + all loop-carried values) with the
+    value it holds at the entry of that iteration.  This closes three soundness
+    holes in the carried-value threading that previously kept such a phi at its
+    INIT value in every cloned iteration:
+        - constant back value            (first-iteration flag `first = 0`)
+        - loop-invariant back value      (`cur = param`)
+        - cross-phi back value           (`x = y; y = t`)
+  * Header-side-effect modeling in the general cloner: the loop condition's
+    own instructions (`cnt++` in `for (i=0; cnt++, i<N; i++)`) run `trip + 1`
+    times (the failing evaluation included).  A final-guard block re-runs them
+    once more after the last clone and its fresh outputs become the live-out
+    values.  Real observable side effects (store / volatile / call) in the
+    header make the cloner fail closed (leave the loop rolled).
+  * Two-block cloner adopts the same environment model and rejects header
+    side effects (it clones only the work blocks, never the header).
+
+vectorize.rs
+  * Reject a loop whose reduction has any unhandled loop-carried phi (e.g. a
+    `last = a[i]` value whose back-edge incoming is a loop-block Value).  The
+    vector transform would leave such a phi on the scaled induction variable
+    and silently read A[0], A[8], ... instead of A[i].  Fails closed to the
+    scalar form, which is correct.
+  * Detect the swapped conditional-sum guard `Select(cond, s, s + x)` (the
+    `if (a[i] & 1) continue; s += a[i];` shape) and reject it before the
+    masked-widening intrinsic, which only encodes add-when-cond-true.
+
+
+--- a/src/passes/loop_unroll.rs	2026-09-03 20:24:00.203728740 +0000
++++ b/src/passes/loop_unroll.rs	2026-09-03 20:24:00.203728740 +0000
+@@ -600,6 +600,360 @@
+     Some(trip)
+ }
+ 
++/// True when `op` denotes a value that depends only on integer constants and
++/// (possibly) `iv`.  Complete unrolling substitutes the OUTER IV with a
++/// per-clone constant, so once such an operand is used in an inner loop's own
++/// IV/bound, that inner loop becomes constant-trip after the outer unroll.
++/// Intended for the persisting-inner-loop gate; a dependency on anything else
++/// (a function parameter, a memory load, a non-IV-dependent phi) means the
++/// inner loop's trip stays dynamic.
++fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, depth: usize) -> bool {
++    if depth > 8 {
++        return false;
++    }
++    // `Operand` is closed over {Const, Value}; both handled above.  The
++    // `Value` arm falls through to a def-chain walk; a def that is a memory /
++    // opaque instruction returns false (never constant after substitution).
++    let value = match op {
++        Operand::Const(_) => return true,
++        Operand::Value(v) => v,
++    };
++    if value.0 == iv.0 {
++        return true;
++    }
++    let mut def: Option<&Instruction> = None;
++    for block in &func.blocks {
++        if let Some(inst) = block.instructions.iter().find(|i| i.dest() == Some(*value)) {
++            def = Some(inst);
++            break;
++        }
++    }
++    let Some(inst) = def else { return false };
++    match inst {
++        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => {
++            depends_only_on_const_and_iv(func, src, iv, depth + 1)
++        }
++        Instruction::BinOp { lhs, rhs, .. } => {
++            depends_only_on_const_and_iv(func, lhs, iv, depth + 1)
++                && depends_only_on_const_and_iv(func, rhs, iv, depth + 1)
++        }
++        Instruction::Phi { incoming, .. } => incoming
++            .iter()
++            .all(|(op, _)| depends_only_on_const_and_iv(func, op, iv, depth + 1)),
++        _ => false,
++    }
++}
++
++/// True when completely unrolling the outer loop `outer` would leave an inner
++/// natural loop alive as a runtime loop in every clone.  That happens when a
++/// properly-nested inner loop's IV/bound depends on a runtime value (anything
++/// other than constants and the outer loop's IV).  The clones then become
++/// sibling runtime reductions sharing one accumulator, a shape the downstream
++/// late vectorizer miscompiles (reproducer: `for (i = 0; i < 4; i++)
++/// for (j = 0; j < n; j++) s += a[i*n+j]` — the outer trip-4 is unrolled, the
++/// runtime-`n` inner survives as four chained reductions, and lccc sums the
++/// wrong elements while GCC returns the correct value).  A CONSTANT-trip inner
++/// loop is fine: the fixpoint fully unrolls it too.  Refusing keeps the outer
++/// loop rolled, which is correct and matches GCC.
++fn body_contains_persisting_inner_loop(
++    func: &IrFunction,
++    cfg: &CfgAnalysis,
++    outer: &loop_analysis::NaturalLoop,
++    outer_iv: Value,
++) -> bool {
++    let all = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
++    for inner in &all {
++        if inner.header == outer.header {
++            continue;
++        }
++        if !outer.body.contains(&inner.header) {
++            continue;
++        }
++        let latches = inner.latches(&cfg.preds);
++        if latches.len() != 1 {
++            // Multi-latch inner loops aren't handled by name here; the general
++            // cloner treats other shapes separately and they are not the
++            // chained-reduction miscompile this gate guards.
++            continue;
++        }
++        let latch = latches[0];
++        let latch_label = func.blocks[latch].label;
++        if !matches!(
++            &func.blocks[latch].terminator,
++            Terminator::Branch(l) if *l == func.blocks[inner.header].label
++        ) {
++            continue;
++        }
++        // Clean counted inner loop: IV, exit condition, and its initial value.
++        let Some((iv_phi, _ty, _step, _)) = find_iv_in_loop(func, inner.header, latch, latch_label)
++        else {
++            continue;
++        };
++        let Some((_et, _be, _cmp, _cty, limit, _islhs, _pos)) =
++            find_exit_condition(func, inner.header, &inner.body, iv_phi)
++        else {
++            continue;
++        };
++        let mut init_op = None;
++        for inst in &func.blocks[inner.header].instructions {
++            if let Instruction::Phi { dest, incoming, .. } = inst {
++                if dest.0 == iv_phi.0 {
++                    for (op, lbl) in incoming {
++                        if *lbl != latch_label {
++                            init_op = Some(op.clone());
++                        }
++                    }
++                }
++            }
++        }
++        let Some(init_op) = init_op else { continue };
++        // If the inner IV's initial value or its bound depends on a runtime
++        // value (not a constant and not the OUTER IV), the inner loop persists
++        // after the outer unroll -> unsafe to unroll the outer loop.
++        if !depends_only_on_const_and_iv(func, &init_op, outer_iv, 0)
++            || !depends_only_on_const_and_iv(func, &limit, outer_iv, 0)
++        {
++            return true;
++        }
++    }
++    false
++}
++
++// ── Header-phi iteration model ───────────────────────────────────────────────
++/// One header phi of a natural loop with a unique preheader and a single
++/// latch: `dest = phi [init, preheader], [back, latch]`.
++#[derive(Clone, Debug)]
++struct HeaderPhi {
++    id: u32,
++    ty: IrType,
++    init: Operand,
++    back: Operand,
++}
++
++/// Collect EVERY phi of the loop header (IV included).  `None` when a phi
++/// is not in the two-incoming preheader/latch form the cloners rely on.
++fn collect_header_phis(
++    func: &IrFunction,
++    header: usize,
++    latch_label: BlockId,
++) -> Option<Vec<HeaderPhi>> {
++    let mut out = Vec::new();
++    for inst in &func.blocks[header].instructions {
++        let Instruction::Phi { dest, ty, incoming } = inst else {
++            continue;
++        };
++        if incoming.len() != 2 {
++            return None;
++        }
++        let back: Operand = incoming.iter().find(|(_, l)| *l == latch_label)?.0.clone();
++        let init: Operand = incoming.iter().find(|(_, l)| *l != latch_label)?.0.clone();
++        out.push(HeaderPhi {
++            id: dest.0,
++            ty: *ty,
++            init,
++            back,
++        });
++    }
++    Some(out)
++}
++
++/// The value every header phi holds at the entry of a given iteration.
++///
++/// Both complete unrollers used to thread only the phis whose back-edge value
++/// was defined in the cloned region and substituted nothing for the rest; the
++/// remaining shapes silently read the phi's INITIAL value in every iteration:
++///   * `first = 0` at the end of the body (constant back value);
++///   * `cur = param` (loop-invariant back value);
++///   * `x = y; y = t` (the back value is ANOTHER header phi).
++/// This model closes all of them: the value of phi `P` at the entry of
++/// iteration `t` (t ≥ 1) is `P.back` evaluated in iteration `t-1`:
++///   * a constant is itself;
++///   * the latch IV increment is the IV's value in iteration `t`;
++///   * another header phi `Q` is `Q`'s value at iteration `t-1`;
++///   * a value defined inside the loop is iteration `t-1`'s copy of it;
++///   * anything else is loop-invariant and used verbatim.
++/// Iteration 0 sees the preheader `init` operands.  Because the results are
++/// never header-phi ids themselves, substituting one phi at a time is
++/// order-independent.
++struct LoopPhiModel {
++    phis: Vec<HeaderPhi>,
++    iv_id: u32,
++    iv_incr_dest: Option<u32>,
++    iv_ty: IrType,
++    iv_init: i64,
++    iv_step: i64,
++    /// Every SSA id defined by an instruction inside the loop (header non-phi
++    /// instructions and all body blocks).
++    loop_defs: FxHashSet<u32>,
++}
++
++impl LoopPhiModel {
++    fn iv_const(&self, t: i64) -> Operand {
++        Operand::Const(IrConst::from_i64(
++            self.iv_init.wrapping_add(self.iv_step.wrapping_mul(t)),
++            self.iv_ty,
++        ))
++    }
++
++    fn is_header_phi(&self, id: u32) -> bool {
++        self.phis.iter().any(|p| p.id == id)
++    }
++
++    /// Environment of iteration 0: every phi holds its preheader value; the
++    /// IV holds its (already constant-resolved) init.
++    fn env_entry(&self) -> FxHashMap<u32, Operand> {
++        let mut env = FxHashMap::default();
++        for p in &self.phis {
++            let v = if p.id == self.iv_id {
++                self.iv_const(0)
++            } else {
++                p.init
++            };
++            env.insert(p.id, v);
++        }
++        env
++    }
++
++    /// Environment of iteration `t ≥ 1`, given iteration `t-1`'s environment
++    /// and the rename map of iteration `t-1`'s copy of the loop (an absent
++    /// entry means the original, un-renamed instruction executes there).
++    fn env_next(
++        &self,
++        t: i64,
++        env_prev: &FxHashMap<u32, Operand>,
++        rename_prev: &FxHashMap<u32, u32>,
++    ) -> FxHashMap<u32, Operand> {
++        let mut env = FxHashMap::default();
++        for p in &self.phis {
++            let v = if p.id == self.iv_id {
++                self.iv_const(t)
++            } else {
++                self.resolve_back(&p.back, t, env_prev, rename_prev)
++            };
++            env.insert(p.id, v);
++        }
++        env
++    }
++
++    fn resolve_back(
++        &self,
++        back: &Operand,
++        t: i64,
++        env_prev: &FxHashMap<u32, Operand>,
++        rename_prev: &FxHashMap<u32, u32>,
++    ) -> Operand {
++        match back {
++            Operand::Const(_) => *back,
++            Operand::Value(v) => {
++                if Some(v.0) == self.iv_incr_dest {
++                    self.iv_const(t)
++                } else if self.is_header_phi(v.0) {
++                    *env_prev
++                        .get(&v.0)
++                        .expect("iteration environment covers every header phi")
++                } else if self.loop_defs.contains(&v.0) {
++                    Operand::Value(Value(*rename_prev.get(&v.0).unwrap_or(&v.0)))
++                } else {
++                    *back
++                }
++            }
++        }
++    }
++}
++
++/// Substitute every header phi of `env` in one instruction / terminator.
++fn apply_env_inst(inst: &mut Instruction, env: &FxHashMap<u32, Operand>) {
++    for (&id, repl) in env {
++        subst_value_with_operand(inst, id, repl);
++    }
++}
++
++fn apply_env_term(term: &mut Terminator, env: &FxHashMap<u32, Operand>) {
++    for (&id, repl) in env {
++        subst_value_in_terminator(term, id, repl);
++    }
++}
++
++/// Header non-phi instructions that are NOT part of the exit-test chain (the
++/// Cmp and an optional Cast feeding the CondBranch).  These carry the loop
++/// condition's side effects and extra values (`for (...; cnt++, i < 4; ...)`),
++/// execute once per guard evaluation — `trip + 1` times — and must therefore
++/// be replicated per iteration AND once more after the last one.
++fn header_extra_indices(func: &IrFunction, header: usize) -> Vec<usize> {
++    let block = &func.blocks[header];
++    let mut chain: FxHashSet<u32> = FxHashSet::default();
++    if let Terminator::CondBranch {
++        cond: Operand::Value(c),
++        ..
++    } = &block.terminator
++    {
++        chain.insert(c.0);
++        if let Some(Instruction::Cast {
++            src: Operand::Value(s),
++            ..
++        }) = block.instructions.iter().find(|i| i.dest() == Some(*c))
++        {
++            chain.insert(s.0);
++        }
++    }
++    block
++        .instructions
++        .iter()
++        .enumerate()
++        .filter(|(_, inst)| {
++            !matches!(inst, Instruction::Phi { .. })
++                && !inst.dest().is_some_and(|d| chain.contains(&d.0))
++        })
++        .map(|(i, _)| i)
++        .collect()
++}
++
++/// Rewrite every use of `env`'s phis (and the `extra` header values) in the
++/// blocks OUTSIDE the loop to their post-loop values.
++fn rewrite_outside_uses(
++    func: &mut IrFunction,
++    loop_body: &FxHashSet<usize>,
++    final_env: &FxHashMap<u32, Operand>,
++    extra_final: &FxHashMap<u32, u32>,
++) {
++    for (bi, block) in func.blocks.iter_mut().enumerate() {
++        if loop_body.contains(&bi) {
++            continue;
++        }
++        for inst in &mut block.instructions {
++            apply_env_inst(inst, final_env);
++            for (&old, &new) in extra_final {
++                subst_value_with_operand(inst, old, &Operand::Value(Value(new)));
++            }
++        }
++        apply_env_term(&mut block.terminator, final_env);
++        for (&old, &new) in extra_final {
++            subst_value_in_terminator(&mut block.terminator, old, &Operand::Value(Value(new)));
++        }
++    }
++}
++
++/// Relabel the exit block's phi edges that named `old_pred` (the header,
++/// which no longer branches to the exit) to `new_pred`.
++fn relabel_exit_phis(
++    func: &mut IrFunction,
++    exit_target: BlockId,
++    old_pred: BlockId,
++    new_pred: BlockId,
++) {
++    if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
++        for inst in &mut func.blocks[exit_bi].instructions {
++            if let Instruction::Phi { incoming, .. } = inst {
++                for (_, lbl) in incoming.iter_mut() {
++                    if *lbl == old_pred {
++                        *lbl = new_pred;
++                    }
++                }
++            }
++        }
++    }
++}
++
+ fn try_complete_unroll_general(
+     func: &mut IrFunction,
+     lp: &loop_analysis::NaturalLoop,
+@@ -680,6 +1034,16 @@
+         return false;
+     };
+ 
++    // Fail closed (correctness, see `body_contains_persisting_inner_loop`):
++    // refuse to unroll when the body contains a nested inner loop whose trip
++    // count depends on a runtime value (so it survives as a runtime loop in
++    // every clone).  The surviving sibling runtime reductions reuse one
++    // accumulator, which the downstream late vectorizer miscompiles; staying
++    // rolled is correct and matches GCC for these shapes.
++    if body_contains_persisting_inner_loop(func, cfg, lp, iv_phi) {
++        return false;
++    }
++
+     // Exit from the header's CondBranch.
+     let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, _pos)) =
+         find_exit_condition(func, header, &lp.body, iv_phi)
+@@ -812,47 +1176,86 @@
+         return false;
+     }
+ 
+-    // Loop-carried phis (skip the IV): init from the preheader edge, back
+-    // value defined somewhere in the body.
+-    let mut carried: Vec<(u32, Operand, u32)> = Vec::new();
+-    for inst in &func.blocks[header].instructions {
+-        let Instruction::Phi { dest, incoming, .. } = inst else {
+-            continue;
+-        };
+-        if dest.0 == iv_phi.0 {
+-            continue;
+-        }
+-        let mut init: Option<Operand> = None;
+-        let mut back: Option<u32> = None;
+-        for (op, lbl) in incoming {
+-            if *lbl == latch_label {
+-                if let Operand::Value(v) = op {
+-                    back = Some(v.0);
+-                }
+-            } else {
+-                init = Some(op.clone());
+-            }
++    // ── Per-iteration SSA environment (header-phi model) ────────────────────
++    let Some(phis) = collect_header_phis(func, header, latch_label) else {
++        return false;
++    };
++    let iv_id = iv_phi.0;
++    let iv_incr_dest = phis
++        .iter()
++        .find(|p| p.id == iv_id)
++        .and_then(|p| match p.back {
++            Operand::Value(v) => Some(v.0),
++            _ => None,
++        });
++    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
++    for &hi in &header_nonphi {
++        if let Some(d) = func.blocks[header].instructions[hi].dest() {
++            loop_defs.insert(d.0);
+         }
+-        if let (Some(init_op), Some(back_id)) = (init, back) {
+-            if is_defined_in_body(back_id, &lp.body, func) {
+-                carried.push((dest.0, init_op, back_id));
++    }
++    for &bi in &body_blocks {
++        for inst in &func.blocks[bi].instructions {
++            if let Some(d) = inst.dest() {
++                loop_defs.insert(d.0);
+             }
+         }
+     }
++    let model = LoopPhiModel {
++        phis,
++        iv_id,
++        iv_incr_dest,
++        iv_ty,
++        iv_init,
++        iv_step,
++        loop_defs,
++    };
++    // Header instructions beyond the (pure) exit-test chain: they execute on
++    // every evaluation of the loop condition, i.e. `trip + 1` times. The last
++    // evaluation is the failing one, which must run exactly once more after
++    // the final cloned iteration.
++    let header_extra: Vec<usize> = header_extra_indices(func, header);
++    let has_header_extra = !header_extra.is_empty();
++    // A header instruction with a real observable side effect (volatile read,
++    // store, call, asm) that we do not model: leave the loop rolled rather
++    // than drop the extra failing evaluation. Pure arithmetic (a `cnt++`
++    // counter, an address computation) is safe to model.
++    if has_header_extra
++        && header_extra.iter().any(|&hi| {
++            matches!(
++                &func.blocks[header].instructions[hi],
++                Instruction::Store { .. }
++                    | Instruction::Call { .. }
++                    | Instruction::CallIndirect { .. }
++                    | Instruction::InlineAsm { .. }
++                    | Instruction::Load { volatile: true, .. }
++            )
++        })
++    {
++        return false;
++    }
+ 
+     // ── Build clones for iterations 1..trip ─────────────────────────────────
+     let mut next_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
+     let mut next_val = func.next_value_id;
+     let num_clones = (trip - 1) as usize;
+ 
+-    // Per-clone: header-copy label, per-body-block labels, vmap.
+     struct ClonePlan {
+         header_copy: BlockId,
+         block_labels: Vec<BlockId>, // parallel to body_blocks
+         vmap: FxHashMap<u32, u32>,
++        env: FxHashMap<u32, Operand>,
+     }
+     let mut plans: Vec<ClonePlan> = Vec::with_capacity(num_clones);
+-    for _ in 0..num_clones {
++
++    // Iteration 0's environment is the preheader init; iteration 0 uses the
++    // ORIGINAL (un-renamed) body so its "rename map" is empty.
++    let mut env_prev = model.env_entry();
++    let mut rename_prev: FxHashMap<u32, u32> = FxHashMap::default();
++
++    for ci in 0..num_clones {
++        let t = (ci + 1) as i64; // clone `t` = iteration index after `t` strides
++        let env = model.env_next(t, &env_prev, &rename_prev);
+         let header_copy = BlockId(next_label);
+         next_label += 1;
+         let block_labels = body_blocks
+@@ -871,7 +1274,7 @@
+                 next_val += 1;
+             }
+         }
+-        // Body defs (skip the latch IV increment — it is dead per iteration).
++        // Body defs (skip the dead latch IV increment).
+         for &bi in &body_blocks {
+             for (idx, inst) in func.blocks[bi].instructions.iter().enumerate() {
+                 if bi == latch && idx == latch_iv_incr_idx {
+@@ -883,73 +1286,92 @@
+                 }
+             }
+         }
++        env_prev = env.clone();
++        rename_prev = vmap.clone();
+         plans.push(ClonePlan {
+             header_copy,
+             block_labels,
+             vmap,
++            env,
+         });
+     }
+ 
+     let mut new_blocks: Vec<BasicBlock> = Vec::new();
+-    // prev_back[c]: value id delivering carried phi c entering this clone
+-    // (clone 1 uses the ORIGINAL body's back value; clone t>1 uses
+-    // clone t-1's renamed back value).
+-    let mut prev_back: Vec<u32> = carried.iter().map(|&(_, _, back)| back).collect();
+-    let mut final_carried: Vec<(u32, u32)> = Vec::new();
+ 
+-    for (ci, plan) in plans.iter().enumerate() {
+-        let t = (ci + 1) as i64; // iteration index this clone represents
+-                                 // Clone `t` observes the IV after `t` strides, not after `t` steps of
+-                                 // 1: with the constant-stride trip count in place the stride may be
+-                                 // any non-zero constant, so the substituted constant must be scaled
+-                                 // (mirrors the two-block cloner's `iv_init + t_idx * iv_step`).
+-        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t * iv_step, iv_ty));
++    // ── Final guard (the failing trip-th evaluation) ────────────────────────
++    // Runs the header_extra instructions once more with the last clone's
++    // values, then falls to the exit. Its fresh outputs are the post-loop
++    // live-out values of those header instructions (e.g. `cnt` after a
++    // `for (i=0; cnt++, i<N; i++)` is N+1, not the value at the last clone's
++    // entry).
++    let last = &plans[num_clones - 1];
++    let env_fg = model.env_next(trip, &last.env, &last.vmap);
++    let mut extra_final: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut final_guard: Option<BlockId> = None;
++    if has_header_extra {
++        let fg_label = BlockId(next_label);
++        next_label += 1;
++        let mut fg_vmap: FxHashMap<u32, u32> = FxHashMap::default();
++        for &hi in &header_extra {
++            if let Some(d) = func.blocks[header].instructions[hi].dest() {
++                fg_vmap.insert(d.0, next_val);
++                next_val += 1;
++            }
++        }
++        let mut fg_insts: Vec<Instruction> = Vec::new();
++        for &hi in &header_extra {
++            let mut cloned = func.blocks[header].instructions[hi].clone();
++            // header_extra → this guard's own fresh outputs first, then the
++            // last clone's values, then substitute the header phis with the
++            // failing-entry environment.
++            replace_values_in_inst(&mut cloned, &fg_vmap);
++            replace_values_in_inst(&mut cloned, &last.vmap);
++            rename_inst_dest(&mut cloned, &fg_vmap);
++            apply_env_inst(&mut cloned, &env_fg);
++            fg_insts.push(cloned);
++        }
++        for &hi in &header_extra {
++            if let Some(d) = func.blocks[header].instructions[hi].dest() {
++                extra_final.insert(d.0, fg_vmap[&d.0]);
++            }
++        }
++        new_blocks.push(BasicBlock {
++            label: fg_label,
++            instructions: fg_insts,
++            terminator: Terminator::Branch(exit_target),
++            source_spans: Vec::new(),
++        });
++        final_guard = Some(fg_label);
++    }
+ 
+-        // label_map: original label → clone label (header + body).
++    // ── Emit the clone blocks ───────────────────────────────────────────────
++    for (ci, plan) in plans.iter().enumerate() {
++        // Original label → clone label (header + body).
+         let mut label_map: FxHashMap<BlockId, BlockId> = FxHashMap::default();
+         label_map.insert(header_label, plan.header_copy);
+         for (i, &bi) in body_blocks.iter().enumerate() {
+             label_map.insert(func.blocks[bi].label, plan.block_labels[i]);
+         }
+-
+-        // Where this clone's latch back-edge goes: next clone's header-copy,
+-        // or the exit target for the last clone.
+         let back_redirect = if ci + 1 < num_clones {
+             plans[ci + 1].header_copy
+         } else {
+-            exit_target
+-        };
+-
+-        // Operand substitution: iv → const, carried → previous value.
+-        let substitute = |inst: &mut Instruction| {
+-            subst_value_with_operand(inst, iv_phi.0, &iv_const);
+-            for (c, &(phi_id, _, _)) in carried.iter().enumerate() {
+-                let repl = Operand::Value(Value(prev_back[c]));
+-                subst_value_with_operand(inst, phi_id, &repl);
+-            }
+-        };
+-        let substitute_term = |term: &mut Terminator| {
+-            subst_value_in_terminator(term, iv_phi.0, &iv_const);
+-            for (c, &(phi_id, _, _)) in carried.iter().enumerate() {
+-                let repl = Operand::Value(Value(prev_back[c]));
+-                subst_value_in_terminator(term, phi_id, &repl);
+-            }
++            final_guard.unwrap_or(exit_target)
+         };
+ 
+         // Header copy: non-phi instructions, unconditional Branch into the
+-        // body entry (trip ≥ 2 ⇒ every cloned iteration executes).
++        // body entry (trip ≥ 2 ⇒ every cloned iteration executes). Pure
++        // exit-test chain instructions are cloned too and DCE'd away.
+         {
+             let mut insts: Vec<Instruction> = Vec::new();
+             for &hi in &header_nonphi {
+                 let mut cloned = func.blocks[header].instructions[hi].clone();
+-                // ORDER: rename FIRST, substitute header-phi references
+-                // AFTER. Clone 1's carried back values are ORIGINAL body
+-                // ids that are also in this clone's vmap — substituting
+-                // first would let the rename rewrite them into this
+-                // clone's own definitions (self-referential phi).
++                // ORDER: rename first, substitute header-phi references after.
++                // Clone 1's env values are ORIGINAL body ids also present in
++                // this clone's vmap; substituting first would let the rename
++                // rewrite them into this clone's own definitions.
+                 replace_values_in_inst(&mut cloned, &plan.vmap);
+                 rename_inst_dest(&mut cloned, &plan.vmap);
+-                substitute(&mut cloned);
++                apply_env_inst(&mut cloned, &plan.env);
+                 insts.push(cloned);
+             }
+             new_blocks.push(BasicBlock {
+@@ -973,16 +1395,9 @@
+                     continue; // dead IV increment
+                 }
+                 let mut cloned = inst.clone();
+-                // Rename first, substitute after (see the header-copy note:
+-                // clone 1's carried values are original body ids present in
+-                // this clone's vmap).
+                 replace_values_in_inst(&mut cloned, &plan.vmap);
+                 rename_inst_dest(&mut cloned, &plan.vmap);
+-                substitute(&mut cloned);
+-                // Phi incoming labels: remap through the label map (inner
+-                // loop headers cloned inside this iteration). Labels equal
+-                // to the OUTER header label now arrive from this clone's
+-                // header copy — the actual predecessor.
++                apply_env_inst(&mut cloned, &plan.env);
+                 if let Instruction::Phi { incoming, .. } = &mut cloned {
+                     for (op, lbl) in incoming.iter_mut() {
+                         if *lbl == header_label {
+@@ -995,11 +1410,7 @@
+                 insts.push(cloned);
+             }
+             let mut term = orig.terminator.clone();
+-            // Rename value uses (e.g. an inner loop header's exit compare)
+-            // first — then substitute header-phi references (see the
+-            // header-copy ordering note).
+             replace_values_in_terminator(&mut term, &plan.vmap);
+-            // Back-edge (latch → header) redirects to the next iteration.
+             if bi == latch {
+                 if let Terminator::Branch(lbl) = &mut term {
+                     if *lbl == header_label {
+@@ -1007,9 +1418,8 @@
+                     }
+                 }
+             }
+-            // General label remap for internal branches.
+             replace_block_ids(&mut term, &label_map);
+-            substitute_term(&mut term);
++            apply_env_term(&mut term, &plan.env);
+             new_blocks.push(BasicBlock {
+                 label: plan.block_labels[i],
+                 instructions: insts,
+@@ -1017,17 +1427,6 @@
+                 source_spans: Vec::new(),
+             });
+         }
+-
+-        // Update prev_back for the NEXT clone: this clone's renamed back
+-        // values. The LAST clone's values feed outside uses.
+-        for (c, &(_, _, back_id)) in carried.iter().enumerate() {
+-            if let Some(&new_id) = plan.vmap.get(&back_id) {
+-                prev_back[c] = new_id;
+-                if ci + 1 == num_clones {
+-                    final_carried.push((carried[c].0, new_id));
+-                }
+-            }
+-        }
+     }
+ 
+     func.next_value_id = next_val;
+@@ -1039,44 +1438,55 @@
+     // The original latch's back-edge flows into clone 1's header copy.
+     func.blocks[latch].terminator = Terminator::Branch(plans[0].header_copy);
+ 
+-    // Outside uses: IV → final constant; carried phis → final clone values.
+-    let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
++    // ── Post-loop substitution for blocks outside the loop ──────────────────
++    // The failing-entry environment holds the live-out value of every ordinary
++    // carried value (an accumulator `sum` is its value after the last body).
++    // A header-extra-backed phi (e.g. `cnt` whose back value is `cnt + 1` in
++    // the header) instead takes the final guard's fresh output: that captures
++    // the one-extra failing evaluation.
++    let extra_out_ids: FxHashSet<u32> = extra_final.keys().copied().collect();
++    let mut final_subst: FxHashMap<u32, Operand> = FxHashMap::default();
++    final_subst.insert(
++        iv_id,
++        Operand::Const(IrConst::from_i64(final_iv_n, iv_ty)),
++    );
++    for (&e, &fg) in &extra_final {
++        final_subst.insert(e, Operand::Value(Value(fg)));
++    }
++    for p in &model.phis {
++        if p.id == iv_id {
++            continue;
++        }
++        if let Operand::Value(v) = &p.back {
++            if extra_out_ids.contains(&v.0) {
++                final_subst.insert(p.id, final_subst[&v.0]);
++                continue;
++            }
++        }
++        final_subst.insert(p.id, *env_fg.get(&p.id).expect("env covers every phi"));
++    }
+     for (block_index, block) in func.blocks.iter_mut().enumerate() {
+         if lp.body.contains(&block_index) {
+             continue;
+         }
+         for instruction in &mut block.instructions {
+-            subst_value_with_operand(instruction, iv_phi.0, &final_iv);
+-            for &(phi_id, final_id) in &final_carried {
+-                let repl = Operand::Value(Value(final_id));
+-                subst_value_with_operand(instruction, phi_id, &repl);
+-            }
+-        }
+-        subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
+-        for &(phi_id, final_id) in &final_carried {
+-            let repl = Operand::Value(Value(final_id));
+-            subst_value_in_terminator(&mut block.terminator, phi_id, &repl);
++            apply_env_inst(instruction, &final_subst);
+         }
++        apply_env_term(&mut block.terminator, &final_subst);
+     }
+ 
+-    // Exit-block phi edges: the edge that arrived from the header now
+-    // arrives from the last clone's latch (the block that branches to the
+-    // exit target).
++    // Exit-block phi edges: the edge that arrived from the header now arrives
++    // from the last clone's latch (or the final guard, when the guard is the
++    // block that branches to the exit).
+     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
+         if exit_bi != header && !lp.body.contains(&exit_bi) {
+-            let last_latch_label = plans[num_clones - 1].block_labels[body_blocks
+-                .iter()
+-                .position(|&b| b == latch)
+-                .expect("latch is a body block")];
+-            for inst in &mut func.blocks[exit_bi].instructions {
+-                if let Instruction::Phi { incoming, .. } = inst {
+-                    for (_, lbl) in incoming.iter_mut() {
+-                        if *lbl == header_label {
+-                            *lbl = last_latch_label;
+-                        }
+-                    }
+-                }
+-            }
++            let new_pred = final_guard.unwrap_or_else(|| {
++                plans[num_clones - 1].block_labels[body_blocks
++                    .iter()
++                    .position(|&b| b == latch)
++                    .expect("latch is a body block")]
++            });
++            relabel_exit_phis(func, exit_target, header_label, new_pred);
+         }
+     }
+ 
+@@ -1287,36 +1697,56 @@
+         return false;
+     }
+ 
+-    // Loop-carried phis (phi_id, init_op, back_value_id in latch). Skip IV phi.
+-    let mut carried: Vec<(u32, Operand, u32)> = Vec::new();
+-    for inst in &func.blocks[header].instructions {
+-        let Instruction::Phi { dest, incoming, .. } = inst else {
+-            continue;
+-        };
+-        if dest.0 == iv_phi.0 {
+-            continue;
+-        }
+-        let mut init: Option<Operand> = None;
+-        let mut back: Option<u32> = None;
+-        for (op, lbl) in incoming {
+-            if *lbl == latch_label {
+-                if let Operand::Value(v) = op {
+-                    back = Some(v.0);
+-                }
+-            } else {
+-                init = Some(op.clone());
++    // ── Header-phi environment model ─────────────────────────────────────────
++    // The final value of every header phi (a counter, a "last" element, a
++    // loop-invariant-then-set value, or a cross-phi swap) depends on where its
++    // back value is computed. The old code carried back values defined in the
++    // latch and silently left everything else at its INIT value, which is why
++    // `cur = p` observed `cur == 1` forever and `x = y; y = t` observed the
++    // initial `x`. Model every header phi explicitly.
++    let Some(phis) = collect_header_phis(func, header, latch_label) else {
++        return false;
++    };
++    let iv_id = iv_phi.0;
++    let iv_incr_dest = phis
++        .iter()
++        .find(|p| p.id == iv_id)
++        .and_then(|p| match p.back {
++            Operand::Value(v) => Some(v.0),
++            _ => None,
++        });
++    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
++    for &wbi in &work_blocks {
++        for inst in &func.blocks[wbi].instructions {
++            if let Some(d) = inst.dest() {
++                loop_defs.insert(d.0);
+             }
+         }
+-        if let (Some(init_op), Some(back_id)) = (init, back) {
+-            let defined_in_latch = func.blocks[latch]
+-                .instructions
+-                .iter()
+-                .any(|li| li.dest().map(|d| d.0 == back_id).unwrap_or(false));
+-            if defined_in_latch {
+-                carried.push((dest.0, init_op, back_id));
++    }
++    for inst in &func.blocks[header].instructions {
++        if !matches!(inst, Instruction::Phi { .. }) {
++            if let Some(d) = inst.dest() {
++                loop_defs.insert(d.0);
+             }
+         }
+     }
++    let model = LoopPhiModel {
++        phis,
++        iv_id,
++        iv_incr_dest,
++        iv_ty,
++        iv_init,
++        iv_step,
++        loop_defs,
++    };
++    // A header instruction beyond the (pure) exit-test chain must run on every
++    // evaluation of the condition, i.e. `trip + 1` times (the failing
++    // evaluation included). The two-block cloner clones only the work blocks,
++    // never the header, so it cannot reproduce that; leaving the loop rolled
++    // is correct.
++    if !header_extra_indices(func, header).is_empty() {
++        return false;
++    }
+ 
+     let mut next_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
+     let mut next_val = func.next_value_id;
+@@ -1328,12 +1758,24 @@
+         })
+         .collect();
+ 
+-    let mut prev_back: Vec<Option<u32>> = vec![None; carried.len()];
+-    let mut final_carried: Vec<(u32, u32)> = Vec::new();
+     let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(trip as usize);
+ 
++    // Per-iteration environments. env[0] = preheader init; env[t] for t ≥ 1 is
++    // derived from the previous clone's environment and rename map. The last
++    // clone's env + rename map feed the failing (`trip`-th) evaluation used
++    // for live-out substitution.
++    let mut env_prev = model.env_entry();
++    let mut rename_prev: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut final_carried: Vec<(u32, u32)> = Vec::new();
++
+     for t_idx in 0..trip {
+-        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t_idx * iv_step, iv_ty));
++        let t = t_idx as i64;
++        let env = if t == 0 {
++            model.env_entry()
++        } else {
++            model.env_next(t, &env_prev, &rename_prev)
++        };
++        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t * iv_step, iv_ty));
+         let mut vmap: FxHashMap<u32, u32> = FxHashMap::default();
+         for &wbi in &work_blocks {
+             for (idx, inst) in func.blocks[wbi].instructions.iter().enumerate() {
+@@ -1353,30 +1795,31 @@
+                     continue;
+                 }
+                 let mut cloned = inst.clone();
+-                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
+-                for (ci, (phi_id, init_op, _)) in carried.iter().enumerate() {
+-                    match prev_back[ci] {
+-                        None => subst_value_with_operand(&mut cloned, *phi_id, init_op),
+-                        Some(prev_id) => subst_value_with_operand(
+-                            &mut cloned,
+-                            *phi_id,
+-                            &Operand::Value(Value(prev_id)),
+-                        ),
+-                    }
+-                }
++                // Rename first, then substitute the header-phi environment.
++                // The env values are consts / invariants / previous-clone ids,
++                // none of which are keys in this clone's rename map.
+                 replace_values_in_inst(&mut cloned, &vmap);
+                 rename_inst_dest(&mut cloned, &vmap);
++                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
++                apply_env_inst(&mut cloned, &env);
+                 new_insts.push(cloned);
+             }
+         }
+-        for (ci, (_, _, back_id)) in carried.iter().enumerate() {
+-            if let Some(&new_id) = vmap.get(back_id) {
+-                prev_back[ci] = Some(new_id);
+-                if t_idx + 1 == trip {
+-                    final_carried.push((carried[ci].0, new_id));
++        if t_idx + 1 == trip {
++            // Clone-defined back values (for the copy-before-def guard below).
++            for p in &model.phis {
++                if p.id == iv_id {
++                    continue;
++                }
++                if let Operand::Value(v) = &p.back {
++                    if let Some(&new_id) = vmap.get(&v.0) {
++                        final_carried.push((p.id, new_id));
++                    }
+                 }
+             }
+         }
++        env_prev = env;
++        rename_prev = vmap;
+         let term = if t_idx + 1 < trip {
+             Terminator::Branch(labels[(t_idx + 1) as usize])
+         } else {
+@@ -1395,30 +1838,29 @@
+     func.blocks[latch].terminator = Terminator::Branch(exit_target);
+     let _ = (body_entry, exit_cond_positive);
+ 
+-    // `final_iv_n` was already computed and overflow-checked above, before
+-    // any CFG mutation — a second check here would bail with the header and
+-    // latch already retargeted (the exact bug the hoisted check fixed).
++    // Live-out substitution. The failing (`trip`-th) environment holds the
++    // value each carried phi has after the final cloned iteration: a body
++    // accumulator's computed total, a constant back value, a loop-invariant
++    // operand, or a cross-phi value — all bound to the last clone's defs.
+     let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
++    let env_fg = model.env_next(trip, &env_prev, &rename_prev);
++    let mut final_subst: FxHashMap<u32, Operand> = FxHashMap::default();
++    final_subst.insert(iv_id, final_iv);
++    for p in &model.phis {
++        if p.id == iv_id {
++            continue;
++        }
++        final_subst.insert(p.id, *env_fg.get(&p.id).expect("env covers every phi"));
++    }
+     for (block_index, block) in func.blocks.iter_mut().enumerate() {
+         if lp.body.contains(&block_index) {
+             continue;
+         }
+         for instruction in &mut block.instructions {
+-            subst_value_with_operand(instruction, iv_phi.0, &final_iv);
+-            for &(phi_id, final_id) in &final_carried {
+-                subst_value_with_operand(instruction, phi_id, &Operand::Value(Value(final_id)));
+-            }
+-        }
+-        subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
+-        for &(phi_id, final_id) in &final_carried {
+-            subst_value_in_terminator(
+-                &mut block.terminator,
+-                phi_id,
+-                &Operand::Value(Value(final_id)),
+-            );
++            apply_env_inst(instruction, &final_subst);
+         }
++        apply_env_term(&mut block.terminator, &final_subst);
+     }
+-
+     func.blocks.extend(new_blocks);
+ 
+     // Resolve EVERY phi in the header. The loop is now straight-line -- the
+@@ -1682,7 +2124,13 @@
+                     None
+                 }
+             });
+-        let back_val = back_val?;
++        // A phi whose back-edge value is a constant (a first-iteration flag
++        // such as `first = 0`) is simply not the IV. It used to abort the
++        // whole search (`?`), which silently disabled unrolling for every
++        // loop whose FIRST header phi happened to be such a flag.
++        let Some(back_val) = back_val else {
++            continue;
++        };
+ 
+         // Look for `Add(phi_dest, const_step)` or `Add(const_step, phi_dest)`
+         // in the latch that produces `back_val`.
+--- a/src/passes/vectorize.rs	2026-09-03 20:24:00.203728740 +0000
++++ b/src/passes/vectorize.rs	2026-09-03 20:24:00.207728740 +0000
+@@ -1180,6 +1180,7 @@
+     accumulator_phis: &[Value],
+     accumulator_derived: &FxHashSet<Value>,
+     allowed_loads: &[Value],
++    iv_phi: Value,
+ ) -> bool {
+     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+     let is_add = |block_idx: usize, inst_idx: usize, dest: Value| {
+@@ -1188,6 +1189,11 @@
+                 .iter()
+                 .any(|&(add_idx, add_result)| add_idx == inst_idx && add_result == dest)
+     };
++    // Labels of every loop block, to detect a phi's back-edge incoming.
++    let loop_block_labels: FxHashSet<u32> = loop_blocks
++        .iter()
++        .map(|&bi| func.blocks[bi].label.0)
++        .collect();
+ 
+     // (4) terminators: only the header may branch (its exit condition);
+     //     every other loop block must end in an unconditional branch.
+@@ -1209,13 +1215,38 @@
+         let block = &func.blocks[block_idx];
+         for (inst_idx, inst) in block.instructions.iter().enumerate() {
+             match inst {
+-                Instruction::Phi { dest, .. } => {
+-                    // The header's own IV phi (and any other non-accumulator
+-                    // phi) is fine; only phis writing an accumulator-derived
+-                    // value are forbidden (the vector transform rewires the
+-                    // accumulator phi to a vector value).  With multiple
+-                    // accumulators, each accumulator's own header phi is
+-                    // allowed; any other accumulator-derived phi is not.
++                Instruction::Phi { dest, incoming, .. } => {
++                    // The transform rewires ONLY the IV phi and the recognized
++                    // accumulator phis. Any OTHER loop-carried phi (a value
++                    // whose back-edge incoming is a non-constant Value from a
++                    // loop block) changes once per scalar iteration but is left
++                    // untouched, so after vectorization it would be updated
++                    // with the scaled induction variable and be silently wrong
++                    // (reproducer: `s += a[i]; last = a[i];` — `last` ended up
++                    // reading A[0], A[8], ... instead of A[i]). Reject the
++                    // whole loop (fail-closed; the scalar form is correct).
++                    let is_iv_or_accum = *dest == iv_phi
++                        || accumulator_phis.iter().any(|phi| *phi == *dest);
++                    if !is_iv_or_accum {
++                        let loop_carried = incoming.iter().any(|(op, lbl)| {
++                            loop_block_labels.contains(&lbl.0) && matches!(op, Operand::Value(_))
++                        });
++                        if loop_carried {
++                            if debug {
++                                eprintln!(
++                                    "[VEC-RED]   Rejecting: unhandled loop-carried phi {} in block {}",
++                                    dest.0, block_idx
++                                );
++                            }
++                            set_reject("loop has an unhandled loop-carried value");
++                            return false;
++                        }
++                    }
++                    // Phis writing an accumulator-derived value are forbidden
++                    // (the vector transform rewires the accumulator phi to a
++                    // vector value).  With multiple accumulators, each
++                    // accumulator's own header phi is allowed; any other
++                    // accumulator-derived phi is not.
+                     if accumulator_derived.contains(dest)
+                         && (block_idx != header_idx
+                             || !accumulator_phis.iter().any(|phi| *phi == *dest))
+@@ -1780,9 +1811,16 @@
+     let mut add_result = None;
+     // Conditional-sum guard (if_convert output): the Select wrapping the
+     // accumulator update. `s' = Select(cond, s + x, s)` — the guard Cmp's
+-    // value id; validated after the added-value chain resolves.
++    // value id; validated after the added-value chain resolves.  The
++    // operator may ALSO be written the other way round,
++    // `s' = Select(cond, s, s + x)` (the `if (a[i] & 1) continue; s +=
++    // a[i];` shape, where the kept value is on the TRUE arm).  Both denote
++    // a guarded update; only the add-on-TRUE arm is expressible by the
++    // masked widening intrinsic, so a swapped guard is recorded and later
++    // rejected.
+     let mut guard_select_cond: Option<Value> = None;
+     let mut guard_rhs: Option<Operand> = None;
++    let mut guard_swapped = false;
+     for &block_idx in &loop_info.body {
+         if block_idx == header_idx {
+             continue;
+@@ -1857,12 +1895,34 @@
+                                 false_val,
+                                 Operand::Value(v) if v.0 == accumulator_phi.0
+                             );
++                            // Swapped form: `Select(cond, s, s + x)` (the
++                            // `if (a[i] & 1) continue; s += a[i]` shape). The
++                            // kept value is the phi, the guarded add is on the
++                            // FALSE arm. Still a guarded update; record the
++                            // cond and mark it swapped so the validator
++                            // rejects the unexpressible form instead of
++                            // silently dropping the guard.
++                            let fv_is_add = matches!(
++                                false_val,
++                                Operand::Value(v) if v.0 == dest.0
++                            );
++                            let tv_is_phi = matches!(
++                                true_val,
++                                Operand::Value(v) if v.0 == accumulator_phi.0
++                            );
+                             if tv_is_add && fv_is_phi {
+                                 if let Operand::Value(cv) = cond {
+                                     guard_select_cond = Some(*cv);
+                                 }
+                                 break;
+                             }
++                            if fv_is_add && tv_is_phi {
++                                if let Operand::Value(cv) = cond {
++                                    guard_select_cond = Some(*cv);
++                                    guard_swapped = true;
++                                }
++                                break;
++                            }
+                         }
+                     }
+                     break;
+@@ -2137,6 +2197,21 @@
+     // scalar — the unguarded vector form would silently drop the guard.
+     let mut select_guard_cond: Option<Value> = None;
+     if let Some(gcv) = guard_select_cond {
++        // Swapped form (`Select(cond, s, s + x)`): the kept value is on the
++        // TRUE arm, so the guarded add is conditional on the NOT-taken path.
++        // The masked widening intrinsic only encodes add-when-cond-true, so
++        // this shape must stay scalar. Reject before the loader-root check
++        // (which would otherwise reject it anyway, but with a misleading
++        // message about `loaded > rhs`).
++        if guard_swapped {
++            if debug {
++                eprintln!(
++                    "[VEC-RED]   Rejecting: conditional-sum guard has the add on the FALSE arm (staying scalar)"
++                );
++            }
++            set_reject("conditional-sum guard has the add on the false arm (not expressible)");
++            return None;
++        }
+         // Resolve the chain root: the loaded I32 element.
+         let chain_root = match added_inst {
+             Instruction::Load { dest, .. } => Some(*dest),
+@@ -2556,6 +2631,7 @@
+             &phis,
+             &derived,
+             &loads,
++            iv,
+         ) {
+             if debug {
+                 eprintln!("[VEC-RED]   Rejecting unsound reduction");
+--- /dev/null	2026-07-23 18:05:36.990886857 +0000
++++ b/tests/regression/loop_unroll_redteam.c	2026-09-03 20:24:00.207728740 +0000
+@@ -0,0 +1,315 @@
++/* Loop-unroll red-team corpus. Every kernel is noinline so the shape the
++ * unroller sees is the shape written here; runtime trip counts come from
++ * volatile globals so no earlier pass can fold them. Output is a stream of
++ * "name=value" lines compared against GCC. */
++#include <stdio.h>
++#include <limits.h>
++#include <string.h>
++#define NOINLINE __attribute__((noinline))
++volatile int vn4 = 4, vn5 = 5, vn7 = 7, vn8 = 8, vn9 = 9, vn17 = 17, vn0 = 0, vn1 = 1, vn3 = 3;
++volatile int vflag1 = 1, vflag0 = 0;
++volatile long vln = 13;
++int A[64], B[64], C[64];
++long LA[64];
++unsigned char UA[64];
++static void init(void) {
++    for (int i = 0; i < 64; i++) { A[i] = i * 7 - 20; B[i] = (i * 13) % 11 - 5; C[i] = 0; LA[i] = i * 3L - 9; UA[i] = (unsigned char)(i * 37); }
++}
++/* 1. "first iteration" flag: carried phi whose back value is a CONSTANT. */
++NOINLINE int k_first_const4(void) {
++    int s = 0, first = 1;
++    for (int i = 0; i < 4; i++) { s += first ? A[i] * 100 : A[i]; first = 0; }
++    return s;
++}
++NOINLINE int k_first_const_rt(int n) {
++    int s = 0, first = 1;
++    for (int i = 0; i < n; i++) { s += first ? A[i] * 100 : A[i]; first = 0; }
++    return s;
++}
++/* 2. carried phi whose back value is a loop-INVARIANT parameter. */
++NOINLINE int k_first_param4(int p) {
++    int s = 0, cur = 1;
++    for (int i = 0; i < 4; i++) { s += cur * A[i]; cur = p; }
++    return s;
++}
++NOINLINE int k_first_param_rt(int p, int n) {
++    int s = 0, cur = 1;
++    for (int i = 0; i < n; i++) { s += cur * A[i]; cur = p; }
++    return s;
++}
++/* 3. Second IV updated in the latch (comma increment). */
++NOINLINE int k_two_iv_rt(int n) {
++    int s = 0;
++    int j;
++    int i;
++    for (i = 0, j = n - 1; i < n; i++, j--) s += A[i] * B[j];
++    return s + j;
++}
++NOINLINE int k_ptr_iv_rt(int n) {
++    int s = 0; int *p = A; int *q = B + 20;
++    for (int i = 0; i < n; i++, p++, q--) s += *p - *q;
++    return s + (int)(p - A) + (int)(q - B);
++}
++NOINLINE int k_two_iv4(void) {
++    int s = 0; int j;
++    for (int i = 0, j2 = 3; i < 4; i++, j2--) { s += A[i] * B[j2]; j = j2; }
++    return s + j;
++}
++/* 4. Diamond with phi inside the body (stores make select-conversion illegal). */
++NOINLINE int k_diamond_rt(int n) {
++    int s = 0;
++    for (int i = 0; i < n; i++) {
++        int t;
++        if (A[i] < 0) { C[i] = 1; t = -A[i]; } else { C[i + 1] += 2; t = A[i] * 3; }
++        s += t;
++    }
++    return s;
++}
++NOINLINE int k_diamond4(void) {
++    int s = 0;
++    for (int i = 0; i < 4; i++) {
++        int t;
++        if (B[i] < 0) { C[i + 8] = 1; t = -B[i]; } else { C[i + 9] += 2; t = B[i] * 3; }
++        s += t;
++    }
++    return s;
++}
++/* 5. Unsigned constants that are negative when sign-extended. */
++NOINLINE int k_u_zero_trip_a(void) { int c = 0; for (unsigned i = 0xFFFFFFFEu; i < 2u; i++) c++; return c; }
++NOINLINE int k_u_zero_trip_b(void) { int c = 0; for (unsigned i = 3u; i > 0xFFFFFFFEu; i--) c++; return c; }
++NOINLINE int k_u_zero_trip_c(void) { int c = 0; for (unsigned i = -3u; i < 5u; i++) c++; return c; }
++NOINLINE int k_u_zero_trip_d(void) { int c = 0; for (unsigned i = 1u; i <= 0xFFFFFFFDu; i += 0x7FFFFFFFu) c++; return c; }
++NOINLINE unsigned k_u_hi_trip(void) { unsigned s = 0; for (unsigned i = 0xFFFFFFF0u; i < 0xFFFFFFF4u; i++) s += i & 15; return s; }
++NOINLINE unsigned k_u_hi_trip_le(void) { unsigned s = 0; for (unsigned i = 0xFFFFFFFCu; i <= 0xFFFFFFFEu; i++) s += i & 15; return s; }
++NOINLINE unsigned k_u_down_hi(void) { unsigned s = 0; for (unsigned i = 0xFFFFFFFFu; i > 0xFFFFFFFBu; i--) s += i & 15; return s; }
++NOINLINE unsigned long k_ul_hi(void) { unsigned long s = 0; for (unsigned long i = ~0ul - 3; i < ~0ul; i++) s += i & 15; return s; }
++NOINLINE long k_l_max(void) { long s = 0; for (long i = LONG_MAX - 3; i < LONG_MAX; i++) s += i & 15; return s; }
++NOINLINE long k_l_min(void) { long s = 0; for (long i = LONG_MIN + 3; i > LONG_MIN; i--) s += i & 15; return s; }
++/* 6. Comparison written the other way round / negated / != */
++NOINLINE int k_rev_gt(void) { int s = 0; for (int i = 0; 4 > i; i++) s += A[i]; return s; }
++NOINLINE int k_rev_ge(void) { int s = 0; for (int i = 0; 4 >= i; i++) s += A[i]; return s; }
++NOINLINE int k_neg_ge(void) { int s = 0; for (int i = 0; !(i >= 4); i++) s += A[i]; return s; }
++NOINLINE int k_ne(void) { int s = 0; for (int i = 0; i != 4; i++) s += A[i]; return s; }
++NOINLINE int k_ne_step3(void) { int s = 0; for (int i = 0; i != 12; i += 3) s += A[i]; return s; }
++NOINLINE int k_zero_ge(void) { int s = 0; for (int i = 0; i >= 4; i++) s += A[i]; return s; }
++NOINLINE int k_rev_lt_exit(void) { int s = 0; for (int i = 0; 4 < i ? 0 : 1; i++) s += A[i]; return s; }
++NOINLINE int k_le_neg_init(void) { int s = 0; for (int i = -3; i <= 3; i += 2) s += A[i + 3]; return s; }
++NOINLINE int k_down_ge(void) { int s = 0; for (int i = 9; i >= 0; i -= 2) s += A[i]; return s; }
++NOINLINE int k_down_gt_sub(void) { int s = 0; for (int i = 10; i > 0; i -= 3) s += A[i]; return s; }
++/* 7. Side effect in the loop condition (header block). */
++NOINLINE int k_header_effect(void) {
++    int cnt = 0, s = 0;
++    for (int i = 0; cnt++, i < 4; i++) s += A[i];
++    return s * 100 + cnt;
++}
++NOINLINE int k_header_store(void) {
++    int s = 0;
++    for (int i = 0; (C[16 + i] = i * 5), i < 4; i++) s += A[i];
++    return s + C[16] + C[17] + C[18] + C[19] + C[20];
++}
++/* 8. Exit block is a merge with a phi (loop on one arm). */
++NOINLINE int k_exit_merge(int flag) {
++    int r = 0;
++    if (flag) { for (int i = 0; i < 4; i++) r += A[i]; } else { r = 7; }
++    return r;
++}
++NOINLINE int k_exit_merge_rt(int flag, int n) {
++    int r = 0;
++    if (flag) { for (int i = 0; i < n; i++) r += A[i]; } else { r = 7; }
++    return r;
++}
++NOINLINE int k_exit_iv_merge(int flag, int n) {
++    int i = 100;
++    if (flag) { for (i = 0; i < n; i++) C[32 + i] = i; }
++    return i;
++}
++/* 9. Values live-out of a partially unrolled loop: IV, accumulator, last element. */
++NOINLINE int k_liveout_rt(int n) {
++    int i, s = 0, last = -1;
++    for (i = 0; i < n; i++) { s += A[i]; last = A[i]; }
++    return s * 1000 + i * 10 + last;
++}
++/* 10. Narrow IVs. */
++NOINLINE int k_uchar_ne(void) { int c = 0; for (unsigned char i = 250; i != 2; i++) c += i; return c; }
++NOINLINE int k_short_neg(void) { int c = 0; for (short i = -3; i < 3; i++) c += i * i; return c; }
++NOINLINE int k_schar_edge(void) { int c = 0; for (signed char i = 124; i < 127; i++) c += i; return c; }
++NOINLINE int k_uchar_hi(void) { int c = 0; for (unsigned char i = 253; i < 255; i++) c += i; return c; }
++/* 11. continue inside body (latch has several predecessors). */
++NOINLINE int k_continue_rt(int n) {
++    int s = 0;
++    for (int i = 0; i < n; i++) { if (A[i] & 1) continue; s += A[i]; }
++    return s;
++}
++/* 12. Loop-carried phi with the latch listed first in the phi (order stress). */
++NOINLINE int k_stride_carried(void) {
++    int x = 1, y = 2;
++    for (int i = 0; i < 8; i += 2) { int t = x + y; x = y; y = t + A[i]; }
++    return x * 31 + y;
++}
++/* 13. Nested loops: constant inner, runtime outer and vice versa. */
++NOINLINE int k_nested_rt_outer(int n) {
++    int s = 0;
++    for (int i = 0; i < n; i++) for (int j = 0; j < 4; j++) s += A[i + j] * (j + 1);
++    return s;
++}
++NOINLINE int k_nested_rt_inner(int n) {
++    int s = 0;
++    for (int i = 0; i < 4; i++) for (int j = 0; j < n; j++) s += A[i + j] * (i + 1);
++    return s;
++}
++NOINLINE int k_triangular(void) {
++    int s = 0;
++    for (int i = 0; i < 5; i++) for (int j = i + 1; j < 5; j++) s += A[i] * B[j];
++    return s;
++}
++/* 14. FP reductions with constant/runtime trips. */
++NOINLINE double k_f64_rt(int n) { double s = 0; for (int i = 0; i < n; i++) s += LA[i] * 0.5; return s; }
++NOINLINE float k_f32_c6(void) { float s = 1; for (int i = 0; i < 6; i++) s = s * 0.5f + A[i]; return s; }
++/* 15. Runtime trips around the unroll factor: 0,1,3,4,5,7,8,9,17. */
++NOINLINE int k_sum_rt(int n) { int s = 0; for (int i = 0; i < n; i++) s += A[i] ^ i; return s; }
++NOINLINE int k_sum_le_rt(int n) { int s = 0; for (int i = 0; i <= n; i++) s += A[i] ^ i; return s; }
++NOINLINE int k_down_rt(int n) { int s = 0; for (int i = n; i > 0; i--) s += A[i] * i; return s; }
++NOINLINE int k_stride3_rt(int n) { int s = 0; for (int i = 0; i < n; i += 3) s += A[i]; return s; }
++NOINLINE unsigned k_u_rt(unsigned n) { unsigned s = 0; for (unsigned i = 0; i < n; i++) s += UA[i]; return s; }
++NOINLINE long k_l_rt(long n) { long s = 0; for (long i = 0; i < n; i++) s += LA[i]; return s; }
++/* 16. Multiple carried values + IV used in address arithmetic. */
++NOINLINE int k_multi_carried_rt(int n) {
++    int a = 1, b = 2, c = 3;
++    for (int i = 0; i < n; i++) { int t = a; a = b + A[i]; b = c ^ t; c = t + 1; }
++    return a * 7 + b * 3 + c;
++}
++/* 17. Store-then-load dependence through memory in unrolled body. */
++NOINLINE int k_mem_dep_rt(int n) {
++    C[40] = 1;
++    for (int i = 0; i < n; i++) C[41 + i] = C[40 + i] * 2 + 1;
++    return C[40 + n];
++}
++NOINLINE int k_mem_dep4(void) {
++    C[50] = 3;
++    for (int i = 0; i < 4; i++) C[51 + i] = C[50 + i] + A[i];
++    return C[54];
++}
++/* 18. Early exit from body (break) — must be left alone or handled. */
++NOINLINE int k_break_rt(int n) {
++    int i;
++    for (i = 0; i < n; i++) if (A[i] > 20) break;
++    return i;
++}
++/* 19. volatile in body */
++NOINLINE int k_volatile4(void) {
++    int s = 0;
++    for (int i = 0; i < 4; i++) s += vn4 + i;
++    return s;
++}
++/* 20. Bool-flag latch-first phi: x = 1 then x = x? param : 0 */
++NOINLINE int k_flag_toggle_rt(int n, int p) {
++    int x = 1, s = 0;
++    for (int i = 0; i < n; i++) { s += x; x = x ? p : 0; }
++    return s;
++}
++/* 21. IV compared with widening use of iv (i32 iv, i64 index) */
++NOINLINE long k_widen_rt(int n) {
++    long s = 0;
++    for (int i = 0; i < n; i++) s += LA[i] * (long)i;
++    return s;
++}
++/* 22. Complete unroll where the IV final value is used after. */
++NOINLINE int k_iv_after8(void) { int i, s = 0; for (i = 3; i < 19; i += 2) s += A[i]; return s * 100 + i; }
++/* 23. Signed init negative, unsigned compare (should be zero trips). */
++NOINLINE int k_u_neg_init(void) { int c = 0; for (int i = -2; (unsigned)i < 3u; i++) c++; return c; }
++/* 24. Step larger than span with <= (exactly one trip) and one-trip loops. */
++NOINLINE int k_one_trip(void) { int s = 0; for (int i = 0; i <= 0; i++) s += A[i] + 5; return s; }
++NOINLINE int k_big_step(void) { int s = 0; for (int i = 0; i < 100; i += 60) s += A[i % 64]; return s; }
++
++int k_mixed_back(int p, int n);
++int k_trip16(void);
++int k_trip16_carried(void);
++int k_desc_carried(void);
++int k_live_mixed(int n);
++long k_wide_inv(int n);
++int main(void) {
++    init();
++    printf("first_const4=%d\n", k_first_const4());
++    printf("first_const_rt5=%d rt9=%d rt1=%d rt0=%d\n", k_first_const_rt(vn5), k_first_const_rt(vn9), k_first_const_rt(vn1), k_first_const_rt(vn0));
++    printf("first_param4=%d\n", k_first_param4(vn3));
++    printf("first_param_rt=%d\n", k_first_param_rt(vn3, vn9));
++    printf("two_iv_rt=%d %d %d\n", k_two_iv_rt(vn9), k_two_iv_rt(vn4), k_two_iv_rt(vn17));
++    printf("ptr_iv_rt=%d %d\n", k_ptr_iv_rt(vn9), k_ptr_iv_rt(vn7));
++    printf("two_iv4=%d\n", k_two_iv4());
++    printf("diamond_rt=%d\n", k_diamond_rt(vn9));
++    printf("diamond4=%d\n", k_diamond4());
++    printf("C=");
++    for (int i = 0; i < 64; i++) printf("%d,", C[i]);
++    printf("\n");
++    printf("u_zero=%d %d %d %d\n", k_u_zero_trip_a(), k_u_zero_trip_b(), k_u_zero_trip_c(), k_u_zero_trip_d());
++    printf("u_hi=%u %u %u %lu %ld %ld\n", k_u_hi_trip(), k_u_hi_trip_le(), k_u_down_hi(), k_ul_hi(), k_l_max(), k_l_min());
++    printf("cmp_forms=%d %d %d %d %d %d %d %d %d %d\n", k_rev_gt(), k_rev_ge(), k_neg_ge(), k_ne(), k_ne_step3(), k_zero_ge(), k_rev_lt_exit(), k_le_neg_init(), k_down_ge(), k_down_gt_sub());
++    printf("header=%d %d\n", k_header_effect(), k_header_store());
++    printf("exit_merge=%d %d %d %d %d %d\n", k_exit_merge(vflag1), k_exit_merge(vflag0), k_exit_merge_rt(vflag1, vn9), k_exit_merge_rt(vflag0, vn9), k_exit_iv_merge(vflag1, vn9), k_exit_iv_merge(vflag0, vn9));
++    printf("liveout=%d %d %d %d\n", k_liveout_rt(vn9), k_liveout_rt(vn8), k_liveout_rt(vn1), k_liveout_rt(vn0));
++    printf("narrow=%d %d %d %d\n", k_uchar_ne(), k_short_neg(), k_schar_edge(), k_uchar_hi());
++    printf("continue=%d\n", k_continue_rt(vn17));
++    printf("stride_carried=%d\n", k_stride_carried());
++    printf("nested=%d %d %d\n", k_nested_rt_outer(vn9), k_nested_rt_inner(vn9), k_triangular());
++    printf("fp=%.3f %.3f\n", k_f64_rt(vn9), k_f32_c6());
++    printf("sum_rt=%d %d %d %d %d %d %d %d %d\n", k_sum_rt(vn0), k_sum_rt(vn1), k_sum_rt(vn3), k_sum_rt(vn4), k_sum_rt(vn5), k_sum_rt(vn7), k_sum_rt(vn8), k_sum_rt(vn9), k_sum_rt(vn17));
++    printf("sum_le_rt=%d %d %d\n", k_sum_le_rt(vn0), k_sum_le_rt(vn7), k_sum_le_rt(vn8));
++    printf("down_rt=%d %d %d\n", k_down_rt(vn9), k_down_rt(vn8), k_down_rt(vn1));
++    printf("stride3_rt=%d %d\n", k_stride3_rt(vn17), k_stride3_rt(vn9));
++    printf("u_rt=%u l_rt=%ld\n", k_u_rt((unsigned)vn17), k_l_rt(vln));
++    printf("multi_carried=%d %d\n", k_multi_carried_rt(vn9), k_multi_carried_rt(vn4));
++    printf("mem_dep=%d %d\n", k_mem_dep_rt(vn9), k_mem_dep4());
++    printf("break=%d\n", k_break_rt(vn17));
++    printf("volatile4=%d\n", k_volatile4());
++    printf("flag_toggle=%d %d\n", k_flag_toggle_rt(vn9, vn1), k_flag_toggle_rt(vn9, vn0));
++    printf("widen=%ld\n", k_widen_rt(vn9));
++    printf("iv_after8=%d\n", k_iv_after8());
++    printf("u_neg_init=%d\n", k_u_neg_init());
++    printf("one_trip=%d big_step=%d\n", k_one_trip(), k_big_step());
++    printf("mixed_back=%d %d %d\n", k_mixed_back(vn3,vn9), k_mixed_back(vn1,vn4), k_mixed_back(vn0,vn1));
++    printf("trip16=%d %d\n", k_trip16(), k_trip16_carried());
++    printf("desc_carried=%d\n", k_desc_carried());
++    printf("live_mixed=%d %d %d\n", k_live_mixed(vn9), k_live_mixed(vn0), k_live_mixed(vn1));
++    printf("wide_inv=%ld\n", k_wide_inv(vln));
++    return 0;
++}
++
++/* 25. One loop mixing every back-value kind: const, invariant param, body
++   accumulator, and a cross-phi swap. */
++NOINLINE int k_mixed_back(int p, int n) {
++    int acc = 0, first = 1, cur = 5, x = 1, y = 2;
++    for (int i = 0; i < n; i++) {
++        acc += cur * A[i];
++        cur = p;
++        first = 0;
++        int t = x + y; x = y; y = t ^ (i & 3);
++    }
++    return acc * 7 + first * 3 + cur * 11 + x * 13 + y * 17;
++}
++/* 26. Max unroll factor boundary (trip = 16). */
++NOINLINE int k_trip16(void) {
++    int s = 0; for (int i = 0; i < 16; i++) s += A[i] ^ (i * 3); return s;
++}
++NOINLINE int k_trip16_carried(void) {
++    int s = 0, prev = A[0];
++    for (int i = 0; i < 16; i++) { s += prev; prev = A[i]; }
++    return s * 9 + prev;
++}
++/* 27. Descending stride 2 with `>=` and IV used in address + carry. */
++NOINLINE int k_desc_carried(void) {
++    int s = 0, last = -1;
++    for (int i = 20; i >= 4; i -= 2) { s += A[i - 4]; last = A[i]; }
++    return s * 100 + last;
++}
++/* 28. Runtime n, accumulator AND a "last" value live-out. */
++NOINLINE int k_live_mixed(int n) {
++    int s = 0, last = -1;
++    for (int i = 0; i < n; i++) { s += A[i] * i; last = A[i + 1]; }
++    return s * 100 + last;
++}
++/* 29. Wide index (i64 iv) with i32 body and a loop-invariant-carried phi. */
++NOINLINE long k_wide_inv(int n) {
++    long s = 0; int mul = 3;
++    for (long i = 0; i < n; i++) { s += LA[i] * mul; mul = n & 1; }
++    return s;
++}
