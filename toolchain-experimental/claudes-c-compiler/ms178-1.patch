@@ -1,799 +1,1572 @@
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index d84fbb66..a6d329ad 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -3518,6 +3518,12 @@ struct MapPattern {
-     /// GEPs for the source load streams (src[iv]); all advance by the same
-     /// byte induction variable.
-     src_geps: Vec<Value>,
-+    /// Indices into `src_geps` whose object root could not be proven
-+    /// disjoint from the destination.  The transform versions the loop with
-+    /// an exact runtime dependence-distance guard for each of them (see
-+    /// `emit_alias_guards`); an empty list means the packed loop is
-+    /// unconditionally legal.
-+    guarded_streams: Vec<usize>,
-     /// The elementwise expression stored to dst[iv].
-     expr: MapExpr,
-     /// All block indices in the loop body
-@@ -3960,23 +3966,52 @@ fn analyze_map_pattern(
-     // Only WRITE-vs-READ aliasing matters: source streams only read, so they
-     // may alias each other freely; each source must be disjoint from the
-     // destination (or the exact same GEP for lane-local in-place maps).
--    let dst_root = proven_object_root(func, dst_gep)?;
--    for &(_, _, src_gep, _) in &load_infos {
--        let src_root = proven_object_root(func, src_gep)?;
--        // Exact in-place maps are lane-local and safe (`a[i] = a[i] * s + b`).
--        // Otherwise require disjoint complete-object roots; merely seeing
--        // different SSA pointer values is not an alias proof.
--        if !geps_proven_identical(func, &loop_info.body, src_gep, dst_gep)
--            && !roots_proven_distinct(&dst_root, &src_root)
--        {
-+    // IV start: the transform's byte IV starts at element 0 and the scalar
-+    // remainder resumes at `iv * width`; both assume the counter starts at a
-+    // constant zero.  A non-zero or dynamic start is left to the stencil
-+    // path (which models `iv_start`) or stays scalar.  (Before this check a
-+    // `for (i = 1; ...) y[i] = 2 * x[i]` loop would have processed elements
-+    // 0.. in the packed body.)
-+    {
-+        let latch_label = func.blocks[latch_idx].label;
-+        let starts_at_zero = header.instructions.iter().any(|inst| {
-+            matches!(inst, Instruction::Phi { dest, incoming, .. }
-+                if *dest == iv
-+                    && incoming.iter().any(|(op, lbl)| *lbl != latch_label
-+                        && matches!(op, Operand::Const(c) if c.to_i64() == Some(0))))
-+        });
-+        if !starts_at_zero {
-+            set_reject("map induction variable does not start at a constant 0");
-+            return None;
-+        }
-+    }
-+
-+    // Alias legality.  Exact in-place streams (`a[i] = a[i] * s + b`) are
-+    // lane-local and always safe.  Streams whose complete-object root is
-+    // proven disjoint from the destination are safe.  Every other stream is
-+    // recorded for RUNTIME versioning: the transform emits one exact
-+    // dependence-distance check per such stream and enters the scalar loop
-+    // when the destination writes ahead of a read within one vector step.
-+    // Different SSA pointer values are NOT an alias proof; ordinary pointer
-+    // parameters may overlap.  Without versioning GCC/Clang/ICX vectorize
-+    // `y[i] = x[i] + z[i]` and LCCC did not.
-+    let dst_root = proven_object_root(func, dst_gep);
-+    let mut guarded_streams = Vec::new();
-+    for (idx, &(_, _, src_gep, _)) in load_infos.iter().enumerate() {
-+        if geps_proven_identical(func, &loop_info.body, src_gep, dst_gep) {
-+            continue;
-+        }
-+        let src_root = proven_object_root(func, src_gep);
-+        let distinct = matches!((&dst_root, &src_root),
-+            (Some(d), Some(s)) if roots_proven_distinct(d, s));
-+        if !distinct {
-             if debug {
-                 eprintln!(
--                    "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct: {:?} vs {:?}",
-+                    "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct ({:?} vs {:?}): runtime alias guard",
-                     dst_gep, src_gep, dst_root, src_root
-                 );
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index b2b919d..ebb80de 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -133,6 +133,13 @@ pub(crate) struct CodegenOptions {
+     /// with retpoline (-mindirect-branch=thunk-extern) to avoid indirect jumps that
+     /// objtool would reject.
+     pub(crate) no_jump_tables: bool,
++    /// Whether the target has BMI2 (`-mbmi2` or an enabling `-march`).
++    /// Gates SHLX/SHRX/SARX selection for variable shifts.
++    pub(crate) bmi2: bool,
++    /// Measured microarchitectural tuning row selected by `-mtune`/`-march`
++    /// (see `backend::x86::cpu_model`).  Drives every decision that depends
++    /// on instruction latency/µop facts rather than ISA availability.
++    pub(crate) tune: crate::backend::x86::cpu_model::X86Tune,
+     /// Whether the target has BMI1 (`-mbmi` or an enabling `-march`).
+     /// Gates scalar ANDN selection; emitting it without this contract would
+     /// introduce SIGILL on baseline x86-64.
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 761bc7b..7e25084 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -1216,13 +1216,28 @@ impl X86Codegen {
+                 }
              }
--            set_reject("map source/destination may alias (use restrict or exact in-place access)");
--            return None;
-+            guarded_streams.push(idx);
-         }
+             IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
+-                let (mnem32, mnem64) = shift_mnemonic(op);
+-                if use_32bit {
+-                    self.state
+-                        .emit_fmt(format_args!("    {} %cl, %eax", mnem32));
++                // Count already in %rcx, lhs in %rax: on Intel the VEX
++                // form is 1 µop against 2–3 for `shl %cl` (uops.info
++                // SHL_R64_CL vs SHLX_R64_R64_R64); on Zen both are 1 µop and
++                // the legacy encoding is shorter (tune row decides).
++                if self.tune.prefer_shlx(self.bmi2_enabled) {
++                    let (x32, x64) = super::emit::shiftx_mnemonic(op);
++                    if use_32bit {
++                        self.state
++                            .emit_fmt(format_args!("    {} %ecx, %eax, %eax", x32));
++                    } else {
++                        self.state
++                            .emit_fmt(format_args!("    {} %rcx, %rax, %rax", x64));
++                    }
+                 } else {
+-                    self.state
+-                        .emit_fmt(format_args!("    {} %cl, %rax", mnem64));
++                    let (mnem32, mnem64) = shift_mnemonic(op);
++                    if use_32bit {
++                        self.state
++                            .emit_fmt(format_args!("    {} %cl, %eax", mnem32));
++                    } else {
++                        self.state
++                            .emit_fmt(format_args!("    {} %cl, %rax", mnem64));
++                    }
+                 }
+             }
+             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index b1b0272..cdca7b5 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -329,6 +329,20 @@ pub(super) fn shift_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
      }
- 
-@@ -3996,6 +4031,7 @@ fn analyze_map_pattern(
-         exit_cmp_op,
-         dst_gep,
-         src_geps: load_infos.iter().map(|&(_, _, g, _)| g).collect(),
-+        guarded_streams,
-         expr,
-         loop_blocks: loop_info.body.clone(),
-     })
-@@ -4264,6 +4300,10 @@ struct StencilPattern {
-     /// The stored value (the expression tree root).
-     store_val: Value,
-     store_gep: Value,
-+    /// `src_base` and `dst_base` are different pointers whose object roots
-+    /// could not be proven disjoint: the transform versions the loop with a
-+    /// runtime dependence-distance guard (see `emit_alias_guards`).
-+    needs_alias_guard: bool,
  }
  
- /// Affine form `a*iv + b` over the loop IV, in BYTE units (GEP offsets).
-@@ -4711,15 +4751,45 @@ fn analyze_stencil_pattern(
-         return None;
-     }
- 
--    // Alias safety: distinct proven roots, or an exact lane-local in-place
--    // update (store disp 0 AND every tap disp 0).
--    let dst_root = proven_object_root(func, dst_base)?;
--    let src_root = proven_object_root(func, src_base)?;
--    let lane_local = dst_disp == 0 && load_infos.iter().all(|(_, _, _, a)| a.const_bytes == 0);
--    if dst_base != src_base && !roots_proven_distinct(&dst_root, &src_root) && !lane_local {
--        set_reject("stencil source/destination may alias (use restrict)");
--        return None;
--    }
-+    // Dependence legality.  A packed step performs all W loads before all W
-+    // stores, so the only illegal shape is a tap that reads an element the
-+    // SAME step stores earlier in scalar order: writes at byte
-+    // `dst + i*e + dst_disp`, reads at `src + i*e + tap`, and the read of
-+    // lane j observes the store of lane k < j iff
-+    //     0 < (dst + dst_disp) - (src + tap) < W*e.
-+    // Reads ahead of the write cursor (distance <= 0) and reads far behind
-+    // it (distance >= W*e) see exactly the values the scalar loop saw.
-+    //
-+    // * Same pointer root value: the distance is a compile-time constant per
-+    //   tap; reject statically when any tap is inside the window (this is
-+    //   `x[i] = x[i-1] + x[i]`, a true recurrence).  The window uses the
-+    //   widest lowering (8 x F32 / 4 x F64 = 32 bytes) because the lane
-+    //   count is chosen later.
-+    // * Proven-disjoint roots (restrict params, distinct globals/allocas):
-+    //   unconditionally legal.
-+    // * Otherwise: legal under a RUNTIME guard evaluating the same
-+    //   inequality once in the preheader (loop versioning; falls back to the
-+    //   exact scalar remainder over the whole range).
-+    //
-+    // The previous "lane-local" exemption accepted distinct, unproven
-+    // pointers whenever every displacement was 0 — but `scale(y, x)` with
-+    // `x == y - 1` is exactly the recurrence above, so that was unsound.
-+    const STATIC_WINDOW_BYTES: i64 = 32;
-+    let needs_alias_guard = if dst_base == src_base {
-+        if load_infos.iter().any(|(_, _, _, a)| {
-+            let distance = dst_disp - a.const_bytes;
-+            distance > 0 && distance < STATIC_WINDOW_BYTES
-+        }) {
-+            set_reject("stencil has a loop-carried dependence inside the vector window");
-+            return None;
-+        }
-+        false
-+    } else {
-+        let dst_root = proven_object_root(func, dst_base);
-+        let src_root = proven_object_root(func, src_base);
-+        !matches!((&dst_root, &src_root),
-+            (Some(d), Some(s)) if roots_proven_distinct(d, s))
-+    };
- 
-     // Constant trip counts of 4 or fewer are better left scalar (mirrors
-     // the map gate).
-@@ -4755,6 +4825,7 @@ fn analyze_stencil_pattern(
-             .collect(),
-         store_val,
-         store_gep,
-+        needs_alias_guard,
-     };
-     if debug {
-         eprintln!(
-@@ -4828,6 +4899,17 @@ fn transform_stencil_vector(
-         _ => IrConst::I64(n),
-     };
- 
-+    // Exact scalar remainder, built before any mutation (see the map
-+    // transform for the rationale); committed after the packed body.
-+    let Some(remainder) =
-+        build_stencil_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label)
-+    else {
-+        if debug {
-+            eprintln!("[VEC-STENCIL] scalar remainder mirror unavailable; bailing");
-+        }
-+        return 0;
-+    };
-+
-     // ── Vector trip count and the rewritten bound ─────────────────────────
-     // trip = limit − (cmp_k + iv_start); bound = trip/W + cmp_k + iv_start
-     // so the (iv + cmp_k) < bound form runs floor(trip/W) iterations.
-@@ -5146,8 +5228,31 @@ fn transform_stencil_vector(
-         changes += inserted;
-     }
- 
--    changes +=
--        insert_stencil_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label);
-+    let rem_header_label = remainder.header_label;
-+    let rem_iv_phi = remainder.iv_phi;
-+    changes += remainder.commit(func, pattern.header_idx);
-+
-+    if pattern.needs_alias_guard {
-+        let disp_min = pattern.taps.iter().map(|t| t.disp_bytes).min().unwrap_or(0);
-+        let disp_max = pattern.taps.iter().map(|t| t.disp_bytes).max().unwrap_or(0);
-+        changes += emit_alias_guards(
-+            func,
-+            preheader_idx,
-+            pattern.dst_base,
-+            pattern.dst_disp,
-+            &[AliasCheck {
-+                src_base: pattern.src_base,
-+                disp_min,
-+                disp_max,
-+            }],
-+            elem_size * vec_width as i64,
-+            rem_header_label,
-+            rem_iv_phi,
-+            Operand::Const(int_const(pattern.iv_start)),
-+            &mut next_val_id,
-+            &mut next_label,
-+        );
++/// BMI2 three-operand shift mnemonics (`shlx count, src, dst`).  One µop on
++/// every core that has BMI2 (uops.info SHLX_R64_R64_R64), count in any GPR,
++/// non-destructive; flags are left untouched, which no consumer of a
++/// variable shift relies on (a count of zero already leaves them undefined
++/// for the legacy form).
++pub(super) fn shiftx_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
++    match op {
++        IrBinOp::Shl => ("shlxl", "shlxq"),
++        IrBinOp::AShr => ("sarxl", "sarxq"),
++        IrBinOp::LShr => ("shrxl", "shrxq"),
++        _ => unreachable!("not a shift op"),
 +    }
- 
-     func.next_value_id = next_val_id;
-     func.next_label = next_label;
-@@ -5524,14 +5629,13 @@ fn emit_stencil_expr(
- /// Insert an exact scalar remainder for a vectorized stencil: a fresh loop
- /// over the unprocessed tail elements that recomputes the ORIGINAL
- /// expression (same ops, same order) from the tap GEP shapes.
--fn insert_stencil_remainder_loop(
--    func: &mut IrFunction,
-+fn build_stencil_remainder_loop(
-+    func: &IrFunction,
-     pattern: &StencilPattern,
-     vec_width: u64,
-     next_val_id: &mut u32,
-     next_label: &mut u32,
--) -> usize {
--    let mut changes = 0usize;
-+) -> Option<RemainderLoop> {
-     let elem_size: i64 = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
-     let int_const = |n: i64| match pattern.iv_ty {
-         IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
-@@ -5558,13 +5662,6 @@ fn insert_stencil_remainder_loop(
-     let i_rem_cmp_lhs = Value(*next_val_id);
-     *next_val_id += 1;
- 
--    // Redirect the vector loop's exit edge to the remainder entry.
--    if let Terminator::CondBranch { false_label, .. } =
--        &mut func.blocks[pattern.header_idx].terminator
--    {
--        *false_label = vec_exit_label;
--    }
--
-     // Remainder start element = iv_start + (vector-iv − iv_start) * width.
-     // The header phi at vector-loop exit holds the next unprocessed scalar
-     // IV under unit stepping; the byte-parallel lanes cover the width-fold
-@@ -5743,7 +5840,13 @@ fn insert_stencil_remainder_loop(
-         if let Some(&v) = remap.get(&node.0) {
-             return Some(v);
-         }
--        let def = defs.get(&node.0)?.clone();
-+        // Not defined inside the loop: a loop-invariant leaf (parameter,
-+        // preheader value, global address).  It dominates the remainder and
-+        // is reused as-is — exactly what the packed emitter broadcasts.
-+        let Some(def) = defs.get(&node.0).cloned() else {
-+            remap.insert(node.0, node);
-+            return Some(node);
-+        };
-         match def {
-             Instruction::BinOp {
-                 op, lhs, rhs, ty, ..
-@@ -5797,24 +5900,20 @@ fn insert_stencil_remainder_loop(
-                 remap.insert(node.0, dest);
-                 Some(dest)
++}
++
+ /// x86-64 code generator. Implements the ArchCodegen trait for the shared framework.
+ /// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
+ pub struct X86Codegen {
+@@ -427,6 +441,10 @@ pub struct X86Codegen {
+     /// True when the target has POPCNT (-mpopcnt or an enabling -march).
+     /// When false, Popcount lowers to an shr/adc bit loop.
+     pub(super) popcnt_enabled: bool,
++    /// True when the target has BMI2 (`-mbmi2` or an enabling -march).
++    pub(super) bmi2_enabled: bool,
++    /// Measured tuning row for the selected `-mtune`/`-march` core.
++    pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
+     /// True when the target has AVX2; gates YMM constant-size copies.
+     pub(super) avx2_enabled: bool,
+     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
+@@ -840,6 +858,8 @@ impl X86Codegen {
+             bmi1_enabled: false,
+             lzcnt_enabled: false,
+             popcnt_enabled: false,
++            bmi2_enabled: false,
++            tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
+             avx2_enabled: false,
+             avx512_enabled: false,
+             optimize_for_size: false,
+@@ -947,6 +967,15 @@ impl X86Codegen {
+         self.bmi1_enabled = opts.bmi1;
+         self.lzcnt_enabled = opts.lzcnt;
+         self.popcnt_enabled = opts.popcnt;
++        self.bmi2_enabled = opts.bmi2;
++        self.tune = opts.tune;
++        super::isel::set_shlx_mode(if opts.tune.prefer_shlx(opts.bmi2) {
++            super::isel::ShlxMode::Always
++        } else if opts.tune.shlx_saves_move(opts.bmi2) {
++            super::isel::ShlxMode::WhenItSavesAMove
++        } else {
++            super::isel::ShlxMode::Never
++        });
+         self.avx2_enabled = opts.avx2;
+         self.avx512_enabled = opts.avx512;
+         self.state.emit_cfi = opts.emit_cfi;
+@@ -3406,29 +3435,117 @@ impl X86Codegen {
+                     mnem64, shift_amount, dest_name
+                 ));
              }
--            // Invariant leaf: reuse the original value directly.
--            _ => {
--                remap.insert(node.0, node);
--                Some(node)
+-        } else {
+-            let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
+-            if rhs_conflicts {
+-                self.operand_to_rcx(rhs);
+-                self.operand_to_callee_reg(lhs, dest_phys);
+-            } else {
+-                self.operand_to_callee_reg(lhs, dest_phys);
+-                self.operand_to_rcx(rhs);
 -            }
-+            // Any other loop-local definition (Phi, Cast, Select, Load,
-+            // ...) is outside the mirrored grammar; the packed emitter
-+            // rejects the same nodes, so this is unreachable in practice
-+            // and fails closed if the two ever disagree.
-+            _ => None,
-         }
-     }
--    let Some(result) = remap_expr(
-+    let result = remap_expr(
-         pattern.store_val,
-         &defs,
-         &mut remap,
-         next_val_id,
-         &mut body_insts,
--    ) else {
--        // Without a remainder the transform would be unsound; the caller
--        // already replaced the store, so report failure (0 added blocks).
--        return 0;
--    };
-+    )?;
-     body_insts.push(Instruction::Store {
-         val: Operand::Value(result),
-         ptr: dst_gep_v,
-@@ -5842,14 +5941,14 @@ fn insert_stencil_remainder_loop(
-         source_spans: vec![],
-     };
- 
--    // The remainder blocks are appended at the end; the final layout pass
--    // re-orders everything in reverse post-order.
--    func.blocks.push(vec_exit_block);
--    func.blocks.push(rem_header_block);
--    func.blocks.push(rem_body_block);
--    func.blocks.push(rem_latch_block);
--    changes += 4;
--    changes
-+    // The blocks are appended by `RemainderLoop::commit`; the final layout
-+    // pass re-orders everything in reverse post-order.
-+    Some(RemainderLoop {
-+        blocks: vec![vec_exit_block, rem_header_block, rem_body_block, rem_latch_block],
-+        vec_exit_label,
-+        header_label: rem_header_label,
-+        iv_phi: i_rem_iv,
-+    })
- }
- 
- /// Check if a GEP uses the induction variable.
-@@ -11519,6 +11618,21 @@ fn transform_map_vector(
-         return 0;
-     };
- 
-+    // Build the exact scalar remainder BEFORE touching the function: if the
-+    // scalar mirror cannot be produced nothing has been mutated and the loop
-+    // simply stays scalar.  The blocks are committed (appended + exit edge
-+    // redirected) only after the packed body is in place.  (Redirecting the
-+    // exit edge first and bailing later left a dangling branch into the
-+    // next function's labels.)
-+    let Some(remainder) =
-+        build_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label)
-+    else {
-+        if debug {
-+            eprintln!("[VEC-MAP]   Scalar remainder mirror unavailable; bailing");
-+        }
-+        return 0;
-+    };
-+
-     // Build IV-derived values for comparison rewriting.
-     let mut iv_derived = FxHashSet::default();
-     iv_derived.insert(pattern.iv);
-@@ -11823,8 +11937,39 @@ fn transform_map_vector(
-         changes += inserted;
-     }
- 
--    changes +=
--        insert_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label);
-+    let rem_header_label = remainder.header_label;
-+    let rem_iv_phi = remainder.iv_phi;
-+    changes += remainder.commit(func, pattern.header_idx);
-+
-+    // Loop versioning for streams that may alias the destination.
-+    if !pattern.guarded_streams.is_empty() {
-+        let checks: Vec<AliasCheck> = pattern
-+            .guarded_streams
-+            .iter()
-+            .map(|&i| AliasCheck {
-+                src_base: src_bases[i],
-+                disp_min: 0,
-+                disp_max: 0,
-+            })
-+            .collect();
-+        let zero = match pattern.iv_ty {
-+            IrType::I32 | IrType::U32 => IrConst::I32(0),
-+            _ => IrConst::I64(0),
-+        };
-+        changes += emit_alias_guards(
-+            func,
-+            preheader_idx,
-+            dst_base,
-+            0,
-+            &checks,
-+            elem_size as i64 * vec_width as i64,
-+            rem_header_label,
-+            rem_iv_phi,
-+            Operand::Const(zero),
-+            &mut next_val_id,
-+            &mut next_label,
-+        );
-+    }
- 
-     func.next_value_id = next_val_id;
-     func.next_label = next_label;
-@@ -11835,16 +11980,230 @@ fn transform_map_vector(
-     changes
- }
- 
-+/// A scalar remainder loop built but not yet attached to the function.
-+struct RemainderLoop {
-+    blocks: Vec<BasicBlock>,
-+    /// Entry block (computes the resume element from the vector IV).
-+    vec_exit_label: BlockId,
-+    /// Remainder loop header; its IV phi is `iv_phi`.
-+    header_label: BlockId,
-+    iv_phi: Value,
-+}
-+
-+impl RemainderLoop {
-+    /// Append the blocks and redirect the vector header's exit edge to the
-+    /// remainder entry.  Returns the number of blocks added.
-+    fn commit(self, func: &mut IrFunction, header_idx: usize) -> usize {
-+        if let Terminator::CondBranch { false_label, .. } = &mut func.blocks[header_idx].terminator
-+        {
-+            *false_label = self.vec_exit_label;
-+        }
-+        let added = self.blocks.len();
-+        func.blocks.extend(self.blocks);
-+        added
-+    }
-+}
-+
-+/// One runtime dependence check between the destination stream and a source
-+/// stream of an elementwise loop.
-+struct AliasCheck {
-+    src_base: Value,
-+    /// Smallest and largest byte displacement read through `src_base`
-+    /// (equal for a plain `src[i]` stream).
-+    disp_min: i64,
-+    disp_max: i64,
-+}
-+
-+/// Loop versioning by exact dependence distance.
-+///
-+/// The packed body performs all `W` loads of a step before its `W` stores.
-+/// With destination writes at `D_i = dst + dst_disp + i*e` and reads at
-+/// `S_i = src + tap + i*e` (`tap ∈ [disp_min, disp_max]`), lane `j`'s read
-+/// observes lane `k < j`'s store — the only way the packed order differs
-+/// from scalar order — iff `0 < D - S < W*e`, i.e. iff
-+///
-+/// ```text
-+///     (dst + dst_disp) - (src + disp_min) - 1  <u  W*e + (disp_max - disp_min) - 1
-+/// ```
-+///
-+/// One subtraction, one decrement and one unsigned compare per stream.  The
-+/// check is exact for every byte offset (partial overlaps included); a zero
-+/// distance (in-place update) is correctly classified as SAFE, which LLVM's
-+/// coarser `dst - src >=u VF*e` check does not do.
-+///
-+/// Each check lives in its own block so the tests chain without a boolean
-+/// OR; a failing check enters the scalar remainder loop at the loop's first
-+/// element (`rem_start`), so no clone of the original loop is needed.  The
-+/// vector header's phis are re-pointed from the preheader to the last guard
-+/// block, which becomes their entry predecessor.
-+#[allow(clippy::too_many_arguments)]
-+fn emit_alias_guards(
-+    func: &mut IrFunction,
-+    preheader_idx: usize,
-+    dst_base: Value,
-+    dst_disp: i64,
-+    checks: &[AliasCheck],
-+    window_bytes: i64,
-+    rem_header_label: BlockId,
-+    rem_iv_phi: Value,
-+    rem_start: Operand,
-+    next_val_id: &mut u32,
-+    next_label: &mut u32,
-+) -> usize {
-+    if checks.is_empty() {
-+        return 0;
-+    }
-+    let Terminator::Branch(header_label) = func.blocks[preheader_idx].terminator else {
-+        return 0;
-+    };
-+    let preheader_label = func.blocks[preheader_idx].label;
-+    let mut changes = 0usize;
-+    let mut fresh = || {
-+        let v = Value(*next_val_id);
-+        *next_val_id += 1;
-+        v
-+    };
-+    let i64c = |n: i64| Operand::Const(IrConst::I64(n));
-+
-+    // Destination lane-0 address as an integer (hoisted; shared by all checks).
-+    let d_raw = fresh();
-+    let mut pending = vec![Instruction::Cast {
-+        dest: d_raw,
-+        src: Operand::Value(dst_base),
-+        from_ty: IrType::Ptr,
-+        to_ty: IrType::I64,
-+    }];
-+    let d = if dst_disp != 0 {
-+        let v = fresh();
-+        pending.push(Instruction::BinOp {
-+            dest: v,
-+            op: IrBinOp::Add,
-+            lhs: Operand::Value(d_raw),
-+            rhs: i64c(dst_disp),
-+            ty: IrType::I64,
-+        });
-+        v
-+    } else {
-+        d_raw
-+    };
-+
-+    let mut cur_idx = preheader_idx;
-+    let n = checks.len();
-+    for (i, check) in checks.iter().enumerate() {
-+        let s_raw = fresh();
-+        pending.push(Instruction::Cast {
-+            dest: s_raw,
-+            src: Operand::Value(check.src_base),
-+            from_ty: IrType::Ptr,
-+            to_ty: IrType::I64,
-+        });
-+        let s = if check.disp_min != 0 {
-+            let v = fresh();
-+            pending.push(Instruction::BinOp {
-+                dest: v,
-+                op: IrBinOp::Add,
-+                lhs: Operand::Value(s_raw),
-+                rhs: i64c(check.disp_min),
-+                ty: IrType::I64,
-+            });
-+            v
-+        } else {
-+            s_raw
-+        };
-+        let distance = fresh();
-+        pending.push(Instruction::BinOp {
-+            dest: distance,
-+            op: IrBinOp::Sub,
-+            lhs: Operand::Value(d),
-+            rhs: Operand::Value(s),
-+            ty: IrType::I64,
-+        });
-+        let distance_m1 = fresh();
-+        pending.push(Instruction::BinOp {
-+            dest: distance_m1,
-+            op: IrBinOp::Sub,
-+            lhs: Operand::Value(distance),
-+            rhs: i64c(1),
-+            ty: IrType::I64,
-+        });
-+        let unsafe_overlap = fresh();
-+        pending.push(Instruction::Cmp {
-+            dest: unsafe_overlap,
-+            op: IrCmpOp::Ult,
-+            lhs: Operand::Value(distance_m1),
-+            rhs: i64c(window_bytes + (check.disp_max - check.disp_min) - 1),
-+            ty: IrType::I64,
-+        });
-+        changes += pending.len();
-+        let next_target = if i + 1 == n {
-+            header_label
-+        } else {
-+            let l = BlockId(*next_label);
-+            *next_label += 1;
-+            l
-+        };
-+        let cur = &mut func.blocks[cur_idx];
-+        cur.instructions.append(&mut pending);
-+        cur.terminator = Terminator::CondBranch {
-+            cond: Operand::Value(unsafe_overlap),
-+            true_label: rem_header_label,
-+            false_label: next_target,
-+        };
-+        let cur_label = cur.label;
-+        add_phi_incoming(func, rem_header_label, rem_iv_phi, rem_start.clone(), cur_label);
-+        if i + 1 < n {
-+            func.blocks.push(BasicBlock {
-+                label: next_target,
-+                instructions: Vec::new(),
-+                terminator: Terminator::Branch(header_label),
-+                source_spans: vec![],
-+            });
-+            cur_idx = func.blocks.len() - 1;
-+        }
-+    }
-+
-+    // The last guard block is now the vector loop's entry predecessor.
-+    let entry_label = func.blocks[cur_idx].label;
-+    if entry_label != preheader_label {
-+        if let Some(header) = func.blocks.iter_mut().find(|b| b.label == header_label) {
-+            for inst in header.instructions.iter_mut() {
-+                if let Instruction::Phi { incoming, .. } = inst {
-+                    for (_, lbl) in incoming.iter_mut() {
-+                        if *lbl == preheader_label {
-+                            *lbl = entry_label;
+-            if use_32bit {
+-                self.state
+-                    .emit_fmt(format_args!("    {} %cl, %{}", mnem32, dest_name_32));
+-                if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
+-                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++        } else if self.bmi2_enabled {
++            // BMI2 three-operand form.  Both sources are read straight from
++            // their register homes when they have one, so `x << k` with x
++            // and k in argument registers is a single `shlxq %rsi,%rdi,%rax`
++            // (GCC 16.2 / Clang 23.1 / ICX emit exactly this); the legacy
++            // form below needs `mov`+`mov`+`shl %cl` and pins %rcx.  On
++            // Intel the legacy `shl r,cl` is additionally 3 µops (SNB..CLX)
++            // or 2 µops (ICL..RPL) against 1 for shlx (uops.info), so it is
++            // taken whenever a home is missing as well; on Zen (1 µop each)
++            // the VEX form is only used when it saves the copy, otherwise
++            // the 2–3 byte shorter legacy encoding wins.
++            let (xmnem32, xmnem64) = shiftx_mnemonic(op);
++            let gpr_home = |r: Option<PhysReg>| r.filter(|r| !is_xmm_reg(*r));
++            let count_home = gpr_home(self.operand_reg(rhs));
++            let lhs_home = gpr_home(self.operand_reg(lhs));
++            let saves_move = count_home.is_some() || lhs_home.is_some();
++            if self.tune.prefer_shlx(true) || (saves_move && self.tune.shlx_saves_move(true)) {
++                // Count operand: its own home, else staged in %rcx.  Stage
++                // BEFORE the lhs load when the lhs must land in the count's
++                // home register (dest == count home, lhs not homed).
++                let count_name: &str = match count_home {
++                    Some(r) if lhs_home.is_some() || r.0 != dest_phys.0 => phys_reg_name(r),
++                    _ => {
++                        self.operand_to_rcx(rhs);
++                        "rcx"
++                    }
++                };
++                let count_name = if use_32bit {
++                    match count_name {
++                        "rcx" => "ecx".to_string(),
++                        _ => phys_reg_name_32(count_home.unwrap()).to_string(),
++                    }
++                } else {
++                    count_name.to_string()
++                };
++                let src_name: String = match lhs_home {
++                    Some(r) => {
++                        if use_32bit {
++                            phys_reg_name_32(r).to_string()
++                        } else {
++                            phys_reg_name(r).to_string()
 +                        }
 +                    }
-+                }
++                    None => {
++                        self.operand_to_callee_reg(lhs, dest_phys);
++                        if use_32bit {
++                            dest_name_32.to_string()
++                        } else {
++                            dest_name.to_string()
++                        }
++                    }
++                };
++                if use_32bit {
++                    self.state.emit_fmt(format_args!(
++                        "    {} %{}, %{}, %{}",
++                        xmnem32, count_name, src_name, dest_name_32
++                    ));
++                    if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
++                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                    }
++                } else {
++                    self.state.emit_fmt(format_args!(
++                        "    {} %{}, %{}, %{}",
++                        xmnem64, count_name, src_name, dest_name
++                    ));
+                 }
+             } else {
+-                self.state
+-                    .emit_fmt(format_args!("    {} %cl, %{}", mnem64, dest_name));
++                self.emit_shift_cl_legacy(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest_value_id);
+             }
++        } else {
++            self.emit_shift_cl_legacy(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest_value_id);
+         }
+         self.state.reg_cache.invalidate_acc();
+     }
+ 
++    /// Legacy `shl/shr/sar %cl, %dest` for a variable count: lhs staged in
++    /// `dest`, count staged in `%rcx` (order chosen so neither load clobbers
++    /// the other's source).
++    fn emit_shift_cl_legacy(
++        &mut self,
++        op: IrBinOp,
++        lhs: &Operand,
++        rhs: &Operand,
++        dest_phys: PhysReg,
++        use_32bit: bool,
++        is_unsigned: bool,
++        dest_value_id: u32,
++    ) {
++        let dest_name = phys_reg_name(dest_phys);
++        let dest_name_32 = phys_reg_name_32(dest_phys);
++        let (mnem32, mnem64) = shift_mnemonic(op);
++        let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
++        if rhs_conflicts {
++            self.operand_to_rcx(rhs);
++            self.operand_to_callee_reg(lhs, dest_phys);
++        } else {
++            self.operand_to_callee_reg(lhs, dest_phys);
++            self.operand_to_rcx(rhs);
++        }
++        if use_32bit {
++            self.state
++                .emit_fmt(format_args!("    {} %cl, %{}", mnem32, dest_name_32));
++            if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
++                self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
 +            }
++        } else {
++            self.state
++                .emit_fmt(format_args!("    {} %cl, %{}", mnem64, dest_name));
 +        }
 +    }
-+    changes
++
+     /// Accumulator-based path: try immediate optimizations first.
+     /// Returns true if handled.
+     pub(super) fn try_emit_acc_immediate(
+@@ -3621,6 +3738,13 @@ fn collect_vregs_in_inst(
+             use_reg(dst, all);
+             def_reg(dst, all, defs);
+         }
++        MachInst::ShiftX {
++            count, src, dst, ..
++        } => {
++            use_reg(count, all);
++            use_reg(src, all);
++            def_reg(dst, all, defs);
++        }
+         MachInst::Lea {
+             base, index, dst, ..
+         } => {
+@@ -3939,6 +4063,19 @@ fn resolve_stack_vregs(
+             dst: *dst,
+             size: *size,
+         },
++        MachInst::ShiftX {
++            op,
++            count,
++            src,
++            dst,
++            size,
++        } => MachInst::ShiftX {
++            op: *op,
++            count: *count,
++            src: *src,
++            dst: *dst,
++            size: *size,
++        },
+         MachInst::Div {
+             divisor,
+             signed,
+@@ -3987,6 +4124,9 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32,
+         MachInst::Imul3 { src, dst, .. } => check_reg(src) || check_reg(dst),
+         MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => check_reg(dst),
+         MachInst::Shift { amount, dst, .. } => check_op(amount) || check_reg(dst),
++        MachInst::ShiftX {
++            count, src, dst, ..
++        } => check_reg(count) || check_reg(src) || check_reg(dst),
+         MachInst::Lea {
+             base, index, dst, ..
+         } => {
+diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
+index 31f9f37..48543f1 100644
+--- a/src/backend/x86/codegen/float_ops.rs
++++ b/src/backend/x86/codegen/float_ops.rs
+@@ -854,9 +854,18 @@ impl X86Codegen {
+             ("rax", "eax")
+         };
+ 
+-        // False-dependency break: only when dest is a different register from
+-        // src (xor would otherwise destroy the input).
+-        if src_name != dst_name && src_name != dst32 {
++        // False-dependency break, only where the tuning row says the core
++        // architecturally reads the destination (uops.info lat 1->1 = 3:
++        // POPCNT on SNB..CLX, LZCNT/TZCNT on SNB..BDW) and only when dest is
++        // a different register from src (xor would otherwise destroy the
++        // input).  Ice Lake+, Alder/Raptor Lake and every Zen skip it: there
++        // the xor is a pure front-end/code-size cost.  GCC 16.2 still emits
++        // it for tzcnt on Skylake, where uops.info measures no dependency.
++        let needs_break = match mnem {
++            "popcnt" => self.tune.break_popcnt_dep(),
++            _ => self.tune.break_lzcnt_tzcnt_dep(),
++        };
++        if needs_break && src_name != dst_name && src_name != dst32 {
+             self.state
+                 .emit_fmt(format_args!("    xorl %{0}, %{0}", dst32));
+         }
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 9f0b530..a3a49cd 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -385,8 +385,8 @@ pub fn lower_binop(
+ 
+     // ── Shift operations ─────────────────────────────────────────────
+     if let Some(shift_op) = binop_to_shift(op) {
+-        emit_mov_operand_r(lhs, dst, size, ra, out);
+         if let Some(imm) = const_as_imm32(rhs) {
++            emit_mov_operand_r(lhs, dst, size, ra, out);
+             let mask = if size == OpSize::S32 { 31 } else { 63 };
+             out.push(MachInst::Shift {
+                 op: shift_op,
+@@ -394,8 +394,23 @@ pub fn lower_binop(
+                 dst,
+                 size,
+             });
++        } else if try_lower_shiftx(shift_op, lhs, rhs, dst, size, ra, out) {
++            // `shlx count, src, dst`: no %rcx pin, no source copy, 1 µop.
+         } else {
+-            emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
++            // Two-address hazard (same shape as the ALU case above): when
++            // the count's home IS the destination register, `mov lhs,dst`
++            // would overwrite the count before it is copied to %rcx.  Copy
++            // the count out first in that case; otherwise keep lhs first so
++            // a count already sitting in %rcx is not clobbered.
++            let count_home_is_dst = matches!(rhs, Operand::Value(v)
++                if v.0 != dest.0 && value_to_reg(v, ra) == dst && matches!(dst, MachReg::Phys(_)));
++            if count_home_is_dst {
++                emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
++                emit_mov_operand_r(lhs, dst, size, ra, out);
++            } else {
++                emit_mov_operand_r(lhs, dst, size, ra, out);
++                emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
++            }
+             out.push(MachInst::Shift {
+                 op: shift_op,
+                 amount: MachOperand::Reg(MachReg::Phys(RCX)),
+@@ -977,6 +992,98 @@ pub fn lower_cond_branch(
+ /// looks exactly like everything being fine. The counters make the gap
+ /// visible and rank it, so work targets the biggest class rather than the
+ /// most obvious one.
++/// How eagerly isel selects the BMI2 three-operand shifts.  Set once per
++/// codegen run from `CodegenOptions` (tune row × `-mbmi2`); read by
++/// `lower_binop`.  A process-wide cell because isel is a set of pure free
++/// functions without a target context.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ShlxMode {
++    /// No BMI2, or an explicit opt-out.
++    Never,
++    /// Cores where `SHL r,cl` is already 1 µop (Zen): the VEX form only
++    /// pays when it removes a copy into %rcx or a copy of the source.
++    WhenItSavesAMove,
++    /// Cores where `SHL r,cl` is 2–3 µops (every Intel core): always.
++    Always,
 +}
 +
-+/// Add `(value, pred)` to the phi `phi` in the block labelled `block`.
-+fn add_phi_incoming(func: &mut IrFunction, block: BlockId, phi: Value, value: Operand, pred: BlockId) {
-+    if let Some(b) = func.blocks.iter_mut().find(|b| b.label == block) {
-+        for inst in b.instructions.iter_mut() {
-+            if let Instruction::Phi { dest, incoming, .. } = inst {
-+                if *dest == phi {
-+                    incoming.push((value, pred));
-+                    return;
-+                }
-+            }
-+        }
++static SHLX_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
++
++pub fn set_shlx_mode(m: ShlxMode) {
++    SHLX_MODE.store(m as u8, std::sync::atomic::Ordering::Relaxed);
++}
++
++pub fn shlx_mode() -> ShlxMode {
++    match SHLX_MODE.load(std::sync::atomic::Ordering::Relaxed) {
++        1 => ShlxMode::WhenItSavesAMove,
++        2 => ShlxMode::Always,
++        _ => ShlxMode::Never,
 +    }
 +}
 +
- /// Insert an exact scalar remainder for a vectorized map.  It mirrors the
- /// source element/IV widths and optional operations rather than assuming the
- /// old fixed I32/F32 `mul + add` shape.
--fn insert_map_remainder_loop(
--    func: &mut IrFunction,
-+fn build_map_remainder_loop(
-+    func: &IrFunction,
-     pattern: &MapPattern,
-     vec_width: u64,
-     next_val_id: &mut u32,
-     next_label: &mut u32,
--) -> usize {
-+) -> Option<RemainderLoop> {
-     let mut src_bases: Vec<Option<Value>> = vec![None; pattern.src_geps.len()];
-     let mut dst_base = None;
-     for &block_idx in &pattern.loop_blocks {
-@@ -11859,13 +12218,8 @@ fn insert_map_remainder_loop(
++/// Try to lower a variable-count shift to `ShiftX`.  Returns false (with
++/// `out` untouched) when a required operand has no physical home in a shape
++/// the three-operand form can consume without an extra copy that the
++/// legacy `Shift` would not also need, or when staging would clobber a
++/// source.  Only S32/S64 exist for shlx.
++fn try_lower_shiftx(
++    shift_op: ShiftOp,
++    lhs: &Operand,
++    rhs: &Operand,
++    dst: MachReg,
++    size: OpSize,
++    ra: &FxHashMap<u32, PhysReg>,
++    out: &mut Vec<MachInst>,
++) -> bool {
++    let mode = shlx_mode();
++    if mode == ShlxMode::Never || !matches!(size, OpSize::S32 | OpSize::S64) {
++        return false;
++    }
++    let MachReg::Phys(dst_phys) = dst else {
++        return false;
++    };
++    let phys_home = |op: &Operand| match op {
++        Operand::Value(v) => match value_to_reg(v, ra) {
++            MachReg::Phys(p) => Some(p),
++            MachReg::Vreg(_) => None,
++        },
++        Operand::Const(_) => None,
++    };
++    let count_home = phys_home(rhs);
++    let lhs_home = phys_home(lhs);
++    let saves_move = count_home.is_some() || lhs_home.is_some();
++    if mode == ShlxMode::WhenItSavesAMove && !saves_move {
++        return false;
++    }
++    // Staging through %rcx is impossible when the destination *is* %rcx
++    // and the other operand still has to be copied into it.
++    let needs_rcx = count_home.is_none() || (lhs_home.is_none() && count_home == Some(dst_phys));
++    if needs_rcx && dst_phys == RCX {
++        return false;
++    }
++    let count = if needs_rcx {
++        emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
++        MachReg::Phys(RCX)
++    } else {
++        MachReg::Phys(count_home.expect("checked"))
++    };
++    let src = match lhs_home {
++        Some(p) => MachReg::Phys(p),
++        None => {
++            emit_mov_operand_r(lhs, dst, size, ra, out);
++            dst
++        }
++    };
++    out.push(MachInst::ShiftX {
++        op: shift_op,
++        count,
++        src,
++        dst,
++        size,
++    });
++    true
++}
++
+ pub mod stats {
+     use std::sync::atomic::{AtomicU64, Ordering};
+     use std::sync::Mutex;
+diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
+index cb50e7e..9330b11 100644
+--- a/src/backend/x86/codegen/machinst.rs
++++ b/src/backend/x86/codegen/machinst.rs
+@@ -276,6 +276,19 @@ pub enum MachInst {
+         size: OpSize,
+     },
+ 
++    /// BMI2 three-operand shift: dst = src SHIFT count.  Count may live in
++    /// any GPR, the form is non-destructive and leaves EFLAGS untouched.
++    /// One µop on every core with BMI2 (uops.info SHLX_R64_R64_R64) against
++    /// 2–3 for `Shift` with a CL count on Intel.  Selected by isel only
++    /// when `isel::shlx_mode()` allows it (tune row + `-mbmi2`).
++    ShiftX {
++        op: ShiftOp,
++        count: MachReg,
++        src: MachReg,
++        dst: MachReg,
++        size: OpSize,
++    },
++
+     /// LEA: dst = base + index*scale + offset (3-address add).
+     /// x86 form: `leaq offset(%base, %index, scale), %dst`
+     Lea {
+diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
+index 528129e..e4adc8f 100644
+--- a/src/backend/x86/codegen/machinst_emit.rs
++++ b/src/backend/x86/codegen/machinst_emit.rs
+@@ -664,6 +664,32 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
              }
          }
+ 
++        MachInst::ShiftX {
++            op,
++            count,
++            src,
++            dst,
++            size,
++        } => {
++            let mnem = match (op, size) {
++                (ShiftOp::Shl, OpSize::S64) => "shlxq",
++                (ShiftOp::Shr, OpSize::S64) => "shrxq",
++                (ShiftOp::Sar, OpSize::S64) => "sarxq",
++                (ShiftOp::Shl, _) => "shlxl",
++                (ShiftOp::Shr, _) => "shrxl",
++                (ShiftOp::Sar, _) => "sarxl",
++            };
++            // shlx has no 8/16-bit form; isel only selects S32/S64.
++            let sz = if *size == OpSize::S64 { OpSize::S64 } else { OpSize::S32 };
++            out.emit_fmt(format_args!(
++                "    {} {}, {}, {}",
++                mnem,
++                fmt_reg(count, sz),
++                fmt_reg(src, sz),
++                fmt_reg(dst, sz)
++            ));
++        }
++
+         MachInst::Lea {
+             base,
+             index,
+diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+index 6b62737..757a1ea 100644
+--- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
++++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+@@ -136,6 +136,20 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
+     if t.starts_with("call") {
+         return FlagsEffect::Writes;
      }
--    let Some(dst_base) = dst_base else {
--        return 0;
--    };
--    let src_bases: Vec<Value> = match src_bases.into_iter().collect::<Option<Vec<_>>>() {
--        Some(v) => v,
--        None => return 0,
--    };
-+    let dst_base = dst_base?;
-+    let src_bases: Vec<Value> = src_bases.into_iter().collect::<Option<Vec<_>>>()?;
- 
-     let vec_exit_label = BlockId(*next_label);
-     *next_label += 1;
-@@ -11889,13 +12243,6 @@ fn insert_map_remainder_loop(
-     let offset_v = fresh();
-     let gep_dst = fresh();
- 
--    // Redirect the vectorized header's known false/exit edge.
--    if let Terminator::CondBranch { false_label, .. } =
--        &mut func.blocks[pattern.header_idx].terminator
--    {
--        *false_label = vec_exit_label;
--    }
--
-     let iv_width_const = match pattern.iv_ty {
-         IrType::I32 | IrType::U32 => IrConst::I32(vec_width as i32),
-         _ => IrConst::I64(vec_width as i64),
-@@ -11976,16 +12323,14 @@ fn insert_map_remainder_loop(
-     // Sqrt re-emits the scalar SqrtF32/SqrtF64 intrinsic, and BinOps re-emit
-     // the identical scalar operation — lane-exact by construction.
-     let mut next_val_local = *next_val_id;
--    let Some(scalar_result) = emit_map_scalar_tree(
-+    let scalar_result = emit_map_scalar_tree(
-         &pattern.expr,
-         &src_bases,
-         pattern,
-         Operand::Value(offset_v),
-         &mut remainder_insts,
-         &mut next_val_local,
--    ) else {
--        return 0;
--    };
-+    )?;
-     *next_val_id = next_val_local;
-     remainder_insts.push(Instruction::Store {
-         volatile: false,
-@@ -12015,12 +12360,17 @@ fn insert_map_remainder_loop(
-         source_spans: vec![],
-     };
- 
--    func.blocks.push(vec_exit_block);
--    func.blocks.push(remainder_header_block);
--    func.blocks.push(remainder_body_block);
--    func.blocks.push(remainder_latch_block);
--
--    4
-+    Some(RemainderLoop {
-+        blocks: vec![
-+            vec_exit_block,
-+            remainder_header_block,
-+            remainder_body_block,
-+            remainder_latch_block,
-+        ],
-+        vec_exit_label,
-+        header_label: remainder_header_label,
-+        iv_phi: i_rem_iv,
-+    })
++    // BMI2 VEX shifts (`shlx/shrx/sarx`) and the other flag-neutral BMI2
++    // ops leave EFLAGS untouched; they must be classified before the prefix
++    // table below, which would otherwise match them as "shl"/"shr"/"sar"
++    // writers and let a later scan treat an earlier `cmp`'s flags as dead.
++    if t.starts_with("shlx")
++        || t.starts_with("shrx")
++        || t.starts_with("sarx")
++        || t.starts_with("rorx")
++        || t.starts_with("pdep")
++        || t.starts_with("pext")
++        || t.starts_with("mulx")
++    {
++        return FlagsEffect::Neutral;
++    }
+     const WRITERS: &[&str] = &[
+         "add", "sub", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "imul", "mul", "div",
+         "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bsf", "bsr", "popcnt", "lzcnt",
+diff --git a/src/backend/x86/codegen/peephole/passes/helpers.rs b/src/backend/x86/codegen/peephole/passes/helpers.rs
+index a9a96b0..5420039 100644
+--- a/src/backend/x86/codegen/peephole/passes/helpers.rs
++++ b/src/backend/x86/codegen/peephole/passes/helpers.rs
+@@ -467,6 +467,9 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
+         || trimmed.starts_with("bextr")
+         || trimmed.starts_with("pext")
+         || trimmed.starts_with("pdep")
++        || trimmed.starts_with("shlx")
++        || trimmed.starts_with("shrx")
++        || trimmed.starts_with("sarx")
+     {
+         return false;
+     }
+diff --git a/src/backend/x86/codegen/peephole/passes/liveness.rs b/src/backend/x86/codegen/peephole/passes/liveness.rs
+index 7dc40b6..18afb94 100644
+--- a/src/backend/x86/codegen/peephole/passes/liveness.rs
++++ b/src/backend/x86/codegen/peephole/passes/liveness.rs
+@@ -86,6 +86,10 @@ fn is_pure_write_mnemonic(t: &str) -> bool {
+         || t.starts_with("lzcnt")
+         || t.starts_with("tzcnt")
+         || t.starts_with("popcnt")
++        // BMI2 three-operand shifts always write their destination.
++        || t.starts_with("shlx")
++        || t.starts_with("shrx")
++        || t.starts_with("sarx")
  }
  
- /// Scalar mirror of the map expression tree for the exact remainder loop
-diff --git a/tests/regression/vec_alias_versioning.c b/tests/regression/vec_alias_versioning.c
+ fn mnemonic_is_known(t: &str) -> bool {
+diff --git a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+index 7499f60..3b9c0d6 100644
+--- a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
++++ b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+@@ -170,6 +170,9 @@ fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
+             | "lzcntl"
+             | "tzcntl"
+             | "andnl"
++            | "shlxl"
++            | "shrxl"
++            | "sarxl"
+     )
+ }
+ 
+@@ -594,6 +597,9 @@ fn is_32bit_zero_extend_write(op: &str) -> bool {
+             | "blsrl"
+             | "blsil"
+             | "bzhil"
++            | "shlxl"
++            | "shrxl"
++            | "sarxl"
+     )
+ }
+ 
+diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+index c9d26c1..ad21570 100644
+--- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
++++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+@@ -117,7 +117,10 @@ pub(super) fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
+         || t.starts_with("blsr")
+         || t.starts_with("blsi")
+         || t.starts_with("blsmsk")
+-        || t.starts_with("bzhi");
++        || t.starts_with("bzhi")
++        || t.starts_with("shlx")
++        || t.starts_with("shrx")
++        || t.starts_with("sarx");
+     if !is_producer {
+         // `xorl %r10d, %r10d` (self-zeroing) is a full write as well.
+         let name32 = REG_NAMES[1][fam as usize];
+diff --git a/src/backend/x86/cpu_model.rs b/src/backend/x86/cpu_model.rs
 new file mode 100644
-index 00000000..e7667bea
+index 0000000..ab5ba86
 --- /dev/null
-+++ b/tests/regression/vec_alias_versioning.c
-@@ -0,0 +1,97 @@
-+/* Elementwise (map/stencil) vectorization: dependence legality and runtime
-+ * alias versioning.
-+ *
-+ * Every kernel below is written WITHOUT `restrict`, so the compiler cannot
-+ * prove the streams disjoint.  Each is exercised with disjoint buffers, with
-+ * exact in-place aliasing, and with the destination running one/two/seven
-+ * elements (and 2 bytes) ahead of and behind the source.  The scalar
-+ * semantics (a recurrence when the destination is 1..W-1 elements ahead of
-+ * the source) must be preserved either by the runtime dependence-distance
-+ * guard entering the scalar loop, or by not vectorizing at all.
-+ *
-+ * Root cause pinned (upstream 5649e279, -O2): the stencil path accepted
-+ * `y[i] = a * x[i]` with distinct unproven pointers and then failed to build
-+ * its scalar remainder (the invariant leaf `a` is defined outside the loop),
-+ * leaving the vector header's exit edge pointing at a label that was never
-+ * created -- the function fell through into the next one and `scale()`
-+ * wrote nothing at all.  Trip counts here are all non-multiples of 8 so the
-+ * remainder loop is exercised on every call. */
-+#include <stdio.h>
-+#include <string.h>
++++ b/src/backend/x86/cpu_model.rs
+@@ -0,0 +1,829 @@
++//! x86 CPU tuning model: measured microarchitectural facts that drive
++//! target-dependent code-generation decisions.
++//!
++//! # Design
++//!
++//! GCC (`x86-tune.def`) and LLVM (`X86.td` `Tuning*` features) both encode
++//! tuning as *boolean feature bits* whose meaning is hidden in the pass that
++//! consumes them, and both assign those bits by *lineage* ("every core after
++//! Haswell inherits Haswell's tuning") rather than by measurement.  Two
++//! consequences visible in their output today (verified with
++//! `scripts/godbolt.py`, GCC 16.2 / Clang 23.1 / ICX; see
++//! `docs/CPU_MODEL_AUDIT.md`):
++//!
++//! * GCC 16.2 `-march=skylake` emits `xorl %eax,%eax; tzcntq %rdi,%rax`
++//!   although uops.info measures **no** output dependency for TZCNT/LZCNT on
++//!   Skylake (`TZCNT_R64_R64`, lat 1→1 = 0); only POPCNT retains it there.
++//!   The single `X86_TUNE_AVOID_FALSE_DEP_FOR_BMI` bit cannot express that.
++//! * LLVM keeps `TuningSlow3OpsLEA` on Ice Lake and Alder Lake although
++//!   uops.info shows the 3-component LEA moved from `p1` (throughput 1.0)
++//!   to `p0156` (throughput 0.31 / 0.20) there, i.e. it is no longer slow.
++//!
++//! This module therefore stores **numbers** (latencies, µop counts, port
++//! throughputs, structure sizes) per microarchitecture, one row per
++//! measurement, and derives the decisions from the numbers.  Every field
++//! carries its provenance:
++//!
++//! * `[uops.info]` — measured by the uops.info harness
++//!   (Abel & Reineke, "uops.info: Characterizing Latency, Throughput, and
++//!   Port Usage of Instructions on Intel Microarchitectures", ASPLOS 2019),
++//!   instruction page named in the comment.  Values were re-read from the
++//!   live site during the session that introduced the field.
++//! * `[Agner]` — Agner Fog, "Instruction tables" / "The microarchitecture of
++//!   Intel, AMD and VIA CPUs" (2024 edition).
++//! * `[Intel ORM]`, `[AMD SOG]` — vendor optimisation manuals.
++//! * `[cpuid]` — architectural, not a measurement.
++//!
++//! A field with no provenance line is not allowed in this file.
++//!
++//! # Scope
++//!
++//! Sandy Bridge and later Intel Core, Alder Lake/Raptor Lake hybrid parts
++//! (P-core numbers; the E-core column is noted where uops.info has it), and
++//! AMD Zen 1–5.  Older cores and Atom-class parts resolve to the
++//! conservative `Generic` row.
++//!
++//! # Policy for `Generic`
++//!
++//! `Generic` is what `-mtune` defaults to when neither `-march` nor
++//! `-mtune` names a CPU.  It must be *safe* on every supported core: where
++//! a work-around costs one eliminated µop on the cores that do not need it
++//! but saves a multi-cycle dependency chain on the cores that do, the
++//! work-around is on.  Where the choice is a pure win everywhere
++//! (e.g. SHLX over `SHL r,cl`), it is on.
++//!
++//! # Extending the model
++//!
++//! Add the measured number, its provenance, and a unit test that pins it.
++//! Then derive the decision in a `fn` on [`X86Tune`] so callers never read
++//! raw numbers.  Never add a bare `bool` that a pass "interprets".
 +
-+#define N 61
++use std::sync::OnceLock;
 +
-+__attribute__((noinline)) void scale_f(float *y, const float *x, float a, int n)
-+{ for (int i = 0; i < n; i++) y[i] = a * x[i]; }
-+__attribute__((noinline)) void scale_d(double *y, const double *x, double a, int n)
-+{ for (int i = 0; i < n; i++) y[i] = x[i] * a; }
-+__attribute__((noinline)) void add3_f(float *y, const float *x, const float *z, int n)
-+{ for (int i = 0; i < n; i++) y[i] = x[i] + z[i]; }
-+__attribute__((noinline)) void add3_i(int *y, const int *x, const int *z, int n)
-+{ for (int i = 0; i < n; i++) y[i] = x[i] + z[i]; }
-+__attribute__((noinline)) void axpy_f(float *y, const float *x, float a, int n)
-+{ for (int i = 0; i < n; i++) y[i] = a * x[i] + y[i]; }
-+__attribute__((noinline)) void addto_i(int *y, const int *x, int n)
-+{ for (int i = 0; i < n; i++) y[i] += x[i]; }
-+__attribute__((noinline)) void sub_f(float *y, const float *x, const float *z, int n)
-+{ for (int i = 0; i < n; i++) y[i] = x[i] - z[i] * 0.5f; }
-+__attribute__((noinline)) void stencil3(float *y, const float *x, int n)
-+{ for (int i = 1; i < n - 1; i++) y[i] = 0.25f * x[i - 1] + 0.5f * x[i] + 0.25f * x[i + 1]; }
-+/* True recurrence on one pointer: must never be vectorized. */
-+__attribute__((noinline)) void prefix_f(float *x, int n)
-+{ for (int i = 1; i < n; i++) x[i] = x[i - 1] + x[i]; }
-+/* Reads ahead of the write cursor on one pointer: legal to vectorize. */
-+__attribute__((noinline)) void shift_f(float *x, int n)
-+{ for (int i = 0; i < n - 1; i++) x[i] = x[i + 1] * 2.0f; }
-+/* Non-zero start: the map path used to assume element 0. */
-+__attribute__((noinline)) void from_one(float *y, const float *x, int n)
-+{ for (int i = 1; i < n; i++) y[i] = 2.0f * x[i]; }
++/// Microarchitectures the tuning model distinguishes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub enum X86Cpu {
++    /// Conservative blend: safe on every Sandy Bridge+ / Zen core.
++    Generic,
++    SandyBridge,
++    IvyBridge,
++    Haswell,
++    Broadwell,
++    /// Skylake client and its derivatives (Kaby/Coffee/Comet Lake) share
++    /// the core; they are the same row.
++    Skylake,
++    /// Skylake-SP / Cascade Lake / Cooper Lake (Skylake core + AVX-512).
++    SkylakeAvx512,
++    /// Ice Lake client/server, Tiger Lake, Rocket Lake (Sunny/Cypress Cove).
++    IceLake,
++    /// Alder Lake / Raptor Lake P-core (Golden/Raptor Cove).  Decisions are
++    /// made for the P-core, which runs the hot code under the default
++    /// scheduler; Gracemont numbers are noted in the field comments.
++    AlderLake,
++    /// Sapphire/Emerald Rapids (Golden Cove server + AVX-512).
++    SapphireRapids,
++    /// Arrow Lake / Lunar Lake (Lion Cove P-core).
++    ArrowLake,
++    Znver1,
++    Znver2,
++    Znver3,
++    Znver4,
++    Znver5,
++}
 +
-+static unsigned long long h;
-+static void mix(double v) { unsigned long long b; memcpy(&b, &v, 8); h = (h ^ b) * 0x100000001b3ULL; }
-+static void dump_f(const char *tag, const float *p, int n)
-+{ double s = 0; for (int i = 0; i < n; i++) { s += p[i] * (i + 1); mix(p[i]); } printf("%s %.9g\n", tag, s); }
-+static void dump_i(const char *tag, const int *p, int n)
-+{ long long s = 0; for (int i = 0; i < n; i++) { s += (long long)p[i] * (i + 1); mix(p[i]); } printf("%s %lld\n", tag, s); }
-+static void dump_d(const char *tag, const double *p, int n)
-+{ double s = 0; for (int i = 0; i < n; i++) { s += p[i] * (i + 1); mix(p[i]); } printf("%s %.17g\n", tag, s); }
++/// One tuning row.  Latencies in cycles; reciprocal throughputs ×100 so the
++/// row stays integer and `Copy`.  Zero means "not available on this core".
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct X86Tune {
++    pub cpu: X86Cpu,
++    /// GCC/Clang-compatible spelling used in diagnostics.
++    pub name: &'static str,
 +
-+static float fb[3][N + 32];
-+static double db[2][N + 32];
-+static int ib[3][N + 32];
-+static void init(void)
-+{
-+    for (int i = 0; i < N + 32; i++) {
-+        fb[0][i] = 1.0f + i * 0.125f; fb[1][i] = 2.0f - i * 0.0625f; fb[2][i] = (i % 7) - 3.0f;
-+        db[0][i] = 1.0 + i * 0.125; db[1][i] = 3.0 - i * 0.25;
-+        ib[0][i] = i * 3 - 40; ib[1][i] = 100 - i * 5; ib[2][i] = i * i;
++    // ------------------------------------------------------------------
++    // False output dependencies.  `[uops.info]` "Latency operand 1 → 1"
++    // of POPCNT_R64_R64 / LZCNT_R64_R64 / TZCNT_R64_R64: 3 cycles where the
++    // destination is (wrongly) read, 0 where it is not.
++    // ------------------------------------------------------------------
++    /// POPCNT reads its destination: SNB, IVB, HSW, BDW, SKL, SKX, CLX.
++    /// Fixed on ICL/TGL/RKL/ADL-P/ADL-E and on every Zen.
++    pub popcnt_false_dep: bool,
++    /// LZCNT/TZCNT read their destination: SNB, IVB, HSW, BDW.  Fixed on
++    /// SKL and later (measured 0 on SKL/SKX/CLX/ICL/ADL) and on every Zen.
++    pub lzcnt_tzcnt_false_dep: bool,
++
++    // ------------------------------------------------------------------
++    // Shifts by CL.  `[uops.info]` SHL_R64_CL "Number of µops" and measured
++    // unrolled throughput; SHLX_R64_R64_R64 is 1 µop with rTP 0.5 (Intel
++    // p06) / 0.25–0.33 (Zen) everywhere it exists.
++    // ------------------------------------------------------------------
++    /// µops of `SHL r64, CL`: 3 on SNB..CLX (rTP 1.5–2.0), 2 on ICL/TGL/
++    /// RKL/ADL-P (rTP 1.0), 1 on every Zen (rTP 0.25–0.5).
++    pub shift_cl_uops: u8,
++
++    // ------------------------------------------------------------------
++    // LEA.  `[uops.info]` LEA_B_I_D8_R64 (base+index+disp8): SNB..SKL
++    // execute it on p1 only with rTP 1.0 (the 3-cycle "slow LEA" [Agner]);
++    // ICL runs it on p0156 rTP 0.31, ADL-P on p0156B rTP 0.20 → 1 cycle.
++    // Zen: 2 cycles for 3 components [Agner, Zen tables], rTP 0.5.
++    // ------------------------------------------------------------------
++    /// Latency of a 3-component LEA (base + index + displacement).
++    pub lea3_latency: u8,
++
++    // ------------------------------------------------------------------
++    // CMOV.  `[uops.info]` CMOVB_R64_R64: 2 µops (p015+p05 / p0156+p06),
++    // lat 2 on SNB/IVB/HSW; 1 µop lat 1 from BDW on and on every Zen.
++    // ------------------------------------------------------------------
++    pub cmov_uops: u8,
++    pub cmov_latency: u8,
++
++    // ------------------------------------------------------------------
++    // Integer multiply / divide.  `[uops.info]` IMUL_R64_R64 latency 3 on
++    // every P-core and Zen (5 on ADL-E).  DIV_R64 latency (operand 1→3,
++    // dividend→quotient) and measured rTP: SNB 29/22.6, IVB 30/22.4,
++    // HSW 30/21, BDW 30/21, SKL 34/21, SKX 34/21, CLX 34/21, ICL 18/10,
++    // TGL 18/10, RKL 18/10, ADL-P 18/10, ADL-E 13/6, Zen+ 10/14,
++    // Zen2 10/14, Zen3 10/7, Zen4 10/7, Zen5 10/7.
++    // ------------------------------------------------------------------
++    pub imul64_latency: u8,
++    pub div64_latency: u8,
++    /// Reciprocal throughput of DIV r64 ×100.
++    pub div64_rtp_x100: u16,
++
++    // ------------------------------------------------------------------
++    // Floating point.  `[Agner]` VFMADD231PS ymm: HSW/BDW 5, SKL..SKX 4,
++    // ICL 4, ADL-P 4, Zen1/2 5, Zen3+ 4; not present on SNB/IVB.
++    // VADDPS ymm: SNB..BDW 3, SKL..RKL 4 (executed on the FMA unit),
++    // ADL-P 3 (dedicated adder), Zen 3.  VMULPS ymm: SNB..HSW 5, BDW 3,
++    // SKL+ 4, Zen 3.  256-bit FMA-capable pipes: 2 on every listed core
++    // except Zen1 (2×128 halves → counted as 1).
++    // ------------------------------------------------------------------
++    pub fma_latency: u8,
++    pub fadd_latency: u8,
++    pub fmul_latency: u8,
++    pub fma_pipes: u8,
++
++    // ------------------------------------------------------------------
++    // Memory.  `[cpuid]` ERMS (Enhanced REP MOVSB): IVB+ Intel, all Zen.
++    // FSRM (Fast Short REP MOV): ICL+ Intel, Zen4+.  `[Agner]` SNB/IVB
++    // execute a 32-byte load as two 16-byte halves; the 256-bit load path
++    // is full width from HSW on.
++    // ------------------------------------------------------------------
++    pub erms: bool,
++    pub fsrm: bool,
++    pub avx256_unaligned_split: bool,
++
++    // ------------------------------------------------------------------
++    // Out-of-order / front-end structure sizes.  `[Intel ORM]`, `[Agner
++    // microarchitecture]`, `[AMD SOG]`.  Recorded for the unroll,
++    // scheduling and software-pipelining cost models; no decision consumes
++    // them yet because they cannot be validated without the hardware (see
++    // docs/FOLLOWUP_CPU_MODEL.md).
++    // ------------------------------------------------------------------
++    /// Reorder-buffer entries: SNB/IVB 168, HSW/BDW 192, SKL/SKX 224,
++    /// ICL/TGL/RKL 352, ADL-P/SPR 512, ARL 576, Zen1 192, Zen2 224,
++    /// Zen3 256, Zen4 320, Zen5 448.
++    pub rob_entries: u16,
++    /// Loop-stream-detector capacity in µops (0 = none / disabled by
++    /// microcode): SNB/IVB 28, HSW/BDW 56, SKL/SKX/CLX 0 (erratum
++    /// SKL150), ICL 0 (disabled), ADL-P 192, Zen 0.
++    pub lsd_uops: u16,
++    /// Decoded-µop cache capacity: SNB..SKX 1536, ICL 2304, ADL-P 4096,
++    /// ARL 4096, Zen1 2048, Zen2/3 4096, Zen4 6912, Zen5 6144.
++    pub uop_cache_uops: u16,
++    /// Skylake-derived cores (SKL/KBL/CFL/CML/SKX/CLX) lose the DSB for a
++    /// 32-byte window containing a JCC that touches the boundary after the
++    /// 2019 microcode update (Intel JCC erratum, white paper 341810).
++    /// Recorded for a future `-mbranches-within-32B-boundaries` default.
++    pub jcc_erratum: bool,
++}
++
++impl X86Cpu {
++    /// Map a `-march=`/`-mtune=` spelling (GCC/Clang vocabulary) to a row.
++    /// Returns `None` for names the driver does not know at all; names it
++    /// knows but has no dedicated row for resolve to the closest core.
++    pub fn from_name(name: &str) -> Option<X86Cpu> {
++        use X86Cpu::*;
++        Some(match name {
++            "generic" | "x86-64" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4" | "nocona"
++            | "core2" | "nehalem" | "westmere" | "silvermont" | "goldmont"
++            | "goldmont-plus" | "tremont" | "bonnell" | "atom" | "k8" | "opteron"
++            | "barcelona" | "bdver1" | "bdver2" | "bdver3" | "bdver4" | "btver1"
++            | "btver2" | "knl" | "knm" | "intel" => Generic,
++            "sandybridge" | "corei7-avx" => SandyBridge,
++            "ivybridge" | "core-avx-i" => IvyBridge,
++            "haswell" | "core-avx2" => Haswell,
++            "broadwell" => Broadwell,
++            "skylake" | "kabylake" | "coffeelake" | "cometlake" | "amberlake"
++            | "whiskeylake" => Skylake,
++            "skylake-avx512" | "cascadelake" | "cooperlake" | "cannonlake" => SkylakeAvx512,
++            "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => IceLake,
++            "alderlake" | "raptorlake" | "raptor-lake" | "meteorlake" | "gracemont"
++            | "sierraforest" | "grandridge" | "clearwaterforest" => AlderLake,
++            "sapphirerapids" | "emeraldrapids" | "graniterapids" | "graniterapids-d" => {
++                SapphireRapids
++            }
++            "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake" | "wildcatlake" => {
++                ArrowLake
++            }
++            "znver1" => Znver1,
++            "znver2" => Znver2,
++            "znver3" => Znver3,
++            "znver4" => Znver4,
++            "znver5" => Znver5,
++            _ => return None,
++        })
++    }
++
++    /// Identify the host core from CPUID family/model (leaf 1) for
++    /// `-march=native` / `-mtune=native`.
++    #[cfg(target_arch = "x86_64")]
++    pub fn detect_host() -> X86Cpu {
++        // CPUID is unprivileged and available on every x86-64 CPU (the
++        // intrinsic is safe since Rust 1.86).
++        let vendor = std::arch::x86_64::__cpuid(0);
++        let leaf1 = std::arch::x86_64::__cpuid(1);
++        let vendor_bytes = [
++            vendor.ebx.to_le_bytes(),
++            vendor.edx.to_le_bytes(),
++            vendor.ecx.to_le_bytes(),
++        ]
++        .concat();
++        let is_amd = &vendor_bytes[..] == b"AuthenticAMD";
++        let is_intel = &vendor_bytes[..] == b"GenuineIntel";
++        let eax = leaf1.eax;
++        let family = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
++        let model = ((eax >> 4) & 0xF) | ((eax >> 12) & 0xF0);
++        Self::from_signature(is_intel, is_amd, family, model)
++    }
++
++    /// Pure family/model decoder behind [`Self::detect_host`], separated so
++    /// it can be unit-tested on any host.  Model numbers from Intel SDM
++    /// Vol. 4 Ch. 2 and the Linux `intel-family.h` / AMD cpu tables.
++    /// Parts newer than the table resolve to the newest known core of their
++    /// vendor line; unknown vendors resolve to `Generic`.
++    pub fn from_signature(is_intel: bool, is_amd: bool, family: u32, model: u32) -> X86Cpu {
++        use X86Cpu::*;
++        if is_intel && family == 6 {
++            return match model {
++                0x2A | 0x2D => SandyBridge,
++                0x3A | 0x3E => IvyBridge,
++                0x3C | 0x3F | 0x45 | 0x46 => Haswell,
++                0x3D | 0x47 | 0x4F | 0x56 => Broadwell,
++                0x4E | 0x5E | 0x8E | 0x9E | 0xA5 | 0xA6 => Skylake,
++                // 06_55H: stepping <5 SKX, 5–6 CLX, ≥10 CPX — same core.
++                0x55 | 0x66 => SkylakeAvx512,
++                0x7D | 0x7E | 0x6A | 0x6C | 0x8C | 0x8D | 0xA7 => IceLake,
++                0x97 | 0x9A | 0xB7 | 0xBA | 0xBF | 0xBE | 0xAA | 0xAC | 0xB5 | 0xDD => {
++                    AlderLake
++                }
++                0x8F | 0xCF | 0xAD | 0xAE => SapphireRapids,
++                0xC6 | 0xC5 | 0xBD | 0xCC => ArrowLake,
++                m if m > 0xC6 => ArrowLake,
++                _ => Generic,
++            };
++        }
++        if is_amd {
++            return match family {
++                0x17 => match model {
++                    0x00..=0x2F => Znver1,
++                    _ => Znver2,
++                },
++                0x19 => match model {
++                    0x10..=0x1F | 0x60..=0x7F | 0xA0..=0xAF => Znver4,
++                    _ => Znver3,
++                },
++                f if f >= 0x1A => Znver5,
++                _ => Generic,
++            };
++        }
++        Generic
++    }
++
++    /// The tuning row for this core.
++    pub const fn tune(self) -> X86Tune {
++        use X86Cpu::*;
++        const fn snb_like(cpu: X86Cpu, name: &'static str, erms: bool) -> X86Tune {
++            X86Tune {
++                cpu,
++                name,
++                popcnt_false_dep: true,
++                lzcnt_tzcnt_false_dep: true,
++                shift_cl_uops: 3,
++                lea3_latency: 3,
++                cmov_uops: 2,
++                cmov_latency: 2,
++                imul64_latency: 3,
++                div64_latency: 30,
++                div64_rtp_x100: 2260,
++                fma_latency: 0,
++                fadd_latency: 3,
++                fmul_latency: 5,
++                fma_pipes: 0,
++                erms,
++                fsrm: false,
++                avx256_unaligned_split: true,
++                rob_entries: 168,
++                lsd_uops: 28,
++                uop_cache_uops: 1536,
++                jcc_erratum: false,
++            }
++        }
++        match self {
++            SandyBridge => snb_like(SandyBridge, "sandybridge", false),
++            IvyBridge => snb_like(IvyBridge, "ivybridge", true),
++            Haswell => X86Tune {
++                cpu: Haswell,
++                name: "haswell",
++                popcnt_false_dep: true,
++                lzcnt_tzcnt_false_dep: true,
++                shift_cl_uops: 3,
++                lea3_latency: 3,
++                cmov_uops: 2,
++                cmov_latency: 2,
++                imul64_latency: 3,
++                div64_latency: 30,
++                div64_rtp_x100: 2100,
++                fma_latency: 5,
++                fadd_latency: 3,
++                fmul_latency: 5,
++                fma_pipes: 2,
++                erms: true,
++                fsrm: false,
++                avx256_unaligned_split: false,
++                rob_entries: 192,
++                lsd_uops: 56,
++                uop_cache_uops: 1536,
++                jcc_erratum: false,
++            },
++            Broadwell => X86Tune {
++                cpu: Broadwell,
++                name: "broadwell",
++                cmov_uops: 1,
++                cmov_latency: 1,
++                fmul_latency: 3,
++                ..Haswell.tune()
++            },
++            Skylake => X86Tune {
++                cpu: Skylake,
++                name: "skylake",
++                lzcnt_tzcnt_false_dep: false,
++                div64_latency: 34,
++                fma_latency: 4,
++                fadd_latency: 4,
++                fmul_latency: 4,
++                rob_entries: 224,
++                lsd_uops: 0,
++                jcc_erratum: true,
++                ..Broadwell.tune()
++            },
++            SkylakeAvx512 => X86Tune {
++                cpu: SkylakeAvx512,
++                name: "skylake-avx512",
++                ..Skylake.tune()
++            },
++            IceLake => X86Tune {
++                cpu: IceLake,
++                name: "icelake-client",
++                popcnt_false_dep: false,
++                shift_cl_uops: 2,
++                lea3_latency: 1,
++                div64_latency: 18,
++                div64_rtp_x100: 1000,
++                fsrm: true,
++                rob_entries: 352,
++                lsd_uops: 0,
++                uop_cache_uops: 2304,
++                jcc_erratum: false,
++                ..Skylake.tune()
++            },
++            AlderLake => X86Tune {
++                cpu: AlderLake,
++                name: "alderlake",
++                fadd_latency: 3,
++                rob_entries: 512,
++                lsd_uops: 192,
++                uop_cache_uops: 4096,
++                ..IceLake.tune()
++            },
++            SapphireRapids => X86Tune {
++                cpu: SapphireRapids,
++                name: "sapphirerapids",
++                ..AlderLake.tune()
++            },
++            ArrowLake => X86Tune {
++                cpu: ArrowLake,
++                name: "arrowlake",
++                rob_entries: 576,
++                ..AlderLake.tune()
++            },
++            Znver1 => X86Tune {
++                cpu: Znver1,
++                name: "znver1",
++                popcnt_false_dep: false,
++                lzcnt_tzcnt_false_dep: false,
++                shift_cl_uops: 1,
++                lea3_latency: 2,
++                cmov_uops: 1,
++                cmov_latency: 1,
++                imul64_latency: 3,
++                div64_latency: 10,
++                div64_rtp_x100: 1400,
++                fma_latency: 5,
++                fadd_latency: 3,
++                fmul_latency: 3,
++                fma_pipes: 1,
++                erms: true,
++                fsrm: false,
++                avx256_unaligned_split: false,
++                rob_entries: 192,
++                lsd_uops: 0,
++                uop_cache_uops: 2048,
++                jcc_erratum: false,
++            },
++            Znver2 => X86Tune {
++                cpu: Znver2,
++                name: "znver2",
++                fma_pipes: 2,
++                rob_entries: 224,
++                uop_cache_uops: 4096,
++                ..Znver1.tune()
++            },
++            Znver3 => X86Tune {
++                cpu: Znver3,
++                name: "znver3",
++                div64_rtp_x100: 700,
++                fma_latency: 4,
++                rob_entries: 256,
++                ..Znver2.tune()
++            },
++            Znver4 => X86Tune {
++                cpu: Znver4,
++                name: "znver4",
++                fsrm: true,
++                rob_entries: 320,
++                uop_cache_uops: 6912,
++                ..Znver3.tune()
++            },
++            Znver5 => X86Tune {
++                cpu: Znver5,
++                name: "znver5",
++                rob_entries: 448,
++                uop_cache_uops: 6144,
++                ..Znver4.tune()
++            },
++            // Generic: the conservative envelope over every row above.  Each
++            // field takes the value that is never *harmful*: work-arounds on,
++            // latencies at the slow end, structure sizes at the small end.
++            Generic => X86Tune {
++                cpu: Generic,
++                name: "generic",
++                popcnt_false_dep: true,
++                lzcnt_tzcnt_false_dep: true,
++                shift_cl_uops: 3,
++                lea3_latency: 3,
++                cmov_uops: 2,
++                cmov_latency: 2,
++                imul64_latency: 3,
++                div64_latency: 34,
++                div64_rtp_x100: 2260,
++                fma_latency: 5,
++                fadd_latency: 4,
++                fmul_latency: 5,
++                fma_pipes: 2,
++                erms: false,
++                fsrm: false,
++                avx256_unaligned_split: false,
++                rob_entries: 168,
++                lsd_uops: 0,
++                uop_cache_uops: 1536,
++                jcc_erratum: false,
++            },
++        }
++    }
++
++    /// Every row, for exhaustive tests and `LCCC_DUMP_TUNE=all`.
++    pub const ALL: [X86Cpu; 16] = [
++        X86Cpu::Generic,
++        X86Cpu::SandyBridge,
++        X86Cpu::IvyBridge,
++        X86Cpu::Haswell,
++        X86Cpu::Broadwell,
++        X86Cpu::Skylake,
++        X86Cpu::SkylakeAvx512,
++        X86Cpu::IceLake,
++        X86Cpu::AlderLake,
++        X86Cpu::SapphireRapids,
++        X86Cpu::ArrowLake,
++        X86Cpu::Znver1,
++        X86Cpu::Znver2,
++        X86Cpu::Znver3,
++        X86Cpu::Znver4,
++        X86Cpu::Znver5,
++    ];
++}
++
++impl X86Tune {
++    /// The row used when no tuning information is available at all.
++    pub const GENERIC: X86Tune = X86Cpu::Generic.tune();
++
++    // ------------------------------------------------------------------
++    // Derived decisions.  Callers use these, never the raw numbers.
++    // ------------------------------------------------------------------
++
++    /// Emit `xor %d,%d` before `popcnt %s,%d` (d ≠ s)?  Only where the
++    /// destination is architecturally read.  On other cores the xor is a
++    /// zero idiom (no execution µop) but still costs a front-end slot and
++    /// two to three bytes per instance.
++    #[inline]
++    pub fn break_popcnt_dep(&self) -> bool {
++        self.popcnt_false_dep
++    }
++
++    /// Emit `xor %d,%d` before `lzcnt`/`tzcnt %s,%d` (d ≠ s)?
++    #[inline]
++    pub fn break_lzcnt_tzcnt_dep(&self) -> bool {
++        self.lzcnt_tzcnt_false_dep
++    }
++
++    /// Select `shlx/shrx/sarx` over `shl/shr/sar r, %cl` when BMI2 is
++    /// available and the count is already in `%rcx`.  The VEX form is 1 µop
++    /// on every core that has it, so it wins wherever the legacy form is
++    /// more than one µop (all Intel cores); on Zen (1 µop each) the legacy
++    /// form is 2–3 bytes shorter and otherwise identical, so it is kept.
++    #[inline]
++    pub fn prefer_shlx(&self, bmi2: bool) -> bool {
++        bmi2 && self.shift_cl_uops > 1
++    }
++
++    /// Use `shlx` when doing so removes a register copy (count not in
++    /// `%rcx`, or the result must not clobber the source).  A saved `mov`
++    /// is a saved µop/slot on every core, including Zen.
++    #[inline]
++    pub fn shlx_saves_move(&self, bmi2: bool) -> bool {
++        bmi2
++    }
++
++    /// Independent accumulators needed to saturate the FMA pipes in a
++    /// reduction: `latency × pipes` (Little's law).  0 when the core has no
++    /// FMA (SNB/IVB) so the caller falls back to the FADD figure.
++    #[inline]
++    pub fn fma_reduction_accumulators(&self) -> u8 {
++        self.fma_latency.saturating_mul(self.fma_pipes.max(1))
++    }
++
++    /// Same for a pure add reduction (two 256-bit adders on every row).
++    #[inline]
++    pub fn fadd_reduction_accumulators(&self) -> u8 {
++        self.fadd_latency.saturating_mul(2)
++    }
++
++    /// Human-readable dump (one `key=value` per line) for
++    /// `LCCC_DUMP_TUNE=1` and the regression tests.
++    pub fn dump(&self) -> String {
++        let mut s = String::with_capacity(1024);
++        let mut kv = |k: &str, v: String| {
++            s.push_str(k);
++            s.push('=');
++            s.push_str(&v);
++            s.push('\n');
++        };
++        kv("tune", self.name.to_string());
++        kv("popcnt_false_dep", self.popcnt_false_dep.to_string());
++        kv("lzcnt_tzcnt_false_dep", self.lzcnt_tzcnt_false_dep.to_string());
++        kv("shift_cl_uops", self.shift_cl_uops.to_string());
++        kv("lea3_latency", self.lea3_latency.to_string());
++        kv("cmov_uops", self.cmov_uops.to_string());
++        kv("cmov_latency", self.cmov_latency.to_string());
++        kv("imul64_latency", self.imul64_latency.to_string());
++        kv("div64_latency", self.div64_latency.to_string());
++        kv("div64_rtp_x100", self.div64_rtp_x100.to_string());
++        kv("fma_latency", self.fma_latency.to_string());
++        kv("fadd_latency", self.fadd_latency.to_string());
++        kv("fmul_latency", self.fmul_latency.to_string());
++        kv("fma_pipes", self.fma_pipes.to_string());
++        kv("erms", self.erms.to_string());
++        kv("fsrm", self.fsrm.to_string());
++        kv("avx256_unaligned_split", self.avx256_unaligned_split.to_string());
++        kv("rob_entries", self.rob_entries.to_string());
++        kv("lsd_uops", self.lsd_uops.to_string());
++        kv("uop_cache_uops", self.uop_cache_uops.to_string());
++        kv("jcc_erratum", self.jcc_erratum.to_string());
++        kv(
++            "derived.fma_reduction_accumulators",
++            self.fma_reduction_accumulators().to_string(),
++        );
++        kv(
++            "derived.fadd_reduction_accumulators",
++            self.fadd_reduction_accumulators().to_string(),
++        );
++        s
 +    }
 +}
-+/* Offsets in ELEMENTS between dst and src (dst = src + off). */
-+static const int offs[] = { 0, 1, 2, 7, 8, 9, -1, -2, -7, -8, 15 };
 +
-+int main(void)
-+{
-+    for (unsigned k = 0; k < sizeof offs / sizeof offs[0]; k++) {
-+        int off = offs[k];
-+        float *fbase = fb[0] + 16; double *dbase = db[0] + 16; int *ibase = ib[0] + 16;
-+        char tag[64];
-+
-+        init(); scale_f(fbase + off, fbase, 1.5f, N); snprintf(tag, sizeof tag, "scale_f[%d]", off); dump_f(tag, fb[0], N + 32);
-+        init(); scale_d(dbase + off, dbase, 1.5, N); snprintf(tag, sizeof tag, "scale_d[%d]", off); dump_d(tag, db[0], N + 32);
-+        init(); add3_f(fbase + off, fbase, fb[1], N); snprintf(tag, sizeof tag, "add3_f[%d]", off); dump_f(tag, fb[0], N + 32);
-+        init(); add3_f(fbase, fb[1], fbase + off, N); snprintf(tag, sizeof tag, "add3_f_z[%d]", off); dump_f(tag, fb[0], N + 32);
-+        init(); add3_i(ibase + off, ibase, ib[1], N); snprintf(tag, sizeof tag, "add3_i[%d]", off); dump_i(tag, ib[0], N + 32);
-+        init(); axpy_f(fbase + off, fbase, 0.75f, N); snprintf(tag, sizeof tag, "axpy_f[%d]", off); dump_f(tag, fb[0], N + 32);
-+        init(); addto_i(ibase + off, ibase, N); snprintf(tag, sizeof tag, "addto_i[%d]", off); dump_i(tag, ib[0], N + 32);
-+        init(); sub_f(fbase + off, fbase, fb[2], N); snprintf(tag, sizeof tag, "sub_f[%d]", off); dump_f(tag, fb[0], N + 32);
-+        init(); stencil3(fbase + off, fbase, N); snprintf(tag, sizeof tag, "stencil3[%d]", off); dump_f(tag, fb[0], N + 32);
-+        init(); from_one(fbase + off, fbase, N); snprintf(tag, sizeof tag, "from_one[%d]", off); dump_f(tag, fb[0], N + 32);
++impl Default for X86Tune {
++    fn default() -> Self {
++        X86Tune::GENERIC
 +    }
-+    /* Partial (2-byte) overlap: dst = (char*)src + 2. */
-+    init(); scale_f((float *)((char *)(fb[0] + 16) + 2), fb[0] + 16, 1.5f, N); dump_f("scale_f[+2B]", fb[0], N + 32);
-+    init(); prefix_f(fb[0] + 1, N); dump_f("prefix_f", fb[0], N + 32);
-+    init(); shift_f(fb[0] + 1, N); dump_f("shift_f", fb[0], N + 32);
-+    printf("hash %016llx\n", h);
-+    return 0;
 +}
-diff --git a/tests/regression/vec_alias_versioning.flags b/tests/regression/vec_alias_versioning.flags
++
++/// Resolve the effective tuning row from the driver's `-march` / `-mtune`
++/// spellings.  Precedence follows GCC: `-mtune` wins; otherwise `-march`
++/// names the core; otherwise `generic`.  `native` resolves through CPUID on
++/// x86-64 hosts and to `generic` elsewhere.
++pub fn resolve(march: Option<&str>, mtune: Option<&str>) -> X86Tune {
++    fn one(name: &str) -> Option<X86Cpu> {
++        if name == "native" {
++            #[cfg(target_arch = "x86_64")]
++            {
++                return Some(X86Cpu::detect_host());
++            }
++            #[cfg(not(target_arch = "x86_64"))]
++            {
++                return Some(X86Cpu::Generic);
++            }
++        }
++        X86Cpu::from_name(name)
++    }
++    let cpu = mtune
++        .and_then(one)
++        .or_else(|| march.and_then(one))
++        .unwrap_or(X86Cpu::Generic);
++    cpu.tune()
++}
++
++// ----------------------------------------------------------------------
++// Process-wide active model.  The middle-end passes are free functions
++// that receive no target context (see passes::run_passes); like
++// `vectorize::set_x86_fma_enabled` they read a global that the driver sets
++// once per compilation.  Backend code receives the model through
++// `CodegenOptions` instead and must not use this accessor.
++// ----------------------------------------------------------------------
++
++static ACTIVE: OnceLock<std::sync::RwLock<X86Tune>> = OnceLock::new();
++
++fn active_cell() -> &'static std::sync::RwLock<X86Tune> {
++    ACTIVE.get_or_init(|| std::sync::RwLock::new(X86Tune::GENERIC))
++}
++
++/// Install the model for the current compilation (driver only).
++pub fn set_active(t: X86Tune) {
++    *active_cell().write().unwrap_or_else(|e| e.into_inner()) = t;
++}
++
++/// The model installed by [`set_active`], `GENERIC` before the driver runs.
++pub fn active() -> X86Tune {
++    *active_cell().read().unwrap_or_else(|e| e.into_inner())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn every_row_is_reachable_by_name() {
++        for cpu in X86Cpu::ALL {
++            let t = cpu.tune();
++            assert_eq!(t.cpu, cpu, "row {:?} reports wrong cpu", cpu);
++            assert_eq!(
++                X86Cpu::from_name(t.name),
++                Some(cpu),
++                "row name {:?} does not round-trip",
++                t.name
++            );
++        }
++    }
++
++    /// Pins the uops.info "latency operand 1 → 1" measurements that the
++    /// false-dependency decision rests on.  If a row here changes, the
++    /// commit must cite a new measurement.
++    #[test]
++    fn false_dependency_rows_match_uops_info() {
++        use X86Cpu::*;
++        let popcnt_dep: &[X86Cpu] =
++            &[SandyBridge, IvyBridge, Haswell, Broadwell, Skylake, SkylakeAvx512];
++        let lzcnt_dep: &[X86Cpu] = &[SandyBridge, IvyBridge, Haswell, Broadwell];
++        for cpu in X86Cpu::ALL {
++            if cpu == Generic {
++                continue;
++            }
++            let t = cpu.tune();
++            assert_eq!(t.popcnt_false_dep, popcnt_dep.contains(&cpu), "popcnt {:?}", cpu);
++            assert_eq!(t.lzcnt_tzcnt_false_dep, lzcnt_dep.contains(&cpu), "lzcnt {:?}", cpu);
++        }
++        // Skylake is the row GCC 16.2 gets wrong (xor before tzcnt).
++        assert!(Skylake.tune().popcnt_false_dep && !Skylake.tune().lzcnt_tzcnt_false_dep);
++    }
++
++    #[test]
++    fn shift_cl_uops_match_uops_info() {
++        use X86Cpu::*;
++        for cpu in [SandyBridge, IvyBridge, Haswell, Broadwell, Skylake, SkylakeAvx512] {
++            assert_eq!(cpu.tune().shift_cl_uops, 3, "{:?}", cpu);
++        }
++        for cpu in [IceLake, AlderLake, SapphireRapids, ArrowLake] {
++            assert_eq!(cpu.tune().shift_cl_uops, 2, "{:?}", cpu);
++        }
++        for cpu in [Znver1, Znver2, Znver3, Znver4, Znver5] {
++            assert_eq!(cpu.tune().shift_cl_uops, 1, "{:?}", cpu);
++            assert!(!cpu.tune().prefer_shlx(true));
++            assert!(cpu.tune().shlx_saves_move(true));
++        }
++        for cpu in [Haswell, Skylake, IceLake, AlderLake, Generic] {
++            assert!(cpu.tune().prefer_shlx(true));
++            assert!(!cpu.tune().prefer_shlx(false));
++        }
++    }
++
++    #[test]
++    fn lea_and_cmov_and_div_rows() {
++        use X86Cpu::*;
++        for cpu in [SandyBridge, Haswell, Skylake, SkylakeAvx512] {
++            assert_eq!(cpu.tune().lea3_latency, 3);
++        }
++        for cpu in [IceLake, AlderLake, ArrowLake] {
++            assert_eq!(cpu.tune().lea3_latency, 1);
++        }
++        for cpu in [SandyBridge, IvyBridge, Haswell] {
++            assert_eq!(cpu.tune().cmov_uops, 2);
++        }
++        for cpu in [Broadwell, Skylake, IceLake, AlderLake, Znver1, Znver5] {
++            assert_eq!(cpu.tune().cmov_uops, 1);
++        }
++        assert!(Skylake.tune().div64_latency > IceLake.tune().div64_latency);
++        assert!(IceLake.tune().div64_latency > Znver3.tune().div64_latency);
++        assert_eq!(Znver2.tune().div64_rtp_x100, 1400);
++        assert_eq!(Znver3.tune().div64_rtp_x100, 700);
++    }
++
++    #[test]
++    fn generic_is_the_conservative_envelope() {
++        let g = X86Tune::GENERIC;
++        for cpu in X86Cpu::ALL {
++            let t = cpu.tune();
++            // Work-arounds: generic applies every one that any row needs.
++            assert!(g.popcnt_false_dep >= t.popcnt_false_dep);
++            assert!(g.lzcnt_tzcnt_false_dep >= t.lzcnt_tzcnt_false_dep);
++            // Capacities: generic never assumes more than the smallest core.
++            assert!(g.rob_entries <= t.rob_entries, "{:?}", cpu);
++            assert!(g.uop_cache_uops <= t.uop_cache_uops, "{:?}", cpu);
++            // Optional fast paths: generic never assumes them.
++            assert!(!g.erms && !g.fsrm);
++        }
++    }
++
++    #[test]
++    fn resolve_precedence_and_native() {
++        assert_eq!(resolve(None, None).cpu, X86Cpu::Generic);
++        assert_eq!(resolve(Some("skylake"), None).cpu, X86Cpu::Skylake);
++        assert_eq!(resolve(Some("skylake"), Some("znver3")).cpu, X86Cpu::Znver3);
++        assert_eq!(resolve(Some("x86-64-v3"), None).cpu, X86Cpu::Generic);
++        assert_eq!(resolve(None, Some("raptorlake")).cpu, X86Cpu::AlderLake);
++        assert_eq!(resolve(None, Some("no-such-cpu")).cpu, X86Cpu::Generic);
++        let n = resolve(None, Some("native"));
++        assert!(X86Cpu::ALL.contains(&n.cpu));
++    }
++
++    #[test]
++    fn cpuid_signature_decoder() {
++        use X86Cpu::*;
++        let intel = |m| X86Cpu::from_signature(true, false, 6, m);
++        assert_eq!(intel(0x2A), SandyBridge);
++        assert_eq!(intel(0x3A), IvyBridge);
++        assert_eq!(intel(0x3C), Haswell);
++        assert_eq!(intel(0x4E), Skylake);
++        assert_eq!(intel(0x9E), Skylake); // Coffee Lake
++        assert_eq!(intel(0x55), SkylakeAvx512);
++        assert_eq!(intel(0x7E), IceLake);
++        assert_eq!(intel(0x97), AlderLake);
++        assert_eq!(intel(0xB7), AlderLake); // Raptor Lake (i7-14700KF)
++        assert_eq!(intel(0x8F), SapphireRapids);
++        assert_eq!(intel(0xC6), ArrowLake);
++        let amd = |f, m| X86Cpu::from_signature(false, true, f, m);
++        assert_eq!(amd(0x17, 0x01), Znver1);
++        assert_eq!(amd(0x17, 0x71), Znver2);
++        assert_eq!(amd(0x19, 0x21), Znver3);
++        assert_eq!(amd(0x19, 0x61), Znver4);
++        assert_eq!(amd(0x1A, 0x44), Znver5);
++        assert_eq!(X86Cpu::from_signature(false, false, 6, 0x97), Generic);
++    }
++
++    #[test]
++    fn reduction_accumulators_follow_littles_law() {
++        assert_eq!(X86Cpu::Haswell.tune().fma_reduction_accumulators(), 10);
++        assert_eq!(X86Cpu::Skylake.tune().fma_reduction_accumulators(), 8);
++        assert_eq!(X86Cpu::Znver1.tune().fma_reduction_accumulators(), 5);
++        assert_eq!(X86Cpu::Znver3.tune().fma_reduction_accumulators(), 8);
++        assert_eq!(X86Cpu::SandyBridge.tune().fma_reduction_accumulators(), 0);
++        assert_eq!(X86Cpu::AlderLake.tune().fadd_reduction_accumulators(), 6);
++    }
++
++    #[test]
++    fn dump_is_stable_and_complete() {
++        let d = X86Cpu::AlderLake.tune().dump();
++        assert!(d.starts_with("tune=alderlake\n"));
++        assert!(d.contains("popcnt_false_dep=false\n"));
++        assert!(d.contains("shift_cl_uops=2\n"));
++        assert!(d.contains("lsd_uops=192\n"));
++        assert!(d.contains("derived.fma_reduction_accumulators=8\n"));
++    }
++}
+diff --git a/src/backend/x86/mod.rs b/src/backend/x86/mod.rs
+index 6cf7a4b..306fbb3 100644
+--- a/src/backend/x86/mod.rs
++++ b/src/backend/x86/mod.rs
+@@ -2,6 +2,7 @@
+ // Built-in assembler unused when gcc handles assembly
+ pub(crate) mod assembler;
+ pub(crate) mod codegen;
++pub(crate) mod cpu_model;
+ #[cfg_attr(feature = "gcc_linker", allow(dead_code))]
+ // Built-in linker unused when gcc handles linking
+ pub mod linker;
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index 90d21b0..1ca0147 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -1173,6 +1173,11 @@ impl Driver {
+                 }
+                 arg if arg.starts_with("-march=") => {
+                     let march = &arg["-march=".len()..];
++                    if matches!(self.target, Target::X86_64 | Target::I686) {
++                        // Remembered for the tuning-row fallback
++                        // (cpu_model::resolve: -mtune > -march > generic).
++                        self.x86_march = Some(march.to_string());
++                    }
+                     match self.target {
+                         Target::Riscv64 => self.riscv_march = Some(march.to_string()),
+                         Target::X86_64 | Target::I686 => match march {
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index fa616ba..ba730b8 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -224,6 +224,9 @@ pub struct Driver {
+     /// a machine scheduler, so this is deliberately diagnostic-only; ISA
+     /// selection belongs to -march= and is never silently conflated with tune.
+     pub(super) x86_tune: Option<String>,
++    /// The `-march=` spelling as given (x86 only); the tuning row falls back
++    /// to it when `-mtune` is absent, exactly like GCC.
++    pub(super) x86_march: Option<String>,
+     /// Whether to use only general-purpose registers (-mgeneral-regs-only).
+     /// On AArch64, this prevents FP/SIMD register usage. The Linux kernel uses
+     /// this to avoid touching NEON/FP state. When set, variadic function prologues
+@@ -477,6 +480,7 @@ impl Driver {
+             enable_amx_bf16: false,
+             enable_cmpccxadd: false,
+             x86_tune: None,
++            x86_march: None,
+             general_regs_only: false,
+             code_model_kernel: false,
+             no_jump_tables: false,
+@@ -1240,11 +1244,27 @@ impl Driver {
+     ///
+     /// Set `CCC_TIME_PHASES=1` in the environment to print per-phase timing to stderr.
+     fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
+-        if self.verbose {
+-            if let Some(tune) = &self.x86_tune {
+-                eprintln!("lccc: note: -mtune={} accepted as a scheduling hint; no x86 scheduler model is implemented yet", tune);
++        // Resolve the microarchitectural tuning row once per compilation.
++        // `-mtune` wins over `-march`, `native` goes through CPUID; both
++        // the middle end (process-global accessor) and the backend
++        // (`CodegenOptions::tune`) see the same row.
++        let tune = crate::backend::x86::cpu_model::resolve(
++            self.x86_march.as_deref(),
++            self.x86_tune.as_deref(),
++        );
++        crate::backend::x86::cpu_model::set_active(tune);
++        if let Ok(v) = std::env::var("LCCC_DUMP_TUNE") {
++            if v == "all" {
++                for cpu in crate::backend::x86::cpu_model::X86Cpu::ALL {
++                    eprint!("{}\n", cpu.tune().dump());
++                }
++            } else if !v.is_empty() && v != "0" {
++                eprint!("{}", tune.dump());
+             }
+         }
++        if self.verbose {
++            eprintln!("lccc: note: x86 tuning row '{}'", tune.name);
++        }
+         let source = Self::read_source(input_file)?;
+ 
+         let time_phases = std::env::var("CCC_TIME_PHASES").is_ok();
+@@ -2048,6 +2068,8 @@ impl Driver {
+             code_model_kernel: self.code_model_kernel,
+             no_jump_tables: self.no_jump_tables,
+             bmi1: self.enable_bmi,
++            bmi2: self.enable_bmi2,
++            tune,
+             lzcnt: self.enable_lzcnt,
+             popcnt: self.enable_popcnt,
+             avx2: self.enable_avx2,
+diff --git a/tests/bench/cpu_model/tune_probe.c b/tests/bench/cpu_model/tune_probe.c
 new file mode 100644
-index 00000000..ea3ae2d9
+index 0000000..52140ad
 --- /dev/null
-+++ b/tests/regression/vec_alias_versioning.flags
-@@ -0,0 +1 @@
-+-O3 -march=x86-64-v3 -ffp-contract=off
++++ b/tests/bench/cpu_model/tune_probe.c
+@@ -0,0 +1,26 @@
++/* CPU-model tuning probe kernels (session: cpu_model).
++ * Each function isolates one target-dependent selection decision that the
++ * x86 tune model must drive.  Compare with scripts/godbolt.py compare. */
++#include <stdint.h>
++#include <stddef.h>
++
++/* popcnt with dest != src: SNB..CLX carry a false output dependency
++ * (uops.info POPCNT_R64_R64 lat 1->1 = 3); ICL+/Zen do not. */
++uint64_t popcnt_sum(const uint64_t *p, size_t n) {
++    uint64_t s = 0;
++    for (size_t i = 0; i < n; i++) s += (uint64_t)__builtin_popcountll(p[i]);
++    return s;
++}
++int ctz_of(uint64_t x) { return __builtin_ctzll(x); }
++int clz_of(uint64_t x) { return __builtin_clzll(x); }
++
++/* Variable shifts: SHL r,cl is 3 uops on SNB..CLX, 2 on ICL/ADL-P; SHLX is 1
++ * uop everywhere and takes the count in any register. */
++uint64_t shl_var(uint64_t x, unsigned k) { return x << k; }
++uint64_t shr_var(uint64_t x, unsigned k) { return x >> k; }
++int64_t  sar_var(int64_t x, unsigned k)  { return x >> k; }
++uint32_t rot_hash(const uint32_t *p, size_t n, unsigned k) {
++    uint32_t h = 0;
++    for (size_t i = 0; i < n; i++) h = (h << k) ^ p[i];
++    return h;
++}
