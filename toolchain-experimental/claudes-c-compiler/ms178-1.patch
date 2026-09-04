@@ -1,2510 +1,796 @@
-From 9539cbc249e6e18990b5a8d1b6ecbea8991add05 Mon Sep 17 00:00:00 2001
-From: LCCC Agent <agent@lccc.local>
-Date: Fri, 4 Sep 2026 00:41:17 +0000
-Subject: [PATCH 1/2] =?UTF-8?q?final:=20S02=20re-based=20on=20main=204abb2?=
- =?UTF-8?q?aa3=20=E2=80=94=20do=5Funroll=20Step5b=20terminator=20rewrite,?=
- =?UTF-8?q?=20strict=20Add-only=20partial-IV=20split,=20fail-closed=20body?=
- =?UTF-8?q?=20guards,=20masked=20guarded-sum=20+=20intrinsics,=20tooling,?=
- =?UTF-8?q?=20tests,=20docs,=20audit?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
----
- .../AUDIT-2026-09-04-ultimate-vs-rebase.md    |  86 +++
- ...2026-09-03c-unroll-vector-redteam-merge.md | 215 ++++++++
- scripts/codegen_oracle.py                     |  41 ++
- scripts/unroll_stress.py                      | 492 ++++++++++++++++++
- src/backend/regalloc.rs                       |   5 +
- src/backend/x86/codegen/intrinsics.rs         | 104 ++++
- src/ir/intrinsics.rs                          |  16 +-
- src/passes/loop_unroll.rs                     | 359 ++++++++++---
- src/passes/vectorize.rs                       |  65 +++
- tests/linker/setup_oracles.sh                 |   4 +-
- tests/regression/unroll_chain_body_exit_phi.c |  19 +
- .../unroll_chain_body_exit_phi.flags          |   1 +
- .../regression/unroll_countdown_chain_body.c  |  25 +
- .../unroll_countdown_chain_body.flags         |   1 +
- tests/regression/unroll_header_extra_trip1.c  |  46 ++
- .../unroll_header_extra_trip1.flags           |   1 +
- tests/regression/vector_guard_sum.c           |  62 +++
- tests/regression/vector_guard_sum.flags       |   1 +
- 18 files changed, 1459 insertions(+), 84 deletions(-)
- create mode 100644 engineering/AUDIT-2026-09-04-ultimate-vs-rebase.md
- create mode 100644 engineering/FOLLOWUP-2026-09-03c-unroll-vector-redteam-merge.md
- create mode 100755 scripts/unroll_stress.py
- create mode 100644 tests/regression/unroll_chain_body_exit_phi.c
- create mode 100644 tests/regression/unroll_chain_body_exit_phi.flags
- create mode 100644 tests/regression/unroll_countdown_chain_body.c
- create mode 100644 tests/regression/unroll_countdown_chain_body.flags
- create mode 100644 tests/regression/unroll_header_extra_trip1.c
- create mode 100644 tests/regression/unroll_header_extra_trip1.flags
- create mode 100644 tests/regression/vector_guard_sum.c
- create mode 100644 tests/regression/vector_guard_sum.flags
-
-diff --git a/engineering/AUDIT-2026-09-04-ultimate-vs-rebase.md b/engineering/AUDIT-2026-09-04-ultimate-vs-rebase.md
-new file mode 100644
-index 00000000..3c1eb5c8
---- /dev/null
-+++ b/engineering/AUDIT-2026-09-04-ultimate-vs-rebase.md
-@@ -0,0 +1,86 @@
-+# Audit: "ms178-ultimate" (Agent C) vs. this revision — and the re-based final tree
-+
-+Date: 2026-09-04
-+Both revisions share the base `2d3d5d78` (tree of merge `82d70096`, PR #374).
-+This tree is the S02 snapshot **re-based on latest upstream main `4abb2aa3`**.
-+
-+## 1. Provenance — exact identity of the competing revision
-+
-+| Question | Evidence | Answer |
-+|---|---|---|
-+| What base is the uploaded patch against? | pre-image blob of `src/passes/loop_unroll.rs` is `16adaddb`, found in history only at `2d3d5d78` | **same base as ours** |
-+| Was it merged upstream? | main's `044bee74` ("Complete-unroll single-trip loops and widen vectorizable reduction shapes") merged as PR **#378**; `git diff 044bee74 4abb2aa3` for the two source files is empty | **yes — the audit target is current main `4abb2aa3`** |
-+| Is merged #378 byte-identical to the upload? | #378 tree vs. upload applied on the base: `git diff` over `loop_unroll.rs` + `vectorize.rs` = **empty**; the merge simply omitted their 4 test files | source identical; tests dropped upstream |
-+
-+## 2. The assigned bugs on current main (= Agent C's revision)
-+
-+Measured this session with the pristine `-O1/-j2` release build of `4abb2aa3`, compared to
-+`gcc -O3`:
-+
-+| Repro | correct | main (Agent C) | verdict |
-+|---|---|---|---|
-+| cfg 1765 — runtime-trip `for (i=5; i<=lim; i+=7)` with a straight-line chain body and an early-exit `return` (`tests/regression/unroll_chain_body_exit_phi.c`) | 30 | **0** | still miscompiles |
-+| cfg 3169 — unsigned countdown `for (i=6; lim != i; i -= 1)` with chain body (`unroll_countdown_chain_body.c`) | 126 | **252** | still miscompiles (regression vs. base `82d7009`: 126) |
-+| guarded sum `if (a[i] > 0) s += a[i]` (`vector_guard_sum.c`, `nat=` and `rhs_rt=`) | 651 / 651 | **612 / 612** | still miscompiles (widening and swapped forms are handled) |
-+
-+**Agent C's revision fixes none of the three assigned miscompiles.**
-+
-+## 3. Verdict: it is not better — it is a strict subset of our revision
-+
-+Three-way diff on the same base:
-+
-+- Every hunk of their patch in `loop_unroll.rs` / `vectorize.rs` is present verbatim in ours;
-+  ours adds +348 / +65 lines that they do not have (their hunks ⊆ ours).
-+- Their content is missing, and is required by the assigned bugs:
-+  1. **do_unroll Step-5b terminator rewrite** (`subst_value_in_terminator` in the post-exit
-+     reader walk) — the actual fix for cfg 1765 (the early-exit `Return` kept the header
-+     phi's PREHEADER value: 0 instead of 30).
-+  2. **strict Add-only `find_iv_in_loop` for `analyze_loop`, with Sub-form recognition
-+     confined to `find_iv_in_loop_ext` for the complete unrollers** — fixes cfg 3169 (their
-+     Sub-accepting detector, feeding `analyze_loop`, is precisely what turned a rolled-but-
-+     correct countdown into the 252 miscompile) while keeping countdown recognition where
-+     the closed form can verify it.
-+  3. fail-closed `analyze_loop` body-connectivity + linear-chain guards (the exact
-+     precondition do_unroll's guard arithmetic is derived for).
-+  4. the **equal-width masked guarded-sum** transform (`VecMaskedAddI32x8`) + I32-only
-+     requirement — the actual fix for the `nat=`/`rhs_rt=` miscompile (their patch only
-+     rejects the *swapped* form, which was already correct-by-scalar).
-+  5. the intrinsic/regalloc pieces the transform needs, `scripts/unroll_stress.py` (the
-+     4000-config differential that found cfg 1765/3169), the pinned regression tests, and
-+     oracle/doc updates.
-+- Their content that ours lacks: **nothing**. Their 4 test files have the same names and
-+  same coverage we carry.
-+- Why they missed the bugs: their corpus contains no runtime-trip chain-body early-exit
-+  shape and no countdown chain shape — the two shapes live entirely in the *partial*
-+  unroller (`do_unroll`), which their revision never touches.
-+
-+Where their work is genuinely good — and note this code is literally shared, since ours
-+contains it too — is the complete-unroller architecture: i128 closed-form trip arithmetic
-+in the comparison's own signedness domain with wrap refusal and final-value bounds, the
-+per-iteration `LoopPhiModel` SSA environments (fixing the whole carried-phi class: constant
-+backs, invariant backs, cross-phi swaps), canonical compare-normalisation (mirror/negate),
-+the persisting-inner-loop fail-closed gate, and the vectorizer's unhandled-loop-carried-phi
-+reject. These we adopt fully and verified as the shared core.
-+
-+## 4. Root causes (evidence from the per-pass IR dump of main on cfg 1765/3169)
-+
-+The inner `j`-loop is completely unrolled first (3 copies); the runtime-trip outer loop is
-+then handed to `do_unroll`. Step 5b inserts a proper exit phi for a value the exit block
-+reads directly (no pre-existing exit phi), then rewrites post-exit *readers* of the stale
-+header phi — but only in **instructions**. The `Return` terminator of the exit block kept
-+the header phi's SSA name, which on the early exit-check edges holds its **preheader**
-+value (the phi update rides the latch edge an early exit never takes) → cfg 1765 returned 0
-+instead of 30. The identical structural break, combined with the Sub-form IV acceptance,
-+doubles the accumulator in cfg 3169 (252 instead of 126); the strict/partial IV split keeps
-+that shape rolled and correct, and the extended detector remains where the closed-form trip
-+arithmetic re-verifies the step.
-+
-+## 5. The re-based tree
-+
-+`main @ 4abb2aa3` + this delta (`<Agent-C tree> → <S02 tree>`, 17 files, +1362/−84; the
-+harness-owned `scripts/lccc-harness-snapshot.sh` intentionally keeps main's version),
-+plus comment corrections so the 5b/5c guards state precisely what they do (they do NOT
-+trigger on cfg 1765/3169) and the `trip_range` doc matches the `1..=1`/`1..=16` call sites.
-+
-+Per instruction, no further builds, tests or differentials were run after the re-base;
-+the validation of the base-deliverable state is recorded in the S02 snapshot artifacts.
-diff --git a/engineering/FOLLOWUP-2026-09-03c-unroll-vector-redteam-merge.md b/engineering/FOLLOWUP-2026-09-03c-unroll-vector-redteam-merge.md
-new file mode 100644
-index 00000000..19d76140
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-03c-unroll-vector-redteam-merge.md
-@@ -0,0 +1,215 @@
-+# Session follow-up: unroll + vectorization red-team merge (ms178-1 × ms178-3 × PR #374)
-+
-+Date: 2026-09-03 (session 09-03c)
-+Base: `82d7009` (upstream ms178/lccc main, contains PR #374 merge `2d3d5d7`)
-+Deliverable: `/home/user/ms178-1.patch` (+ `artifacts/ms178-1.Sxx-*.patch`, `lccc-src.tar.gz`, `lccc.bundle`)
-+Binary: `artifacts/bin/lccc-merged` (== `lccc/target/fastbuild/lccc`, md5 `e3a32010098cf83ab6213e6c4fb8ec74`)
-+
-+---
-+
-+## 1. What was asked and what was delivered
-+
-+The user mandated a deep red-team audit of the two competing revisions of the
-+unroll/vectorization work — `ms178-1.patch` (Fable) and `ms178-3.patch`
-+(Agent B) — plus a full audit of upstream PR #374 (touched `loop_unroll.rs`),
-+the production of a merged "godlike" patch rebased on latest main, and proof
-+of the choice by real testing. The outcome is a single merged patch that takes
-+the validated insights of both revisions, repairs the CFG/trip-count bugs both
-+missed, and re-grafts PR #374's `do_unroll` foreign-predecessor fix that the
-+merge process had initially lost.
-+
-+## 2. Red-team audit results (empirical matrix)
-+
-+Corpora: `A_unsigned.c` (unsigned trip domains, near-wrap bounds), `B_carried.c`
-+(carried dependencies across unrolled iterations, multi-block loops),
-+`C_vector.c` (conditional vector reduction with a runtime guard), all compared
-+against `gcc -O0` refs on x86-64. Flags: A/B `-O3`, C `-O3 -march=x86-64-v3`.
-+
-+| Corpus | Baseline 82d7009 | w1 (ms178-1) | w3 (ms178-3) | **MERGED** |
-+|---|---|---|---|---|
-+| A_unsigned (g1, h1) | 2 fail (4294967287 / 18446744073709551607 vs 0) | **ALL PASS** | 2 fail | **ALL PASS** |
-+| B_carried (first_const4, first_param4, stride_carried, header_effect) | 4 fail (+ new header_effect1 regression) | 4 fail + header_effect1 fail | **ALL PASS** | **ALL PASS** |
-+| C_vector (guard_nat, guard_swapped) | 2 fail (612 vs 651; wrong guard handling) | 2 fail | 2 fail | **ALL PASS** |
-+
-+Conclusions:
-+- **w1 is right about the unsigned trip domain** (the dominant bug class: g1/h1
-+  are 64-bit unsigned near-wrap loops that the baseline and w3 mis-unroll).
-+- **w3 is right about the two-block/carried CFG shape** (exit phis, latch
-+  removal, header-extra conditional evaluation) — w1's single-trip path is
-+  *incorrect* (it drops the second condition evaluation) and was not used.
-+- **Neither w1 nor w3 handles the vector guard**: both silently dropped the
-+  Select that narrows the result to in-range lanes (guard_nat 612 insns, wrong
-+  value). The merge introduces proper masked-vector lowering instead.
-+- Baseline also mis-handled `do_unroll` exit phi predecessors; PR #374's fix
-+  got lost during the splice and was re-grafted from `afd6c0f→2d3d5d7`.
-+
-+## 3. The merge (what the final patch contains)
-+
-+### 3.1 Loop unroller (`src/passes/loop_unroll.rs`) — G1–G3, T1a/T1b, PR #374
-+- `try_complete_unroll_general(func, lp, cfg, trip_range)` + closed-form
-+  `complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step, iv_ty)`;
-+  `canonical_continue_cmp(raw_cmp_op, iv_is_lhs, exit_pos)`; `cmp_ty != iv_ty`
-+  rejected (structured, typed trip math).
-+- Resolved constants via `resolve_const_operand`; unsigned init/limit kept as
-+  `IrConst::from_i64(iv_ty)` so `to_i64()` round-trips at the IV's own type
-+  (U8/U16/U32 stay zero-extended).
-+- `signed_step` / IV detection split (see §3.3): the EXTENDED detector
-+  `find_iv_in_loop_ext` (w1's domain reasoning: `Sub(phi,k)` countdowns +
-+  sign-reinterpreted unsigned constants, steps computed in `i128`) is used
-+  ONLY by the complete unrollers, which re-verify the step in closed form;
-+  `analyze_loop` keeps the strict Add-only `find_iv_in_loop` so `do_unroll`
-+  sees exactly the acceptance set it was written for (fail-closed).
-+- Two-block loops: `latch → Unreachable`, exit phis relabeled with the
-+  last-iteration header value, `foreign_preds` of the exit block get an
-+  incoming value for the merged edge (PR #374 `do_unroll` repair).
-+- General `trip == 1`: environment for the single iteration is
-+  `model.env_next(trip, env_entry, empty_vmap)` when no plans remain; the latch
-+  is replaced by `final_guard.unwrap_or(exit_target)` so *both* condition
-+  evaluations still happen (w3's semantics; w1's `1..=1` shortcut was wrong).
-+- Not-unrollable shapes fail closed (no partial deopt): `unroll_unsigned_domain_trip`,
-+  `unroll_header_extra_trip1`, `k30_unroll_shapes` regression tests.
-+
-+### 3.2 Vectorizer + masked reduction (`vectorize.rs`, `intrinsics.rs`,
-+`regalloc.rs`, `x86/codegen/intrinsics.rs`)
-+- New `IntrinsicOp::VecMaskedAddI32x8` with args
-+  `[acc I32x8, base, byte_offset, guard_rhs]` — a conditional 8×i32
-+  vector-sum whose per-lane mask comes from `vpcmpgtd`.
-+- x86 lowering: load base+offset (`vmovdqu` → ymm0), broadcast rhs (const 0 →
-+  `vpxor`; const n → `vmovd` + `vpbroadcastd`; runtime value → `mov` + `vmovd`
-+  + `vpbroadcastd`), `vpcmpgtd %ymm1,%ymm0,%ymm1`, `vpand`, `vpaddd` into the
-+  accumulator. Scratch confined to ymm0/ymm1 so the accumulator may live in
-+  ymm2..ymm15.
-+- Regalloc: `class-of = Some(5)` with a `legal_consumer` whitelist so the
-+  new op participates in width partitioning without risking illegal temps.
-+- Vectorizer emits the masked intrinsic whenever the conditional-sum has a
-+  guard condition and splices out the (previously dropped!) Select; non-I32
-+  guarded sums are rejected fail-closed.
-+
-+### 3.3 Red-team round 2 — `unroll_stress.py` found two more miscompiles (fixed)
-+
-+The exhaustive differential (4000 enumerated loop shapes, lccc -O3 vs
-+lccc -O3+`CCC_DISABLE_PASSES=unroll` vs gcc -O0) found **2 real miscompiles**
-+(the other 37 "fails" were all-three-compiler RUN TIMEOUTs of slow programs):
-+
-+| cfg | loop | correct | baseline | w1 | w3 | merged (before) |
-+|---|---|---|---|---|---|---|
-+| 1765 | `long i=5; i <= lim; i += 7`, nested body | 30 | **0** | 30 | 30 | **0** |
-+| 3169 | `unsigned long lim != i; i -= 1`, nested body | 126 | 126 | 126 | 126 | **252** |
-+
-+Root causes (diagnosed with `CCC_TRACE_UNROLL` instrumentation + per-pass IR
-+dumps on instrumented baseline/w1/w3 builds):
-+
-+1. **cfg 1765 — `do_unroll` exit-value bug (BASELINE bug, inherited by the
-+   merge).** The loop's body is a straight-line chain left behind by
-+   complete-unrolling the inner loop; the RETURN block uses the header phi
-+   directly (no exit-block phi). Step 5b correctly INSERTED an exit phi with
-+   per-edge values but the reader-rewrite covered only *instructions* — the
-+   **terminator** (`Return(v27)`) kept the header phi's name, which on the new
-+   exit-check edges holds its PREHEADER value → returned 0 instead of 30.
-+   Fix: also `subst_value_in_terminator` in the Step 5b rewrite walk. (w1/w3
-+   only *accidentally* avoided the bug: their invocation-1 CFG kept the dead
-+   inner latch inside the outer body, so `analyze_loop` rejected the shape.)
-+2. **cfg 3169 — merge-specific acceptance leak.** The extended
-+   `find_iv_in_loop` (Sub-form countdown + unsigned sign-reinterpretation)
-+   reached `analyze_loop`, so `do_unroll` accepted a countdown IV whose step
-+   semantics its guard arithmetic cannot express → 4x clone chain whose early
-+   exit paths fell through with the previous iteration's accumulator (252).
-+   Fix: split detectors (see §3.1) — strict Add-only for the partial path.
-+3. **Fail-closed hardening added to `analyze_loop`:** (5b) body-connectivity
-+   — every body block must be reachable from the header without the back edge
-+   (rejects detached clone cycles); (5c) body_work must be a simple linear
-+   chain header→work→latch with exactly one chain tail, no CondBranch, no
-+   merges — the exact precondition `do_unroll`'s guard arithmetic was derived
-+   for. Anything else stays rolled (correctness over unrolling).
-+
-+Validation of the fixes: cfg 1765 and 3169 now return the correct values; a
-+trip-range differential (lims 0/4/5/11/12/18/19/100/1000000 for the Add form,
-+lims 0–6 for the countdown form) matches gcc -O0 exactly. Both shapes are
-+pinned as `tests/regression/unroll_chain_body_exit_phi.c` and
-+`unroll_countdown_chain_body.c`.
-+
-+## 4. Validation evidence (all against the deliverable binary)
-+
-+| Check | Result |
-+|---|---|
-+| `cargo test --lib` (clean-room, AFTER the round-2 fixes) | 1698 passed / 0 failed / 6 ignored |
-+| full regression suite (`run_regression_suite.sh`, incl. the 2 new round-2 tests) | **PASS=595 FAIL=0 SKIP=15** (AB-diff 0) |
-+| A/B/C red-team corpora + guard.c | PASS (A -O3; B -O3; C -O3 -march=x86-64-v3) |
-+| `vector_guard_sum` / `unroll_header_extra_trip1` oracles | PASS (guard_nat=651, trip==1 evaluated twice) |
-+| masked codegen (`guard.c -S`) | `vpcmpgtd`/`vpand`/`vpaddd` confirmed |
-+| `unroll_stress.py` (exhaustive differential vs gcc -O0, 4000 configs, post-fix) | **0 mismatches** (38 RUN-TIMEOUTs, all-compiler harness noise; round-1 had 2 real miscompiles which are now fixed) |
-+| codegen oracle `k30_unroll_shapes.c` | lccc 361 insns, best of 5 (gcc 434 / clang 363 / icc 370 / icx 384) |
-+| codegen oracle k01–k15 (`-O3 -march=x86-64-v3`) | lccc 306 total insns — best aggregate (icx 457, icc 519, clang 610, gcc 945); 5/15 per-file best |
-+
-+Oracle aggregate per file (lccc / 2nd best | winner):
-+
-+| file | lccc | best | winner |
-+|---|---|---|---|
-+| k01_adler | 70 | 65 | icx |
-+| k02_sum8 | 14 | 14 | lccc |
-+| k03_crc | 26 | 17 | gcc |
-+| k04_strlen | 10 | 1 | clang |
-+| k05_max | 21 | 21 | lccc |
-+| k06_dot | 14 | 14 | lccc |
-+| k07_bswap | 13 | 12 | icc |
-+| k08_bcopy | 6 | 6 | lccc (tie) |
-+| k09_clz | 3 | 2 | clang |
-+| k10_ffs | 20 | 11 | gcc |
-+| k11_swp | 8 | 7 | tie |
-+| k12_hash | 16 | 15 | gcc |
-+| k13_strcmp | 25 | 12 | gcc |
-+| k14_isort | 41 | 19 | icx |
-+| k15_bytemask | 19 | 19 | lccc |
-+
-+## 5. Files added/changed in this session (all in the patch)
-+
-+- `src/passes/loop_unroll.rs`, `src/passes/vectorize.rs` (M)
-+- `src/ir/intrinsics.rs`, `src/backend/regalloc.rs`,
-+  `src/backend/x86/codegen/intrinsics.rs` (M)
-+- `tests/regression/{vector_guard_sum,unroll_header_extra_trip1,unroll_unsigned_domain_trip,loop_unroll_redteam,unroll_chain_body_exit_phi,unroll_countdown_chain_body}.c(+.flags)`
-+- `tests/benchmark/kernel_corpus/k30_unroll_shapes.c`
-+- `scripts/unroll_stress.py`, `scripts/lccc-harness-snapshot.sh` (new)
-+- `scripts/codegen_oracle.py` (+ `--totals`: cross-source per-compiler aggregate
-+  of insns/loads/stores/spills/branches/vectors + per-source bests; the summary
-+  table in §4 was produced with it)
-+- `tests/linker/setup_oracles.sh` (removed stale `bench_linker.py` references)
-+- goldens: gzip/zlib-ng/expat/SQLite/linux/glibc workload kernels (earlier
-+  session, provenance in `tests/benchmark/WORKLOAD_PROVENANCE.md`)
-+
-+## 6. To-do (ranked, next session)
-+
-+1. **Codegen gaps visible in the oracle sweep** (biggest wins first):
-+   - `k03_crc` (26 vs gcc 17): scalar CRC recurrence is 1.5x larger — look at
-+     the shift/xor chain; consider `crc32` instruction only if semantics allow.
-+   - `k13_strcmp` (25 vs gcc 12): byte-compare loop — investigate
-+     word-at-a-time + `pmovmskb`/`bsf` pattern (lccc has `strlen`-family work
-+     in k04 but it falls back to a libc call for 1-insn string functions).
-+   - `k10_ffs` (20 vs 11), `k14_isort` (41 vs icx 19), `k01_adler` (70 vs 65).
-+   - `k04_strlen`: 10 insns incl. a store vs clang 1 (pattern-recognition
-+     into `strlen` call/builtin). Not a real perf loss; low priority.
-+   - k12_hash + k15_bytemask are close (16 vs 15, 19 vs 19 tie) — micro.
-+2. **Run the linker oracle battery** (`tests/linker/run_linker_tests.py`,
-+   `real_workloads.py`) with `setup_oracles.sh` — not re-run this session;
-+   oracle policy (git-HEAD mold/wild, bfd 2.47, `MOLD_TARGETS=X86_64;I386`)
-+   was verified only statically this session.
-+3. **Extended differential fuzzing**: run `unroll_stress.py` with a bigger
-+   `--limit` / fresh seeds, and `csmith_diff.py` / `yarpgen_diff.py` slices
-+   focused on header-condition + multi-exit loops.
-+4. **Benchmark on real hardware when available**: k01–k15 + golden workloads
-+   through `run_benchmarks.py`; VM has no PMU so use closed-form + assembly.
-+5. **Re-check the merge against next upstream head** (rebase workflow:
-+   `lccc-snapshot.sh` before every upstream pull).
-+
-+## 7. Risks / known limitations
-+
-+- `VecMaskedAddI32x8` handles **I32 only** by design; I64/I16 guarded
-+  conditional sums are rejected during analysis (fail closed). An I64 variant
-+  (`vpcmpeqq`-style widening or 2×I32 lanes) is the natural next step if a
-+  golden workload needs it.
-+- Trip-count closed form uses i128 intermediates; loops whose iteration count
-+  exceeds 2^127 are not representable (unreachable in practice for counted
-+  loops with 64-bit IVs).
-+- The `trip == 1` path now goes through the general model (env_next with an
-+  empty plan list); it is covered by `unroll_header_extra_trip1` but a
-+  dedicated `trip==1` × every cmp-op × signed/unsigned sweep is still missing
-+  (see to-do 3).
-diff --git a/scripts/codegen_oracle.py b/scripts/codegen_oracle.py
-index 7ee1844a..4def548e 100644
---- a/scripts/codegen_oracle.py
-+++ b/scripts/codegen_oracle.py
-@@ -352,6 +352,42 @@ def _markdown(results: list[dict[str, Any]], path: Path) -> None:
-     path.write_text("\n".join(lines) + "\n")
+diff --git a/scripts/lccc-harness-snapshot.sh b/scripts/lccc-harness-snapshot.sh
+index 23237a1..d417328 100755
+--- a/scripts/lccc-harness-snapshot.sh
++++ b/scripts/lccc-harness-snapshot.sh
+@@ -1,17 +1,17 @@
+ #!/usr/bin/env bash
+ # ============================================================================
+-# LCCC session snapshot for the Vite/web-app harness ("Kontinuität v2").
++# LCCC session snapshot for the Vite/web-app harness ("Kontinuität v3").
+ #
+-# ROOT CAUSE of lost snapshots: in this harness the ONLY artefact that reaches
+-# the user is the single-file Vite build (dist/index.html produced by
+-# vite-plugin-singlefile) plus the sandbox source tree.  Files written under
++# ROOT CAUSE of lost snapshots in earlier sessions: in this harness the ONLY
++# artefact guaranteed to reach the user is the single-file Vite build
++# (dist/index.html produced by vite-plugin-singlefile).  Files written under
+ # /home/user/artifacts or the repo worktree are invisible to the user and are
+-# wiped with the sandbox.
++# wiped together with the sandbox.
+ #
+ # Therefore every validated improvement is materialised INSIDE the web
+ # bundle's source tree so `npm run build` inlines it into the delivered HTML:
+ #
+-#   $SANDBOX/public/patches/ms178-1.patch           (static copy, canonical)
++#   $SANDBOX/public/patches/ms178-1.patch           (static copy)
+ #   $SANDBOX/public/patches/ms178-1.<tag>.patch     (per-snapshot copy)
+ #   $SANDBOX/src/generated/patch.ts                 (patch as a TS string,
+ #                                                    bundled into index.html)
+@@ -20,13 +20,17 @@
+ #
+ # The web app offers the patch as a Blob download, shows its SHA-256, the
+ # ledger and the docs, so the deliverable survives even if only the HTML
+-# survives.  Writes are atomic (tmp + rename); the patch is verified to apply
+-# cleanly to the recorded upstream base before it is published.
++# survives.  All writes are atomic (tmp + rename) so a mid-write kill can
++# never leave a truncated deliverable.
+ #
+ # Usage:  scripts/lccc-harness-snapshot.sh "<slug>" "<one-line description>"
+-# Env:    LCCC_REPO (default /home/user/lccc)   LCCC_SANDBOX (default
+-#         /home/user/sandbox)   LCCC_BASE_REF (upstream commit; recorded once)
+-#         LCCC_SNAPSHOT_DOCS (space-separated repo-relative docs to bundle)
++# Env:    LCCC_REPO      (default /home/user/lccc)
++#         LCCC_SANDBOX   (default /home/user/sandbox)
++#         LCCC_BASE_REF  (upstream commit the session is rebased on; recorded
++#                         once in $GEN/.base_ref and reused afterwards)
++#         LCCC_SNAPSHOT_DOCS  (extra space-separated repo-relative doc paths)
++#         LCCC_SKIP_WEB_BUILD=1  (skip `npm run build`; useful while a cargo
++#                         build is saturating the 2 cores)
+ # ============================================================================
+ set -euo pipefail
  
+@@ -36,7 +40,6 @@ GEN="$SANDBOX/src/generated"
+ PUB="$SANDBOX/public/patches"
+ LEDGER="$GEN/ledger.json"
+ BASE_REF_FILE="$GEN/.base_ref"
+-DOCS=${LCCC_SNAPSHOT_DOCS:-"docs/I686_ALU_AUDIT.md docs/FOLLOWUP_I686_ALU.md"}
  
-+def _print_totals(results: list[dict[str, Any]]) -> None:
-+    """Cross-source aggregate: sum static stats per compiler and count
-+    per-source bests.  Gives a one-glance answer to 'which compiler is
-+    smallest over this whole corpus' that the per-file tables cannot.
-+
-+    These are screening metrics, not PMU evidence (see _markdown header).
-+    """
-+    import collections
-+
-+    totals: dict[str, dict[str, float]] = collections.defaultdict(
-+        lambda: {"instructions": 0, "loads": 0, "stores": 0,
-+                 "spills": 0, "branches": 0, "vectors": 0, "sources": 0}
+ slug=${1:-snapshot}
+ desc=${2:-"session snapshot"}
+@@ -52,7 +55,8 @@ else
+   printf '%s\n' "$BASE" > "$BASE_REF_FILE"
+ fi
+ 
+-# Commit pending work (deterministic identity).
++# Commit pending work (deterministic identity).  Build outputs, caches and
++# oracle artefacts are excluded via .gitignore; never `git add -f` here.
+ if ! git diff --quiet || ! git diff --cached --quiet || \
+    [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+   git add -A
+@@ -119,23 +123,23 @@ tmp = path + ".tmp"
+ json.dump(led, open(tmp, "w"), indent=2); os.replace(tmp, path)
+ PY
+ 
+-# 5. Bundle docs that must reach the user.
+-#    Auto-discover: every Markdown file added or modified in base..HEAD is a
+-#    session deliverable (follow-up notes, audits, task files) and is bundled
+-#    without manual list maintenance; LCCC_SNAPSHOT_DOCS adds extra paths.
+-session_docs=$(git diff --name-only --diff-filter=AM "$BASE" HEAD -- '*.md' 2>/dev/null || true)
+-for d in $DOCS $session_docs; do
+-  [[ -f "$d" ]] && cp -f "$d" "$GEN/docs/$(printf '%s' "$d" | tr '/' '_')"
++# 5. Bundle docs that must reach the user: every follow-up / audit document
++#    touched by this session (base..HEAD) plus anything listed explicitly.
++docs=$(git diff --name-only "$BASE" HEAD -- 'engineering/*.md' 'engineering/agent/*.md' 'docs/*.md' 'scripts/*.md' 2>/dev/null || true)
++for d in $docs ${LCCC_SNAPSHOT_DOCS:-}; do
++  [[ -f "$d" ]] && cp -f "$d" "$GEN/docs/$(echo "$d" | tr '/' '_')"
+ done
+ ( cd "$GEN/docs" && python3 -c "
+ import json,glob,os
+-print(json.dumps({os.path.basename(f): open(f).read() for f in sorted(glob.glob('*.md'))}))" ) | atomic_write "$GEN/docs.json"
++print(json.dumps({os.path.basename(f): open(f, encoding='utf-8', errors='replace').read() for f in sorted(glob.glob('*.md'))}))" ) | atomic_write "$GEN/docs.json"
+ 
+ rm -f "$patch_tmp"
+ 
+ # 6. Rebuild the single-file web bundle so dist/index.html carries this
+ #    snapshot even if the session dies before the harness's final build.
+-if [[ -f "$SANDBOX/package.json" ]]; then
++if [[ "${LCCC_SKIP_WEB_BUILD:-0}" == "1" ]]; then
++  web="web build skipped (LCCC_SKIP_WEB_BUILD=1)"
++elif [[ -f "$SANDBOX/package.json" ]]; then
+   ( cd "$SANDBOX" && npm run build >/dev/null 2>&1 ) && web="dist rebuilt" || web="WARN: web build failed"
+ else
+   web="no sandbox package.json"
+diff --git a/src/backend/i686/codegen/alu.rs b/src/backend/i686/codegen/alu.rs
+index 2169be2..dcc5db6 100644
+--- a/src/backend/i686/codegen/alu.rs
++++ b/src/backend/i686/codegen/alu.rs
+@@ -1380,8 +1380,16 @@ mod synth_mul_tests {
+         assert_eq!(f(15), vec![MulStep::LeaSrcSrc(2), MulStep::LeaSelf(4)]);
+         // 17 = x + 8*(2x): two LEAs beat GCC's mov/sal/add.
+         assert_eq!(f(17), vec![MulStep::LeaSrcSrc(1), MulStep::LeaSrcPlus(8)]);
+-        // 33 = 32x + x needs the shift: mov (eliminated) + shl + add.
+-        assert_eq!(f(33), vec![MulStep::Mov, MulStep::Shl(5), MulStep::AddSrc]);
++        // 33 = x + 8*(4x): two fast LEAs (2 µops, 2c dependent latency) beat
++        // GCC's mov/shl/add (3 µops, 2c) under the speed policy; the scaled
++        // LEA `leal (,%src,4)` is a two-component (index*scale + disp) form,
++        // 1c on every Intel/AMD core since Sandy Bridge. Without the scale
++        // LEA (size policy) the canonical GCC form is the only 2c chain.
++        assert_eq!(f(33), vec![MulStep::LeaScaleSrc(4), MulStep::LeaSrcPlus(8)]);
++        assert_eq!(
++            synth_mul(33, false, 3, false).unwrap(),
++            vec![MulStep::Mov, MulStep::Shl(5), MulStep::AddSrc]
++        );
+         assert_eq!(f(31), vec![MulStep::Mov, MulStep::Shl(5), MulStep::SubSrc]);
+         assert_eq!(f(24), vec![MulStep::LeaSrcSrc(2), MulStep::Shl(3)]);
+         assert_eq!(f(-3), vec![MulStep::LeaSrcSrc(2), MulStep::Neg]);
+diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
+index 69682f0..e4c8692 100644
+--- a/src/backend/stack_layout/copy_coalescing.rs
++++ b/src/backend/stack_layout/copy_coalescing.rs
+@@ -2114,6 +2114,222 @@ pub(super) fn compute_x87_defer_values(func: &IrFunction) -> FxHashSet<u32> {
+     result
+ }
+ 
++/// Pure vector loads: they write no memory and define no GPR (their address
++/// is either an RA-homed GPR pair or the `%rax`/`%rcx` scratch pair).
++pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
++    use crate::ir::intrinsics::IntrinsicOp as O;
++    matches!(
++        op,
++        O::VecLoadF64x4
++            | O::VecLoadF32x8
++            | O::VecLoadI32x8
++            | O::VecLoadF64x2
++            | O::VecLoadF32x4
++            | O::VecLoadI32x4
++            | O::VecLoadI64x2
 +    )
-+    wins: dict[str, int] = collections.defaultdict(int)
-+    for result in results:
-+        records = {r["key"]: r for r in result["records"]}
-+        comparable = [r for r in result["records"] if r.get("instructions", 0) > 0]
-+        if comparable:
-+            best = min(comparable, key=lambda r: r["instructions"])
-+            wins[best["key"]] += 1
-+        for key, record in records.items():
-+            agg = totals[key]
-+            for field in ("instructions", "loads", "stores", "spills", "branches", "vectors"):
-+                agg[field] += record.get(field, 0)
-+            agg["sources"] += 1
-+    print(f"\nTOTALS across {len(results)} source(s) per compiler:"
-+          " instruction/load/store/spill/branch/vector sums, per-source bests")
-+    print(f"{'compiler':<12} {'insns':>7} {'loads':>6} {'stores':>7} "
-+          f"{'spills':>7} {'branch':>7} {'vector':>6} {'best':>5}")
-+    print("-" * 72)
-+    for key, agg in sorted(totals.items(), key=lambda kv: kv[1]["instructions"]):
-+        print(f"{key:<12} {agg['instructions']:>7.0f} {agg['loads']:>6.0f} "
-+              f"{agg['stores']:>7.0f} {agg['spills']:>7.0f} {agg['branches']:>7.0f} "
-+              f"{agg['vectors']:>6.0f} {wins.get(key, 0):>5}")
-+
-+
- def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-     argv = list(sys.argv[1:] if argv is None else argv)
-     # Dash-leading flag values ("--local-flags -O3", "--flags -O3 ...") are
-@@ -378,6 +414,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-     parser.add_argument("--artifact-dir", type=Path)
-     parser.add_argument("--json", type=Path)
-     parser.add_argument("--markdown", type=Path)
-+    parser.add_argument("--totals", action="store_true",
-+                        help="also print a cross-source aggregate per compiler "
-+                             "(summed static stats + per-source bests)")
-     parser.add_argument("-j", "--jobs", type=int, default=4)
-     return parser.parse_args(argv)
- 
-@@ -420,6 +459,8 @@ def main(argv: list[str] | None = None) -> int:
-         tmp.replace(args.json)
-     if args.markdown:
-         _markdown(results, args.markdown)
-+    if args.totals:
-+        _print_totals(results)
-     return 1 if any(result["errors"] for result in results) else 0
- 
- 
-diff --git a/scripts/unroll_stress.py b/scripts/unroll_stress.py
-new file mode 100755
-index 00000000..50a944ad
---- /dev/null
-+++ b/scripts/unroll_stress.py
-@@ -0,0 +1,492 @@
-+#!/usr/bin/env python3
-+"""Exhaustive differential stress test for LCCC's loop unroller.
-+
-+Hardware counters are unavailable on the research VM, so correctness evidence
-+for `src/passes/loop_unroll.rs` has to come from *coverage of the input space*
-+rather than from a handful of hand-written loops.  This tool enumerates the
-+counted-loop shape space the unroller reasons about and checks every point
-+three ways:
-+
-+    lccc -O3                               (unroller ON)
-+    lccc -O3 + CCC_DISABLE_PASSES=unroll   (unroller OFF, same compiler)
-+    gcc  -O0                               (independent reference)
-+
-+Any divergence is a miscompile.  ON-vs-OFF isolates the unroller from the rest
-+of the pipeline; the GCC arm catches shared frontend bugs.
-+
-+The enumerated dimensions are exactly the ones `loop_unroll.rs` pattern-matches
-+on, so a bug in any branch of its analysis has a generated witness:
-+
-+  * IV type            : int, unsigned, long, unsigned long, short,
-+                         unsigned short, signed char, unsigned char
-+  * compare op         : <  <=  >  >=  !=
-+  * operand order      : `i OP lim` and `lim OP i` (iv_is_lhs)
-+  * branch polarity    : `for(;c;)`, `for(;!(nc);)`, `for(;;){if(nc)break;}`
-+  * stride             : +1 +2 +3 +7 -1 -2 -3
-+  * init / limit       : trip counts 0..17 plus signed/unsigned boundary pairs
-+                         (0xFFFFFFFC vs 4, INT_MIN neighbourhood, ...) whose
-+                         signed and unsigned orderings disagree
-+  * limit kind         : compile-time constant (complete unroll) or a runtime
-+                         parameter (partial unroll with intermediate exits)
-+  * body kind          : reduction, array store, multiplicative hash, guarded
-+                         accumulate (diamond), two accumulators, pointer walk,
-+                         early `break`, `continue`, nested fixed-trip loop,
-+                         IV live-out (`return i`), float accumulate
-+
-+Every configuration is first run through a small C-semantics emulator that
-+rejects loops that would invoke UB (signed overflow) or fail to terminate
-+within a bound, so every generated program has a single well-defined answer.
-+
-+Usage (from the repo root, after a fastbuild)::
-+
-+    scripts/unroll_stress.py --lccc target/fastbuild/lccc
-+    scripts/unroll_stress.py --lccc target/fastbuild/lccc --limit 400 --seed 7
-+    scripts/unroll_stress.py --lccc target/fastbuild/lccc --keep results/unroll-fail
-+
-+Exit status is 0 only when every configuration agrees across all arms.
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import itertools
-+import os
-+import random
-+import shutil
-+import subprocess
-+import sys
-+import tempfile
-+from dataclasses import dataclass
-+from pathlib import Path
-+from typing import Iterable, List, Optional, Sequence, Tuple
-+
-+# ── Type model ────────────────────────────────────────────────────────────────
-+
-+@dataclass(frozen=True)
-+class CType:
-+    name: str
-+    bits: int
-+    signed: bool
-+    suffix: str  # literal suffix for wide types
-+
-+    @property
-+    def lo(self) -> int:
-+        return -(1 << (self.bits - 1)) if self.signed else 0
-+
-+    @property
-+    def hi(self) -> int:
-+        return (1 << (self.bits - 1)) - 1 if self.signed else (1 << self.bits) - 1
-+
-+    def wrap(self, v: int) -> int:
-+        m = 1 << self.bits
-+        v %= m
-+        if self.signed and v > self.hi:
-+            v -= m
-+        return v
-+
-+    def literal(self, v: int) -> str:
-+        """Spell `v` (a representable value of this type) as a C expression of
-+        exactly this type, avoiding `-2147483648`-style negated literals."""
-+        if v == self.lo and self.signed and self.bits >= 32:
-+            return f"(({self.name})({self.lo + 1}{self.suffix} - 1))"
-+        if self.bits < 32:
-+            return f"(({self.name}){v})"
-+        return f"(({self.name}){v}{self.suffix})"
-+
-+
-+TYPES = [
-+    CType("int", 32, True, ""),
-+    CType("unsigned", 32, False, "u"),
-+    CType("long", 64, True, "l"),
-+    CType("unsigned long", 64, False, "ul"),
-+    CType("short", 16, True, ""),
-+    CType("unsigned short", 16, False, ""),
-+    CType("signed char", 8, True, ""),
-+    CType("unsigned char", 8, False, ""),
-+]
-+
-+OPS = ["<", "<=", ">", ">=", "!="]
-+NEG = {"<": ">=", "<=": ">", ">": "<=", ">=": "<", "!=": "=="}
-+STEPS = [1, 2, 3, 7, -1, -2, -3]
-+POLARITIES = ["plain", "notneg", "break"]
-+LIMIT_KINDS = ["const", "runtime"]
-+BODIES = [
-+    "sum", "store", "hash", "guard", "twoacc", "ptrwalk",
-+    "early", "continue", "nested", "liveout", "fsum",
-+    # Inner loops whose init/limit is an affine function of the outer IV:
-+    # after the outer loop is completely unrolled these become constant
-+    # expressions that `resolve_const_operand` must evaluate in the IV's
-+    # own width and signedness.
-+    "nestedj", "nestedjd", "nestedlim",
-+]
-+
-+MAX_TRIP = 4096  # emulation bound: anything longer is "does not terminate"
-+
-+
-+# ── Emulation ─────────────────────────────────────────────────────────────────
-+
-+def cmp(op: str, a: int, b: int) -> bool:
-+    return {
-+        "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b,
-+        "!=": a != b, "==": a == b,
-+    }[op]
-+
-+
-+def emulate_trip(ty: CType, init: int, limit: int, op: str, step: int) -> Optional[int]:
-+    """Number of body executions, or None if UB / non-terminating.
-+
-+    Both operands are spelled as values of `ty`, so after the usual arithmetic
-+    conversions the comparison is numerically the comparison of the
-+    represented values for every type (narrow types promote to int, which
-+    preserves value).  `i += step` is performed in int for narrow types and
-+    converted back (wrapping, well defined) and in `ty` for wide types (UB on
-+    signed overflow -> rejected)."""
-+    i = init
-+    trip = 0
-+    while cmp(op, i, limit):
-+        trip += 1
-+        if trip > MAX_TRIP:
-+            return None
-+        nxt = i + step
-+        if ty.bits >= 32 and ty.signed and not (ty.lo <= nxt <= ty.hi):
-+            return None  # signed overflow: UB
-+        i = ty.wrap(nxt)
-+    return trip
-+
-+
-+# ── Program generation ────────────────────────────────────────────────────────
-+
-+@dataclass(frozen=True)
-+class Config:
-+    ty: CType
-+    op: str
-+    iv_lhs: bool
-+    polarity: str
-+    step: int
-+    init: int
-+    limit: int
-+    limit_kind: str
-+    body: str
-+
-+    def ident(self, n: int) -> str:
-+        return f"f{n:04d}"
-+
-+    def describe(self) -> str:
-+        return (f"{self.ty.name} i={self.init} {'i' if self.iv_lhs else 'lim'} "
-+                f"{self.op} {'lim' if self.iv_lhs else 'i'}={self.limit} "
-+                f"step={self.step:+d} pol={self.polarity} lim={self.limit_kind} "
-+                f"body={self.body}")
-+
-+
-+def cond_expr(cfg: Config, op: str) -> str:
-+    lim = "lim" if cfg.limit_kind == "runtime" else cfg.ty.literal(cfg.limit)
-+    if cfg.iv_lhs:
-+        return f"(i {op} {lim})"
-+    mirror = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "!=": "!=", "==": "=="}[op]
-+    return f"({lim} {mirror} i)"
-+
-+
-+def body_code(cfg: Config) -> Tuple[str, str, str]:
-+    """(pre-loop decls, loop body, post-loop expression producing u64)."""
-+    t = cfg.ty.name
-+    if cfg.body == "sum":
-+        return ("unsigned long long acc = 0;",
-+                "acc += (unsigned long long)i;",
-+                "acc")
-+    if cfg.body == "store":
-+        return ("unsigned long long acc = 0; unsigned buf[64]; unsigned k = 0;"
-+                " for (k = 0; k < 64; k++) buf[k] = 0; k = 0;",
-+                "buf[k & 63] = (unsigned)i * 2654435761u; k++;",
-+                "({ unsigned q; for (q = 0; q < 64; q++) acc = acc * 31 + buf[q]; acc; })")
-+    if cfg.body == "hash":
-+        return ("unsigned long long acc = 0x9E3779B97F4A7C15ull;",
-+                "acc ^= (unsigned long long)i; acc *= 0x100000001B3ull;",
-+                "acc")
-+    if cfg.body == "guard":
-+        return ("unsigned long long acc = 0, odd = 0;",
-+                "if ((i & 1) != 0) odd += (unsigned long long)i; else acc += 3;",
-+                "(acc * 1000003ull + odd)")
-+    if cfg.body == "twoacc":
-+        return ("unsigned long long a0 = 1, a1 = 2;",
-+                "a0 += (unsigned long long)i * 3; a1 ^= a0;",
-+                "(a0 * 65599ull + a1)")
-+    if cfg.body == "ptrwalk":
-+        return ("unsigned long long acc = 0; static unsigned tbl[4096 + 64];"
-+                " const unsigned *p = tbl; { unsigned q; for (q = 0; q < 4096 + 64; q++)"
-+                " tbl[q] = q * 7u; }",
-+                "acc += *p++;",
-+                "(acc + (unsigned long long)(p - tbl))")
-+    if cfg.body == "early":
-+        return ("unsigned long long acc = 0; unsigned n = 0;",
-+                "acc += (unsigned long long)i; if (++n == 5) break;",
-+                "(acc * 7 + n)")
-+    if cfg.body == "continue":
-+        return ("unsigned long long acc = 0;",
-+                "if ((i & 2) != 0) continue; acc += (unsigned long long)i + 1;",
-+                "acc")
-+    if cfg.body == "nested":
-+        return ("unsigned long long acc = 0;",
-+                "{ int j; for (j = 0; j < 3; j++) acc += (unsigned long long)i * (j + 1); }",
-+                "acc")
-+    if cfg.body == "liveout":
-+        return ("unsigned long long acc = 0;",
-+                "acc += 1;",
-+                f"(acc * 4096 + (unsigned long long)({t})i)")
-+    if cfg.body == "nestedj":
-+        return ("unsigned long long acc = 0;",
-+                f"{{ {t} j; for (j = ({t})(i + 1); j < ({t})6; j++) acc += (unsigned long long)j * 3u; }}",
-+                "acc")
-+    if cfg.body == "nestedjd":
-+        return ("unsigned long long acc = 0;",
-+                f"{{ {t} j; for (j = ({t})(i + 1); j < ({t})6; j++)"
-+                " { if (j & 1) acc += (unsigned long long)j; else acc ^= (unsigned long long)j; } }",
-+                "acc")
-+    if cfg.body == "nestedlim":
-+        return ("unsigned long long acc = 0;",
-+                f"{{ {t} j; for (j = ({t})2; j < ({t})(i + 4); j++)"
-+                " { if (j & 1) acc += (unsigned long long)j; else acc ^= (unsigned long long)j; } }",
-+                "acc")
-+    if cfg.body == "fsum":
-+        return ("double acc = 0.0;",
-+                "acc += (double)i * 0.5;",
-+                "(unsigned long long)(long long)(acc * 4.0)")
-+    raise ValueError(cfg.body)
-+
-+
-+def gen_function(n: int, cfg: Config) -> str:
-+    t = cfg.ty.name
-+    pre, body, post = body_code(cfg)
-+    param = f"{t} lim" if cfg.limit_kind == "runtime" else "int unused"
-+    lines = [f"__attribute__((noinline)) unsigned long long {cfg.ident(n)}({param}) {{"]
-+    if cfg.limit_kind != "runtime":
-+        lines.append("    (void)unused;")
-+    lines.append(f"    {pre}")
-+    lines.append(f"    {t} i;")
-+    step = f"i += {cfg.step}" if cfg.step > 0 else f"i -= {-cfg.step}"
-+    init = cfg.ty.literal(cfg.init)
-+    if cfg.polarity == "plain":
-+        lines.append(f"    for (i = {init}; {cond_expr(cfg, cfg.op)}; {step}) {{")
-+        lines.append(f"        {body}")
-+        lines.append("    }")
-+    elif cfg.polarity == "notneg":
-+        lines.append(f"    for (i = {init}; !{cond_expr(cfg, NEG[cfg.op])}; {step}) {{")
-+        lines.append(f"        {body}")
-+        lines.append("    }")
-+    else:  # break
-+        lines.append(f"    for (i = {init}; ; {step}) {{")
-+        lines.append(f"        if {cond_expr(cfg, NEG[cfg.op])} break;")
-+        lines.append(f"        {body}")
-+        lines.append("    }")
-+    lines.append(f"    return {post};")
-+    lines.append("}")
-+    return "\n".join(lines)
-+
-+
-+def gen_program(configs: Sequence[Config]) -> str:
-+    out = ["#include <stdio.h>", ""]
-+    for n, cfg in enumerate(configs):
-+        out.append(f"/* {cfg.describe()} */")
-+        out.append(gen_function(n, cfg))
-+        out.append("")
-+    out.append("int main(void) {")
-+    out.append("    volatile int zero = 0; (void)zero;")
-+    for n, cfg in enumerate(configs):
-+        if cfg.limit_kind == "runtime":
-+            lit = cfg.ty.literal(cfg.limit)
-+            arg = f"({cfg.ty.name})({lit} + zero)"
-+        else:
-+            arg = "zero"
-+        out.append(f'    printf("{cfg.ident(n)} %llu\\n", {cfg.ident(n)}({arg}));')
-+    out.append("    return 0;")
-+    out.append("}")
-+    return "\n".join(out) + "\n"
-+
-+
-+# ── Configuration space ───────────────────────────────────────────────────────
-+
-+def init_limit_pairs(ty: CType, op: str, step: int) -> Iterable[Tuple[int, int]]:
-+    """Constant pairs giving trips 0..17 plus boundary pairs whose signed and
-+    unsigned orderings differ (the class of bug a signed-only trip-count
-+    computation cannot see)."""
-+    pairs = set()
-+    ascending = step > 0
-+    for base in (0, 5, -7 if ty.signed else 3):
-+        for trip in (0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17):
-+            span = trip * step
-+            if op in ("<", ">", "!="):
-+                lim = base + span
-+            else:  # <=, >=
-+                lim = base + span - (1 if ascending else -1) if trip else base - step
-+            if ty.lo <= base <= ty.hi and ty.lo <= lim <= ty.hi:
-+                pairs.add((base, lim))
-+    top = ty.hi
-+    for a, b in ((top - 3, 4), (4, top - 3), (top - 8, top), (top, top - 8),
-+                 (ty.lo, ty.lo + 6), (ty.lo + 6, ty.lo), (top - 1, top),
-+                 (0, top), (top, 0)):
-+        if ty.lo <= a <= ty.hi and ty.lo <= b <= ty.hi:
-+            pairs.add((a, b))
-+    return sorted(pairs)
-+
-+
-+def enumerate_configs(rng: random.Random, limit: Optional[int]) -> List[Config]:
-+    """Covering design over the shape space.
-+
-+    The full cross product is ~10^6 functions -- far beyond what three
-+    compiler arms can process in a session -- so the design is layered:
-+
-+      core      every (type, op, order, polarity, step, limit-kind) tuple
-+                appears, each with `--per-tuple` seeded (init, limit, body)
-+                draws, so every branch of the unroller's analysis is hit for
-+                every type;
-+      boundary  every (type, op, step, order) with EVERY boundary pair and
-+                the nested/IV-dependent bodies, because those pairs are where
-+                signed-vs-unsigned reasoning diverges;
-+      nested    every (type, op, step) with the three nested bodies on small
-+                constant trips, both operand orders, constant limits.
-+
-+    Configurations that the emulator classifies as UB or non-terminating are
-+    dropped before generation, so every emitted loop has one defined answer.
-+    """
-+    cfgs: set = set()
-+    for ty, op, iv_lhs, pol, step, lk in itertools.product(
-+            TYPES, OPS, (True, False), POLARITIES, STEPS, LIMIT_KINDS):
-+        pairs = [p for p in init_limit_pairs(ty, op, step)
-+                 if emulate_trip(ty, p[0], p[1], op, step) is not None]
-+        if not pairs:
-+            continue
-+        for _ in range(PER_TUPLE):
-+            init, lim = rng.choice(pairs)
-+            cfgs.add(Config(ty, op, iv_lhs, pol, step, init, lim, lk, rng.choice(BODIES)))
-+    for ty, op, step, iv_lhs in itertools.product(TYPES, OPS, STEPS, (True, False)):
-+        top = ty.hi
-+        for init, lim in ((top - 3, 4), (4, top - 3), (top - 8, top), (top, top - 8),
-+                          (ty.lo, ty.lo + 6), (ty.lo + 6, ty.lo), (top - 1, top),
-+                          (0, top), (top, 0), (top - 6, top - 1)):
-+            if not (ty.lo <= init <= ty.hi and ty.lo <= lim <= ty.hi):
-+                continue
-+            if emulate_trip(ty, init, lim, op, step) is None:
-+                continue
-+            for body in ("sum", "guard", "nestedj", "nestedjd", "nestedlim", "liveout"):
-+                cfgs.add(Config(ty, op, iv_lhs, "plain", step, init, lim, "const", body))
-+    for ty, op, step, iv_lhs in itertools.product(TYPES, OPS, STEPS, (True, False)):
-+        for init, lim in init_limit_pairs(ty, op, step):
-+            tr = emulate_trip(ty, init, lim, op, step)
-+            if tr is None or tr > 9:
-+                continue
-+            for body in ("nestedj", "nestedjd", "nestedlim"):
-+                cfgs.add(Config(ty, op, iv_lhs, "plain", step, init, lim, "const", body))
-+    out = sorted(cfgs, key=lambda c: (c.ty.name, c.op, c.iv_lhs, c.polarity, c.step,
-+                                     c.init, c.limit, c.limit_kind, c.body))
-+    rng.shuffle(out)
-+    if limit is not None:
-+        out = out[:limit]
-+    return out
-+
-+
-+PER_TUPLE = 2
-+
-+
-+# ── Execution ─────────────────────────────────────────────────────────────────
-+
-+def run(cmd: Sequence[str], env: Optional[dict] = None, timeout: int = 600) -> subprocess.CompletedProcess:
-+    return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout, env=env)
-+
-+
-+def compile_and_run(compiler: str, flags: Sequence[str], src: Path, exe: Path,
-+                    env_extra: Optional[dict] = None) -> Tuple[bool, str]:
-+    env = dict(os.environ)
-+    if env_extra:
-+        env.update(env_extra)
-+    cp = run([compiler, *flags, str(src), "-o", str(exe)], env=env)
-+    if cp.returncode != 0:
-+        return False, f"COMPILE FAILED ({compiler}):\n{cp.stderr[-4000:]}"
-+    try:
-+        rp = run([str(exe)], timeout=60)
-+    except subprocess.TimeoutExpired:
-+        return False, f"RUN TIMEOUT ({compiler})"
-+    if rp.returncode != 0:
-+        return False, f"RUN FAILED ({compiler}) rc={rp.returncode}\n{rp.stderr[-2000:]}"
-+    return True, rp.stdout
-+
-+
-+def parse_results(text: str) -> dict:
-+    res = {}
-+    for line in text.splitlines():
-+        parts = line.split()
-+        if len(parts) == 2:
-+            res[parts[0]] = parts[1]
-+    return res
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-+    ap.add_argument("--lccc", required=True, help="path to the lccc driver under test")
-+    ap.add_argument("--gcc", default="gcc", help="reference compiler (default: gcc)")
-+    ap.add_argument("--lccc-flags", default="-O3", help="flags for the lccc arms (default: -O3)")
-+    ap.add_argument("--batch", type=int, default=48, help="functions per translation unit")
-+    ap.add_argument("--limit", type=int, default=None, help="cap on configurations (default: all)")
-+    ap.add_argument("--seed", type=int, default=1, help="shuffle seed for --limit sampling")
-+    ap.add_argument("--keep", default=None, help="directory to keep failing programs in")
-+    ap.add_argument("--no-gcc", action="store_true", help="skip the independent reference arm")
-+    ap.add_argument("--quiet", action="store_true")
-+    args = ap.parse_args()
-+
-+    rng = random.Random(args.seed)
-+    cfgs = enumerate_configs(rng, args.limit)
-+    print(f"[unroll_stress] {len(cfgs)} configurations, batch={args.batch}")
-+
-+    lccc_flags = args.lccc_flags.split()
-+    failures = 0
-+    checked = 0
-+    tmp = Path(tempfile.mkdtemp(prefix="unroll_stress."))
-+    keep = Path(args.keep) if args.keep else None
-+    if keep:
-+        keep.mkdir(parents=True, exist_ok=True)
-+    try:
-+        for bi in range(0, len(cfgs), args.batch):
-+            batch = cfgs[bi:bi + args.batch]
-+            src = tmp / f"b{bi // args.batch:04d}.c"
-+            src.write_text(gen_program(batch))
-+            arms = {
-+                "lccc-on": (args.lccc, lccc_flags, None),
-+                "lccc-off": (args.lccc, lccc_flags, {"CCC_DISABLE_PASSES": "unroll"}),
-+            }
-+            if not args.no_gcc:
-+                arms["gcc-O0"] = (args.gcc, ["-O0", "-w"], None)
-+            outputs = {}
-+            bad = []
-+            for name, (cc, fl, env) in arms.items():
-+                ok, out = compile_and_run(cc, fl, src, tmp / f"{src.stem}.{name}", env)
-+                if not ok:
-+                    bad.append(f"[{name}] {out}")
-+                    continue
-+                outputs[name] = parse_results(out)
-+            mism = []
-+            if "lccc-on" in outputs:
-+                for n, cfg in enumerate(batch):
-+                    key = cfg.ident(n)
-+                    vals = {a: o.get(key, "<missing>") for a, o in outputs.items()}
-+                    if len(set(vals.values())) > 1:
-+                        mism.append((cfg, vals))
-+            checked += len(batch)
-+            if bad or mism:
-+                failures += len(mism) + len(bad)
-+                print(f"\n=== FAIL batch {src.name} ===")
-+                for b in bad:
-+                    print(b)
-+                for cfg, vals in mism:
-+                    print(f"  MISMATCH {cfg.describe()}")
-+                    for a, v in vals.items():
-+                        print(f"      {a:9s} {v}")
-+                if keep:
-+                    shutil.copy(src, keep / src.name)
-+            elif not args.quiet:
-+                print(f"  ok  {src.name}  ({checked}/{len(cfgs)})", flush=True)
-+    finally:
-+        shutil.rmtree(tmp, ignore_errors=True)
-+
-+    print(f"\n[unroll_stress] checked={checked} failures={failures}")
-+    return 1 if failures else 0
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index ee6fec75..2dd8f570 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -4990,6 +4990,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
-             // VecHorizontalAdd — stays classified and reaches the XMM
-             // allocator (register-homed accumulator, no stack round-trip).
-             O::VecWidenAddI32x4ToI64x2 | O::VecWidenMaskedAddI32x4ToI64x2 => Some(7),
-+            // Equal-width masked add consumes an I32x8 accumulator exactly
-+            // like VecAddI32x8 (its lowering confines scratch to ymm0/ymm1,
-+            // mirroring the widening-masked path's xmm0/xmm1 discipline).
-+            O::VecMaskedAddI32x8 => Some(5),
-             O::VecLoadWidenI32ToI64x2 => Some(7),
-             _ => None,
-         }
-@@ -5022,6 +5026,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
-                     // it. Both lowerings confine scratch to xmm0/xmm1.
-                     | O::VecMaxI32x8
-                     | O::VecHorizontalMaxI32x8
-+                    | O::VecMaskedAddI32x8
-             ),
-             6 => matches!(
-                 op,
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index 878a8085..fb91abb1 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -3311,6 +3311,110 @@ impl X86Codegen {
-                     }
-                 }
-             }
-+            IntrinsicOp::VecMaskedAddI32x8 => {
-+                // dest(I32x8 accumulator) += lanes(load8×I32(base, off))
-+                // where lane > guard_rhs.  args = [acc, base, off,
-+                // guard_rhs].  Equal-width sibling of the masked widening
-+                // path:
-+                //   vmovdqu (mem)            → ymm0 = {a0..a7}
-+                //   <broadcast rhs → ymm1>
-+                //   vpcmpgtd ymm1, ymm0 → ymm1 = {m0..m7} (0/-1 per lane)
-+                //   vpand ymm1, ymm0 → ymm0   = {a&m}  (zero for lanes ≤ rhs)
-+                //   vpaddd ymm0, acc → dest
-+                // Scratch confined to ymm0/ymm1 so a register-homed I32x8
-+                // accumulator (ymm2..ymm15) is never clobbered — the same
-+                // discipline as the widening masked path.  Masking at I32 is
-+                // exact: the mask is 0/-1 from vpcmpgtd (lanes > rhs), and
-+                // vpand zero-masks strictly-below lanes before the fold, so
-+                // the guarded scalar semantics (skip lane when lane ≤ rhs)
-+                // hold bit-for-bit.
-+                self.flush_pending_vec_store_impl();
-+                self.state.invalidate_vec_peephole();
-+                let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
-+                match index {
-+                    Some(idx) => self
-+                        .state
-+                        .emit_fmt(format_args!("    vmovdqu (%{},%{}), %ymm0", base, idx)),
-+                    None => self
-+                        .state
-+                        .emit_fmt(format_args!("    vmovdqu (%{}), %ymm0", base)),
-+                }
-+                // Build the mask in ymm1 = broadcast(guard_rhs).
-+                match &args[3] {
-+                    Operand::Const(c) if c.to_i64() == Some(0) => {
-+                        self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
-+                    }
-+                    Operand::Const(c) => {
-+                        if let Some(v) = c.to_i64() {
-+                            self.state
-+                                .emit_fmt(format_args!("    movl ${}, %eax", v as i32));
-+                        } else {
-+                            self.state.emit("    xorl %eax, %eax");
-+                        }
-+                        self.state.emit("    vmovd %eax, %xmm1");
-+                        self.state.emit("    vpbroadcastd %xmm1, %ymm1");
-+                    }
-+                    op => {
-+                        // Scalar value operand: materialize into %eax.
-+                        self.operand_to_reg(op, "rax");
-+                        self.state.emit("    vmovd %eax, %xmm1");
-+                        self.state.emit("    vpbroadcastd %xmm1, %ymm1");
-+                    }
-+                }
-+                // mask = lanes > rhs (AT&T: vpcmpgtd src2=rhs, src1=lanes).
-+                self.state.emit("    vpcmpgtd %ymm1, %ymm0, %ymm1");
-+                // Apply mask to the loaded lanes in-place, then fold.
-+                self.state.emit("    vpand %ymm1, %ymm0, %ymm0");
-+                if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
-+                    let acc_reg = self
-+                        .reg_assignments
-+                        .get(&acc.0)
-+                        .copied()
-+                        .filter(|r| is_xmm_reg(*r))
-+                        .map(|r| phys_reg_name_256(r));
-+                    let dst_reg = self
-+                        .reg_assignments
-+                        .get(&d.0)
-+                        .copied()
-+                        .filter(|r| is_xmm_reg(*r))
-+                        .map(|r| phys_reg_name_256(r));
-+                    match (acc_reg, dst_reg) {
-+                        (Some(a), Some(dst)) => {
-+                            if dst != a {
-+                                self.state
-+                                    .emit_fmt(format_args!("    vmovdqa %{}, %{}", a, dst));
-+                            }
-+                            self.state
-+                                .emit_fmt(format_args!("    vpaddd %ymm0, %{}, %{}", dst, dst));
-+                            self.state.vector_values.insert(d.0);
-+                            self.state.vec_live_regs.insert(d.0, dst);
-+                            self.state.vec_last_store_val = Some(d.0);
-+                            self.state.vec_last_store_reg = true;
-+                            self.state.vec_last_store_reg_name = Some(dst);
-+                        }
-+                        _ => {
-+                            // Slot-homed: ymm0 holds the masked lanes; load the
-+                            // accumulator into ymm1 (mask consumed), fold,
-+                            // round-trip through the slot.
-+                            if let Some(slot) = self.state.get_slot(acc.0) {
-+                                self.state
-+                                    .out
-+                                    .emit_instr_rbp_reg("    vmovdqu", slot.0, "ymm1");
-+                                self.state.emit("    vpaddd %ymm0, %ymm1, %ymm1");
-+                                if let Some(dslot) = self.state.get_slot(d.0) {
-+                                    self.state.out.emit_instr_reg_rbp(
-+                                        "    vmovdqu",
-+                                        "ymm1",
-+                                        dslot.0,
-+                                    );
-+                                }
-+                            } else {
-+                                self.state.emit("    vpaddd %ymm0, %ymm0, %ymm0");
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-             IntrinsicOp::VecMulI64x2 => {
-                 self.flush_pending_vec_store_impl();
-                 self.state.invalidate_vec_peephole();
-diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
-index 7a4be67b..94b8b7c9 100644
---- a/src/ir/intrinsics.rs
-+++ b/src/ir/intrinsics.rs
-@@ -361,6 +361,17 @@ pub enum IntrinsicOp {
-     /// values before the paddq folds — exact lane-guarded I64 accumulation
-     /// (GCC's canonical conditional-reduction form).
-     VecWidenMaskedAddI32x4ToI64x2,
-+    /// Masked equal-width reduction step: dest(I32x8 accumulator) +=
-+    /// 8×I32 loaded from (base, byte_offset) WHERE the lane satisfies
-+    /// `lane > guard_rhs` (signed).  args = [accumulator, base,
-+    /// byte_offset, guard_rhs].  The x86 lowering builds the per-lane I32
-+    /// mask with vpcmpgtd (lanes > rhs), vpand zero-masks the loaded lanes
-+    /// and vpaddd folds them into the accumulator — the equal-width sibling
-+    /// of VecWidenMaskedAddI32x4ToI64x2.  Without it the non-widening
-+    /// conditional-sum transform silently DROPPED the Select guard
-+    /// (`if (a[i] > 0) s += a[i]` summed every element; regression:
-+    /// tests/regression/vector_guard_sum.c).
-+    VecMaskedAddI32x8,
-     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
-     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
-     VecMulI32x4,
-@@ -1196,6 +1207,7 @@ impl IntrinsicOp {
-             | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
-             | VecWidenAddI32x4ToI64x2
-             | VecWidenMaskedAddI32x4ToI64x2
-+            | VecMaskedAddI32x8
-             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
-             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
-             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
-@@ -1222,7 +1234,8 @@ impl IntrinsicOp {
-             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
-             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
-             IntrinsicOp::VecWidenAddI32x4ToI64x2
--            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 |
-+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
-+            | IntrinsicOp::VecMaskedAddI32x8 |
-             IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
-             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
-             IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
-@@ -1319,6 +1332,7 @@ impl IntrinsicOp {
-                 | IntrinsicOp::VecSqrtF32x4
-                 | IntrinsicOp::VecWidenAddI32x4ToI64x2
-                 | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
-+                | IntrinsicOp::VecMaskedAddI32x8
-                 | IntrinsicOp::VecBroadcastF32x8
-                 | IntrinsicOp::VecBroadcastF32x4
-                 | IntrinsicOp::VecFmaF64x4
-diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
-index 19934ea4..87c8c1cb 100644
---- a/src/passes/loop_unroll.rs
-+++ b/src/passes/loop_unroll.rs
-@@ -265,6 +265,142 @@ fn analyze_loop(
-         }
-     }
- 
-+    // 5b. Body connectivity: every body block must be reachable from the
-+    // header WITHOUT taking the back edge.  This is an inherent property of
-+    // a natural loop, so a violation means the "body" contains a detached
-+    // cycle — e.g. the clone chain a complete unroller left behind when it
-+    // rewrote an inner loop and the CFG simplifier has not run yet.  Such a
-+    // cycle has no entry from the preheader, evades the nested-loop check
-+    // (unreachable blocks are not merged into `all_headers`), and do_unroll
-+    // would clone it into a garbage 4x structure whose exit guards fall
-+    // through to the wrong accumulator.  Rejecting here is purely
-+    // conservative: the loop simply stays rolled.
-+    // NOTE: this guard does NOT trigger on red-team cfg 1765/3169 (their
-+    // bodies are reachable and connected); those two were fixed elsewhere
-+    // (the strict Add-only partial-IV split and the do_unroll Step 5b
-+    // terminator rewrite below).
-+    {
-+        let mut seen: FxHashSet<usize> = FxHashSet::default();
-+        let mut stack: Vec<usize> = vec![header];
-+        while let Some(bi) = stack.pop() {
-+            if !seen.insert(bi) {
-+                continue;
-+            }
-+            let label = func.blocks[bi].label;
-+            let mut succs: Vec<BlockId> = match &func.blocks[bi].terminator {
-+                Terminator::Branch(l) => vec![*l],
-+                Terminator::CondBranch {
-+                    true_label,
-+                    false_label,
-+                    ..
-+                } => vec![*true_label, *false_label],
-+                Terminator::Switch { default, cases, .. } => {
-+                    let mut v = vec![*default];
-+                    v.extend(cases.iter().map(|(_, l)| *l));
-+                    v
-+                }
-+                _ => vec![],
-+            };
-+            succs.retain(|l| *l != header_label);
-+            for l in succs {
-+                if let Some(next) = func.blocks.iter().position(|b| b.label == l) {
-+                    if lp.body.contains(&next) {
-+                        stack.push(next);
-+                    }
-+                }
-+            }
-+        }
-+        if seen.len() != lp.body.len() {
-+            return None;
-+        }
-+    }
-+
-+    // 5c. body_work must be a simple linear chain header -> work -> latch.
-+    // `do_unroll` emits, per clone, ONE guard that decides whether to enter
-+    // the next clone or branch to the exit, and it threads the loop-carried
-+    // value through the clones under the assumption that control always
-+    // flows work[0] -> work[1] -> ... -> latch.  A body_work with branches,
-+    // merges or sub-cycles violates that: the clone-local guard exits jump
-+    // to the exit block with whatever the value carried from the PREVIOUS
-+    // iteration, doubling the accumulator.  Requiring a linear chain is the
-+    // exact precondition the guard arithmetic was derived for; anything else
-+    // simply stays rolled (fail-closed).
-+    // NOTE: unlike the general shape above, the chain in red-team cfg 1765
-+    // IS linear and passes this check — 1765 was fixed by the Step 5b
-+    // terminator rewrite in do_unroll, not by this guard.  The guard covers
-+    // the wider class of non-linear bodies; those shapes are exercised
-+    // exhaustively by scripts/unroll_stress.py.
-+    {
-+        let mut chain_ok = true;
-+        let mut seen_work: FxHashSet<usize> = FxHashSet::default();
-+        let mut entry_preds = 0usize;
-+        for &bi in &body_work {
-+            let inner_preds: Vec<usize> = cfg
-+                .preds
-+                .row(bi)
-+                .iter()
-+                .map(|&p| p as usize)
-+                .filter(|p| lp.body.contains(p))
-+                .collect();
-+            // Exactly one predecessor inside the loop; it must be the header
-+            // (the body entry) or another body_work block.
-+            if inner_preds.len() != 1 {
-+                chain_ok = false;
-+                break;
-+            }
-+            let p = inner_preds[0];
-+            if !(p == header || body_work.contains(&p)) {
-+                chain_ok = false;
-+                break;
-+            }
-+            if p == header {
-+                entry_preds += 1;
-+            }
-+            if !seen_work.insert(p) {
-+                // two work blocks share a predecessor -> merge, not a chain
-+                chain_ok = false;
-+                break;
-+            }
-+        }
-+        if !chain_ok || entry_preds != 1 {
-+            return None;
-+        }
-+        // Exactly one work block must terminate by branching to the latch
-+        // (the chain tail); every other work block's successor lies in
-+        // body_work (checked below via the chain walk).
-+        let latch_label = func.blocks[latch].label;
-+        let mut tails = 0usize;
-+        for &bi in &body_work {
-+            if let Terminator::Branch(l) = &func.blocks[bi].terminator {
-+                if *l == latch_label {
-+                    tails += 1;
-+                }
-+            }
-+        }
-+        if tails != 1 {
-+            return None;
-+        }
-+        // And every work block must branch only to body_work or the latch
-+        // (no jump out of the loop, no CondBranch in the chain).
-+        for &bi in &body_work {
-+            let succ_labels: Vec<BlockId> = match &func.blocks[bi].terminator {
-+                Terminator::Branch(l) => vec![*l],
-+                Terminator::CondBranch { .. } => vec![],
-+                _ => vec![],
-+            };
-+            for l in succ_labels {
-+                if l != latch_label {
-+                    let idx = func.blocks.iter().position(|b| b.label == l);
-+                    if let Some(idx) = idx {
-+                        if !body_work.contains(&idx) {
-+                            return None;
-+                        }
-+                    }
-+                }
-+            }
-+        }
-+    }
-+
-     // Cloning currently re-plumbs only the header exit. Reject body exits
-     // until exit-phi remapping is implemented.
-     {
-@@ -512,12 +648,13 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
- ///   header's CondBranch; every body block's successors stay inside
- ///   body ∪ {header}; body terminators are Branch/CondBranch/Switch only.
- /// - constant IV init (after const-chain resolution) and constant limit,
--///   trip inside `trip_range` (callers pass `1..=16`; a trip of exactly 1
--///   deletes the loop — header phis become copies of their init values, the
--///   latch falls through to the exit — with zero code growth, which is what
--///   the last row of a triangular nest `for (j = i+1; j < n; …)` becomes
--///   after the outer loop is straightened), and (header non-phi + body)
--///   instructions × trip within the expansion budget.
-+///   trip inside `trip_range` (callers pass `1..=1` for the tiny-loop
-+///   deletion pass — trip 1 folds every header phi to its init value and the
-+///   latch falls straight through to the exit, which is what the last row of
-+///   a triangular nest `for (j = i+1; j < n; …)` becomes after the outer loop
-+///   is straightened — and `1..=16` for the general complete unroll), and
-+///   (header non-phi + body) instructions × trip within the expansion
-+///   budget.
- /// - no calls / inline asm / dynamic allocas in body or header; intrinsics
- ///   only when pure (sqrt/FMA-class loop bodies stay eligible — the nbody
- ///   `advance`/`energy` shapes).
-@@ -763,7 +900,6 @@ fn complete_unroll_trip(
-     }
-     i64::try_from(trip).ok()
- }
--
- /// True when `op` denotes a value that depends only on integer constants and
- /// (possibly) `iv`.  Complete unrolling substitutes the OUTER IV with a
- /// per-clone constant, so once such an operand is used in an inner loop's own
-@@ -849,7 +985,7 @@ fn body_contains_persisting_inner_loop(
-             continue;
-         }
-         // Clean counted inner loop: IV, exit condition, and its initial value.
--        let Some((iv_phi, _ty, _step, _)) = find_iv_in_loop(func, inner.header, latch, latch_label)
-+        let Some((iv_phi, _ty, _step, _)) = find_iv_in_loop_ext(func, inner.header, latch, latch_label)
-         else {
-             continue;
-         };
-@@ -1194,7 +1330,7 @@ fn try_complete_unroll_general(
-     // be any non-zero constant; complete_unroll_trip rejects degenerate
-     // stride/comparison combinations.
-     let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
--        find_iv_in_loop(func, header, latch, latch_label)
-+        find_iv_in_loop_ext(func, header, latch, latch_label)
-     else {
-         return false;
-     };
-@@ -1216,7 +1352,10 @@ fn try_complete_unroll_general(
-         return false;
-     };
-     // The compare must be in the IV's own type, and its operator is put into
--    // the canonical "continue while iv OP limit" form before any arithmetic.
-+    // the canonical "continue while iv OP limit" form before any arithmetic
-+    // (the IV may be the RIGHT operand and the CondBranch may send `true` to
-+    // the EXIT; feeding the raw operator into the closed form computes the
-+    // trip count of a different loop).
-     if cmp_ty != iv_ty {
-         return false;
-     }
-@@ -1475,19 +1614,16 @@ fn try_complete_unroll_general(
-     // live-out values of those header instructions (e.g. `cnt` after a
-     // `for (i=0; cnt++, i<N; i++)` is N+1, not the value at the last clone's
-     // entry).
--    // The failing evaluation's environment: after the LAST clone (or, for a
--    // single-trip loop, after iteration 0's original body).  `plans` is empty
--    // when `trip == 1` (the single-trip deletion path), in which case there are
--    // no renamed values and the original body's defs are used verbatim.
--    let last: Option<&ClonePlan> = plans.last();
--    let last_vmap: FxHashMap<u32, u32> = last.map(|l| l.vmap.clone()).unwrap_or_default();
--    let env_fg = model.env_next(
--        trip,
--        last.map(|l| &l.env).unwrap_or(&env_prev),
--        last.map(|l| &l.vmap).unwrap_or(&rename_prev),
--    );
-     let mut extra_final: FxHashMap<u32, u32> = FxHashMap::default();
-     let mut final_guard: Option<BlockId> = None;
-+    // Failing (trip-th) evaluation environment: derived from the LAST
-+    // executed iteration — the last clone when trip >= 2, iteration 0 (the
-+    // original, un-renamed body) when the loop runs exactly once.
-+    let empty_vmap: FxHashMap<u32, u32> = FxHashMap::default();
-+    let (env_fg, last_vmap) = match plans.last() {
-+        Some(last) => (model.env_next(trip, &last.env, &last.vmap), &last.vmap),
-+        None => (model.env_next(trip, &model.env_entry(), &empty_vmap), &empty_vmap),
-+    };
-     if has_header_extra {
-         let fg_label = BlockId(next_label);
-         next_label += 1;
-@@ -1505,7 +1641,7 @@ fn try_complete_unroll_general(
-             // last clone's values, then substitute the header phis with the
-             // failing-entry environment.
-             replace_values_in_inst(&mut cloned, &fg_vmap);
--            replace_values_in_inst(&mut cloned, &last_vmap);
-+            replace_values_in_inst(&mut cloned, last_vmap);
-             rename_inst_dest(&mut cloned, &fg_vmap);
-             apply_env_inst(&mut cloned, &env_fg);
-             fg_insts.push(cloned);
-@@ -1616,11 +1752,13 @@ fn try_complete_unroll_general(
-     // becomes an unconditional Branch into the body entry.
-     func.blocks[header].terminator = Terminator::Branch(body_entry);
-     // The original latch's back-edge flows into clone 1's header copy — or
--    // straight to the exit when the loop runs exactly once (no clones).
-+    // straight to the exit (final guard when the header carries extra
-+    // instructions) when the loop runs exactly once and no clone exists.
-     func.blocks[latch].terminator = Terminator::Branch(match plans.first() {
-         Some(first) => first.header_copy,
--        None => exit_target,
-+        None => final_guard.unwrap_or(exit_target),
-     });
-+
-     // ── Post-loop substitution for blocks outside the loop ──────────────────
-     // The failing-entry environment holds the live-out value of every ordinary
-     // carried value (an accumulator `sum` is its value after the last body).
-@@ -1663,16 +1801,13 @@ fn try_complete_unroll_general(
-     // block that branches to the exit).
-     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
-         if exit_bi != header && !lp.body.contains(&exit_bi) {
--            let new_pred = final_guard.unwrap_or_else(|| {
--                match plans.last() {
--                    Some(last) => last.block_labels[body_blocks
--                        .iter()
--                        .position(|&b| b == latch)
--                        .expect("latch is a body block")],
--                    // Single-trip deletion: the original latch now branches
--                    // straight to the exit, so it IS the predecessor.
--                    None => latch_label,
--                }
-+            let new_pred = final_guard.unwrap_or_else(|| match plans.last() {
-+                Some(last) => last.block_labels[body_blocks
-+                    .iter()
-+                    .position(|&b| b == latch)
-+                    .expect("latch is a body block")],
-+                // trip == 1: no clone; the latch itself branches to the exit.
-+                None => latch_label,
-             });
-             relabel_exit_phis(func, exit_target, header_label, new_pred);
-         }
-@@ -1731,7 +1866,7 @@ fn try_complete_unroll_two_block(
-         _ => return false,
-     }
-     let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
--        find_iv_in_loop(func, header, latch, latch_label)
-+        find_iv_in_loop_ext(func, header, latch, latch_label)
-     else {
-         return false;
-     };
-@@ -2029,29 +2164,27 @@ fn try_complete_unroll_two_block(
-     func.blocks[header].terminator = Terminator::Branch(labels[0]);
-     // The latch is now UNREACHABLE: the header branches into the clone chain
-     // and the chain's last block branches straight to `exit_target`, so no
--    // edge reaches the latch any more.
--    //
--    // This used to be `Branch(exit_target)`, which fabricated a control-flow
--    // edge latch->exit that the *program* does not have.  The latch was only
--    // ever a predecessor of the header (its terminator is checked to be
--    // `Branch(header_label)` above), never of the exit, so any phi in the
--    // exit block acquired a predecessor it had no incoming for.  That is a
--    // hard SSA violation, and it is exactly what the IR verifier reported on
--    // linux-cachymod 6.18.47 `drivers/gpu/drm/i915/display/intel_sprite.c`:
--    //
--    //   after `loop_unroll_post_vec` in `vlv_sprite_update_arm`:
--    //     phi v904 has an incoming from BlockId(94080), which is not a
--    //     predecessor (real predecessors: [93725, 94081, 94090])
--    //     phi v904 has no incoming for predecessor BlockId(94090)
--    //
--    // Downstream, v904 reached x86 codegen with no register home and no stack
--    // slot, and `operand_to_rax`'s hard gate aborted the compile ("refusing to
--    // fabricate a value").  Before that gate existed this same shape silently
--    // emitted `xorl %eax,%eax` — i.e. a miscompile.  Marking the block
--    // `Unreachable` states the truth; DCE/CFG-simplify then delete it.
-+    // edge reaches the latch any more.  (This used to be
-+    // `Branch(exit_target)`, which fabricated a control-flow edge latch->exit
-+    // the program does not have: the latch was only ever a predecessor of the
-+    // header, never of the exit, so any phi in the exit block acquired a
-+    // predecessor it had no incoming for — a hard SSA violation the verifier
-+    // reported on linux-cachymod drivers/gpu/drm/i915/display/intel_sprite.c
-+    // and which silently emitted `xorl %eax,%eax` before the hard gate
-+    // existed.  Marking the block Unreachable states the truth; DCE/CFG-
-+    // simplify then delete it.)
-     func.blocks[latch].terminator = Terminator::Unreachable;
--    let _ = (body_entry, exit_cond_positive);
--
-+    let _ = body_entry;
-+
-+    // Repair the exit block's phis (the exit may be a JOIN carrying phis:
-+    // `if (cond) { for (...) ... }` merges the loop exit with the skip path).
-+    // The `header -> exit_target` edge is gone; the block that reaches the
-+    // exit is the LAST CLONE.  Every phi incoming still labelled
-+    // `header_label` must be relabelled to that clone (label only — the
-+    // operands are rewritten to the final values by the substitution sweep
-+    // below).  A phi incoming labelled `latch_label` cannot exist here (the
-+    // latch's terminator was verified to be `Branch(header_label)`), but drop
-+    // any such entry defensively rather than leave a dangling predecessor.
-     {
-         let last_clone = labels[(trip - 1) as usize];
-         if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
-@@ -2068,6 +2201,7 @@ fn try_complete_unroll_two_block(
-             }
-         }
-     }
-+
-     // Live-out substitution. The failing (`trip`-th) environment holds the
-     // value each carried phi has after the final cloned iteration: a body
-     // accumulator's computed total, a constant back value, a loop-invariant
-@@ -2274,18 +2408,6 @@ fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
-     false
- }
- 
--/// Evaluate `op` to a constant when it is a constant or a short chain of
--/// `Copy` / integer `Cast` / `Add` / `Sub` / `Mul` over constants — the shape
--/// an inner loop's `j = i + 1` init takes once the outer loop has been
--/// completely unrolled and `i` substituted by a per-clone constant.
--///
--/// Every intermediate result is normalised to the canonical `IrConst`
--/// representation of the instruction's result type via
--/// [`normalize_to_type`], so unsigned arithmetic zero-extends and narrowing
--/// casts truncate exactly as the constant folder would.  Values are only ever
--/// compared by [`complete_unroll_trip`] after a second normalisation to the
--/// IV type, which makes the whole chain representation-stable regardless of
--/// which pass produced the constants.
- fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
-     if depth > 6 {
-         return None;
-@@ -2357,6 +2479,20 @@ fn signed_step(c: IrConst, ty: IrType) -> Option<i64> {
-     }
- }
- 
-+
-+/// STRICT induction-variable detector for the partial-unroll path.
-+///
-+/// `do_unroll` was written for Add-form induction; its guard arithmetic and
-+/// back-edge offset assume `step` is the additive constant of an `Add` in the
-+/// latch.  The extended detector used by the COMPLETE unrollers also accepts
-+/// `Sub(phi, k)` countdowns and re-materials unsigned constants through
-+/// `IrConst::from_i64`, which can turn a U32 `0xFFFFFFFE` step into `-2`.
-+/// Feeding either to `do_unroll` produces guards the unroller cannot express
-+/// and silently drops/adds iterations (red-team cfg 3169: `lim != i; i -= 1`
-+/// with a nested body lost exactly half the accumulator).  Keeping this
-+/// Add-only detector here restores the baseline acceptance set for the
-+/// partial path; the extended detector stays confined to the complete
-+/// unrollers, whose closed-form trip count re-verifies every step.
- fn find_iv_in_loop(
-     func: &IrFunction,
-     header: usize,
-@@ -2380,14 +2516,62 @@ fn find_iv_in_loop(
-                     None
-                 }
-             });
--        // A phi whose back-edge value is a constant (a first-iteration flag
--        // such as `first = 0`) is simply not the IV. It used to abort the
--        // whole search (`?`), which silently disabled unrolling for every
--        // loop whose FIRST header phi happened to be such a flag.
--        let Some(back_val) = back_val else {
--            continue;
-+        let back_val = back_val?;
-+
-+        // Look for `Add(phi_dest, const_step)` or `Add(const_step, phi_dest)`
-+        // in the latch that produces `back_val`.
-+        let phi_id = phi_dest.0;
-+        for (idx, latch_inst) in func.blocks[latch].instructions.iter().enumerate() {
-+            if let Instruction::BinOp {
-+                dest,
-+                op: IrBinOp::Add,
-+                lhs,
-+                rhs,
-+                ..
-+            } = latch_inst
-+            {
-+                if *dest != back_val {
-+                    continue;
-+                }
-+                let step = match (lhs, rhs) {
-+                    (Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => c.to_i64(),
-+                    (Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => c.to_i64(),
-+                    _ => None,
-+                };
-+                if let Some(step) = step {
-+                    return Some((*phi_dest, *ty, step, idx));
-+                }
-+            }
-+        }
-+    }
-+    None
 +}
 +
-+fn find_iv_in_loop_ext(
-+    func: &IrFunction,
-+    header: usize,
-+    latch: usize,
-+    latch_label: BlockId,
-+) -> Option<(Value, IrType, i64, usize)> {
-+    for inst in &func.blocks[header].instructions {
-+        let (phi_dest, ty, incoming) = match inst {
-+            Instruction::Phi { dest, ty, incoming } if ty.is_integer() => (dest, ty, incoming),
-+            _ => continue,
-         };
- 
-+        // Value flowing into the header from the latch (the back-edge value).
-+        let back_val = incoming
-+            .iter()
-+            .find(|(_, lbl)| *lbl == latch_label)
-+            .and_then(|(op, _)| {
-+                if let Operand::Value(v) = op {
-+                    Some(*v)
++/// 256-bit loads eligible for source-operand folding (VLFOLD).
++pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
++    use crate::ir::intrinsics::IntrinsicOp as O;
++    matches!(op, O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8)
++}
++
++/// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
++/// the bias folds through the 213 form (`vfmadd213ps mem, %scale, %ymm0` =
++/// scale*input + mem) and the input through the 231 form
++/// (`vfmadd231ps mem, %scale, %ymm0` = scale*mem + bias).
++pub(crate) fn memfold_consumer_madd_256(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
++    use crate::ir::intrinsics::IntrinsicOp as O;
++    matches!(op, O::VecMaddF64x4 | O::VecMaddF32x8)
++}
++
++/// Two-operand 256-bit VEX arithmetic intrinsics that go through
++/// `emit_avx_binary_256` and therefore can take a memory operand.
++/// Returns `Some(commutative)`.
++pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<bool> {
++    use crate::ir::intrinsics::IntrinsicOp as O;
++    match op {
++        O::VecAddF64x4
++        | O::VecMulF64x4
++        | O::VecAddF32x8
++        | O::VecMulF32x8
++        | O::VecAddI32x8
++        | O::VecMulI32x8
++        | O::VecMaxI32x8 => Some(true),
++        O::VecSubF64x4 | O::VecSubF32x8 | O::VecDivF64x4 | O::VecDivF32x8 => Some(false),
++        _ => None,
++    }
++}
++
++/// VLFOLD (the general form of IS-05): a single-use 256-bit `VecLoad*` whose
++/// only consumer is the next — or next-but-one, across another pure
++/// `VecLoad*` — two-operand VEX arithmetic intrinsic in the same block is
++/// elided entirely; the consumer folds the load's *source* memory operand
++/// (`vpaddd (%rdx,%r13), %ymm0, %ymm0`) exactly like ICX/GCC/Clang emit for
++/// `c[i] = a[i] + b[i]` and `s += a[i]`.  Before this analysis the first of
++/// two streamed loads was deferred, then flushed to its home slot when the
++/// second load claimed `%ymm0`, and the consumer re-read the slot: one
++/// store + one stack load per iteration in every map/reduction body.
++///
++/// Soundness argument (mirrors the deferred-store whitelist above):
++/// * the only instructions allowed between load and consumer are pure
++///   vector loads, which write no memory and define no GPR, so the elided
++///   load's RA-homed base/index registers still hold the same values when
++///   the consumer re-materialises the memory operand;
++/// * the emitter additionally requires base/index to be RA-homed GPRs (or a
++///   zero constant): scratch `%rax`/`%rcx` addressing would not survive the
++///   intervening load — it falls back to the ordinary load otherwise;
++/// * VEX arithmetic imposes no alignment on memory operands, so unaligned
++///   streams are legal; legacy-SSE 128-bit forms (`paddd m128`) would fault,
++///   hence only the 256-bit family is eligible;
++/// * a non-commutative consumer may only fold its second operand (AT&T
++///   `op mem, %src1, %dst` computes `src1 op mem`);
++/// * every consumer path either uses the memory operand or materialises the
++///   load (`avx_load_arg_to`), and a safety net in `emit_intrinsic_impl`
++///   materialises a pending fold before any unexpected intrinsic.
++///
++/// When both operands of a consumer are adjacent loads, the farther one is
++/// folded: the nearer load then streams through `%ymm0` under the existing
++/// deferral and the consumer becomes `op mem, %ymm0, %ymm0`.
++/// Kill switch: `CCC_NO_VLFOLD=1`.
++pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32> {
++    let mut result = FxHashSet::default();
++    if env_flag("CCC_NO_VLFOLD") {
++        return result;
++    }
++
++    // Exact use census: intrinsic-argument uses are counted, every other
++    // kind of reference (non-intrinsic operand, terminator, value ref,
++    // dest_ptr) poisons the value.
++    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut poisoned: FxHashSet<u32> = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            match inst {
++                Instruction::Intrinsic { args, dest_ptr, .. } => {
++                    for a in args {
++                        if let Operand::Value(v) = a {
++                            *use_count.entry(v.0).or_default() += 1;
++                        }
++                    }
++                    if let Some(p) = dest_ptr {
++                        poisoned.insert(p.0);
++                    }
++                }
++                other => {
++                    for_each_operand_in_instruction(other, |op| {
++                        if let Operand::Value(v) = op {
++                            poisoned.insert(v.0);
++                        }
++                    });
++                    for_each_value_use_in_instruction(other, |v| {
++                        poisoned.insert(v.0);
++                    });
++                }
++            }
++        }
++        for_each_operand_in_terminator(&block.terminator, |op| {
++            if let Operand::Value(v) = op {
++                poisoned.insert(v.0);
++            }
++        });
++    }
++
++    let debug = env_flag("CCC_DEBUG_VLFOLD");
++    for (bi, block) in func.blocks.iter().enumerate() {
++        let insts = &block.instructions;
++        let load_at = |k: usize| -> Option<u32> {
++            match insts.get(k) {
++                Some(Instruction::Intrinsic {
++                    dest: Some(d), op, ..
++                }) if is_memfold_vec_load(op) => Some(d.0),
++                _ => None,
++            }
++        };
++        let pure_load_at = |k: usize| -> bool {
++            matches!(insts.get(k), Some(Instruction::Intrinsic { op, .. }) if is_pure_vec_load(op))
++        };
++        for j in 0..insts.len() {
++            let Instruction::Intrinsic {
++                dest: Some(_),
++                op: cop,
++                args: cargs,
++                ..
++            } = &insts[j]
++            else {
++                continue;
++            };
++            // Madd `a*b + c`: every position may fold (the multiplicands
++            // commute; the emitter picks the 213/231 form and keeps the
++            // XMM-homed broadcast as the register source).
++            let madd = memfold_consumer_madd_256(cop);
++            let (commutative, a0, a1) = if madd {
++                if cargs.len() != 3 {
++                    continue;
++                }
++                let (Operand::Value(a0), Operand::Value(_), Operand::Value(a2)) =
++                    (&cargs[0], &cargs[1], &cargs[2])
++                else {
++                    continue;
++                };
++                (true, a0, a2)
++            } else {
++                let Some(commutative) = memfold_consumer_256(cop) else {
++                    continue;
++                };
++                if cargs.len() != 2 {
++                    continue;
++                }
++                let (Operand::Value(a0), Operand::Value(a1)) = (&cargs[0], &cargs[1]) else {
++                    continue;
++                };
++                (commutative, a0, a1)
++            };
++            if a0.0 == a1.0 {
++                continue;
++            }
++            let eligible = |d: u32, is_second: bool| -> bool {
++                (is_second || commutative)
++                    && !poisoned.contains(&d)
++                    && use_count.get(&d).copied() == Some(1)
++            };
++            let a_mid = match (madd, &cargs[1]) {
++                (true, Operand::Value(v)) => Some(v.0),
++                _ => None,
++            };
++            let pick_from = |d: u32| -> Option<u32> {
++                if d == a1.0 && eligible(d, true) {
++                    Some(d)
++                } else if (d == a0.0 || a_mid == Some(d)) && eligible(d, false) {
++                    Some(d)
 +                } else {
 +                    None
 +                }
-+            });
-+        let back_val = back_val?;
-+
-         // Look for `Add(phi_dest, const_step)` / `Add(const_step, phi_dest)`
-         // or `Sub(phi_dest, const_step)` in the latch that produces
-         // `back_val`.  `i -= k` lowers to a `Sub` — the countdown-loop
-@@ -3142,6 +3326,19 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
-                         }
-                         subst_value_with_operand(inst, dest.0, &Operand::Value(new_phi));
-                     }
-+                    // The terminator can also USE the carried value: a
-+                    // `Return(H)` after a counted loop is the canonical
-+                    // late-exit reader, and its operand is not covered by
-+                    // the instruction loop above (red-team cfg 1765:
-+                    // `i <= lim; i += 7` with an inlined chain body returned
-+                    // the phi's PREHEADER value — 0 instead of 30 — because
-+                    // every early exit-check edge read the un-updated
-+                    // header phi).
-+                    subst_value_in_terminator(
-+                        &mut func.blocks[bi].terminator,
-+                        dest.0,
-+                        &Operand::Value(new_phi),
-+                    );
-                 }
-                 let succs: Vec<BlockId> = match &func.blocks[bi].terminator {
-                     Terminator::Branch(l) => vec![*l],
-@@ -4178,12 +4375,12 @@ mod tests {
-         // must refuse rather than produce a wrapped trip count.
-         assert_eq!(trip_i64(-1, i64::MAX, Slt, 1), None);
-         assert_eq!(trip_i64(i64::MIN, 0, Sgt, -1), None);
--        // `i > i64::MIN` with step i64::MIN: the loop runs exactly once
--        // (0 -> i64::MIN -> exit test fails).  The typed closed form computes
--        // step_abs in i128, which does NOT overflow for i64::MIN, so it returns
--        // Some(1) instead of the old checked_abs-based None.  (Some(1) is the
--        // correct count; the old None rejected a shape the loop genuinely
--        // executes once.)
-+        // `-iv_step` used to overflow for iv_step = i64::MIN (checked_abs
-+        // refused).  The typed closed form computes |step| in i128, so the
-+        // true answer emerges: `for (i = 0; i > MIN; i += MIN)` runs exactly
-+        // ONCE (0 > MIN, then i = MIN, MIN > MIN is false) and the final IV
-+        // stays in range — Some(1).  trip == 1 is below the unroll gate, so
-+        // the loop stays rolled; the count only feeds the caller's gate.
-         assert_eq!(trip_i64(0, i64::MIN, Sgt, i64::MIN), Some(1));
-         assert_eq!(trip_i64(0, i64::MAX, Slt, i64::MIN), None);
-         // Huge stride: 0, 2^62 are < MAX (2 body executions) but the exit
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 96c03a01..d84fbb66 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -2262,6 +2262,17 @@ fn analyze_reduction_pattern(
-             set_reject("conditional-sum guard shape not expressible (needs loaded > rhs)");
-             return None;
-         }
-+        // The masked composite step exists for I32 lanes (x86 vpcmpgtd /
-+        // vpand / vpaddd).  A guarded F32/F64 (or narrow-int) equal-width sum
-+        // has no expressible masked form and the equal-width transform would
-+        // silently DROP the guard (miscompile: `if (a[i] > 0) s += a[i]`
-+        // summed every element).  Keep such loops scalar — correct code
-+        // beats wrong vectors, and the scalar guarded sum is what GCC emits
-+        // for the innermost remainder anyway.
-+        if element_type != IrType::I32 {
-+            set_reject("conditional-sum guard needs an I32 element type (masked equal-width form)");
-+            return None;
++            };
++            let mut pick = None;
++            if j >= 2 && pure_load_at(j - 1) {
++                if let Some(d) = load_at(j - 2) {
++                    pick = pick_from(d);
++                }
++            }
++            if pick.is_none() && j >= 1 {
++                if let Some(d) = load_at(j - 1) {
++                    pick = pick_from(d);
++                }
++            }
++            if let Some(d) = pick {
++                if debug {
++                    eprintln!("[VLFOLD-IR] {} b{} i{} fold load %{} into {:?}", func.name, bi, j, d, cop);
++                }
++                result.insert(d);
++            }
 +        }
++    }
++    result
++}
++
+ /// Defer a vector home-slot store when every def is consumed once from the
+ /// last-store peephole by a cache-aware intrinsic in the same block.
+ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
+@@ -2304,9 +2520,13 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
+             let pos = cargs
+                 .iter()
+                 .position(|a| matches!(a, Operand::Value(v) if v.0 == slot));
++            // VLFOLD: `emit_avx_map_fma` streams whichever multiplicand or
++            // bias is not folded/homed through `avx_load_arg`, which is a
++            // no-op for the deferred value (positions 1 and 2 of VecMadd*).
+             let cache_aware = match pos {
+                 Some(0) => !is_raw_reader_intrinsic(cop),
+-                Some(1) => is_two_operand_binary(cop),
++                Some(1) => is_two_operand_binary(cop) || memfold_consumer_madd_256(cop),
++                Some(2) => memfold_consumer_madd_256(cop),
+                 _ => false,
+             };
+             if !cache_aware {
+diff --git a/src/backend/stack_layout/mod.rs b/src/backend/stack_layout/mod.rs
+index 15aa25b..8b9b9c0 100644
+--- a/src/backend/stack_layout/mod.rs
++++ b/src/backend/stack_layout/mod.rs
+@@ -122,6 +122,9 @@ struct StackLayoutContext {
+     /// set. The backend may skip their slot store entirely (accumulator
+     /// renaming).
+     vector_defer_values: FxHashSet<u32>,
++    /// VLFOLD: 256-bit vector loads elided in favour of a folded memory
++    /// operand in their adjacent consumer (`compute_vector_memfold_values`).
++    vector_memfold_values: FxHashSet<u32>,
+     x87_defer_values: FxHashSet<u32>,
+     /// Values that appear as incoming operands in Phi instructions.
+     /// These must NOT be classified as block-local (Tier 3) because phi
+@@ -355,6 +358,7 @@ pub fn calculate_stack_space_common(
+     // vector-intrinsic results that can skip their slot store (their only
+     // use is the adjacent intrinsic's args[0]/args[1] load).
+     state.vector_defer_values = ctx.vector_defer_values.clone();
++    state.vector_memfold_values = ctx.vector_memfold_values.clone();
+     // i686 x87 top-of-stack deferral: F64 binop results consumed exactly once
+     // by the adjacent F64 binop (the x87 twin of the vector deferral above;
+     // backends that never set x87_pending ignore it).
+@@ -628,6 +632,7 @@ fn build_layout_context(
+         }
+     }
+     let vector_defer_values = copy_coalescing::compute_vector_defer_values(func);
++    let vector_memfold_values = copy_coalescing::compute_vector_memfold_values(func);
+     let x87_defer_values = copy_coalescing::compute_x87_defer_values(func);
+ 
+     // Propagate copy-alias uses into use_blocks_map so that root values account
+@@ -766,6 +771,7 @@ fn build_layout_context(
+         coalescable_allocas,
+         immediately_consumed,
+         vector_defer_values,
++        vector_memfold_values,
+         x87_defer_values,
+         phi_incoming_values,
+         memcpy_value_sizes,
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index 8bc205b..69331bc 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -190,6 +190,16 @@ pub struct CodegenState {
+     /// needs. When the store is skipped the value stays in the register and
+     /// the consumer's load becomes a no-op (accumulator renaming).
+     pub vector_defer_values: FxHashSet<u32>,
++    /// VLFOLD: 256-bit `VecLoad*` results whose single use is the adjacent
++    /// two-operand VEX arithmetic intrinsic (`compute_vector_memfold_values`).
++    /// The load is not emitted; the consumer folds its source memory operand.
++    pub vector_memfold_values: FxHashSet<u32>,
++    /// The elided load awaiting its consumer: (value id, memory operand,
++    /// load mnemonic for materialisation). Consumed by `emit_avx_binary_256`
++    /// as a memory operand, or by `avx_load_arg_to` as a real load; the
++    /// safety net in `emit_intrinsic_impl` materialises it before any other
++    /// intrinsic.
++    pub pending_vec_memfold: Option<(u32, String, &'static str)>,
+     /// Lazy-flush half of the deferred-store mechanism: a skipped vector
+     /// result store is kept PENDING here (value id, holding register, 256-bit
+     /// flag) instead of being dropped. If the consumer really receives the
+@@ -490,6 +500,8 @@ impl CodegenState {
+             sse_last_store_reg: false,
+             sse_last_store_reg_name: None,
+             vector_defer_values: FxHashSet::default(),
++            vector_memfold_values: FxHashSet::default(),
++            pending_vec_memfold: None,
+             pending_vec_store: None,
+             x87_pending: None,
+             x87_defer_values: FxHashSet::default(),
+@@ -738,6 +750,8 @@ impl CodegenState {
+         self.vector128_values.clear();
+         self.protected_slot_values.clear();
+         self.vector_defer_values.clear();
++        self.vector_memfold_values.clear();
++        self.pending_vec_memfold = None;
+         self.pending_vec_store = None;
+         self.x87_pending = None;
+         self.x87_defer_values.clear();
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index b6c0594..b655838 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -6230,6 +6230,10 @@ impl ArchCodegen for X86Codegen {
      }
  
-     let mut primary_loads: Vec<Value> = Vec::new();
-@@ -9698,6 +9709,60 @@ fn transform_reduction_avx2(
-                             .instructions
-                             .remove(pattern.accumulator_add_idx + 1);
-                         changes += 1;
-+                    } else if pattern.guard_cond.is_some() {
-+                        // CONDITIONAL (guarded) EQUAL-WIDTH sum: the old
-+                        // transform silently DROPPED the Select guard here —
-+                        // `if (a[i] > 0) s += a[i]` summed every element
-+                        // (regression: tests/regression/vector_guard_sum.c,
-+                        // lccc returned 612 where GCC returns 651).  Use the
-+                        // composite masked intrinsic whose lowering builds
-+                        // the per-lane compare mask internally; splice out
-+                        // the Select (it sits after the Add) and replace the
-+                        // scalar Add with the masked step.
-+                        let guard_rhs = pattern
-+                            .guard_rhs
-+                            .clone()
-+                            .unwrap_or(Operand::Const(IrConst::I32(0)));
-+                        let masked_inst = Instruction::Intrinsic {
-+                            dest: Some(vec_sum_value),
-+                            op: IntrinsicOp::VecMaskedAddI32x8,
-+                            dest_ptr: None,
-+                            args: vec![
-+                                Operand::Value(pattern.accumulator_phi),
-+                                base,
-+                                off,
-+                                guard_rhs,
-+                            ],
-+                        };
-+                        // The Add's result id (the Select's true_val), read
-+                        // BEFORE any splice shifts indices.
-+                        let add_result_id = body_block
-+                            .instructions
-+                            .get(pattern.accumulator_add_idx)
-+                            .and_then(|i| i.dest())
-+                            .map(|d| d.0);
-+                        let mut select_idx = None;
-+                        for (sidx, sin) in body_block.instructions.iter().enumerate() {
-+                            if let Instruction::Select { true_val, .. } = sin {
-+                                if matches!(
-+                                    true_val,
-+                                    Operand::Value(tv) if Some(tv.0) == add_result_id
-+                                ) {
-+                                    select_idx = Some(sidx);
-+                                    break;
-+                                }
-+                            }
-+                        }
-+                        if let Some(si) = select_idx {
-+                            body_block.instructions.remove(si);
-+                        }
-+                        body_block
-+                            .instructions
-+                            .insert(pattern.accumulator_add_idx, masked_inst);
-+                        body_block
-+                            .instructions
-+                            .remove(pattern.accumulator_add_idx + 1);
-+                        changes += 1;
-                     } else {
-                         // Vector load from array → SSA value
-                         let load_inst = Instruction::Intrinsic {
-diff --git a/tests/linker/setup_oracles.sh b/tests/linker/setup_oracles.sh
-index a328a547..72ca1316 100644
---- a/tests/linker/setup_oracles.sh
-+++ b/tests/linker/setup_oracles.sh
-@@ -2,7 +2,7 @@
- # ============================================================================
- # LCCC linker oracle provisioning
- #
--# Builds the reference linkers that `run_linker_tests.py`, `bench_linker.py`
-+# Builds the reference linkers that `run_linker_tests.py`
- # and `real_workloads.py` compare against.  Project policy, encoded here so it
- # is honoured automatically instead of remembered:
- #
-@@ -183,7 +183,7 @@ Then:
+     fn flush_pending_vec_store(&mut self) {
++        // Boundary hook (block ends, calls, inline asm, non-intrinsic
++        // instructions): a VLFOLD-elided load that has not met its consumer
++        // is materialised first so the mechanism is sound by construction.
++        self.materialize_pending_memfold();
+         self.flush_pending_vec_store_impl();
+     }
  
-     tests/linker/run_linker_tests.py
-     tests/linker/real_workloads.py
--    tests/linker/bench_linker.py
+diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
+index fb91abb..e7ff193 100644
+--- a/src/backend/x86/codegen/intrinsics.rs
++++ b/src/backend/x86/codegen/intrinsics.rs
+@@ -269,6 +269,101 @@ impl X86Codegen {
+     /// leave the block without the consumer having taken the value — emits the
+     /// store that was originally skipped, making deferred stores sound by
+     /// construction. No-op when nothing is pending.
++    /// VLFOLD entry (see `compute_vector_memfold_values`): elide an eligible
++    /// 256-bit load and remember its source memory operand for the adjacent
++    /// consumer. Returns `true` when nothing must be emitted for this
++    /// intrinsic. Falls back to the ordinary load path unless base/index are
++    /// RA-homed GPRs (or a zero constant) — scratch `%rax`/`%rcx` addressing
++    /// would not survive the intervening load — and unless the destination
++    /// has no XMM home (a homed load is already a single instruction).
++    fn try_elide_vec_load(
++        &mut self,
++        dest: &Option<Value>,
++        op: &IntrinsicOp,
++        args: &[Operand],
++    ) -> bool {
++        let Some(d) = dest else {
++            return false;
++        };
++        if !self.state.vector_memfold_values.contains(&d.0)
++            || self.state.pending_vec_memfold.is_some()
++            || args.len() < 2
++        {
++            return false;
++        }
++        if self
++            .reg_assignments
++            .get(&d.0)
++            .is_some_and(|r| is_xmm_reg(*r))
++        {
++            return false;
++        }
++        let mnemonic = match op {
++            IntrinsicOp::VecLoadF64x4 => "vmovupd",
++            IntrinsicOp::VecLoadF32x8 => "vmovups",
++            IntrinsicOp::VecLoadI32x8 => "vmovdqu",
++            _ => return false,
++        };
++        // The allocator only hands out rbx/r8-r15 (never rsp/rbp/rdi/rsi/rdx
++        // and never the scratch pair), all legal base AND index registers.
++        let is_gpr = |r: PhysReg| (1..=16).contains(&r.0);
++        let Some(base) = self.operand_reg(&args[0]).filter(|r| is_gpr(*r)) else {
++            return false;
++        };
++        let index = match &args[1] {
++            Operand::Const(c) if c.to_i64() == Some(0) => None,
++            Operand::Const(_) => return false,
++            other => match self.operand_reg(other) {
++                Some(r) if is_gpr(r) => Some(r),
++                _ => return false,
++            },
++        };
++        let disp = Self::vec_disp_arg(args, 2);
++        let disp_str = if disp == 0 {
++            String::new()
++        } else {
++            disp.to_string()
++        };
++        let mem = match index {
++            Some(ix) => format!("{}(%{},%{})", disp_str, phys_reg_name(base), phys_reg_name(ix)),
++            None => format!("{}(%{})", disp_str, phys_reg_name(base)),
++        };
++        if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
++            eprintln!("[VLFOLD-EMIT] elide load %{} <- {} {}", d.0, mnemonic, mem);
++        }
++        self.state.vector_values.insert(d.0);
++        self.state.pending_vec_memfold = Some((d.0, mem, mnemonic));
++        true
++    }
 +
++    /// Memory operand of a pending VLFOLD load if `arg` is that value.
++    fn memfold_operand(&self, arg: &Operand) -> Option<String> {
++        match (arg, &self.state.pending_vec_memfold) {
++            (Operand::Value(v), Some((pv, mem, _))) if v.0 == *pv => Some(mem.clone()),
++            _ => None,
++        }
++    }
++
++    /// Materialise a pending VLFOLD load through `%ymm0` and its ordinary
++    /// home (register or slot). Never expected on the analysed shapes; keeps
++    /// the elision sound if an unexpected instruction intervenes.
++    pub(super) fn materialize_pending_memfold(&mut self) {
++        let Some((val, mem, mnemonic)) = self.state.pending_vec_memfold.take() else {
++            return;
++        };
++        if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
++            eprintln!("[VLFOLD-EMIT] materialising %{} (unexpected consumer)", val);
++        }
++        self.flush_pending_vec_store_impl();
++        self.state
++            .emit_fmt(format_args!("    {} {}, %ymm0", mnemonic, mem));
++        self.state.dirty_upper_ymm = true;
++        self.avx_store_dest(&Value(val));
++        // The value now has a real home; a later deferral is not permitted
++        // to skip the store again for this def.
++        self.flush_pending_vec_store_impl();
++    }
++
+     pub(super) fn flush_pending_vec_store_impl(&mut self) {
+         let Some((val_id, reg, is_256)) = self.state.pending_vec_store.take() else {
+             return;
+@@ -450,6 +545,20 @@ impl X86Codegen {
  
- Resolved revisions: $BIN/ORACLE_REVISIONS.txt
- EOF
-diff --git a/tests/regression/unroll_chain_body_exit_phi.c b/tests/regression/unroll_chain_body_exit_phi.c
-new file mode 100644
-index 00000000..dbd2530b
---- /dev/null
-+++ b/tests/regression/unroll_chain_body_exit_phi.c
-@@ -0,0 +1,19 @@
-+#include <stdio.h>
-+/* Red-team cfg 1765 (unroll_stress seed=1): runtime-trip loop whose body is a
-+ * straight-line chain left behind by the complete unroller of an inner loop.
-+ * do_unroll's early exit-check edges used to read the header phi's PREHEADER
-+ * value (0 instead of 30) because the Step-5b reader rewrite covered only
-+ * instructions, never the RETURN terminator. */
-+__attribute__((noinline)) unsigned long long f0000(long lim) {
-+    unsigned long long acc = 0;
-+    long i;
-+    for (i = ((long)5l); (i <= lim); i += 7) {
-+        { int j; for (j = 0; j < 3; j++) acc += (unsigned long long)i * (j + 1); }
-+    }
-+    return acc;
-+}
-+int main(void) {
-+    volatile int zero = 0; (void)zero;
-+    printf("f0000 %llu\n", f0000((long)(((long)11l) + zero)));
-+    return 0;
-+}
-diff --git a/tests/regression/unroll_chain_body_exit_phi.flags b/tests/regression/unroll_chain_body_exit_phi.flags
-new file mode 100644
-index 00000000..d15a7108
---- /dev/null
-+++ b/tests/regression/unroll_chain_body_exit_phi.flags
-@@ -0,0 +1 @@
-+-O3
-diff --git a/tests/regression/unroll_countdown_chain_body.c b/tests/regression/unroll_countdown_chain_body.c
-new file mode 100644
-index 00000000..9a0280ec
---- /dev/null
-+++ b/tests/regression/unroll_countdown_chain_body.c
-@@ -0,0 +1,25 @@
-+#include <stdio.h>
-+/* Red-team cfg 3169 (unroll_stress seed=1): runtime-trip UNSIGNED COUNTDOWN
-+ * loop (`lim != i; i -= 1`) whose body is the straight-line chain of a
-+ * fully-unrolled inner loop.  The merged `analyze_loop` (through the extended
-+ * `find_iv_in_loop_ext`, which accepts `Sub(phi, k)` and sign-reinterprets
-+ * unsigned constants) used to hand this countdown IV to `do_unroll`, whose
-+ * guard arithmetic only knows Add-form steps: the partial unroll produced a
-+ * 4x clone chain whose early exits fell through to the exit block with the
-+ * PREVIOUS iteration's accumulator — 252 instead of 126.  `analyze_loop` now
-+ * uses a strict Add-only detector (the extended one stays confined to the
-+ * complete unrollers, which re-verify the step in closed form), so the
-+ * countdown loop simply stays rolled. */
-+__attribute__((noinline)) unsigned long long f0000(unsigned long lim) {
-+    unsigned long long acc = 0;
-+    unsigned long i;
-+    for (i = ((unsigned long)6ul); (lim != i); i -= 1) {
-+        { int j; for (j = 0; j < 3; j++) acc += (unsigned long long)i * (j + 1); }
-+    }
-+    return acc;
-+}
-+int main(void) {
-+    volatile int zero = 0; (void)zero;
-+    printf("f0000 %llu\n", f0000((unsigned long)(((unsigned long)0ul) + zero)));
-+    return 0;
-+}
-diff --git a/tests/regression/unroll_countdown_chain_body.flags b/tests/regression/unroll_countdown_chain_body.flags
-new file mode 100644
-index 00000000..d15a7108
---- /dev/null
-+++ b/tests/regression/unroll_countdown_chain_body.flags
-@@ -0,0 +1 @@
-+-O3
-diff --git a/tests/regression/unroll_header_extra_trip1.c b/tests/regression/unroll_header_extra_trip1.c
-new file mode 100644
-index 00000000..dd7688a6
---- /dev/null
-+++ b/tests/regression/unroll_header_extra_trip1.c
-@@ -0,0 +1,46 @@
-+/* Complete-unroll with header-extra side effects AND a single-trip loop.
-+ *
-+ * A loop condition comma-expression (`for (i=0; cnt++, i<N; i++)`) evaluates
-+ * `trip + 1` times (the failing evaluation included).  A red-team audit of
-+ * the "delete 1-trip loops" feature found its first victim: for N == 1 the
-+ * deletion path kept the original header (one `cnt++`) and dropped the
-+ * second evaluation, producing cnt == 1 instead of 2.  The merged general
-+ * cloner now emits the final guard for trip == 1 too: the guard re-runs the
-+ * header's extra instructions once more with the failing-entry environment,
-+ * so cnt == 2.  The trip-4 variant exercises the same machinery on the
-+ * multi-clone path (cnt == 5).
-+ */
-+#include <stdio.h>
-+int A[64];
-+static void init(void) { for (int i = 0; i < 64; i++) A[i] = i * 7 - 20; }
-+#define NOINLINE __attribute__((noinline))
-+NOINLINE int k_header_effect1(void) {
-+    int cnt = 0, s = 0;
-+    for (int i = 0; cnt++, i < 1; i++) s += A[i];
-+    return s * 100 + cnt;
-+}
-+NOINLINE int k_header_effect4(void) {
-+    int cnt = 0, s = 0;
-+    for (int i = 0; cnt++, i < 4; i++) s += A[i];
-+    return s * 100 + cnt;
-+}
-+/* Two comma-separated counters + trip 1. */
-+NOINLINE int k_two_counter1(void) {
-+    int a = 0, b = 0, s = 0;
-+    for (int i = 0; a++, b += 2, i < 1; i++) s += A[i];
-+    return s * 1000 + a * 10 + b;
-+}
-+/* trip=2 (clone path) with a counter: condition runs 3 times. */
-+NOINLINE int k_header_effect2(void) {
-+    int cnt = 0, s = 0;
-+    for (int i = 0; cnt++, i < 2; i++) s += A[i];
-+    return s * 100 + cnt;
-+}
-+int main(void) {
-+    init();
-+    printf("e1=%d (ref %d)\n", k_header_effect1(), A[0] * 100 + 2);
-+    printf("e4=%d (ref %d)\n", k_header_effect4(), (A[0] + A[1] + A[2] + A[3]) * 100 + 5);
-+    printf("t1=%d (ref %d)\n", k_two_counter1(), A[0] * 1000 + 12);
-+    printf("e2=%d (ref %d)\n", k_header_effect2(), (A[0] + A[1]) * 100 + 3);
-+    return 0;
-+}
-diff --git a/tests/regression/unroll_header_extra_trip1.flags b/tests/regression/unroll_header_extra_trip1.flags
-new file mode 100644
-index 00000000..cd11b1e1
---- /dev/null
-+++ b/tests/regression/unroll_header_extra_trip1.flags
-@@ -0,0 +1 @@
-+-O3 -march=x86-64-v3
-diff --git a/tests/regression/vector_guard_sum.c b/tests/regression/vector_guard_sum.c
-new file mode 100644
-index 00000000..4ca89852
---- /dev/null
-+++ b/tests/regression/vector_guard_sum.c
-@@ -0,0 +1,62 @@
-+/* Conditional-sum guard (if_convert Select) must survive vectorization.
-+ *
-+ * `if (a[i] > 0) s += a[i]` lowers to `s' = Select(a[i] > 0, s + a[i], s)`.
-+ * The old equal-width vector transform replaced the scalar Add with a plain
-+ * vector add and REMOVED the Select — silently summing every element:
-+ * lccc printed 612 for the 17-element kernel below where GCC prints 651
-+ * (612 = 7*136 - 20*17 = the UNGUARDED sum; regression introduced by the
-+ * "masked widening" work which only guarded the widening form).  The fix
-+ * emits the equal-width masked step (x86 vpcmpgtd/vpand/vpaddd) whose
-+ * per-lane mask reproduces `lane > rhs` exactly, or keeps the loop scalar
-+ * for non-I32 elements.
-+ *
-+ * The swapped form (`if (a[i] & 1) continue; s += a[i]`, i.e.
-+ * Select(cond, s, s + x)) is rejected up front: the masked intrinsic only
-+ * encodes add-when-cond-true.
-+ */
-+#include <stdio.h>
-+volatile int vn17 = 17, vn9 = 9, vn5 = 5;
-+int A[64], B[64];
-+static void init(void) {
-+    for (int i = 0; i < 64; i++) { A[i] = i * 7 - 20; B[i] = (i * 13) % 11 - 5; }
-+}
-+#define NOINLINE __attribute__((noinline))
-+/* Natural form: guard on the TRUE arm. */
-+NOINLINE int k_guard_nat(int n) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) { if (A[i] > 0) s += A[i]; }
-+    return s;
-+}
-+/* Rhs is a runtime parameter. */
-+NOINLINE int k_guard_rhs_rt(int n, int lim) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) { if (A[i] > lim) s += A[i]; }
-+    return s;
-+}
-+/* Guarded widening (long accumulator): the masked widening path. */
-+NOINLINE long k_guard_widen(int n) {
-+    long s = 0;
-+    for (int i = 0; i < n; i++) { if (A[i] > 0) s += A[i]; }
-+    return s;
-+}
-+/* Swapped form: add on the FALSE arm (continue-skip idiom). */
-+NOINLINE int k_guard_swapped(int n) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) { if (A[i] & 1) continue; s += A[i]; }
-+    return s;
-+}
-+/* Guarded FP sum: must stay scalar (correct), never lose the guard. */
-+NOINLINE double k_guard_fp(int n) {
-+    double s = 0;
-+    for (int i = 0; i < n; i++) { if (A[i] > 0) s += A[i] * 0.5; }
-+    return s;
-+}
-+int main(void) {
-+    init();
-+    printf("nat=%d %d\n", k_guard_nat(vn17), k_guard_nat(vn9));
-+    printf("rhs_rt=%d %d\n", k_guard_rhs_rt(vn17, 0), k_guard_rhs_rt(vn17, -3));
-+    printf("widen=%ld\n", k_guard_widen(vn17));
-+    printf("swapped=%d\n", k_guard_swapped(vn17));
-+    printf("fp=%.1f\n", k_guard_fp(vn5));
-+    return 0;
-+}
-diff --git a/tests/regression/vector_guard_sum.flags b/tests/regression/vector_guard_sum.flags
-new file mode 100644
-index 00000000..cd11b1e1
---- /dev/null
-+++ b/tests/regression/vector_guard_sum.flags
-@@ -0,0 +1 @@
-+-O3 -march=x86-64-v3
--- 
-2.47.3
-
-
-From 9c06afc4c0a1bf2062a5fe889763771d7a3a6237 Mon Sep 17 00:00:00 2001
-From: LCCC Agent <agent@lccc.local>
-Date: Fri, 4 Sep 2026 00:41:54 +0000
-Subject: [PATCH 2/2] =?UTF-8?q?final:=20carry=20over=20the=20shared=20red-?=
- =?UTF-8?q?team=20corpus=20(k30=5Funroll=5Fshapes,=20loop=5Funroll=5Fredte?=
- =?UTF-8?q?am,=20unroll=5Funsigned=5Fdomain=5Ftrip)=20=E2=80=94=20identica?=
- =?UTF-8?q?l=20in=20both=20revisions,=20absent=20from=20main=20(#378=20omi?=
- =?UTF-8?q?tted=20its=20tests)?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
----
- .../kernel_corpus/k30_unroll_shapes.c         |  87 +++++
- tests/regression/loop_unroll_redteam.c        | 315 ++++++++++++++++++
- .../regression/unroll_unsigned_domain_trip.c  | 140 ++++++++
- .../unroll_unsigned_domain_trip.flags         |   1 +
- 4 files changed, 543 insertions(+)
- create mode 100644 tests/benchmark/kernel_corpus/k30_unroll_shapes.c
- create mode 100644 tests/regression/loop_unroll_redteam.c
- create mode 100644 tests/regression/unroll_unsigned_domain_trip.c
- create mode 100644 tests/regression/unroll_unsigned_domain_trip.flags
-
-diff --git a/tests/benchmark/kernel_corpus/k30_unroll_shapes.c b/tests/benchmark/kernel_corpus/k30_unroll_shapes.c
-new file mode 100644
-index 00000000..20a2009a
---- /dev/null
-+++ b/tests/benchmark/kernel_corpus/k30_unroll_shapes.c
-@@ -0,0 +1,87 @@
-+/* Loop-unroller shape corpus (loop_unroll.rs red-team audit).
-+ *
-+ * Each kernel is a counted-loop idiom lifted from the golden workloads
-+ * (zlib-ng adler32 DO16 macro, gzip/zlib crc bit loop, expat name scanning,
-+ * decompressor countdowns, small fixed-size reductions).  They exercise the
-+ * decisions the unroller makes -- complete vs partial, stride, direction,
-+ * exit polarity, unsigned domains -- and are compared against GCC 16.2,
-+ * Clang 23.1, ICC and ICX via scripts/codegen_oracle.py.
-+ */
-+#include <stddef.h>
-+#include <stdint.h>
-+
-+/* zlib-ng adler32 DO16: two-accumulator constant-trip reduction. */
-+uint32_t adler_do16(uint32_t adler, uint32_t sum2, const unsigned char *buf) {
-+    for (int i = 0; i < 16; i++) { adler += buf[i]; sum2 += adler; }
-+    return (sum2 << 16) | (adler & 0xffff);
-+}
-+
-+/* Countdown copy: `while (len--)` decompressor idiom, runtime trip. */
-+void copy_down(unsigned char *dst, const unsigned char *src, unsigned len) {
-+    for (unsigned i = len; i > 0; i -= 1) *dst++ = *src++;
-+}
-+
-+/* Sub-stride countdown, constant trip (i -= 2). */
-+int sum_odd_down(const int *a) {
-+    int s = 0;
-+    for (int i = 15; i >= 1; i -= 2) s += a[i];
-+    return s;
-+}
-+
-+/* Runtime-trip reduction: the partial unroller's bread and butter. */
-+long sum_n(const int *a, int n) {
-+    long s = 0;
-+    for (int i = 0; i < n; i++) s += a[i];
-+    return s;
-+}
-+
-+/* `!=` exit with exact stride: 8-byte lanes. */
-+uint64_t xor_lanes(const uint64_t *p) {
-+    uint64_t x = 0;
-+    for (unsigned i = 0; i != 32; i += 4) x ^= p[i] + p[i + 1] + p[i + 2] + p[i + 3];
-+    return x;
-+}
-+
-+/* expat-style scan: early exit inside the body, IV live-out. */
-+const char *scan_name(const char *p, const char *end) {
-+    for (; p != end; p++) {
-+        unsigned char c = (unsigned char)*p;
-+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9'))) break;
-+    }
-+    return p;
-+}
-+
-+/* Nested constant trips: 4x4 fixed matrix-vector product. */
-+void mat4_vec(const float m[16], const float v[4], float out[4]) {
-+    for (int r = 0; r < 4; r++) {
-+        float acc = 0.0f;
-+        for (int c = 0; c < 4; c++) acc += m[r * 4 + c] * v[c];
-+        out[r] = acc;
-+    }
-+}
-+
-+/* Polarity: for(;;) { if (guard) break; } with unsigned domain. */
-+uint32_t pack_bytes(const unsigned char *b) {
-+    uint32_t v = 0;
-+    for (unsigned i = 0;; i++) {
-+        if (i >= 4u) break;
-+        v |= (uint32_t)b[i] << (8 * i);
-+    }
-+    return v;
-+}
-+
-+/* Mirrored operand order: limit on the left. */
-+int sum_mirror(const int *a) {
-+    int s = 0;
-+    for (int i = 0; 8 > i; i++) s += a[i] * (i + 1);
-+    return s;
-+}
-+
-+/* Triangular nest: inner init depends on the outer IV (affine const after
-+ * the outer complete unroll). */
-+int tri_pairs(const int *a) {
-+    int s = 0;
-+    for (int i = 0; i < 5; i++)
-+        for (int j = i + 1; j < 5; j++) s += a[i] * a[j];
-+    return s;
-+}
-diff --git a/tests/regression/loop_unroll_redteam.c b/tests/regression/loop_unroll_redteam.c
-new file mode 100644
-index 00000000..3f55a10f
---- /dev/null
-+++ b/tests/regression/loop_unroll_redteam.c
-@@ -0,0 +1,315 @@
-+/* Loop-unroll red-team corpus. Every kernel is noinline so the shape the
-+ * unroller sees is the shape written here; runtime trip counts come from
-+ * volatile globals so no earlier pass can fold them. Output is a stream of
-+ * "name=value" lines compared against GCC. */
-+#include <stdio.h>
-+#include <limits.h>
-+#include <string.h>
-+#define NOINLINE __attribute__((noinline))
-+volatile int vn4 = 4, vn5 = 5, vn7 = 7, vn8 = 8, vn9 = 9, vn17 = 17, vn0 = 0, vn1 = 1, vn3 = 3;
-+volatile int vflag1 = 1, vflag0 = 0;
-+volatile long vln = 13;
-+int A[64], B[64], C[64];
-+long LA[64];
-+unsigned char UA[64];
-+static void init(void) {
-+    for (int i = 0; i < 64; i++) { A[i] = i * 7 - 20; B[i] = (i * 13) % 11 - 5; C[i] = 0; LA[i] = i * 3L - 9; UA[i] = (unsigned char)(i * 37); }
-+}
-+/* 1. "first iteration" flag: carried phi whose back value is a CONSTANT. */
-+NOINLINE int k_first_const4(void) {
-+    int s = 0, first = 1;
-+    for (int i = 0; i < 4; i++) { s += first ? A[i] * 100 : A[i]; first = 0; }
-+    return s;
-+}
-+NOINLINE int k_first_const_rt(int n) {
-+    int s = 0, first = 1;
-+    for (int i = 0; i < n; i++) { s += first ? A[i] * 100 : A[i]; first = 0; }
-+    return s;
-+}
-+/* 2. carried phi whose back value is a loop-INVARIANT parameter. */
-+NOINLINE int k_first_param4(int p) {
-+    int s = 0, cur = 1;
-+    for (int i = 0; i < 4; i++) { s += cur * A[i]; cur = p; }
-+    return s;
-+}
-+NOINLINE int k_first_param_rt(int p, int n) {
-+    int s = 0, cur = 1;
-+    for (int i = 0; i < n; i++) { s += cur * A[i]; cur = p; }
-+    return s;
-+}
-+/* 3. Second IV updated in the latch (comma increment). */
-+NOINLINE int k_two_iv_rt(int n) {
-+    int s = 0;
-+    int j;
-+    int i;
-+    for (i = 0, j = n - 1; i < n; i++, j--) s += A[i] * B[j];
-+    return s + j;
-+}
-+NOINLINE int k_ptr_iv_rt(int n) {
-+    int s = 0; int *p = A; int *q = B + 20;
-+    for (int i = 0; i < n; i++, p++, q--) s += *p - *q;
-+    return s + (int)(p - A) + (int)(q - B);
-+}
-+NOINLINE int k_two_iv4(void) {
-+    int s = 0; int j;
-+    for (int i = 0, j2 = 3; i < 4; i++, j2--) { s += A[i] * B[j2]; j = j2; }
-+    return s + j;
-+}
-+/* 4. Diamond with phi inside the body (stores make select-conversion illegal). */
-+NOINLINE int k_diamond_rt(int n) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) {
-+        int t;
-+        if (A[i] < 0) { C[i] = 1; t = -A[i]; } else { C[i + 1] += 2; t = A[i] * 3; }
-+        s += t;
-+    }
-+    return s;
-+}
-+NOINLINE int k_diamond4(void) {
-+    int s = 0;
-+    for (int i = 0; i < 4; i++) {
-+        int t;
-+        if (B[i] < 0) { C[i + 8] = 1; t = -B[i]; } else { C[i + 9] += 2; t = B[i] * 3; }
-+        s += t;
-+    }
-+    return s;
-+}
-+/* 5. Unsigned constants that are negative when sign-extended. */
-+NOINLINE int k_u_zero_trip_a(void) { int c = 0; for (unsigned i = 0xFFFFFFFEu; i < 2u; i++) c++; return c; }
-+NOINLINE int k_u_zero_trip_b(void) { int c = 0; for (unsigned i = 3u; i > 0xFFFFFFFEu; i--) c++; return c; }
-+NOINLINE int k_u_zero_trip_c(void) { int c = 0; for (unsigned i = -3u; i < 5u; i++) c++; return c; }
-+NOINLINE int k_u_zero_trip_d(void) { int c = 0; for (unsigned i = 1u; i <= 0xFFFFFFFDu; i += 0x7FFFFFFFu) c++; return c; }
-+NOINLINE unsigned k_u_hi_trip(void) { unsigned s = 0; for (unsigned i = 0xFFFFFFF0u; i < 0xFFFFFFF4u; i++) s += i & 15; return s; }
-+NOINLINE unsigned k_u_hi_trip_le(void) { unsigned s = 0; for (unsigned i = 0xFFFFFFFCu; i <= 0xFFFFFFFEu; i++) s += i & 15; return s; }
-+NOINLINE unsigned k_u_down_hi(void) { unsigned s = 0; for (unsigned i = 0xFFFFFFFFu; i > 0xFFFFFFFBu; i--) s += i & 15; return s; }
-+NOINLINE unsigned long k_ul_hi(void) { unsigned long s = 0; for (unsigned long i = ~0ul - 3; i < ~0ul; i++) s += i & 15; return s; }
-+NOINLINE long k_l_max(void) { long s = 0; for (long i = LONG_MAX - 3; i < LONG_MAX; i++) s += i & 15; return s; }
-+NOINLINE long k_l_min(void) { long s = 0; for (long i = LONG_MIN + 3; i > LONG_MIN; i--) s += i & 15; return s; }
-+/* 6. Comparison written the other way round / negated / != */
-+NOINLINE int k_rev_gt(void) { int s = 0; for (int i = 0; 4 > i; i++) s += A[i]; return s; }
-+NOINLINE int k_rev_ge(void) { int s = 0; for (int i = 0; 4 >= i; i++) s += A[i]; return s; }
-+NOINLINE int k_neg_ge(void) { int s = 0; for (int i = 0; !(i >= 4); i++) s += A[i]; return s; }
-+NOINLINE int k_ne(void) { int s = 0; for (int i = 0; i != 4; i++) s += A[i]; return s; }
-+NOINLINE int k_ne_step3(void) { int s = 0; for (int i = 0; i != 12; i += 3) s += A[i]; return s; }
-+NOINLINE int k_zero_ge(void) { int s = 0; for (int i = 0; i >= 4; i++) s += A[i]; return s; }
-+NOINLINE int k_rev_lt_exit(void) { int s = 0; for (int i = 0; 4 < i ? 0 : 1; i++) s += A[i]; return s; }
-+NOINLINE int k_le_neg_init(void) { int s = 0; for (int i = -3; i <= 3; i += 2) s += A[i + 3]; return s; }
-+NOINLINE int k_down_ge(void) { int s = 0; for (int i = 9; i >= 0; i -= 2) s += A[i]; return s; }
-+NOINLINE int k_down_gt_sub(void) { int s = 0; for (int i = 10; i > 0; i -= 3) s += A[i]; return s; }
-+/* 7. Side effect in the loop condition (header block). */
-+NOINLINE int k_header_effect(void) {
-+    int cnt = 0, s = 0;
-+    for (int i = 0; cnt++, i < 4; i++) s += A[i];
-+    return s * 100 + cnt;
-+}
-+NOINLINE int k_header_store(void) {
-+    int s = 0;
-+    for (int i = 0; (C[16 + i] = i * 5), i < 4; i++) s += A[i];
-+    return s + C[16] + C[17] + C[18] + C[19] + C[20];
-+}
-+/* 8. Exit block is a merge with a phi (loop on one arm). */
-+NOINLINE int k_exit_merge(int flag) {
-+    int r = 0;
-+    if (flag) { for (int i = 0; i < 4; i++) r += A[i]; } else { r = 7; }
-+    return r;
-+}
-+NOINLINE int k_exit_merge_rt(int flag, int n) {
-+    int r = 0;
-+    if (flag) { for (int i = 0; i < n; i++) r += A[i]; } else { r = 7; }
-+    return r;
-+}
-+NOINLINE int k_exit_iv_merge(int flag, int n) {
-+    int i = 100;
-+    if (flag) { for (i = 0; i < n; i++) C[32 + i] = i; }
-+    return i;
-+}
-+/* 9. Values live-out of a partially unrolled loop: IV, accumulator, last element. */
-+NOINLINE int k_liveout_rt(int n) {
-+    int i, s = 0, last = -1;
-+    for (i = 0; i < n; i++) { s += A[i]; last = A[i]; }
-+    return s * 1000 + i * 10 + last;
-+}
-+/* 10. Narrow IVs. */
-+NOINLINE int k_uchar_ne(void) { int c = 0; for (unsigned char i = 250; i != 2; i++) c += i; return c; }
-+NOINLINE int k_short_neg(void) { int c = 0; for (short i = -3; i < 3; i++) c += i * i; return c; }
-+NOINLINE int k_schar_edge(void) { int c = 0; for (signed char i = 124; i < 127; i++) c += i; return c; }
-+NOINLINE int k_uchar_hi(void) { int c = 0; for (unsigned char i = 253; i < 255; i++) c += i; return c; }
-+/* 11. continue inside body (latch has several predecessors). */
-+NOINLINE int k_continue_rt(int n) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) { if (A[i] & 1) continue; s += A[i]; }
-+    return s;
-+}
-+/* 12. Loop-carried phi with the latch listed first in the phi (order stress). */
-+NOINLINE int k_stride_carried(void) {
-+    int x = 1, y = 2;
-+    for (int i = 0; i < 8; i += 2) { int t = x + y; x = y; y = t + A[i]; }
-+    return x * 31 + y;
-+}
-+/* 13. Nested loops: constant inner, runtime outer and vice versa. */
-+NOINLINE int k_nested_rt_outer(int n) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) for (int j = 0; j < 4; j++) s += A[i + j] * (j + 1);
-+    return s;
-+}
-+NOINLINE int k_nested_rt_inner(int n) {
-+    int s = 0;
-+    for (int i = 0; i < 4; i++) for (int j = 0; j < n; j++) s += A[i + j] * (i + 1);
-+    return s;
-+}
-+NOINLINE int k_triangular(void) {
-+    int s = 0;
-+    for (int i = 0; i < 5; i++) for (int j = i + 1; j < 5; j++) s += A[i] * B[j];
-+    return s;
-+}
-+/* 14. FP reductions with constant/runtime trips. */
-+NOINLINE double k_f64_rt(int n) { double s = 0; for (int i = 0; i < n; i++) s += LA[i] * 0.5; return s; }
-+NOINLINE float k_f32_c6(void) { float s = 1; for (int i = 0; i < 6; i++) s = s * 0.5f + A[i]; return s; }
-+/* 15. Runtime trips around the unroll factor: 0,1,3,4,5,7,8,9,17. */
-+NOINLINE int k_sum_rt(int n) { int s = 0; for (int i = 0; i < n; i++) s += A[i] ^ i; return s; }
-+NOINLINE int k_sum_le_rt(int n) { int s = 0; for (int i = 0; i <= n; i++) s += A[i] ^ i; return s; }
-+NOINLINE int k_down_rt(int n) { int s = 0; for (int i = n; i > 0; i--) s += A[i] * i; return s; }
-+NOINLINE int k_stride3_rt(int n) { int s = 0; for (int i = 0; i < n; i += 3) s += A[i]; return s; }
-+NOINLINE unsigned k_u_rt(unsigned n) { unsigned s = 0; for (unsigned i = 0; i < n; i++) s += UA[i]; return s; }
-+NOINLINE long k_l_rt(long n) { long s = 0; for (long i = 0; i < n; i++) s += LA[i]; return s; }
-+/* 16. Multiple carried values + IV used in address arithmetic. */
-+NOINLINE int k_multi_carried_rt(int n) {
-+    int a = 1, b = 2, c = 3;
-+    for (int i = 0; i < n; i++) { int t = a; a = b + A[i]; b = c ^ t; c = t + 1; }
-+    return a * 7 + b * 3 + c;
-+}
-+/* 17. Store-then-load dependence through memory in unrolled body. */
-+NOINLINE int k_mem_dep_rt(int n) {
-+    C[40] = 1;
-+    for (int i = 0; i < n; i++) C[41 + i] = C[40 + i] * 2 + 1;
-+    return C[40 + n];
-+}
-+NOINLINE int k_mem_dep4(void) {
-+    C[50] = 3;
-+    for (int i = 0; i < 4; i++) C[51 + i] = C[50 + i] + A[i];
-+    return C[54];
-+}
-+/* 18. Early exit from body (break) — must be left alone or handled. */
-+NOINLINE int k_break_rt(int n) {
-+    int i;
-+    for (i = 0; i < n; i++) if (A[i] > 20) break;
-+    return i;
-+}
-+/* 19. volatile in body */
-+NOINLINE int k_volatile4(void) {
-+    int s = 0;
-+    for (int i = 0; i < 4; i++) s += vn4 + i;
-+    return s;
-+}
-+/* 20. Bool-flag latch-first phi: x = 1 then x = x? param : 0 */
-+NOINLINE int k_flag_toggle_rt(int n, int p) {
-+    int x = 1, s = 0;
-+    for (int i = 0; i < n; i++) { s += x; x = x ? p : 0; }
-+    return s;
-+}
-+/* 21. IV compared with widening use of iv (i32 iv, i64 index) */
-+NOINLINE long k_widen_rt(int n) {
-+    long s = 0;
-+    for (int i = 0; i < n; i++) s += LA[i] * (long)i;
-+    return s;
-+}
-+/* 22. Complete unroll where the IV final value is used after. */
-+NOINLINE int k_iv_after8(void) { int i, s = 0; for (i = 3; i < 19; i += 2) s += A[i]; return s * 100 + i; }
-+/* 23. Signed init negative, unsigned compare (should be zero trips). */
-+NOINLINE int k_u_neg_init(void) { int c = 0; for (int i = -2; (unsigned)i < 3u; i++) c++; return c; }
-+/* 24. Step larger than span with <= (exactly one trip) and one-trip loops. */
-+NOINLINE int k_one_trip(void) { int s = 0; for (int i = 0; i <= 0; i++) s += A[i] + 5; return s; }
-+NOINLINE int k_big_step(void) { int s = 0; for (int i = 0; i < 100; i += 60) s += A[i % 64]; return s; }
-+
-+int k_mixed_back(int p, int n);
-+int k_trip16(void);
-+int k_trip16_carried(void);
-+int k_desc_carried(void);
-+int k_live_mixed(int n);
-+long k_wide_inv(int n);
-+int main(void) {
-+    init();
-+    printf("first_const4=%d\n", k_first_const4());
-+    printf("first_const_rt5=%d rt9=%d rt1=%d rt0=%d\n", k_first_const_rt(vn5), k_first_const_rt(vn9), k_first_const_rt(vn1), k_first_const_rt(vn0));
-+    printf("first_param4=%d\n", k_first_param4(vn3));
-+    printf("first_param_rt=%d\n", k_first_param_rt(vn3, vn9));
-+    printf("two_iv_rt=%d %d %d\n", k_two_iv_rt(vn9), k_two_iv_rt(vn4), k_two_iv_rt(vn17));
-+    printf("ptr_iv_rt=%d %d\n", k_ptr_iv_rt(vn9), k_ptr_iv_rt(vn7));
-+    printf("two_iv4=%d\n", k_two_iv4());
-+    printf("diamond_rt=%d\n", k_diamond_rt(vn9));
-+    printf("diamond4=%d\n", k_diamond4());
-+    printf("C=");
-+    for (int i = 0; i < 64; i++) printf("%d,", C[i]);
-+    printf("\n");
-+    printf("u_zero=%d %d %d %d\n", k_u_zero_trip_a(), k_u_zero_trip_b(), k_u_zero_trip_c(), k_u_zero_trip_d());
-+    printf("u_hi=%u %u %u %lu %ld %ld\n", k_u_hi_trip(), k_u_hi_trip_le(), k_u_down_hi(), k_ul_hi(), k_l_max(), k_l_min());
-+    printf("cmp_forms=%d %d %d %d %d %d %d %d %d %d\n", k_rev_gt(), k_rev_ge(), k_neg_ge(), k_ne(), k_ne_step3(), k_zero_ge(), k_rev_lt_exit(), k_le_neg_init(), k_down_ge(), k_down_gt_sub());
-+    printf("header=%d %d\n", k_header_effect(), k_header_store());
-+    printf("exit_merge=%d %d %d %d %d %d\n", k_exit_merge(vflag1), k_exit_merge(vflag0), k_exit_merge_rt(vflag1, vn9), k_exit_merge_rt(vflag0, vn9), k_exit_iv_merge(vflag1, vn9), k_exit_iv_merge(vflag0, vn9));
-+    printf("liveout=%d %d %d %d\n", k_liveout_rt(vn9), k_liveout_rt(vn8), k_liveout_rt(vn1), k_liveout_rt(vn0));
-+    printf("narrow=%d %d %d %d\n", k_uchar_ne(), k_short_neg(), k_schar_edge(), k_uchar_hi());
-+    printf("continue=%d\n", k_continue_rt(vn17));
-+    printf("stride_carried=%d\n", k_stride_carried());
-+    printf("nested=%d %d %d\n", k_nested_rt_outer(vn9), k_nested_rt_inner(vn9), k_triangular());
-+    printf("fp=%.3f %.3f\n", k_f64_rt(vn9), k_f32_c6());
-+    printf("sum_rt=%d %d %d %d %d %d %d %d %d\n", k_sum_rt(vn0), k_sum_rt(vn1), k_sum_rt(vn3), k_sum_rt(vn4), k_sum_rt(vn5), k_sum_rt(vn7), k_sum_rt(vn8), k_sum_rt(vn9), k_sum_rt(vn17));
-+    printf("sum_le_rt=%d %d %d\n", k_sum_le_rt(vn0), k_sum_le_rt(vn7), k_sum_le_rt(vn8));
-+    printf("down_rt=%d %d %d\n", k_down_rt(vn9), k_down_rt(vn8), k_down_rt(vn1));
-+    printf("stride3_rt=%d %d\n", k_stride3_rt(vn17), k_stride3_rt(vn9));
-+    printf("u_rt=%u l_rt=%ld\n", k_u_rt((unsigned)vn17), k_l_rt(vln));
-+    printf("multi_carried=%d %d\n", k_multi_carried_rt(vn9), k_multi_carried_rt(vn4));
-+    printf("mem_dep=%d %d\n", k_mem_dep_rt(vn9), k_mem_dep4());
-+    printf("break=%d\n", k_break_rt(vn17));
-+    printf("volatile4=%d\n", k_volatile4());
-+    printf("flag_toggle=%d %d\n", k_flag_toggle_rt(vn9, vn1), k_flag_toggle_rt(vn9, vn0));
-+    printf("widen=%ld\n", k_widen_rt(vn9));
-+    printf("iv_after8=%d\n", k_iv_after8());
-+    printf("u_neg_init=%d\n", k_u_neg_init());
-+    printf("one_trip=%d big_step=%d\n", k_one_trip(), k_big_step());
-+    printf("mixed_back=%d %d %d\n", k_mixed_back(vn3,vn9), k_mixed_back(vn1,vn4), k_mixed_back(vn0,vn1));
-+    printf("trip16=%d %d\n", k_trip16(), k_trip16_carried());
-+    printf("desc_carried=%d\n", k_desc_carried());
-+    printf("live_mixed=%d %d %d\n", k_live_mixed(vn9), k_live_mixed(vn0), k_live_mixed(vn1));
-+    printf("wide_inv=%ld\n", k_wide_inv(vln));
-+    return 0;
-+}
-+
-+/* 25. One loop mixing every back-value kind: const, invariant param, body
-+   accumulator, and a cross-phi swap. */
-+NOINLINE int k_mixed_back(int p, int n) {
-+    int acc = 0, first = 1, cur = 5, x = 1, y = 2;
-+    for (int i = 0; i < n; i++) {
-+        acc += cur * A[i];
-+        cur = p;
-+        first = 0;
-+        int t = x + y; x = y; y = t ^ (i & 3);
-+    }
-+    return acc * 7 + first * 3 + cur * 11 + x * 13 + y * 17;
-+}
-+/* 26. Max unroll factor boundary (trip = 16). */
-+NOINLINE int k_trip16(void) {
-+    int s = 0; for (int i = 0; i < 16; i++) s += A[i] ^ (i * 3); return s;
-+}
-+NOINLINE int k_trip16_carried(void) {
-+    int s = 0, prev = A[0];
-+    for (int i = 0; i < 16; i++) { s += prev; prev = A[i]; }
-+    return s * 9 + prev;
-+}
-+/* 27. Descending stride 2 with `>=` and IV used in address + carry. */
-+NOINLINE int k_desc_carried(void) {
-+    int s = 0, last = -1;
-+    for (int i = 20; i >= 4; i -= 2) { s += A[i - 4]; last = A[i]; }
-+    return s * 100 + last;
-+}
-+/* 28. Runtime n, accumulator AND a "last" value live-out. */
-+NOINLINE int k_live_mixed(int n) {
-+    int s = 0, last = -1;
-+    for (int i = 0; i < n; i++) { s += A[i] * i; last = A[i + 1]; }
-+    return s * 100 + last;
-+}
-+/* 29. Wide index (i64 iv) with i32 body and a loop-invariant-carried phi. */
-+NOINLINE long k_wide_inv(int n) {
-+    long s = 0; int mul = 3;
-+    for (long i = 0; i < n; i++) { s += LA[i] * mul; mul = n & 1; }
-+    return s;
-+}
-diff --git a/tests/regression/unroll_unsigned_domain_trip.c b/tests/regression/unroll_unsigned_domain_trip.c
-new file mode 100644
-index 00000000..c9c697b2
---- /dev/null
-+++ b/tests/regression/unroll_unsigned_domain_trip.c
-@@ -0,0 +1,140 @@
-+/* Complete-unroll trip counts must be computed in the comparison's value
-+ * domain and in the IV's own width (loop_unroll.rs red-team audit).
-+ *
-+ * Two miscompiles, both reachable once an OUTER constant-trip loop is
-+ * completely unrolled and the INNER loop's init/limit becomes an affine
-+ * constant expression of the substituted outer IV:
-+ *
-+ *  1. `resolve_const_operand` narrowed every <= 4-byte BinOp result with
-+ *     `x as i32 as i64`.  The IR stores unsigned constants zero-extended
-+ *     (`IrConst::I64(0xFFFFFFF9)` for a U32), so the U32 sum
-+ *     `0xFFFFFFF8 + 1` folded to -7.  `-7 < 4` gave the inner loop
-+ *     `j = i + 1; j < 4u` a trip count of 11 although it never executes
-+ *     (0xFFFFFFF9 < 4 is false).  g1: 4294967287 instead of 0.
-+ *
-+ *  2. `complete_unroll_trip` evaluated `Ult/Ule/Ugt/Uge` with signed i64
-+ *     ordering.  A U64 constant >= 2^63 is a negative i64, so
-+ *     `0xFFFFFFFFFFFFFFF9 < 4` was "true" with a span of 10.  h1:
-+ *     18446744073709551607 instead of 0.
-+ *
-+ * The fix normalises every folded value through the IR's own constant
-+ * constructor (`IrConst::from_i64(v, ty).to_i64()`), does the closed form
-+ * in i128 in the compare's signedness domain, and refuses any IV walk that
-+ * would leave the IV type's range.  Each kernel below prints a value that
-+ * differs between the wrong and the right trip count; run_regression_suite
-+ * diffs against GCC.
-+ */
-+#include <stdio.h>
-+
-+/* (1) U32 affine inner init after outer complete unroll; inner never runs. */
-+__attribute__((noinline)) unsigned g1(void) {
-+    unsigned acc = 0, i, j;
-+    for (i = 0xFFFFFFF8u; i < 0xFFFFFFFAu; i++)
-+        for (j = i + 1; j < 4u; j++) {
-+            if (j & 1) acc += j; else acc ^= j;
+     pub(super) fn avx_load_arg_to(&mut self, arg: &Operand, ymm: &'static str) {
+         if let Operand::Value(v) = arg {
++            // VLFOLD: a consumer path that needs the elided load in a
++            // register performs the load itself (from the recorded source
++            // operand, never from the never-written home slot).
++            if self.memfold_operand(arg).is_some() {
++                let (_, mem, mnemonic) = self.state.pending_vec_memfold.take().unwrap();
++                if self.state.pending_vec_store.map(|(_, r, _)| r) == Some(ymm) {
++                    self.flush_pending_vec_store_impl();
++                }
++                self.state
++                    .emit_fmt(format_args!("    {} {}, %{}", mnemonic, mem, ymm));
++                self.state.dirty_upper_ymm = true;
++                self.state.vec_last_store_reg = false;
++                return;
++            }
+             // Width-aware register allocation: PhysReg 20..33 names the SIMD
+             // register family; this AVX helper selects its YMM view. Consult
+             // the assignment at every block boundary because vec_live_regs is
+@@ -839,6 +948,25 @@ impl X86Codegen {
+         dest_ptr: &Option<Value>,
+         args: &[Operand],
+     ) {
++        // VLFOLD: an eligible single-use 256-bit load emits nothing; its
++        // adjacent consumer folds the source memory operand.
++        if self.try_elide_vec_load(dest, op, args) {
++            return;
 +        }
-+    return acc;
-+}
-+
-+/* (1b) descending U32 inner loop that DOES run 9 times per outer iteration. */
-+__attribute__((noinline)) unsigned g2(void) {
-+    unsigned acc = 0, i, j;
-+    for (i = 0xFFFFFFF8u; i < 0xFFFFFFFAu; i++)
-+        for (j = i + 1; j > 0xFFFFFFF0u; j--) {
-+            if (j & 1) acc += j; else acc ^= j;
++        // VLFOLD safety net: only the registered consumer or an intervening
++        // pure vector load may follow an elided load; anything else
++        // materialises it first.
++        if let Some((pv, _, _)) = &self.state.pending_vec_memfold {
++            let pv = *pv;
++            let consumes = args
++                .iter()
++                .any(|a| matches!(a, Operand::Value(v) if v.0 == pv));
++            if !consumes
++                && !crate::backend::stack_layout::copy_coalescing::is_pure_vec_load(op)
++            {
++                self.materialize_pending_memfold();
++            }
 +        }
-+    return acc;
-+}
-+
-+/* (1c) the limit is the affine expression. */
-+__attribute__((noinline)) unsigned g3(void) {
-+    unsigned acc = 0, i, j;
-+    for (i = 0xFFFFFFF8u; i < 0xFFFFFFFAu; i++)
-+        for (j = 2u; j < i + 8u; j++) {
-+            if (j & 1) acc += j; else acc ^= j;
-+        }
-+    return acc;
-+}
-+
-+/* (1d) narrowing cast in the init chain: (unsigned char)(i + 10) wraps. */
-+__attribute__((noinline)) unsigned g4(void) {
-+    unsigned acc = 0; unsigned i;
-+    for (i = 250u; i < 252u; i++) {
-+        unsigned char j;
-+        for (j = (unsigned char)(i + 10); j < 6; j++) {
-+            if (j & 1) acc += j; else acc ^= j * 3u;
+         // Lazy flush: a deferred vector result may be pending in a register.
+         // Flush it before any intrinsic that is not its cache-aware consumer
+         // (fences/pause/rdtsc neither clobber XMM regs nor read vector slots,
+@@ -4319,7 +4447,68 @@ impl X86Codegen {
+     /// operand as the memory source, and copies at most ONE operand through
+     /// %ymm1.
+     fn emit_avx_map_fma(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
++        let folded = self
++            .state
++            .pending_vec_memfold
++            .as_ref()
++            .map(|(pv, _, _)| *pv)
++            .filter(|pv| args.iter().any(|a| matches!(a, Operand::Value(v) if v.0 == *pv)));
++        self.emit_avx_map_fma_inner(dest, args, mnemonic);
++        if folded.is_some() {
++            self.state.pending_vec_memfold = None;
 +        }
 +    }
-+    return acc;
-+}
 +
-+/* (2) U64 >= 2^63 through a nested affine init; inner never runs. */
-+__attribute__((noinline)) unsigned long h1(void) {
-+    unsigned long acc = 0, i, j;
-+    for (i = 0xFFFFFFFFFFFFFFF8ul; i < 0xFFFFFFFFFFFFFFFAul; i++)
-+        for (j = i + 1; j < 4ul; j++) {
-+            if (j & 1) acc += j; else acc ^= j;
++    fn emit_avx_map_fma_inner(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
+         assert!(args.len() == 3, "{} expects input, scale, bias", mnemonic);
++        // VLFOLD forms (ICX saxpy shape). With the scale in an XMM home:
++        //   bias elided : input streams in %ymm0 → `vfmadd213 mem, %s, %ymm0`
++        //                 (= s*input + mem)
++        //   input elided: bias  streams in %ymm0 → `vfmadd231 mem, %s, %ymm0`
++        //                 (= s*mem + bias)
++        if let (Some((pv, mem, _)), Operand::Value(m0), Operand::Value(m1), Operand::Value(bias)) = (
++            self.state.pending_vec_memfold.clone(),
++            &args[0],
++            &args[1],
++            &args[2],
++        ) {
++            // The multiplicands commute: whichever of args[0]/args[1] has an
++            // XMM home (the loop-invariant broadcast) is the register source,
++            // the other one is the streamed element vector.
++            let home = |this: &Self, v: &Value| {
++                this.reg_assignments
++                    .get(&v.0)
++                    .copied()
++                    .filter(|r| is_xmm_reg(*r))
++            };
++            let (scale_reg, streamed_mul) = match (home(self, m0), home(self, m1)) {
++                (Some(r), None) => (Some(r), Some((m1, &args[1]))),
++                (None, Some(r)) => (Some(r), Some((m0, &args[0]))),
++                _ => (None, None),
++            };
++            if let (Some(scale_reg), Some((streamed, streamed_arg))) = (scale_reg, streamed_mul) {
++                let form = if bias.0 == pv {
++                    Some((mnemonic.replace("132", "213"), streamed_arg))
++                } else if streamed.0 == pv {
++                    Some((mnemonic.replace("132", "231"), &args[2]))
++                } else {
++                    None
++                };
++                if let Some((form, streamed)) = form {
++                    self.avx_load_arg(streamed);
++                    self.state.emit_fmt(format_args!(
++                        "    {} {}, %{}, %ymm0",
++                        form,
++                        mem,
++                        phys_reg_name_256(scale_reg)
++                    ));
++                    self.state.pending_vec_memfold = None;
++                    self.state.vec_last_store_reg = false;
++                    self.avx_store_dest(dest);
++                    return;
++                }
++            }
 +        }
-+    return acc;
-+}
-+
-+/* (2b) U64 descending across 2^63 boundary; runs 8 times per outer trip. */
-+__attribute__((noinline)) unsigned long h2(void) {
-+    unsigned long acc = 0, i, j;
-+    for (i = 0x8000000000000003ul; i < 0x8000000000000005ul; i++)
-+        for (j = i + 1; j > 0x7FFFFFFFFFFFFFFCul; j--) {
-+            if (j & 1) acc += j; else acc ^= j;
-+        }
-+    return acc;
-+}
-+
-+/* Signed nesting must still be unrolled correctly (positive control). */
-+__attribute__((noinline)) int s1(void) {
-+    int acc = 0, i, j;
-+    for (i = 0; i < 3; i++)
-+        for (j = i + 1; j < 6; j++) {
-+            if (j & 1) acc += j; else acc ^= j;
-+        }
-+    return acc;
-+}
-+
-+/* Signed INT_MIN neighbourhood: sign extension is the right thing here. */
-+__attribute__((noinline)) long s2(void) {
-+    long acc = 0; int i;
-+    for (i = -2147483647 - 1; i < -2147483646; i++) {
-+        int j;
-+        for (j = i + 1; j < -2147483643; j++) {
-+            if (j & 1) acc += j; else acc ^= j;
+         if let (Operand::Value(input), Operand::Value(scale), Operand::Value(bias)) =
+             (&args[0], &args[1], &args[2])
+         {
+@@ -4513,6 +4702,81 @@ impl X86Codegen {
+         avx_inst: &str,
+         commutative: bool,
+     ) {
++        let folded = self
++            .state
++            .pending_vec_memfold
++            .as_ref()
++            .map(|(pv, _, _)| *pv)
++            .filter(|pv| args.iter().any(|a| matches!(a, Operand::Value(v) if v.0 == *pv)));
++        self.emit_avx_binary_256_inner(dest_ptr, args, avx_inst, commutative);
++        // VLFOLD: every path of the consumer either used the memory operand
++        // or materialised the load; the elided value is consumed now.
++        if folded.is_some() {
++            self.state.pending_vec_memfold = None;
 +        }
 +    }
-+    return acc;
-+}
 +
-+/* `!=` exit with exact stride divisibility is now completely unrolled;
-+ * a non-dividing stride must stay a loop and terminate via wrap.  Both
-+ * must print the same as GCC. */
-+__attribute__((noinline)) unsigned n1(void) {
-+    unsigned acc = 0, i;
-+    for (i = 0; i != 12; i += 3) acc = acc * 31 + i;
-+    return acc;
-+}
-+__attribute__((noinline)) unsigned n2(void) {
-+    unsigned acc = 0; unsigned char i;
-+    for (i = 0; i != 7; i += 3) acc = acc * 31 + i;   /* wraps twice before hitting 7 */
-+    return acc;
-+}
++    fn emit_avx_binary_256_inner(
++        &mut self,
++        dest_ptr: &Value,
++        args: &[Operand],
++        avx_inst: &str,
++        commutative: bool,
++    ) {
++        // VLFOLD register forms. `acc' = op(acc, load)` with acc/acc' in one
++        // YMM family becomes the single ICX reduction instruction
++        // `op mem, %ymmA, %ymmA`; a homed non-accumulator source (map
++        // broadcast invariant) gives `op mem, %ymmS, %ymmD` for a homed
++        // destination or `op mem, %ymmS, %ymm0` + home store otherwise —
++        // never a per-iteration `vmovdqa %ymmS, %ymm1` copy.
++        if let Some((pv, mem, _)) = self.state.pending_vec_memfold.clone() {
++            if let (Operand::Value(x), Operand::Value(y)) = (&args[0], &args[1]) {
++                let other = if y.0 == pv {
++                    Some(x)
++                } else if x.0 == pv && commutative {
++                    Some(y)
++                } else {
++                    None
++                };
++                let other_reg = other
++                    .and_then(|o| self.reg_assignments.get(&o.0).copied())
++                    .filter(|r| is_xmm_reg(*r));
++                if let Some(oreg) = other_reg {
++                    let src = phys_reg_name_256(oreg);
++                    self.state.dirty_upper_ymm = true;
++                    let dest_home = self
++                        .reg_assignments
++                        .get(&dest_ptr.0)
++                        .copied()
++                        .filter(|r| is_xmm_reg(*r));
++                    if let Some(dest_reg) = dest_home {
++                        let dst = phys_reg_name_256(dest_reg);
++                        self.state.emit_fmt(format_args!(
++                            "    {} {}, %{}, %{}",
++                            avx_inst, mem, src, dst
++                        ));
++                        self.state.vec_live_regs.insert(dest_ptr.0, dst);
++                        self.state.vec_last_store_val = Some(dest_ptr.0);
++                        self.state.vec_last_store_reg = true;
++                        self.state.vec_last_store_reg_name = Some(dst);
++                        self.state.reg_cache.invalidate_acc();
++                    } else {
++                        // %ymm0 may hold a deferred value of a different def:
++                        // commit it before overwriting the scratch register.
++                        self.flush_pending_vec_store_impl();
++                        self.state.emit_fmt(format_args!(
++                            "    {} {}, %{}, %ymm0",
++                            avx_inst, mem, src
++                        ));
++                        self.state.vec_last_store_reg = false;
++                        self.avx_store_dest(dest_ptr);
++                    }
++                    self.state.pending_vec_memfold = None;
++                    return;
++                }
++            }
++        }
 +
-+/* Operand order and polarity: `lim > i`, `!(i >= lim)`, `if (...) break`. */
-+__attribute__((noinline)) int p1(void) { int s = 0, i; for (i = 0; 5 > i; i++) s += i * 7; return s; }
-+__attribute__((noinline)) int p2(void) { int s = 0, i; for (i = 0; !(i >= 5); i++) s += i * 11; return s; }
-+__attribute__((noinline)) int p3(void) { int s = 0, i; for (i = 9; ; i -= 2) { if (i < 2) break; s += i * 13; } return s; }
-+__attribute__((noinline)) unsigned p4(void) { unsigned s = 0, i; for (i = 3u; 0xFFFFFFF9u <= i; i++) s += i; return s; }
-+
-+int main(void) {
-+    printf("g1=%u g2=%u g3=%u g4=%u\n", g1(), g2(), g3(), g4());
-+    printf("h1=%lu h2=%lu\n", h1(), h2());
-+    printf("s1=%d s2=%ld\n", s1(), s2());
-+    printf("n1=%u n2=%u\n", n1(), n2());
-+    printf("p1=%d p2=%d p3=%d p4=%u\n", p1(), p2(), p3(), p4());
-+    return 0;
-+}
-diff --git a/tests/regression/unroll_unsigned_domain_trip.flags b/tests/regression/unroll_unsigned_domain_trip.flags
-new file mode 100644
-index 00000000..cd11b1e1
---- /dev/null
-+++ b/tests/regression/unroll_unsigned_domain_trip.flags
-@@ -0,0 +1 @@
-+-O3 -march=x86-64-v3
--- 
-2.47.3
-
+         // In AT&T VEX syntax only the first textual source may be memory.
+         // Preserve operand order for non-commutative operations.
+         //
+@@ -4618,6 +4882,9 @@ impl X86Codegen {
+         }
+ 
+         let mem_of = |this: &Self, arg: &Operand| -> Option<String> {
++            if let Some(mem) = this.memfold_operand(arg) {
++                return Some(mem);
++            }
+             match arg {
+                 Operand::Value(v) => {
+                     if this.state.vec_live_regs.contains_key(&v.0)
+diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
+index f42555f..4db9fa7 100644
+--- a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
++++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
+@@ -250,7 +250,17 @@ fn a_copy_SURVIVES_when_the_use_also_writes_the_destination() {
+         "    movl %esi, %eax\n",
+         "    ret"
+     )));
+-    assert_eq!(count(&out, "movl %eax, %esi"), 1, "must not fold:\n{}", out);
++    // Rule 4 must never rewrite the use into `addl %ecx, %eax` (that would
++    // clobber the copy source before `movl %esi, %eax` reads the result).
++    assert_eq!(count(&out, "addl %ecx, %eax"), 0, "rule 4 violated:\n{}", out);
++    // The copy may still disappear through a different, legal route: the
++    // later `load_op_fuse` "copy + commutative op into the dying operand"
++    // pass turns the triple into `addl %eax, %ecx; movl %ecx, %eax` because
++    // %ecx (caller-saved) and %esi are dead at `ret`. Either shape is correct;
++    // the illegal rule-4 shape is the only thing this test forbids.
++    let survives = count(&out, "movl %eax, %esi") == 1 && out.contains("addl %ecx, %esi");
++    let bridged = out.contains("addl %eax, %ecx") && out.contains("movl %ecx, %eax");
++    assert!(survives || bridged, "unexpected shape:\n{}", out);
+ }
+ 
+ #[test]
