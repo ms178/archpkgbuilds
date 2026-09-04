@@ -1,876 +1,585 @@
-diff --git a/src/passes/cvp.rs b/src/passes/cvp.rs
-new file mode 100644
-index 0000000..7e30c8c
---- /dev/null
-+++ b/src/passes/cvp.rs
-@@ -0,0 +1,816 @@
-+//! Correlated value propagation (dominance-scoped predicate folding).
-+//!
-+//! Conditional control flow is a source of facts: on the true edge of
-+//! `br (x <u 10)`, `x` is known to lie in `[0, 9]`; on the false edge of
-+//! `br (v == 0)`, `v` is known non-zero.  Every block dominated by such an
-+//! edge inherits the fact, and any later compare of the same value against a
-+//! constant whose outcome is *implied* by the accumulated facts is redundant.
-+//!
-+//! GCC (VRP / evrp / dom-threading) and LLVM (CorrelatedValuePropagation,
-+//! LazyValueInfo) both perform this analysis; LCCC did not, so redundant
-+//! checks survived to the backend.  Two concrete shapes motivated the pass:
-+//!
-+//!  * Linux `find_next_bit`: the `__ffs` tree is recognised as `Ctz`, but the
-+//!    recogniser must guard the zero case (`v == 0 ? 63 : ctz(v)`) because
-+//!    the C function is well defined for zero.  The tree is only ever reached
-+//!    through `while (!value)`, so `value != 0` on that path and the guard
-+//!    (`test/sete/movzbl/test/cmov` ×2, ten instructions) is dead.
-+//!  * Post-inlining chains such as `if (p) f(p)` with `f` starting `if (!p)`,
-+//!    SQLite/Expat byte classifiers that re-test a range already tested by the
-+//!    enclosing branch, and `switch` cases that re-compare the selector.
-+//!
-+//! # Facts
-+//!
-+//! A fact is `(value, bits, interval-set)`: the value of `value` (interpreted
-+//! as a `bits`-wide integer) is contained in the interval set.  Interval sets
-+//! are kept in the **unsigned** domain `[0, 2^bits)`; signed comparisons are
-+//! mapped by splitting at the sign boundary, so signed and unsigned facts
-+//! about the same value compose (`x >s -1 && x <s 100` ⇒ `x <u 100`).
-+//!
-+//! Edge facts come from `CondBranch` on a `Cmp value-vs-constant` (and from
-+//! the boolean condition value itself, so a re-branch on the same `_Bool`
-+//! folds) and from `Switch` (`val == case` on a case edge, `val != every
-+//! case` on the default edge).
-+//!
-+//! A fact holds in block `S` when **every** predecessor edge of `S` carries
-+//! it (single-predecessor blocks are the common special case; the per-edge
-+//! sets are unioned).  Facts of `S` then hold in every block `S` dominates.
-+//! The pass walks the dominator tree with an explicit fact stack, so
-+//! gathering is `O(blocks + facts)`.
-+//!
-+//! # Folds
-+//!
-+//! * `Cmp value-vs-constant` whose truth set contains / is disjoint from the
-+//!   fact set → canonical boolean constant (`IrConst::I32(0|1)`, as SCCP).
-+//! * `Select` whose condition is a known boolean → the selected arm.
-+//! * `CondBranch` whose condition is known → `Branch`, with the dropped
-+//!   successor's phi incomings for this block removed.  Removing edges can
-+//!   only enlarge dominance, so facts computed before the edit stay valid
-+//!   for the rest of the walk; `cfg_simplify` later deletes unreachable
-+//!   blocks.
-+//!
-+//! The pass never invents values, never widens a type, and is idempotent.
-+//! Pass name for `CCC_DISABLE_PASSES`: `"cvp"`.
-+
-+use crate::common::fx_hash::FxHashMap;
-+
-+use crate::common::types::IrType;
-+use crate::ir::analysis::{
-+    build_cfg, build_dom_tree_children, build_label_map, compute_dominators,
-+};
-+use crate::ir::reexports::{
-+    BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
-+};
-+
-+/// A sorted, disjoint, non-adjacent list of closed intervals in `[0, max]`.
-+type Set = Vec<(i128, i128)>;
-+
-+/// Carrier width used for facts about boolean condition values themselves.
-+const BOOL_BITS: u32 = 64;
-+
-+fn bits_of(ty: IrType) -> Option<u32> {
-+    match ty {
-+        IrType::I8 | IrType::U8 => Some(8),
-+        IrType::I16 | IrType::U16 => Some(16),
-+        IrType::I32 | IrType::U32 => Some(32),
-+        IrType::I64 | IrType::U64 => Some(64),
-+        IrType::Ptr => Some((crate::common::types::target_ptr_size() * 8) as u32),
-+        _ => None,
-+    }
-+}
-+
-+fn umax(bits: u32) -> i128 {
-+    (1i128 << bits) - 1
-+}
-+
-+/// Normalise an integer constant to the unsigned `bits`-wide domain.
-+fn to_unsigned(c: i128, bits: u32) -> i128 {
-+    c & umax(bits)
-+}
-+
-+fn normalize(mut v: Set) -> Set {
-+    v.retain(|(a, b)| a <= b);
-+    v.sort_unstable();
-+    let mut out: Set = Vec::with_capacity(v.len());
-+    for (a, b) in v {
-+        if let Some(last) = out.last_mut() {
-+            if a <= last.1 + 1 {
-+                last.1 = last.1.max(b);
-+                continue;
-+            }
+diff --git a/src/ir/lowering/stmt_switch.rs b/src/ir/lowering/stmt_switch.rs
+index 13b9dde..f1d5480 100644
+--- a/src/ir/lowering/stmt_switch.rs
++++ b/src/ir/lowering/stmt_switch.rs
+@@ -16,7 +16,22 @@ impl Lowerer {
+         // C99 6.8.4.2: Integer promotions are performed on the controlling expression.
+         // Non-integer types (pointers, floats, etc.) are rejected by sema; this Ptr
+         // arm is a defensive fallback to avoid crashes if sema is bypassed.
+-        let raw_expr_ty = self.get_expr_type(expr);
++        //
++        // The controlling value is consumed at a CONVERSION BOUNDARY (the
++        // `Switch` terminator compares exactly `ty` bits), so its type must
++        // describe the bits the lowered expression really produces.
++        // `get_expr_type` reports the widened *storage* type: on LP64 an
++        // integer literal is I64, so `x + 0` / `x * 1` / `x + 1` with
++        // `int x` was reported as I64 while `lower_arithmetic_binop` computed
++        // the sum as a 32-bit `addl`.  The dispatch chain then compared the
++        // full 64-bit register (`cmpq $-1, %rdi`), whose upper half is
++        // ABI-undefined for an `int` argument (SysV: only the low 32 bits of
++        // a 32-bit parameter are meaningful) or zero after a 32-bit ALU op —
++        // so `case -1:` never matched and `case 5:` matched garbage.  Found
++        // by tests/stress (switch family, every seed, every -O level).
++        // `value_ir_type` mirrors lower_arithmetic_binop's exact type
++        // computation and is the documented query for such boundaries.
++        let raw_expr_ty = self.value_ir_type(expr);
+         let switch_expr_ty = match raw_expr_ty {
+             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
+             IrType::Ptr => crate::common::types::target_int_ir_type(),
+diff --git a/src/passes/copy_prop.rs b/src/passes/copy_prop.rs
+index cedd1f0..fe9b3fd 100644
+--- a/src/passes/copy_prop.rs
++++ b/src/passes/copy_prop.rs
+@@ -976,29 +976,43 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
+     // RESOLVED source. Chained copies (d1=Copy(s1); d2=Copy(d1)) must resolve
+     // d2's source to s1 — substituting the intermediate d1 would leave a
+     // dangling reference once d1's own copy is removed.
+-    let resolved_src: Vec<Operand> = to_remove
+-        .iter()
+-        .map(|&(_, _, dest, src)| {
+-            let mut cur = src;
+-            let mut depth = 0;
+-            while depth < 32 {
+-                match cur {
+-                    Operand::Value(v) => {
+-                        if let Some(&(_, _, d2, s2)) =
+-                            to_remove.iter().find(|&&(_, _, d, _)| d == v)
+-                        {
+-                            cur = s2;
+-                            depth += 1;
+-                        } else {
+-                            break;
+-                        }
+-                    }
+-                    _ => break,
+-                }
+-            }
+-            cur
+-        })
+-        .collect();
++    //
++    // Resolution is a single memoised sweep in program order.  A removable
++    // copy's src is (by the `src_available` rule above) a constant, or a value
++    // defined in the SAME block at an EARLIER index; and its dest is
++    // single-def.  Hence every chain link points at a strictly earlier entry
++    // of `to_remove` (which is in program order), so `resolved[k]` only ever
++    // needs `resolved[j]` for j < k — O(n) total, exact for chains of any
++    // length.  The previous implementation walked each chain with a linear
++    // `find` and a hard `depth < 32` cap: a 35-link chain (the `fails`
++    // accumulator of a stress-lab `main` after every check block folded to
++    // `Copy`) stopped at an intermediate dest that was itself removed, and
++    // the backend then met `Copy v393 = v359` with v359 undefined (-O1 ICE
++    // "operand_to_rax: value has no register home" in divmod/shifts/builtins
++    // seeds; tests/regression/post_phi_copy_chain_long.c).
++    let resolved_src: Vec<Operand> = {
++        let mut dest_to_idx: crate::common::fx_hash::FxHashMap<u32, usize> =
++            crate::common::fx_hash::FxHashMap::default();
++        let mut resolved: Vec<Operand> = Vec::with_capacity(to_remove.len());
++        for (k, &(_, _, dest, src)) in to_remove.iter().enumerate() {
++            let r = match src {
++                Operand::Value(v) => match dest_to_idx.get(&v.0) {
++                    Some(&j) => resolved[j],
++                    None => src,
++                },
++                Operand::Const(_) => src,
++            };
++            resolved.push(r);
++            dest_to_idx.insert(dest.0, k);
 +        }
-+        out.push((a, b));
-+    }
-+    out
-+}
-+
-+fn complement(s: &Set, bits: u32) -> Set {
-+    let max = umax(bits);
-+    let mut out = Vec::new();
-+    let mut cur = 0i128;
-+    for &(a, b) in s {
-+        if a > cur {
-+            out.push((cur, a - 1));
-+        }
-+        cur = b + 1;
-+    }
-+    if cur <= max {
-+        out.push((cur, max));
-+    }
-+    out
-+}
-+
-+fn intersect(x: &Set, y: &Set) -> Set {
-+    let mut out = Vec::new();
-+    let (mut i, mut j) = (0, 0);
-+    while i < x.len() && j < y.len() {
-+        let lo = x[i].0.max(y[j].0);
-+        let hi = x[i].1.min(y[j].1);
-+        if lo <= hi {
-+            out.push((lo, hi));
-+        }
-+        if x[i].1 < y[j].1 {
-+            i += 1;
-+        } else {
-+            j += 1;
-+        }
-+    }
-+    out
-+}
-+
-+fn is_subset(sub: &Set, sup: &Set) -> bool {
-+    // Both normalised: every `sub` interval must sit inside one `sup` interval.
-+    let mut j = 0;
-+    for &(a, b) in sub {
-+        while j < sup.len() && sup[j].1 < a {
-+            j += 1;
-+        }
-+        if j >= sup.len() || sup[j].0 > a || sup[j].1 < b {
-+            return false;
-+        }
-+    }
-+    true
-+}
-+
-+/// Signed closed interval → unsigned interval set (split at the sign bit).
-+fn signed_interval(a: i128, b: i128, bits: u32) -> Set {
-+    if a > b {
-+        return Vec::new();
-+    }
-+    let m = 1i128 << bits;
-+    if a >= 0 {
-+        vec![(a, b)]
-+    } else if b < 0 {
-+        vec![(a + m, b + m)]
-+    } else {
-+        vec![(0, b), (a + m, m - 1)]
-+    }
-+}
-+
-+/// The set of `bits`-wide values `x` for which `x OP c` is true.
-+fn truth_set(op: IrCmpOp, c: i128, bits: u32) -> Set {
-+    let max = umax(bits);
-+    let cu = to_unsigned(c, bits);
-+    let smin = -(1i128 << (bits - 1));
-+    let smax = (1i128 << (bits - 1)) - 1;
-+    // Sign-extend the constant for signed orderings.
-+    let cs = if cu > smax { cu - (1i128 << bits) } else { cu };
-+    let raw = match op {
-+        IrCmpOp::Eq => vec![(cu, cu)],
-+        IrCmpOp::Ne => return normalize(complement(&vec![(cu, cu)], bits)),
-+        IrCmpOp::Ult => vec![(0, cu - 1)],
-+        IrCmpOp::Ule => vec![(0, cu)],
-+        IrCmpOp::Ugt => vec![(cu + 1, max)],
-+        IrCmpOp::Uge => vec![(cu, max)],
-+        IrCmpOp::Slt => signed_interval(smin, cs - 1, bits),
-+        IrCmpOp::Sle => signed_interval(smin, cs, bits),
-+        IrCmpOp::Sgt => signed_interval(cs + 1, smax, bits),
-+        IrCmpOp::Sge => signed_interval(cs, smax, bits),
++        // Invariant: no resolved source may name a dest that is being removed
++        // (that is exactly the dangling-reference failure mode above).
++        debug_assert!(resolved.iter().all(|r| match r {
++            Operand::Value(v) => !dest_to_idx.contains_key(&v.0),
++            Operand::Const(_) => true,
++        }));
++        resolved
 +    };
-+    normalize(raw)
-+}
-+
-+fn swap_op(op: IrCmpOp) -> IrCmpOp {
-+    match op {
-+        IrCmpOp::Eq => IrCmpOp::Eq,
-+        IrCmpOp::Ne => IrCmpOp::Ne,
-+        IrCmpOp::Slt => IrCmpOp::Sgt,
-+        IrCmpOp::Sle => IrCmpOp::Sge,
-+        IrCmpOp::Sgt => IrCmpOp::Slt,
-+        IrCmpOp::Sge => IrCmpOp::Sle,
-+        IrCmpOp::Ult => IrCmpOp::Ugt,
-+        IrCmpOp::Ule => IrCmpOp::Uge,
-+        IrCmpOp::Ugt => IrCmpOp::Ult,
-+        IrCmpOp::Uge => IrCmpOp::Ule,
-+    }
-+}
-+
-+/// `value OP const` canonical form of a compare, if exactly one side is an
-+/// integer constant.
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+struct Pred {
-+    value: Value,
-+    op: IrCmpOp,
-+    c: i128,
-+    bits: u32,
-+}
-+
-+fn canonical_pred(op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option<Pred> {
-+    let bits = bits_of(ty)?;
-+    match (lhs, rhs) {
-+        (Operand::Value(v), Operand::Const(k)) => Some(Pred {
-+            value: *v,
-+            op,
-+            c: k.to_i128()?,
-+            bits,
-+        }),
-+        (Operand::Const(k), Operand::Value(v)) => Some(Pred {
-+            value: *v,
-+            op: swap_op(op),
-+            c: k.to_i128()?,
-+            bits,
-+        }),
-+        _ => None,
-+    }
-+}
-+
-+/// A fact that holds on a CFG edge: `value ∈ set` (as a `bits`-wide integer).
-+#[derive(Clone, Debug, PartialEq, Eq)]
-+struct Fact {
-+    value: Value,
-+    bits: u32,
-+    set: Set,
-+}
-+
-+impl Fact {
-+    fn from_pred(p: Pred, truth: bool) -> Fact {
-+        let mut set = truth_set(p.op, p.c, p.bits);
-+        if !truth {
-+            set = complement(&set, p.bits);
-+        }
-+        Fact {
-+            value: p.value,
-+            bits: p.bits,
-+            set,
-+        }
-+    }
-+}
-+
-+/// Facts carried by the edge `from → to_label`.
-+fn edge_facts(
-+    func: &IrFunction,
-+    defs: &FxHashMap<Value, (usize, usize)>,
-+    from: usize,
-+    to_label: BlockId,
-+) -> Vec<Fact> {
-+    let mut out = Vec::new();
-+    match &func.blocks[from].terminator {
-+        Terminator::CondBranch {
-+            cond: Operand::Value(cv),
-+            true_label,
-+            false_label,
-+        } => {
-+            if true_label == false_label {
-+                return out;
-+            }
-+            let truth = if *true_label == to_label {
-+                true
-+            } else if *false_label == to_label {
-+                false
-+            } else {
-+                return out;
-+            };
-+            // The boolean itself is known on this edge (its carrier type
-+            // does not matter: the consumer only asks "zero or not").
-+            out.push(Fact {
-+                value: *cv,
-+                bits: BOOL_BITS,
-+                set: if truth { vec![(1, umax(BOOL_BITS))] } else { vec![(0, 0)] },
+     // Const-resolved removals must not orphan Value-position uses (Load.ptr,
+     // Store.ptr, GEP.base, ...): those fields cannot hold a constant, so
+     // `replace_value_in_place` would silently skip them and the removed copy's
+@@ -1072,6 +1086,87 @@ mod tests {
+     use crate::common::types::IrType;
+     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst};
+ 
++    /// Post-phi cleanup must resolve copy chains of ANY length exactly.  The
++    /// old resolver capped the walk at 32 links; a longer chain resolved to
++    /// an intermediate dest that was itself removed and the survivor read an
++    /// undefined value (backend hard gate ICE at -O1).  Chain of 40 links,
++    /// last link consumed by a Cmp in another block (so it is kept) and by a
++    /// Return: after cleanup every remaining operand must be defined.
++    #[test]
++    fn test_post_phi_long_chain_no_dangling_use() {
++        const N: u32 = 40;
++        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
++        let mut insts = vec![Instruction::Copy {
++            dest: Value(1),
++            src: Operand::Const(IrConst::I32(0)),
++        }];
++        for i in 1..N {
++            insts.push(Instruction::Copy {
++                dest: Value(i + 1),
++                src: Operand::Value(Value(i)),
 +            });
-+            if let Some(&(bi, ii)) = defs.get(cv) {
-+                if let Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } = func.blocks[bi].instructions[ii] {
-+                    if let Some(p) = canonical_pred(*op, lhs, rhs, *ty) {
-+                        out.push(Fact::from_pred(p, truth));
-+                    }
-+                }
-+            }
 +        }
-+        Terminator::Switch {
-+            val: Operand::Value(v),
-+            cases,
-+            default,
-+            ty,
-+        } => {
-+            let Some(bits) = bits_of(*ty) else { return out };
-+            if *default == to_label {
-+                // Default edge: val is none of the case values that do not
-+                // also target the default block.
-+                let excluded: Set = normalize(
-+                    cases
-+                        .iter()
-+                        .filter(|(_, l)| *l != to_label)
-+                        .map(|(c, _)| {
-+                            let u = to_unsigned(*c as i128, bits);
-+                            (u, u)
-+                        })
-+                        .collect(),
-+                );
-+                out.push(Fact {
-+                    value: *v,
-+                    bits,
-+                    set: complement(&excluded, bits),
-+                });
-+            } else {
-+                let hits: Set = normalize(
-+                    cases
-+                        .iter()
-+                        .filter(|(_, l)| *l == to_label)
-+                        .map(|(c, _)| {
-+                            let u = to_unsigned(*c as i128, bits);
-+                            (u, u)
-+                        })
-+                        .collect(),
-+                );
-+                if !hits.is_empty() {
-+                    out.push(Fact {
-+                        value: *v,
-+                        bits,
-+                        set: hits,
-+                    });
-+                }
-+            }
-+        }
-+        _ => {}
-+    }
-+    out
-+}
-+
-+/// Facts that hold on entry to `blk`: for each value, the union over all
-+/// incoming edges of that edge's fact — kept only if every edge has one.
-+fn block_entry_facts(
-+    func: &IrFunction,
-+    defs: &FxHashMap<Value, (usize, usize)>,
-+    preds: &[u32],
-+    blk: usize,
-+) -> Vec<Fact> {
-+    if preds.is_empty() {
-+        return Vec::new();
-+    }
-+    let label = func.blocks[blk].label;
-+    let mut acc: Option<Vec<Fact>> = None;
-+    for &p in preds {
-+        let ef = edge_facts(func, defs, p as usize, label);
-+        acc = Some(match acc {
-+            None => ef,
-+            Some(prev) => {
-+                let mut merged = Vec::new();
-+                for f in prev {
-+                    for g in ef.iter().filter(|g| g.value == f.value && g.bits == f.bits) {
-+                        let mut u = f.set.clone();
-+                        u.extend_from_slice(&g.set);
-+                        merged.push(Fact {
-+                            value: f.value,
-+                            bits: f.bits,
-+                            set: normalize(u),
-+                        });
-+                    }
-+                }
-+                merged
-+            }
-+        });
-+        if acc.as_ref().is_some_and(Vec::is_empty) {
-+            break;
-+        }
-+    }
-+    acc.unwrap_or_default()
-+}
-+
-+/// Known interval set for `value` given the active facts.
-+fn known_set(stack: &[Fact], value: Value, bits: u32) -> Option<Set> {
-+    let mut acc: Option<Set> = None;
-+    for f in stack.iter().filter(|f| f.value == value && f.bits == bits) {
-+        acc = Some(match acc {
-+            None => f.set.clone(),
-+            Some(prev) => intersect(&prev, &f.set),
-+        });
-+    }
-+    acc
-+}
-+
-+/// Decide `value OP c` under the active facts.
-+fn decide_pred(stack: &[Fact], p: Pred) -> Option<bool> {
-+    let known = known_set(stack, p.value, p.bits)?;
-+    if known.is_empty() {
-+        // Contradictory facts: the block is unreachable.  Leave it alone —
-+        // nothing here is observable, and cfg_simplify owns dead code.
-+        return None;
-+    }
-+    let t = truth_set(p.op, p.c, p.bits);
-+    if is_subset(&known, &t) {
-+        Some(true)
-+    } else if intersect(&known, &t).is_empty() {
-+        Some(false)
-+    } else {
-+        None
-+    }
-+}
-+
-+/// Decide the truth of a boolean operand under the active facts.
-+fn decide_bool(
-+    stack: &[Fact],
-+    func: &IrFunction,
-+    defs: &FxHashMap<Value, (usize, usize)>,
-+    cond: &Operand,
-+) -> Option<bool> {
-+    match cond {
-+        Operand::Const(k) => k.to_i128().map(|v| v != 0),
-+        Operand::Value(v) => {
-+            if let Some(s) = known_set(stack, *v, BOOL_BITS) {
-+                if s.as_slice() == [(0, 0)] {
-+                    return Some(false);
-+                }
-+                if !s.is_empty() && s[0].0 >= 1 {
-+                    return Some(true);
-+                }
-+            }
-+            let &(bi, ii) = defs.get(v)?;
-+            if let Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } = func.blocks[bi].instructions[ii] {
-+                return decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?);
-+            }
-+            None
-+        }
-+    }
-+}
-+
-+fn bool_const(b: bool) -> Operand {
-+    Operand::Const(IrConst::I32(b as i32))
-+}
-+
-+/// Remove `pred_label` from the phi incomings of block `target`.
-+fn remove_phi_incoming(func: &mut IrFunction, target: usize, pred_label: BlockId) {
-+    for inst in &mut func.blocks[target].instructions {
-+        if let Instruction::Phi { incoming, .. } = inst {
-+            incoming.retain(|(_, l)| *l != pred_label);
-+        }
-+    }
-+}
-+
-+/// Run correlated value propagation on one function.  Returns the number of
-+/// folded instructions and terminators.
-+pub fn run_function(func: &mut IrFunction) -> usize {
-+    let n = func.blocks.len();
-+    if n < 2 {
-+        return 0;
-+    }
-+    let label_to_idx = build_label_map(func);
-+    let (preds, succs) = build_cfg(func, &label_to_idx);
-+    let idom = compute_dominators(n, &preds, &succs);
-+    let children = build_dom_tree_children(n, &idom);
-+
-+    // Value → (block, instruction) for Cmp definitions.
-+    let mut defs: FxHashMap<Value, (usize, usize)> = FxHashMap::default();
-+    for (bi, b) in func.blocks.iter().enumerate() {
-+        for (ii, inst) in b.instructions.iter().enumerate() {
-+            if let Instruction::Cmp { dest, .. } = inst {
-+                defs.insert(*dest, (bi, ii));
-+            }
-+        }
-+    }
-+
-+    // Entry facts per block, computed on the pristine CFG.
-+    let entry_facts: Vec<Vec<Fact>> = (0..n)
-+        .map(|b| block_entry_facts(func, &defs, preds.row(b), b))
-+        .collect();
-+
-+    let mut changes = 0usize;
-+    let mut stack: Vec<Fact> = entry_facts[0].clone();
-+    // Explicit DFS over the dominator tree: (block, next child index).
-+    let mut work: Vec<(usize, usize)> = vec![(0, 0)];
-+    let mut pushed: Vec<usize> = vec![entry_facts[0].len()];
-+
-+    while let Some(&mut (blk, ref mut next)) = work.last_mut() {
-+        if *next == 0 {
-+            // First visit: fold inside this block under the active facts.
-+            let mut i = 0;
-+            while i < func.blocks[blk].instructions.len() {
-+                let repl = match &func.blocks[blk].instructions[i] {
-+                    Instruction::Cmp { dest, op, lhs, rhs, ty } => canonical_pred(*op, lhs, rhs, *ty)
-+                        .and_then(|p| decide_pred(&stack, p))
-+                        .map(|t| Instruction::Copy {
-+                            dest: *dest,
-+                            src: bool_const(t),
-+                        }),
-+                    Instruction::Select {
-+                        dest,
-+                        cond,
-+                        true_val,
-+                        false_val,
-+                        ..
-+                    } => decide_bool(&stack, func, &defs, cond).map(|t| Instruction::Copy {
-+                        dest: *dest,
-+                        src: if t { *true_val } else { *false_val },
-+                    }),
-+                    _ => None,
-+                };
-+                if let Some(r) = repl {
-+                    // A folded Cmp must no longer be looked through.
-+                    if let Instruction::Cmp { dest, .. } = &func.blocks[blk].instructions[i] {
-+                        defs.remove(dest);
-+                    }
-+                    func.blocks[blk].instructions[i] = r;
-+                    changes += 1;
-+                }
-+                i += 1;
-+            }
-+            let decided = match &func.blocks[blk].terminator {
-+                Terminator::CondBranch {
-+                    cond,
-+                    true_label,
-+                    false_label,
-+                } if true_label != false_label => decide_bool(&stack, func, &defs, cond)
-+                    .map(|t| if t { (*true_label, *false_label) } else { (*false_label, *true_label) }),
-+                _ => None,
-+            };
-+            if let Some((keep, drop)) = decided {
-+                let this_label = func.blocks[blk].label;
-+                if let Some(&di) = label_to_idx.get(&drop) {
-+                    remove_phi_incoming(func, di, this_label);
-+                }
-+                func.blocks[blk].terminator = Terminator::Branch(keep);
-+                changes += 1;
-+            }
-+        }
-+        if *next < children[blk].len() {
-+            let child = children[blk][*next];
-+            *next += 1;
-+            let f = &entry_facts[child];
-+            stack.extend(f.iter().cloned());
-+            pushed.push(f.len());
-+            work.push((child, 0));
-+        } else {
-+            work.pop();
-+            let k = pushed.pop().unwrap_or(0);
-+            let new_len = stack.len().saturating_sub(k);
-+            stack.truncate(new_len);
-+        }
-+    }
-+    changes
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::ir::reexports::BasicBlock;
-+
-+    #[test]
-+    fn truth_sets_signed_and_unsigned() {
-+        assert_eq!(truth_set(IrCmpOp::Ult, 10, 32), vec![(0, 9)]);
-+        assert_eq!(truth_set(IrCmpOp::Ne, 0, 8), vec![(1, 255)]);
-+        assert_eq!(truth_set(IrCmpOp::Slt, 0, 8), vec![(128, 255)]);
-+        assert_eq!(truth_set(IrCmpOp::Sgt, -1, 8), vec![(0, 127)]);
-+        assert_eq!(truth_set(IrCmpOp::Sle, 5, 8), vec![(0, 5), (128, 255)]);
-+        assert!(truth_set(IrCmpOp::Ult, 0, 16).is_empty());
-+        assert_eq!(truth_set(IrCmpOp::Uge, 0, 16), vec![(0, 65535)]);
-+    }
-+
-+    #[test]
-+    fn complement_and_intersection() {
-+        let s = truth_set(IrCmpOp::Eq, 7, 8);
-+        assert_eq!(complement(&s, 8), vec![(0, 6), (8, 255)]);
-+        let a = truth_set(IrCmpOp::Sge, 0, 8);
-+        let b = truth_set(IrCmpOp::Ult, 100, 8);
-+        assert_eq!(intersect(&a, &b), vec![(0, 99)]);
-+        assert!(is_subset(&vec![(3, 4), (10, 10)], &vec![(0, 5), (8, 12)]));
-+        assert!(!is_subset(&vec![(3, 6)], &vec![(0, 5), (8, 12)]));
-+    }
-+
-+    fn pred(op: IrCmpOp, c: i128) -> Pred {
-+        Pred {
-+            value: Value(1),
-+            op,
-+            c,
-+            bits: 64,
-+        }
-+    }
-+
-+    #[test]
-+    fn nonzero_fact_folds_zero_compare() {
-+        let stack = vec![Fact::from_pred(pred(IrCmpOp::Eq, 0), false)];
-+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Eq, 0)), Some(false));
-+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ne, 0)), Some(true));
-+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ugt, 0)), Some(true));
-+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ult, 5)), None);
-+    }
-+
-+    #[test]
-+    fn signed_unsigned_facts_compose() {
-+        let stack = vec![
-+            Fact::from_pred(pred(IrCmpOp::Sgt, -1), true),
-+            Fact::from_pred(pred(IrCmpOp::Slt, 100), true),
-+        ];
-+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ult, 100)), Some(true));
-+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Uge, 100)), Some(false));
-+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Eq, 50)), None);
-+        // `x <s 100` alone says nothing about `x <u 100` (negatives wrap high).
-+        let stack2 = vec![Fact::from_pred(pred(IrCmpOp::Slt, 100), true)];
-+        assert_eq!(decide_pred(&stack2, pred(IrCmpOp::Ult, 100)), None);
-+    }
-+
-+    #[test]
-+    fn mismatched_width_is_not_used() {
-+        let stack = vec![Fact::from_pred(pred(IrCmpOp::Eq, 0), false)];
-+        let narrow = Pred {
-+            value: Value(1),
-+            op: IrCmpOp::Eq,
-+            c: 0,
-+            bits: 32,
-+        };
-+        assert_eq!(decide_pred(&stack, narrow), None);
-+    }
-+
-+    fn mk(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
-+        BasicBlock {
-+            label: BlockId(id),
-+            instructions: insts,
-+            terminator: term,
-+            source_spans: Vec::new(),
-+        }
-+    }
-+
-+    fn cmp0(d: u32, op: IrCmpOp) -> Instruction {
-+        Instruction::Cmp {
-+            dest: Value(d),
-+            op,
-+            lhs: Operand::Value(Value(0)),
-+            rhs: Operand::Const(IrConst::I64(0)),
-+            ty: IrType::U64,
-+        }
-+    }
-+
-+    #[test]
-+    fn full_function_folds_guard_and_branch() {
-+        // b0: c = cmp eq v, 0 ; br c, b1, b2
-+        // b1: ret v
-+        // b2: g = cmp eq v, 0 ; s = select g, 63, v ; c2 = cmp ne v, 0 ; br c2, b3, b4
-+        // b3: ret s      b4: ret 0
-+        let v = Value(0);
-+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
-+        f.blocks = vec![
-+            mk(
-+                0,
-+                vec![cmp0(1, IrCmpOp::Eq)],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(1)),
-+                    true_label: BlockId(1),
-+                    false_label: BlockId(2),
-+                },
-+            ),
-+            mk(1, vec![], Terminator::Return(Some(Operand::Value(v)))),
-+            mk(
-+                2,
-+                vec![
-+                    cmp0(2, IrCmpOp::Eq),
-+                    Instruction::Select {
-+                        dest: Value(3),
-+                        cond: Operand::Value(Value(2)),
-+                        true_val: Operand::Const(IrConst::I64(63)),
-+                        false_val: Operand::Value(v),
-+                        ty: IrType::U64,
-+                    },
-+                    cmp0(4, IrCmpOp::Ne),
-+                ],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(4)),
-+                    true_label: BlockId(3),
-+                    false_label: BlockId(4),
-+                },
-+            ),
-+            mk(3, vec![], Terminator::Return(Some(Operand::Value(Value(3))))),
-+            mk(4, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(0))))),
-+        ];
-+        f.next_value_id = 5;
-+        let n = run_function(&mut f);
-+        assert_eq!(n, 4, "guard cmp, select, second cmp, branch");
-+        assert!(matches!(
-+            f.blocks[2].instructions[0],
-+            Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. }
-+        ));
-+        assert!(matches!(
-+            f.blocks[2].instructions[1],
-+            Instruction::Copy { src: Operand::Value(Value(0)), .. }
-+        ));
-+        assert!(matches!(f.blocks[2].terminator, Terminator::Branch(BlockId(3))));
-+        assert_eq!(run_function(&mut f), 0, "idempotent");
-+    }
-+
-+    #[test]
-+    fn two_agreeing_edges_carry_the_fact_and_phi_is_maintained() {
-+        // b0: c = cmp ne v, 0 ; br c, b3, b1
-+        // b1: c1 = cmp ne v, 0 ; br c1, b3, b2      (second edge, same fact)
-+        // b2: ret 0
-+        // b3: p = phi [1,b0],[2,b1] ; g = cmp eq v,0 ; br g, b4, b5
-+        // b4: ret 9   b5: ret p
-+        let v = Value(0);
-+        let cmpne = |d: u32| cmp0(d, IrCmpOp::Ne);
-+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
-+        f.blocks = vec![
-+            mk(
-+                0,
-+                vec![cmpne(1)],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(1)),
-+                    true_label: BlockId(3),
-+                    false_label: BlockId(1),
-+                },
-+            ),
-+            mk(
-+                1,
-+                vec![cmpne(2)],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(2)),
-+                    true_label: BlockId(3),
-+                    false_label: BlockId(2),
-+                },
-+            ),
-+            mk(2, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(0))))),
-+            mk(
-+                3,
-+                vec![
-+                    Instruction::Phi {
-+                        dest: Value(3),
-+                        ty: IrType::U64,
-+                        incoming: vec![
-+                            (Operand::Const(IrConst::I64(1)), BlockId(0)),
-+                            (Operand::Const(IrConst::I64(2)), BlockId(1)),
-+                        ],
-+                    },
-+                    cmp0(4, IrCmpOp::Eq),
-+                ],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(4)),
-+                    true_label: BlockId(4),
-+                    false_label: BlockId(5),
-+                },
-+            ),
-+            mk(4, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(9))))),
-+            mk(5, vec![], Terminator::Return(Some(Operand::Value(v)))),
-+        ];
-+        f.next_value_id = 5;
-+        let n = run_function(&mut f);
-+        // b1 is on the false edge of (v != 0): v == 0 there, so its own
-+        // re-test folds to false and its branch becomes `br b2`; b3's phi
-+        // loses the b1 incoming.  b3 is then reached only from b0 with
-+        // v != 0, so the guard folds and the branch goes to b5.
-+        assert_eq!(n, 4);
-+        assert!(matches!(f.blocks[1].terminator, Terminator::Branch(BlockId(2))));
-+        assert!(matches!(f.blocks[3].terminator, Terminator::Branch(BlockId(5))));
-+        if let Instruction::Phi { incoming, .. } = &f.blocks[3].instructions[0] {
-+            assert_eq!(incoming.len(), 1);
-+            assert_eq!(incoming[0].1, BlockId(0));
-+        } else {
-+            panic!("phi expected");
-+        }
-+    }
-+
-+    #[test]
-+    fn switch_edges_carry_case_facts() {
-+        // b0: switch v [1→b1, 2→b2] default b3
-+        // b1: c = cmp eq v, 1 ; ret c        (true)
-+        // b2: c = cmp eq v, 1 ; ret c        (false)
-+        // b3: c = cmp eq v, 2 ; ret c        (false: default excludes 1 and 2)
-+        let v = Value(0);
-+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
-+        let cmpk = |d: u32, k: i32| Instruction::Cmp {
-+            dest: Value(d),
-+            op: IrCmpOp::Eq,
-+            lhs: Operand::Value(v),
-+            rhs: Operand::Const(IrConst::I32(k)),
++        // Last link feeds a compare in the same block AND a return in
++        // another block, so it must survive while the chain collapses.
++        insts.push(Instruction::Cmp {
++            dest: Value(N + 1),
++            op: crate::ir::reexports::IrCmpOp::Eq,
++            lhs: Operand::Value(Value(N)),
++            rhs: Operand::Const(IrConst::I32(0)),
 +            ty: IrType::I32,
-+        };
-+        f.blocks = vec![
-+            mk(
-+                0,
-+                vec![],
-+                Terminator::Switch {
-+                    val: Operand::Value(v),
-+                    cases: vec![(1, BlockId(1)), (2, BlockId(2))],
-+                    default: BlockId(3),
-+                    ty: IrType::I32,
-+                },
-+            ),
-+            mk(1, vec![cmpk(1, 1)], Terminator::Return(Some(Operand::Value(Value(1))))),
-+            mk(2, vec![cmpk(2, 1)], Terminator::Return(Some(Operand::Value(Value(2))))),
-+            mk(3, vec![cmpk(3, 2)], Terminator::Return(Some(Operand::Value(Value(3))))),
-+        ];
-+        f.next_value_id = 4;
-+        assert_eq!(run_function(&mut f), 3);
-+        let val = |b: usize| match &f.blocks[b].instructions[0] {
-+            Instruction::Copy {
-+                src: Operand::Const(IrConst::I32(k)),
-+                ..
-+            } => *k,
-+            other => panic!("unexpected {other:?}"),
-+        };
-+        assert_eq!((val(1), val(2), val(3)), (1, 0, 0));
-+    }
-+}
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index f1fba09..095303d 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -16,6 +16,7 @@ pub(crate) mod aggregate_sroa;
- pub(crate) mod alias;
- pub(crate) mod backedge_pre;
- pub(crate) mod bit_idioms;
-+pub(crate) mod cvp;
- pub(crate) mod block_layout;
- pub(crate) mod bool_thread;
- pub(crate) mod cfg_simplify;
-@@ -1459,6 +1460,21 @@ pub(crate) fn run_passes(
-             cur_pass_changes[3] += n;
-             total_changes += n;
-             total_changes_excl_dce += n;
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: insts,
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(N + 1)),
++                true_label: BlockId(1),
++                false_label: BlockId(1),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(1),
++            instructions: vec![],
++            terminator: Terminator::Return(Some(Operand::Value(Value(N)))),
++            source_spans: Vec::new(),
++        });
 +
-+            // Correlated value propagation: fold compares, selects and
-+            // branches whose outcome is implied by dominating conditional
-+            // edges (GCC evrp / LLVM CVP).  Runs after bit_idioms so the
-+            // zero guards it materializes are folded on paths that already
-+            // established non-zero.  Pass name for CCC_DISABLE_PASSES: "cvp".
-+            if !pass_disabled(&disabled, "cvp") {
-+                let n = timed_pass!(
-+                    "cvp",
-+                    run_on_visited(module, &dirty, &mut changed, cvp::run_function)
-+                );
-+                cur_pass_changes[3] += n;
-+                total_changes += n;
-+                total_changes_excl_dce += n;
++        let removed = propagate_copies_post_phi(&mut func);
++        assert!(removed >= (N - 1) as usize, "chain should collapse, removed={removed}");
++
++        // Every remaining Value operand must have a definition.
++        let mut defined = std::collections::HashSet::new();
++        for b in &func.blocks {
++            for inst in &b.instructions {
++                if let Some(d) = inst.dest() {
++                    defined.insert(d.0);
++                }
 +            }
-         }
- 
-         // Phase 3b: Loop-carried accumulator reassociation.
-@@ -1630,6 +1646,19 @@ pub(crate) fn run_passes(
-             total_changes_excl_dce += n;
-         }
- 
-+        // Correlated value propagation after if-conversion: the post-ifconv
-+        // bit_idioms placement (Ctz from the __ffs Select chain) emits a
-+        // `v == 0 ? 63 : ctz(v)` guard whose block is dominated by the
-+        // `while (!v)` exit edge; only a dominance-scoped fold removes it.
-+        if !pass_disabled(&disabled, "cvp") {
-+            let n = timed_pass!(
-+                "cvp_post_ifconv",
-+                run_on_visited(module, &dirty, &mut changed, cvp::run_function)
-+            );
-+            total_changes += n;
-+            total_changes_excl_dce += n;
 +        }
++        for b in &func.blocks {
++            for inst in &b.instructions {
++                crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
++                    if let Operand::Value(v) = op {
++                        assert!(defined.contains(&v.0), "dangling use of v{} in {:?}", v.0, inst);
++                    }
++                });
++            }
++            crate::backend::liveness::for_each_operand_in_terminator(&b.terminator, |op| {
++                if let Operand::Value(v) = op {
++                    assert!(defined.contains(&v.0), "dangling use of v{} in terminator", v.0);
++                }
++            });
++        }
++        // The surviving definition of the last link must be the constant.
++        let last = func.blocks[0]
++            .instructions
++            .iter()
++            .find(|i| matches!(i, Instruction::Copy { dest, .. } if dest.0 == N))
++            .expect("last link kept");
++        assert!(matches!(last, Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. }), "{last:?}");
++    }
 +
-         // Phase 7b: Range-check folding.
-         // (x >= lo && x <= hi) -> (unsigned)(x - lo) <= (hi - lo), and the
-         // complement (x < lo || x > hi) -> (unsigned)(x - lo) > (hi - lo).
+     #[test]
+     fn test_simple_copy_propagation() {
+         // %1 = Copy %0
+diff --git a/tests/regression/post_phi_copy_chain_long.c b/tests/regression/post_phi_copy_chain_long.c
+new file mode 100644
+index 0000000..a07afdf
+--- /dev/null
++++ b/tests/regression/post_phi_copy_chain_long.c
+@@ -0,0 +1,113 @@
++// Regression: post-phi copy cleanup must resolve copy chains longer than
++// 32 links.  After every check block below folds, the `fails` accumulator
++// is a chain of 48 `Copy` instructions; propagate_copies_post_phi resolved
++// chains with a hard `depth < 32` cap, so the survivor was rewritten to an
++// intermediate value whose own copy had been removed, and the backend's
++// no-home hard gate fired (-O1 ICE: "operand_to_rax: value has no register
++// home").  Found by tests/stress/run_stress.py (divmod/shifts/builtins).
++// Unit test: passes::copy_prop::tests::test_post_phi_long_chain_no_dangling_use
++#include <stdio.h>
++#include <stdint.h>
++
++static inline uint32_t k0(uint32_t p) { return (p / 3u) ^ (p % 3u); }
++static inline uint32_t k1(uint32_t p) { return (p / 4u) ^ (p % 4u); }
++static inline uint32_t k2(uint32_t p) { return (p / 5u) ^ (p % 5u); }
++static inline uint32_t k3(uint32_t p) { return (p / 6u) ^ (p % 6u); }
++static inline uint32_t k4(uint32_t p) { return (p / 7u) ^ (p % 7u); }
++static inline uint32_t k5(uint32_t p) { return (p / 8u) ^ (p % 8u); }
++static inline uint32_t k6(uint32_t p) { return (p / 9u) ^ (p % 9u); }
++static inline uint32_t k7(uint32_t p) { return (p / 10u) ^ (p % 10u); }
++static inline uint32_t k8(uint32_t p) { return (p / 11u) ^ (p % 11u); }
++static inline uint32_t k9(uint32_t p) { return (p / 12u) ^ (p % 12u); }
++static inline uint32_t k10(uint32_t p) { return (p / 13u) ^ (p % 13u); }
++static inline uint32_t k11(uint32_t p) { return (p / 14u) ^ (p % 14u); }
++static inline uint32_t k12(uint32_t p) { return (p / 15u) ^ (p % 15u); }
++static inline uint32_t k13(uint32_t p) { return (p / 16u) ^ (p % 16u); }
++static inline uint32_t k14(uint32_t p) { return (p / 17u) ^ (p % 17u); }
++static inline uint32_t k15(uint32_t p) { return (p / 18u) ^ (p % 18u); }
++static inline uint32_t k16(uint32_t p) { return (p / 19u) ^ (p % 19u); }
++static inline uint32_t k17(uint32_t p) { return (p / 20u) ^ (p % 20u); }
++static inline uint32_t k18(uint32_t p) { return (p / 21u) ^ (p % 21u); }
++static inline uint32_t k19(uint32_t p) { return (p / 22u) ^ (p % 22u); }
++static inline uint32_t k20(uint32_t p) { return (p / 23u) ^ (p % 23u); }
++static inline uint32_t k21(uint32_t p) { return (p / 24u) ^ (p % 24u); }
++static inline uint32_t k22(uint32_t p) { return (p / 25u) ^ (p % 25u); }
++static inline uint32_t k23(uint32_t p) { return (p / 26u) ^ (p % 26u); }
++static inline uint32_t k24(uint32_t p) { return (p / 27u) ^ (p % 27u); }
++static inline uint32_t k25(uint32_t p) { return (p / 28u) ^ (p % 28u); }
++static inline uint32_t k26(uint32_t p) { return (p / 29u) ^ (p % 29u); }
++static inline uint32_t k27(uint32_t p) { return (p / 30u) ^ (p % 30u); }
++static inline uint32_t k28(uint32_t p) { return (p / 31u) ^ (p % 31u); }
++static inline uint32_t k29(uint32_t p) { return (p / 32u) ^ (p % 32u); }
++static inline uint32_t k30(uint32_t p) { return (p / 33u) ^ (p % 33u); }
++static inline uint32_t k31(uint32_t p) { return (p / 34u) ^ (p % 34u); }
++static inline uint32_t k32(uint32_t p) { return (p / 35u) ^ (p % 35u); }
++static inline uint32_t k33(uint32_t p) { return (p / 36u) ^ (p % 36u); }
++static inline uint32_t k34(uint32_t p) { return (p / 37u) ^ (p % 37u); }
++static inline uint32_t k35(uint32_t p) { return (p / 38u) ^ (p % 38u); }
++static inline uint32_t k36(uint32_t p) { return (p / 39u) ^ (p % 39u); }
++static inline uint32_t k37(uint32_t p) { return (p / 40u) ^ (p % 40u); }
++static inline uint32_t k38(uint32_t p) { return (p / 41u) ^ (p % 41u); }
++static inline uint32_t k39(uint32_t p) { return (p / 42u) ^ (p % 42u); }
++static inline uint32_t k40(uint32_t p) { return (p / 43u) ^ (p % 43u); }
++static inline uint32_t k41(uint32_t p) { return (p / 44u) ^ (p % 44u); }
++static inline uint32_t k42(uint32_t p) { return (p / 45u) ^ (p % 45u); }
++static inline uint32_t k43(uint32_t p) { return (p / 46u) ^ (p % 46u); }
++static inline uint32_t k44(uint32_t p) { return (p / 47u) ^ (p % 47u); }
++static inline uint32_t k45(uint32_t p) { return (p / 48u) ^ (p % 48u); }
++static inline uint32_t k46(uint32_t p) { return (p / 49u) ^ (p % 49u); }
++static inline uint32_t k47(uint32_t p) { return (p / 50u) ^ (p % 50u); }
++
++int main(void) {
++    int fails = 0;
++    { uint32_t r = k0(0u); if (r != 0u) { fails++; printf("FAIL k0 got %u\n", r); } }
++    { uint32_t r = k1(2654435761u); if (r != 663608941u) { fails++; printf("FAIL k1 got %u\n", r); } }
++    { uint32_t r = k2(1013904226u); if (r != 202780844u) { fails++; printf("FAIL k2 got %u\n", r); } }
++    { uint32_t r = k3(3668339987u); if (r != 611389992u) { fails++; printf("FAIL k3 got %u\n", r); } }
++    { uint32_t r = k4(2027808452u); if (r != 289686924u) { fails++; printf("FAIL k4 got %u\n", r); } }
++    { uint32_t r = k5(387276917u); if (r != 48409611u) { fails++; printf("FAIL k5 got %u\n", r); } }
++    { uint32_t r = k6(3041712678u); if (r != 337968072u) { fails++; printf("FAIL k6 got %u\n", r); } }
++    { uint32_t r = k7(1401181143u); if (r != 140118113u) { fails++; printf("FAIL k7 got %u\n", r); } }
++    { uint32_t r = k8(4055616904u); if (r != 368692436u) { fails++; printf("FAIL k8 got %u\n", r); } }
++    { uint32_t r = k9(2415085369u); if (r != 201257115u) { fails++; printf("FAIL k9 got %u\n", r); } }
++    { uint32_t r = k10(774553834u); if (r != 59581066u) { fails++; printf("FAIL k10 got %u\n", r); } }
++    { uint32_t r = k11(3428989595u); if (r != 244927831u) { fails++; printf("FAIL k11 got %u\n", r); } }
++    { uint32_t r = k12(1788458060u); if (r != 119230540u) { fails++; printf("FAIL k12 got %u\n", r); } }
++    { uint32_t r = k13(147926525u); if (r != 9245394u) { fails++; printf("FAIL k13 got %u\n", r); } }
++    { uint32_t r = k14(2802362286u); if (r != 164844846u) { fails++; printf("FAIL k14 got %u\n", r); } }
++    { uint32_t r = k15(1161830751u); if (r != 64546151u) { fails++; printf("FAIL k15 got %u\n", r); } }
++    { uint32_t r = k16(3816266512u); if (r != 200856128u) { fails++; printf("FAIL k16 got %u\n", r); } }
++    { uint32_t r = k17(2175734977u); if (r != 108786733u) { fails++; printf("FAIL k17 got %u\n", r); } }
++    { uint32_t r = k18(535203442u); if (r != 25485874u) { fails++; printf("FAIL k18 got %u\n", r); } }
++    { uint32_t r = k19(3189639203u); if (r != 144983603u) { fails++; printf("FAIL k19 got %u\n", r); } }
++    { uint32_t r = k20(1549107668u); if (r != 67352508u) { fails++; printf("FAIL k20 got %u\n", r); } }
++    { uint32_t r = k21(4203543429u); if (r != 175147631u) { fails++; printf("FAIL k21 got %u\n", r); } }
++    { uint32_t r = k22(2563011894u); if (r != 102520456u) { fails++; printf("FAIL k22 got %u\n", r); } }
++    { uint32_t r = k23(922480359u); if (r != 35480024u) { fails++; printf("FAIL k23 got %u\n", r); } }
++    { uint32_t r = k24(3576916120u); if (r != 132478384u) { fails++; printf("FAIL k24 got %u\n", r); } }
++    { uint32_t r = k25(1936384585u); if (r != 69156601u) { fails++; printf("FAIL k25 got %u\n", r); } }
++    { uint32_t r = k26(295853050u); if (r != 10201836u) { fails++; printf("FAIL k26 got %u\n", r); } }
++    { uint32_t r = k27(2950288811u); if (r != 98342971u) { fails++; printf("FAIL k27 got %u\n", r); } }
++    { uint32_t r = k28(1309757276u); if (r != 42250220u) { fails++; printf("FAIL k28 got %u\n", r); } }
++    { uint32_t r = k29(3964193037u); if (r != 123881029u) { fails++; printf("FAIL k29 got %u\n", r); } }
++    { uint32_t r = k30(2323661502u); if (r != 70414014u) { fails++; printf("FAIL k30 got %u\n", r); } }
++    { uint32_t r = k31(683129967u); if (r != 20092036u) { fails++; printf("FAIL k31 got %u\n", r); } }
++    { uint32_t r = k32(3337565728u); if (r != 95359024u) { fails++; printf("FAIL k32 got %u\n", r); } }
++    { uint32_t r = k33(1697034193u); if (r != 47139815u) { fails++; printf("FAIL k33 got %u\n", r); } }
++    { uint32_t r = k34(56502658u); if (r != 1527066u) { fails++; printf("FAIL k34 got %u\n", r); } }
++    { uint32_t r = k35(2710938419u); if (r != 71340511u) { fails++; printf("FAIL k35 got %u\n", r); } }
++    { uint32_t r = k36(1070406884u); if (r != 27446324u) { fails++; printf("FAIL k36 got %u\n", r); } }
++    { uint32_t r = k37(3724842645u); if (r != 93121071u) { fails++; printf("FAIL k37 got %u\n", r); } }
++    { uint32_t r = k38(2084311110u); if (r != 50836854u) { fails++; printf("FAIL k38 got %u\n", r); } }
++    { uint32_t r = k39(443779575u); if (r != 10566187u) { fails++; printf("FAIL k39 got %u\n", r); } }
++    { uint32_t r = k40(3098215336u); if (r != 72051500u) { fails++; printf("FAIL k40 got %u\n", r); } }
++    { uint32_t r = k41(1457683801u); if (r != 33129172u) { fails++; printf("FAIL k41 got %u\n", r); } }
++    { uint32_t r = k42(4112119562u); if (r != 91380466u) { fails++; printf("FAIL k42 got %u\n", r); } }
++    { uint32_t r = k43(2471588027u); if (r != 53730153u) { fails++; printf("FAIL k43 got %u\n", r); } }
++    { uint32_t r = k44(831056492u); if (r != 17682052u) { fails++; printf("FAIL k44 got %u\n", r); } }
++    { uint32_t r = k45(3485492253u); if (r != 72614456u) { fails++; printf("FAIL k45 got %u\n", r); } }
++    { uint32_t r = k46(1844960718u); if (r != 37652280u) { fails++; printf("FAIL k46 got %u\n", r); } }
++    { uint32_t r = k47(204429183u); if (r != 4088614u) { fails++; printf("FAIL k47 got %u\n", r); } }
++    if (fails == 0) puts("ALL OK");
++    return fails;
++}
+diff --git a/tests/regression/switch_binop_literal_width.c b/tests/regression/switch_binop_literal_width.c
+new file mode 100644
+index 0000000..b7c6009
+--- /dev/null
++++ b/tests/regression/switch_binop_literal_width.c
+@@ -0,0 +1,99 @@
++// Regression: switch controlling expression `int OP literal` must be
++// compared at 32-bit width.
++//
++// get_expr_type() reports the widened *storage* type of an int-op-literal
++// expression (I64 on LP64, because integer literals are I64 at that level),
++// while lower_arithmetic_binop() computes the value as a 32-bit `addl`.
++// lower_switch_stmt() typed the Switch terminator with the former, so the
++// dispatch chain emitted `cmpq $-1, %rdi`: the upper 32 bits of %rdi are
++// ABI-undefined for an `int` argument (SysV passes only the low 32 bits)
++// and are ZERO after any 32-bit ALU op, so `case -1:` never matched and
++// large positive garbage could match other cases.  Found by
++// tests/stress/run_stress.py (switch family, every seed, every -O level).
++//
++// Every shape below must agree with GCC; the driver compares stdout and exit
++// status against gcc.  `noinline` keeps the callee's argument in a register
++// whose upper half the caller deliberately pollutes via a 64-bit value.
++#include <stdint.h>
++#include <stdio.h>
++
++static __attribute__((noinline)) int sw_add0(int x) {
++    switch (x + 0) { case -1: return 1; case 5: return 2; case -65536: return 3; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_add1(int x) {
++    switch (x + 1) { case -1: return 1; case 5: return 2; case 2147483647: return 3; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_mul1(int x) {
++    switch (x * 1) { case -1: return 1; case 5: return 2; case -2147483647 - 1: return 3; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_sub(int x) {
++    switch (x - 3) { case -1: return 1; case 5: return 2; case -2: return 3; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_or(int x) {
++    switch (x | 0) { case -1: return 1; case 5: return 2; default: return 9; }
++}
++static __attribute__((noinline)) int sw_xor(int x) {
++    switch (x ^ 1) { case -2: return 1; case 4: return 2; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_neg(int x) {
++    switch (-x + 0) { case 1: return 1; case -5: return 2; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_short(short x) {
++    switch (x + 0) { case -1: return 1; case 5: return 2; case -32768: return 3; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_uchar(unsigned char x) {
++    switch (x - 1) { case -1: return 1; case 254: return 2; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_uint(unsigned x) {
++    switch (x + 1u) { case 0u: return 1; case 5u: return 2; case 0x80000000u: return 3; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_long(long x) {
++    // 64-bit controlling expression must stay 64-bit.
++    switch (x + 0) { case -1L: return 1; case 0x100000000L: return 2; case 5L: return 3; }
++    return 0;
++}
++static __attribute__((noinline)) int sw_cmp(int x) {
++    // Comparison result is an int; `(x < 0) + 0` is I32.
++    switch ((x < 0) + 0) { case 0: return 10; case 1: return 11; }
++    return 0;
++}
++
++// Pollute the upper halves: pass values derived from a 64-bit variable so
++// the caller has no reason to zero-extend.
++static volatile int64_t wide = (int64_t)0xFFFFFFFF00000000LL;
++
++int main(void) {
++    int64_t w = wide;
++    int m1 = (int)(w | 0xFFFFFFFFu);          // -1 with garbage above
++    int p5 = (int)(w | 5);                    // 5 with garbage above
++    int big = (int)(w | 0x7FFFFFFF);
++    unsigned long long h = 1469598103934665603ull;
++#define H(v) h = (h ^ (unsigned long long)(v)) * 1099511628211ull
++    H(sw_add0(m1)); H(sw_add0(p5)); H(sw_add0(-65536)); H(sw_add0(7));
++    H(sw_add1(m1 - 1)); H(sw_add1(4)); H(sw_add1(big - 1)); H(sw_add1(0));
++    H(sw_mul1(m1)); H(sw_mul1(p5)); H(sw_mul1(-2147483647 - 1)); H(sw_mul1(0));
++    H(sw_sub(2)); H(sw_sub(8)); H(sw_sub(1)); H(sw_sub(3));
++    H(sw_or(m1)); H(sw_or(p5)); H(sw_or(0));
++    H(sw_xor(m1)); H(sw_xor(p5)); H(sw_xor(0));
++    H(sw_neg(m1)); H(sw_neg(p5)); H(sw_neg(2));
++    H(sw_short(-1)); H(sw_short(5)); H(sw_short(-32768)); H(sw_short(0));
++    H(sw_uchar(0)); H(sw_uchar(255)); H(sw_uchar(1));
++    H(sw_uint(0xFFFFFFFFu)); H(sw_uint(4)); H(sw_uint(0x7FFFFFFFu)); H(sw_uint(9));
++    H(sw_long(-1)); H(sw_long(0x100000000L)); H(sw_long(5)); H(sw_long(0));
++    H(sw_cmp(m1)); H(sw_cmp(p5)); H(sw_cmp(0));
++    printf("%d %d %d %d %d %d %d %d %d %d %d %d\n",
++           sw_add0(m1), sw_add0(p5), sw_add1(m1 - 1), sw_mul1(m1), sw_sub(2), sw_or(m1),
++           sw_xor(m1), sw_neg(m1), sw_short(-1), sw_uchar(0), sw_uint(0xFFFFFFFFu), sw_cmp(m1));
++    printf("%llx\n", h);
++    return (sw_add0(m1) == 1 && sw_add0(p5) == 2 && sw_add1(m1 - 1) == 1 && sw_mul1(m1) == 1
++            && sw_or(m1) == 1 && sw_xor(m1) == 1 && sw_neg(m1) == 1 && sw_cmp(m1) == 11) ? 0 : 1;
++}
+diff --git a/tests/stress/reduce_ice.py b/tests/stress/reduce_ice.py
+new file mode 100755
+index 0000000..37a0f78
+--- /dev/null
++++ b/tests/stress/reduce_ice.py
+@@ -0,0 +1,168 @@
++#!/usr/bin/env python3
++"""Structure-aware ICE/CRASH reducer for stress-lab programs.
++
++``run_stress.py`` reduces MISMATCHes for free (each case is an independent
++function and is re-emitted alone), but an ICE or a runtime CRASH gives no
++failing *case*: the compiler died somewhere inside the whole translation
++unit.  This tool shrinks such a program to the smallest set of cases that
++still reproduces the failure, using the structural knowledge the generator
++has instead of a generic line-based delta debugger:
++
++* ``main`` is a sequence of independent ``{ ... }`` check blocks, one per
++  case; a block can be deleted without touching any other block.
++* Every case function is ``static``; once no block references it, the
++  function (and its ``static const`` probe tables) is dead and is deleted as
++  well, so the final reproducer contains only the cases that matter.
++
++The oracle is "the failure signature is still present": for an ICE the
++compiler exits non-zero and the first ``internal error`` / ``panicked`` line
++has the same head; for a CRASH the produced binary dies by the same signal.
++ddmin over blocks (halving granularity, then singles) converges in
++O(k log n) compiler invocations for k culprit blocks.
++
++Usage:
++  tests/stress/reduce_ice.py <program.c> --lccc target/fastbuild/lccc \\
++      --flags -O1 [--out reduced.c] [--mode ice|crash] [--timeout 60]
++
++Exit status: 0 when a reduced reproducer was written, 2 when the input does
++not reproduce the failure with the given flags.
++"""
++from __future__ import annotations
++
++import argparse
++import re
++import shutil
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++SIG_RE = re.compile(r"(internal error.*|panicked at.*|error:.*|Segmentation fault.*)")
++
++
++def split_main(src: str) -> tuple[str, list[str], str]:
++    """Return (prefix-up-to-first-block, blocks, suffix-after-last-block)."""
++    m = re.search(r"^int main\(void\) \{\n    int fails = 0;\n", src, re.M)
++    if not m:
++        raise SystemExit("reduce_ice: input is not a stress-lab program (no main header)")
++    body_start = m.end()
++    tail = src.index("    if (fails == 0) puts", body_start)
++    body = src[body_start:tail]
++    blocks = [p for p in re.split(r"(?m)^(?=    \{ )", body) if p.strip()]
++    return src[:body_start], blocks, src[tail:]
++
++
++def strip_dead_cases(prefix: str, blocks: list[str]) -> str:
++    """Delete case functions/tables not referenced by any surviving block."""
++    live: set[str] = set()
++    for b in blocks:
++        live.update(re.findall(r"\b([a-z]+_\d+)\(", b))
++    # Case functions are <family>_<n>; helpers share the numeric suffix
++    # (sw_fn_11, sw_probes_11, ...) — keep every chunk with a live suffix.
++    suffixes = {name.rsplit("_", 1)[1] for name in live}
++    out: list[str] = []
++    for chunk in re.split(r"\n(?=(?:static|typedef|struct|union|#|int main))", prefix):
++        names = re.findall(r"\b[A-Za-z_]+_(\d+)\b", chunk)
++        if chunk.startswith(("int main", "#")) or not names or any(n in suffixes for n in names):
++            out.append(chunk)
++    return "\n".join(out)
++
++
++def signature(text: str) -> str:
++    m = SIG_RE.search(text)
++    return m.group(1).strip()[:160] if m else ""
++
++
++class Oracle:
++    def __init__(self, lccc: str, flags: list[str], mode: str, timeout: int, work: Path):
++        self.lccc, self.flags, self.mode, self.timeout, self.work = lccc, flags, mode, timeout, work
++        self.expected: str | None = None
++        self.runs = 0
++
++    def probe(self, src: str) -> str | None:
++        """Return the failure signature for `src`, or None when it is fine."""
++        self.runs += 1
++        c = self.work / f"cand{self.runs}.c"
++        exe = self.work / f"cand{self.runs}"
++        c.write_text(src)
++        try:
++            cp = subprocess.run([self.lccc, *self.flags, str(c), "-o", str(exe)],
++                                capture_output=True, text=True, timeout=self.timeout)
++        except subprocess.TimeoutExpired:
++            return "TIMEOUT(compile)"
++        if self.mode == "ice":
++            if cp.returncode == 0:
++                return None
++            return signature(cp.stderr) or f"exit {cp.returncode}"
++        if cp.returncode != 0:
++            return None  # a different failure; not the crash we are chasing
++        try:
++            rp = subprocess.run([str(exe)], capture_output=True, text=True, timeout=self.timeout)
++        except subprocess.TimeoutExpired:
++            return "TIMEOUT(run)"
++        return f"signal {-rp.returncode}" if rp.returncode < 0 else None
++
++    def fails(self, src: str) -> bool:
++        sig = self.probe(src)
++        if sig is None:
++            return False
++        if self.expected is None:
++            self.expected = sig
++            return True
++        # Same failure class: value ids / register numbers differ between
++        # candidates, so compare only the head of the signature.
++        return sig.split(":")[0] == self.expected.split(":")[0]
++
++
++def ddmin(blocks: list[str], test) -> list[str]:
++    n = 2
++    while len(blocks) >= 2:
++        chunk = max(1, len(blocks) // n)
++        reduced = False
++        for i in range(0, len(blocks), chunk):
++            cand = blocks[:i] + blocks[i + chunk:]
++            if cand and test(cand):
++                blocks, n, reduced = cand, max(n - 1, 2), True
++                break
++        if not reduced:
++            if n >= len(blocks):
++                break
++            n = min(n * 2, len(blocks))
++    return blocks
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("program")
++    ap.add_argument("--lccc", default=str(Path(__file__).resolve().parents[2] / "target/fastbuild/lccc"))
++    ap.add_argument("--flags", nargs="*", default=["-O1"])
++    ap.add_argument("--mode", choices=["ice", "crash"], default="ice")
++    ap.add_argument("--timeout", type=int, default=60)
++    ap.add_argument("--out")
++    a = ap.parse_args()
++
++    src = Path(a.program).read_text()
++    prefix, blocks, suffix = split_main(src)
++    work = Path(tempfile.mkdtemp(prefix="lccc-reduce-"))
++    orc = Oracle(a.lccc, a.flags, a.mode, a.timeout, work)
++
++    def assemble(bs: list[str]) -> str:
++        return strip_dead_cases(prefix, bs) + "".join(bs) + suffix
++
++    if not orc.fails(assemble(blocks)):
++        print("reduce_ice: input does not reproduce with", a.flags, file=sys.stderr)
++        shutil.rmtree(work, ignore_errors=True)
++        return 2
++    print(f"reduce_ice: signature = {orc.expected}", file=sys.stderr)
++    print(f"reduce_ice: {len(blocks)} blocks to start", file=sys.stderr)
++    kept = ddmin(blocks, lambda bs: orc.fails(assemble(bs)))
++    final = assemble(kept)
++    out = Path(a.out) if a.out else Path(a.program).with_suffix(".reduced.c")
++    out.write_text(final)
++    print(f"reduce_ice: {len(kept)} block(s) remain after {orc.runs} compiles -> {out}", file=sys.stderr)
++    shutil.rmtree(work, ignore_errors=True)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
