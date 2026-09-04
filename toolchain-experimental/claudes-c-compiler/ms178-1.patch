@@ -1,585 +1,435 @@
 diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index ba5f47d8..e9527ef8 100644
+index ba5f47d..d7281de 100644
 --- a/src/backend/regalloc.rs
 +++ b/src/backend/regalloc.rs
-@@ -6205,11 +6205,51 @@ pub(crate) fn detect_phi_coalesce_groups(
-     }
+@@ -16,6 +16,7 @@ use super::liveness::{
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::common::types::IrType;
+ use crate::ir::analysis;
++use crate::ir::intrinsics::IntrinsicOp;
+ use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
  
-     let label_to_idx = analysis::build_label_map(func);
--    let (preds, _succs) = analysis::build_cfg(func, &label_to_idx);
-+    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
- 
-     let debug = env_on("CCC_DEBUG_PHI_COALESCE");
-     let mut candidates = Vec::new();
- 
-+    // Pre-def dataflow closure of `phi` inside `block[..def_idx]`: every value
-+    // computed from the OLD phi before the destructive update.  A folded GEP
-+    // (`p = &a[i]`) reads `i`'s register at the Load/Store that absorbs it,
-+    // so such a value read after the update observes the NEW `i`.
-+    let derived_before = |block: &crate::ir::reexports::BasicBlock,
-+                          def_idx: usize,
-+                          phi: u32|
-+     -> FxHashSet<u32> {
-+        let mut derived: FxHashSet<u32> = FxHashSet::default();
-+        derived.insert(phi);
-+        for earlier in &block.instructions[..def_idx] {
-+            let mut depends = false;
-+            for_each_operand_in_instruction(earlier, |op| {
-+                if matches!(op, Operand::Value(v) if derived.contains(&v.0)) {
-+                    depends = true;
-+                }
-+            });
-+            for_each_value_use_in_instruction(earlier, |v| {
-+                if derived.contains(&v.0) {
-+                    depends = true;
-+                }
-+            });
-+            if depends {
-+                if let Some(d) = earlier.dest() {
-+                    derived.insert(d.0);
-+                }
-+            }
-+        }
-+        derived
-+    };
-+    let terminator_uses = |term: &Terminator, set: &FxHashSet<u32>| -> bool {
-+        let mut found = false;
-+        for_each_operand_in_terminator(term, |op| {
-+            if matches!(op, Operand::Value(v) if set.contains(&v.0)) {
-+                found = true;
-+            }
-+        });
-+        found
-+    };
-+
-     for (block_idx, block) in func.blocks.iter().enumerate() {
-         if liveness
-             .block_loop_depth
-@@ -6246,11 +6286,20 @@ pub(crate) fn detect_phi_coalesce_groups(
-             };
- 
-             let same_block = source_block == block_idx;
--            let source_is_fp = func.blocks[source_block].instructions[source_def_idx]
--                .result_type()
--                .is_some_and(|ty| ty.is_float());
-+            // Split-latch shape (any type): the loop body ends in a
-+            // conditional branch whose loop edge is critical, so phi
-+            // elimination parks the copies in a one-predecessor split block
-+            // (`do { DO8 } while (--n)`, every rotated counted loop, every
-+            // `while` whose latch is also an exit test).  This is the most
-+            // common hot-loop shape and it used to be excluded for every
-+            // non-FP value, leaving 2 copies per accumulator per iteration in
-+            // zlib-ng adler32, expat and the arith_loop webs.  The
-+            // destructive-update proof for it is completed below by
-+            // `phi_derived_used_in_window`'s cross-block arm: the old phi
-+            // (and anything derived from it before the update) may not be
-+            // observed after the source's definition along ANY path out of
-+            // the source block, not merely along the latch.
-             let pred_is_unique = !same_block
--                && source_is_fp
-                 && preds.len(block_idx) == 1
-                 && preds.row(block_idx)[0] as usize == source_block
-                 // Do not coalesce a preheader/init definition into a loop phi:
-@@ -6288,31 +6337,41 @@ pub(crate) fn detect_phi_coalesce_groups(
-             // formed.  Track the pre-update dataflow closure and reject when a
-             // derived old-phi value remains live after the source definition.
-             let phi_derived_used_in_window = if same_block {
--                let mut derived: FxHashSet<u32> = FxHashSet::default();
--                derived.insert(dest.0);
--                for earlier in &block.instructions[..source_def_idx] {
--                    let mut depends = false;
--                    for_each_operand_in_instruction(earlier, |op| {
--                        if matches!(op, Operand::Value(v) if derived.contains(&v.0)) {
--                            depends = true;
--                        }
--                    });
--                    for_each_value_use_in_instruction(earlier, |v| {
--                        if derived.contains(&v.0) {
--                            depends = true;
--                        }
--                    });
--                    if depends {
--                        if let Some(d) = earlier.dest() {
--                            derived.insert(d.0);
--                        }
--                    }
--                }
-+                let derived = derived_before(block, source_def_idx, dest.0);
-                 block.instructions[source_def_idx + 1..copy_idx]
-                     .iter()
-                     .any(|middle| derived.iter().any(|&v| uses_value(middle, v)))
-             } else {
--                false
-+                // Cross-block proof.  The register is overwritten at the
-+                // source definition inside `source_block`; from that point on
-+                // the old phi value is gone on EVERY path, so it (and every
-+                // pre-update derived value) must be dead on every path:
-+                //   1. not read by the rest of the source block or its
-+                //      terminator (`switch (state)` after `state_next = ..`);
-+                //   2. not read before the copy in the split latch;
-+                //   3. not live into any successor of the source block other
-+                //      than the latch — the classic `return i` after a
-+                //      `for (...; ++i)` exit branch reads the OLD i;
-+                //   4. no derived value live out of the source block at all:
-+                //      a folded GEP rooted at the phi is re-formed from the
-+                //      phi register wherever it is consumed.
-+                let src_blk = &func.blocks[source_block];
-+                let derived = derived_before(src_blk, source_def_idx, dest.0);
-+                let read_in_tail = src_blk.instructions[source_def_idx + 1..]
-+                    .iter()
-+                    .chain(block.instructions[..copy_idx].iter())
-+                    .any(|middle| derived.iter().any(|&v| uses_value(middle, v)));
-+                let read_by_terminator = terminator_uses(&src_blk.terminator, &derived);
-+                let phi_escapes = succs
-+                    .row(source_block)
-+                    .iter()
-+                    .any(|&s| s as usize != block_idx && liveness.is_live_in(s as usize, dest.0))
-+                    || liveness.is_live_in(block_idx, dest.0);
-+                let derived_escapes = derived
-+                    .iter()
-+                    .filter(|&&v| v != dest.0)
-+                    .any(|&v| liveness.is_live_out(source_block, v));
-+                read_in_tail || read_by_terminator || phi_escapes || derived_escapes
-             };
-             let source_used_elsewhere = src_use_blocks.get(&src.0).is_some_and(|blocks| {
-                 blocks
-@@ -6620,6 +6679,176 @@ mod phi_coalesce_tests {
-         );
-     }
- 
-+    #[test]
-+    fn coalesces_integer_split_latch_counter() {
-+        // `do { ... } while (--n)`: the update `n2 = n1 - 1` ends the body,
-+        // the phi-elim copy sits alone in the one-predecessor split latch,
-+        // and nothing reads the OLD n after the destructive update (the exit
-+        // returns a constant).  Pre-Fable this shape was restricted to FP
-+        // sources, leaving 2 copies per iteration in every counted loop.
-+        let mut func = IrFunction::new("split_latch_counter".to_string(), IrType::I32, vec![], false);
-+        func.blocks = vec![
-+            block(
-+                0,
-+                vec![Instruction::Copy {
-+                    dest: Value(1),
-+                    src: Operand::Const(IrConst::I32(10)),
-+                }],
-+                Terminator::Branch(BlockId(1)),
-+            ),
-+            block(
-+                1,
-+                vec![Instruction::BinOp {
-+                    dest: Value(2),
-+                    op: IrBinOp::Sub,
-+                    lhs: Operand::Value(Value(1)),
-+                    rhs: Operand::Const(IrConst::I32(1)),
-+                    ty: IrType::I32,
-+                }],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(2)),
-+                    true_label: BlockId(2),
-+                    false_label: BlockId(3),
-+                },
-+            ),
-+            block(
-+                2,
-+                vec![Instruction::Copy {
-+                    dest: Value(1),
-+                    src: Operand::Value(Value(2)),
-+                }],
-+                Terminator::Branch(BlockId(1)),
-+            ),
-+            block(3, Vec::new(), Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
-+        ];
-+        func.next_value_id = 4;
-+
-+        let liveness = compute_live_intervals(&func);
-+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
-+        assert!(
-+            candidates
-+                .iter()
-+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
-+            "integer split-latch counter must coalesce: {candidates:?}"
-+        );
-+    }
-+
-+    #[test]
-+    fn rejects_split_latch_when_old_phi_read_on_exit() {
-+        // `for (i = 0; i < n; i++) ...; return i;` — the exit path reads the
-+        // phi AFTER the destructive update in the body; sharing the homes
-+        // would hand the exit the POST-increment value.  The exit block
-+        // reads the phi, so `phi_escapes` must block the candidate.
-+        let mut func = IrFunction::new("split_latch_return_phi".to_string(), IrType::I32, vec![], false);
-+        func.blocks = vec![
-+            block(
-+                0,
-+                vec![Instruction::Copy {
-+                    dest: Value(1),
-+                    src: Operand::Const(IrConst::I32(0)),
-+                }],
-+                Terminator::Branch(BlockId(1)),
-+            ),
-+            block(
-+                1,
-+                vec![Instruction::BinOp {
-+                    dest: Value(2),
-+                    op: IrBinOp::Add,
-+                    lhs: Operand::Value(Value(1)),
-+                    rhs: Operand::Const(IrConst::I32(1)),
-+                    ty: IrType::I32,
-+                }],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(2)),
-+                    true_label: BlockId(2),
-+                    false_label: BlockId(3),
-+                },
-+            ),
-+            block(
-+                2,
-+                vec![Instruction::Copy {
-+                    dest: Value(1),
-+                    src: Operand::Value(Value(2)),
-+                }],
-+                Terminator::Branch(BlockId(1)),
-+            ),
-+            block(3, Vec::new(), Terminator::Return(Some(Operand::Value(Value(1))))),
-+        ];
-+        func.next_value_id = 4;
-+
-+        let liveness = compute_live_intervals(&func);
-+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
-+        assert!(
-+            !candidates
-+                .iter()
-+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
-+            "old phi live into the exit block must block coalesce: {candidates:?}"
-+        );
-+    }
-+
-+    #[test]
-+    fn rejects_split_latch_when_gp_derived_value_escapes() {
-+        // Old-phi-derived value `v3 = n1 * 2` carried to the exit block:
-+        // after the source def the register holds the NEW value, so v3's
-+        // consumer would be corrupted — even though the phi itself does not
-+        // escape.  `derived_escapes` must block the candidate.
-+        let mut func =
-+            IrFunction::new("split_latch_derived_escape".to_string(), IrType::I32, vec![], false);
-+        func.blocks = vec![
-+            block(
-+                0,
-+                vec![Instruction::Copy {
-+                    dest: Value(1),
-+                    src: Operand::Const(IrConst::I32(10)),
-+                }],
-+                Terminator::Branch(BlockId(1)),
-+            ),
-+            block(
-+                1,
-+                vec![
-+                    Instruction::BinOp {
-+                        dest: Value(3),
-+                        op: IrBinOp::Mul,
-+                        lhs: Operand::Value(Value(1)),
-+                        rhs: Operand::Const(IrConst::I32(2)),
-+                        ty: IrType::I32,
-+                    },
-+                    Instruction::BinOp {
-+                        dest: Value(2),
-+                        op: IrBinOp::Sub,
-+                        lhs: Operand::Value(Value(1)),
-+                        rhs: Operand::Const(IrConst::I32(1)),
-+                        ty: IrType::I32,
-+                    },
-+                ],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(2)),
-+                    true_label: BlockId(2),
-+                    false_label: BlockId(3),
-+                },
-+            ),
-+            block(
-+                2,
-+                vec![Instruction::Copy {
-+                    dest: Value(1),
-+                    src: Operand::Value(Value(2)),
-+                }],
-+                Terminator::Branch(BlockId(1)),
-+            ),
-+            block(3, Vec::new(), Terminator::Return(Some(Operand::Value(Value(3))))),
-+        ];
-+        func.next_value_id = 5;
-+
-+        let liveness = compute_live_intervals(&func);
-+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
-+        assert!(
-+            !candidates
-+                .iter()
-+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
-+            "derived old-phi value live out of the source block must block coalesce: {candidates:?}"
-+        );
-+    }
-+
-     #[test]
-     fn rejects_phi_value_derived_before_update_and_used_after_it() {
-         // Reduced from gcc.c-torture/execute/pr51933.c after GVN merged two
-diff --git a/src/ir/lowering/const_eval.rs b/src/ir/lowering/const_eval.rs
-index d3ac8c01..54b0b4cc 100644
---- a/src/ir/lowering/const_eval.rs
-+++ b/src/ir/lowering/const_eval.rs
-@@ -345,6 +345,27 @@ impl Lowerer {
- 
-         let src_val = self.eval_const_expr(inner)?;
- 
-+        // C11 6.3.1.2p1: conversion to _Bool yields 0 or 1.  The constant
-+        // cast must NORMALIZE, not bit-copy: `(_Bool)5` is 1, not 5 (the
-+        // runtime path emits `val != 0`; the fold must mirror it, including
-+        // NaN -> 1, ±0.0 -> 0, negative integers -> 1).  Decimal constants
-+        // are declined so `lower_decimal_truthiness` (+0 == -0) handles them.
-+        if target_ct == CType::Bool {
-+            let is_nonzero = match &src_val {
-+                IrConst::F32(v) => *v != 0.0,
-+                IrConst::F64(v) => *v != 0.0,
-+                IrConst::LongDouble(v, _) => *v != 0.0,
-+                IrConst::I8(v) => *v != 0,
-+                IrConst::I16(v) => *v != 0,
-+                IrConst::I32(v) => *v != 0,
-+                IrConst::I64(v) => *v != 0,
-+                IrConst::I128(v) => *v != 0,
-+                IrConst::Zero => false,
-+                IrConst::D32(_) | IrConst::D64(_) => return None,
-+            };
-+            return Some(IrConst::I8(if is_nonzero { 1 } else { 0 }));
-+        }
-+
-         // Handle float source types: use value-based conversion, not bit manipulation
-         if let IrConst::LongDouble(fv, bytes) = &src_val {
-             return IrConst::cast_long_double_to_target(*fv, bytes, target_ir_ty);
-diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
-index 1b00c376..72598b44 100644
---- a/src/ir/lowering/expr_builtins.rs
-+++ b/src/ir/lowering/expr_builtins.rs
-@@ -316,21 +316,44 @@ impl Lowerer {
-         let builtin_info = builtins::resolve_builtin(name)?;
-         match &builtin_info.kind {
-             BuiltinKind::LibcAlias(libc_name) => {
--                let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
--                let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-+                let mut arg_types: Vec<IrType> =
-+                    args.iter().map(|a| self.get_expr_type(a)).collect();
-+                let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-                 let dest = self.fresh_value();
-+                // The builtin is callable without a prior libc prototype
-+                // (`__builtin_printf("%g", f)` in a TU that never includes
-+                // <stdio.h>).  The variadic contract of the printf family is
-+                // part of the builtin's own signature, so it must not depend
-+                // on whether the user happened to declare the libc symbol:
-+                // without it, a `float` argument was passed as a 4-byte F32
-+                // in an XMM register and printf read garbage (C11 6.5.2.2p6
-+                // requires float->double, char/short->int promotion).
-                 let libc_sig = self.func_meta.sigs.get(libc_name.as_str());
--                let variadic = libc_sig.is_some_and(|s| s.is_variadic);
--                let n_fixed = if variadic {
--                    libc_sig
--                        .map(|s| s.param_types.len())
--                        .unwrap_or(arg_vals.len())
--                } else {
--                    arg_vals.len()
-+                let (variadic, n_fixed) = match libc_sig {
-+                    Some(sig) if sig.is_variadic => (true, sig.param_types.len()),
-+                    // Unprototyped declaration (`int printf();`): the default
-+                    // argument promotions apply to EVERY argument (C11
-+                    // 6.5.2.2p6), and the callee is the real variadic libc
-+                    // function — use the builtin's own fixed-arity contract.
-+                    Some(sig) if sig.param_types.is_empty() => {
-+                        match builtin_variadic_fixed_arity(libc_name.as_str()) {
-+                            Some(n) => (true, n),
-+                            None => (true, arg_vals.len()),
-+                        }
-+                    }
-+                    Some(_) => (false, arg_vals.len()),
-+                    None => match builtin_variadic_fixed_arity(libc_name.as_str()) {
-+                        Some(n) => (true, n),
-+                        None => (false, arg_vals.len()),
-+                    },
-                 };
-+                let libc_return_type = libc_sig.map(|s| s.return_type);
-+                if variadic {
-+                    self.promote_variadic_args(&mut arg_vals, &mut arg_types, n_fixed);
-+                }
-                 let return_type = self
-                     .builtin_return_type(name)
--                    .or_else(|| libc_sig.map(|s| s.return_type))
-+                    .or(libc_return_type)
-                     .unwrap_or(crate::common::types::target_int_ir_type());
-                 let struct_arg_sizes = vec![None; arg_vals.len()];
-                 self.emit(Instruction::Call {
-@@ -1128,14 +1151,29 @@ impl Lowerer {
-         );
- 
-         // Lower all arguments in order
--        let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
--        let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
-+        let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-+        let mut arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
- 
-         let dest = self.fresh_value();
-         let return_type = self
-             .builtin_return_type(name)
-             .unwrap_or(crate::common::types::target_int_ir_type());
--        let n_fixed = arg_vals.len(); // All explicitly passed args are "fixed" from our perspective
-+        // The fortified printf family has a fixed prefix (flag/size/format
-+        // operands) followed by `...`.  Everything past the prefix is a
-+        // variadic argument and must receive the default argument
-+        // promotions, exactly as for the unfortified builtin: glibc's
-+        // <stdio.h> rewrites `printf("%g", f)` into
-+        // `__builtin___printf_chk(1, "%g", f)` and a float passed as F32
-+        // there was read by glibc as a double.  The count also matters for
-+        // the SysV `%al` XMM-count and the i686 stack layout.
-+        let n_fixed = if is_variadic {
-+            builtin_variadic_fixed_arity(libc_chk_name).unwrap_or(arg_vals.len())
-+        } else {
-+            arg_vals.len()
-+        };
-+        if is_variadic {
-+            self.promote_variadic_args(&mut arg_vals, &mut arg_types, n_fixed);
-+        }
-         let struct_arg_sizes = vec![None; arg_vals.len()];
-         self.emit(Instruction::Call {
-             func: libc_chk_name.to_string(),
-@@ -1162,6 +1200,32 @@ impl Lowerer {
-         Some(Operand::Value(dest))
-     }
- 
-+    /// Apply the C11 6.5.2.2p6 default argument promotions to every argument at
-+    /// index >= `n_fixed` of a variadic call: `float` -> `double`,
-+    /// `char`/`short` (any signedness) -> `int`.  `arg_types` is rewritten in
-+    /// lock-step so the backend classifies the promoted value (F64 travels in
-+    /// an XMM register and is counted in `%al`; I32 is a GPR/stack slot).
-+    /// `_Bool` is already materialised as an I8 0/1 and widens to `int` here as
-+    /// well, which is what the C standard requires.
-+    pub(super) fn promote_variadic_args(
-+        &mut self,
-+        arg_vals: &mut [Operand],
-+        arg_types: &mut [IrType],
-+        n_fixed: usize,
-+    ) {
-+        for i in n_fixed..arg_vals.len() {
-+            let ty = arg_types[i];
-+            let promoted = match ty {
-+                IrType::F32 => IrType::F64,
-+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
-+                _ => continue,
-+            };
-+            let val = std::mem::replace(&mut arg_vals[i], Operand::Const(IrConst::I64(0)));
-+            arg_vals[i] = self.emit_implicit_cast(val, ty, promoted);
-+            arg_types[i] = promoted;
-+        }
-+    }
-+
-     /// Lower __builtin_is{greater,less,unordered,...} float comparison builtins.
-     /// Promotes operands to the widest float type, then emits the appropriate comparison.
-     fn lower_fp_compare(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
-@@ -2073,6 +2137,29 @@ enum X86IntrinsicKind {
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+@@ -238,6 +239,73 @@ pub fn riscv_param_caller_homes_safe(func: &IrFunction) -> bool {
+     true
  }
  
- /// Map a BuiltinIntrinsic to its emission pattern.
-+/// Number of fixed (non-variadic) parameters of the variadic libc / glibc
-+/// fortification functions reachable through `__builtin_*`.  This is the
-+/// builtin's own contract and is consulted when the translation unit never
-+/// declared the libc symbol (or declared it without a prototype), so the
-+/// trailing arguments still receive the default argument promotions and the
-+/// SysV XMM count in `%al` is correct.
-+fn builtin_variadic_fixed_arity(libc_name: &str) -> Option<usize> {
-+    Some(match libc_name {
-+        "printf" => 1,
-+        "fprintf" | "sprintf" | "dprintf" => 2,
-+        "snprintf" => 3,
-+        // __printf_chk(flag, fmt, ...)
-+        "__printf_chk" => 2,
-+        // __fprintf_chk(fp, flag, fmt, ...)
-+        "__fprintf_chk" => 3,
-+        // __sprintf_chk(s, flag, slen, fmt, ...)
-+        "__sprintf_chk" => 4,
-+        // __snprintf_chk(s, maxlen, flag, slen, fmt, ...)
-+        "__snprintf_chk" => 5,
-+        _ => return None,
-+    })
++/// True when ANY instruction of `func` implicitly clobbers %rdx: division
++/// (cqto/cltd sign-extends into rdx:rax), i128 arithmetic (the rax:rdx
++/// pair), Switch (jump-table dispatch scratch), or a fixed-scratch
++/// intrinsic. This is the SAME condition under which the x86-64 prologue
++/// excludes %rdx (PhysReg 16) from allocation — both gates must stay in
++/// lockstep: a value homed in %rdx is unsound exactly when the body can
++/// overwrite %rdx behind the allocator's back.
++pub fn x86_body_implicitly_clobbers_rdx(func: &IrFunction) -> bool {
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            match inst {
++                Instruction::BinOp { op, ty, .. } => {
++                    if matches!(
++                        op,
++                        IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
++                    ) {
++                        return true;
++                    }
++                    if matches!(ty, IrType::I128 | IrType::U128) {
++                        return true;
++                    }
++                }
++                Instruction::UnaryOp { ty, .. }
++                | Instruction::Cmp { ty, .. }
++                | Instruction::Store { ty, .. } => {
++                    if matches!(ty, IrType::I128 | IrType::U128) {
++                        return true;
++                    }
++                }
++                Instruction::Cast { from_ty, to_ty, .. } => {
++                    if matches!(from_ty, IrType::I128 | IrType::U128)
++                        || matches!(to_ty, IrType::I128 | IrType::U128)
++                    {
++                        return true;
++                    }
++                }
++                Instruction::Intrinsic { op, .. } => {
++                    if matches!(
++                        op,
++                        IntrinsicOp::Rdtsc
++                            | IntrinsicOp::Rdtscp
++                            | IntrinsicOp::F128Copysign
++                            | IntrinsicOp::FmaF64x2
++                            | IntrinsicOp::FmaF64x4
++                            | IntrinsicOp::FmaF64x4Hoisted
++                            | IntrinsicOp::FmaF64x4SIB
++                            | IntrinsicOp::FmaF64x4HoistedSIB
++                            | IntrinsicOp::LoadF64x4
++                            | IntrinsicOp::LoadF64x2
++                            | IntrinsicOp::LoadI32x8
++                            | IntrinsicOp::LoadI32x4
++                            | IntrinsicOp::VecZeroI32x8
++                            | IntrinsicOp::VecZeroI32x4
++                    ) {
++                        return true;
++                    }
++                }
++                _ => {}
++            }
++        }
++        if matches!(block.terminator, Terminator::Switch { .. }) {
++            return true;
++        }
++    }
++    false
 +}
 +
- fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
-     match intrinsic {
-         BuiltinIntrinsic::X86Lfence
-diff --git a/tests/regression/builtin_printf_chk_promotion.c b/tests/regression/builtin_printf_chk_promotion.c
-new file mode 100644
-index 00000000..e8d0fd74
---- /dev/null
-+++ b/tests/regression/builtin_printf_chk_promotion.c
-@@ -0,0 +1,19 @@
-+/* glibc's fortified printf family has a fixed prefix (flag/size/format)
-+ * followed by `...`; everything past the prefix must receive the C11
-+ * 6.5.2.2p6 default argument promotions.  glibc's <stdio.h> rewrites
-+ * `printf("%g", f)` into `__builtin___printf_chk(1, "%g", f)`; without the
-+ * promotions a float arrived as a 4-byte F32 and was read as a double. */
-+#include <stdio.h>
+ pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
+     if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
+         return false;
+@@ -260,6 +328,19 @@ pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
+     }) {
+         return false;
+     }
++    // The pre-store model parks each register param in its incoming ABI
++    // register for the WHOLE body. Any instruction that implicitly clobbers
++    // %rdx (division via cqto/cltd, i128 rax:rdx pairs, switch jump tables,
++    // fixed-scratch intrinsics) destroys a param homed there behind the
++    // allocator's back. Reproduced: `(uint8_t)p2` read from %dl after an
++    // `idivq`'s cqto zeroed it — every truncation of the param silently
++    // wrong (stress intexpr seed 1, O1 rt+cf, got 65533 expected 65532).
++    // Mirror the prologue's rdx-allocation exclusion (see
++    // x86_body_implicitly_clobbers_rdx): when the body can clobber %rdx,
++    // params fall back to the ordinary spill-home path.
++    if x86_body_implicitly_clobbers_rdx(func) {
++        return false;
++    }
+     for (bi, block) in func.blocks.iter().enumerate() {
+         if bi != 0 {
+             if block
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+index c033245..f0aacfc 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+@@ -726,6 +726,12 @@ mod tests {
+         // Reduced from gcc.c-torture/execute/20090207-1.c after base-index
+         // folding. A raw last-comma split saw `%r8)` as the destination and
+         // deleted this observable store as a dead pure register write.
++        //
++        // The base-index LEA fold now rewrites the pair first into the
++        // canonical SIB store `movl $2, 8(%rsp, %r8)` — the SAME address
++        // (rsp + r8 + 8) with the LEA folded away — so accept either the
++        // folded or the pre-fold form: the invariant under guard is that the
++        // observable SIB-destination store SURVIVES the dead-write pass.
+         let out = run(concat!(
+             "foo:\n",
+             ".cfi_startproc\n",
+@@ -734,8 +740,9 @@ mod tests {
+             "    ret\n",
+             ".cfi_endproc\n",
+         ));
+-        assert!(out.contains("movl $2, (%rcx, %r8)"), "{out}");
+-        assert!(out.contains("leaq 8(%rsp), %rcx"), "{out}");
++        let store_survives = out.contains("movl $2, 8(%rsp, %r8)")
++            || out.contains("movl $2, (%rcx, %r8)");
++        assert!(store_survives, "observable SIB store deleted: {out}");
+     }
+ 
+     #[test]
+diff --git a/src/backend/x86/codegen/peephole/passes/memory_fold.rs b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
+index 63e39e1..8a990d4 100644
+--- a/src/backend/x86/codegen/peephole/passes/memory_fold.rs
++++ b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
+@@ -106,8 +106,8 @@ fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
+ /// Fold movsd stack load into subsequent scalar FP binary op as memory operand.
+ ///
+ /// Pattern (produced after eliminate_fp_xmm_roundtrips):
+-///   movsd -M(%rbp), %xmm1   ; Other{dest_reg: 25 (xmm1), rbp_offset: -M}
+-///   OP %xmm1, %xmm0          ; Other{dest_reg: 24 (xmm0)}, OP ∈ {mulsd, addsd, subsd, divsd}
++///   movsd -M(%rbp), %xmm1   ; LoadXmmRbp{offset: -M} (historically Other{dest_reg: 25})
++///   OP %xmm1, %xmm0          ; OP ∈ {mulsd, addsd, subsd, divsd}
+ ///
+ /// Transformed to:
+ ///   OP -M(%rbp), %xmm0
+@@ -124,8 +124,15 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
+             continue;
+         }
+ 
+-        // Look for Other{dest_reg: 25} = writes to %xmm1 (family 24+1=25)
+-        if let LineKind::Other { dest_reg: 25 } = infos[i].kind {
++        // Candidate: an XMM slot LOAD (`movsd -M(%rbp), %xmmN`). The line
++        // classifier routes these to LoadXmmRbp (with `rbp_offset` cached by
++        // xmm_slot_line_info); when this pass was written they were classified
++        // as `Other{dest_reg: 25}` and the stale pre-filter silently disabled
++        // the whole fold (caught by test_fp_memory_fold_mulsd after the
++        // classifier gained the dedicated XMM slot kinds). The dest-register
++        // check stays textual below: LoadXmmRbp records offset/size, not the
++        // register, and the pass folds only the exact `%xmm1` dest form.
++        if let LineKind::LoadXmmRbp { .. } = infos[i].kind {
+             let offset = infos[i].rbp_offset;
+             if offset == RBP_OFFSET_NONE {
+                 i += 1;
+diff --git a/src/ir/lowering/complex.rs b/src/ir/lowering/complex.rs
+index 7dc8a93..7e59743 100644
+--- a/src/ir/lowering/complex.rs
++++ b/src/ir/lowering/complex.rs
+@@ -81,7 +81,11 @@ impl Lowerer {
+             dest: alloca,
+             ty: IrType::Ptr,
+             size,
+-            align: 0,
++            // Natural alignment of the complex type (16 for _Complex long
++            // double). Alignment-0 allocas land 8-mod-16 in FPO frames and
++            // are unsuitable homes for any value a consumer may move with
++            // aligned SSE loads/stores.
++            align: self.ctype_align(ctype).max(1),
+             volatile: false,
+             semantic_volatile: false,
+         });
+diff --git a/src/ir/lowering/expr_calls.rs b/src/ir/lowering/expr_calls.rs
+index 6bec06a..beaad5c 100644
+--- a/src/ir/lowering/expr_calls.rs
++++ b/src/ir/lowering/expr_calls.rs
+@@ -262,12 +262,36 @@ impl Lowerer {
+ 
+         // For sret calls, allocate space and prepend hidden pointer argument
+         let sret_alloca = if let Some(size) = sret_size {
++            // The buffer's alignment MUST be the returned aggregate's natural
++            // alignment (SysV: the callee writes the return value through the
++            // hidden pointer — with aligned SSE stores, i.e. movaps, whenever
++            // that alignment is 16, e.g. structs containing long double).
++            // Recording `align: 0` made the FPO frame layout place the buffer
++            // at an address ≡ 8 (mod 16); any GCC-compiled callee then faulted
++            // with #GP on `movaps %xmm,(%rdi)` — SIGSEGV with si_addr = 0
++            // (stress abi family, seed 0, lccc-caller/gcc-callee pairing;
++            // frame-parity dependent, hence seed-shape dependent).
++            // Direct calls read the alignment from the callee's recorded
++            // return CType; indirect calls resolve it from the function
++            // pointer's type via get_call_return_struct_align (same type
++            // query as the sret SIZE, so the two can never disagree).
++            let sret_align = match stripped_func {
++                Expr::Identifier(name, _) if !self.is_func_ptr_variable(name) => self
++                    .func_meta
++                    .sigs
++                    .get(name.as_str())
++                    .and_then(|s| s.return_ctype.as_ref())
++                    .map(|ct| self.ctype_align(ct).max(1))
++                    .or_else(|| self.get_call_return_struct_align(stripped_func))
++                    .unwrap_or(0),
++                _ => self.get_call_return_struct_align(stripped_func).unwrap_or(0),
++            };
+             let alloca = self.fresh_value();
+             self.emit(Instruction::Alloca {
+                 dest: alloca,
+                 ty: IrType::Ptr,
+                 size,
+-                align: 0,
++                align: sret_align,
+                 volatile: false,
+                 semantic_volatile: false,
+             });
+diff --git a/src/ir/lowering/expr_types.rs b/src/ir/lowering/expr_types.rs
+index be87e92..fd28504 100644
+--- a/src/ir/lowering/expr_types.rs
++++ b/src/ir/lowering/expr_types.rs
+@@ -286,20 +286,18 @@ impl Lowerer {
+         }
+     }
+ 
+-    /// For indirect calls (function pointer calls), determine if the return type is a struct,
+-    /// union, or vector and return its size. Returns None if not an aggregate return or if
+-    /// the type cannot be determined.
+-    pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
+-        // For indirect calls, extract the return type from the function pointer's CType.
+-        // Strip Deref layers since dereferencing function pointers is a no-op in C.
++    /// Resolve the RETURN type of the function designated by `func`, for
++    /// indirect calls (function pointer calls). Strip Deref layers since
++    /// dereferencing function pointers is a no-op in C.
++    ///
++    /// Shared by `get_call_return_struct_size` and
++    /// `get_call_return_struct_align` so the size and alignment queries can
++    /// never disagree about which type they describe.
++    pub(super) fn call_return_ctype(&self, func: &Expr) -> Option<CType> {
+         let func_ctype = match func {
+             Expr::Identifier(name, _) => {
+                 // Could be a function pointer variable
+-                if let Some(vi) = self.lookup_var_info(name) {
+-                    vi.c_type.clone()
+-                } else {
+-                    None
+-                }
++                self.lookup_var_info(name).and_then(|vi| vi.c_type.clone())
+             }
+             Expr::Deref(..) => {
+                 let mut expr = func;
+@@ -310,21 +308,36 @@ impl Lowerer {
+             }
+             _ => self.get_expr_ctype(func),
+         };
++        func_ctype.and_then(|ref ct| ct.func_ptr_return_type(false))
++    }
+ 
+-        if let Some(ref ctype) = func_ctype {
+-            // Navigate through CType to find the return type
+-            let ret_ctype = ctype.func_ptr_return_type(false);
+-            if let Some(ret_ct) = ret_ctype {
+-                if ret_ct.is_struct_or_union() {
+-                    // Use resolve_ctype_size to look up struct layouts properly;
+-                    // CType::size() returns 0 for Struct/Union since they only
+-                    // store a key, not the actual layout.
+-                    return Some(self.resolve_ctype_size(&ret_ct));
+-                }
+-                if ret_ct.is_vector() {
+-                    return Some(self.resolve_ctype_size(&ret_ct));
+-                }
+-            }
++    /// For indirect calls (function pointer calls), determine if the return type is a struct,
++    /// union, or vector and return its size. Returns None if not an aggregate return or if
++    /// the type cannot be determined.
++    pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
++        let ret_ct = self.call_return_ctype(func)?;
++        if ret_ct.is_struct_or_union() {
++            // Use resolve_ctype_size to look up struct layouts properly;
++            // CType::size() returns 0 for Struct/Union since they only
++            // store a key, not the actual layout.
++            return Some(self.resolve_ctype_size(&ret_ct));
++        }
++        if ret_ct.is_vector() {
++            return Some(self.resolve_ctype_size(&ret_ct));
++        }
++        None
++    }
 +
-+int main(void)
-+{
-+    float f = 1.25f;
-+    char c = -3;
-+    unsigned short us = 62000;
-+    __builtin___printf_chk(1, "%g %d %u\n", f, c, us);
-+    char buf[64];
-+    int n = __builtin___snprintf_chk(buf, sizeof buf, 1, sizeof buf,
-+                                     "%g %d\n", 2.75f, (short)-9);
-+    printf("n=%d %s", n, buf);
-+    return 0;
-+}
-diff --git a/tests/regression/builtin_printf_prototyped.c b/tests/regression/builtin_printf_prototyped.c
-new file mode 100644
-index 00000000..b9a47beb
---- /dev/null
-+++ b/tests/regression/builtin_printf_prototyped.c
-@@ -0,0 +1,18 @@
-+/* __builtin_printf family with <stdio.h> present: the declared libc
-+ * prototype IS variadic, and the trailing args beyond the fixed prefix must
-+ * still receive the C11 6.5.2.2p6 default argument promotions. */
-+#include <stdio.h>
-+
-+int main(void)
-+{
-+    float f = 2.5f;
-+    char c = -7;
-+    unsigned short us = 61000;
-+    __builtin_printf("%g %d %u\n", f, c, us);
-+    /* The plain call path must keep promoting identically. */
-+    printf("%g %d %u\n", f, c, us);
-+    char buf[64];
-+    int n = __builtin_snprintf(buf, sizeof buf, "%g %u\n", 3.25f, us);
-+    printf("n=%d %s", n, buf);
-+    return 0;
-+}
-diff --git a/tests/regression/builtin_printf_variadic_promotion.c b/tests/regression/builtin_printf_variadic_promotion.c
-new file mode 100644
-index 00000000..dec52a46
---- /dev/null
-+++ b/tests/regression/builtin_printf_variadic_promotion.c
-@@ -0,0 +1,21 @@
-+/* __builtin_printf / __builtin_snprintf in a TU with NO <stdio.h>: the
-+ * variadic contract of the printf family belongs to the builtin's own
-+ * signature, not to a user-declared libc prototype.  C11 6.5.2.2p6 default
-+ * argument promotions must still apply: float -> double, char/short (any
-+ * signedness) -> int.  A float passed as a 4-byte F32 in an XMM register
-+ * was read by glibc's printf as a double (garbage); a char/short passed in
-+ * a narrowed register was read as int (stale upper bits). */
-+int main(void)
-+{
-+    float f = 1.5f;
-+    float g = 0.1f;
-+    char c = -1;
-+    signed char sc = -2;
-+    unsigned char uc = 250;
-+    short s = -30000;
-+    unsigned short us = 60000;
-+    __builtin_printf("%g %d %d %u %d %u %d\n", f, c, sc, uc, s, us, 42);
-+    __builtin_printf("%.17g\n", g);
-+    __builtin_printf("%d %d\n", (_Bool)5, (_Bool)0);
-+    return 0;
-+}
++    /// Natural alignment of the aggregate returned by an indirect call —
++    /// the companion of `get_call_return_struct_size`. The hidden sret
++    /// buffer for such a call must be aligned to the returned type: a
++    /// callee compiled by GCC materialises the return value with aligned
++    /// SSE stores (movaps) whenever the struct's alignment is 16, and an
++    /// 8-mod-16 buffer faults with #GP at runtime.
++    pub(super) fn get_call_return_struct_align(&self, func: &Expr) -> Option<usize> {
++        let ret_ct = self.call_return_ctype(func)?;
++        if ret_ct.is_struct_or_union() || ret_ct.is_vector() {
++            return Some(self.ctype_align(&ret_ct).max(1));
+         }
+         None
+     }
+diff --git a/src/passes/cvp.rs b/src/passes/cvp.rs
+index 7e30c8c..82771f0 100644
+--- a/src/passes/cvp.rs
++++ b/src/passes/cvp.rs
+@@ -416,30 +416,54 @@ fn decide_pred(stack: &[Fact], p: Pred) -> Option<bool> {
+ }
+ 
+ /// Decide the truth of a boolean operand under the active facts.
++///
++/// `cond` values defined by a `Copy` are looked through recursively (depth
++/// capped): this covers BOTH the values this pass itself folds — a decided
++/// `Cmp` becomes `Copy { src: bool_const }` at its own def site, and every
++/// later `Select`/branch conditioned on it must see the constant — and
++/// ordinary copy chains left by earlier passes. Without the look-through,
++/// folding a guard `Cmp` would erase the very fact its consumers need
++/// (reproduced: full_function_folds_guard_and_branch folded 2/4 instead of
++/// 4/4 — the select and the branch after the folded guard stayed put).
+ fn decide_bool(
+     stack: &[Fact],
+     func: &IrFunction,
+     defs: &FxHashMap<Value, (usize, usize)>,
+     cond: &Operand,
+ ) -> Option<bool> {
+-    match cond {
+-        Operand::Const(k) => k.to_i128().map(|v| v != 0),
+-        Operand::Value(v) => {
+-            if let Some(s) = known_set(stack, *v, BOOL_BITS) {
+-                if s.as_slice() == [(0, 0)] {
+-                    return Some(false);
++    fn go(
++        stack: &[Fact],
++        func: &IrFunction,
++        defs: &FxHashMap<Value, (usize, usize)>,
++        cond: &Operand,
++        depth: u8,
++    ) -> Option<bool> {
++        match cond {
++            Operand::Const(k) => k.to_i128().map(|v| v != 0),
++            Operand::Value(v) => {
++                if let Some(s) = known_set(stack, *v, BOOL_BITS) {
++                    if s.as_slice() == [(0, 0)] {
++                        return Some(false);
++                    }
++                    if !s.is_empty() && s[0].0 >= 1 {
++                        return Some(true);
++                    }
+                 }
+-                if !s.is_empty() && s[0].0 >= 1 {
+-                    return Some(true);
++                if depth == 0 {
++                    return None;
++                }
++                let &(bi, ii) = defs.get(v)?;
++                match &func.blocks[bi].instructions[ii] {
++                    Instruction::Copy { src, .. } => go(stack, func, defs, src, depth - 1),
++                    Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } => {
++                        decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?)
++                    }
++                    _ => None,
+                 }
+             }
+-            let &(bi, ii) = defs.get(v)?;
+-            if let Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } = func.blocks[bi].instructions[ii] {
+-                return decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?);
+-            }
+-            None
+         }
+     }
++    go(stack, func, defs, cond, 16)
+ }
+ 
+ fn bool_const(b: bool) -> Operand {
+@@ -513,10 +537,12 @@ pub fn run_function(func: &mut IrFunction) -> usize {
+                     _ => None,
+                 };
+                 if let Some(r) = repl {
+-                    // A folded Cmp must no longer be looked through.
+-                    if let Instruction::Cmp { dest, .. } = &func.blocks[blk].instructions[i] {
+-                        defs.remove(dest);
+-                    }
++                    // The fold REPLACES the Cmp with its decided constant at
++                    // the same (bi, ii), so the defs entry stays valid — it
++                    // now maps to a `Copy { src: bool_const }`, which
++                    // decide_bool looks through. Erasing the entry here would
++                    // hide the folded fact from later consumers in this very
++                    // block (select cond / branch cond follow the guard).
+                     func.blocks[blk].instructions[i] = r;
+                     changes += 1;
+                 }
+diff --git a/src/passes/vec_load_sink.rs b/src/passes/vec_load_sink.rs
+index e701459..304721f 100644
+--- a/src/passes/vec_load_sink.rs
++++ b/src/passes/vec_load_sink.rs
+@@ -131,7 +131,7 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
+     if func.is_declaration || func.blocks.is_empty() {
+         return 0;
+     }
+-    let uses = collect_use_sites(func);
++    let mut uses = collect_use_sites(func);
+     let debug = std::env::var_os("CCC_DEBUG_VEC_LOAD_SINK").is_some();
+     let mut moved = 0usize;
+ 
+@@ -209,6 +209,20 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
+                 let span = block.source_spans.remove(i);
+                 block.source_spans.insert(uj - 1, span);
+             }
++            // The permutation `remove(i); insert(uj-1)` shifts every recorded
++            // use site strictly inside (i, uj) down by one; sites at uj (the
++            // moved load's own consumer) and outside the window are stable.
++            // Without this remap, a still-unvisited load whose consumer sits
++            // inside the permuted window fails the re-verification below and
++            // its sink is forfeited (two independent streams in one block
++            // sank only the higher-indexed load).
++            for sites in uses.values_mut() {
++                for (b, p) in sites.iter_mut() {
++                    if *b == bi && *p > i && *p < uj {
++                        *p -= 1;
++                    }
++                }
++            }
+             moved += 1;
+         }
+     }
