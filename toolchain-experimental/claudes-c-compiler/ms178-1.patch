@@ -1,3 +1,304 @@
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 4fef5ae..9f0b530 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -636,6 +636,59 @@ pub fn lower_cmp_branch(
+ // ── Cast ─────────────────────────────────────────────────────────────────
+ 
+ /// Lower an IR Cast (integer-to-integer only; float casts go through Raw).
++/// Fold an integer `Cast` whose source is a compile-time constant.
++///
++/// The MachInst layer copy-propagates `Copy dest, Const` into later uses, so a
++/// `Cast` can legitimately see an `Operand::Const` source at any width.  The
++/// result is the exact 64-bit register image C semantics demand:
++///
++/// 1. the raw payload is first interpreted at the SOURCE type (sign- or
++///    zero-extended from `from_ty`'s width by `from_ty`'s signedness), then
++/// 2. truncated to the DESTINATION width and re-extended by `to_ty`'s
++///    signedness (a wider reader of the register must see the same value the
++///    mature path and GCC/Clang produce).
++///
++/// Before this fold existed the lowering picked the move width from the
++/// destination signedness alone, so `Cast I64->U64` of `0x8000000000000000`
++/// was emitted as `movl $0` (gcc.c-torture `20020219-1.c` aborted at -O2),
++/// `Cast I32(300)->U8` kept the 0x100 bit and `Cast U32(0xFFFFFFFF)->I64`
++/// produced -1.
++pub(crate) fn fold_int_cast_const(raw: i64, from_ty: IrType, to_ty: IrType) -> i64 {
++    fn extend(v: i64, bits: u32, signed: bool) -> i64 {
++        if bits >= 64 {
++            return v;
++        }
++        let shift = 64 - bits;
++        if signed {
++            (v << shift) >> shift
++        } else {
++            ((v as u64) << shift >> shift) as i64
++        }
++    }
++    let from_bits = (from_ty.size() as u32).saturating_mul(8).clamp(8, 64);
++    let to_bits = (to_ty.size() as u32).saturating_mul(8).clamp(8, 64);
++    let mathematical = extend(raw, from_bits, from_ty.is_signed());
++    extend(mathematical, to_bits, to_ty.is_signed())
++}
++
++/// Materialise an exact 64-bit register image with the cheapest encoding:
++/// `movl $imm32` (zero-extends, 5-6 bytes) when the image fits in 32 unsigned
++/// bits, `movq $simm32` (sign-extends) or `movabsq` otherwise - decided by the
++/// emitter from the value alone.  Never uses a narrow move, so no reader of
++/// the destination register can observe stale upper bits.
++fn emit_exact_imm64(image: i64, dst: MachReg, out: &mut Vec<MachInst>) {
++    let size = if image >= 0 && image <= u32::MAX as i64 {
++        OpSize::S32
++    } else {
++        OpSize::S64
++    };
++    out.push(MachInst::Mov {
++        src: MachOperand::Imm(image),
++        dst: MachOperand::Reg(dst),
++        size,
++    });
++}
++
+ pub fn lower_cast(
+     dest: &Value,
+     src: &Operand,
+@@ -648,6 +701,17 @@ pub fn lower_cast(
+     let from_size = OpSize::from_ir_type(from_ty);
+     let to_size = OpSize::from_ir_type(to_ty);
+ 
++    // Constant source (MachInst const-propagation): fold at compile time
++    // with full C conversion semantics and emit one exact move.  This
++    // covers narrowing, same-size and widening casts uniformly.
++    if let Operand::Const(c) = src {
++        if !from_ty.is_float() && !to_ty.is_float() && from_ty.size() <= 8 && to_ty.size() <= 8 {
++            let image = fold_int_cast_const(const_to_i64(c), from_ty, to_ty);
++            emit_exact_imm64(image, dst, out);
++            return;
++        }
++    }
++
+     if to_size as u8 <= from_size as u8 {
+         // Narrowing or same-size cast.  A plain truncating move (movb/movw/
+         // movl) would leave the destination register's UPPER BITS STALE.
+diff --git a/src/passes/ipcp.rs b/src/passes/ipcp.rs
+index 9e431a5..eb32c84 100644
+--- a/src/passes/ipcp.rs
++++ b/src/passes/ipcp.rs
+@@ -295,6 +295,15 @@ fn eval_const_function(
+                     Instruction::Copy { dest, src } => {
+                         values.insert(dest.0, eval_const_operand(src, &values)?);
+                     }
++                    // Cast/UnaryOp/BinOp/Cmp are evaluated by the canonical
++                    // constant-fold evaluators so that the interprocedural
++                    // interpreter can never disagree with the intraprocedural
++                    // folder.  The previous hand-rolled arms went through
++                    // `to_i64()` and ignored the operation TYPE: a `Cmp Ne` at
++                    // U16 between `Cast U32(0xFFFFFFFF)->U16` (held as
++                    // I64(65535)) and `I16(-1)` (the same 16-bit pattern)
++                    // evaluated 65535 != -1 and proved a branch that was
++                    // never taken, so a caller was folded onto its abort path.
+                     Instruction::Cast {
+                         dest,
+                         src,
+@@ -302,35 +311,26 @@ fn eval_const_function(
+                         to_ty,
+                     } => {
+                         let value = eval_const_operand(src, &values)?;
+-                        values.insert(dest.0, value.coerce_to_with_src(*to_ty, Some(*from_ty)));
++                        values.insert(
++                            dest.0,
++                            crate::passes::constant_fold::eval_cast_const(
++                                value, *from_ty, *to_ty,
++                            )?,
++                        );
+                     }
+                     Instruction::UnaryOp { dest, op, src, ty } => {
+-                        let value = eval_const_operand(src, &values)?.to_i64()?;
+-                        let result = match op {
+-                            crate::ir::reexports::IrUnaryOp::Neg => value.checked_neg()?,
+-                            crate::ir::reexports::IrUnaryOp::Not => !value,
+-                            crate::ir::reexports::IrUnaryOp::Clz => {
+-                                (value as u64).leading_zeros() as i64
+-                            }
+-                            crate::ir::reexports::IrUnaryOp::Ctz => {
+-                                (value as u64).trailing_zeros() as i64
+-                            }
+-                            crate::ir::reexports::IrUnaryOp::Popcount => {
+-                                (value as u64).count_ones() as i64
+-                            }
+-                            crate::ir::reexports::IrUnaryOp::Bswap => match *ty {
+-                                IrType::I32 | IrType::U32 => (value as i32).swap_bytes() as i64,
+-                                _ => value.swap_bytes(),
+-                            },
+-                            crate::ir::reexports::IrUnaryOp::BitReverse => match *ty {
+-                                IrType::I8 | IrType::U8 => (value as u8).reverse_bits() as i64,
+-                                IrType::I16 | IrType::U16 => (value as u16).reverse_bits() as i64,
+-                                IrType::I32 | IrType::U32 => (value as u32).reverse_bits() as i64,
+-                                _ => (value as u64).reverse_bits() as i64,
+-                            },
+-                            crate::ir::reexports::IrUnaryOp::IsConstant => 1,
+-                        };
+-                        values.insert(dest.0, IrConst::from_i64(result, *ty));
++                        // `__builtin_constant_p` is phase-dependent; the pure
++                        // evaluator must not commit to an answer for it.
++                        if *op == crate::ir::reexports::IrUnaryOp::IsConstant {
++                            return None;
++                        }
++                        let value = eval_const_operand(src, &values)?;
++                        values.insert(
++                            dest.0,
++                            crate::passes::constant_fold::eval_unaryop_const(
++                                *op, value, None, *ty,
++                            )?,
++                        );
+                     }
+                     Instruction::BinOp {
+                         dest,
+@@ -339,19 +339,25 @@ fn eval_const_function(
+                         rhs,
+                         ty,
+                     } => {
+-                        let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
+-                        let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
+-                        let result = op.eval_i64(lhs, rhs)?;
+-                        values.insert(dest.0, IrConst::from_i64(result, *ty));
++                        let lhs = eval_const_operand(lhs, &values)?;
++                        let rhs = eval_const_operand(rhs, &values)?;
++                        values.insert(
++                            dest.0,
++                            crate::passes::constant_fold::eval_binop_const(*op, lhs, rhs, *ty)?,
++                        );
+                     }
+                     Instruction::Cmp {
+-                        dest, op, lhs, rhs, ..
++                        dest,
++                        op,
++                        lhs,
++                        rhs,
++                        ty,
+                     } => {
+-                        let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
+-                        let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
++                        let lhs = eval_const_operand(lhs, &values)?;
++                        let rhs = eval_const_operand(rhs, &values)?;
+                         values.insert(
+                             dest.0,
+-                            IrConst::I32(if op.eval_i64(lhs, rhs) { 1 } else { 0 }),
++                            crate::passes::constant_fold::eval_cmp_const(*op, lhs, rhs, *ty)?,
+                         );
+                     }
+                     Instruction::Select {
+diff --git a/tests/regression/machinst_const_cast_fold.c b/tests/regression/machinst_const_cast_fold.c
+new file mode 100644
+index 0000000..4a2b42c
+--- /dev/null
++++ b/tests/regression/machinst_const_cast_fold.c
+@@ -0,0 +1,97 @@
++/* MachInst constant-cast fold (x86-64 MachInst path).
++ *
++ * gcc.c-torture/execute/20020219-1.c aborted at -O2/-O3/-Os: after IPCP
++ * replaced `foo()` by `Copy %v, Const(I64(0x8000000000000000))`, the MachInst
++ * lowering of the following `Cast I64->U64` picked the move width from the
++ * DESTINATION signedness alone and emitted `movl $0` (the emitter truncates a
++ * wide immediate to the 32-bit width).  The same lowering kept the 0x100 bit
++ * of `Cast I32(300)->U8` and sign-extended `Cast U32(0xFFFFFFFF)->I64` to -1.
++ *
++ * Every accessor below is a constant-returning function so that IPCP feeds the
++ * cast a constant operand late in the pipeline (after the IR constant folder
++ * ran), which is exactly the shape that reached the backend.  Every expected
++ * value is compared as a full-width integer so a stale/truncated register
++ * image cannot pass by accident.  Exit status is the contract (torture style);
++ * stdout is compared against GCC as well.  */
++#include <stdio.h>
++#include <stdlib.h>
++
++#define NOINLINE __attribute__((noinline))
++
++long long get_msb64(void) { return (long long)(1ULL << 63); }
++int get_300(void) { return 300; }
++unsigned get_u32_max(void) { return 0xFFFFFFFFu; }
++signed char get_sc_m1(void) { return -1; }
++short get_sh_m1(void) { return -1; }
++unsigned short get_us_max(void) { return 0xFFFFu; }
++long long get_m1_64(void) { return -1LL; }
++int get_i32_min(void) { return (int)0x80000000; }
++unsigned char get_uc_200(void) { return 200; }
++long long get_mixed(void) { return 0x1234567890ABCDEFLL; }
++unsigned long long get_umsb(void) { return 0x8000000000000001ULL; }
++
++
++/* One function per case: the torture shape is `Cmp(cast(const), const)` feeding
++ * a branch to abort(), in a function small enough for the MachInst path.
++ * Each returns the case id on failure so the exit code identifies it.  */
++static NOINLINE int t_i64_u64_msb(void) { if (((unsigned long long)get_msb64()) != (0x8000000000000000ULL)) return 1; return 0; }
++static NOINLINE int t_i32_300_u8(void) { if (((unsigned char)get_300()) != (44)) return 2; return 0; }
++static NOINLINE int t_i32_300_i8(void) { if (((long long)(signed char)get_300()) != (44)) return 3; return 0; }
++static NOINLINE int t_u32max_u16(void) { if (((unsigned short)get_u32_max()) != (0xFFFF)) return 4; return 0; }
++static NOINLINE int t_u32max_i16(void) { if (((long long)(short)get_u32_max()) != (-1LL)) return 5; return 0; }
++static NOINLINE int t_mixed_u32(void) { if (((unsigned)get_mixed()) != (0x90ABCDEFu)) return 6; return 0; }
++static NOINLINE int t_mixed_i32(void) { if (((long long)(int)get_mixed()) != ((long long)0xFFFFFFFF90ABCDEFULL)) return 7; return 0; }
++static NOINLINE int t_mixed_u8(void) { if (((unsigned char)get_mixed()) != (0xEF)) return 8; return 0; }
++static NOINLINE int t_umsb_i64(void) { if (((long long)get_umsb()) != ((long long)0x8000000000000001ULL)) return 9; return 0; }
++static NOINLINE int t_u32max_i64(void) { if (((long long)get_u32_max()) != (0xFFFFFFFFLL)) return 10; return 0; }
++static NOINLINE int t_u32max_u64(void) { if (((unsigned long long)get_u32_max()) != (0xFFFFFFFFULL)) return 11; return 0; }
++static NOINLINE int t_sc_m1_u32(void) { if (((unsigned)get_sc_m1()) != (0xFFFFFFFFu)) return 12; return 0; }
++static NOINLINE int t_sc_m1_u64(void) { if (((unsigned long long)get_sc_m1()) != (0xFFFFFFFFFFFFFFFFULL)) return 13; return 0; }
++static NOINLINE int t_sh_m1_u64(void) { if (((unsigned long long)get_sh_m1()) != (0xFFFFFFFFFFFFFFFFULL)) return 14; return 0; }
++static NOINLINE int t_us_max_i32(void) { if (((int)get_us_max()) != (0xFFFF)) return 15; return 0; }
++static NOINLINE int t_us_max_i16(void) { if (((long long)(short)get_us_max()) != (-1LL)) return 16; return 0; }
++static NOINLINE int t_uc200_i8(void) { if (((long long)(signed char)get_uc_200()) != (-56LL)) return 17; return 0; }
++static NOINLINE int t_i32min_u64(void) { if (((unsigned long long)get_i32_min()) != (0xFFFFFFFF80000000ULL)) return 18; return 0; }
++static NOINLINE int t_i32min_u32(void) { if (((unsigned)get_i32_min()) != (0x80000000u)) return 19; return 0; }
++static NOINLINE int t_m1_64_u32_u64(void) { if (((unsigned long long)(unsigned)get_m1_64()) != (0xFFFFFFFFULL)) return 20; return 0; }
++static NOINLINE int t_m1_64_i32_u64(void) { if (((unsigned long long)(int)get_m1_64()) != (0xFFFFFFFFFFFFFFFFULL)) return 21; return 0; }
++static NOINLINE int t_m1_64_u16_i64(void) { if (((long long)(unsigned short)get_m1_64()) != (0xFFFFLL)) return 22; return 0; }
++static NOINLINE int t_i64_u64_neg(void) { if (((unsigned long long)get_m1_64()) != (0xFFFFFFFFFFFFFFFFULL)) return 23; return 0; }
++static NOINLINE int t_u64_i64_big(void) { if (((long long)get_umsb() < 0 ? 1 : 0) != (1)) return 24; return 0; }
++
++int main(void) {
++  int rc = 0;
++  if ((rc = t_i64_u64_msb()) != 0) { printf("FAIL case %d (i64_u64_msb)\n", rc); return rc; }
++  if ((rc = t_i32_300_u8()) != 0) { printf("FAIL case %d (i32_300_u8)\n", rc); return rc; }
++  if ((rc = t_i32_300_i8()) != 0) { printf("FAIL case %d (i32_300_i8)\n", rc); return rc; }
++  if ((rc = t_u32max_u16()) != 0) { printf("FAIL case %d (u32max_u16)\n", rc); return rc; }
++  if ((rc = t_u32max_i16()) != 0) { printf("FAIL case %d (u32max_i16)\n", rc); return rc; }
++  if ((rc = t_mixed_u32()) != 0) { printf("FAIL case %d (mixed_u32)\n", rc); return rc; }
++  if ((rc = t_mixed_i32()) != 0) { printf("FAIL case %d (mixed_i32)\n", rc); return rc; }
++  if ((rc = t_mixed_u8()) != 0) { printf("FAIL case %d (mixed_u8)\n", rc); return rc; }
++  if ((rc = t_umsb_i64()) != 0) { printf("FAIL case %d (umsb_i64)\n", rc); return rc; }
++  if ((rc = t_u32max_i64()) != 0) { printf("FAIL case %d (u32max_i64)\n", rc); return rc; }
++  if ((rc = t_u32max_u64()) != 0) { printf("FAIL case %d (u32max_u64)\n", rc); return rc; }
++  if ((rc = t_sc_m1_u32()) != 0) { printf("FAIL case %d (sc_m1_u32)\n", rc); return rc; }
++  if ((rc = t_sc_m1_u64()) != 0) { printf("FAIL case %d (sc_m1_u64)\n", rc); return rc; }
++  if ((rc = t_sh_m1_u64()) != 0) { printf("FAIL case %d (sh_m1_u64)\n", rc); return rc; }
++  if ((rc = t_us_max_i32()) != 0) { printf("FAIL case %d (us_max_i32)\n", rc); return rc; }
++  if ((rc = t_us_max_i16()) != 0) { printf("FAIL case %d (us_max_i16)\n", rc); return rc; }
++  if ((rc = t_uc200_i8()) != 0) { printf("FAIL case %d (uc200_i8)\n", rc); return rc; }
++  if ((rc = t_i32min_u64()) != 0) { printf("FAIL case %d (i32min_u64)\n", rc); return rc; }
++  if ((rc = t_i32min_u32()) != 0) { printf("FAIL case %d (i32min_u32)\n", rc); return rc; }
++  if ((rc = t_m1_64_u32_u64()) != 0) { printf("FAIL case %d (m1_64_u32_u64)\n", rc); return rc; }
++  if ((rc = t_m1_64_i32_u64()) != 0) { printf("FAIL case %d (m1_64_i32_u64)\n", rc); return rc; }
++  if ((rc = t_m1_64_u16_i64()) != 0) { printf("FAIL case %d (m1_64_u16_i64)\n", rc); return rc; }
++  if ((rc = t_i64_u64_neg()) != 0) { printf("FAIL case %d (i64_u64_neg)\n", rc); return rc; }
++  if ((rc = t_u64_i64_big()) != 0) { printf("FAIL case %d (u64_i64_big)\n", rc); return rc; }
++  /* the torture shape verbatim: shift by (Y & 31) with Y = 32 */
++  {
++    long long C = 1ULL << 63, X;
++    int Y = 32;
++    X = C >> (Y & 31);
++    if (X != (long long)(1ULL << 63)) abort();
++  }
++  puts("ok");
++  return 0;
++}
+diff --git a/tests/regression/machinst_const_cast_fold.flags b/tests/regression/machinst_const_cast_fold.flags
+new file mode 100644
+index 0000000..3a3b579
+--- /dev/null
++++ b/tests/regression/machinst_const_cast_fold.flags
+@@ -0,0 +1 @@
++-O2
+
 From 8c6e471a71056abf000e0cf5f969b84714b59a06 Mon Sep 17 00:00:00 2001
 From: arena-agent <arena-agent@localhost>
 Date: Fri, 4 Sep 2026 08:46:52 +0000
