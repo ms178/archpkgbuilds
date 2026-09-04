@@ -1,224 +1,1838 @@
-diff --git a/src/backend/call_abi.rs b/src/backend/call_abi.rs
-index b631882..ce7675b 100644
---- a/src/backend/call_abi.rs
-+++ b/src/backend/call_abi.rs
-@@ -1261,16 +1261,34 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
-                 let struct_align = param
-                     .and_then(|p| p.struct_align)
-                     .unwrap_or(slot_size as usize);
-+                if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
-+                    eprintln!(
-+                        "[STACK-ALIGN-ARM] fn={} i={} size={} ir_align={:?} slot_size={} cap={} aligning={}",
-+                        func.name, i, size, param.and_then(|p| p.struct_align), slot_size,
-+                        config.stack_arg_align_cap,
-+                        struct_align > slot_size as usize
-+                    );
-+                }
-                 let tf_carrier_ia32 =
-                     slot_size == 4 && param.is_some_and(|p| p.is_f128_sse) && struct_align >= 16;
-                 if tf_carrier_ia32 {
-                     stack_offset = (stack_offset + 15) & !15;
-                 } else if struct_align > slot_size as usize {
--                    let a = (struct_align as i64)
--                        .min(config.stack_arg_align_cap as i64)
--                        .max(slot_size as i64);
-+                    // NOTE: the cap is `usize::MAX` when uncapped (x86-64);
-+                    // the min/max MUST run in usize — casting the cap to i64
-+                    // turns usize::MAX into -1, min() then selects it and the
-+                    // clamp collapses every alignment to the slot size
-+                    // (observed: a 192-byte union with long double read 8
-+                    // bytes early by the callee's param stores — stress abi
-+                    // fn3, gcc-interop SIGSEGV).
-+                    let a = struct_align
-+                        .min(config.stack_arg_align_cap)
-+                        .max(slot_size as usize) as i64;
-                     stack_offset = (stack_offset + a - 1) & !(a - 1);
-                 }
-+                if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
-+                    eprintln!("[STACK-ALIGN-ARM2] fn={} i={} post_align_offset={}", func.name, i, stack_offset);
-+                }
-                 let off = stack_offset;
-                 stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
-                 if matches!(*c, CoreArgClass::LargeStructStack { .. }) {
-@@ -1318,6 +1336,19 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
-         classes.push(pc);
+diff --git a/src/ir/lowering/lvalue.rs b/src/ir/lowering/lvalue.rs
+index 895b1c8..bdf1706 100644
+--- a/src/ir/lowering/lvalue.rs
++++ b/src/ir/lowering/lvalue.rs
+@@ -1,7 +1,7 @@
+ use super::definitions::{LValue, LValueKind};
+ use super::lower::Lowerer;
+ use crate::common::types::{AddressSpace, CType, IrType};
+-use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
++use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier, UnaryOp};
+ use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
+ 
+ impl Lowerer {
+@@ -265,14 +265,64 @@ impl Lowerer {
+             Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => {
+                 self.expr_access_is_volatile(base)
+             }
+-            Expr::ArraySubscript(base, _, _) => self.expr_access_is_volatile(base),
++            // `p[i]` is `*(p + i)`: volatile when the base is a volatile
++            // array object (`volatile int buf[8]; buf[i]`) OR a pointer to
++            // volatile (`volatile u32 *regs; regs[i]` — the MMIO register
++            // array idiom). The first arm alone returned false for every
++            // pointer-typed identifier, so `regs[STATUS]` spin-waits and
++            // back-to-back register writes were silently non-volatile.
++            // `i[p]` (index/base swapped) is covered symmetrically.
++            Expr::ArraySubscript(base, index, _) => {
++                self.expr_access_is_volatile(base)
++                    || self.pointee_expr_is_volatile(base)
++                    || self.pointee_expr_is_volatile(index)
++            }
+             _ => false,
+         }
      }
  
-+    if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
-+        for (i, pc) in classes.iter().enumerate() {
-+            eprintln!(
-+                "[STACK-ALIGN] fn={} param {} = {:?} ir_align={:?}",
-+                func.name,
-+                i,
-+                pc,
-+                func.params.get(i).and_then(|p| p.struct_align)
-+            );
+     /// Whether dereferencing `ptr_expr` accesses a volatile pointee.
+     pub(super) fn pointee_expr_is_volatile(&self, ptr_expr: &Expr) -> bool {
+-        let ptr_expr = ptr_expr;
++        // Pointer arithmetic keeps the pointee qualifier: `*(p + i)`,
++        // `*(p - 1)`, `*(i + p)`, `*(cond ? p : q)`, `*(x, p)`. The integer
++        // side of an Add/Sub is never a pointer, so recursing into both
++        // operands is exact.
++        match ptr_expr {
++            Expr::BinaryOp(BinOp::Add, l, r, _) | Expr::BinaryOp(BinOp::Sub, l, r, _) => {
++                return self.pointee_expr_is_volatile(l) || self.pointee_expr_is_volatile(r);
++            }
++            Expr::Conditional(_, t, f, _) => {
++                return self.pointee_expr_is_volatile(t) || self.pointee_expr_is_volatile(f);
++            }
++            Expr::Comma(_, r, _) => return self.pointee_expr_is_volatile(r),
++            // `volatile int *tbl[4]; *tbl[i]` / `tbl[i][j]`: the element of a
++            // volatile-based array of pointers points at volatile T.
++            Expr::ArraySubscript(base, _, _) => {
++                if let Expr::Identifier(name, _) = base.as_ref() {
++                    let (base_volatile, c_type): (bool, Option<&CType>) = if let Some(info) =
++                        self.func_state.as_ref().and_then(|fs| fs.locals.get(name))
++                    {
++                        (info.base_type_volatile, info.var.c_type.as_ref())
++                    } else if let Some(g) = self.globals.get(name) {
++                        (g.base_type_volatile, g.var.c_type.as_ref())
++                    } else {
++                        return false;
++                    };
++                    return base_volatile
++                        && match c_type {
++                            Some(CType::Array(elem, _)) => match elem.as_ref() {
++                                CType::Pointer(pointee, _) => {
++                                    !matches!(pointee.as_ref(), CType::Pointer(..))
++                                }
++                                _ => false,
++                            },
++                            _ => false,
++                        };
++                }
++                return false;
++            }
++            _ => {}
 +        }
-+        eprintln!("[STACK-ALIGN] fn={} total_stack_bytes={}", func.name, stack_offset);
+         if let Expr::Identifier(name, _) = ptr_expr {
+             let (base_volatile, c_type): (bool, Option<&CType>) =
+                 if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
+diff --git a/src/passes/loop_carried_forward.rs b/src/passes/loop_carried_forward.rs
+new file mode 100644
+index 0000000..25e4190
+--- /dev/null
++++ b/src/passes/loop_carried_forward.rs
+@@ -0,0 +1,1276 @@
++//! Loop-carried store-to-load forwarding (distance-1 predictive commoning).
++//!
++//! Recurrence loops of the form
++//!
++//! ```c
++//! for (i = lo; i <= hi; i++) {
++//!     a[i] = a[i - 1] + p;          // prefix sums, IIR filters, DP tables,
++//!     ...                           // Adler rolling sums, LCG tables, ...
++//! }
++//! ```
++//!
++//! store `a[i]` in iteration n and load `a[i-1]` in iteration n+1 through the
++//! **same address**. Without this pass the load is a store-to-load-forwarding
++//! round trip through the L1D (≈5 cycles on Raptor Lake, on the loop's
++//! critical path); GCC keeps the value in a register (`tree-predcom`,
++//! distance 1) and the loop runs at 1 cycle/iteration. lccc measured 2.19×
++//! slower than GCC on `tls_seg_access` for exactly this reason.
++//!
++//! The pass turns the load into a header phi:
++//!
++//! ```text
++//! preheader:  q0 = load  addr_L(0)            // first iteration's value
++//! header:     q  = phi(q0 [preheader], v [latch])
++//! body:       store v -> addr_S(n)            // unchanged
++//!             (load addr_L(n) deleted; all uses renamed to q)
++//! ```
++//!
++//! # Address model
++//!
++//! Every pointer expression that reaches a loop load/store is normalised to
++//! an affine chain of recurrences over the loop's iteration number `n`:
++//!
++//! ```text
++//! addr(n) = root + Σ c_k·inv_k + stride·n + base
++//! ```
++//!
++//! where `root` is a loop-invariant pointer (`GlobalAddr`, `Alloca`, or an
++//! opaque invariant pointer), `inv_k` are loop-invariant pointer-width
++//! integers, and `stride`/`base` are compile-time constants. Header phis with
++//! a constant step (`i = phi(init, i + c)`, marching pointers
++//! `p = phi(p0, p + 8)`), `GetElementPtr`, `Add`/`Sub`/`Shl`/`Mul` by
++//! constants, `Copy` and same-width `Cast` are folded; everything else is
++//! opaque and fails the candidate closed. Only pointer-width integer
++//! arithmetic is modelled, so wrapping narrow induction variables can never
++//! be mistaken for linear addresses (`iv_widen` runs first and widens the
++//! common `int i` shapes).
++//!
++//! # Legality (all required; every check fails closed)
++//!
++//! 1. Natural loop with a unique preheader and a single latch.
++//! 2. `S` (store) and `L` (load) are non-volatile, default address space,
++//!    identical `IrType`, `S` dominates the latch (executes every iteration).
++//! 3. `lin(L.ptr)` and `lin(S.ptr)` have the same root object, identical
++//!    invariant terms, identical non-zero stride `a` with `|a| ≥ size`, and
++//!    `base_S = base_L + a` — i.e. `addr_L(n+1) == addr_S(n)` and the two
++//!    accesses in the same iteration never overlap.
++//! 4. No instruction in the loop has unmodelled memory effects (calls,
++//!    memcpy, intrinsics, atomics, inline asm, va_*, stack ops ...).
++//! 5. Every other store `T` in the loop is provably disjoint from `L` for
++//!    all iteration pairs: distinct object roots (two different globals, two
++//!    different allocas, or global vs alloca), or the same root with the
++//!    same stride and invariant terms whose byte window
++//!    `(base_T - base_L) mod |a|` never intersects `L`'s window
++//!    (interleaved struct fields). Anything else — unknown roots, different
++//!    strides — rejects the candidate.
++//! 6. The preheader load `addr_L(0)` must be safe to execute even when the
++//!    loop body would not run: either the root is a `GlobalAddr`/`Alloca`
++//!    of known size with no invariant terms and `[base_L, base_L+size)`
++//!    inside the object, or `L`'s block dominates the latch **and** every
++//!    exiting block (so `L` executes before any exit whenever the loop is
++//!    entered at all).
++//! 7. The loop's header does not already carry more than
++//!    `MAX_CARRIED_PHIS` values (register-pressure guard; one saved load is
++//!    not worth a spill).
++//!
++//! # Soundness argument
++//!
++//! Let `M(x)` be the memory at address `x`. `q_0 = M(addr_L(0))` at the
++//! preheader; by (5) and (3) no store between the preheader and `L` in
++//! iteration 0 touches `addr_L(0)` (`S(0)` writes `addr_L(0)+a`, disjoint by
++//! `|a| ≥ size`), so `q_0 == L_0`. For n ≥ 0, `S(n)` writes `v_n` to
++//! `addr_S(n) = addr_L(n+1)`; between `S(n)` and `L(n+1)` the only stores are
++//! later stores of iteration n and earlier stores of iteration n+1, all of
++//! which are either `S` at a different iteration (distinct address, `a ≠ 0`,
++//! `|a| ≥ size`) or provably disjoint `T`s (5). Hence `L_{n+1} == v_n ==
++//! q_{n+1}`. `q` is defined in the header, which dominates every use of `L`,
++//! so renaming is semantics-preserving. The store itself is kept: memory
++//! stays observable.
++//!
++//! Kill switch: `CCC_NO_LOOP_CARRIED_FWD=1`.
++//! Explainability: `CCC_DEBUG_LOOP_CARRIED_FWD=1` prints applied rewrites and
++//! every rejected (load, store) pair that matched the address shape.
++
++use super::loop_analysis::{self, DominanceChecker, NaturalLoop};
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
++use crate::common::source::Span;
++use crate::common::types::{target_ptr_size, AddressSpace, IrType};
++use crate::ir::analysis::CfgAnalysis;
++use crate::ir::reexports::{
++    BlockId, Instruction, IrBinOp, IrConst, IrFunction, IrModule, Operand, Value,
++};
++
++/// Loop-carried phi budget per header (GPR-class). Beyond this the scan
++/// allocator is already at its limit on x86-64 (14 allocatable GPRs minus
++/// scratch); adding a carried value costs a spill that outweighs one load.
++const MAX_CARRIED_PHIS: usize = 10;
++/// Recursion fuel for the affine address normaliser.
++const LIN_FUEL: u32 = 24;
++/// Upper bound on rewrites per function per round (compile-time guard).
++const MAX_REWRITES: usize = 64;
++/// Fixpoint rounds: a rewrite can expose a chained recurrence
++/// (`a[i] = a[i-1] + a[i-2]` needs two rounds).
++const MAX_ROUNDS: usize = 3;
++
++#[derive(Clone, Copy)]
++struct Env {
++    disabled: bool,
++    debug: bool,
++}
++
++impl Env {
++    fn read() -> Self {
++        Self {
++            disabled: std::env::var_os("CCC_NO_LOOP_CARRIED_FWD").is_some(),
++            debug: std::env::var_os("CCC_DEBUG_LOOP_CARRIED_FWD").is_some(),
++        }
++    }
++}
++
++/// Identity of the object a normalised address points into.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++enum Root {
++    Global(String),
++    Alloca(u32),
++    /// Loop-invariant pointer of unknown provenance (parameter, loaded
++    /// pointer, ...). Two `Opaque` roots are the same object iff they are
++    /// the same SSA value; an `Opaque` root may alias *anything* else.
++    Opaque(u32),
++}
++
++/// `root + Σ terms + stride·n + base`, terms sorted by value id.
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct Lin {
++    root: Option<Root>,
++    terms: Vec<(u32, i64)>,
++    stride: i64,
++    base: i64,
++}
++
++impl Lin {
++    fn constant(c: i64) -> Self {
++        Lin {
++            root: None,
++            terms: Vec::new(),
++            stride: 0,
++            base: c,
++        }
 +    }
 +
-     ParamClassification {
-         classes,
-         int_reg_idx: core.int_reg_idx,
-diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
-index 2478eae..b474994 100644
---- a/src/backend/x86/codegen/cast_ops.rs
-+++ b/src/backend/x86/codegen/cast_ops.rs
-@@ -487,6 +487,15 @@ impl X86Codegen {
-             _ => None,
-         };
-         if let Some(src_reg) = src_phys {
-+            // XMM-homed source (integer bit-punned in the float domain): the
-+            // extending move forms below name GP sub-registers only, and
-+            // typed_phys_reg_name has no spelling for xmm indices. Stage
-+            // through the generic callee-register path, which owns the
-+            // xmm→GPR move.
-+            if super::emit::is_xmm_reg(src_reg) {
-+                self.operand_to_callee_reg(src, dest_phys);
-+                return;
++    fn of_root(root: Root) -> Self {
++        Lin {
++            root: Some(root),
++            terms: Vec::new(),
++            stride: 0,
++            base: 0,
++        }
++    }
++
++    fn add(mut self, other: Lin) -> Option<Lin> {
++        if self.root.is_some() && other.root.is_some() {
++            return None;
++        }
++        if self.root.is_none() {
++            self.root = other.root;
++        }
++        self.stride = self.stride.checked_add(other.stride)?;
++        self.base = self.base.checked_add(other.base)?;
++        for (v, c) in other.terms {
++            match self.terms.iter_mut().find(|(w, _)| *w == v) {
++                Some(e) => e.1 = e.1.checked_add(c)?,
++                None => self.terms.push((v, c)),
 +            }
-             // Source is in a register — emit reg-to-reg extending move.
-             let src_typed = typed_phys_reg_name(src_reg, ft);
-             if ft.is_signed() {
-@@ -910,6 +919,14 @@ impl X86Codegen {
-         if src_phys.is_none() && src_slot.is_none() {
-             return false;
-         }
-+        // An XMM-homed source is an integer bit-punned in the float domain
-+        // (fp-select/int-select blending keeps the value in the SSE domain).
-+        // The extending moves below encode GP register names only — route
-+        // such sources through the accumulator fallback, which performs the
-+        // xmm→GPR move (same contract as emit_int_cmp_insn_typed).
-+        if src_phys.is_some_and(super::emit::is_xmm_reg) {
++        }
++        self.terms.retain(|(_, c)| *c != 0);
++        self.terms.sort_unstable();
++        Some(self)
++    }
++
++    fn scale(mut self, k: i64) -> Option<Lin> {
++        if self.root.is_some() {
++            return None;
++        }
++        self.stride = self.stride.checked_mul(k)?;
++        self.base = self.base.checked_mul(k)?;
++        for t in &mut self.terms {
++            t.1 = t.1.checked_mul(k)?;
++        }
++        self.terms.retain(|(_, c)| *c != 0);
++        Some(self)
++    }
++
++    fn same_shape(&self, other: &Lin) -> bool {
++        self.root == other.root && self.terms == other.terms && self.stride == other.stride
++    }
++}
++
++/// Per-function definition table: value id → (block index, instruction index).
++struct Defs {
++    at: Vec<Option<(u32, u32)>>,
++}
++
++impl Defs {
++    fn build(func: &IrFunction, bound: usize) -> Self {
++        let mut at = vec![None; bound];
++        for (bi, b) in func.blocks.iter().enumerate() {
++            for (ii, inst) in b.instructions.iter().enumerate() {
++                if let Some(d) = inst.dest() {
++                    if (d.0 as usize) < bound {
++                        at[d.0 as usize] = Some((bi as u32, ii as u32));
++                    }
++                }
++            }
++        }
++        Defs { at }
++    }
++
++    #[inline]
++    fn get(&self, v: Value) -> Option<(usize, usize)> {
++        self.at
++            .get(v.0 as usize)
++            .copied()
++            .flatten()
++            .map(|(b, i)| (b as usize, i as usize))
++    }
++}
++
++struct Ctx<'a> {
++    func: &'a IrFunction,
++    dom: &'a DominanceChecker,
++    idom: &'a [usize],
++    defs: &'a Defs,
++    globals: &'a FxHashMap<String, usize>,
++    ptr_ty_size: usize,
++    env: Env,
++}
++
++struct LoopShape<'a> {
++    lp: &'a NaturalLoop,
++    header: usize,
++    preheader: usize,
++    latch: usize,
++    preheader_label: BlockId,
++    latch_label: BlockId,
++    exiting: Vec<usize>,
++}
++
++fn const_i64(c: &IrConst) -> Option<i64> {
++    match c {
++        IrConst::I64(v) => Some(*v),
++        IrConst::I32(v) => Some(*v as i64),
++        IrConst::I16(v) => Some(*v as i64),
++        IrConst::I8(v) => Some(*v as i64),
++        _ => None,
++    }
++}
++
++impl<'a> Ctx<'a> {
++    #[inline]
++    fn inst(&self, b: usize, i: usize) -> &Instruction {
++        &self.func.blocks[b].instructions[i]
++    }
++
++    fn in_loop(&self, lp: &NaturalLoop, v: Value) -> bool {
++        match self.defs.get(v) {
++            Some((b, _)) => lp.contains(b),
++            None => false,
++        }
++    }
++
++    fn is_ptr_width_int(&self, ty: IrType) -> bool {
++        ty.is_integer() && ty.size() == self.ptr_ty_size
++    }
++
++    /// Classify a loop-invariant value as a pointer root or an integer term.
++    fn invariant(&self, v: Value) -> Option<Lin> {
++        let mut cur = v;
++        for _ in 0..LIN_FUEL {
++            // A value without a definition (never happens for well-formed
++            // SSA; parameters arrive via `ParamRef`) fails closed.
++            let (b, i) = self.defs.get(cur)?;
++            match self.inst(b, i) {
++                Instruction::GlobalAddr { name, .. } => {
++                    return Some(Lin::of_root(Root::Global(name.clone())))
++                }
++                Instruction::Alloca { dest, .. } => {
++                    return Some(Lin::of_root(Root::Alloca(dest.0)))
++                }
++                Instruction::Copy {
++                    src: Operand::Value(s),
++                    ..
++                } => cur = *s,
++                Instruction::Copy {
++                    src: Operand::Const(c),
++                    ..
++                } => return const_i64(c).map(Lin::constant),
++                Instruction::GetElementPtr { base, offset, .. } => {
++                    let bl = self.invariant(*base)?;
++                    bl.root.as_ref()?;
++                    let ol = self.invariant_operand(offset)?;
++                    if ol.root.is_some() {
++                        return None;
++                    }
++                    return bl.add(ol);
++                }
++                Instruction::BinOp {
++                    op, lhs, rhs, ty, ..
++                } if self.is_ptr_width_int(*ty) => {
++                    return match op {
++                        IrBinOp::Add => {
++                            let a = self.invariant_operand(lhs)?;
++                            a.add(self.invariant_operand(rhs)?)
++                        }
++                        IrBinOp::Sub => {
++                            let a = self.invariant_operand(lhs)?;
++                            a.add(self.invariant_operand(rhs)?.scale(-1)?)
++                        }
++                        IrBinOp::Shl => {
++                            let Operand::Const(c) = rhs else { return None };
++                            let k = const_i64(c)?;
++                            if !(0..=31).contains(&k) {
++                                return None;
++                            }
++                            self.invariant_operand(lhs)?.scale(1i64 << k)
++                        }
++                        IrBinOp::Mul => {
++                            let (x, c) = match (lhs, rhs) {
++                                (x, Operand::Const(c)) => (x, c),
++                                (Operand::Const(c), x) => (x, c),
++                                _ => return None,
++                            };
++                            self.invariant_operand(x)?.scale(const_i64(c)?)
++                        }
++                        // Any other pointer-width integer op: an opaque term.
++                        _ => Some(Lin {
++                            root: None,
++                            terms: vec![(cur.0, 1)],
++                            stride: 0,
++                            base: 0,
++                        }),
++                    };
++                }
++                Instruction::Cast {
++                    src: Operand::Value(sv),
++                    from_ty,
++                    to_ty,
++                    ..
++                } if from_ty.size() == to_ty.size()
++                    && (to_ty.is_integer() || *to_ty == IrType::Ptr)
++                    && (from_ty.is_integer() || *from_ty == IrType::Ptr) =>
++                {
++                    cur = *sv
++                }
++                inst => {
++                    return match inst.result_type() {
++                        Some(IrType::Ptr) => Some(Lin::of_root(Root::Opaque(cur.0))),
++                        Some(ty) if self.is_ptr_width_int(ty) => Some(Lin {
++                            root: None,
++                            terms: vec![(cur.0, 1)],
++                            stride: 0,
++                            base: 0,
++                        }),
++                        _ => None,
++                    }
++                }
++            }
++        }
++        None
++    }
++
++    fn invariant_operand(&self, op: &Operand) -> Option<Lin> {
++        match op {
++            Operand::Const(c) => const_i64(c).map(Lin::constant),
++            Operand::Value(v) => self.invariant(*v),
++        }
++    }
++
++    /// Latch-side step of a header phi: `next == phi + c` (pointer-width
++    /// integer add/sub of a constant, or a GEP by a constant byte offset).
++    /// Copies are looked through.
++    fn phi_step(&self, lp: &NaturalLoop, phi: Value, next: &Operand) -> Option<i64> {
++        let Operand::Value(mut cur) = next else {
++            return None;
++        };
++        for _ in 0..LIN_FUEL {
++            let (b, i) = self.defs.get(cur)?;
++            if !lp.contains(b) {
++                return None;
++            }
++            match self.inst(b, i) {
++                Instruction::Copy {
++                    src: Operand::Value(s),
++                    ..
++                } => cur = *s,
++                Instruction::BinOp {
++                    op: IrBinOp::Add,
++                    lhs,
++                    rhs,
++                    ty,
++                    ..
++                } if self.is_ptr_width_int(*ty) => {
++                    return match (lhs, rhs) {
++                        (Operand::Value(v), Operand::Const(c)) if *v == phi => const_i64(c),
++                        (Operand::Const(c), Operand::Value(v)) if *v == phi => const_i64(c),
++                        _ => None,
++                    }
++                }
++                Instruction::BinOp {
++                    op: IrBinOp::Sub,
++                    lhs: Operand::Value(v),
++                    rhs: Operand::Const(c),
++                    ty,
++                    ..
++                } if *v == phi && self.is_ptr_width_int(*ty) => {
++                    return const_i64(c)?.checked_neg()
++                }
++                Instruction::GetElementPtr {
++                    base,
++                    offset: Operand::Const(c),
++                    ..
++                } if *base == phi => return const_i64(c),
++                _ => return None,
++            }
++        }
++        None
++    }
++
++    /// Affine normalisation of an operand relative to `sh`'s loop.
++    fn lin(&self, sh: &LoopShape, op: &Operand, fuel: u32) -> Option<Lin> {
++        if fuel == 0 {
++            return None;
++        }
++        let v = match op {
++            Operand::Const(c) => return const_i64(c).map(Lin::constant),
++            Operand::Value(v) => *v,
++        };
++        if !self.in_loop(sh.lp, v) {
++            return self.invariant(v);
++        }
++        let (b, i) = self.defs.get(v)?;
++        match self.inst(b, i) {
++            Instruction::Phi { incoming, ty, .. } => {
++                if b != sh.header || incoming.len() != 2 {
++                    return None;
++                }
++                if !(*ty == IrType::Ptr || self.is_ptr_width_int(*ty)) {
++                    return None;
++                }
++                let (init, next) = match (&incoming[0], &incoming[1]) {
++                    ((a, la), (n, ln)) if *la == sh.preheader_label && *ln == sh.latch_label => {
++                        (a, n)
++                    }
++                    ((n, ln), (a, la)) if *la == sh.preheader_label && *ln == sh.latch_label => {
++                        (a, n)
++                    }
++                    _ => return None,
++                };
++                let step = self.phi_step(sh.lp, v, next)?;
++                let mut l = self.lin(sh, init, fuel - 1)?;
++                l.stride = l.stride.checked_add(step)?;
++                Some(l)
++            }
++            Instruction::Copy { src, .. } => self.lin(sh, src, fuel - 1),
++            Instruction::Cast {
++                src,
++                from_ty,
++                to_ty,
++                ..
++            } => {
++                // Same-width int↔int / int↔ptr reinterpretations are linear;
++                // narrowing or widening is not (wrap / sign extension).
++                let same = from_ty.size() == to_ty.size()
++                    && (to_ty.is_integer() || *to_ty == IrType::Ptr)
++                    && (from_ty.is_integer() || *from_ty == IrType::Ptr);
++                if same {
++                    self.lin(sh, src, fuel - 1)
++                } else {
++                    None
++                }
++            }
++            Instruction::GetElementPtr { base, offset, .. } => {
++                let bl = self.lin(sh, &Operand::Value(*base), fuel - 1)?;
++                bl.root.as_ref()?;
++                let ol = self.lin(sh, offset, fuel - 1)?;
++                if ol.root.is_some() {
++                    return None;
++                }
++                bl.add(ol)
++            }
++            Instruction::BinOp {
++                op, lhs, rhs, ty, ..
++            } => {
++                if !self.is_ptr_width_int(*ty) {
++                    return None;
++                }
++                match op {
++                    IrBinOp::Add => {
++                        let a = self.lin(sh, lhs, fuel - 1)?;
++                        let b = self.lin(sh, rhs, fuel - 1)?;
++                        a.add(b)
++                    }
++                    IrBinOp::Sub => {
++                        let a = self.lin(sh, lhs, fuel - 1)?;
++                        let b = self.lin(sh, rhs, fuel - 1)?.scale(-1)?;
++                        a.add(b)
++                    }
++                    IrBinOp::Shl => {
++                        let Operand::Const(c) = rhs else { return None };
++                        let k = const_i64(c)?;
++                        if !(0..=31).contains(&k) {
++                            return None;
++                        }
++                        self.lin(sh, lhs, fuel - 1)?.scale(1i64 << k)
++                    }
++                    IrBinOp::Mul => {
++                        let (x, c) = match (lhs, rhs) {
++                            (x, Operand::Const(c)) => (x, c),
++                            (Operand::Const(c), x) => (x, c),
++                            _ => return None,
++                        };
++                        let k = const_i64(c)?;
++                        self.lin(sh, x, fuel - 1)?.scale(k)
++                    }
++                    _ => None,
++                }
++            }
++            _ => None,
++        }
++    }
++
++    /// Is a preheader load of `addr_L(0)` guaranteed not to fault?
++    fn preheader_load_safe(
++        &self,
++        sh: &LoopShape,
++        l: &Lin,
++        size: usize,
++        load_block: usize,
++    ) -> bool {
++        // (a) in-bounds access of an object with statically known size.
++        if l.terms.is_empty() {
++            let obj_size = match &l.root {
++                Some(Root::Global(name)) => self.globals.get(name).copied(),
++                Some(Root::Alloca(id)) => match self.defs.get(Value(*id)) {
++                    Some((b, i)) => match self.inst(b, i) {
++                        Instruction::Alloca { size, .. } => Some(*size),
++                        _ => None,
++                    },
++                    None => None,
++                },
++                _ => None,
++            };
++            if let Some(obj) = obj_size {
++                if obj > 0 && l.base >= 0 && (l.base as u128) + (size as u128) <= obj as u128 {
++                    return true;
++                }
++            }
++        }
++        // (b) the load executes before any exit whenever the loop is entered.
++        if self.dom.dominates(load_block, sh.latch)
++            && sh.exiting.iter().all(|&e| self.dom.dominates(load_block, e))
++        {
++            return true;
++        }
++        // (c) some non-volatile access of the same address (same root, same
++        // invariant terms, same byte offset, at least as wide) already
++        // executed on every path to the preheader: `a[n] = k; for (i = n-1;
++        // ...) a[i] = f(a[i+1])`. Walk the preheader and its dominators.
++        if self.dominating_access_covers(sh, l, size) {
++            return true;
++        }
++        // (d) the header's exit test is a compare of a header phi with a
++        // constant init against a constant, and it passes on the first
++        // iteration: the body (and the load, if it dominates the latch)
++        // executes at least once whenever the preheader does.
++        self.dom.dominates(load_block, sh.latch) && self.first_trip_proven(sh)
++    }
++
++    fn dominating_access_covers(&self, sh: &LoopShape, l: &Lin, size: usize) -> bool {
++        const BUDGET: usize = 256;
++        let mut seen = 0usize;
++        let mut b = sh.preheader;
++        loop {
++            for inst in self.func.blocks[b].instructions.iter().rev() {
++                seen += 1;
++                if seen > BUDGET {
++                    return false;
++                }
++                let (ptr, ty, vol, seg) = match inst {
++                    Instruction::Load {
++                        ptr,
++                        ty,
++                        volatile,
++                        seg_override,
++                        ..
++                    }
++                    | Instruction::Store {
++                        ptr,
++                        ty,
++                        volatile,
++                        seg_override,
++                        ..
++                    } => (*ptr, *ty, *volatile, *seg_override),
++                    _ => continue,
++                };
++                if vol || seg != AddressSpace::Default || ty.size() < size {
++                    continue;
++                }
++                let Some(al) = self.invariant(ptr) else { continue };
++                if al.root == l.root && al.terms == l.terms && al.stride == 0 && al.base == l.base {
++                    return true;
++                }
++            }
++            let idom = self.idom[b];
++            if idom == b || idom == usize::MAX || idom >= self.func.blocks.len() {
++                return false;
++            }
++            b = idom;
++        }
++    }
++
++    fn first_trip_proven(&self, sh: &LoopShape) -> bool {
++        use crate::ir::reexports::{IrCmpOp, Terminator};
++        let header = &self.func.blocks[sh.header];
++        let Terminator::CondBranch {
++            cond: Operand::Value(cv),
++            true_label,
++            false_label,
++        } = &header.terminator
++        else {
++            return false;
++        };
++        let Some((cb, ci)) = self.defs.get(*cv) else { return false };
++        if cb != sh.header {
 +            return false;
 +        }
- 
-         match kind {
-             CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 3d31a03..b1b0272 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -1755,6 +1755,17 @@ impl X86Codegen {
-                         let n = lines.len();
-                         lines[n.saturating_sub(30)..].to_vec()
-                     };
-+                    if std::env::var_os("CCC_DEBUG_NOHOME").is_some() {
-+                        eprintln!(
-+                            "[NOHOME] fn={} value={} defined_by={:?} in_ir_shadow={}",
-+                            self.state.current_func_name,
-+                            v.0,
-+                            self.get_defining_instruction(v.0).map(|i| format!("{i:?}")),
-+                            self.machinst_buf_ir
-+                                .iter()
-+                                .any(|i| i.dest().map(|d| d.0) == Some(v.0))
-+                        );
-+                    }
-                     panic!(
-                         "x86 codegen: operand_to_rax: value {} in function '{}' \
-                          has no register home, no stack slot and no acc-cache \
-@@ -4966,6 +4977,38 @@ impl ArchCodegen for X86Codegen {
-         {
-             return false;
-         }
-+        // PF-15 hazard closure: a Cast admitted to the MachInst queue never
-+        // runs the mature cast emitter, so it neither records a pending
-+        // widening move nor honours try_record_pending_widen's refusal
-+        // contract ("any refusal flushes the deferred moves FIRST"). Every
-+        // other instruction kind flushes at the per-instruction loop head;
-+        // a Cmp folds-or-flushes in its dispatch arm. A Cast is therefore
-+        // the ONLY instruction that can be lowered while a pending-widen
-+        // record is alive, and its register writes are invisible to the
-+        // record's soundness model.
-+        //
-+        // Why that is a miscompile: the recorded source's only modelled use
-+        // is its own deferred move, so RA legally reuses the source's home
-+        // for a later cast's destination. Queueing that cast emits the
-+        // clobbering move while the record still promises the consuming
-+        // compare an intact source home
-+        // (stress reproducer: `cmp((int)p2, (uint16)p1)` after
-+        // `movzwl %esi, %edx` — both operands collapsed to %rdx, lccc
-+        // returned 1 for 58142 <= 0).
-+        //
-+        // Ordering: the record-creating cast went through the classic path,
-+        // which flushed the MachInst run first, so every buffered
-+        // instruction POSTDATES the record. Emitting the deferred widening
-+        // moves before that buffered run restores exact program order: the
-+        // moves read their source homes at the record point, ahead of any
-+        // queued clobber. The flushed run is pure performance state — the
-+        // buffer reforms behind the widening moves.
-+        if matches!(inst, crate::ir::reexports::Instruction::Cast { .. })
-+            && (self.pending_widen[0].is_some() || self.pending_widen[1].is_some())
-+        {
-+            self.flush_pending_widen_impl();
-+            self.flush_machinst();
++        let Instruction::Cmp { op, lhs, rhs, ty, .. } = self.inst(cb, ci) else {
++            return false;
++        };
++        if !ty.is_integer() {
++            return false;
 +        }
-         // ParamRef: lower the no-code subset AND the single-move
-         // materializations through MachInst.
-         //
-diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index 514dd18..7575554 100644
---- a/src/backend/x86/codegen/prologue.rs
-+++ b/src/backend/x86/codegen/prologue.rs
-@@ -297,6 +297,14 @@ impl X86Codegen {
-         }
-         // Count named params using the shared ABI classification, so this
-         // stays in sync with classify_call_args (caller side) automatically.
-+        //
-+        // NOTE (SysV x86-64 sret): for functions returning a MEMORY-class
-+        // struct the IR already carries the hidden return pointer as an
-+        // extra leading parameter, so the classification's GP count includes
-+        // the sret slot — gp_offset and the register-save gp_start derived
-+        // below are correct as-is. Do NOT add another +1 here (verified:
-+        // stress abi fn3 `union A3 fn3(long, float, uchar, A3, ull, A3, ...)`
-+        // expects gp_offset = 32 = sret(rdi) + a0(rsi) + a3(rdx) + a5(rcx)).
-         {
-             let config = self.call_abi_config_impl();
-             let classification = crate::backend::call_abi::classify_params_full(func, &config);
-diff --git a/src/frontend/parser/parse.rs b/src/frontend/parser/parse.rs
-index 89177ec..e92315d 100644
---- a/src/frontend/parser/parse.rs
-+++ b/src/frontend/parser/parse.rs
-@@ -1831,6 +1831,25 @@ impl Parser {
-         }
-     }
- 
-+    /// True when the next token terminates the enclosing block, i.e. a
-+    /// `case` / `default` / identifier label is the final item before the
-+    /// closing brace of a compound statement (or the token stream ends).
-+    ///
-+    /// This accepts the GNU/C23 form where a label directly precedes `}`:
-+    ///
-+    /// ```c
-+    /// switch (x) {
-+    ///     case 1: return 10;
-+    ///     case 2:          // falls out of the switch
-+    /// }
-+    /// ```
-+    ///
-+    /// Callers attach a null statement in that situation; execution simply
-+    /// continues with the statement following the enclosing block.
-+    pub(super) fn label_at_block_end(&self) -> bool {
-+        matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof)
++        // Resolve each side to its first-iteration constant value.
++        let first = |o: &Operand| -> Option<i128> {
++            match o {
++                Operand::Const(c) => const_i64(c).map(|v| v as i128),
++                Operand::Value(v) => {
++                    let (b, i) = self.defs.get(*v)?;
++                    if b != sh.header {
++                        return None;
++                    }
++                    let Instruction::Phi { incoming, .. } = self.inst(b, i) else {
++                        return None;
++                    };
++                    let (init, _) = incoming.iter().find(|(_, l)| *l == sh.preheader_label)?;
++                    match init {
++                        Operand::Const(c) => const_i64(c).map(|v| v as i128),
++                        _ => None,
++                    }
++                }
++            }
++        };
++        let (Some(a), Some(b)) = (first(lhs), first(rhs)) else {
++            return false;
++        };
++        let bits = (ty.size() * 8) as u32;
++        let mask: i128 = if bits >= 128 { -1 } else { (1i128 << bits) - 1 };
++        let (ua, ub) = (a & mask, b & mask);
++        let taken = match op {
++            IrCmpOp::Eq => a == b,
++            IrCmpOp::Ne => a != b,
++            IrCmpOp::Slt => a < b,
++            IrCmpOp::Sle => a <= b,
++            IrCmpOp::Sgt => a > b,
++            IrCmpOp::Sge => a >= b,
++            IrCmpOp::Ult => ua < ub,
++            IrCmpOp::Ule => ua <= ub,
++            IrCmpOp::Ugt => ua > ub,
++            IrCmpOp::Uge => ua >= ub,
++        };
++        let label_to_idx = |l: &BlockId| self.func.blocks.iter().position(|bb| bb.label == *l);
++        let target = if taken { true_label } else { false_label };
++        match label_to_idx(target) {
++            Some(t) => sh.lp.contains(t) && t != sh.header,
++            None => false,
++        }
++    }
++}
++
++/// Instructions the analysis models precisely. Anything else that could
++/// touch memory rejects the loop (default-closed, see `store_load_forward.rs`).
++fn is_modelled(inst: &Instruction) -> bool {
++    matches!(
++        inst,
++        Instruction::Load { .. }
++            | Instruction::Store { .. }
++            | Instruction::BinOp { .. }
++            | Instruction::UnaryOp { .. }
++            | Instruction::Cmp { .. }
++            | Instruction::GetElementPtr { .. }
++            | Instruction::Cast { .. }
++            | Instruction::Copy { .. }
++            | Instruction::GlobalAddr { .. }
++            | Instruction::Phi { .. }
++            | Instruction::Select { .. }
++            | Instruction::ParamRef { .. }
++            | Instruction::LabelAddr { .. }
++    )
++}
++
++struct MemOp {
++    block: usize,
++    idx: usize,
++    is_store: bool,
++    volatile: bool,
++    seg: AddressSpace,
++    ty: IrType,
++    lin: Option<Lin>,
++}
++
++struct Rewrite {
++    load_block: usize,
++    load_idx: usize,
++    load_dest: Value,
++    ty: IrType,
++    store_val: Operand,
++    lin0: Lin,
++}
++
++/// Can store `t` ever overlap load address `l` (any iteration pair)?
++/// Conservative: `true` unless disjointness is proven.
++fn may_overlap(t: &MemOp, l: &Lin, l_size: usize) -> bool {
++    let Some(tl) = &t.lin else { return true };
++    let t_size = t.ty.size();
++    if t_size == 0 {
++        return true;
++    }
++    match (&tl.root, &l.root) {
++        (Some(Root::Global(a)), Some(Root::Global(b))) if a != b => return false,
++        (Some(Root::Alloca(a)), Some(Root::Alloca(b))) if a != b => return false,
++        (Some(Root::Global(_)), Some(Root::Alloca(_)))
++        | (Some(Root::Alloca(_)), Some(Root::Global(_))) => return false,
++        (Some(Root::Opaque(_)), _) | (_, Some(Root::Opaque(_))) => {
++            // An opaque pointer may alias any other object; only the same
++            // SSA pointer with the same shape can be reasoned about.
++            if tl.root != l.root {
++                return true;
++            }
++        }
++        _ => {}
++    }
++    if !tl.same_shape(l) || l.stride == 0 {
++        return true;
++    }
++    let a = l.stride.unsigned_abs() as i128;
++    let d = ((tl.base as i128 - l.base as i128) % a + a) % a; // in [0, a)
++    let t_end = d + t_size as i128;
++    let l_size = l_size as i128;
++    // Within one stride period T occupies [d, d+t_size) and L occupies
++    // [0, l_size). They overlap when T starts inside L's window, or when T
++    // wraps past the period end back into [0, t_end - a).
++    d < l_size || t_end > a
++}
++
++fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
++    // Register-pressure guard.
++    let carried = cx.func.blocks[sh.header]
++        .instructions
++        .iter()
++        .filter(|i| matches!(i, Instruction::Phi { .. }))
++        .count();
++    if carried > MAX_CARRIED_PHIS {
++        return;
++    }
++    let mut ops: Vec<MemOp> = Vec::new();
++    let mut blocks: Vec<usize> = sh.lp.body.iter().copied().collect();
++    blocks.sort_unstable();
++    for &b in &blocks {
++        for (i, inst) in cx.func.blocks[b].instructions.iter().enumerate() {
++            if !is_modelled(inst) {
++                if cx.env.debug {
++                    eprintln!(
++                        "[lcfwd] {}: loop@{} rejected: unmodelled memory effect {:?}",
++                        cx.func.name,
++                        sh.header,
++                        std::mem::discriminant(inst)
++                    );
++                }
++                return;
++            }
++            match inst {
++                Instruction::Load {
++                    ptr,
++                    ty,
++                    seg_override,
++                    volatile,
++                    ..
++                } => ops.push(MemOp {
++                    block: b,
++                    idx: i,
++                    is_store: false,
++                    volatile: *volatile,
++                    seg: *seg_override,
++                    ty: *ty,
++                    lin: cx.lin(sh, &Operand::Value(*ptr), LIN_FUEL),
++                }),
++                Instruction::Store {
++                    ptr,
++                    ty,
++                    seg_override,
++                    volatile,
++                    ..
++                } => ops.push(MemOp {
++                    block: b,
++                    idx: i,
++                    is_store: true,
++                    volatile: *volatile,
++                    seg: *seg_override,
++                    ty: *ty,
++                    lin: cx.lin(sh, &Operand::Value(*ptr), LIN_FUEL),
++                }),
++                _ => {}
++            }
++        }
++    }
++    if !ops.iter().any(|o| o.is_store) {
++        return;
++    }
++    let mut claimed_loads: FxHashSet<(usize, usize)> = FxHashSet::default();
++    for (si, s) in ops.iter().enumerate() {
++        if !s.is_store || s.volatile || s.seg != AddressSpace::Default {
++            continue;
++        }
++        let Some(sl) = &s.lin else { continue };
++        if sl.root.is_none() || sl.stride == 0 {
++            continue;
++        }
++        if !cx.dom.dominates(s.block, sh.latch) {
++            continue;
++        }
++        let size = s.ty.size();
++        if size == 0 || (sl.stride.unsigned_abs() as usize) < size {
++            continue;
++        }
++        for l in ops.iter() {
++            if l.is_store || l.volatile || l.seg != AddressSpace::Default || l.ty != s.ty {
++                continue;
++            }
++            if claimed_loads.contains(&(l.block, l.idx)) {
++                continue;
++            }
++            let Some(ll) = &l.lin else { continue };
++            if !ll.same_shape(sl) || ll.base.checked_add(sl.stride) != Some(sl.base) {
++                continue;
++            }
++            // Candidate pair: L(n+1) == S(n). Every other store must be
++            // provably disjoint from L across all iterations.
++            let conflict = ops
++                .iter()
++                .enumerate()
++                .filter(|(ti, t)| *ti != si && t.is_store)
++                .find(|(_, t)| may_overlap(t, ll, size));
++            if let Some((_, t)) = conflict {
++                if cx.env.debug {
++                    eprintln!(
++                        "[lcfwd] {}: loop@{} pair (load b{}i{}, store b{}i{}) rejected: \
++                         store b{}i{} may alias (load {:?}, store {:?})",
++                        cx.func.name, sh.header, l.block, l.idx, s.block, s.idx, t.block, t.idx, ll, t.lin
++                    );
++                }
++                continue;
++            }
++            if !cx.preheader_load_safe(sh, ll, size, l.block) {
++                if cx.env.debug {
++                    eprintln!(
++                        "[lcfwd] {}: loop@{} pair (load b{}i{}, store b{}i{}) rejected: \
++                         preheader load not provably safe",
++                        cx.func.name, sh.header, l.block, l.idx, s.block, s.idx
++                    );
++                }
++                continue;
++            }
++            let Instruction::Load { dest, .. } = cx.inst(l.block, l.idx) else {
++                continue;
++            };
++            let Instruction::Store { val, .. } = cx.inst(s.block, s.idx) else {
++                continue;
++            };
++            claimed_loads.insert((l.block, l.idx));
++            out.push(Rewrite {
++                load_block: l.block,
++                load_idx: l.idx,
++                load_dest: *dest,
++                ty: l.ty,
++                store_val: val.clone(),
++                lin0: ll.clone(),
++            });
++            if cx.env.debug {
++                eprintln!(
++                    "[lcfwd] {}: loop@{} forward store b{}i{} -> load b{}i{} ({:?}, stride {}, base {})",
++                    cx.func.name, sh.header, s.block, s.idx, l.block, l.idx, l.ty, ll.stride, ll.base
++                );
++            }
++            if out.len() >= MAX_REWRITES {
++                return;
++            }
++            break; // one load per store per round
++        }
++    }
++}
++
++fn alloc_value(func: &mut IrFunction) -> Value {
++    let v = Value(func.next_value_id);
++    func.next_value_id += 1;
++    v
++}
++
++fn push_inst(func: &mut IrFunction, block: usize, inst: Instruction) {
++    let b = &mut func.blocks[block];
++    if !b.source_spans.is_empty() {
++        b.source_spans.push(Span::dummy());
++    }
++    b.instructions.push(inst);
++}
++
++fn insert_inst(func: &mut IrFunction, block: usize, at: usize, inst: Instruction) {
++    let b = &mut func.blocks[block];
++    if !b.source_spans.is_empty() {
++        b.source_spans.insert(at, Span::dummy());
++    }
++    b.instructions.insert(at, inst);
++}
++
++fn remove_inst(func: &mut IrFunction, block: usize, at: usize) {
++    let b = &mut func.blocks[block];
++    if !b.source_spans.is_empty() {
++        b.source_spans.remove(at);
++    }
++    b.instructions.remove(at);
++}
++
++/// Build `root + Σ c_k·inv_k + base` at the end of `preheader`.
++fn materialise_addr(
++    func: &mut IrFunction,
++    preheader: usize,
++    root: Value,
++    lin: &Lin,
++    int_ty: IrType,
++) -> Value {
++    let mut ptr = root;
++    if !lin.terms.is_empty() {
++        let mut acc: Option<Value> = None;
++        for &(v, c) in &lin.terms {
++            let term = if c == 1 {
++                Value(v)
++            } else {
++                let t = alloc_value(func);
++                push_inst(
++                    func,
++                    preheader,
++                    Instruction::BinOp {
++                        dest: t,
++                        op: IrBinOp::Mul,
++                        lhs: Operand::Value(Value(v)),
++                        rhs: Operand::Const(IrConst::I64(c)),
++                        ty: int_ty,
++                    },
++                );
++                t
++            };
++            acc = Some(match acc {
++                None => term,
++                Some(a) => {
++                    let s = alloc_value(func);
++                    push_inst(
++                        func,
++                        preheader,
++                        Instruction::BinOp {
++                            dest: s,
++                            op: IrBinOp::Add,
++                            lhs: Operand::Value(a),
++                            rhs: Operand::Value(term),
++                            ty: int_ty,
++                        },
++                    );
++                    s
++                }
++            });
++        }
++        let g = alloc_value(func);
++        push_inst(
++            func,
++            preheader,
++            Instruction::GetElementPtr {
++                dest: g,
++                base: ptr,
++                offset: Operand::Value(acc.expect("non-empty terms")),
++                ty: IrType::I8,
++            },
++        );
++        ptr = g;
++    }
++    if lin.base != 0 {
++        let g = alloc_value(func);
++        push_inst(
++            func,
++            preheader,
++            Instruction::GetElementPtr {
++                dest: g,
++                base: ptr,
++                offset: Operand::Const(IrConst::I64(lin.base)),
++                ty: IrType::I8,
++            },
++        );
++        ptr = g;
++    }
++    ptr
++}
++
++/// The SSA value that carries `lin.root`. For globals, the `GlobalAddr`
++/// reachable from the load's own address chain is used — by construction it
++/// dominates the loop and therefore the preheader.
++fn root_value(func: &IrFunction, defs: &Defs, lin: &Lin, load_ptr: Value) -> Option<Value> {
++    match lin.root.as_ref()? {
++        Root::Alloca(id) | Root::Opaque(id) => Some(Value(*id)),
++        Root::Global(name) => {
++            let mut cur = load_ptr;
++            for _ in 0..LIN_FUEL {
++                let (b, i) = defs.get(cur)?;
++                match &func.blocks[b].instructions[i] {
++                    Instruction::GlobalAddr { dest, name: n } if n == name => return Some(*dest),
++                    Instruction::GetElementPtr { base, .. } => cur = *base,
++                    Instruction::Copy {
++                        src: Operand::Value(s),
++                        ..
++                    }
++                    | Instruction::Cast {
++                        src: Operand::Value(s),
++                        ..
++                    } => cur = *s,
++                    Instruction::Phi { incoming, .. } => {
++                        // Follow the incoming that is defined outside the
++                        // phi's own block (the init side).
++                        let mut next = None;
++                        for (o, _) in incoming {
++                            if let Operand::Value(s) = o {
++                                if defs.get(*s).map(|(db, _)| db) != Some(b) {
++                                    next = Some(*s);
++                                    break;
++                                }
++                            }
++                        }
++                        cur = next?;
++                    }
++                    _ => return None,
++                }
++            }
++            None
++        }
++    }
++}
++
++fn run_round(func: &mut IrFunction, globals: &FxHashMap<String, usize>, env: Env) -> usize {
++    let cfg = CfgAnalysis::build(func);
++    let loops = loop_analysis::find_merged_natural_loops(
++        func.blocks.len(),
++        &cfg.preds,
++        &cfg.succs,
++        &cfg.idom,
++    );
++    if loops.is_empty() {
++        return 0;
++    }
++    let bound = func.sound_next_value_id();
++    func.next_value_id = bound;
++    let dom = DominanceChecker::new(func.blocks.len(), &cfg.idom);
++    let defs = Defs::build(func, bound as usize);
++    let ptr_ty_size = target_ptr_size();
++    let int_ty = if ptr_ty_size == 8 {
++        IrType::I64
++    } else {
++        IrType::I32
++    };
++
++    struct Plan {
++        header: usize,
++        preheader: usize,
++        ph_label: BlockId,
++        latch_label: BlockId,
++        rewrites: Vec<Rewrite>,
++    }
++    let mut plans: Vec<Plan> = Vec::new();
++    {
++        let cx = Ctx {
++            func: &*func,
++            dom: &dom,
++            idom: &cfg.idom,
++            defs: &defs,
++            globals,
++            ptr_ty_size,
++            env,
++        };
++        for lp in &loops {
++            let Some(preheader) = lp.find_preheader(&cfg.preds) else {
++                continue;
++            };
++            let Some(latch) = lp.single_latch(&cfg.preds) else {
++                continue;
++            };
++            let sh = LoopShape {
++                lp,
++                header: lp.header,
++                preheader,
++                latch,
++                preheader_label: func.blocks[preheader].label,
++                latch_label: func.blocks[latch].label,
++                exiting: lp.exiting_blocks(&cfg.succs),
++            };
++            let mut rewrites = Vec::new();
++            plan_loop(&cx, &sh, &mut rewrites);
++            if !rewrites.is_empty() {
++                plans.push(Plan {
++                    header: sh.header,
++                    preheader,
++                    ph_label: sh.preheader_label,
++                    latch_label: sh.latch_label,
++                    rewrites,
++                });
++            }
++        }
++    }
++    if plans.is_empty() {
++        return 0;
 +    }
 +
-     /// Parse the parenthesized argument of `aligned(expr)` in __attribute__.
-     /// Expects the opening `(` to be the current token (not yet consumed).
-     /// Parses and evaluates a constant expression, consuming through the closing `)`.
-diff --git a/src/frontend/parser/statements.rs b/src/frontend/parser/statements.rs
-index bd55721..bc5d3b3 100644
---- a/src/frontend/parser/statements.rs
-+++ b/src/frontend/parser/statements.rs
-@@ -297,7 +297,11 @@ impl Parser {
-     /// the rest of the function (the stress lab's `switch` family emits this
-     /// shape and GCC 12 accepts it).
-     fn parse_label_body(&mut self) -> Stmt {
--        if matches!(self.peek(), TokenKind::RBrace) {
-+        // GNU/C23 6.8.1: a label may be the last item of a compound statement
-+        // (`case 2:` directly before `}`).  `label_at_block_end` also accepts
-+        // a truncated token stream (Eof) so malformed input degrades to a
-+        // null-statement label instead of an unhandled parse failure.
-+        if self.label_at_block_end() {
-             return Stmt::Expr(None);
++    // Apply. Loads are deleted last, from high to low index, so recorded
++    // positions stay valid; renames are applied globally at the end (a
++    // load's dest may be another rewrite's store value).
++    let mut rename: FxHashMap<u32, Value> = FxHashMap::default();
++    let mut deletions: Vec<(usize, usize)> = Vec::new();
++    let mut applied = 0usize;
++    for plan in plans {
++        for rw in plan.rewrites {
++            let Instruction::Load { ptr: load_ptr, .. } =
++                func.blocks[rw.load_block].instructions[rw.load_idx].clone()
++            else {
++                continue;
++            };
++            let Some(root) = root_value(func, &defs, &rw.lin0, load_ptr) else {
++                if env.debug {
++                    eprintln!(
++                        "[lcfwd] {}: could not materialise root for load {:?}",
++                        func.name, rw.load_dest
++                    );
++                }
++                continue;
++            };
++            let addr0 = materialise_addr(func, plan.preheader, root, &rw.lin0, int_ty);
++            let q0 = alloc_value(func);
++            push_inst(
++                func,
++                plan.preheader,
++                Instruction::Load {
++                    dest: q0,
++                    ptr: addr0,
++                    ty: rw.ty,
++                    seg_override: AddressSpace::Default,
++                    volatile: false,
++                },
++            );
++            let q = alloc_value(func);
++            insert_inst(
++                func,
++                plan.header,
++                0,
++                Instruction::Phi {
++                    dest: q,
++                    ty: rw.ty,
++                    incoming: vec![
++                        (Operand::Value(q0), plan.ph_label),
++                        (rw.store_val.clone(), plan.latch_label),
++                    ],
++                },
++            );
++            // The header phi insertion shifted every recorded index in that
++            // header by one (this rewrite's load and earlier deletions).
++            for d in deletions.iter_mut() {
++                if d.0 == plan.header {
++                    d.1 += 1;
++                }
++            }
++            let load_idx = if rw.load_block == plan.header {
++                rw.load_idx + 1
++            } else {
++                rw.load_idx
++            };
++            deletions.push((rw.load_block, load_idx));
++            rename.insert(rw.load_dest.0, q);
++            applied += 1;
++        }
++    }
++    if applied == 0 {
++        return 0;
++    }
++    // Resolve rename chains (q of one rewrite may be the store value of
++    // another whose load was itself renamed).
++    let resolve = |mut v: Value| {
++        for _ in 0..LIN_FUEL {
++            match rename.get(&v.0) {
++                Some(n) if *n != v => v = *n,
++                _ => break,
++            }
++        }
++        v
++    };
++    for b in func.blocks.iter_mut() {
++        for inst in b.instructions.iter_mut() {
++            inst.for_each_value_use_mut(|v| *v = resolve(*v));
++            inst.for_each_operand_mut(|o| {
++                if let Operand::Value(v) = o {
++                    *v = resolve(*v);
++                }
++            });
++        }
++        b.terminator.for_each_operand_mut(|o| {
++            if let Operand::Value(v) = o {
++                *v = resolve(*v);
++            }
++        });
++    }
++    deletions.sort_unstable_by(|a, b| b.cmp(a));
++    deletions.dedup();
++    for (b, i) in deletions {
++        debug_assert!(matches!(
++            func.blocks[b].instructions[i],
++            Instruction::Load { .. }
++        ));
++        remove_inst(func, b, i);
++    }
++    applied
++}
++
++/// Module entry: global object sizes feed the dereferenceability proof.
++pub(crate) fn run_module(module: &mut IrModule) -> usize {
++    let env = Env::read();
++    if env.disabled {
++        return 0;
++    }
++    let globals: FxHashMap<String, usize> = module
++        .globals
++        .iter()
++        .map(|g| (g.name.clone(), g.size))
++        .collect();
++    module.for_each_function(|f| {
++        if f.blocks.is_empty() {
++            return 0;
++        }
++        let mut total = 0;
++        for _ in 0..MAX_ROUNDS {
++            let n = run_round(f, &globals, env);
++            if n == 0 {
++                break;
++            }
++            total += n;
++        }
++        total
++    })
++}
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 095303d..b78cd23 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -42,6 +42,7 @@ pub(crate) mod licm;
+ pub(crate) mod load_forward;
+ pub(crate) mod loop_analysis;
+ pub(crate) mod loop_invert;
++pub(crate) mod loop_carried_forward;
+ pub(crate) mod loop_memory_promote;
+ pub(crate) mod loop_rotate;
+ pub(crate) mod loop_unroll;
+@@ -737,6 +738,12 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
+         module.for_each_function(loop_memory_promote::run);
+     }
+     iphase_dump!("cleanup-loop-memory-promote");
++    // Loop-carried store-to-load forwarding (distance-1 predictive
++    // commoning): `a[i] = f(a[i-1])` keeps the recurrence in a register
++    // instead of a store-forwarding round trip per iteration.
++    loop_carried_forward::run_module(module);
++    verify::verify_after_pass(module, "loop_carried_forward");
++    iphase_dump!("cleanup-loop-carried-forward");
+     // Resolve constant branches exposed by inlining before the bounded
+     // constant-call evaluator in ipcp examines the surviving call sites.
+     //
+@@ -1405,6 +1412,29 @@ pub(crate) fn run_passes(
+             total_changes_excl_dce += n;
          }
-         self.parse_stmt()
+ 
++        // Loop-carried store-to-load forwarding — iter 0, AFTER iv_widen
++        // (the `int i` address chains are now pointer-width affine forms)
++        // and BEFORE loop rotation / IVSR (guard-at-top preheader+header+
++        // latch shape, plain `GEP(base, i<<k)` addresses). Turns
++        // `a[i] = f(a[i-1])` into a register recurrence: removes the load
++        // and the L1D store-forwarding round trip from the loop's critical
++        // path (tls_seg_access 2.19× → parity with GCC's tree-predcom).
++        // Kill switch `CCC_NO_LOOP_CARRIED_FWD`. -O2+.
++        if iter == 0 && opt_level >= 2 && !pass_disabled(&disabled, "loop_carried_forward") {
++            let n = timed_pass!(
++                "loop_carried_forward",
++                loop_carried_forward::run_module(module)
++            );
++            if n > 0 {
++                for c in changed.iter_mut() {
++                    *c = true;
++                }
++                verify::verify_after_pass(module, "loop_carried_forward");
++            }
++            total_changes += n;
++            total_changes_excl_dce += n;
++        }
++
+         // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
+         // widened phi flows through the rotated form and emits `addq`
+         // directly). Transforms "guard-at-top" loops into "test-at-bottom"
+@@ -2011,6 +2041,10 @@ pub(crate) fn run_passes(
+         module.for_each_function(loop_memory_promote::run);
+         module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+     }
++    // Late loop-carried forwarding: IVSR / CFG cleanup expose marching-pointer
++    // recurrences that the early run could not normalise.
++    loop_carried_forward::run_module(module);
++    verify::verify_after_pass(module, "loop_carried_forward_late");
+     // Late redundant-load elimination: post-IVSR field accesses have constant
+     // offsets, so same-address loads merge when intervening stores are
+     // provably non-aliasing (volatile loads are exempt by construction).
+diff --git a/tests/regression/check_volatile_pointer_subscript.sh b/tests/regression/check_volatile_pointer_subscript.sh
+new file mode 100755
+index 0000000..aacab18
+--- /dev/null
++++ b/tests/regression/check_volatile_pointer_subscript.sh
+@@ -0,0 +1,79 @@
++#!/usr/bin/env bash
++# check_volatile_pointer_subscript.sh — volatile qualifier must survive
++# array subscripts and pointer arithmetic on pointer-to-volatile.
++#
++# Bug class (fixed in src/ir/lowering/lvalue.rs, expr_access_is_volatile /
++# pointee_expr_is_volatile): `volatile u32 *regs; regs[i]` and `*(regs + i)`
++# were lowered with `volatile: false` (only the plain `*regs` form kept the
++# qualifier). The consequences are exactly the MMIO idioms the Linux kernel
++# relies on:
++#   * `while (!regs[STATUS]) ;`  → load hoisted, infinite loop;
++#   * `regs[CTRL] = 1; regs[CTRL] = 2;` → first write dead-store-eliminated;
++#   * `x = regs[DATA] + regs[DATA];` → two reads CSE'd into one.
++#
++# Each probe below is compiled at -O2 and the emitted instruction count for
++# the access is asserted. Mutation-verified: reverting the lvalue.rs fix
++# makes every probe report a single access (or none for the spin loop).
++set -euo pipefail
++CCC=${CCC:-./target/fastbuild/lccc}
++tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-volatile-subscript.XXXXXX")
++trap 'rm -rf "$tmp"' EXIT
++
++cat > "$tmp/v.c" <<'EOF'
++typedef unsigned int u32;
++u32 rd_subscript(volatile u32 *p)            { return p[1] + p[1]; }
++u32 rd_subscript_var(volatile u32 *p, long i){ return p[i] + p[i]; }
++u32 rd_arith(volatile u32 *p, long i)        { return *(p + i) + *(p + i); }
++u32 rd_swapped(volatile u32 *p, long i)      { return i[p] + i[p]; }
++u32 rd_sub(volatile u32 *p)                  { return *(p - 1) + *(p - 1); }
++void wr_subscript(volatile u32 *p)           { p[2] = 1; p[2] = 2; }
++void wr_subscript_var(volatile u32 *p, long i){ p[i] = 1; p[i] = 2; }
++void wr_arith(volatile u32 *p, long i)       { *(p + i) = 1; *(p + i) = 2; }
++void wr_cond(volatile u32 *p, volatile u32 *q, int c) { *(c ? p : q) = 1; *(c ? p : q) = 2; }
++void spin(volatile u32 *regs)                { while (!regs[4]) { } }
++u32 arr_of_ptr(void) { static volatile u32 *tbl[4]; return *tbl[1] + *tbl[1]; }
++/* Negative control: a pointer to NON-volatile must still CSE to one load. */
++u32 plain(u32 *p)                            { return p[1] + p[1]; }
++EOF
++"$CCC" -O2 -S "$tmp/v.c" -o "$tmp/v.s"
++
++# Count memory-operand instructions (any mnemonic except lea — folded
++# `addl 4(%rdi), %edx` is a real second access) inside one function body.
++count_mem_movs() {
++    awk -v fn="$1" '
++        $0 ~ "^"fn":" { inside = 1; next }
++        inside && /^[A-Za-z_.][A-Za-z0-9_.]*:/ && $0 !~ /^\.L/ { inside = 0 }
++        inside && /^[[:space:]]*[a-z]+[[:space:]]/ && /\(/ && $1 !~ /^lea/ { n++ }
++        END { print n + 0 }' "$tmp/v.s"
++}
++
++fail=0
++expect() { # expect <fn> <op> <n>
++    local got; got=$(count_mem_movs "$1")
++    if ! [ "$got" "$2" "$3" ]; then
++        echo "FAIL $1: expected memory movs $2 $3, got $got" >&2
++        fail=1
++    fi
++}
++for fn in rd_subscript rd_subscript_var rd_arith rd_swapped rd_sub \
++          wr_subscript wr_subscript_var wr_arith wr_cond arr_of_ptr; do
++    expect "$fn" -ge 2
++done
++expect plain -le 1
++
++# The spin loop must re-load inside the loop: a backward branch whose body
++# contains a memory read. Assert the load count is >= 1 AND there is a
++# conditional branch (an empty infinite loop would have neither).
++spin_loads=$(count_mem_movs spin)
++spin_branch=$(awk '/^spin:/{i=1;next} i&&/^[A-Za-z_][A-Za-z0-9_]*:/{i=0} i&&/^[[:space:]]*j(e|ne|z|nz)/{n++} END{print n+0}' "$tmp/v.s")
++if [ "$spin_loads" -lt 1 ] || [ "$spin_branch" -lt 1 ]; then
++    echo "FAIL spin: load hoisted out of the volatile spin loop (loads=$spin_loads branches=$spin_branch)" >&2
++    fail=1
++fi
++
++if [ "$fail" -ne 0 ]; then
++    echo "--- asm ---" >&2
++    grep -vE '^\s*\.' "$tmp/v.s" >&2
++    exit 1
++fi
++echo "volatile pointer subscript / arithmetic: ok"
+diff --git a/tests/regression/loop_carried_store_load_forward.c b/tests/regression/loop_carried_store_load_forward.c
+new file mode 100644
+index 0000000..ea67666
+--- /dev/null
++++ b/tests/regression/loop_carried_store_load_forward.c
+@@ -0,0 +1,319 @@
++/* Loop-carried store-to-load forwarding (src/passes/loop_carried_forward.rs).
++ *
++ * `a[i] = f(a[i-1])` must become a register recurrence (the load of a[i-1]
++ * is replaced by a header phi fed by the previous iteration's stored value)
++ * WITHOUT changing semantics in any of the shapes below. Every kernel is
++ * self-checking against a reference computed with the transform provably
++ * inapplicable (volatile / opaque pointer), and the exit code is the
++ * verdict (RULES.md #5). Mutation-verified: forcing the preheader load
++ * to `addr_L(1)` (off-by-one), skipping the `|stride| >= size` guard, or
++ * ignoring the interleaved-field overlap test each makes at least one of
++ * these kernels abort.
++ *
++ * Shapes:
++ *   k1  canonical prefix recurrence on a global (tls_seg_access shape),
++ *       int IV widened by iv_widen, volatile aliasing *read* in the body
++ *   k2  descending stride (a[i] = a[i+1] ^ k), signed I64 IV
++ *   k3  chained distance-2 recurrence (Fibonacci table) — two rounds
++ *   k4  interleaved struct fields: write s[i].x, read s[i-1].x, and an
++ *       unrelated store to s[i].y that shares the object and stride
++ *   k5  same-object store at a DIFFERENT stride in the body — must NOT fire
++ *       (memory result is the oracle either way)
++ *   k6  zero-trip loop on an alloca: preheader load must be in-bounds-safe
++ *       or not speculated; the untouched array must remain untouched
++ *   k7  do-while shape with the store value being the load itself
++ *       (degenerate copy a[i] = a[i-1])
++ *   k8  loop with a pointer parameter (opaque root): forwarding through the
++ *       same pointer is legal; a second opaque pointer store must veto it
++ *   k9  byte-sized elements with |stride| == size (edge of the overlap
++ *       guard) and unsigned char wrap
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define N 64
++static uint64_t g_slots[N + 2];
++
++__attribute__((noinline)) static uint64_t k1(unsigned p) {
++    uint64_t acc = 0;
++    g_slots[1] = p;
++    for (int i = 2; i <= N; i++) {
++        g_slots[i] = g_slots[i - 1] + p;
++        acc += g_slots[i] ^ *(volatile uint64_t *)&g_slots[(i & 7) + 1];
++    }
++    return acc + g_slots[N];
++}
++__attribute__((noinline)) static uint64_t k1_ref(unsigned p) {
++    volatile uint64_t *s = g_slots;
++    uint64_t acc = 0;
++    s[1] = p;
++    for (int i = 2; i <= N; i++) {
++        s[i] = s[i - 1] + p;
++        acc += s[i] ^ s[(i & 7) + 1];
++    }
++    return acc + s[N];
++}
++
++__attribute__((noinline)) static uint64_t k2(uint64_t *a, int64_t n, uint64_t k) {
++    a[n] = k;
++    for (int64_t i = n - 1; i >= 0; i--)
++        a[i] = (a[i + 1] * 0x9E3779B97F4A7C15ull) ^ k;
++    return a[0];
++}
++__attribute__((noinline)) static uint64_t k2_ref(volatile uint64_t *a, int64_t n, uint64_t k) {
++    a[n] = k;
++    for (int64_t i = n - 1; i >= 0; i--)
++        a[i] = (a[i + 1] * 0x9E3779B97F4A7C15ull) ^ k;
++    return a[0];
++}
++
++__attribute__((noinline)) static uint32_t k3(uint32_t *f, long n) {
++    f[0] = 1;
++    f[1] = 1;
++    for (long i = 2; i < n; i++)
++        f[i] = f[i - 1] + f[i - 2];
++    return f[n - 1];
++}
++__attribute__((noinline)) static uint32_t k3_ref(volatile uint32_t *f, long n) {
++    f[0] = 1;
++    f[1] = 1;
++    for (long i = 2; i < n; i++)
++        f[i] = f[i - 1] + f[i - 2];
++    return f[n - 1];
++}
++
++struct pair {
++    uint64_t x, y;
++};
++__attribute__((noinline)) static uint64_t k4(struct pair *s, long n) {
++    s[0].x = 7;
++    s[0].y = 3;
++    for (long i = 1; i < n; i++) {
++        s[i].x = s[i - 1].x * 3 + 1;
++        s[i].y = s[i].x ^ (uint64_t)i;
++    }
++    return s[n - 1].x + s[n - 1].y;
++}
++__attribute__((noinline)) static uint64_t k4_ref(volatile struct pair *s, long n) {
++    s[0].x = 7;
++    s[0].y = 3;
++    for (long i = 1; i < n; i++) {
++        s[i].x = s[i - 1].x * 3 + 1;
++        s[i].y = s[i].x ^ (uint64_t)i;
++    }
++    return s[n - 1].x + s[n - 1].y;
++}
++
++static uint64_t g_k5[2 * N + 4];
++__attribute__((noinline)) static uint64_t k5(uint64_t seed) {
++    g_k5[0] = seed;
++    for (long i = 1; i < N; i++) {
++        g_k5[i] = g_k5[i - 1] + 1;
++        g_k5[2 * i] = 0xFFu; /* different stride: overlaps a[i-1] for i even */
++    }
++    return g_k5[N - 1] + g_k5[N - 2];
++}
++__attribute__((noinline)) static uint64_t k5_ref(uint64_t seed) {
++    volatile uint64_t *a = g_k5;
++    a[0] = seed;
++    for (long i = 1; i < N; i++) {
++        a[i] = a[i - 1] + 1;
++        a[2 * i] = 0xFFu;
++    }
++    return a[N - 1] + a[N - 2];
++}
++
++__attribute__((noinline)) static uint64_t k6(long n) {
++    uint64_t buf[8];
++    memset(buf, 0xAB, sizeof buf);
++    buf[0] = 1;
++    for (long i = 1; i < n; i++)
++        buf[i] = buf[i - 1] << 1;
++    uint64_t h = 0;
++    for (int i = 0; i < 8; i++)
++        h = h * 31 + buf[i];
++    return h;
++}
++__attribute__((noinline)) static uint64_t k6_ref(long n) {
++    volatile uint64_t buf[8];
++    for (int i = 0; i < 8; i++)
++        buf[i] = 0xABABABABABABABABull;
++    buf[0] = 1;
++    for (long i = 1; i < n; i++)
++        buf[i] = buf[i - 1] << 1;
++    uint64_t h = 0;
++    for (int i = 0; i < 8; i++)
++        h = h * 31 + buf[i];
++    return h;
++}
++
++__attribute__((noinline)) static uint32_t k7(uint32_t *a, long n, uint32_t v) {
++    a[0] = v;
++    long i = 1;
++    do {
++        a[i] = a[i - 1];
++        i++;
++    } while (i < n);
++    return a[n - 1];
++}
++
++__attribute__((noinline)) static uint64_t k8(uint64_t *a, uint64_t *b, long n) {
++    /* b may alias a: forwarding a[i-1] across the b[i] store is illegal. */
++    for (long i = 1; i < n; i++) {
++        a[i] = a[i - 1] + 5;
++        b[i] = 1;
++    }
++    return a[n - 1];
++}
++__attribute__((noinline)) static uint64_t k8_ref(volatile uint64_t *a, volatile uint64_t *b, long n) {
++    for (long i = 1; i < n; i++) {
++        a[i] = a[i - 1] + 5;
++        b[i] = 1;
++    }
++    return a[n - 1];
++}
++
++__attribute__((noinline)) static unsigned k9(unsigned char *c, long n) {
++    c[0] = 200;
++    for (long i = 1; i < n; i++)
++        c[i] = (unsigned char)(c[i - 1] + 37);
++    unsigned h = 0;
++    for (long i = 0; i < n; i++)
++        h = h * 131 + c[i];
++    return h;
++}
++__attribute__((noinline)) static unsigned k9_ref(volatile unsigned char *c, long n) {
++    c[0] = 200;
++    for (long i = 1; i < n; i++)
++        c[i] = (unsigned char)(c[i - 1] + 37);
++    unsigned h = 0;
++    for (long i = 0; i < n; i++)
++        h = h * 131 + c[i];
++    return h;
++}
++
++static uint64_t A[N + 2], B[N + 2];
++static uint32_t F[N + 2];
++static struct pair P[N + 2];
++static unsigned char C[N + 2];
++
++int main(void) {
++    int fails = 0;
++#define CHECK(id, got, want)                                                  \
++    do {                                                                      \
++        unsigned long long g_ = (unsigned long long)(got), w_ = (want);       \
++        if (g_ != w_) {                                                       \
++            printf("%s: got %llu want %llu\n", id, g_, w_);                   \
++            fails++;                                                          \
++        }                                                                     \
++    } while (0)
++
++    /* The volatile read at slot (i & 7) + 1 runs ahead of the write front
++       for i < 8, so both variants must start from identical memory. */
++    for (unsigned p = 1; p < 40; p += 13) {
++        memset(g_slots, 0, sizeof g_slots);
++        uint64_t got = k1(p);
++        memset(g_slots, 0, sizeof g_slots);
++        CHECK("k1", got, k1_ref(p));
++    }
++
++    memset(A, 0, sizeof A);
++    memset(B, 0, sizeof B);
++    CHECK("k2", k2(A, N, 0x1234567ull), k2_ref(B, N, 0x1234567ull));
++    if (memcmp(A, B, sizeof A) != 0) {
++        printf("k2: memory differs\n");
++        fails++;
++    }
++
++    memset(F, 0, sizeof F);
++    uint32_t f_got = k3(F, 40);
++    uint32_t f_snapshot[N + 2];
++    memcpy(f_snapshot, F, sizeof F);
++    memset(F, 0, sizeof F);
++    CHECK("k3", f_got, k3_ref(F, 40));
++    if (memcmp(F, f_snapshot, sizeof F) != 0) {
++        printf("k3: memory differs\n");
++        fails++;
++    }
++
++    memset(P, 0, sizeof P);
++    uint64_t p_got = k4(P, N);
++    struct pair p_snapshot[N + 2];
++    memcpy(p_snapshot, P, sizeof P);
++    memset(P, 0, sizeof P);
++    CHECK("k4", p_got, k4_ref(P, N));
++    if (memcmp(P, p_snapshot, sizeof P) != 0) {
++        printf("k4: memory differs\n");
++        fails++;
++    }
++
++    uint64_t k5_got = k5(9);
++    uint64_t k5_mem[2 * N + 4];
++    memcpy(k5_mem, g_k5, sizeof g_k5);
++    memset(g_k5, 0, sizeof g_k5);
++    CHECK("k5", k5_got, k5_ref(9));
++    if (memcmp(k5_mem, g_k5, sizeof g_k5) != 0) {
++        printf("k5: memory differs\n");
++        fails++;
++    }
++
++    CHECK("k6-zero-trip", k6(0), k6_ref(0));
++    CHECK("k6-one-trip", k6(1), k6_ref(1));
++    CHECK("k6-full", k6(8), k6_ref(8));
++
++    memset(F, 0, sizeof F);
++    CHECK("k7", k7(F, 17, 0xC0FFEEu), 0xC0FFEEu);
++    for (int i = 0; i < 17; i++)
++        if (F[i] != 0xC0FFEEu) {
++            printf("k7: F[%d]=%u\n", i, F[i]);
++            fails++;
++            break;
++        }
++
++    /* k8 with b == a + 1: b[i] overwrites a[i+1] before the next iteration
++       reads it (a[i] = a[i-1] + 5 must see the 1 written by b). */
++    memset(A, 0, sizeof A);
++    memset(B, 0, sizeof B);
++    A[0] = 100;
++    B[0] = 100;
++    CHECK("k8-alias", k8(A, A + 1, 32), k8_ref(B, B + 1, 32));
++    if (memcmp(A, B, sizeof A) != 0) {
++        printf("k8: memory differs\n");
++        fails++;
++    }
++    /* k8 with disjoint arrays. */
++    memset(A, 0, sizeof A);
++    memset(B, 0, sizeof B);
++    A[0] = 100;
++    uint64_t k8d = k8(A, B, 32);
++    uint64_t A2[N + 2], B2[N + 2];
++    memset(A2, 0, sizeof A2);
++    memset(B2, 0, sizeof B2);
++    A2[0] = 100;
++    CHECK("k8-disjoint", k8d, k8_ref(A2, B2, 32));
++    if (memcmp(A, A2, sizeof A) != 0 || memcmp(B, B2, sizeof B) != 0) {
++        printf("k8-disjoint: memory differs\n");
++        fails++;
++    }
++
++    memset(C, 0, sizeof C);
++    unsigned c_got = k9(C, N);
++    unsigned char c_snapshot[N + 2];
++    memcpy(c_snapshot, C, sizeof C);
++    memset(C, 0, sizeof C);
++    CHECK("k9", c_got, k9_ref(C, N));
++    if (memcmp(C, c_snapshot, sizeof C) != 0) {
++        printf("k9: memory differs\n");
++        fails++;
++    }
++
++    if (fails) {
++        printf("loop_carried_store_load_forward: %d failure(s)\n", fails);
++        fflush(stdout);
++        abort();
++    }
++    printf("loop_carried_store_load_forward: ok\n");
++    return 0;
++}
