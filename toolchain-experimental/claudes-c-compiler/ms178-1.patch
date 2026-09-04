@@ -1,435 +1,301 @@
+diff --git a/scripts/ra_quality_census.py b/scripts/ra_quality_census.py
+new file mode 100755
+index 0000000..353eb74
+--- /dev/null
++++ b/scripts/ra_quality_census.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python3
++"""Register-allocation quality census: LCCC vs GCC vs Clang, per function.
++
++`kernel_count.py` reports one number (instructions).  Register-allocator work
++needs the *shape* of the loss, so this tool classifies every instruction of
++every function in a corpus into RA-relevant buckets and prints per-function
++and per-bucket columns (lccc/gcc/clang) sorted by the instruction delta:
++
++    insns    all instructions in the function body
++    rrmov    register-to-register `mov*` (coalescing failures / relays)
++    stkref   memory operands through %rsp/%rbp/%esp/%ebp (spill traffic)
++    push     `push %reg` (callee-saved pressure)
++    acc      accumulator-pinned forms (cltq/cwtl/cqto/cltd/...)
++
++Usage:
++    scripts/ra_quality_census.py                  # benchmark programs + kernel corpus
++    scripts/ra_quality_census.py FILE.c ...       # explicit files
++    scripts/ra_quality_census.py --m32            # i686 (needs gcc-multilib)
++    scripts/ra_quality_census.py --json out.json  # machine-readable
++    scripts/ra_quality_census.py --top 15         # 15 worst functions only
++
++Environment:
++    LCCC / GCC / CLANG   compiler paths (defaults: target/fastbuild/lccc, gcc, clang)
++    CFLAGS               extra flags appended for every compiler
++
++A compiler failure on one file skips that file and is listed at the end; the
++census never aborts on oracle-only or target-specific programs.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import re
++import shutil
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parent.parent
++DEFAULT_DIRS = [REPO / "tests" / "benchmark" / "programs", REPO / "tests" / "benchmark" / "kernel_corpus"]
++LCCC = os.environ.get("LCCC", str(REPO / "target" / "fastbuild" / "lccc"))
++GCC = os.environ.get("GCC", "gcc")
++CLANG = os.environ.get("CLANG", "clang")
++EXTRA = os.environ.get("CFLAGS", "").split()
++BUCKETS = ("insns", "rrmov", "stkref", "push", "acc")
++
++_LABEL = re.compile(r"^([A-Za-z_$][\w.$@]*):")
++_DIRECTIVE = re.compile(r"^\s*\.")
++_REG_REG_MOV = re.compile(r"^\s*mov[lqwb]?\s+%[a-z0-9]+\s*,\s*%[a-z0-9]+\s*$")
++_STKREF = re.compile(r"\(%(?:rsp|rbp|esp|ebp)\b")
++_PUSH = re.compile(r"^\s*push[lq]?\s+%")
++_ACC = re.compile(r"^\s*(cltq|cwtl|cqto|cltd|cbtw|cwtd|cdqe)\b")
++
++
++def compile_to_asm(cc: str, src: Path, flags: list[str]) -> str | None:
++    fd, out = tempfile.mkstemp(suffix=".s")
++    os.close(fd)
++    try:
++        proc = subprocess.run([cc, *flags, "-S", "-o", out, str(src)], capture_output=True, text=True, timeout=180)
++        if proc.returncode != 0:
++            return None
++        return Path(out).read_text(errors="replace")
++    except (subprocess.TimeoutExpired, OSError):
++        return None
++    finally:
++        try:
++            os.unlink(out)
++        except OSError:
++            pass
++
++
++def census(asm: str) -> dict[str, dict[str, int]]:
++    funcs: dict[str, dict[str, int]] = {}
++    counts: dict[str, int] | None = None
++    in_text = True
++    for raw in asm.splitlines():
++        line = raw.split("#", 1)[0].rstrip()
++        s = line.strip()
++        if not s:
++            continue
++        if s.startswith((".section", ".data", ".bss", ".rodata")):
++            in_text = ".text" in s
++            continue
++        if s == ".text":
++            in_text = True
++            continue
++        m = _LABEL.match(line)
++        if m:
++            if in_text:
++                counts = funcs.setdefault(m.group(1), dict.fromkeys(BUCKETS, 0))
++            continue
++        if _DIRECTIVE.match(line) or counts is None or not in_text:
++            continue
++        counts["insns"] += 1
++        counts["rrmov"] += bool(_REG_REG_MOV.match(line))
++        counts["stkref"] += bool(_STKREF.search(line))
++        counts["push"] += bool(_PUSH.match(line))
++        counts["acc"] += bool(_ACC.match(line))
++    return funcs
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("files", nargs="*", type=Path)
++    ap.add_argument("--m32", action="store_true")
++    ap.add_argument("--O", default="-O2")
++    ap.add_argument("--json", type=Path)
++    ap.add_argument("--top", type=int, default=0)
++    ap.add_argument("--no-clang", action="store_true")
++    args = ap.parse_args()
++
++    files = list(args.files) or [f for d in DEFAULT_DIRS for f in sorted(d.glob("*.c"))]
++    flags = [args.O, *EXTRA] + (["-m32"] if args.m32 else [])
++    compilers = [("lccc", LCCC), ("gcc", GCC)]
++    if not args.no_clang and shutil.which(CLANG):
++        compilers.append(("clang", CLANG))
++    names = [n for n, _ in compilers]
++
++    table = []
++    totals = {n: dict.fromkeys(BUCKETS, 0) for n in names}
++    skipped = []
++    for src in files:
++        per_cc = {}
++        for name, cc in compilers:
++            asm = compile_to_asm(cc, src, flags)
++            if asm is None:
++                skipped.append(f"{src.name}({name})")
++                break
++            per_cc[name] = census(asm)
++        if len(per_cc) != len(compilers):
++            continue
++        for fn in sorted(set(per_cc["lccc"]) & set(per_cc["gcc"])):
++            if fn == "main":
++                continue
++            row = {n: per_cc[n].get(fn, dict.fromkeys(BUCKETS, 0)) for n in names}
++            table.append((src.name, fn, row))
++            for n in names:
++                for b in BUCKETS:
++                    totals[n][b] += row[n][b]
++
++    table.sort(key=lambda t: t[2]["lccc"]["insns"] - t[2]["gcc"]["insns"], reverse=True)
++    rows = table[: args.top] if args.top else table
++    tag = "/".join(names)
++    hdr = f"{'file':<26} {'function':<24} " + " ".join(f"{b + ' ' + tag:>20}" for b in BUCKETS)
++    print(hdr)
++    print("-" * len(hdr))
++    for fname, fn, row in rows:
++        print(f"{fname[:26]:<26} {fn[:24]:<24} " + " ".join(f"{'/'.join(str(row[n][b]) for n in names):>20}" for b in BUCKETS))
++    print("-" * len(hdr))
++    print(f"{'TOTAL':<26} {str(len(table)) + ' fns':<24} " + " ".join(f"{'/'.join(str(totals[n][b]) for n in names):>20}" for b in BUCKETS))
++    if skipped:
++        print("skipped:", ", ".join(skipped))
++    if args.json:
++        args.json.write_text(json.dumps({"flags": flags, "compilers": dict(compilers), "totals": totals, "skipped": skipped,
++            "functions": [{"file": f, "fn": fn, **{n: row[n] for n in names}} for f, fn, row in table]}, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index ba5f47d..d7281de 100644
+index 95669dc..17b1a72 100644
 --- a/src/backend/regalloc.rs
 +++ b/src/backend/regalloc.rs
-@@ -16,6 +16,7 @@ use super::liveness::{
- use crate::common::fx_hash::{FxHashMap, FxHashSet};
- use crate::common::types::IrType;
- use crate::ir::analysis;
-+use crate::ir::intrinsics::IntrinsicOp;
- use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
- 
- #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-@@ -238,6 +239,73 @@ pub fn riscv_param_caller_homes_safe(func: &IrFunction) -> bool {
-     true
- }
- 
-+/// True when ANY instruction of `func` implicitly clobbers %rdx: division
-+/// (cqto/cltd sign-extends into rdx:rax), i128 arithmetic (the rax:rdx
-+/// pair), Switch (jump-table dispatch scratch), or a fixed-scratch
-+/// intrinsic. This is the SAME condition under which the x86-64 prologue
-+/// excludes %rdx (PhysReg 16) from allocation — both gates must stay in
-+/// lockstep: a value homed in %rdx is unsound exactly when the body can
-+/// overwrite %rdx behind the allocator's back.
-+pub fn x86_body_implicitly_clobbers_rdx(func: &IrFunction) -> bool {
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            match inst {
-+                Instruction::BinOp { op, ty, .. } => {
-+                    if matches!(
-+                        op,
-+                        IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
-+                    ) {
-+                        return true;
-+                    }
-+                    if matches!(ty, IrType::I128 | IrType::U128) {
-+                        return true;
-+                    }
-+                }
-+                Instruction::UnaryOp { ty, .. }
-+                | Instruction::Cmp { ty, .. }
-+                | Instruction::Store { ty, .. } => {
-+                    if matches!(ty, IrType::I128 | IrType::U128) {
-+                        return true;
-+                    }
-+                }
-+                Instruction::Cast { from_ty, to_ty, .. } => {
-+                    if matches!(from_ty, IrType::I128 | IrType::U128)
-+                        || matches!(to_ty, IrType::I128 | IrType::U128)
-+                    {
-+                        return true;
-+                    }
-+                }
-+                Instruction::Intrinsic { op, .. } => {
-+                    if matches!(
-+                        op,
-+                        IntrinsicOp::Rdtsc
-+                            | IntrinsicOp::Rdtscp
-+                            | IntrinsicOp::F128Copysign
-+                            | IntrinsicOp::FmaF64x2
-+                            | IntrinsicOp::FmaF64x4
-+                            | IntrinsicOp::FmaF64x4Hoisted
-+                            | IntrinsicOp::FmaF64x4SIB
-+                            | IntrinsicOp::FmaF64x4HoistedSIB
-+                            | IntrinsicOp::LoadF64x4
-+                            | IntrinsicOp::LoadF64x2
-+                            | IntrinsicOp::LoadI32x8
-+                            | IntrinsicOp::LoadI32x4
-+                            | IntrinsicOp::VecZeroI32x8
-+                            | IntrinsicOp::VecZeroI32x4
-+                    ) {
-+                        return true;
-+                    }
-+                }
-+                _ => {}
-+            }
-+        }
-+        if matches!(block.terminator, Terminator::Switch { .. }) {
-+            return true;
-+        }
-+    }
-+    false
-+}
-+
- pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
-     if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
-         return false;
-@@ -260,6 +328,19 @@ pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
-     }) {
-         return false;
-     }
-+    // The pre-store model parks each register param in its incoming ABI
-+    // register for the WHOLE body. Any instruction that implicitly clobbers
-+    // %rdx (division via cqto/cltd, i128 rax:rdx pairs, switch jump tables,
-+    // fixed-scratch intrinsics) destroys a param homed there behind the
-+    // allocator's back. Reproduced: `(uint8_t)p2` read from %dl after an
-+    // `idivq`'s cqto zeroed it — every truncation of the param silently
-+    // wrong (stress intexpr seed 1, O1 rt+cf, got 65533 expected 65532).
-+    // Mirror the prologue's rdx-allocation exclusion (see
-+    // x86_body_implicitly_clobbers_rdx): when the body can clobber %rdx,
-+    // params fall back to the ordinary spill-home path.
-+    if x86_body_implicitly_clobbers_rdx(func) {
-+        return false;
-+    }
-     for (bi, block) in func.blocks.iter().enumerate() {
-         if bi != 0 {
-             if block
-diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-index c033245..f0aacfc 100644
---- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-+++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-@@ -726,6 +726,12 @@ mod tests {
-         // Reduced from gcc.c-torture/execute/20090207-1.c after base-index
-         // folding. A raw last-comma split saw `%r8)` as the destination and
-         // deleted this observable store as a dead pure register write.
-+        //
-+        // The base-index LEA fold now rewrites the pair first into the
-+        // canonical SIB store `movl $2, 8(%rsp, %r8)` — the SAME address
-+        // (rsp + r8 + 8) with the LEA folded away — so accept either the
-+        // folded or the pre-fold form: the invariant under guard is that the
-+        // observable SIB-destination store SURVIVES the dead-write pass.
-         let out = run(concat!(
-             "foo:\n",
-             ".cfi_startproc\n",
-@@ -734,8 +740,9 @@ mod tests {
-             "    ret\n",
-             ".cfi_endproc\n",
-         ));
--        assert!(out.contains("movl $2, (%rcx, %r8)"), "{out}");
--        assert!(out.contains("leaq 8(%rsp), %rcx"), "{out}");
-+        let store_survives = out.contains("movl $2, 8(%rsp, %r8)")
-+            || out.contains("movl $2, (%rcx, %r8)");
-+        assert!(store_survives, "observable SIB store deleted: {out}");
-     }
- 
-     #[test]
-diff --git a/src/backend/x86/codegen/peephole/passes/memory_fold.rs b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
-index 63e39e1..8a990d4 100644
---- a/src/backend/x86/codegen/peephole/passes/memory_fold.rs
-+++ b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
-@@ -106,8 +106,8 @@ fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
- /// Fold movsd stack load into subsequent scalar FP binary op as memory operand.
- ///
- /// Pattern (produced after eliminate_fp_xmm_roundtrips):
--///   movsd -M(%rbp), %xmm1   ; Other{dest_reg: 25 (xmm1), rbp_offset: -M}
--///   OP %xmm1, %xmm0          ; Other{dest_reg: 24 (xmm0)}, OP ∈ {mulsd, addsd, subsd, divsd}
-+///   movsd -M(%rbp), %xmm1   ; LoadXmmRbp{offset: -M} (historically Other{dest_reg: 25})
-+///   OP %xmm1, %xmm0          ; OP ∈ {mulsd, addsd, subsd, divsd}
- ///
- /// Transformed to:
- ///   OP -M(%rbp), %xmm0
-@@ -124,8 +124,15 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
-             continue;
-         }
- 
--        // Look for Other{dest_reg: 25} = writes to %xmm1 (family 24+1=25)
--        if let LineKind::Other { dest_reg: 25 } = infos[i].kind {
-+        // Candidate: an XMM slot LOAD (`movsd -M(%rbp), %xmmN`). The line
-+        // classifier routes these to LoadXmmRbp (with `rbp_offset` cached by
-+        // xmm_slot_line_info); when this pass was written they were classified
-+        // as `Other{dest_reg: 25}` and the stale pre-filter silently disabled
-+        // the whole fold (caught by test_fp_memory_fold_mulsd after the
-+        // classifier gained the dedicated XMM slot kinds). The dest-register
-+        // check stays textual below: LoadXmmRbp records offset/size, not the
-+        // register, and the pass folds only the exact `%xmm1` dest form.
-+        if let LineKind::LoadXmmRbp { .. } = infos[i].kind {
-             let offset = infos[i].rbp_offset;
-             if offset == RBP_OFFSET_NONE {
-                 i += 1;
-diff --git a/src/ir/lowering/complex.rs b/src/ir/lowering/complex.rs
-index 7dc8a93..7e59743 100644
---- a/src/ir/lowering/complex.rs
-+++ b/src/ir/lowering/complex.rs
-@@ -81,7 +81,11 @@ impl Lowerer {
-             dest: alloca,
-             ty: IrType::Ptr,
-             size,
--            align: 0,
-+            // Natural alignment of the complex type (16 for _Complex long
-+            // double). Alignment-0 allocas land 8-mod-16 in FPO frames and
-+            // are unsuitable homes for any value a consumer may move with
-+            // aligned SSE loads/stores.
-+            align: self.ctype_align(ctype).max(1),
-             volatile: false,
-             semantic_volatile: false,
-         });
-diff --git a/src/ir/lowering/expr_calls.rs b/src/ir/lowering/expr_calls.rs
-index 6bec06a..beaad5c 100644
---- a/src/ir/lowering/expr_calls.rs
-+++ b/src/ir/lowering/expr_calls.rs
-@@ -262,12 +262,36 @@ impl Lowerer {
- 
-         // For sret calls, allocate space and prepend hidden pointer argument
-         let sret_alloca = if let Some(size) = sret_size {
-+            // The buffer's alignment MUST be the returned aggregate's natural
-+            // alignment (SysV: the callee writes the return value through the
-+            // hidden pointer — with aligned SSE stores, i.e. movaps, whenever
-+            // that alignment is 16, e.g. structs containing long double).
-+            // Recording `align: 0` made the FPO frame layout place the buffer
-+            // at an address ≡ 8 (mod 16); any GCC-compiled callee then faulted
-+            // with #GP on `movaps %xmm,(%rdi)` — SIGSEGV with si_addr = 0
-+            // (stress abi family, seed 0, lccc-caller/gcc-callee pairing;
-+            // frame-parity dependent, hence seed-shape dependent).
-+            // Direct calls read the alignment from the callee's recorded
-+            // return CType; indirect calls resolve it from the function
-+            // pointer's type via get_call_return_struct_align (same type
-+            // query as the sret SIZE, so the two can never disagree).
-+            let sret_align = match stripped_func {
-+                Expr::Identifier(name, _) if !self.is_func_ptr_variable(name) => self
-+                    .func_meta
-+                    .sigs
-+                    .get(name.as_str())
-+                    .and_then(|s| s.return_ctype.as_ref())
-+                    .map(|ct| self.ctype_align(ct).max(1))
-+                    .or_else(|| self.get_call_return_struct_align(stripped_func))
-+                    .unwrap_or(0),
-+                _ => self.get_call_return_struct_align(stripped_func).unwrap_or(0),
-+            };
-             let alloca = self.fresh_value();
-             self.emit(Instruction::Alloca {
-                 dest: alloca,
-                 ty: IrType::Ptr,
-                 size,
--                align: 0,
-+                align: sret_align,
-                 volatile: false,
-                 semantic_volatile: false,
-             });
-diff --git a/src/ir/lowering/expr_types.rs b/src/ir/lowering/expr_types.rs
-index be87e92..fd28504 100644
---- a/src/ir/lowering/expr_types.rs
-+++ b/src/ir/lowering/expr_types.rs
-@@ -286,20 +286,18 @@ impl Lowerer {
-         }
-     }
- 
--    /// For indirect calls (function pointer calls), determine if the return type is a struct,
--    /// union, or vector and return its size. Returns None if not an aggregate return or if
--    /// the type cannot be determined.
--    pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
--        // For indirect calls, extract the return type from the function pointer's CType.
--        // Strip Deref layers since dereferencing function pointers is a no-op in C.
-+    /// Resolve the RETURN type of the function designated by `func`, for
-+    /// indirect calls (function pointer calls). Strip Deref layers since
-+    /// dereferencing function pointers is a no-op in C.
-+    ///
-+    /// Shared by `get_call_return_struct_size` and
-+    /// `get_call_return_struct_align` so the size and alignment queries can
-+    /// never disagree about which type they describe.
-+    pub(super) fn call_return_ctype(&self, func: &Expr) -> Option<CType> {
-         let func_ctype = match func {
-             Expr::Identifier(name, _) => {
-                 // Could be a function pointer variable
--                if let Some(vi) = self.lookup_var_info(name) {
--                    vi.c_type.clone()
--                } else {
--                    None
--                }
-+                self.lookup_var_info(name).and_then(|vi| vi.c_type.clone())
-             }
-             Expr::Deref(..) => {
-                 let mut expr = func;
-@@ -310,21 +308,36 @@ impl Lowerer {
-             }
-             _ => self.get_expr_ctype(func),
-         };
-+        func_ctype.and_then(|ref ct| ct.func_ptr_return_type(false))
-+    }
- 
--        if let Some(ref ctype) = func_ctype {
--            // Navigate through CType to find the return type
--            let ret_ctype = ctype.func_ptr_return_type(false);
--            if let Some(ret_ct) = ret_ctype {
--                if ret_ct.is_struct_or_union() {
--                    // Use resolve_ctype_size to look up struct layouts properly;
--                    // CType::size() returns 0 for Struct/Union since they only
--                    // store a key, not the actual layout.
--                    return Some(self.resolve_ctype_size(&ret_ct));
--                }
--                if ret_ct.is_vector() {
--                    return Some(self.resolve_ctype_size(&ret_ct));
--                }
--            }
-+    /// For indirect calls (function pointer calls), determine if the return type is a struct,
-+    /// union, or vector and return its size. Returns None if not an aggregate return or if
-+    /// the type cannot be determined.
-+    pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
-+        let ret_ct = self.call_return_ctype(func)?;
-+        if ret_ct.is_struct_or_union() {
-+            // Use resolve_ctype_size to look up struct layouts properly;
-+            // CType::size() returns 0 for Struct/Union since they only
-+            // store a key, not the actual layout.
-+            return Some(self.resolve_ctype_size(&ret_ct));
-+        }
-+        if ret_ct.is_vector() {
-+            return Some(self.resolve_ctype_size(&ret_ct));
-+        }
-+        None
-+    }
-+
-+    /// Natural alignment of the aggregate returned by an indirect call —
-+    /// the companion of `get_call_return_struct_size`. The hidden sret
-+    /// buffer for such a call must be aligned to the returned type: a
-+    /// callee compiled by GCC materialises the return value with aligned
-+    /// SSE stores (movaps) whenever the struct's alignment is 16, and an
-+    /// 8-mod-16 buffer faults with #GP at runtime.
-+    pub(super) fn get_call_return_struct_align(&self, func: &Expr) -> Option<usize> {
-+        let ret_ct = self.call_return_ctype(func)?;
-+        if ret_ct.is_struct_or_union() || ret_ct.is_vector() {
-+            return Some(self.ctype_align(&ret_ct).max(1));
-         }
+@@ -2616,8 +2616,31 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+     // one taken costs a push/pop pair. Let the hot loop values compete for
+     // the volatile pool in Phase 2 first; Phase 2c still hands the overflow
+     // a callee-saved home (see `RegAllocConfig::leaf_caller_saved_homes`).
++    //
++    // RA-23 (loop-leaf extension): the same argument holds for a function
++    // whose call points all sit OUTSIDE every loop — `memset` at entry
++    // before the sieve, a `printf` after the loop nest, an `abort` in a
++    // cold depth-0 tail. No hot loop value spans such a call (a spanning
++    // value is `call_spanning` and stays in Phase 1 regardless), so the
++    // Phase-1 promotion again only converts a free volatile home into a
++    // push/pop pair. Measured on the benchmark corpus at -O2: sieve
++    // `count_primes` 5 -> 0 pushes, matmul 6 -> 0, glibc memcmp 6 -> 2,
++    // with the loop bodies unchanged. Calls INSIDE a loop keep the boot-
++    // corpus behaviour (cmdline_find_option: the state machine wants a
++    // dedicated home because the in-loop call fragments the volatile pool).
++    // A/B: `CCC_LEAF_STRICT_CALL_FREE=1` restores the call-free-only rule.
++    let calls_only_outside_loops = !call_points.is_empty()
++        && !env_on("CCC_LEAF_STRICT_CALL_FREE")
++        && call_points.iter().all(|&p| {
++            liveness
++                .block_starts
++                .iter()
++                .zip(liveness.block_ends.iter())
++                .position(|(&s, &e)| s <= p && p <= e)
++                .is_some_and(|b| liveness.block_loop_depth.get(b).copied().unwrap_or(1) == 0)
++        });
+     let leaf_prefers_caller_saved = config.leaf_caller_saved_homes
+-        && call_points.is_empty()
++        && (call_points.is_empty() || calls_only_outside_loops)
+         && !env_on("CCC_NO_LEAF_CALLER_HOME");
+     let hot_loop_home = |iv: &LiveInterval| -> bool {
+         if env_on("CCC_NO_HOT_LOOP") || leaf_prefers_caller_saved {
+diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
+index b474994..768b95f 100644
+--- a/src/backend/x86/codegen/cast_ops.rs
++++ b/src/backend/x86/codegen/cast_ops.rs
+@@ -888,6 +888,64 @@ impl X86Codegen {
          None
      }
-diff --git a/src/passes/cvp.rs b/src/passes/cvp.rs
-index 7e30c8c..82771f0 100644
---- a/src/passes/cvp.rs
-+++ b/src/passes/cvp.rs
-@@ -416,30 +416,54 @@ fn decide_pred(stack: &[Fact], p: Pred) -> Option<bool> {
- }
  
- /// Decide the truth of a boolean operand under the active facts.
-+///
-+/// `cond` values defined by a `Copy` are looked through recursively (depth
-+/// capped): this covers BOTH the values this pass itself folds — a decided
-+/// `Cmp` becomes `Copy { src: bool_const }` at its own def site, and every
-+/// later `Select`/branch conditioned on it must see the constant — and
-+/// ordinary copy chains left by earlier passes. Without the look-through,
-+/// folding a guard `Cmp` would erase the very fact its consumers need
-+/// (reproduced: full_function_folds_guard_and_branch folded 2/4 instead of
-+/// 4/4 — the select and the branch after the folded guard stayed put).
- fn decide_bool(
-     stack: &[Fact],
-     func: &IrFunction,
-     defs: &FxHashMap<Value, (usize, usize)>,
-     cond: &Operand,
- ) -> Option<bool> {
--    match cond {
--        Operand::Const(k) => k.to_i128().map(|v| v != 0),
--        Operand::Value(v) => {
--            if let Some(s) = known_set(stack, *v, BOOL_BITS) {
--                if s.as_slice() == [(0, 0)] {
--                    return Some(false);
-+    fn go(
-+        stack: &[Fact],
-+        func: &IrFunction,
-+        defs: &FxHashMap<Value, (usize, usize)>,
-+        cond: &Operand,
-+        depth: u8,
-+    ) -> Option<bool> {
-+        match cond {
-+            Operand::Const(k) => k.to_i128().map(|v| v != 0),
-+            Operand::Value(v) => {
-+                if let Some(s) = known_set(stack, *v, BOOL_BITS) {
-+                    if s.as_slice() == [(0, 0)] {
-+                        return Some(false);
-+                    }
-+                    if !s.is_empty() && s[0].0 >= 1 {
-+                        return Some(true);
-+                    }
-                 }
--                if !s.is_empty() && s[0].0 >= 1 {
--                    return Some(true);
-+                if depth == 0 {
-+                    return None;
-+                }
-+                let &(bi, ii) = defs.get(v)?;
-+                match &func.blocks[bi].instructions[ii] {
-+                    Instruction::Copy { src, .. } => go(stack, func, defs, src, depth - 1),
-+                    Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } => {
-+                        decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?)
-+                    }
-+                    _ => None,
-                 }
-             }
--            let &(bi, ii) = defs.get(v)?;
--            if let Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } = func.blocks[bi].instructions[ii] {
--                return decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?);
--            }
--            None
-         }
-     }
-+    go(stack, func, defs, cond, 16)
- }
- 
- fn bool_const(b: bool) -> Operand {
-@@ -513,10 +537,12 @@ pub fn run_function(func: &mut IrFunction) -> usize {
-                     _ => None,
-                 };
-                 if let Some(r) = repl {
--                    // A folded Cmp must no longer be looked through.
--                    if let Instruction::Cmp { dest, .. } = &func.blocks[blk].instructions[i] {
--                        defs.remove(dest);
--                    }
-+                    // The fold REPLACES the Cmp with its decided constant at
-+                    // the same (bi, ii), so the defs entry stays valid — it
-+                    // now maps to a `Copy { src: bool_const }`, which
-+                    // decide_bool looks through. Erasing the entry here would
-+                    // hide the folded fact from later consumers in this very
-+                    // block (select cond / branch cond follow the guard).
-                     func.blocks[blk].instructions[i] = r;
-                     changes += 1;
-                 }
-diff --git a/src/passes/vec_load_sink.rs b/src/passes/vec_load_sink.rs
-index e701459..304721f 100644
---- a/src/passes/vec_load_sink.rs
-+++ b/src/passes/vec_load_sink.rs
-@@ -131,7 +131,7 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
-     if func.is_declaration || func.blocks.is_empty() {
-         return 0;
-     }
--    let uses = collect_use_sites(func);
-+    let mut uses = collect_use_sites(func);
-     let debug = std::env::var_os("CCC_DEBUG_VEC_LOAD_SINK").is_some();
-     let mut moved = 0usize;
- 
-@@ -209,6 +209,20 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
-                 let span = block.source_spans.remove(i);
-                 block.source_spans.insert(uj - 1, span);
-             }
-+            // The permutation `remove(i); insert(uj-1)` shifts every recorded
-+            // use site strictly inside (i, uj) down by one; sites at uj (the
-+            // moved load's own consumer) and outside the window are stable.
-+            // Without this remap, a still-unvisited load whose consumer sits
-+            // inside the permuted window fails the re-verification below and
-+            // its sink is forfeited (two independent streams in one block
-+            // sank only the higher-indexed load).
-+            for sites in uses.values_mut() {
-+                for (b, p) in sites.iter_mut() {
-+                    if *b == bi && *p > i && *p < uj {
-+                        *p -= 1;
-+                    }
-+                }
++    /// Register-direct cast whose source currently lives in the accumulator
++    /// (see the call site in `try_emit_cast_reg_direct`). Returns false for
++    /// shapes that have no single-instruction extending/truncating move;
++    /// nothing is emitted in that case.
++    fn emit_cast_from_accumulator(
++        &mut self,
++        kind: crate::backend::cast::CastKind,
++        to_ty: IrType,
++        dest_32: &str,
++        dest_64: &str,
++    ) -> bool {
++        use crate::backend::cast::CastKind;
++        match kind {
++            CastKind::IntWiden { from_ty: ft, .. } => {
++                let (insn, src, dst) = match (ft.is_signed(), ft.size()) {
++                    (true, 1) => ("movsbq", "al", dest_64),
++                    (true, 2) => ("movswq", "ax", dest_64),
++                    (true, 4) => ("movslq", "eax", dest_64),
++                    (false, 1) => ("movzbl", "al", dest_32),
++                    (false, 2) => ("movzwl", "ax", dest_32),
++                    (false, 4) => ("movl", "eax", dest_32),
++                    _ => return false,
++                };
++                self.state
++                    .emit_fmt(format_args!("    {insn} %{src}, %{dst}"));
++                true
 +            }
-             moved += 1;
++            CastKind::IntNarrow { to_ty: t } => {
++                let (insn, src, dst) = match (t.size(), t.is_unsigned()) {
++                    (4, true) => ("movl", "eax", dest_32),
++                    (4, false) => ("movslq", "eax", dest_64),
++                    (2, _) => ("movzwl", "ax", dest_32),
++                    (1, _) => ("movzbl", "al", dest_32),
++                    _ => return false,
++                };
++                self.state
++                    .emit_fmt(format_args!("    {insn} %{src}, %{dst}"));
++                true
++            }
++            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {
++                if to_ty.size() <= 4 {
++                    self.state
++                        .emit_fmt(format_args!("    movl %eax, %{dest_32}"));
++                } else {
++                    self.state
++                        .emit_fmt(format_args!("    movq %rax, %{dest_64}"));
++                }
++                true
++            }
++            CastKind::SignedToUnsignedSameSize { to_ty: t } if t.size() == 4 => {
++                self.state
++                    .emit_fmt(format_args!("    movl %eax, %{dest_32}"));
++                true
++            }
++            _ => false,
++        }
++    }
++
+     fn try_emit_cast_reg_direct(
+         &mut self,
+         _dest: &Value,
+@@ -915,9 +973,24 @@ impl X86Codegen {
+             return false;
          }
-     }
+ 
+-        // Need either a source register or a stack slot.
++        // Accumulator-staged source (an immediately-consumed producer with
++        // no register and no slot: `j = (long)(i - 1)` where `i - 1` was
++        // computed straight into %eax). The generic path would emit the
++        // accumulator form and then relay the result (`cltq; movq %rax,%r10`
++        // / `movl %eax,%eax; movq %rax,%r10`); the extending move can
++        // target the destination register directly from %rax's sub-
++        // register (`movslq %eax, %r10`): one instruction and no %rax
++        // write — %rax keeps holding the SOURCE, so the register cache
++        // stays exactly as it was. Bit-identical to the accumulator form:
++        // both read the same low `from_ty` bits and produce the same
++        // extension. Shapes without a one-instruction form fall through to
++        // the generic path (which handles them today).
+         if src_phys.is_none() && src_slot.is_none() {
+-            return false;
++            let Operand::Value(v) = src else { return false };
++            if !self.state.reg_cache.acc_has(v.0, self.state.is_alloca(v.0)) {
++                return false;
++            }
++            return self.emit_cast_from_accumulator(kind, to_ty, dest_32, dest_64);
+         }
+         // An XMM-homed source is an integer bit-punned in the float domain
+         // (fp-select/int-select blending keeps the value in the SSE domain).
