@@ -270,3 +270,448 @@ index a0990d6..be87e92 100644
          if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
              if !op.is_comparison() && !matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
                  // C23 decimal FP: decimal operands carry the result in the
+diff --git a/scripts/torture_evidence.py b/scripts/torture_evidence.py
+new file mode 100755
+index 00000000..9dd7dacb
+--- /dev/null
++++ b/scripts/torture_evidence.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""Summarise gcc.c-torture JSON reports into the session evidence table.
++
++Input:  one or more ``--json`` reports written by ``scripts/x86_gcc_torture.py``
++        or ``scripts/x86_gcc_torture_i686.py`` (schema 1).
++Output: ``engineering/evidence/session/evidence.json`` (consumed by the
++        harness web console via ``scripts/lccc-harness-snapshot.sh``) and a
++        Markdown table on stdout for follow-up documents.
++
++Reference skips (``reference-compile-skip`` / ``reference-run-skip``) are tests
++the host GCC itself cannot build or run; they are excluded from the
++denominator because they say nothing about LCCC.  Everything else is either
++``pass`` or an LCCC failure, so ``pass + fail == total``.
++
++Usage:
++  scripts/torture_evidence.py x64.json:x86-64 i686.json:i686 [--out evidence.json]
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++import time
++from collections import Counter, defaultdict
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parent.parent
++DEFAULT_OUT = REPO / "engineering" / "evidence" / "session" / "evidence.json"
++SKIPS = {"reference-compile-skip", "reference-run-skip"}
++
++
++def summarise(path: Path, target: str) -> tuple[list[dict], list[str]]:
++    data = json.loads(path.read_text())
++    per_flag: dict[str, Counter] = defaultdict(Counter)
++    failing: dict[str, list[str]] = defaultdict(list)
++    for r in data["results"]:
++        per_flag[r["flags"]][r["status"]] += 1
++        if r["status"] not in SKIPS and r["status"] != "pass":
++            failing[r["test"]].append(f"{r['flags']}:{r['status']}")
++    rows = []
++    for flag in data["flags"]:
++        c = per_flag[flag]
++        skipped = sum(v for k, v in c.items() if k in SKIPS)
++        fail = sum(v for k, v in c.items() if k not in SKIPS and k != "pass")
++        rows.append(dict(
++            suite="gcc.c-torture/execute", target=target, flags=flag,
++            pass_=c["pass"], fail=fail, total=c["pass"] + fail, skipped=skipped,
++            note=f"lccc {str(data.get('lccc_head') or '')[:12]}",
++        ))
++    notes = [f"{target}: {len(failing)} distinct failing sources: " +
++             ", ".join(f"{t} [{' '.join(v)}]" for t, v in sorted(failing.items()))
++             if failing else f"{target}: zero LCCC failures across {', '.join(data['flags'])}"]
++    return rows, notes
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("reports", nargs="+", help="<report.json>:<target-label>")
++    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
++    ap.add_argument("--append-note", action="append", default=[])
++    args = ap.parse_args(argv)
++    rows, notes = [], []
++    for item in args.reports:
++        path, _, label = item.partition(":")
++        r, n = summarise(Path(path), label or Path(path).stem)
++        rows += r
++        notes += n
++    notes += args.append_note
++    payload = {"generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++               "rows": [{("pass" if k == "pass_" else k): v for k, v in row.items()} for row in rows],
++               "notes": notes}
++    args.out.parent.mkdir(parents=True, exist_ok=True)
++    tmp = args.out.with_suffix(".json.tmp")
++    tmp.write_text(json.dumps(payload, indent=2) + "\n")
++    os.replace(tmp, args.out)
++    print("| Target | Flags | Pass | Fail | Rate |")
++    print("|---|---|---:|---:|---:|")
++    for row in payload["rows"]:
++        rate = 100.0 * row["pass"] / row["total"] if row["total"] else 0.0
++        print(f"| {row['target']} | `{row['flags']}` | {row['pass']}/{row['total']} | {row['fail']} | {rate:.2f}% |")
++    for n in notes:
++        print(f"\n{n}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/x86_gcc_torture.py b/scripts/x86_gcc_torture.py
+index 52f0a2ce..d46d531f 100755
+--- a/scripts/x86_gcc_torture.py
++++ b/scripts/x86_gcc_torture.py
+@@ -248,6 +248,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+ 
+ 
+ def main(argv: Sequence[str] | None = None) -> int:
++    # Progress must be visible in `nohup ... > log` runs on the constrained
++    # research host; default block buffering hides it for tens of minutes.
++    sys.stdout.reconfigure(line_buffering=True)
+     args = parse_args(argv)
+     args.suite = args.suite.expanduser().resolve()
+     args.lccc = args.lccc.expanduser().resolve()
+diff --git a/scripts/x86_gcc_torture_i686.py b/scripts/x86_gcc_torture_i686.py
+index 015f86cc..fc71c1a9 100644
+--- a/scripts/x86_gcc_torture_i686.py
++++ b/scripts/x86_gcc_torture_i686.py
+@@ -55,8 +55,30 @@ DEFAULT_FLAGS = ("-O0", "-O1", "-O2", "-O3", "-Os")
+ _DIRECTIVE = re.compile(r"\{\s*dg-(?:additional-)?options\s+\"([^\"]*)\"([^}]*)\}")
+ 
+ # GCC multilib include dirs required for 32-bit system headers (stdarg.h etc.).
++#
++# The compiler-private include directory is derived from the host GCC rather
++# than hard-coded to one major version: research hosts have shipped GCC 12,
++# 14 and 16, and a stale `/usr/lib/gcc/<triple>/<N>/include` silently turns
++# every test that needs <stddef.h>/<stdarg.h> into a bogus compile-fail.
++def _gcc_private_include(gcc: str) -> list[str]:
++    try:
++        proc = subprocess.run([gcc, "-m32", "-print-file-name=include"],
++                              capture_output=True, text=True, timeout=10, check=False)
++        path = proc.stdout.strip()
++        if proc.returncode == 0 and path and os.path.isdir(path):
++            return ["-isystem", path]
++    except (OSError, subprocess.SubprocessError):
++        pass
++    import glob as _glob
++    candidates = sorted(
++        _glob.glob("/usr/lib/gcc/x86_64-linux-gnu/*/include"),
++        key=lambda p: int(p.split("/")[-2]) if p.split("/")[-2].isdigit() else -1,
++    )
++    return ["-isystem", candidates[-1]] if candidates else []
++
++
+ _I686_INCLUDES = [
+-    "-isystem", "/usr/lib/gcc/x86_64-linux-gnu/14/include",
++    *_gcc_private_include(os.environ.get("GCC_BIN", "gcc")),
+     "-isystem", "/usr/include/x86_64-linux-gnu",
+     "-isystem", "/usr/include/i386-linux-gnu",
+     "-isystem", "/usr/include",
+@@ -248,6 +270,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+ 
+ 
+ def main(argv: Sequence[str] | None = None) -> int:
++    # Progress must be visible in `nohup ... > log` runs on the constrained
++    # research host; default block buffering hides it for tens of minutes.
++    sys.stdout.reconfigure(line_buffering=True)
+     args = parse_args(argv)
+     args.suite = args.suite.expanduser().resolve()
+     args.lccc = args.lccc.expanduser().resolve()
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_code.rs b/src/backend/x86/codegen/peephole/passes/dead_code.rs
+index bb34234b..23168901 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_code.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_code.rs
+@@ -362,6 +362,29 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
+                 }
+             }
+ 
++            // Scalar-FP / SSE slot traffic participates in the same byte-range
++            // model. A GP store that is reloaded into an XMM register through
++            // the slot (`movq %rax, -72(%rbp)` / `movss -72(%rbp), %xmm0` —
++            // the -O0 int<->float bit-transfer idiom) is a live store; an XMM
++            // store that fully covers our bytes kills it exactly like a GP one.
++            if let LineKind::LoadXmmRbp { offset: load_off, size: load_sz } = infos[j].kind {
++                if ranges_overlap(store_offset, store_bytes, load_off, load_sz.byte_size()) {
++                    slot_read = true;
++                    break;
++                }
++            }
++            if let LineKind::StoreXmmRbp { offset: new_off, size: new_sz } = infos[j].kind {
++                let new_bytes = new_sz.byte_size();
++                if new_off <= store_offset && new_off + new_bytes >= store_offset + store_bytes {
++                    slot_overwritten = true;
++                    break;
++                }
++                if ranges_overlap(store_offset, store_bytes, new_off, new_bytes) {
++                    slot_read = true;
++                    break;
++                }
++            }
++
+             // Check Other and Cmp lines for rbp references. Cmp lines can
+             // have memory operands after memory fold (e.g., cmpq -N(%rbp), %rax).
+             if matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp) {
+diff --git a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+index a6cebec4..8fdcff8d 100644
+--- a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
++++ b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+@@ -556,6 +556,23 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
+ 
+             LineKind::Cmp | LineKind::Directive => {}
+ 
++            // A scalar-FP / SSE store rewrites frame bytes: every GP mapping
++            // whose slot range intersects it is stale. When %rbp is a data
++            // register the `(%rbp)` form is an opaque pointer write. (These
++            // lines were `Other` before the XMM slot kinds existed and were
++            // range-invalidated through `gsf_handle_other`; falling into
++            // `_ => {}` silently kept stale GP mappings alive.)
++            LineKind::StoreXmmRbp { offset, size } => {
++                if !rbp_is_frame && infos[i].reg_refs & (1u16 << 5) != 0 {
++                    invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
++                } else {
++                    invalidate_slots_at(&mut slot_entries, &mut reg_offsets, offset, size.byte_size());
++                }
++            }
++            // An XMM load writes no GP register and no memory: mappings stay
++            // valid (a later GP reload of the same slot may still forward).
++            LineKind::LoadXmmRbp { .. } => {}
++
+             _ => {}
+         }
+     }
+diff --git a/src/backend/x86/codegen/peephole/types.rs b/src/backend/x86/codegen/peephole/types.rs
+index 6d421afa..bc915191 100644
+--- a/src/backend/x86/codegen/peephole/types.rs
++++ b/src/backend/x86/codegen/peephole/types.rs
+@@ -282,6 +282,40 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
+     }
+ }
+ 
++/// Build a `LineInfo` for a scalar-FP / SSE frame-slot move
++/// (`StoreXmmRbp` / `LoadXmmRbp`).
++///
++/// These lines used to be classified as `Other`, which populated the
++/// memory-operand caches (`rbp_offset`, `has_indirect_mem`) and the GP
++/// `reg_refs` bitmask (the `%rbp`/`%rsp` base). Every slot-tracking pass that
++/// reaches an XMM slot move through a generic `_ =>` arm — windowed
++/// dead-store elimination, frame compaction, store forwarding's range
++/// invalidation, the `%rbp`-as-data-register escape checks — depends on
++/// those caches. Constructing the new kinds with the bare `line_info` helper
++/// left them empty, so a GP store feeding `movss slot, %xmmN` was deleted as
++/// dead (gcc.c-torture 20000605-1.c, pr47538.c, pr59229.c, pr109938.c,
++/// pr109986.c, 20021120-1.c at -O0; 920428-2.c/pr37573.c at -O1;
++/// 20060420-1.c at -O2/-O3). Same contract as `cmp_line_info`.
++#[inline]
++pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) -> LineInfo {
++    debug_assert!(matches!(kind, LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. }));
++    let has_indirect = has_indirect_memory_access(s);
++    let rbp_off = if has_indirect {
++        RBP_OFFSET_NONE
++    } else {
++        parse_rbp_offset(s)
++    };
++    LineInfo {
++        kind,
++        ext_kind: ExtKind::None,
++        trim_start: ts,
++        has_indirect_mem: has_indirect,
++        rbp_offset: rbp_off,
++        reg_refs: scan_register_refs(sb),
++        pinned: false,
++    }
++}
++
+ /// Helper to construct a LineInfo with default ext_kind but pre-scanned reg_refs.
+ #[inline]
+ pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> LineInfo {
+@@ -349,13 +383,15 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
+     if first == b'v' && sb.len() >= 7 && sb[1] == b'm' && sb[2] == b'o' && sb[3] == b'v' {
+         if let Some((store, offset_str, size)) = parse_fp_slot_move(s) {
+             let offset = fast_parse_i32(offset_str);
+-            return line_info(
++            return xmm_slot_line_info(
+                 if store {
+                     LineKind::StoreXmmRbp { offset, size }
+                 } else {
+                     LineKind::LoadXmmRbp { offset, size }
+                 },
+                 ts,
++                s,
++                sb,
+             );
+         }
+     }
+@@ -364,13 +400,15 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
+     if first == b'm' && sb.len() >= 4 && sb[1] == b'o' && sb[2] == b'v' {
+         if let Some((store, offset_str, size)) = parse_fp_slot_move(s) {
+             let offset = fast_parse_i32(offset_str);
+-            return line_info(
++            return xmm_slot_line_info(
+                 if store {
+                     LineKind::StoreXmmRbp { offset, size }
+                 } else {
+                     LineKind::LoadXmmRbp { offset, size }
+                 },
+                 ts,
++                s,
++                sb,
+             );
+         }
+         if let Some((reg_str, offset_str, size)) = parse_store_to_rbp_str(s) {
+diff --git a/tests/regression/xmm_slot_gp_store_liveness.c b/tests/regression/xmm_slot_gp_store_liveness.c
+new file mode 100644
+index 00000000..7172f245
+--- /dev/null
++++ b/tests/regression/xmm_slot_gp_store_liveness.c
+@@ -0,0 +1,98 @@
++/* Regression: scalar-FP frame-slot moves must participate in the peephole
++ * slot model (x86 `StoreXmmRbp` / `LoadXmmRbp`).
++ *
++ * Upstream b5c634ed introduced dedicated line kinds for movss/movsd slot
++ * traffic but constructed them with empty memory-operand caches, so:
++ *   (1) windowed dead-store elimination could not see `movss slot, %xmmN`
++ *       and deleted the GP store feeding it (`movq %rax, slot`) — the -O0
++ *       int<->float bit-transfer idiom broke: gcc.c-torture 20000605-1.c,
++ *       pr47538.c, pr59229.c, pr109938.c, pr109986.c, 20021120-1.c;
++ *   (2) store forwarding kept a GP slot mapping alive across an XMM store to
++ *       the same slot, forwarding a stale GP value into a later reload.
++ *
++ * Kept at -O0 (see .flags) because the idiom is emitted by the unoptimised
++ * lowering; every optimisation level must still pass. */
++void abort(void);
++
++typedef struct { int y; float scaley; int src_y; } RenderInfo;
++
++static void bar(void) {}
++
++/* Shape (1): float error flows through a GP register and a frame slot. */
++static int render(RenderInfo *info)
++{
++    int y = info->y, ye = 256;
++    float step = 1.0 / info->scaley;
++    float error = y * step;
++    error -= ((int) error) - step;
++    for (; y < ye; y++) {
++        if (error >= 1.0) {
++            info->src_y += (int) error;
++            error -= (int) error;
++            bar();
++        }
++        error += step;
++    }
++    return info->src_y;
++}
++
++/* Shape (1b): double variant with an alternating-sign reduction. */
++struct S { double a, b, *c; unsigned long d; };
++__attribute__((noinline)) static void foo(struct S *x, const struct S *y)
++{
++    const unsigned long n = y->d + 1;
++    const double m = 0.25 * (y->b - y->a);
++    x->a = y->a; x->b = y->b;
++    if (n == 1) x->c[0] = 0.;
++    else if (n == 2) { x->c[1] = m * y->c[0]; x->c[0] = 2.0 * x->c[1]; }
++    else {
++        double o = 0.0, p = 1.0; unsigned long i;
++        for (i = 1; i <= n - 2; i++) {
++            x->c[i] = m * (y->c[i - 1] - y->c[i + 1]) / (double) i;
++            o += p * x->c[i];
++            p = -p;
++        }
++        x->c[n - 1] = m * y->c[n - 2] / (n - 1.0);
++        o += p * x->c[n - 1];
++        x->c[0] = 2.0 * o;
++    }
++}
++
++/* Shape (2): the same slot is written by a GP store, then by an XMM store,
++ * then reloaded into a GP register — the reload must observe the XMM bits. */
++union Bits { float f; unsigned u; };
++__attribute__((noinline)) static unsigned reslot(unsigned seed, float f)
++{
++    union Bits b;
++    b.u = seed;            /* GP store to the slot */
++    if (seed & 1)
++        b.f = f;           /* XMM store fully covering the slot */
++    return b.u + 1;        /* GP reload: must not forward `seed` */
++}
++
++int main(void)
++{
++    RenderInfo info = { 0, 1.0f, 0 };
++    if (render(&info) != 256)
++        abort();
++
++    struct S x, y;
++    double c[4] = { 10, 20, 30, 40 }, d[4], e[4] = { 118, 118, 118, 118 };
++    y.a = 10; y.b = 6; y.c = c; x.c = d; y.d = 3;
++    __builtin_memcpy(d, e, sizeof d);
++    foo(&x, &y);
++    if (d[0] != 0 || d[1] != 20 || d[2] != 10 || d[3] != -10)
++        abort();
++    y.d = 0;
++    __builtin_memcpy(d, e, sizeof d);
++    foo(&x, &y);
++    if (d[0] != 0 || d[1] != 118)
++        abort();
++
++    union Bits probe; probe.f = 1.5f;
++    if (reslot(7u, 1.5f) != probe.u + 1)
++        abort();
++    if (reslot(6u, 1.5f) != 7u)
++        abort();
++    return 0;
++}
+diff --git a/tests/regression/xmm_slot_gp_store_liveness.flags b/tests/regression/xmm_slot_gp_store_liveness.flags
+new file mode 100644
+index 00000000..e2571f8c
+--- /dev/null
++++ b/tests/regression/xmm_slot_gp_store_liveness.flags
+@@ -0,0 +1 @@
++-O0
+diff --git a/tests/regression/xmm_slot_gp_store_liveness_o1.c b/tests/regression/xmm_slot_gp_store_liveness_o1.c
+new file mode 100644
+index 00000000..263f7cf4
+--- /dev/null
++++ b/tests/regression/xmm_slot_gp_store_liveness_o1.c
+@@ -0,0 +1,26 @@
++/* -O1 companion of xmm_slot_gp_store_liveness.c: same peephole model bug,
++ * exercised through the -O1 lowering shapes of gcc.c-torture 920428-2.c and
++ * pr37573.c (unsigned<->float conversions and bit-level slot transfers). */
++void abort(void);
++
++__attribute__((noinline)) static unsigned f2u(float f) { return (unsigned) f; }
++__attribute__((noinline)) static float u2f(unsigned u) { return (float) u; }
++
++__attribute__((noinline)) static unsigned mix(unsigned a, float b, unsigned c)
++{
++    unsigned t = a * 2654435761u;      /* lives in a GP slot at -O1 */
++    float g = u2f(t) + b;              /* transfer through the slot */
++    unsigned r = f2u(g) ^ c;
++    return r + t;
++}
++
++int main(void)
++{
++    if (f2u(4294967040.0f) != 4294967040u)
++        abort();
++    if (u2f(4294967295u) != 4294967296.0f)
++        abort();
++    if (mix(1u, 0.0f, 0u) != (unsigned)(2654435761u) + 2654435840u)
++        abort();
++    return 0;
++}
+diff --git a/tests/regression/xmm_slot_gp_store_liveness_o1.flags b/tests/regression/xmm_slot_gp_store_liveness_o1.flags
+new file mode 100644
+index 00000000..11c863a6
+--- /dev/null
++++ b/tests/regression/xmm_slot_gp_store_liveness_o1.flags
+@@ -0,0 +1 @@
++-O1
