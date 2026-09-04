@@ -1,736 +1,103 @@
-diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
-index e4c8692..d9e1896 100644
---- a/src/backend/stack_layout/copy_coalescing.rs
-+++ b/src/backend/stack_layout/copy_coalescing.rs
-@@ -2332,7 +2332,10 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
- 
- /// Defer a vector home-slot store when every def is consumed once from the
- /// last-store peephole by a cache-aware intrinsic in the same block.
--pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
-+pub(super) fn compute_vector_defer_values(
-+    func: &IrFunction,
-+    memfold_values: &FxHashSet<u32>,
-+) -> FxHashSet<u32> {
-     let mut result = FxHashSet::default();
- 
-     let mut allocas: FxHashSet<u32> = FxHashSet::default();
-@@ -2498,6 +2501,25 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
- 
-             let mut ok = true;
-             for ik in &insts[(i + 1)..u] {
-+                // A VLFOLD-elided 256-bit load never materialises: it is
-+                // consumed as a memory operand by the SAME consumer `u`
-+                // (`vec_load_sink` places it directly before `u`), so it
-+                // cannot clobber the deferred %ymm0 value.  Should the
-+                // elision bail at emit time, the fallback load flushes the
-+                // pending store before touching %ymm0 (intrinsics.rs), so
-+                // crossing it here is sound in both outcomes.
-+                let elided_load = matches!(
-+                    ik,
-+                    Instruction::Intrinsic {
-+                        dest: Some(ld),
-+                        dest_ptr: None,
-+                        op: lop,
-+                        ..
-+                    } if is_memfold_vec_load(lop) && memfold_values.contains(&ld.0)
-+                );
-+                if elided_load {
-+                    continue;
-+                }
-                 if is_vec_invalidator(ik) || matches!(ik, Instruction::Intrinsic { .. }) {
-                     ok = false;
-                     break;
-diff --git a/src/backend/stack_layout/mod.rs b/src/backend/stack_layout/mod.rs
-index 8b9b9c0..f5d6f07 100644
---- a/src/backend/stack_layout/mod.rs
-+++ b/src/backend/stack_layout/mod.rs
-@@ -631,8 +631,11 @@ fn build_layout_context(
-             }
-         }
-     }
--    let vector_defer_values = copy_coalescing::compute_vector_defer_values(func);
-+    // VLFOLD candidates first: the defer analysis treats an elided load as
-+    // transparent between a deferred def and its consumer.
-     let vector_memfold_values = copy_coalescing::compute_vector_memfold_values(func);
-+    let vector_defer_values =
-+        copy_coalescing::compute_vector_defer_values(func, &vector_memfold_values);
-     let x87_defer_values = copy_coalescing::compute_x87_defer_values(func);
- 
-     // Propagate copy-alias uses into use_blocks_map so that root values account
+From 8c6e471a71056abf000e0cf5f969b84714b59a06 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@localhost>
+Date: Fri, 4 Sep 2026 08:46:52 +0000
+Subject: [PATCH] S05: fix three upstream regressions (PR #381/#382 fallout)
+
+1. intrinsics.rs emit_avx_map_fma_inner (None,None) arm: a pending VLFOLD
+   load on the SCALE operand was read through the value's never-written home
+   slot (vfmadd132pd 80(%rsp) on streamed three_stream maps); consume the
+   parked source operand instead. Fixes vectorize_map_expr_tree:oracle.
+2. load_op_fuse.rs fuse_load_into_alu copy-bridged commutative form: the
+   replacement 'mov C,B; op mem,B' clobbers the folded memory operand's
+   address register when B is one of its families (nested double-loop
+   miscompile, k_nested_rt_inner 90 vs 1980). Bail when (b_bit & addr)!=0.
+3. callee_saves.rs eliminate_unused_callee_saves_fpo: removing a leading push
+   shifts every %rsp-relative data reference (va save areas, overflow
+   pointers, spill slots) by 8 bytes; the safe-gate only bailed on and/%xmm
+   lines. Bail on any non-adjust %rsp reference. Fixes
+   va_arg_wide_struct:oracle (ll/big).
+---
+ src/backend/x86/codegen/intrinsics.rs         | 16 ++++++++++++---
+ .../codegen/peephole/passes/callee_saves.rs   | 20 ++++++++++---------
+ .../codegen/peephole/passes/load_op_fuse.rs   |  7 +++++++
+ 3 files changed, 31 insertions(+), 12 deletions(-)
+
 diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index e7ff193..051fbe4 100644
+index e7ff193c..8b2fc76a 100644
 --- a/src/backend/x86/codegen/intrinsics.rs
 +++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -3134,6 +3134,11 @@ impl X86Codegen {
-                     }
-                 }
-                 if !loaded_home {
-+                    // A deferred result may still sit in %ymm0 (the defer
-+                    // analysis lets VLFOLD-elided loads be crossed; when the
-+                    // elision bails at emit time this load must not clobber
-+                    // the pending value): commit it first.
-+                    self.flush_pending_vec_store_impl();
-                     self.state
-                         .emit_fmt(format_args!("    vmovupd {}, %ymm0", mem));
-                 }
-@@ -3195,6 +3200,9 @@ impl X86Codegen {
-             }
-             IntrinsicOp::VecLoadI32x8 => {
-                 // Defer-aware store; reuse register-allocated base/offset.
-+                // Commit a pending deferred %ymm0 result before clobbering
-+                // the scratch register (see VecLoadF64x4).
-+                self.flush_pending_vec_store_impl();
-                 let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
-                 match &index {
-                     Some(ix) => self
-@@ -4136,6 +4144,9 @@ impl X86Codegen {
-                     }
-                 }
-                 if !loaded_home {
-+                    // Commit a pending deferred %ymm0 result before
-+                    // clobbering the scratch register (see VecLoadF64x4).
-+                    self.flush_pending_vec_store_impl();
-                     if is8 {
-                         self.state
-                             .emit_fmt(format_args!("    vmovups {}, %ymm0", mem));
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 16d199d..f1fba09 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -59,6 +59,7 @@ pub(crate) mod store_load_forward;
- pub(crate) mod tail_call_elim;
- pub(crate) mod univsr;
- pub(crate) mod use_def;
-+pub(crate) mod vec_load_sink;
- pub(crate) mod vector_temp_promotion;
- pub(crate) mod vectorize;
- pub(crate) mod verify;
-@@ -1326,6 +1327,25 @@ pub(crate) fn run_passes(
-             total_changes += n;
-             total_changes_excl_dce += n;
- 
-+            // Single-use vector-load sinking (x86 only): place each stream
-+            // load directly before its unique consumer so the emitter's
-+            // VLFOLD window folds it as a memory operand instead of staging
-+            // it through %ymm0 and a 32-byte spill slot (saxpy-shaped
-+            // `y[i] = y[i] OP f(x[i])` bodies at -ffp-contract=off).  Runs
-+            // before the post-vectorize unroll so every unrolled copy
-+            // inherits the folded order.  Pure reordering of reads; a
-+            // "changed" signal is not needed downstream.
-+            // Pass name for CCC_DISABLE_PASSES: "vec_load_sink"
-+            if target == crate::backend::Target::X86_64
-+                && !pass_disabled(&disabled, "vec_load_sink")
-+            {
-+                let mut scratch = vec![false; module.functions.len()];
-+                timed_pass!(
-+                    "vec_load_sink",
-+                    run_on_visited(module, &dirty, &mut scratch, vec_load_sink::sink_vector_loads)
-+                );
-+            }
-+
-             // Post-vectorize unroll: the matmul/map vector body is often a
-             // single intrinsic — unrolling it 2–4× exposes independent FMA
-             // chains (GCC's multi-accum style) without growing scalar code.
-diff --git a/src/passes/vec_load_sink.rs b/src/passes/vec_load_sink.rs
-new file mode 100644
-index 0000000..e701459
---- /dev/null
-+++ b/src/passes/vec_load_sink.rs
-@@ -0,0 +1,538 @@
-+//! Single-use vector-load sinking (x86 VLFOLD enabler).
-+//!
-+//! The x86 vector emitter can fold a 256-bit `VecLoad*` straight into the
-+//! memory operand of its consumer (`vaddps (%rdi,%r10), %ymm0, %ymm0`,
-+//! see `compute_vector_memfold_values` / `try_elide_vec_load`), but only
-+//! when the load is *adjacent* to that consumer (position `j-1`, or `j-2`
-+//! behind another pure load).  The vectorizer, however, emits every stream
-+//! load at the top of the body:
-+//!
-+//! ```text
-+//!   %y = VecLoadF32x8 y, iv        ; <- consumed three instructions later
-+//!   %x = VecLoadF32x8 x, iv
-+//!   %p = VecMulF32x8 %a, %x        ; folds %x (adjacent)
-+//!   %s = VecAddF32x8 %y, %p        ; %y NOT foldable: staged via %ymm0 -> slot
-+//!   VecStoreF32x8 %s -> y, iv
-+//! ```
-+//!
-+//! Without this pass the `y[i]` load is loaded into `%ymm0`, spilled to a
-+//! 32-byte stack slot (the scratch register is needed for the product),
-+//! and re-read as the `vaddps` memory operand: two extra memory µops and a
-+//! 136-byte frame in every `y[i] += a*x[i]`-shaped loop compiled at the
-+//! default `-ffp-contract=off` (GCC/ICX/Clang emit three instructions).
-+//!
-+//! The pass moves a pure, non-volatile vector load with exactly one use to
-+//! the instruction slot immediately before that use, when
-+//!
-+//! * the use is in the same basic block and is an `Intrinsic`
-+//!   (the only consumers that can take a memory operand), and
-+//! * every instruction strictly between the load and the use is free of
-+//!   memory writes and side effects: pure intrinsics (`IntrinsicOp::is_pure`
-+//!   with no `dest_ptr`), scalar arithmetic / compares / casts / GEPs /
-+//!   selects / copies, and **non-volatile** scalar loads.
-+//!
-+//! Sinking a read past other reads is always semantics-preserving; crossing
-+//! any store, call, atomic, memcpy, inline asm, volatile access or counter
-+//! update is refused fail-closed.  SSA guarantees the load's address
-+//! operands are still valid at the new position.  `source_spans` (parallel
-+//! to `instructions`) is kept in lock-step so `-g` line tables stay exact.
-+//!
-+//! Pass name for `CCC_DISABLE_PASSES`: `vec_load_sink`.  Kill switch:
-+//! `CCC_NO_VEC_LOAD_SINK=1`.  Trace: `CCC_DEBUG_VEC_LOAD_SINK=1`.
-+
-+use crate::backend::liveness::{
-+    for_each_operand_in_instruction, for_each_operand_in_terminator,
-+    for_each_value_use_in_instruction,
-+};
-+use crate::common::fx_hash::FxHashMap;
-+use crate::ir::reexports::{Instruction, IrFunction, Operand};
-+
-+/// One recorded use of an SSA value: (block index, instruction index).
-+/// `usize::MAX` as the instruction index denotes the block terminator.
-+type UseSite = (usize, usize);
-+
-+/// Sinkable candidate: a pure, non-volatile vector load producing an SSA
-+/// value (no `dest_ptr`).
-+fn is_sinkable_vec_load(inst: &Instruction) -> bool {
-+    match inst {
-+        Instruction::Intrinsic {
-+            dest: Some(_),
-+            op,
-+            dest_ptr: None,
-+            ..
-+        } => {
-+            use crate::ir::intrinsics::IntrinsicOp as O;
-+            matches!(
-+                op,
-+                O::VecLoadF64x4
-+                    | O::VecLoadF32x8
-+                    | O::VecLoadI32x8
-+                    | O::VecLoadI64x4
-+                    | O::VecLoadF64x2
-+                    | O::VecLoadF32x4
-+                    | O::VecLoadI32x4
-+                    | O::VecLoadI64x2
-+            )
-+        }
-+        _ => false,
-+    }
-+}
-+
-+/// May a vector load be moved *past* this instruction (i.e. may this
-+/// instruction execute before the load instead of after it)?  Only
-+/// instructions that neither write memory nor carry side effects qualify.
-+fn is_transparent_for_load(inst: &Instruction) -> bool {
-+    match inst {
-+        Instruction::Intrinsic {
-+            op, dest_ptr: None, ..
-+        } => op.is_pure(),
-+        Instruction::Load { volatile, .. } => !*volatile,
-+        Instruction::BinOp { .. }
-+        | Instruction::UnaryOp { .. }
-+        | Instruction::Cmp { .. }
-+        | Instruction::Cast { .. }
-+        | Instruction::GetElementPtr { .. }
-+        | Instruction::Select { .. }
-+        | Instruction::Copy { .. } => true,
-+        _ => false,
-+    }
-+}
-+
-+/// Collect every use site of every SSA value in `func` (operands, value
-+/// references such as store pointers / GEP bases, and terminator operands).
-+fn collect_use_sites(func: &IrFunction) -> FxHashMap<u32, Vec<UseSite>> {
-+    let mut uses: FxHashMap<u32, Vec<UseSite>> = FxHashMap::default();
-+    for (bi, block) in func.blocks.iter().enumerate() {
-+        for (ii, inst) in block.instructions.iter().enumerate() {
-+            for_each_operand_in_instruction(inst, |op| {
-+                if let Operand::Value(v) = op {
-+                    uses.entry(v.0).or_default().push((bi, ii));
-+                }
-+            });
-+            for_each_value_use_in_instruction(inst, |v| {
-+                uses.entry(v.0).or_default().push((bi, ii));
-+            });
-+        }
-+        for_each_operand_in_terminator(&block.terminator, |op| {
-+            if let Operand::Value(v) = op {
-+                uses.entry(v.0).or_default().push((bi, usize::MAX));
-+            }
-+        });
-+    }
-+    uses
-+}
-+
-+/// Sink single-use pure vector loads next to their consumer.  Returns the
-+/// number of loads moved.
-+pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
-+    if std::env::var_os("CCC_NO_VEC_LOAD_SINK").is_some() {
-+        return 0;
-+    }
-+    if func.is_declaration || func.blocks.is_empty() {
-+        return 0;
-+    }
-+    let uses = collect_use_sites(func);
-+    let debug = std::env::var_os("CCC_DEBUG_VEC_LOAD_SINK").is_some();
-+    let mut moved = 0usize;
-+
-+    for (bi, block) in func.blocks.iter_mut().enumerate() {
-+        // Walk backwards.  Moving the load at `i` to `uj-1` only permutes
-+        // instructions inside `[i, uj)`; every position `>= uj` and every
-+        // position `< i` is untouched, so the recorded use index of any
-+        // candidate still to be visited (all at positions `< i`) stays valid
-+        // as long as its consumer lies outside the permuted window — which
-+        // is re-verified below before each move (fail-closed).
-+        let mut i = block.instructions.len();
-+        while i > 0 {
-+            i -= 1;
-+            if !is_sinkable_vec_load(&block.instructions[i]) {
-+                continue;
-+            }
-+            let Instruction::Intrinsic { dest: Some(d), .. } = &block.instructions[i] else {
-+                continue;
-+            };
-+            let d = d.0;
-+            let Some(sites) = uses.get(&d) else {
-+                continue;
-+            };
-+            // Exactly one use, in this block, at a later instruction that is
-+            // an intrinsic (the only consumer class able to take a memory
-+            // operand), and not already adjacent.
-+            let [(ub, uj)] = sites.as_slice() else {
-+                continue;
-+            };
-+            let (ub, uj) = (*ub, *uj);
-+            if ub != bi || uj == usize::MAX || uj <= i + 1 || uj >= block.instructions.len() {
-+                continue;
-+            }
-+            // Re-verify the consumer really is at `uj` (earlier moves may have
-+            // permuted the window) and still names `d`.
-+            let consumer_ok = match &block.instructions[uj] {
-+                inst @ Instruction::Intrinsic { .. } => {
-+                    let mut found = false;
-+                    for_each_operand_in_instruction(inst, |op| {
-+                        if matches!(op, Operand::Value(v) if v.0 == d) {
-+                            found = true;
-+                        }
-+                    });
-+                    found
-+                }
-+                _ => false,
-+            };
-+            if !consumer_ok {
-+                continue;
-+            }
-+            if !block.instructions[i + 1..uj]
-+                .iter()
-+                .all(is_transparent_for_load)
-+            {
-+                continue;
-+            }
-+            if debug {
-+                let consumer = match &block.instructions[uj] {
-+                    Instruction::Intrinsic { op, .. } => format!("{:?}", op),
-+                    _ => String::new(),
+@@ -4607,9 +4607,19 @@ impl X86Codegen {
+                 let Operand::Value(sv) = &args[1] else {
+                     unreachable!("vfmadd132 scale operand must be a value");
+                 };
+-                let scale_mem = self.value_ptr_mem_operand(sv.0).unwrap_or_else(|| {
+-                    unreachable!("vfmadd132 scale operand must be homed, tracked, or slot-homed")
+-                });
++                // VLFOLD soundness: an elided load leaves its home slot NEVER
++                // WRITTEN, so a pending fold on the scale must be consumed as
++                // the real source memory operand here — never through the
++                // value's slot (the pre-fix vfmadd132pd read of an uninitialised
++                // stack slot that miscompiled streamed `a*b+c` maps).
++                let scale_mem = if let Some(mem) = self.memfold_operand(&args[1]) {
++                    self.state.pending_vec_memfold = None;
++                    mem
++                } else {
++                    self.value_ptr_mem_operand(sv.0).unwrap_or_else(|| {
++                        unreachable!("vfmadd132 scale operand must be homed, tracked, or slot-homed")
++                    })
 +                };
-+                eprintln!(
-+                    "[VEC-LOAD-SINK] {} b{}: move %{} from i{} to i{} (consumer {})",
-+                    func.name,
-+                    bi,
-+                    d,
-+                    i,
-+                    uj - 1,
-+                    consumer
-+                );
-+            }
-+            let inst = block.instructions.remove(i);
-+            block.instructions.insert(uj - 1, inst);
-+            if block.source_spans.len() > uj - 1 {
-+                let span = block.source_spans.remove(i);
-+                block.source_spans.insert(uj - 1, span);
-+            }
-+            moved += 1;
-+        }
-+    }
-+    moved
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::common::source::Span;
-+    use crate::common::types::{AddressSpace, IrType};
-+    use crate::ir::intrinsics::IntrinsicOp as O;
-+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst, Terminator, Value};
-+
-+    fn mkfunc() -> IrFunction {
-+        IrFunction::new("t".to_string(), IrType::Void, vec![], false)
-+    }
-+
-+    fn vload(dest: u32, base: u32, idx: u32) -> Instruction {
-+        Instruction::Intrinsic {
-+            dest: Some(Value(dest)),
-+            op: O::VecLoadF32x8,
-+            dest_ptr: None,
-+            args: vec![Operand::Value(Value(base)), Operand::Value(Value(idx))],
-+        }
-+    }
-+
-+    fn vbin(op: O, dest: u32, a: u32, b: u32) -> Instruction {
-+        Instruction::Intrinsic {
-+            dest: Some(Value(dest)),
-+            op,
-+            dest_ptr: None,
-+            args: vec![Operand::Value(Value(a)), Operand::Value(Value(b))],
-+        }
-+    }
-+
-+    fn vstore(val: u32, base: u32, idx: u32) -> Instruction {
-+        Instruction::Intrinsic {
-+            dest: None,
-+            op: O::VecStoreF32x8,
-+            dest_ptr: Some(Value(base)),
-+            args: vec![
-+                Operand::Value(Value(val)),
-+                Operand::Value(Value(base)),
-+                Operand::Value(Value(idx)),
-+            ],
-+        }
-+    }
-+
-+    fn sload(dest: u32, ptr: u32, volatile: bool) -> Instruction {
-+        Instruction::Load {
-+            volatile,
-+            dest: Value(dest),
-+            ptr: Value(ptr),
-+            ty: IrType::I32,
-+            seg_override: AddressSpace::Default,
-+        }
-+    }
-+
-+    fn block(id: u32, instructions: Vec<Instruction>) -> BasicBlock {
-+        BasicBlock {
-+            label: BlockId(id),
-+            instructions,
-+            terminator: Terminator::Return(None),
-+            source_spans: Vec::new(),
-+        }
-+    }
-+
-+    fn ops(f: &IrFunction, b: usize) -> Vec<String> {
-+        f.blocks[b]
-+            .instructions
-+            .iter()
-+            .map(|i| match i {
-+                Instruction::Intrinsic { dest, op, .. } => {
-+                    format!("{:?}:{}", op, dest.map(|v| v.0 as i64).unwrap_or(-1))
-+                }
-+                Instruction::Store { .. } => "store".to_string(),
-+                Instruction::Load { dest, .. } => format!("load:{}", dest.0),
-+                Instruction::BinOp { dest, .. } => format!("binop:{}", dest.0),
-+                _ => "other".to_string(),
-+            })
-+            .collect()
-+    }
-+
-+    /// The saxpy shape: the `y` load sinks below the product so VLFOLD can
-+    /// fold it into `vaddps`.
-+    #[test]
-+    fn saxpy_y_load_sinks_to_add() {
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(37, 4, 35),
-+                vload(39, 5, 35),
-+                vbin(O::VecMulF32x8, 40, 38, 39),
-+                vbin(O::VecAddF32x8, 41, 37, 40),
-+                vstore(41, 4, 35),
-+            ],
-+        ));
-+        assert_eq!(sink_vector_loads(&mut f), 1);
-+        assert_eq!(
-+            ops(&f, 0),
-+            vec![
-+                "VecLoadF32x8:39",
-+                "VecMulF32x8:40",
-+                "VecLoadF32x8:37",
-+                "VecAddF32x8:41",
-+                "VecStoreF32x8:-1",
-+            ]
-+        );
-+        // Idempotent: nothing left to move.
-+        assert_eq!(sink_vector_loads(&mut f), 0);
-+    }
-+
-+    /// `add(load_a, load_b)`: `load_b` is adjacent already; `load_a` sits at
-+    /// `j-2` and is moved to `j-1` (a harmless reorder among reads) — the
-+    /// exact contract is asserted so a change here is a conscious decision.
-+    #[test]
-+    fn adjacent_pair_contract() {
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(40, 5, 38),
-+                vload(41, 6, 38),
-+                vbin(O::VecAddI32x8, 42, 40, 41),
-+                vstore(42, 4, 38),
-+            ],
-+        ));
-+        assert_eq!(sink_vector_loads(&mut f), 1);
-+        assert_eq!(
-+            ops(&f, 0),
-+            vec!["VecLoadF32x8:41", "VecLoadF32x8:40", "VecAddI32x8:42", "VecStoreF32x8:-1"]
-+        );
-+    }
-+
-+    /// A scalar store between the load and its use blocks the sink.
-+    #[test]
-+    fn intervening_store_blocks_sink() {
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(37, 4, 35),
-+                Instruction::Store {
-+                    volatile: false,
-+                    val: Operand::Const(IrConst::I32(1)),
-+                    ptr: Value(7),
-+                    ty: IrType::I32,
-+                    seg_override: AddressSpace::Default,
-+                },
-+                vload(39, 5, 35),
-+                vbin(O::VecMulF32x8, 40, 38, 39),
-+                vbin(O::VecAddF32x8, 41, 37, 40),
-+            ],
-+        ));
-+        assert_eq!(sink_vector_loads(&mut f), 0);
-+        assert_eq!(ops(&f, 0)[0], "VecLoadF32x8:37");
-+    }
-+
-+    /// A vector store intrinsic (`dest_ptr` set) is a memory write: blocks.
-+    #[test]
-+    fn intervening_vector_store_blocks_sink() {
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(37, 4, 35),
-+                vstore(30, 9, 35),
-+                vbin(O::VecMulF32x8, 40, 38, 38),
-+                vbin(O::VecAddF32x8, 41, 37, 40),
-+            ],
-+        ));
-+        assert_eq!(sink_vector_loads(&mut f), 0);
-+    }
-+
-+    /// A call is opaque (may write the loaded memory): blocks.
-+    #[test]
-+    fn intervening_call_blocks_sink() {
-+        use crate::ir::reexports::CallInfo;
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(37, 4, 35),
-+                Instruction::Call {
-+                    func: "opaque".to_string(),
-+                    info: CallInfo::default(),
-+                },
-+                vbin(O::VecMulF32x8, 40, 38, 38),
-+                vbin(O::VecAddF32x8, 41, 37, 40),
-+            ],
-+        ));
-+        assert_eq!(sink_vector_loads(&mut f), 0);
-+    }
-+
-+    /// A volatile scalar load is an observable side effect: blocks.
-+    #[test]
-+    fn intervening_volatile_load_blocks_sink() {
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(37, 4, 35),
-+                sload(50, 7, true),
-+                vbin(O::VecMulF32x8, 40, 38, 38),
-+                vbin(O::VecAddF32x8, 41, 37, 40),
-+            ],
-+        ));
-+        assert_eq!(sink_vector_loads(&mut f), 0);
-+    }
-+
-+    /// Non-volatile scalar loads and scalar arithmetic are transparent.
-+    #[test]
-+    fn scalar_reads_and_arith_are_transparent() {
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(37, 4, 35),
-+                sload(50, 7, false),
-+                Instruction::BinOp {
-+                    dest: Value(51),
-+                    op: IrBinOp::Add,
-+                    lhs: Operand::Value(Value(50)),
-+                    rhs: Operand::Const(IrConst::I32(1)),
-+                    ty: IrType::I32,
-+                },
-+                vbin(O::VecMulF32x8, 40, 38, 38),
-+                vbin(O::VecAddF32x8, 41, 37, 40),
-+            ],
-+        ));
-+        assert_eq!(sink_vector_loads(&mut f), 1);
-+        assert_eq!(ops(&f, 0)[3], "VecLoadF32x8:37");
-+        assert_eq!(ops(&f, 0)[4], "VecAddF32x8:41");
-+    }
-+
-+    /// Two uses (even in the same block) disqualify the load.
-+    #[test]
-+    fn multi_use_load_is_not_sunk() {
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(37, 4, 35),
-+                vbin(O::VecMulF32x8, 40, 38, 38),
-+                vbin(O::VecAddF32x8, 41, 37, 40),
-+                vbin(O::VecAddF32x8, 42, 37, 41),
-+            ],
-+        ));
-+        assert_eq!(sink_vector_loads(&mut f), 0);
-+    }
-+
-+    /// A use in another block disqualifies the load (no cross-block motion).
-+    #[test]
-+    fn cross_block_use_is_not_sunk() {
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![vload(37, 4, 35), vbin(O::VecMulF32x8, 40, 38, 38)],
-+        ));
-+        f.blocks.push(block(1, vec![vbin(O::VecAddF32x8, 41, 37, 40)]));
-+        assert_eq!(sink_vector_loads(&mut f), 0);
-+    }
-+
-+    /// A use by a non-intrinsic (e.g. a terminator operand) never sinks.
-+    #[test]
-+    fn terminator_use_is_not_sunk() {
-+        let mut f = mkfunc();
-+        let mut b = block(0, vec![vload(37, 4, 35), vbin(O::VecMulF32x8, 40, 38, 38)]);
-+        b.terminator = Terminator::Return(Some(Operand::Value(Value(37))));
-+        f.blocks.push(b);
-+        assert_eq!(sink_vector_loads(&mut f), 0);
-+    }
-+
-+    /// Kill switch honoured.
-+    #[test]
-+    fn kill_switch_disables_pass() {
-+        std::env::set_var("CCC_NO_VEC_LOAD_SINK", "1");
-+        let mut f = mkfunc();
-+        f.blocks.push(block(
-+            0,
-+            vec![
-+                vload(37, 4, 35),
-+                vbin(O::VecMulF32x8, 40, 38, 38),
-+                vbin(O::VecAddF32x8, 41, 37, 40),
-+            ],
-+        ));
-+        let n = sink_vector_loads(&mut f);
-+        std::env::remove_var("CCC_NO_VEC_LOAD_SINK");
-+        assert_eq!(n, 0);
-+    }
-+
-+    /// Two independent sinks in one block keep their consumers correct and
-+    /// the parallel `source_spans` vector in lock-step.
-+    #[test]
-+    fn multiple_sinks_and_spans_stay_parallel() {
-+        let mut f = mkfunc();
-+        let mut b = block(
-+            0,
-+            vec![
-+                vload(10, 4, 35),                 // -> add %14
-+                vload(11, 5, 35),                 // -> add %15
-+                vbin(O::VecMulF32x8, 12, 38, 38), // pure filler
-+                vbin(O::VecMulF32x8, 13, 38, 38), // pure filler
-+                vbin(O::VecAddF32x8, 14, 10, 12),
-+                vbin(O::VecAddF32x8, 15, 11, 13),
-+            ],
-+        );
-+        b.source_spans = (0..6u32).map(|k| Span::new(100 + k, 100 + k, 0)).collect();
-+        f.blocks.push(b);
-+        assert_eq!(sink_vector_loads(&mut f), 2);
-+        assert_eq!(
-+            ops(&f, 0),
-+            vec![
-+                "VecMulF32x8:12",
-+                "VecMulF32x8:13",
-+                "VecLoadF32x8:10",
-+                "VecAddF32x8:14",
-+                "VecLoadF32x8:11",
-+                "VecAddF32x8:15",
-+            ]
-+        );
-+        let starts: Vec<u32> = f.blocks[0].source_spans.iter().map(|s| s.start).collect();
-+        assert_eq!(starts, vec![102, 103, 100, 104, 101, 105]);
-+    }
-+}
-diff --git a/tests/regression/vec_load_sink_memfold.c b/tests/regression/vec_load_sink_memfold.c
-new file mode 100644
-index 0000000..3711e45
---- /dev/null
-+++ b/tests/regression/vec_load_sink_memfold.c
-@@ -0,0 +1,46 @@
-+/* Regression: single-use vector-load sinking + VLFOLD-transparent deferral.
-+ *
-+ * `y[i] += a*x[i]`-shaped bodies at the default -ffp-contract=off used to
-+ * stage the `y[i]` stream through %ymm0 and a 32-byte spill slot because the
-+ * vectorizer emits every stream load at the top of the body, outside the
-+ * emitter's memory-fold window.  `passes/vec_load_sink.rs` moves each
-+ * single-use pure vector load directly before its consumer, and the deferred
-+ * store analysis treats such an elided load as transparent, giving GCC's
-+ * 3-instruction body: `vmulps mem, vaddps mem, vmovups`.
-+ *
-+ * Shapes covered: saxpy (F32x8), daxpy (F64x4 mul+add), addv (I32x8),
-+ * two-product map (fma3: both products need staging), reductions (sumi,
-+ * dot), an aliasing in-place update (no restrict), and a body followed by a
-+ * volatile store.  Every result is hashed bit-exactly and compared against
-+ * GCC by run_regression_suite.sh.  Kill switch: CCC_NO_VEC_LOAD_SINK=1.
-+ */
-+#include <stdio.h>
-+#include <stdlib.h>
-+#include <string.h>
-+void saxpy(float * __restrict y, const float * __restrict x, float a, int n){ for(int i=0;i<n;i++) y[i]+=a*x[i]; }
-+void daxpy(double * __restrict y, const double * __restrict x, double a, int n){ for(int i=0;i<n;i++) y[i]=y[i]*a+x[i]; }
-+void addv(int * __restrict c,const int * __restrict a,const int * __restrict b,int n){ for(int i=0;i<n;i++) c[i]=a[i]+b[i]; }
-+void fma3(float * __restrict d,const float * __restrict a,const float * __restrict b,const float * __restrict c,int n){ for(int i=0;i<n;i++) d[i]=a[i]*b[i]+c[i]*d[i]; }
-+int sumi(const int *a, int n){ int s=0; for(int i=0;i<n;i++) s+=a[i]; return s; }
-+double dot(const double *a,const double *b,int n){ double s=0; for(int i=0;i<n;i++) s+=a[i]*b[i]; return s; }
-+void alias_inplace(float *y, int n){ for(int i=0;i<n;i++) y[i]=y[i]*2.0f+y[i]; }
-+volatile int sink;
-+void with_volatile(float * __restrict y,const float * __restrict x,int n){ for(int i=0;i<n;i++){ y[i]=y[i]+x[i]*3.0f; } sink=n; }
-+
-+static unsigned fnv(unsigned h,const void*p,size_t n){const unsigned char*b=p;for(size_t i=0;i<n;i++){h^=b[i];h*=16777619u;}return h;}
-+int main(void){
-+  enum{N=1031}; static float y[N],x[N],d[N],a[N],b[N],c[N],y0[N],d0[N]; static double dy[N],dx[N],dy0[N]; static int ia[N],ib[N],ic[N];
-+  unsigned s=12345; for(int i=0;i<N;i++){ s=s*1103515245u+12345u; y0[i]=(s>>8)%97*0.5f; x[i]=(s>>4)%53*0.25f; d0[i]=(s>>3)%7; a[i]=(s>>5)%11; b[i]=(s>>6)%13; c[i]=(s>>7)%17; dy0[i]=(s>>9)%31*0.125; dx[i]=(s>>2)%29; ia[i]=(int)(s>>1); ib[i]=(int)(s>>3); }
-+  unsigned h=2166136261u; long is=0; double ds=0;
-+  for(int n=0;n<N;n+=7){
-+    memcpy(y,y0,sizeof y); saxpy(y,x,1.5f,n); h=fnv(h,y,sizeof y);
-+    memcpy(dy,dy0,sizeof dy); daxpy(dy,dx,0.75,n); h=fnv(h,dy,sizeof dy);
-+    memset(ic,0,sizeof ic); addv(ic,ia,ib,n); h=fnv(h,ic,sizeof ic);
-+    memcpy(d,d0,sizeof d); fma3(d,a,b,c,n); h=fnv(h,d,sizeof d);
-+    memcpy(y,y0,sizeof y); alias_inplace(y,n); h=fnv(h,y,sizeof y);
-+    memcpy(y,y0,sizeof y); with_volatile(y,x,n); h=fnv(h,y,sizeof y);
-+    is+=sumi(ia,n); ds+=dot(dx,dy0,n);
-+  }
-+  printf("%08x %ld %.17g %d\n",h,is,ds,sink);
-+  return 0;
-+}
-diff --git a/tests/regression/vec_load_sink_memfold.flags b/tests/regression/vec_load_sink_memfold.flags
-new file mode 100644
-index 0000000..5e2403b
---- /dev/null
-+++ b/tests/regression/vec_load_sink_memfold.flags
-@@ -0,0 +1 @@
-+-O2 -march=x86-64-v3
+                 self.state
+                     .emit_fmt(format_args!("    {} {}, %ymm1, %ymm0", mnemonic, scale_mem));
+                 self.state.vec_last_store_reg = false;
+diff --git a/src/backend/x86/codegen/peephole/passes/callee_saves.rs b/src/backend/x86/codegen/peephole/passes/callee_saves.rs
+index aa8602c3..013845af 100644
+--- a/src/backend/x86/codegen/peephole/passes/callee_saves.rs
++++ b/src/backend/x86/codegen/peephole/passes/callee_saves.rs
+@@ -341,15 +341,17 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
+                 _ => {}
+             }
+             if line.contains("%rsp") {
+-                let is_stack_adjust = matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+-                    || line.starts_with("subq $")
+-                    || line.starts_with("addq $");
+-                if !is_stack_adjust
+-                    && (line.starts_with("and")
+-                        || line.contains("%xmm")
+-                        || line.contains("%ymm")
+-                        || line.contains("%zmm"))
+-                {
++                let is_stack_adjust =
++                    matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
++                        || line.starts_with("subq $")
++                        || line.starts_with("addq $");
++                // Removing a leading push changes the runtime %rsp by 8 bytes,
++                // so EVERY %rsp-relative data reference in the body (va-register
++                // save areas, `leaq N(%rsp)` overflow pointers, spill slots,
++                // return-address reads) would point 8 bytes off. Only stack
++                // adjustments are offset-independent; anything else addressing
++                // the stack makes the elimination unsafe.
++                if !is_stack_adjust {
+                     safe = false;
+                     break;
+                 }
+diff --git a/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs b/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
+index c23929e9..47282fe0 100644
+--- a/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
++++ b/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
+@@ -528,6 +528,13 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo])
+             || c_fam == b_fam
+             || c_fam == t_fam
+             || !COMMUTATIVE_OPS.contains(&op)
++            // The replacement is TWO instructions: `mov C, B` (at j) followed
++            // by `op mem, B` (at k), and the folded memory operand's address
++            // is evaluated at k. If B is one of the address families the copy
++            // writes an address input BEFORE the op reads it (e.g. an index
++            // `(base,%rdx,4)` with B=%rdx staged by `mov %r11d, %edx`) — a
++            // miscompile. Bail: the copy-bridged shape stays untouched.
++            || (b_bit & addr) != 0
+         {
+             i += 1;
+             continue;
+-- 
+2.47.3
+
