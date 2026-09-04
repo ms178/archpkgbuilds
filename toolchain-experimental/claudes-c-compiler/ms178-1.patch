@@ -1,1572 +1,1035 @@
-diff --git a/src/backend/mod.rs b/src/backend/mod.rs
-index b2b919d..ebb80de 100644
---- a/src/backend/mod.rs
-+++ b/src/backend/mod.rs
-@@ -133,6 +133,13 @@ pub(crate) struct CodegenOptions {
-     /// with retpoline (-mindirect-branch=thunk-extern) to avoid indirect jumps that
-     /// objtool would reject.
-     pub(crate) no_jump_tables: bool,
-+    /// Whether the target has BMI2 (`-mbmi2` or an enabling `-march`).
-+    /// Gates SHLX/SHRX/SARX selection for variable shifts.
-+    pub(crate) bmi2: bool,
-+    /// Measured microarchitectural tuning row selected by `-mtune`/`-march`
-+    /// (see `backend::x86::cpu_model`).  Drives every decision that depends
-+    /// on instruction latency/µop facts rather than ISA availability.
-+    pub(crate) tune: crate::backend::x86::cpu_model::X86Tune,
-     /// Whether the target has BMI1 (`-mbmi` or an enabling `-march`).
-     /// Gates scalar ANDN selection; emitting it without this contract would
-     /// introduce SIGILL on baseline x86-64.
-diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
-index 761bc7b..7e25084 100644
---- a/src/backend/x86/codegen/alu.rs
-+++ b/src/backend/x86/codegen/alu.rs
-@@ -1216,13 +1216,28 @@ impl X86Codegen {
+diff --git a/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs b/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
+index 6775795..47a4e20 100644
+--- a/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
++++ b/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
+@@ -48,7 +48,7 @@
+ //!    liveness model.
+ 
+ use super::super::types::*;
+-use super::helpers::{has_implicit_reg_usage, is_shift_or_rotate, replace_reg_family};
++use super::helpers::{is_shift_or_rotate, replace_reg_family};
+ use super::liveness::FileLiveness;
+ use super::relay_and_lea::{
+     function_range, is_relayable_family, plain_gp_operand, split_two_operands,
+@@ -151,12 +151,21 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
+                     let target = t.trim_start_matches(|c: char| c != ' ').trim();
+                     !target.starts_with('.') && matches!(d_fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10)
                  }
-             }
-             IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
--                let (mnem32, mnem64) = shift_mnemonic(op);
--                if use_32bit {
--                    self.state
--                        .emit_fmt(format_args!("    {} %cl, %eax", mnem32));
-+                // Count already in %rcx, lhs in %rax: on Intel the VEX
-+                // form is 1 µop against 2–3 for `shl %cl` (uops.info
-+                // SHL_R64_CL vs SHLX_R64_R64_R64); on Zen both are 1 µop and
-+                // the legacy encoding is shorter (tune row decides).
-+                if self.tune.prefer_shlx(self.bmi2_enabled) {
-+                    let (x32, x64) = super::emit::shiftx_mnemonic(op);
-+                    if use_32bit {
-+                        self.state
-+                            .emit_fmt(format_args!("    {} %ecx, %eax, %eax", x32));
-+                    } else {
-+                        self.state
-+                            .emit_fmt(format_args!("    {} %rcx, %rax, %rax", x64));
-+                    }
-                 } else {
--                    self.state
--                        .emit_fmt(format_args!("    {} %cl, %rax", mnem64));
-+                    let (mnem32, mnem64) = shift_mnemonic(op);
-+                    if use_32bit {
-+                        self.state
-+                            .emit_fmt(format_args!("    {} %cl, %eax", mnem32));
-+                    } else {
-+                        self.state
-+                            .emit_fmt(format_args!("    {} %cl, %rax", mnem64));
-+                    }
++                // An implicit read OR write of the destination family is an
++                // unrenamable hazard: the textual rewrite cannot touch an
++                // operand the instruction never names. `cqto` overwrites
++                // `%rdx`, `syscall` clobbers `%rsi`/`%rdi`/`%r8`-`%r11`,
++                // `cltq` reads `%rax`, `cpuid` rewrites `%rbx` — none of
++                // these can be renamed and none may be missed. The central
++                // oracle sees all of them; the old
++                // `has_implicit_reg_usage(t) && d_fam <= 2` veto knew only a
++                // hand-picked subset and silently coalesced across the rest.
+                 // A shift/rotate takes its variable count in %cl and nowhere
+                 // else: renaming that family produces `shlq %sil, %r8`, which
+-                // does not exist. `has_implicit_reg_usage` does not cover the
+-                // plain shifts, so check them separately.
++                // does not exist. The count is named explicitly, so the
++                // implicit oracle does not cover it; check it separately.
+                 _ => {
+-                    (has_implicit_reg_usage(t) && d_fam <= 2)
++                    implicit_reg_refs(t.as_bytes()) & d_mask != 0
+                         || (d_fam == 1 && is_shift_or_rotate(t))
                  }
-             }
-             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index b1b0272..cdca7b5 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -329,6 +329,20 @@ pub(super) fn shift_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
+             };
+@@ -435,4 +444,29 @@ mod tests {
+         ));
+         assert!(out.contains("movq %rdi, %rdx"), "{out}");
      }
++    #[test]
++    fn rsi_home_is_not_coalesced_across_a_syscall_clobber() {
++        // `syscall` reads its argument registers (among them %rsi) and
++        // returns in %rax while clobbering %rcx/%r11 — all without naming
++        // any of them. Coalescing a %rsi home across one would delete the
++        // copy and leave the kernel's pointer argument reading whatever
++        // %rsi held before it was ever written. The old hand-picked veto
++        // (`has_implicit_reg_usage(t) && d_fam <= 2`) never saw this: it
++        // only protected %rax/%rcx/%rdx.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movq %r9, %rsi\n",
++            "    syscall\n",
++            "    movq %rsi, %rbx\n",
++            "    movq %rbx, %rax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("syscall"), "{out}");
++        assert!(
++            out.contains("movq %r9, %rsi"),
++            "coalescing across syscall is unsound:\n{out}"
++        );
++    }
  }
- 
-+/// BMI2 three-operand shift mnemonics (`shlx count, src, dst`).  One µop on
-+/// every core that has BMI2 (uops.info SHLX_R64_R64_R64), count in any GPR,
-+/// non-destructive; flags are left untouched, which no consumer of a
-+/// variable shift relies on (a count of zero already leaves them undefined
-+/// for the legacy form).
-+pub(super) fn shiftx_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
-+    match op {
-+        IrBinOp::Shl => ("shlxl", "shlxq"),
-+        IrBinOp::AShr => ("sarxl", "sarxq"),
-+        IrBinOp::LShr => ("shrxl", "shrxq"),
-+        _ => unreachable!("not a shift op"),
-+    }
-+}
-+
- /// x86-64 code generator. Implements the ArchCodegen trait for the shared framework.
- /// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
- pub struct X86Codegen {
-@@ -427,6 +441,10 @@ pub struct X86Codegen {
-     /// True when the target has POPCNT (-mpopcnt or an enabling -march).
-     /// When false, Popcount lowers to an shr/adc bit loop.
-     pub(super) popcnt_enabled: bool,
-+    /// True when the target has BMI2 (`-mbmi2` or an enabling -march).
-+    pub(super) bmi2_enabled: bool,
-+    /// Measured tuning row for the selected `-mtune`/`-march` core.
-+    pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
-     /// True when the target has AVX2; gates YMM constant-size copies.
-     pub(super) avx2_enabled: bool,
-     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
-@@ -840,6 +858,8 @@ impl X86Codegen {
-             bmi1_enabled: false,
-             lzcnt_enabled: false,
-             popcnt_enabled: false,
-+            bmi2_enabled: false,
-+            tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
-             avx2_enabled: false,
-             avx512_enabled: false,
-             optimize_for_size: false,
-@@ -947,6 +967,15 @@ impl X86Codegen {
-         self.bmi1_enabled = opts.bmi1;
-         self.lzcnt_enabled = opts.lzcnt;
-         self.popcnt_enabled = opts.popcnt;
-+        self.bmi2_enabled = opts.bmi2;
-+        self.tune = opts.tune;
-+        super::isel::set_shlx_mode(if opts.tune.prefer_shlx(opts.bmi2) {
-+            super::isel::ShlxMode::Always
-+        } else if opts.tune.shlx_saves_move(opts.bmi2) {
-+            super::isel::ShlxMode::WhenItSavesAMove
-+        } else {
-+            super::isel::ShlxMode::Never
-+        });
-         self.avx2_enabled = opts.avx2;
-         self.avx512_enabled = opts.avx512;
-         self.state.emit_cfi = opts.emit_cfi;
-@@ -3406,29 +3435,117 @@ impl X86Codegen {
-                     mnem64, shift_amount, dest_name
-                 ));
+diff --git a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
+index f0bcca5..1970e4c 100644
+--- a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
++++ b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
+@@ -319,13 +319,30 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
              }
--        } else {
--            let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
--            if rhs_conflicts {
--                self.operand_to_rcx(rhs);
--                self.operand_to_callee_reg(lhs, dest_phys);
--            } else {
--                self.operand_to_callee_reg(lhs, dest_phys);
--                self.operand_to_rcx(rhs);
--            }
--            if use_32bit {
--                self.state
--                    .emit_fmt(format_args!("    {} %cl, %{}", mnem32, dest_name_32));
--                if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
--                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
-+        } else if self.bmi2_enabled {
-+            // BMI2 three-operand form.  Both sources are read straight from
-+            // their register homes when they have one, so `x << k` with x
-+            // and k in argument registers is a single `shlxq %rsi,%rdi,%rax`
-+            // (GCC 16.2 / Clang 23.1 / ICX emit exactly this); the legacy
-+            // form below needs `mov`+`mov`+`shl %cl` and pins %rcx.  On
-+            // Intel the legacy `shl r,cl` is additionally 3 µops (SNB..CLX)
-+            // or 2 µops (ICL..RPL) against 1 for shlx (uops.info), so it is
-+            // taken whenever a home is missing as well; on Zen (1 µop each)
-+            // the VEX form is only used when it saves the copy, otherwise
-+            // the 2–3 byte shorter legacy encoding wins.
-+            let (xmnem32, xmnem64) = shiftx_mnemonic(op);
-+            let gpr_home = |r: Option<PhysReg>| r.filter(|r| !is_xmm_reg(*r));
-+            let count_home = gpr_home(self.operand_reg(rhs));
-+            let lhs_home = gpr_home(self.operand_reg(lhs));
-+            let saves_move = count_home.is_some() || lhs_home.is_some();
-+            if self.tune.prefer_shlx(true) || (saves_move && self.tune.shlx_saves_move(true)) {
-+                // Count operand: its own home, else staged in %rcx.  Stage
-+                // BEFORE the lhs load when the lhs must land in the count's
-+                // home register (dest == count home, lhs not homed).
-+                let count_name: &str = match count_home {
-+                    Some(r) if lhs_home.is_some() || r.0 != dest_phys.0 => phys_reg_name(r),
-+                    _ => {
-+                        self.operand_to_rcx(rhs);
-+                        "rcx"
-+                    }
-+                };
-+                let count_name = if use_32bit {
-+                    match count_name {
-+                        "rcx" => "ecx".to_string(),
-+                        _ => phys_reg_name_32(count_home.unwrap()).to_string(),
-+                    }
-+                } else {
-+                    count_name.to_string()
-+                };
-+                let src_name: String = match lhs_home {
-+                    Some(r) => {
-+                        if use_32bit {
-+                            phys_reg_name_32(r).to_string()
-+                        } else {
-+                            phys_reg_name(r).to_string()
+         }
+ 
+-        // Instructions with implicit register usage conservatively invalidate all.
++        // Instructions with implicit register usage conservatively invalidate
++        // all. The oracle pass below additionally retires exactly the
++        // identities of implicit writers the boolean veto list does not name
++        // (single-operand `imul`, string primitives, `loop`, ...): those
++        // clobber architectural registers without tripping the blanket.
+         {
+             let cur_trimmed = infos[i].trimmed(store.get(i));
+             if has_implicit_reg_usage(cur_trimmed) {
+                 copy_src = [REG_NONE; 16];
+                 copy_src32 = [REG_NONE; 16];
+             }
++            let implicit_writes = implicit_write_refs(cur_trimmed.as_bytes());
++            for fam in 0..=REG_GP_MAX {
++                if implicit_writes & (1u16 << fam) != 0 {
++                    for k in 0..16u8 {
++                        if k == fam || copy_src[k as usize] == fam {
++                            copy_src[k as usize] = REG_NONE;
++                        }
++                        if k == fam || copy_src32[k as usize] == fam {
++                            copy_src32[k as usize] = REG_NONE;
 +                        }
 +                    }
-+                    None => {
-+                        self.operand_to_callee_reg(lhs, dest_phys);
-+                        if use_32bit {
-+                            dest_name_32.to_string()
-+                        } else {
-+                            dest_name.to_string()
-+                        }
-+                    }
-+                };
-+                if use_32bit {
-+                    self.state.emit_fmt(format_args!(
-+                        "    {} %{}, %{}, %{}",
-+                        xmnem32, count_name, src_name, dest_name_32
-+                    ));
-+                    if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
-+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
-+                    }
-+                } else {
-+                    self.state.emit_fmt(format_args!(
-+                        "    {} %{}, %{}, %{}",
-+                        xmnem64, count_name, src_name, dest_name
-+                    ));
-                 }
-             } else {
--                self.state
--                    .emit_fmt(format_args!("    {} %cl, %{}", mnem64, dest_name));
-+                self.emit_shift_cl_legacy(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest_value_id);
-             }
-+        } else {
-+            self.emit_shift_cl_legacy(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest_value_id);
-         }
-         self.state.reg_cache.invalidate_acc();
-     }
- 
-+    /// Legacy `shl/shr/sar %cl, %dest` for a variable count: lhs staged in
-+    /// `dest`, count staged in `%rcx` (order chosen so neither load clobbers
-+    /// the other's source).
-+    fn emit_shift_cl_legacy(
-+        &mut self,
-+        op: IrBinOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+        dest_phys: PhysReg,
-+        use_32bit: bool,
-+        is_unsigned: bool,
-+        dest_value_id: u32,
-+    ) {
-+        let dest_name = phys_reg_name(dest_phys);
-+        let dest_name_32 = phys_reg_name_32(dest_phys);
-+        let (mnem32, mnem64) = shift_mnemonic(op);
-+        let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
-+        if rhs_conflicts {
-+            self.operand_to_rcx(rhs);
-+            self.operand_to_callee_reg(lhs, dest_phys);
-+        } else {
-+            self.operand_to_callee_reg(lhs, dest_phys);
-+            self.operand_to_rcx(rhs);
-+        }
-+        if use_32bit {
-+            self.state
-+                .emit_fmt(format_args!("    {} %cl, %{}", mnem32, dest_name_32));
-+            if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
-+                self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                }
 +            }
-+        } else {
-+            self.state
-+                .emit_fmt(format_args!("    {} %cl, %{}", mnem64, dest_name));
-+        }
-+    }
-+
-     /// Accumulator-based path: try immediate optimizations first.
-     /// Returns true if handled.
-     pub(super) fn try_emit_acc_immediate(
-@@ -3621,6 +3738,13 @@ fn collect_vregs_in_inst(
-             use_reg(dst, all);
-             def_reg(dst, all, defs);
          }
-+        MachInst::ShiftX {
-+            count, src, dst, ..
-+        } => {
-+            use_reg(count, all);
-+            use_reg(src, all);
-+            def_reg(dst, all, defs);
-+        }
-         MachInst::Lea {
-             base, index, dst, ..
-         } => {
-@@ -3939,6 +4063,19 @@ fn resolve_stack_vregs(
-             dst: *dst,
-             size: *size,
-         },
-+        MachInst::ShiftX {
-+            op,
-+            count,
-+            src,
-+            dst,
-+            size,
-+        } => MachInst::ShiftX {
-+            op: *op,
-+            count: *count,
-+            src: *src,
-+            dst: *dst,
-+            size: *size,
-+        },
-         MachInst::Div {
-             divisor,
-             signed,
-@@ -3987,6 +4124,9 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32,
-         MachInst::Imul3 { src, dst, .. } => check_reg(src) || check_reg(dst),
-         MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => check_reg(dst),
-         MachInst::Shift { amount, dst, .. } => check_op(amount) || check_reg(dst),
-+        MachInst::ShiftX {
-+            count, src, dst, ..
-+        } => check_reg(count) || check_reg(src) || check_reg(dst),
-         MachInst::Lea {
-             base, index, dst, ..
-         } => {
-diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
-index 31f9f37..48543f1 100644
---- a/src/backend/x86/codegen/float_ops.rs
-+++ b/src/backend/x86/codegen/float_ops.rs
-@@ -854,9 +854,18 @@ impl X86Codegen {
-             ("rax", "eax")
-         };
  
--        // False-dependency break: only when dest is a different register from
--        // src (xor would otherwise destroy the input).
--        if src_name != dst_name && src_name != dst32 {
-+        // False-dependency break, only where the tuning row says the core
-+        // architecturally reads the destination (uops.info lat 1->1 = 3:
-+        // POPCNT on SNB..CLX, LZCNT/TZCNT on SNB..BDW) and only when dest is
-+        // a different register from src (xor would otherwise destroy the
-+        // input).  Ice Lake+, Alder/Raptor Lake and every Zen skip it: there
-+        // the xor is a pure front-end/code-size cost.  GCC 16.2 still emits
-+        // it for tzcnt on Skylake, where uops.info measures no dependency.
-+        let needs_break = match mnem {
-+            "popcnt" => self.tune.break_popcnt_dep(),
-+            _ => self.tune.break_lzcnt_tzcnt_dep(),
-+        };
-+        if needs_break && src_name != dst_name && src_name != dst32 {
-             self.state
-                 .emit_fmt(format_args!("    xorl %{0}, %{0}", dst32));
-         }
-diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
-index 9f0b530..a3a49cd 100644
---- a/src/backend/x86/codegen/isel.rs
-+++ b/src/backend/x86/codegen/isel.rs
-@@ -385,8 +385,8 @@ pub fn lower_binop(
- 
-     // ── Shift operations ─────────────────────────────────────────────
-     if let Some(shift_op) = binop_to_shift(op) {
--        emit_mov_operand_r(lhs, dst, size, ra, out);
-         if let Some(imm) = const_as_imm32(rhs) {
-+            emit_mov_operand_r(lhs, dst, size, ra, out);
-             let mask = if size == OpSize::S32 { 31 } else { 63 };
-             out.push(MachInst::Shift {
-                 op: shift_op,
-@@ -394,8 +394,23 @@ pub fn lower_binop(
-                 dst,
-                 size,
-             });
-+        } else if try_lower_shiftx(shift_op, lhs, rhs, dst, size, ra, out) {
-+            // `shlx count, src, dst`: no %rcx pin, no source copy, 1 µop.
-         } else {
--            emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
-+            // Two-address hazard (same shape as the ALU case above): when
-+            // the count's home IS the destination register, `mov lhs,dst`
-+            // would overwrite the count before it is copied to %rcx.  Copy
-+            // the count out first in that case; otherwise keep lhs first so
-+            // a count already sitting in %rcx is not clobbered.
-+            let count_home_is_dst = matches!(rhs, Operand::Value(v)
-+                if v.0 != dest.0 && value_to_reg(v, ra) == dst && matches!(dst, MachReg::Phys(_)));
-+            if count_home_is_dst {
-+                emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
-+                emit_mov_operand_r(lhs, dst, size, ra, out);
-+            } else {
-+                emit_mov_operand_r(lhs, dst, size, ra, out);
-+                emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
-+            }
-             out.push(MachInst::Shift {
-                 op: shift_op,
-                 amount: MachOperand::Reg(MachReg::Phys(RCX)),
-@@ -977,6 +992,98 @@ pub fn lower_cond_branch(
- /// looks exactly like everything being fine. The counters make the gap
- /// visible and rank it, so work targets the biggest class rather than the
- /// most obvious one.
-+/// How eagerly isel selects the BMI2 three-operand shifts.  Set once per
-+/// codegen run from `CodegenOptions` (tune row × `-mbmi2`); read by
-+/// `lower_binop`.  A process-wide cell because isel is a set of pure free
-+/// functions without a target context.
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub enum ShlxMode {
-+    /// No BMI2, or an explicit opt-out.
-+    Never,
-+    /// Cores where `SHL r,cl` is already 1 µop (Zen): the VEX form only
-+    /// pays when it removes a copy into %rcx or a copy of the source.
-+    WhenItSavesAMove,
-+    /// Cores where `SHL r,cl` is 2–3 µops (every Intel core): always.
-+    Always,
-+}
-+
-+static SHLX_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-+
-+pub fn set_shlx_mode(m: ShlxMode) {
-+    SHLX_MODE.store(m as u8, std::sync::atomic::Ordering::Relaxed);
-+}
-+
-+pub fn shlx_mode() -> ShlxMode {
-+    match SHLX_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-+        1 => ShlxMode::WhenItSavesAMove,
-+        2 => ShlxMode::Always,
-+        _ => ShlxMode::Never,
-+    }
-+}
-+
-+/// Try to lower a variable-count shift to `ShiftX`.  Returns false (with
-+/// `out` untouched) when a required operand has no physical home in a shape
-+/// the three-operand form can consume without an extra copy that the
-+/// legacy `Shift` would not also need, or when staging would clobber a
-+/// source.  Only S32/S64 exist for shlx.
-+fn try_lower_shiftx(
-+    shift_op: ShiftOp,
-+    lhs: &Operand,
-+    rhs: &Operand,
-+    dst: MachReg,
-+    size: OpSize,
-+    ra: &FxHashMap<u32, PhysReg>,
-+    out: &mut Vec<MachInst>,
-+) -> bool {
-+    let mode = shlx_mode();
-+    if mode == ShlxMode::Never || !matches!(size, OpSize::S32 | OpSize::S64) {
-+        return false;
-+    }
-+    let MachReg::Phys(dst_phys) = dst else {
-+        return false;
-+    };
-+    let phys_home = |op: &Operand| match op {
-+        Operand::Value(v) => match value_to_reg(v, ra) {
-+            MachReg::Phys(p) => Some(p),
-+            MachReg::Vreg(_) => None,
-+        },
-+        Operand::Const(_) => None,
-+    };
-+    let count_home = phys_home(rhs);
-+    let lhs_home = phys_home(lhs);
-+    let saves_move = count_home.is_some() || lhs_home.is_some();
-+    if mode == ShlxMode::WhenItSavesAMove && !saves_move {
-+        return false;
-+    }
-+    // Staging through %rcx is impossible when the destination *is* %rcx
-+    // and the other operand still has to be copied into it.
-+    let needs_rcx = count_home.is_none() || (lhs_home.is_none() && count_home == Some(dst_phys));
-+    if needs_rcx && dst_phys == RCX {
-+        return false;
-+    }
-+    let count = if needs_rcx {
-+        emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
-+        MachReg::Phys(RCX)
-+    } else {
-+        MachReg::Phys(count_home.expect("checked"))
-+    };
-+    let src = match lhs_home {
-+        Some(p) => MachReg::Phys(p),
-+        None => {
-+            emit_mov_operand_r(lhs, dst, size, ra, out);
-+            dst
-+        }
-+    };
-+    out.push(MachInst::ShiftX {
-+        op: shift_op,
-+        count,
-+        src,
-+        dst,
-+        size,
-+    });
-+    true
-+}
-+
- pub mod stats {
-     use std::sync::atomic::{AtomicU64, Ordering};
-     use std::sync::Mutex;
-diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
-index cb50e7e..9330b11 100644
---- a/src/backend/x86/codegen/machinst.rs
-+++ b/src/backend/x86/codegen/machinst.rs
-@@ -276,6 +276,19 @@ pub enum MachInst {
-         size: OpSize,
-     },
- 
-+    /// BMI2 three-operand shift: dst = src SHIFT count.  Count may live in
-+    /// any GPR, the form is non-destructive and leaves EFLAGS untouched.
-+    /// One µop on every core with BMI2 (uops.info SHLX_R64_R64_R64) against
-+    /// 2–3 for `Shift` with a CL count on Intel.  Selected by isel only
-+    /// when `isel::shlx_mode()` allows it (tune row + `-mbmi2`).
-+    ShiftX {
-+        op: ShiftOp,
-+        count: MachReg,
-+        src: MachReg,
-+        dst: MachReg,
-+        size: OpSize,
-+    },
-+
-     /// LEA: dst = base + index*scale + offset (3-address add).
-     /// x86 form: `leaq offset(%base, %index, scale), %dst`
-     Lea {
-diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
-index 528129e..e4adc8f 100644
---- a/src/backend/x86/codegen/machinst_emit.rs
-+++ b/src/backend/x86/codegen/machinst_emit.rs
-@@ -664,6 +664,32 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+         i += 1;
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_code.rs b/src/backend/x86/codegen/peephole/passes/dead_code.rs
+index 2316890..1161daa 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_code.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_code.rs
+@@ -155,15 +155,16 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
+                 break;
              }
-         }
  
-+        MachInst::ShiftX {
-+            op,
-+            count,
-+            src,
-+            dst,
-+            size,
-+        } => {
-+            let mnem = match (op, size) {
-+                (ShiftOp::Shl, OpSize::S64) => "shlxq",
-+                (ShiftOp::Shr, OpSize::S64) => "shrxq",
-+                (ShiftOp::Sar, OpSize::S64) => "sarxq",
-+                (ShiftOp::Shl, _) => "shlxl",
-+                (ShiftOp::Shr, _) => "shrxl",
-+                (ShiftOp::Sar, _) => "sarxl",
-+            };
-+            // shlx has no 8/16-bit form; isel only selects S32/S64.
-+            let sz = if *size == OpSize::S64 { OpSize::S64 } else { OpSize::S32 };
-+            out.emit_fmt(format_args!(
-+                "    {} {}, {}, {}",
-+                mnem,
-+                fmt_reg(count, sz),
-+                fmt_reg(src, sz),
-+                fmt_reg(dst, sz)
-+            ));
-+        }
-+
-         MachInst::Lea {
-             base,
-             index,
+-            {
+-                let trimmed_j = infos[j].trimmed(store.get(j));
+-                if has_implicit_reg_usage(trimmed_j) {
+-                    break;
+-                }
++            let trimmed_j = infos[j].trimmed(store.get(j));
++            if has_implicit_reg_usage(trimmed_j) {
++                break;
+             }
+ 
+             let refs_dst = infos[j].reg_refs & dst_mask != 0;
+-            let writes_dst = get_dest_reg(&infos[j]) == dst_reg;
++            // Redefinition includes architectural implicit writes: `cqto`
++            // overwrites %rdx, `idivq` rewrites %rax:%rdx — the classified
++            // destination alone answers only half of that.
++            let writes_dst = writes_family(&infos[j], trimmed_j, dst_reg);
+ 
+             if writes_dst {
+                 let also_reads = match infos[j].kind {
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+index f0aacfc..d732fb0 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+@@ -16,7 +16,7 @@
+ //!   to a register the address depends on.
+ 
+ use super::super::types::*;
+-use super::helpers::{get_dest_reg, has_implicit_reg_usage};
++use super::helpers::{has_implicit_reg_usage, writes_family};
+ use super::liveness::FileLiveness;
+ use super::relay_and_lea::{
+     is_relayable_family, plain_gp_operand, provably_dead_lv, split_two_operands,
+@@ -243,15 +243,17 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
+             if line_writes_memory(t) {
+                 break;
+             }
+-            // A write to an address register invalidates the operand.
+-            if infos[j].reg_refs & addr_mask != 0 {
+-                let w = get_dest_reg(&infos[j]);
+-                if w != REG_NONE && addr_fams.contains(&w) {
+-                    break;
+-                }
++            // A write to an address register invalidates the operand. The
++            // mentions gate keeps the common case O(1); `writes_family`
++            // supplies the exact answer for the lines it admits — including
++            // implicit writes such as `cqto` overwriting an %rdx address.
++            if infos[j].reg_refs & addr_mask != 0
++                && addr_fams.iter().any(|&f| writes_family(&infos[j], t, f))
++            {
++                break;
+             }
+             // The first load's destination must still hold the value.
+-            if infos[j].reg_refs & dst_mask != 0 && get_dest_reg(&infos[j]) == dst_fam {
++            if infos[j].reg_refs & dst_mask != 0 && writes_family(&infos[j], t, dst_fam) {
+                 break;
+             }
+             if let Some((op2, mem2, dst2, _)) = load_operand(t) {
 diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
-index 6b62737..757a1ea 100644
+index 6b62737..69f209c 100644
 --- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
 +++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
-@@ -136,6 +136,20 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
-     if t.starts_with("call") {
-         return FlagsEffect::Writes;
-     }
-+    // BMI2 VEX shifts (`shlx/shrx/sarx`) and the other flag-neutral BMI2
-+    // ops leave EFLAGS untouched; they must be classified before the prefix
-+    // table below, which would otherwise match them as "shl"/"shr"/"sar"
-+    // writers and let a later scan treat an earlier `cmp`'s flags as dead.
-+    if t.starts_with("shlx")
-+        || t.starts_with("shrx")
-+        || t.starts_with("sarx")
-+        || t.starts_with("rorx")
-+        || t.starts_with("pdep")
-+        || t.starts_with("pext")
-+        || t.starts_with("mulx")
-+    {
-+        return FlagsEffect::Neutral;
-+    }
-     const WRITERS: &[&str] = &[
-         "add", "sub", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "imul", "mul", "div",
-         "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bsf", "bsr", "popcnt", "lzcnt",
+@@ -23,7 +23,7 @@
+ //! conditional branch elsewhere may consume flags that were set before a label.
+ 
+ use super::super::types::*;
+-use super::helpers::get_dest_reg;
++use super::helpers::{get_dest_reg, writes_family};
+ use super::liveness::FileLiveness;
+ use super::relay_and_lea::{
+     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
+@@ -1190,7 +1190,19 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
+                 if mentions_exact_name(tj, name64) {
+                     break; // a 64-bit read observes the sign extension
+                 }
+-                if get_dest_reg(&infos[j]) == dst_fam && !tj.starts_with("cmov") {
++                // An implicit READ of the family observes the extension just
++                // as much as a named 64-bit operand does: `cqto` consumes
++                // all 64 bits of %rax, `idivq` reads %rax:%rdx. The
++                // `reg_refs` union is what routes these lines here at all.
++                if implicit_read_refs(tj.as_bytes()) & mask != 0 {
++                    break;
++                }
++                // "Fully redefined" must mean a real write of the family.
++                // `writes_family` is exact: a `cqto` is classified with %rax
++                // as its primary destination, but %rax is its implicit input
++                // — the only family it writes is %rdx — so it can never
++                // retire a %rax identity here.
++                if writes_family(&infos[j], tj, dst_fam) && !tj.starts_with("cmov") {
+                     ok = true; // fully redefined before any wide read
+                     break;
+                 }
 diff --git a/src/backend/x86/codegen/peephole/passes/helpers.rs b/src/backend/x86/codegen/peephole/passes/helpers.rs
-index a9a96b0..5420039 100644
+index a9a96b0..ade932b 100644
 --- a/src/backend/x86/codegen/peephole/passes/helpers.rs
 +++ b/src/backend/x86/codegen/peephole/passes/helpers.rs
-@@ -467,6 +467,9 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
-         || trimmed.starts_with("bextr")
-         || trimmed.starts_with("pext")
-         || trimmed.starts_with("pdep")
-+        || trimmed.starts_with("shlx")
-+        || trimmed.starts_with("shrx")
-+        || trimmed.starts_with("sarx")
-     {
-         return false;
+@@ -335,6 +335,49 @@ pub(super) fn get_dest_reg(info: &LineInfo) -> RegId {
      }
-diff --git a/src/backend/x86/codegen/peephole/passes/liveness.rs b/src/backend/x86/codegen/peephole/passes/liveness.rs
-index 7dc40b6..18afb94 100644
---- a/src/backend/x86/codegen/peephole/passes/liveness.rs
-+++ b/src/backend/x86/codegen/peephole/passes/liveness.rs
-@@ -86,6 +86,10 @@ fn is_pure_write_mnemonic(t: &str) -> bool {
-         || t.starts_with("lzcnt")
-         || t.starts_with("tzcnt")
-         || t.starts_with("popcnt")
-+        // BMI2 three-operand shifts always write their destination.
-+        || t.starts_with("shlx")
-+        || t.starts_with("shrx")
-+        || t.starts_with("sarx")
  }
  
- fn mnemonic_is_known(t: &str) -> bool {
-diff --git a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
-index 7499f60..3b9c0d6 100644
---- a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
-+++ b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
-@@ -170,6 +170,9 @@ fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
-             | "lzcntl"
-             | "tzcntl"
-             | "andnl"
-+            | "shlxl"
-+            | "shrxl"
-+            | "sarxl"
-     )
- }
++/// Does the line classified as `info` (text `trimmed`) write ANY part of GP
++/// family `fam`?
++///
++/// `get_dest_reg` yields the single classified destination, which is the
++/// explicit AT&T destination or the primary implicit one (`%rax` for
++/// `cltq`/`cqto`/`div`/`mul`).  Instructions with a SECOND implicit output
++/// (`cqto` → `%rdx`, `idivq` → `%rax:%rdx`, `cpuid`, `rep stos`, `syscall`,
++/// ...) are invisible to that answer, and every copy-rewriting pass that
++/// asked "is the copy source still intact at line j?" via
++/// `get_dest_reg(j) == src` let `movq %rdx, %r8; ...; cqto; idivq; movzbl
++/// %r8b` be rewritten to read the remainder in `%dl`.  Use this predicate for
++/// every redefinition check.
++///
++/// Exactness contract (this predicate is safe to use on ACCEPTANCE paths —
++/// "the register is fully redefined, the old value is unobservable" — where
++/// an over-approximation would wrongly enable a transform):
++///
++/// * the architectural implicit write set ([`implicit_write_refs`]) is exact
++///   and wins over the classified destination;
++/// * the classified destination counts only if the line does not implicitly
++///   READ the family: the classifier reports `%rax` as the primary
++///   destination of `cqto`/`cdq`/`cqo`, but %rax is those instructions'
++///   implicit INPUT — their only output is `%rdx`, which the oracle already
++///   reported.  (An instruction that both reads and writes the family
++///   implicitly — `idivq` on %rax, `cltq` — is decided by its write set, so
++///   the read-guard only ever suppresses a classified answer for a family
++///   the instruction genuinely only reads.)
++#[inline]
++pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
++    if fam > REG_GP_MAX {
++        return false;
++    }
++    let bit = 1u16 << fam;
++    // 1. Architectural implicit writes: exact.
++    if implicit_write_refs(trimmed.as_bytes()) & bit != 0 {
++        return true;
++    }
++    // 2. The classified destination (explicit AT&T destination or the primary
++    //    implicit one), suppressed when the instruction implicitly reads the
++    //    family without writing it (the `cqto`-family %rax misclassification).
++    get_dest_reg(info) == fam && implicit_read_refs(trimmed.as_bytes()) & bit == 0
++}
++
+ // ── Label/jump parsing ───────────────────────────────────────────────────────
  
-@@ -594,6 +597,9 @@ fn is_32bit_zero_extend_write(op: &str) -> bool {
-             | "blsrl"
-             | "blsil"
-             | "bzhil"
-+            | "shlxl"
-+            | "shrxl"
-+            | "sarxl"
-     )
+ /// Parse ".LBB<number>:" label into its number, e.g. ".LBB123:" -> Some(123)
+@@ -474,3 +517,46 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
+     // Default: assume read-modify-write (conservative)
+     true
  }
- 
-diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-index c9d26c1..ad21570 100644
---- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-+++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-@@ -117,7 +117,10 @@ pub(super) fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
-         || t.starts_with("blsr")
-         || t.starts_with("blsi")
-         || t.starts_with("blsmsk")
--        || t.starts_with("bzhi");
-+        || t.starts_with("bzhi")
-+        || t.starts_with("shlx")
-+        || t.starts_with("shrx")
-+        || t.starts_with("sarx");
-     if !is_producer {
-         // `xorl %r10d, %r10d` (self-zeroing) is a full write as well.
-         let name32 = REG_NAMES[1][fam as usize];
-diff --git a/src/backend/x86/cpu_model.rs b/src/backend/x86/cpu_model.rs
-new file mode 100644
-index 0000000..ab5ba86
---- /dev/null
-+++ b/src/backend/x86/cpu_model.rs
-@@ -0,0 +1,829 @@
-+//! x86 CPU tuning model: measured microarchitectural facts that drive
-+//! target-dependent code-generation decisions.
-+//!
-+//! # Design
-+//!
-+//! GCC (`x86-tune.def`) and LLVM (`X86.td` `Tuning*` features) both encode
-+//! tuning as *boolean feature bits* whose meaning is hidden in the pass that
-+//! consumes them, and both assign those bits by *lineage* ("every core after
-+//! Haswell inherits Haswell's tuning") rather than by measurement.  Two
-+//! consequences visible in their output today (verified with
-+//! `scripts/godbolt.py`, GCC 16.2 / Clang 23.1 / ICX; see
-+//! `docs/CPU_MODEL_AUDIT.md`):
-+//!
-+//! * GCC 16.2 `-march=skylake` emits `xorl %eax,%eax; tzcntq %rdi,%rax`
-+//!   although uops.info measures **no** output dependency for TZCNT/LZCNT on
-+//!   Skylake (`TZCNT_R64_R64`, lat 1→1 = 0); only POPCNT retains it there.
-+//!   The single `X86_TUNE_AVOID_FALSE_DEP_FOR_BMI` bit cannot express that.
-+//! * LLVM keeps `TuningSlow3OpsLEA` on Ice Lake and Alder Lake although
-+//!   uops.info shows the 3-component LEA moved from `p1` (throughput 1.0)
-+//!   to `p0156` (throughput 0.31 / 0.20) there, i.e. it is no longer slow.
-+//!
-+//! This module therefore stores **numbers** (latencies, µop counts, port
-+//! throughputs, structure sizes) per microarchitecture, one row per
-+//! measurement, and derives the decisions from the numbers.  Every field
-+//! carries its provenance:
-+//!
-+//! * `[uops.info]` — measured by the uops.info harness
-+//!   (Abel & Reineke, "uops.info: Characterizing Latency, Throughput, and
-+//!   Port Usage of Instructions on Intel Microarchitectures", ASPLOS 2019),
-+//!   instruction page named in the comment.  Values were re-read from the
-+//!   live site during the session that introduced the field.
-+//! * `[Agner]` — Agner Fog, "Instruction tables" / "The microarchitecture of
-+//!   Intel, AMD and VIA CPUs" (2024 edition).
-+//! * `[Intel ORM]`, `[AMD SOG]` — vendor optimisation manuals.
-+//! * `[cpuid]` — architectural, not a measurement.
-+//!
-+//! A field with no provenance line is not allowed in this file.
-+//!
-+//! # Scope
-+//!
-+//! Sandy Bridge and later Intel Core, Alder Lake/Raptor Lake hybrid parts
-+//! (P-core numbers; the E-core column is noted where uops.info has it), and
-+//! AMD Zen 1–5.  Older cores and Atom-class parts resolve to the
-+//! conservative `Generic` row.
-+//!
-+//! # Policy for `Generic`
-+//!
-+//! `Generic` is what `-mtune` defaults to when neither `-march` nor
-+//! `-mtune` names a CPU.  It must be *safe* on every supported core: where
-+//! a work-around costs one eliminated µop on the cores that do not need it
-+//! but saves a multi-cycle dependency chain on the cores that do, the
-+//! work-around is on.  Where the choice is a pure win everywhere
-+//! (e.g. SHLX over `SHL r,cl`), it is on.
-+//!
-+//! # Extending the model
-+//!
-+//! Add the measured number, its provenance, and a unit test that pins it.
-+//! Then derive the decision in a `fn` on [`X86Tune`] so callers never read
-+//! raw numbers.  Never add a bare `bool` that a pass "interprets".
 +
-+use std::sync::OnceLock;
-+
-+/// Microarchitectures the tuning model distinguishes.
-+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-+pub enum X86Cpu {
-+    /// Conservative blend: safe on every Sandy Bridge+ / Zen core.
-+    Generic,
-+    SandyBridge,
-+    IvyBridge,
-+    Haswell,
-+    Broadwell,
-+    /// Skylake client and its derivatives (Kaby/Coffee/Comet Lake) share
-+    /// the core; they are the same row.
-+    Skylake,
-+    /// Skylake-SP / Cascade Lake / Cooper Lake (Skylake core + AVX-512).
-+    SkylakeAvx512,
-+    /// Ice Lake client/server, Tiger Lake, Rocket Lake (Sunny/Cypress Cove).
-+    IceLake,
-+    /// Alder Lake / Raptor Lake P-core (Golden/Raptor Cove).  Decisions are
-+    /// made for the P-core, which runs the hot code under the default
-+    /// scheduler; Gracemont numbers are noted in the field comments.
-+    AlderLake,
-+    /// Sapphire/Emerald Rapids (Golden Cove server + AVX-512).
-+    SapphireRapids,
-+    /// Arrow Lake / Lunar Lake (Lion Cove P-core).
-+    ArrowLake,
-+    Znver1,
-+    Znver2,
-+    Znver3,
-+    Znver4,
-+    Znver5,
-+}
-+
-+/// One tuning row.  Latencies in cycles; reciprocal throughputs ×100 so the
-+/// row stays integer and `Copy`.  Zero means "not available on this core".
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub struct X86Tune {
-+    pub cpu: X86Cpu,
-+    /// GCC/Clang-compatible spelling used in diagnostics.
-+    pub name: &'static str,
-+
-+    // ------------------------------------------------------------------
-+    // False output dependencies.  `[uops.info]` "Latency operand 1 → 1"
-+    // of POPCNT_R64_R64 / LZCNT_R64_R64 / TZCNT_R64_R64: 3 cycles where the
-+    // destination is (wrongly) read, 0 where it is not.
-+    // ------------------------------------------------------------------
-+    /// POPCNT reads its destination: SNB, IVB, HSW, BDW, SKL, SKX, CLX.
-+    /// Fixed on ICL/TGL/RKL/ADL-P/ADL-E and on every Zen.
-+    pub popcnt_false_dep: bool,
-+    /// LZCNT/TZCNT read their destination: SNB, IVB, HSW, BDW.  Fixed on
-+    /// SKL and later (measured 0 on SKL/SKX/CLX/ICL/ADL) and on every Zen.
-+    pub lzcnt_tzcnt_false_dep: bool,
-+
-+    // ------------------------------------------------------------------
-+    // Shifts by CL.  `[uops.info]` SHL_R64_CL "Number of µops" and measured
-+    // unrolled throughput; SHLX_R64_R64_R64 is 1 µop with rTP 0.5 (Intel
-+    // p06) / 0.25–0.33 (Zen) everywhere it exists.
-+    // ------------------------------------------------------------------
-+    /// µops of `SHL r64, CL`: 3 on SNB..CLX (rTP 1.5–2.0), 2 on ICL/TGL/
-+    /// RKL/ADL-P (rTP 1.0), 1 on every Zen (rTP 0.25–0.5).
-+    pub shift_cl_uops: u8,
-+
-+    // ------------------------------------------------------------------
-+    // LEA.  `[uops.info]` LEA_B_I_D8_R64 (base+index+disp8): SNB..SKL
-+    // execute it on p1 only with rTP 1.0 (the 3-cycle "slow LEA" [Agner]);
-+    // ICL runs it on p0156 rTP 0.31, ADL-P on p0156B rTP 0.20 → 1 cycle.
-+    // Zen: 2 cycles for 3 components [Agner, Zen tables], rTP 0.5.
-+    // ------------------------------------------------------------------
-+    /// Latency of a 3-component LEA (base + index + displacement).
-+    pub lea3_latency: u8,
-+
-+    // ------------------------------------------------------------------
-+    // CMOV.  `[uops.info]` CMOVB_R64_R64: 2 µops (p015+p05 / p0156+p06),
-+    // lat 2 on SNB/IVB/HSW; 1 µop lat 1 from BDW on and on every Zen.
-+    // ------------------------------------------------------------------
-+    pub cmov_uops: u8,
-+    pub cmov_latency: u8,
-+
-+    // ------------------------------------------------------------------
-+    // Integer multiply / divide.  `[uops.info]` IMUL_R64_R64 latency 3 on
-+    // every P-core and Zen (5 on ADL-E).  DIV_R64 latency (operand 1→3,
-+    // dividend→quotient) and measured rTP: SNB 29/22.6, IVB 30/22.4,
-+    // HSW 30/21, BDW 30/21, SKL 34/21, SKX 34/21, CLX 34/21, ICL 18/10,
-+    // TGL 18/10, RKL 18/10, ADL-P 18/10, ADL-E 13/6, Zen+ 10/14,
-+    // Zen2 10/14, Zen3 10/7, Zen4 10/7, Zen5 10/7.
-+    // ------------------------------------------------------------------
-+    pub imul64_latency: u8,
-+    pub div64_latency: u8,
-+    /// Reciprocal throughput of DIV r64 ×100.
-+    pub div64_rtp_x100: u16,
-+
-+    // ------------------------------------------------------------------
-+    // Floating point.  `[Agner]` VFMADD231PS ymm: HSW/BDW 5, SKL..SKX 4,
-+    // ICL 4, ADL-P 4, Zen1/2 5, Zen3+ 4; not present on SNB/IVB.
-+    // VADDPS ymm: SNB..BDW 3, SKL..RKL 4 (executed on the FMA unit),
-+    // ADL-P 3 (dedicated adder), Zen 3.  VMULPS ymm: SNB..HSW 5, BDW 3,
-+    // SKL+ 4, Zen 3.  256-bit FMA-capable pipes: 2 on every listed core
-+    // except Zen1 (2×128 halves → counted as 1).
-+    // ------------------------------------------------------------------
-+    pub fma_latency: u8,
-+    pub fadd_latency: u8,
-+    pub fmul_latency: u8,
-+    pub fma_pipes: u8,
-+
-+    // ------------------------------------------------------------------
-+    // Memory.  `[cpuid]` ERMS (Enhanced REP MOVSB): IVB+ Intel, all Zen.
-+    // FSRM (Fast Short REP MOV): ICL+ Intel, Zen4+.  `[Agner]` SNB/IVB
-+    // execute a 32-byte load as two 16-byte halves; the 256-bit load path
-+    // is full width from HSW on.
-+    // ------------------------------------------------------------------
-+    pub erms: bool,
-+    pub fsrm: bool,
-+    pub avx256_unaligned_split: bool,
-+
-+    // ------------------------------------------------------------------
-+    // Out-of-order / front-end structure sizes.  `[Intel ORM]`, `[Agner
-+    // microarchitecture]`, `[AMD SOG]`.  Recorded for the unroll,
-+    // scheduling and software-pipelining cost models; no decision consumes
-+    // them yet because they cannot be validated without the hardware (see
-+    // docs/FOLLOWUP_CPU_MODEL.md).
-+    // ------------------------------------------------------------------
-+    /// Reorder-buffer entries: SNB/IVB 168, HSW/BDW 192, SKL/SKX 224,
-+    /// ICL/TGL/RKL 352, ADL-P/SPR 512, ARL 576, Zen1 192, Zen2 224,
-+    /// Zen3 256, Zen4 320, Zen5 448.
-+    pub rob_entries: u16,
-+    /// Loop-stream-detector capacity in µops (0 = none / disabled by
-+    /// microcode): SNB/IVB 28, HSW/BDW 56, SKL/SKX/CLX 0 (erratum
-+    /// SKL150), ICL 0 (disabled), ADL-P 192, Zen 0.
-+    pub lsd_uops: u16,
-+    /// Decoded-µop cache capacity: SNB..SKX 1536, ICL 2304, ADL-P 4096,
-+    /// ARL 4096, Zen1 2048, Zen2/3 4096, Zen4 6912, Zen5 6144.
-+    pub uop_cache_uops: u16,
-+    /// Skylake-derived cores (SKL/KBL/CFL/CML/SKX/CLX) lose the DSB for a
-+    /// 32-byte window containing a JCC that touches the boundary after the
-+    /// 2019 microcode update (Intel JCC erratum, white paper 341810).
-+    /// Recorded for a future `-mbranches-within-32B-boundaries` default.
-+    pub jcc_erratum: bool,
-+}
-+
-+impl X86Cpu {
-+    /// Map a `-march=`/`-mtune=` spelling (GCC/Clang vocabulary) to a row.
-+    /// Returns `None` for names the driver does not know at all; names it
-+    /// knows but has no dedicated row for resolve to the closest core.
-+    pub fn from_name(name: &str) -> Option<X86Cpu> {
-+        use X86Cpu::*;
-+        Some(match name {
-+            "generic" | "x86-64" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4" | "nocona"
-+            | "core2" | "nehalem" | "westmere" | "silvermont" | "goldmont"
-+            | "goldmont-plus" | "tremont" | "bonnell" | "atom" | "k8" | "opteron"
-+            | "barcelona" | "bdver1" | "bdver2" | "bdver3" | "bdver4" | "btver1"
-+            | "btver2" | "knl" | "knm" | "intel" => Generic,
-+            "sandybridge" | "corei7-avx" => SandyBridge,
-+            "ivybridge" | "core-avx-i" => IvyBridge,
-+            "haswell" | "core-avx2" => Haswell,
-+            "broadwell" => Broadwell,
-+            "skylake" | "kabylake" | "coffeelake" | "cometlake" | "amberlake"
-+            | "whiskeylake" => Skylake,
-+            "skylake-avx512" | "cascadelake" | "cooperlake" | "cannonlake" => SkylakeAvx512,
-+            "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => IceLake,
-+            "alderlake" | "raptorlake" | "raptor-lake" | "meteorlake" | "gracemont"
-+            | "sierraforest" | "grandridge" | "clearwaterforest" => AlderLake,
-+            "sapphirerapids" | "emeraldrapids" | "graniterapids" | "graniterapids-d" => {
-+                SapphireRapids
-+            }
-+            "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake" | "wildcatlake" => {
-+                ArrowLake
-+            }
-+            "znver1" => Znver1,
-+            "znver2" => Znver2,
-+            "znver3" => Znver3,
-+            "znver4" => Znver4,
-+            "znver5" => Znver5,
-+            _ => return None,
-+        })
-+    }
-+
-+    /// Identify the host core from CPUID family/model (leaf 1) for
-+    /// `-march=native` / `-mtune=native`.
-+    #[cfg(target_arch = "x86_64")]
-+    pub fn detect_host() -> X86Cpu {
-+        // CPUID is unprivileged and available on every x86-64 CPU (the
-+        // intrinsic is safe since Rust 1.86).
-+        let vendor = std::arch::x86_64::__cpuid(0);
-+        let leaf1 = std::arch::x86_64::__cpuid(1);
-+        let vendor_bytes = [
-+            vendor.ebx.to_le_bytes(),
-+            vendor.edx.to_le_bytes(),
-+            vendor.ecx.to_le_bytes(),
-+        ]
-+        .concat();
-+        let is_amd = &vendor_bytes[..] == b"AuthenticAMD";
-+        let is_intel = &vendor_bytes[..] == b"GenuineIntel";
-+        let eax = leaf1.eax;
-+        let family = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
-+        let model = ((eax >> 4) & 0xF) | ((eax >> 12) & 0xF0);
-+        Self::from_signature(is_intel, is_amd, family, model)
-+    }
-+
-+    /// Pure family/model decoder behind [`Self::detect_host`], separated so
-+    /// it can be unit-tested on any host.  Model numbers from Intel SDM
-+    /// Vol. 4 Ch. 2 and the Linux `intel-family.h` / AMD cpu tables.
-+    /// Parts newer than the table resolve to the newest known core of their
-+    /// vendor line; unknown vendors resolve to `Generic`.
-+    pub fn from_signature(is_intel: bool, is_amd: bool, family: u32, model: u32) -> X86Cpu {
-+        use X86Cpu::*;
-+        if is_intel && family == 6 {
-+            return match model {
-+                0x2A | 0x2D => SandyBridge,
-+                0x3A | 0x3E => IvyBridge,
-+                0x3C | 0x3F | 0x45 | 0x46 => Haswell,
-+                0x3D | 0x47 | 0x4F | 0x56 => Broadwell,
-+                0x4E | 0x5E | 0x8E | 0x9E | 0xA5 | 0xA6 => Skylake,
-+                // 06_55H: stepping <5 SKX, 5–6 CLX, ≥10 CPX — same core.
-+                0x55 | 0x66 => SkylakeAvx512,
-+                0x7D | 0x7E | 0x6A | 0x6C | 0x8C | 0x8D | 0xA7 => IceLake,
-+                0x97 | 0x9A | 0xB7 | 0xBA | 0xBF | 0xBE | 0xAA | 0xAC | 0xB5 | 0xDD => {
-+                    AlderLake
-+                }
-+                0x8F | 0xCF | 0xAD | 0xAE => SapphireRapids,
-+                0xC6 | 0xC5 | 0xBD | 0xCC => ArrowLake,
-+                m if m > 0xC6 => ArrowLake,
-+                _ => Generic,
-+            };
-+        }
-+        if is_amd {
-+            return match family {
-+                0x17 => match model {
-+                    0x00..=0x2F => Znver1,
-+                    _ => Znver2,
-+                },
-+                0x19 => match model {
-+                    0x10..=0x1F | 0x60..=0x7F | 0xA0..=0xAF => Znver4,
-+                    _ => Znver3,
-+                },
-+                f if f >= 0x1A => Znver5,
-+                _ => Generic,
-+            };
-+        }
-+        Generic
-+    }
-+
-+    /// The tuning row for this core.
-+    pub const fn tune(self) -> X86Tune {
-+        use X86Cpu::*;
-+        const fn snb_like(cpu: X86Cpu, name: &'static str, erms: bool) -> X86Tune {
-+            X86Tune {
-+                cpu,
-+                name,
-+                popcnt_false_dep: true,
-+                lzcnt_tzcnt_false_dep: true,
-+                shift_cl_uops: 3,
-+                lea3_latency: 3,
-+                cmov_uops: 2,
-+                cmov_latency: 2,
-+                imul64_latency: 3,
-+                div64_latency: 30,
-+                div64_rtp_x100: 2260,
-+                fma_latency: 0,
-+                fadd_latency: 3,
-+                fmul_latency: 5,
-+                fma_pipes: 0,
-+                erms,
-+                fsrm: false,
-+                avx256_unaligned_split: true,
-+                rob_entries: 168,
-+                lsd_uops: 28,
-+                uop_cache_uops: 1536,
-+                jcc_erratum: false,
-+            }
-+        }
-+        match self {
-+            SandyBridge => snb_like(SandyBridge, "sandybridge", false),
-+            IvyBridge => snb_like(IvyBridge, "ivybridge", true),
-+            Haswell => X86Tune {
-+                cpu: Haswell,
-+                name: "haswell",
-+                popcnt_false_dep: true,
-+                lzcnt_tzcnt_false_dep: true,
-+                shift_cl_uops: 3,
-+                lea3_latency: 3,
-+                cmov_uops: 2,
-+                cmov_latency: 2,
-+                imul64_latency: 3,
-+                div64_latency: 30,
-+                div64_rtp_x100: 2100,
-+                fma_latency: 5,
-+                fadd_latency: 3,
-+                fmul_latency: 5,
-+                fma_pipes: 2,
-+                erms: true,
-+                fsrm: false,
-+                avx256_unaligned_split: false,
-+                rob_entries: 192,
-+                lsd_uops: 56,
-+                uop_cache_uops: 1536,
-+                jcc_erratum: false,
-+            },
-+            Broadwell => X86Tune {
-+                cpu: Broadwell,
-+                name: "broadwell",
-+                cmov_uops: 1,
-+                cmov_latency: 1,
-+                fmul_latency: 3,
-+                ..Haswell.tune()
-+            },
-+            Skylake => X86Tune {
-+                cpu: Skylake,
-+                name: "skylake",
-+                lzcnt_tzcnt_false_dep: false,
-+                div64_latency: 34,
-+                fma_latency: 4,
-+                fadd_latency: 4,
-+                fmul_latency: 4,
-+                rob_entries: 224,
-+                lsd_uops: 0,
-+                jcc_erratum: true,
-+                ..Broadwell.tune()
-+            },
-+            SkylakeAvx512 => X86Tune {
-+                cpu: SkylakeAvx512,
-+                name: "skylake-avx512",
-+                ..Skylake.tune()
-+            },
-+            IceLake => X86Tune {
-+                cpu: IceLake,
-+                name: "icelake-client",
-+                popcnt_false_dep: false,
-+                shift_cl_uops: 2,
-+                lea3_latency: 1,
-+                div64_latency: 18,
-+                div64_rtp_x100: 1000,
-+                fsrm: true,
-+                rob_entries: 352,
-+                lsd_uops: 0,
-+                uop_cache_uops: 2304,
-+                jcc_erratum: false,
-+                ..Skylake.tune()
-+            },
-+            AlderLake => X86Tune {
-+                cpu: AlderLake,
-+                name: "alderlake",
-+                fadd_latency: 3,
-+                rob_entries: 512,
-+                lsd_uops: 192,
-+                uop_cache_uops: 4096,
-+                ..IceLake.tune()
-+            },
-+            SapphireRapids => X86Tune {
-+                cpu: SapphireRapids,
-+                name: "sapphirerapids",
-+                ..AlderLake.tune()
-+            },
-+            ArrowLake => X86Tune {
-+                cpu: ArrowLake,
-+                name: "arrowlake",
-+                rob_entries: 576,
-+                ..AlderLake.tune()
-+            },
-+            Znver1 => X86Tune {
-+                cpu: Znver1,
-+                name: "znver1",
-+                popcnt_false_dep: false,
-+                lzcnt_tzcnt_false_dep: false,
-+                shift_cl_uops: 1,
-+                lea3_latency: 2,
-+                cmov_uops: 1,
-+                cmov_latency: 1,
-+                imul64_latency: 3,
-+                div64_latency: 10,
-+                div64_rtp_x100: 1400,
-+                fma_latency: 5,
-+                fadd_latency: 3,
-+                fmul_latency: 3,
-+                fma_pipes: 1,
-+                erms: true,
-+                fsrm: false,
-+                avx256_unaligned_split: false,
-+                rob_entries: 192,
-+                lsd_uops: 0,
-+                uop_cache_uops: 2048,
-+                jcc_erratum: false,
-+            },
-+            Znver2 => X86Tune {
-+                cpu: Znver2,
-+                name: "znver2",
-+                fma_pipes: 2,
-+                rob_entries: 224,
-+                uop_cache_uops: 4096,
-+                ..Znver1.tune()
-+            },
-+            Znver3 => X86Tune {
-+                cpu: Znver3,
-+                name: "znver3",
-+                div64_rtp_x100: 700,
-+                fma_latency: 4,
-+                rob_entries: 256,
-+                ..Znver2.tune()
-+            },
-+            Znver4 => X86Tune {
-+                cpu: Znver4,
-+                name: "znver4",
-+                fsrm: true,
-+                rob_entries: 320,
-+                uop_cache_uops: 6912,
-+                ..Znver3.tune()
-+            },
-+            Znver5 => X86Tune {
-+                cpu: Znver5,
-+                name: "znver5",
-+                rob_entries: 448,
-+                uop_cache_uops: 6144,
-+                ..Znver4.tune()
-+            },
-+            // Generic: the conservative envelope over every row above.  Each
-+            // field takes the value that is never *harmful*: work-arounds on,
-+            // latencies at the slow end, structure sizes at the small end.
-+            Generic => X86Tune {
-+                cpu: Generic,
-+                name: "generic",
-+                popcnt_false_dep: true,
-+                lzcnt_tzcnt_false_dep: true,
-+                shift_cl_uops: 3,
-+                lea3_latency: 3,
-+                cmov_uops: 2,
-+                cmov_latency: 2,
-+                imul64_latency: 3,
-+                div64_latency: 34,
-+                div64_rtp_x100: 2260,
-+                fma_latency: 5,
-+                fadd_latency: 4,
-+                fmul_latency: 5,
-+                fma_pipes: 2,
-+                erms: false,
-+                fsrm: false,
-+                avx256_unaligned_split: false,
-+                rob_entries: 168,
-+                lsd_uops: 0,
-+                uop_cache_uops: 1536,
-+                jcc_erratum: false,
-+            },
-+        }
-+    }
-+
-+    /// Every row, for exhaustive tests and `LCCC_DUMP_TUNE=all`.
-+    pub const ALL: [X86Cpu; 16] = [
-+        X86Cpu::Generic,
-+        X86Cpu::SandyBridge,
-+        X86Cpu::IvyBridge,
-+        X86Cpu::Haswell,
-+        X86Cpu::Broadwell,
-+        X86Cpu::Skylake,
-+        X86Cpu::SkylakeAvx512,
-+        X86Cpu::IceLake,
-+        X86Cpu::AlderLake,
-+        X86Cpu::SapphireRapids,
-+        X86Cpu::ArrowLake,
-+        X86Cpu::Znver1,
-+        X86Cpu::Znver2,
-+        X86Cpu::Znver3,
-+        X86Cpu::Znver4,
-+        X86Cpu::Znver5,
-+    ];
-+}
-+
-+impl X86Tune {
-+    /// The row used when no tuning information is available at all.
-+    pub const GENERIC: X86Tune = X86Cpu::Generic.tune();
-+
-+    // ------------------------------------------------------------------
-+    // Derived decisions.  Callers use these, never the raw numbers.
-+    // ------------------------------------------------------------------
-+
-+    /// Emit `xor %d,%d` before `popcnt %s,%d` (d ≠ s)?  Only where the
-+    /// destination is architecturally read.  On other cores the xor is a
-+    /// zero idiom (no execution µop) but still costs a front-end slot and
-+    /// two to three bytes per instance.
-+    #[inline]
-+    pub fn break_popcnt_dep(&self) -> bool {
-+        self.popcnt_false_dep
-+    }
-+
-+    /// Emit `xor %d,%d` before `lzcnt`/`tzcnt %s,%d` (d ≠ s)?
-+    #[inline]
-+    pub fn break_lzcnt_tzcnt_dep(&self) -> bool {
-+        self.lzcnt_tzcnt_false_dep
-+    }
-+
-+    /// Select `shlx/shrx/sarx` over `shl/shr/sar r, %cl` when BMI2 is
-+    /// available and the count is already in `%rcx`.  The VEX form is 1 µop
-+    /// on every core that has it, so it wins wherever the legacy form is
-+    /// more than one µop (all Intel cores); on Zen (1 µop each) the legacy
-+    /// form is 2–3 bytes shorter and otherwise identical, so it is kept.
-+    #[inline]
-+    pub fn prefer_shlx(&self, bmi2: bool) -> bool {
-+        bmi2 && self.shift_cl_uops > 1
-+    }
-+
-+    /// Use `shlx` when doing so removes a register copy (count not in
-+    /// `%rcx`, or the result must not clobber the source).  A saved `mov`
-+    /// is a saved µop/slot on every core, including Zen.
-+    #[inline]
-+    pub fn shlx_saves_move(&self, bmi2: bool) -> bool {
-+        bmi2
-+    }
-+
-+    /// Independent accumulators needed to saturate the FMA pipes in a
-+    /// reduction: `latency × pipes` (Little's law).  0 when the core has no
-+    /// FMA (SNB/IVB) so the caller falls back to the FADD figure.
-+    #[inline]
-+    pub fn fma_reduction_accumulators(&self) -> u8 {
-+        self.fma_latency.saturating_mul(self.fma_pipes.max(1))
-+    }
-+
-+    /// Same for a pure add reduction (two 256-bit adders on every row).
-+    #[inline]
-+    pub fn fadd_reduction_accumulators(&self) -> u8 {
-+        self.fadd_latency.saturating_mul(2)
-+    }
-+
-+    /// Human-readable dump (one `key=value` per line) for
-+    /// `LCCC_DUMP_TUNE=1` and the regression tests.
-+    pub fn dump(&self) -> String {
-+        let mut s = String::with_capacity(1024);
-+        let mut kv = |k: &str, v: String| {
-+            s.push_str(k);
-+            s.push('=');
-+            s.push_str(&v);
-+            s.push('\n');
-+        };
-+        kv("tune", self.name.to_string());
-+        kv("popcnt_false_dep", self.popcnt_false_dep.to_string());
-+        kv("lzcnt_tzcnt_false_dep", self.lzcnt_tzcnt_false_dep.to_string());
-+        kv("shift_cl_uops", self.shift_cl_uops.to_string());
-+        kv("lea3_latency", self.lea3_latency.to_string());
-+        kv("cmov_uops", self.cmov_uops.to_string());
-+        kv("cmov_latency", self.cmov_latency.to_string());
-+        kv("imul64_latency", self.imul64_latency.to_string());
-+        kv("div64_latency", self.div64_latency.to_string());
-+        kv("div64_rtp_x100", self.div64_rtp_x100.to_string());
-+        kv("fma_latency", self.fma_latency.to_string());
-+        kv("fadd_latency", self.fadd_latency.to_string());
-+        kv("fmul_latency", self.fmul_latency.to_string());
-+        kv("fma_pipes", self.fma_pipes.to_string());
-+        kv("erms", self.erms.to_string());
-+        kv("fsrm", self.fsrm.to_string());
-+        kv("avx256_unaligned_split", self.avx256_unaligned_split.to_string());
-+        kv("rob_entries", self.rob_entries.to_string());
-+        kv("lsd_uops", self.lsd_uops.to_string());
-+        kv("uop_cache_uops", self.uop_cache_uops.to_string());
-+        kv("jcc_erratum", self.jcc_erratum.to_string());
-+        kv(
-+            "derived.fma_reduction_accumulators",
-+            self.fma_reduction_accumulators().to_string(),
-+        );
-+        kv(
-+            "derived.fadd_reduction_accumulators",
-+            self.fadd_reduction_accumulators().to_string(),
-+        );
-+        s
-+    }
-+}
-+
-+impl Default for X86Tune {
-+    fn default() -> Self {
-+        X86Tune::GENERIC
-+    }
-+}
-+
-+/// Resolve the effective tuning row from the driver's `-march` / `-mtune`
-+/// spellings.  Precedence follows GCC: `-mtune` wins; otherwise `-march`
-+/// names the core; otherwise `generic`.  `native` resolves through CPUID on
-+/// x86-64 hosts and to `generic` elsewhere.
-+pub fn resolve(march: Option<&str>, mtune: Option<&str>) -> X86Tune {
-+    fn one(name: &str) -> Option<X86Cpu> {
-+        if name == "native" {
-+            #[cfg(target_arch = "x86_64")]
-+            {
-+                return Some(X86Cpu::detect_host());
-+            }
-+            #[cfg(not(target_arch = "x86_64"))]
-+            {
-+                return Some(X86Cpu::Generic);
-+            }
-+        }
-+        X86Cpu::from_name(name)
-+    }
-+    let cpu = mtune
-+        .and_then(one)
-+        .or_else(|| march.and_then(one))
-+        .unwrap_or(X86Cpu::Generic);
-+    cpu.tune()
-+}
-+
-+// ----------------------------------------------------------------------
-+// Process-wide active model.  The middle-end passes are free functions
-+// that receive no target context (see passes::run_passes); like
-+// `vectorize::set_x86_fma_enabled` they read a global that the driver sets
-+// once per compilation.  Backend code receives the model through
-+// `CodegenOptions` instead and must not use this accessor.
-+// ----------------------------------------------------------------------
-+
-+static ACTIVE: OnceLock<std::sync::RwLock<X86Tune>> = OnceLock::new();
-+
-+fn active_cell() -> &'static std::sync::RwLock<X86Tune> {
-+    ACTIVE.get_or_init(|| std::sync::RwLock::new(X86Tune::GENERIC))
-+}
-+
-+/// Install the model for the current compilation (driver only).
-+pub fn set_active(t: X86Tune) {
-+    *active_cell().write().unwrap_or_else(|e| e.into_inner()) = t;
-+}
-+
-+/// The model installed by [`set_active`], `GENERIC` before the driver runs.
-+pub fn active() -> X86Tune {
-+    *active_cell().read().unwrap_or_else(|e| e.into_inner())
-+}
++// ── tests: the redefinition predicate ────────────────────────────────────────
 +
 +#[cfg(test)]
-+mod tests {
++mod writes_family_tests {
 +    use super::*;
 +
 +    #[test]
-+    fn every_row_is_reachable_by_name() {
-+        for cpu in X86Cpu::ALL {
-+            let t = cpu.tune();
-+            assert_eq!(t.cpu, cpu, "row {:?} reports wrong cpu", cpu);
-+            assert_eq!(
-+                X86Cpu::from_name(t.name),
-+                Some(cpu),
-+                "row name {:?} does not round-trip",
-+                t.name
-+            );
-+        }
-+    }
-+
-+    /// Pins the uops.info "latency operand 1 → 1" measurements that the
-+    /// false-dependency decision rests on.  If a row here changes, the
-+    /// commit must cite a new measurement.
-+    #[test]
-+    fn false_dependency_rows_match_uops_info() {
-+        use X86Cpu::*;
-+        let popcnt_dep: &[X86Cpu] =
-+            &[SandyBridge, IvyBridge, Haswell, Broadwell, Skylake, SkylakeAvx512];
-+        let lzcnt_dep: &[X86Cpu] = &[SandyBridge, IvyBridge, Haswell, Broadwell];
-+        for cpu in X86Cpu::ALL {
-+            if cpu == Generic {
-+                continue;
-+            }
-+            let t = cpu.tune();
-+            assert_eq!(t.popcnt_false_dep, popcnt_dep.contains(&cpu), "popcnt {:?}", cpu);
-+            assert_eq!(t.lzcnt_tzcnt_false_dep, lzcnt_dep.contains(&cpu), "lzcnt {:?}", cpu);
-+        }
-+        // Skylake is the row GCC 16.2 gets wrong (xor before tzcnt).
-+        assert!(Skylake.tune().popcnt_false_dep && !Skylake.tune().lzcnt_tzcnt_false_dep);
++    fn is_exact_for_the_widening_branch() {
++        let info = classify_line("    cqto");
++        // The classifier names %rax as cqto's primary destination, but %rax
++        // is the implicit INPUT; the only family written is %rdx.
++        assert!(writes_family(&info, "cqto", 2));
++        assert!(!writes_family(&info, "cqto", 0));
 +    }
 +
 +    #[test]
-+    fn shift_cl_uops_match_uops_info() {
-+        use X86Cpu::*;
-+        for cpu in [SandyBridge, IvyBridge, Haswell, Broadwell, Skylake, SkylakeAvx512] {
-+            assert_eq!(cpu.tune().shift_cl_uops, 3, "{:?}", cpu);
-+        }
-+        for cpu in [IceLake, AlderLake, SapphireRapids, ArrowLake] {
-+            assert_eq!(cpu.tune().shift_cl_uops, 2, "{:?}", cpu);
-+        }
-+        for cpu in [Znver1, Znver2, Znver3, Znver4, Znver5] {
-+            assert_eq!(cpu.tune().shift_cl_uops, 1, "{:?}", cpu);
-+            assert!(!cpu.tune().prefer_shlx(true));
-+            assert!(cpu.tune().shlx_saves_move(true));
-+        }
-+        for cpu in [Haswell, Skylake, IceLake, AlderLake, Generic] {
-+            assert!(cpu.tune().prefer_shlx(true));
-+            assert!(!cpu.tune().prefer_shlx(false));
-+        }
++    fn covers_the_implicit_second_output() {
++        let info = classify_line("    idivq %r11");
++        assert!(writes_family(&info, "idivq %r11", 0));
++        assert!(writes_family(&info, "idivq %r11", 2));
++        assert!(!writes_family(&info, "idivq %r11", 3));
 +    }
 +
 +    #[test]
-+    fn lea_and_cmov_and_div_rows() {
-+        use X86Cpu::*;
-+        for cpu in [SandyBridge, Haswell, Skylake, SkylakeAvx512] {
-+            assert_eq!(cpu.tune().lea3_latency, 3);
-+        }
-+        for cpu in [IceLake, AlderLake, ArrowLake] {
-+            assert_eq!(cpu.tune().lea3_latency, 1);
-+        }
-+        for cpu in [SandyBridge, IvyBridge, Haswell] {
-+            assert_eq!(cpu.tune().cmov_uops, 2);
-+        }
-+        for cpu in [Broadwell, Skylake, IceLake, AlderLake, Znver1, Znver5] {
-+            assert_eq!(cpu.tune().cmov_uops, 1);
-+        }
-+        assert!(Skylake.tune().div64_latency > IceLake.tune().div64_latency);
-+        assert!(IceLake.tune().div64_latency > Znver3.tune().div64_latency);
-+        assert_eq!(Znver2.tune().div64_rtp_x100, 1400);
-+        assert_eq!(Znver3.tune().div64_rtp_x100, 700);
++    fn still_answers_explicit_destinations() {
++        let info = classify_line("    movq %rcx, %rax");
++        assert!(writes_family(&info, "movq %rcx, %rax", 0));
++        assert!(!writes_family(&info, "movq %rcx, %rax", 1));
++        // An RMW of another family is not a write of the source family; a
++        // read of a family the instruction never writes must not be one
++        // either.
++        let info = classify_line("    addq %rdx, %rcx");
++        assert!(!writes_family(&info, "addq %rdx, %rcx", 2));
++        assert!(writes_family(&info, "addq %rdx, %rcx", 1));
 +    }
 +
 +    #[test]
-+    fn generic_is_the_conservative_envelope() {
-+        let g = X86Tune::GENERIC;
-+        for cpu in X86Cpu::ALL {
-+            let t = cpu.tune();
-+            // Work-arounds: generic applies every one that any row needs.
-+            assert!(g.popcnt_false_dep >= t.popcnt_false_dep);
-+            assert!(g.lzcnt_tzcnt_false_dep >= t.lzcnt_tzcnt_false_dep);
-+            // Capacities: generic never assumes more than the smallest core.
-+            assert!(g.rob_entries <= t.rob_entries, "{:?}", cpu);
-+            assert!(g.uop_cache_uops <= t.uop_cache_uops, "{:?}", cpu);
-+            // Optional fast paths: generic never assumes them.
-+            assert!(!g.erms && !g.fsrm);
-+        }
-+    }
-+
-+    #[test]
-+    fn resolve_precedence_and_native() {
-+        assert_eq!(resolve(None, None).cpu, X86Cpu::Generic);
-+        assert_eq!(resolve(Some("skylake"), None).cpu, X86Cpu::Skylake);
-+        assert_eq!(resolve(Some("skylake"), Some("znver3")).cpu, X86Cpu::Znver3);
-+        assert_eq!(resolve(Some("x86-64-v3"), None).cpu, X86Cpu::Generic);
-+        assert_eq!(resolve(None, Some("raptorlake")).cpu, X86Cpu::AlderLake);
-+        assert_eq!(resolve(None, Some("no-such-cpu")).cpu, X86Cpu::Generic);
-+        let n = resolve(None, Some("native"));
-+        assert!(X86Cpu::ALL.contains(&n.cpu));
-+    }
-+
-+    #[test]
-+    fn cpuid_signature_decoder() {
-+        use X86Cpu::*;
-+        let intel = |m| X86Cpu::from_signature(true, false, 6, m);
-+        assert_eq!(intel(0x2A), SandyBridge);
-+        assert_eq!(intel(0x3A), IvyBridge);
-+        assert_eq!(intel(0x3C), Haswell);
-+        assert_eq!(intel(0x4E), Skylake);
-+        assert_eq!(intel(0x9E), Skylake); // Coffee Lake
-+        assert_eq!(intel(0x55), SkylakeAvx512);
-+        assert_eq!(intel(0x7E), IceLake);
-+        assert_eq!(intel(0x97), AlderLake);
-+        assert_eq!(intel(0xB7), AlderLake); // Raptor Lake (i7-14700KF)
-+        assert_eq!(intel(0x8F), SapphireRapids);
-+        assert_eq!(intel(0xC6), ArrowLake);
-+        let amd = |f, m| X86Cpu::from_signature(false, true, f, m);
-+        assert_eq!(amd(0x17, 0x01), Znver1);
-+        assert_eq!(amd(0x17, 0x71), Znver2);
-+        assert_eq!(amd(0x19, 0x21), Znver3);
-+        assert_eq!(amd(0x19, 0x61), Znver4);
-+        assert_eq!(amd(0x1A, 0x44), Znver5);
-+        assert_eq!(X86Cpu::from_signature(false, false, 6, 0x97), Generic);
-+    }
-+
-+    #[test]
-+    fn reduction_accumulators_follow_littles_law() {
-+        assert_eq!(X86Cpu::Haswell.tune().fma_reduction_accumulators(), 10);
-+        assert_eq!(X86Cpu::Skylake.tune().fma_reduction_accumulators(), 8);
-+        assert_eq!(X86Cpu::Znver1.tune().fma_reduction_accumulators(), 5);
-+        assert_eq!(X86Cpu::Znver3.tune().fma_reduction_accumulators(), 8);
-+        assert_eq!(X86Cpu::SandyBridge.tune().fma_reduction_accumulators(), 0);
-+        assert_eq!(X86Cpu::AlderLake.tune().fadd_reduction_accumulators(), 6);
-+    }
-+
-+    #[test]
-+    fn dump_is_stable_and_complete() {
-+        let d = X86Cpu::AlderLake.tune().dump();
-+        assert!(d.starts_with("tune=alderlake\n"));
-+        assert!(d.contains("popcnt_false_dep=false\n"));
-+        assert!(d.contains("shift_cl_uops=2\n"));
-+        assert!(d.contains("lsd_uops=192\n"));
-+        assert!(d.contains("derived.fma_reduction_accumulators=8\n"));
++    fn rejects_non_gp_families() {
++        let info = classify_line("    movsd %xmm0, %xmm1");
++        assert!(!writes_family(&info, "movsd %xmm0, %xmm1", 25));
 +    }
 +}
-diff --git a/src/backend/x86/mod.rs b/src/backend/x86/mod.rs
-index 6cf7a4b..306fbb3 100644
---- a/src/backend/x86/mod.rs
-+++ b/src/backend/x86/mod.rs
-@@ -2,6 +2,7 @@
- // Built-in assembler unused when gcc handles assembly
- pub(crate) mod assembler;
- pub(crate) mod codegen;
-+pub(crate) mod cpu_model;
- #[cfg_attr(feature = "gcc_linker", allow(dead_code))]
- // Built-in linker unused when gcc handles linking
- pub mod linker;
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 90d21b0..1ca0147 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -1173,6 +1173,11 @@ impl Driver {
-                 }
-                 arg if arg.starts_with("-march=") => {
-                     let march = &arg["-march=".len()..];
-+                    if matches!(self.target, Target::X86_64 | Target::I686) {
-+                        // Remembered for the tuning-row fallback
-+                        // (cpu_model::resolve: -mtune > -march > generic).
-+                        self.x86_march = Some(march.to_string());
-+                    }
-                     match self.target {
-                         Target::Riscv64 => self.riscv_march = Some(march.to_string()),
-                         Target::X86_64 | Target::I686 => match march {
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index fa616ba..ba730b8 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -224,6 +224,9 @@ pub struct Driver {
-     /// a machine scheduler, so this is deliberately diagnostic-only; ISA
-     /// selection belongs to -march= and is never silently conflated with tune.
-     pub(super) x86_tune: Option<String>,
-+    /// The `-march=` spelling as given (x86 only); the tuning row falls back
-+    /// to it when `-mtune` is absent, exactly like GCC.
-+    pub(super) x86_march: Option<String>,
-     /// Whether to use only general-purpose registers (-mgeneral-regs-only).
-     /// On AArch64, this prevents FP/SIMD register usage. The Linux kernel uses
-     /// this to avoid touching NEON/FP state. When set, variadic function prologues
-@@ -477,6 +480,7 @@ impl Driver {
-             enable_amx_bf16: false,
-             enable_cmpccxadd: false,
-             x86_tune: None,
-+            x86_march: None,
-             general_regs_only: false,
-             code_model_kernel: false,
-             no_jump_tables: false,
-@@ -1240,11 +1244,27 @@ impl Driver {
-     ///
-     /// Set `CCC_TIME_PHASES=1` in the environment to print per-phase timing to stderr.
-     fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
--        if self.verbose {
--            if let Some(tune) = &self.x86_tune {
--                eprintln!("lccc: note: -mtune={} accepted as a scheduling hint; no x86 scheduler model is implemented yet", tune);
-+        // Resolve the microarchitectural tuning row once per compilation.
-+        // `-mtune` wins over `-march`, `native` goes through CPUID; both
-+        // the middle end (process-global accessor) and the backend
-+        // (`CodegenOptions::tune`) see the same row.
-+        let tune = crate::backend::x86::cpu_model::resolve(
-+            self.x86_march.as_deref(),
-+            self.x86_tune.as_deref(),
-+        );
-+        crate::backend::x86::cpu_model::set_active(tune);
-+        if let Ok(v) = std::env::var("LCCC_DUMP_TUNE") {
-+            if v == "all" {
-+                for cpu in crate::backend::x86::cpu_model::X86Cpu::ALL {
-+                    eprint!("{}\n", cpu.tune().dump());
-+                }
-+            } else if !v.is_empty() && v != "0" {
-+                eprint!("{}", tune.dump());
-             }
-         }
-+        if self.verbose {
-+            eprintln!("lccc: note: x86 tuning row '{}'", tune.name);
-+        }
-         let source = Self::read_source(input_file)?;
+diff --git a/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs b/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
+index faeffaa..ef0c789 100644
+--- a/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
++++ b/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
+@@ -162,24 +162,12 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
+     {
+         return 0;
+     }
+-    // Explicit implicit-operand instructions.
+-    match mnemonic {
+-        "cltq" | "cdqe" | "cwtl" | "cbtw" | "cbw" | "cwde" => return RAX,
+-        "cqto" | "cqo" | "cltd" | "cdq" | "cwtd" | "cwd" => return RAX | RDX,
+-        "rdtsc" | "rdtscp" => return RAX | RCX | RDX,
+-        "cpuid" => return RAX | RBX | RCX | RDX,
+-        "syscall" | "sysenter" => return RAX | RCX | R11,
+-        "leave" | "enter" => return RSP | RBP,
+-        "xgetbv" | "rdpmc" | "rdmsr" => return RAX | RDX,
+-        _ => {}
+-    }
+-    if mnemonic.starts_with("div")
+-        || mnemonic.starts_with("idiv")
+-        || (mnemonic.starts_with("mul") && !mnemonic.starts_with("mulx"))
+-        || (mnemonic.starts_with("imul") && !rest.contains(','))
+-    {
+-        return RAX | RDX;
+-    }
++    // Multi-destination / opaque: every mentioned GP family plus the
++    // implicit accumulator pair (cmpxchg16b names no register at all).
++    // These must run BEFORE the implicit oracle: `cmpxchg` has an implicit
++    // accumulator AND a conditionally-written explicit destination, so the
++    // implicit write set alone would under-approximate. (With the central
++    // union, `info.reg_refs` here already includes the implicit bits too.)
+     if mnemonic.starts_with("xchg")
+         || mnemonic.starts_with("cmpxchg")
+         || mnemonic.starts_with("xadd")
+@@ -187,10 +175,21 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
+         || mnemonic.starts_with("mulx")
+         || mnemonic.starts_with("rep")
+     {
+-        // Multi-destination / opaque: every mentioned GP family plus the
+-        // implicit accumulator pair (cmpxchg16b names no register at all).
+         return info.reg_refs | RAX | RDX | RCX | ALL_STRING_REGS;
+     }
++    // Explicit implicit-operand instructions: the central oracle in
++    // `types.rs` is the single source of truth for architectural implicit
++    // writes (this used to be a private duplicate that drifted — it knew
++    // nothing of `cmpxchg8b`, conflated rdtsc with rdtscp's %rcx write, and
++    // taxed every SSE `mulsd`/`divsd` with the integer accumulator pair,
++    // blocking load fusions in FP code).  Instructions reaching this arm
++    // either have no GP destination operand (`cqto`, `syscall`, `leave`,
++    // the string primitives) or name only read operands (`divq %r11`), so
++    // the implicit write set alone is the complete answer.
++    let implicit = implicit_write_refs(t.as_bytes());
++    if implicit != 0 {
++        return implicit;
++    }
+     // String instructions without operands (`movsb`, `stosq`, ...).
+     if !rest.contains('%') && !rest.contains('$') {
+         return ALL_GPR;
+@@ -1303,4 +1302,23 @@ mod tests {
+         let t = "    cmpxchg16b (%rdi)";
+         assert_eq!(may_write_families(t.trim(), &li(t)) & (RAX | RDX), RAX | RDX);
+     }
++    #[test]
++    fn may_write_model_is_exact_for_implicit_operands() {
++        let li = |s: &str| classify_line(s);
++        // The widening branch writes ONLY %rdx: %rax is its input. The old
++        // private table returned RAX | RDX, freezing cache invalidation for
++        // an accumulator it never touched.
++        let t = "    cqto";
++        assert_eq!(may_write_families(t.trim(), &li(t)), RDX);
++        // rdtsc vs rdtscp: only the latter reports the TSC_AUX in %rcx.
++        let t = "    rdtsc";
++        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
++        let t = "    rdtscp";
++        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RCX | RDX);
++        // SSE arithmetic does not inherit the integer accumulator pair.
++        let t = "    mulsd %xmm0, %xmm1";
++        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
++        let t = "    divsd %xmm1, %xmm0";
++        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
++    }
+ }
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index ce7c3d7..f324744 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -17,6 +17,7 @@ use super::super::types::*;
+ use super::helpers::{
+     extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
+     is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
++    writes_family,
+ };
  
-         let time_phases = std::env::var("CCC_TIME_PHASES").is_ok();
-@@ -2048,6 +2068,8 @@ impl Driver {
-             code_model_kernel: self.code_model_kernel,
-             no_jump_tables: self.no_jump_tables,
-             bmi1: self.enable_bmi,
-+            bmi2: self.enable_bmi2,
-+            tune,
-             lzcnt: self.enable_lzcnt,
-             popcnt: self.enable_popcnt,
-             avx2: self.enable_avx2,
-diff --git a/tests/bench/cpu_model/tune_probe.c b/tests/bench/cpu_model/tune_probe.c
-new file mode 100644
-index 0000000..52140ad
---- /dev/null
-+++ b/tests/bench/cpu_model/tune_probe.c
-@@ -0,0 +1,26 @@
-+/* CPU-model tuning probe kernels (session: cpu_model).
-+ * Each function isolates one target-dependent selection decision that the
-+ * x86 tune model must drive.  Compare with scripts/godbolt.py compare. */
-+#include <stdint.h>
-+#include <stddef.h>
+ /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
+@@ -575,9 +576,13 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
+                                 && lr != 5
+                                 && lr != sr
+                             {
+-                                // Middle line: writes %S, doesn't read %D, no memory access,
+-                                // and is a plain register-dest instruction.
+-                                let mid_writes_s = get_dest_reg(&infos[m]) == sr
++                                // Middle line: writes %S (explicitly, or
++                                // implicitly — `cqto` overwrites %rdx without
++                                // naming it), doesn't read %D, no memory
++                                // access, and is a plain register-dest
++                                // instruction.
++                                let mid_t = infos[m].trimmed(store.get(m));
++                                let mid_writes_s = writes_family(&infos[m], mid_t, sr)
+                                     && matches!(infos[m].kind, LineKind::Other { .. });
+                                 let mid_refs_d = infos[m].reg_refs & (1u16 << lr) != 0;
+                                 // leaq is address ARITHMETIC: `leaq 1(%r11), %r11`
+@@ -586,7 +591,6 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
+                                 // flags any non-frame paren base — for leaq
+                                 // that is an arithmetic source, not a load).
+                                 // Any other paren operand is a real access.
+-                                let mid_t = infos[m].trimmed(store.get(m));
+                                 let mid_is_lea =
+                                     mid_t.starts_with("leaq ") || mid_t.starts_with("leal ");
+                                 let mid_has_mem = infos[m].rbp_offset != RBP_OFFSET_NONE
+@@ -1670,11 +1674,13 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
+             }
+             let t = infos[n].trimmed(store.get(n));
+ 
+-            // Base or index redefined => the LEA's value is no longer
+-            // reproducible from them; stop (uses collected so far are still
+-            // valid only if we fold nothing after this point).
+-            let writes = get_dest_reg(&infos[n]);
+-            if writes == base_family || writes == index_family {
++            // Base or index redefined (explicitly or implicitly — `cqto`
++            // overwrites %rdx without naming it) => the LEA's value is no
++            // longer reproducible from them; stop (uses collected so far are
++            // still valid only if we fold nothing after this point).
++            if writes_family(&infos[n], t, base_family)
++                || writes_family(&infos[n], t, index_family)
++            {
+                 break;
+             }
+             if infos[n].reg_refs & dst_mask != 0 {
+@@ -1702,7 +1708,10 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
+                 } else if mentions {
+                     // A pure redefinition of %tmp ends its live range cleanly:
+                     // everything after belongs to a different value.
+-                    if writes == dst_family && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
++                    // `writes_family` also sees architectural implicit writes
++                    // (`cqto` redefining an %rdx temporary).
++                    if writes_family(&infos[n], t, dst_family)
++                        && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
+                     {
+                         break;
+                     }
+diff --git a/src/backend/x86/codegen/peephole/passes/memory_fold.rs b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
+index 3fa0559..34e7351 100644
+--- a/src/backend/x86/codegen/peephole/passes/memory_fold.rs
++++ b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
+@@ -17,7 +17,7 @@
+ 
+ use super::super::types::*;
+ use super::helpers::{
+-    get_dest_reg, implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line,
++    implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, writes_family,
+ };
+ 
+ /// True when a line transfers control or merges paths, so that textual line
+@@ -1215,11 +1215,14 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
+                 // would test/combine the WRONG slot. (The old code only
+                 // checked for stores to the same stack offset, missing
+                 // register re-writes such as `movl mem2, %eax` between
+-                // `movl mem1, %eax` and `testl %eax, %eax`.) Checking
+-                // `get_dest_reg` catches every register-writing instruction.
++                // `movl mem1, %eax` and `testl %eax, %eax`.)
++                // `writes_family` catches every register-writing instruction
++                // — explicitly destination-named ones and architecturally
++                // implicit ones alike (`cqto` overwriting %rdx, `idivq`
++                // rewriting %rax:%rdx).
+                 let mut reg_rewritten = false;
+                 for k in (i + 1)..j {
+-                    if get_dest_reg(&infos[k]) == load_reg {
++                    if writes_family(&infos[k], infos[k].trimmed(store.get(k)), load_reg) {
+                         reg_rewritten = true;
+                         break;
+                     }
+diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
+index 274f497..a65075f 100644
+--- a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
++++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
+@@ -51,6 +51,10 @@
+ //! 1. **No barrier in `(i, k]`.** A label can be entered on another path where
+ //!    `%S` holds something else.
+ //! 2. **`%S` is not written in `(i, k]`.** Otherwise the two have diverged.
++//!    Written implicitly counts too: `cqto`/`idivq` overwrite `%rdx` without
++//!    naming it, `cpuid` rewrites `%rbx`, a `syscall` clobbers `%rcx` and
++//!    `%r11` — [`helpers::writes_family`] answers this rule for both the
++//!    classified destination and the architectural implicit write set.
+ //! 3. **`%D` is not written in `(i, k)`.** A later write starts a new live
+ //!    range that this copy does not feed.
+ //! 4. **No use in `(i, k]` writes `%D` while reading it.** `addl %eax, %edx`
+@@ -70,7 +74,9 @@
+ //! `%dxl` and the assembler rejected the function.
+ 
+ use super::super::types::*;
+-use super::helpers::{get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate};
++use super::helpers::{
++    get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family,
++};
+ use super::liveness::FileLiveness;
+ 
+ /// High-byte names have no equivalent in the `%rsi`/`%rdi`/`%r8`+ families.
+@@ -335,26 +341,32 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
+             if infos[j].is_barrier() {
+                 break;
+             }
+-            let dest_j = get_dest_reg(&infos[j]);
+-            // Rule 2: the source must still hold the copied value.
+-            if dest_j == sfam {
++            let line = infos[j].trimmed(store.get(j));
++            // Rule 2: the source must still hold the copied value.  The
++            // implicit second output of `cqto`/`idivq`/`cpuid`/`rep stos`...
++            // counts as a write even though `get_dest_reg` names only `%rax`
++            // (stress lab `intexpr` seed 1, `-O1`: a narrow reload of the
++            // parameter home was folded onto `%dl` and read the division
++            // remainder).
++            if writes_family(&infos[j], line, sfam) {
+                 break;
+             }
+             let mentions_d = infos[j].reg_refs & (1u16 << dfam) != 0;
+             if !mentions_d {
+                 // Rule 3: a write to %D with no read ends our range; the copy
+                 // is then dead and `dead_writes` will retire it.
+-                if dest_j == dfam {
++                if writes_family(&infos[j], line, dfam) {
+                     break;
+                 }
+                 continue;
+             }
+-            // Rule 4: the use must not also write %D.
+-            if dest_j == dfam {
++            // Rule 4: the use must not also write %D (explicitly — `addl
++            // %eax, %edx` — or implicitly, e.g. `idivq` overwriting a %rax
++            // copy).
++            if writes_family(&infos[j], line, dfam) {
+                 ok = false;
+                 break;
+             }
+-            let line = infos[j].trimmed(store.get(j));
+             // Rule 6.
+             if has_implicit_reg_usage(line) || is_shift_or_rotate(line) {
+                 ok = false;
+diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
+index 4db9fa7..7e63b16 100644
+--- a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
++++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
+@@ -468,3 +468,91 @@ fn no_output_line_names_a_nonexistent_register() {
+         assert!(ok, "output names unknown register %{}:\n{}", name, out);
+     }
+ }
 +
-+/* popcnt with dest != src: SNB..CLX carry a false output dependency
-+ * (uops.info POPCNT_R64_R64 lat 1->1 = 3); ICL+/Zen do not. */
-+uint64_t popcnt_sum(const uint64_t *p, size_t n) {
-+    uint64_t s = 0;
-+    for (size_t i = 0; i < n; i++) s += (uint64_t)__builtin_popcountll(p[i]);
-+    return s;
++// ── Rule 2/3/4: architectural implicit writes (the stress-lab regression) ───
++
++#[test]
++fn a_copy_does_NOT_fold_across_a_division_that_clobbers_its_source() {
++    // SOUNDNESS, stress lab `intexpr` seed 1 at -O1 (the ms178-1 regression):
++    // `cqto`/`idivq %r11` overwrite %rdx without naming it in their operand
++    // text. The window walk used to see "no mention of %rdx" between the
++    // copy and the narrow reload and retargeted `movzbl %r8b, ...` to
++    // `movzbl %dl, ...` — reading the division REMAINDER instead of the
++    // parameter the copy had homed.
++    let out = run(&f(concat!(
++        "    movq %rdx, %r8\n",
++        "    cqto\n",
++        "    idivq %r11\n",
++        "    movzbl %r8b, %eax\n",
++        "    ret\n",
++    )));
++    assert!(
++        out.contains("movzbl %r8b, %eax"),
++        "reload must keep its home register:\n{}",
++        out
++    );
++    assert_eq!(
++        count(&out, "movzbl %dl"),
++        0,
++        "division remainder must not leak into the reload:\n{}",
++        out
++    );
 +}
-+int ctz_of(uint64_t x) { return __builtin_ctzll(x); }
-+int clz_of(uint64_t x) { return __builtin_clzll(x); }
 +
-+/* Variable shifts: SHL r,cl is 3 uops on SNB..CLX, 2 on ICL/ADL-P; SHLX is 1
-+ * uop everywhere and takes the count in any register. */
-+uint64_t shl_var(uint64_t x, unsigned k) { return x << k; }
-+uint64_t shr_var(uint64_t x, unsigned k) { return x >> k; }
-+int64_t  sar_var(int64_t x, unsigned k)  { return x >> k; }
-+uint32_t rot_hash(const uint32_t *p, size_t n, unsigned k) {
-+    uint32_t h = 0;
-+    for (size_t i = 0; i < n; i++) h = (h << k) ^ p[i];
-+    return h;
++#[test]
++fn a_copy_into_rdx_does_NOT_fold_across_an_idiv_that_rewrites_it() {
++    // Rules 3/4 mirrored through the oracle: `idivq %rcx` rewrites
++    // %rax:%rdx but names neither. Pre-union its reg_refs were {%rcx} only,
++    // so the window walk sailed through and retargeted later %rdx uses at
++    // the copy's source — feeding them the stale copy instead of the
++    // remainder the division had just written. The use lands in %rbx so it
++    // survives to the return (a dead use would be deleted, hiding the
++    // defect); the return value must therefore come from the remainder in
++    // %rdx, never from the stale %r9.
++    let out = run(&f(concat!(
++        "    movq %r9, %rdx\n",
++        "    cqto\n",
++        "    idivq %rcx\n",
++        "    movq %rdx, %rbx\n",
++        "    movq %rbx, %rax\n",
++        "    ret\n",
++    )));
++    assert!(out.contains("idivq"), "{out}");
++    assert_eq!(
++        count(&out, "movq %r9, %rbx"),
++        0,
++        "stale copy source must not leak into the reload:\n{}",
++        out
++    );
++    assert_eq!(
++        count(&out, "movq %r9, %rax"),
++        0,
++        "stale copy source must not reach the return value:\n{}",
++        out
++    );
++}
++
++#[test]
++fn a_copy_out_of_rax_folds_across_cqto_which_only_reads_it() {
++    // The oracle is exact, not merely conservative: `cqto` reads %rax and
++    // writes ONLY %rdx. The classified destination (%rax) used to end the
++    // window at Rule 2 (`dest_j == sfam`) even though the instruction never
++    // overwrites the copy source; the exact predicate lets the fold
++    // through. (An `idivq`, which DOES rewrite %rax, still blocks it — see
++    // the Rule 4 oracle. The use's destination is %ecx so the use itself
++    // does not re-write the copy source, which Rule 2 must and does
++    // continue to block.)
++    let out = run(&f(concat!(
++        "    movq %rax, %r8\n",
++        "    cqto\n",
++        "    movzbl %r8b, %bl\n",
++        "    movq %rbx, %rax\n",
++        "    ret\n",
++    )));
++    assert_eq!(count(&out, "movq %rax, %r8"), 0, "copy must fold:\n{}", out);
++    assert!(
++        out.contains("movzbl %al, %bl"),
++        "use must retarget at the copy source:\n{}",
++        out
++    );
++}
+diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+index c9d26c1..8d4d7a7 100644
+--- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
++++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+@@ -49,7 +49,7 @@
+ //! immediately recycled by the next LEA).
+ 
+ use super::super::types::*;
+-use super::helpers::{get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family};
++use super::helpers::{get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, writes_family};
+ use super::liveness::FileLiveness;
+ 
+ /// Widest window (in non-NOP instructions) searched for the consumer of a LEA.
+@@ -471,8 +471,11 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
+                 let _ = folded;
+                 break;
+             }
+-            if infos[j].reg_refs & src_mask != 0 && get_dest_reg(&infos[j]) == src_fam {
+-                break; // %S redefined before the use: the copy is not a relay
++            // %S redefined (explicitly or implicitly — `cqto` overwrites
++            // %rdx without naming it) before the use: the copy is not a
++            // relay.
++            if writes_family(&infos[j], infos[j].trimmed(store.get(j)), src_fam) {
++                break;
+             }
+             j += 1;
+         }
+diff --git a/src/backend/x86/codegen/peephole/types.rs b/src/backend/x86/codegen/peephole/types.rs
+index bc91519..20291e2 100644
+--- a/src/backend/x86/codegen/peephole/types.rs
++++ b/src/backend/x86/codegen/peephole/types.rs
+@@ -1742,7 +1742,207 @@ pub(super) fn scan_register_refs(b: &[u8]) -> u16 {
+             i += 1;
+         }
+     }
+-    refs
++    // Architectural implicit operands (`cqto`, `idivq %r11`, `cpuid`, string
++    // primitives, ...) are invisible to the textual scan above; every consumer
++    // of `reg_refs` must see the same instruction as the CPU executes it.
++    refs | implicit_reg_refs(b)
++}
++
++// ── Implicit register operands ───────────────────────────────────────────────
++
++/// Register families an instruction reads or writes WITHOUT naming them in
++/// its operand text.
++///
++/// `reg_refs` is the "does this line mention family F at all" oracle for
++/// every text pass (copy coalescing, copy propagation, relay folding, dead
++/// write elimination, loop trampolines, ...).  A purely textual scan misses
++/// the architectural implicit operands, so `cqto` / `idivq %r11` looked like
++/// lines that never touch `%rdx`, and `coalesce_register_copies` happily
++/// renamed a parameter home `movq %rdx, %r8` back onto `%rdx` across a
++/// division — the reload of the parameter (`movzbl %dl, ...`) then read the
++/// remainder (stress lab `intexpr` seed 1, `-O1`).  `load_op_fuse` used to
++/// add `RAX | RDX | RCX | string regs` privately; folding the knowledge into
++/// the classifier makes every consumer see the same truth.
++///
++/// The table records the implicit READS and the implicit WRITES separately:
++/// [`implicit_reg_refs`] unions both (the "mentions" oracle — a set bit only
++/// makes a pass more conservative), while [`implicit_write_refs`] and
++/// [`implicit_read_refs`] project the exact halves for callers that must not
++/// conflate reading with writing (redefinition checks vs. observation
++/// checks).
++///
++/// Prefixes (`lock`, `rep`, `repe`, `repz`, `repne`, `repnz`) are skipped so
++/// the mnemonic that follows is classified; the `rep` family additionally
++/// contributes `%rcx` (count) — and `rep ret` / `rep nop` (pause) contribute
++/// nothing.
++///
++/// Mnemonics are matched EXACTLY, never by prefix: `divsd`/`mulsd`/`mulpd`
++/// are SSE instructions with fully explicit operands and must not inherit
++/// the integer `div`/`mul` accumulator pair (the local liveness model's
++/// prefix match over-approximates this; the oracle is exact).  The emitter
++/// today only produces a subset of the table, but the oracle is written
++/// against the ISA, so the next new emitter site is covered for free.
++#[inline]
++pub(super) fn implicit_reg_refs(b: &[u8]) -> u16 {
++    let (reads, writes) = classify_implicit_operands(b);
++    reads | writes
++}
++
++/// Families an instruction implicitly READS without naming them in its
++/// operand text.  An implicit read observes the register's current value:
++/// acceptance-style checks ("this use observes the full 64-bit value") must
++/// consult this projection, not [`implicit_reg_refs`], or a pure writer such
++/// as `cqto` would be mistaken for a reader of the `%rax` family it merely
++/// consumes as input... and conversely a redefinition check that used the
++/// combined set would freeze coalescing across `cqto` for `%rax` copies that
++/// are architecturally untouched.
++#[inline]
++pub(super) fn implicit_read_refs(b: &[u8]) -> u16 {
++    classify_implicit_operands(b).0
++}
++
++/// Families an instruction implicitly WRITES without naming them in its
++/// operand text.  This is the exact write half of [`implicit_reg_refs`] —
++/// the counterpart of the classified destination for instructions whose
++/// second (or only) destination is architectural: `cqto` → `%rdx`,
++/// `idivq %r11` → `%rax:%rdx`, `rep stosq` → `%rdi:%rcx`, `syscall` →
++/// `%rax:%rcx:%r11`, ...
++#[inline]
++pub(super) fn implicit_write_refs(b: &[u8]) -> u16 {
++    classify_implicit_operands(b).1
++}
++
++/// One instruction's implicit (reads, writes) over the GP family numbering
++/// (0 = %rax .. 15 = %r15), derived from its mnemonic.  Both halves are
++/// EXACT for every instruction listed; unknown mnemonics yield (0, 0) —
++/// callers that need a MAY model must add their own conservative fallback
++/// (that is what `load_op_fuse::may_write_families` layers on top).
++fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
++    const RAX: u16 = 1 << 0;
++    const RCX: u16 = 1 << 1;
++    const RDX: u16 = 1 << 2;
++    const RBX: u16 = 1 << 3;
++    const RSP: u16 = 1 << 4;
++    const RBP: u16 = 1 << 5;
++    const RSI: u16 = 1 << 6;
++    const RDI: u16 = 1 << 7;
++    const R8: u16 = 1 << 8;
++    const R9: u16 = 1 << 9;
++    const R10: u16 = 1 << 10;
++    const R11: u16 = 1 << 11;
++
++    // Split "mnemonic [operands]" on the first blank.  Lines are already
++    // trimmed on the left by the caller.
++    fn mnemonic(b: &[u8]) -> (&[u8], &[u8]) {
++        let mut i = 0;
++        while i < b.len() && b[i] != b' ' && b[i] != b'\t' {
++            i += 1;
++        }
++        let m = &b[..i];
++        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
++            i += 1;
++        }
++        (m, &b[i..])
++    }
++
++    let (mut m, mut rest) = mnemonic(b);
++    if m.is_empty() || m[0] == b'.' || m[m.len() - 1] == b':' || m[0] == b'#' {
++        // Labels, directives and comments name no instruction.
++        return (0, 0);
++    }
++    let mut reads: u16 = 0;
++    let mut writes: u16 = 0;
++    // Prefixes.
++    loop {
++        match m {
++            b"lock" => {}
++            b"rep" | b"repe" | b"repz" | b"repne" | b"repnz" => {
++                // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
++                // counted loops: they touch no register at all.
++                let (m2, _) = mnemonic(rest);
++                if m2 != b"ret" && m2 != b"retq" && m2 != b"nop" {
++                    reads |= RCX; // count tested for zero
++                    writes |= RCX; // count decremented
++                }
++            }
++            _ => break,
++        }
++        let (m2, r2) = mnemonic(rest);
++        if m2.is_empty() {
++            return (reads, writes);
++        }
++        m = m2;
++        rest = r2;
++    }
++    let has_comma = rest.contains(&b',');
++    let table: (u16, u16) = match m {
++        // Sign-extension of the accumulator in place.
++        b"cbtw" | b"cwtl" | b"cltq" | b"cbw" | b"cwde" | b"cdqe" => (RAX, RAX),
++        // Sign-extension into the data register: %rax is the INPUT.
++        b"cwtd" | b"cltd" | b"cqto" | b"cwd" | b"cdq" | b"cqo" => (RAX, RDX),
++        // Single-operand multiply/divide: rax:rdx implicit.  The byte forms
++        // divide/multiply AX by r/m8 (quotient AL, remainder AH, product AX)
++        // and never touch the %rdx family.
++        b"divb" | b"idivb" | b"mulb" | b"imulb" => (RAX, RAX),
++        b"div" | b"divw" | b"divl" | b"divq" | b"idiv" | b"idivw" | b"idivl" | b"idivq"
++        | b"mul" | b"mulw" | b"mull" | b"mulq" => (RAX | RDX, RAX | RDX),
++        // imul with a single operand is the widening form (rax:rdx); the
++        // two/three-operand forms name every register they touch.
++        b"imul" | b"imulw" | b"imull" | b"imulq" if !has_comma => (RAX, RAX | RDX),
++        // BMI2 mulx reads %rdx implicitly; both destinations are explicit.
++        b"mulx" | b"mulxl" | b"mulxq" => (RDX, 0),
++        // String instructions: %rsi source, %rdi destination, %rax data.  The
++        // pointer registers are post-incremented, i.e. also written.
++        b"movsb" | b"movsw" | b"movsl" | b"movsq" | b"cmpsb" | b"cmpsw" | b"cmpsl" | b"cmpsq" => {
++            (RSI | RDI, RSI | RDI)
++        }
++        b"stosb" | b"stosw" | b"stosl" | b"stosq" | b"scasb" | b"scasw" | b"scasl" | b"scasq" => {
++            (RAX | RDI, RDI)
++        }
++        b"lodsb" | b"lodsw" | b"lodsl" | b"lodsq" => (RSI, RAX | RSI),
++        b"insb" | b"insw" | b"insl" => (RDX, RDI),
++        b"outsb" | b"outsw" | b"outsl" => (RDX | RSI, RSI),
++        b"in" | b"inb" | b"inw" | b"inl" => (RDX, RAX),
++        b"out" | b"outb" | b"outw" | b"outl" => (RAX | RDX, 0),
++        // Serialising / system instructions with fixed register interfaces.
++        b"cpuid" => (RAX, RAX | RBX | RCX | RDX),
++        b"rdtsc" => (0, RAX | RDX),
++        b"rdtscp" => (0, RAX | RCX | RDX),
++        b"rdpmc" | b"rdmsr" | b"xgetbv" => (RCX, RAX | RDX),
++        b"wrmsr" | b"xsetbv" => (RAX | RDX | RCX, 0),
++        b"monitor" | b"mwait" => (RAX | RCX | RDX, 0),
++        // The xsave family passes its feature mask in %edx:%eax; state goes
++        // to/from memory, never to a GP register.
++        b"xsave" | b"xsaveopt" | b"xsavec" | b"xsaves" | b"xrstor" | b"xrstors" | b"xsave64"
++        | b"xsaveopt64" | b"xsavec64" | b"xsaves64" | b"xrstor64" | b"xrstors64" => (RAX | RDX, 0),
++        // syscall: number/return in %rax, arguments in rdi/rsi/rdx/r10/r8/r9,
++        // and the kernel clobbers %rcx/%r11.
++        b"syscall" => (RAX | RDX | RSI | RDI | R8 | R9 | R10, RAX | RCX | R11),
++        b"sysenter" | b"sysexit" | b"sysret" | b"sysretq" => (RAX | RCX | RDX, RAX | RCX | RDX),
++        // Software interrupt: the handler's register contract is unknown
++        // (i386 `int $0x80` passes ebx/ecx/edx/esi/edi/ebp and returns eax).
++        b"int" => (
++            RAX | RBX | RCX | RDX | RSI | RDI | RBP,
++            RAX | RBX | RCX | RDX | RSI | RDI | RBP,
++        ),
++        // Atomics with an implicit accumulator: %rax holds the compare value
++        // and is reloaded when the exchange fails.
++        b"cmpxchg" | b"cmpxchgb" | b"cmpxchgw" | b"cmpxchgl" | b"cmpxchgq" => (RAX, RAX),
++        // CMPXCHG8B/16B compares %edx:%eax (reloaded on failure) against
++        // memory; %ecx:%ebx are the store payload, read-only.
++        b"cmpxchg8b" | b"cmpxchg16b" => (RAX | RBX | RCX | RDX, RAX | RDX),
++        // Misc legacy: table lookup, flags <-> %ah, counted loops.
++        b"xlat" | b"xlatb" => (RBX, RAX),
++        b"lahf" => (0, RAX),
++        b"sahf" => (RAX, 0),
++        b"loop" | b"loope" | b"loopz" | b"loopne" | b"loopnz" => (RCX, RCX),
++        b"jrcxz" | b"jecxz" => (RCX, 0),
++        // Frame instructions.
++        b"enter" => (0, RSP | RBP),
++        b"leave" | b"leaveq" => (RBP, RSP | RBP),
++        _ => (0, 0),
++    };
++    (reads | table.0, writes | table.1)
+ }
+ 
+ /// Write an integer and the "(%rbp)" suffix into a buffer without using core::fmt.
+@@ -1806,3 +2006,146 @@ pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
+     };
+     REG_NAMES[row][id as usize]
+ }
++
++// ── tests: the implicit-operand oracle ───────────────────────────────────────
++
++#[cfg(test)]
++mod implicit_oracle_tests {
++    use super::*;
++
++    const RAX: u16 = 1 << 0;
++    const RCX: u16 = 1 << 1;
++    const RDX: u16 = 1 << 2;
++    const RBX: u16 = 1 << 3;
++    const RSI: u16 = 1 << 6;
++    const RDI: u16 = 1 << 7;
++    const R8: u16 = 1 << 8;
++    const R9: u16 = 1 << 9;
++    const R10: u16 = 1 << 10;
++    const R11: u16 = 1 << 11;
++
++    fn reads(line: &str) -> u16 {
++        implicit_read_refs(line.trim().as_bytes())
++    }
++    fn writes(line: &str) -> u16 {
++        implicit_write_refs(line.trim().as_bytes())
++    }
++    fn touches(line: &str) -> u16 {
++        implicit_reg_refs(line.trim().as_bytes())
++    }
++
++    #[test]
++    fn the_widening_branch_writes_rdx_and_only_reads_rax() {
++        // The heart of the stress-lab `intexpr` seed 1 miscompile: `cqto`
++        // rewrote %rdx while being invisible to every textual scan.
++        assert_eq!(touches("    cqto"), RAX | RDX);
++        assert_eq!(reads("    cqto"), RAX);
++        assert_eq!(writes("    cqto"), RDX);
++        for m in ["cwtd", "cltd", "cqto", "cwd", "cdq", "cqo"] {
++            assert_eq!(writes(m), RDX, "{m}");
++            assert_eq!(reads(m), RAX, "{m}");
++        }
++    }
++
++    #[test]
++    fn in_place_extensions_read_and_write_the_accumulator() {
++        for m in ["cbtw", "cwtl", "cltq", "cbw", "cwde", "cdqe"] {
++            assert_eq!(touches(m), RAX, "{m}");
++        }
++    }
++
++    #[test]
++    fn integer_division_names_its_implicit_pair_exactly() {
++        assert_eq!(writes("    idivq %r11"), RAX | RDX);
++        assert_eq!(reads("    idivq %r11"), RAX | RDX);
++        assert_eq!(writes("    divl %ecx"), RAX | RDX);
++        // SSE divides/multiplies have fully explicit operands: a prefix
++        // match against "div"/"mul" would tax every FP loop with a
++        // phantom accumulator pair.
++        assert_eq!(touches("    divsd %xmm0, %xmm1"), 0);
++        assert_eq!(touches("    mulsd %xmm0, %xmm1"), 0);
++        assert_eq!(touches("    mulpd %xmm0, %xmm1"), 0);
++        // The byte forms divide/multiply AX: quotient AL, remainder AH,
++        // product AX — the %rdx family is never touched.
++        assert_eq!(writes("    idivb %r11b"), RAX);
++        assert_eq!(writes("    mulb %cl"), RAX);
++    }
++
++    #[test]
++    fn single_operand_imul_is_the_widening_form() {
++        assert_eq!(writes("    imulq %r11"), RAX | RDX);
++        assert_eq!(reads("    imulq %r11"), RAX);
++        // The two/three-operand forms name every register they touch.
++        assert_eq!(touches("    imulq %rcx, %rax"), 0);
++        assert_eq!(touches("    imulq $5, %rcx, %rax"), 0);
++    }
++
++    #[test]
++    fn system_instructions_have_their_contract() {
++        // The kernel returns in %rax and destroys %rcx/%r11; the argument
++        // registers are read-only inputs.
++        assert_eq!(writes("    syscall"), RAX | RCX | R11);
++        assert_eq!(reads("    syscall") & RDI, RDI);
++        assert_eq!(reads("    syscall") & (R8 | R9 | R10), R8 | R9 | R10);
++        assert_eq!(writes("    cpuid"), RAX | RBX | RCX | RDX);
++        assert_eq!(writes("    rdtsc"), RAX | RDX);
++        // rdtscp additionally returns the TSC_AUX in %rcx; rdtsc does not.
++        assert_eq!(writes("    rdtscp"), RAX | RCX | RDX);
++    }
++
++    #[test]
++    fn rep_prefixes_contribute_the_count_register() {
++        assert_eq!(touches("    rep stosq"), RCX | RAX | RDI);
++        assert_eq!(writes("    rep stosq"), RCX | RDI);
++        assert_eq!(writes("    repne scasq"), RCX | RDI);
++        // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
++        // counted loops: they touch no register at all.
++        assert_eq!(touches("    rep ret"), 0);
++        assert_eq!(touches("    rep nop"), 0);
++    }
++
++    #[test]
++    fn string_primitives_post_increment_their_pointers() {
++        assert_eq!(writes("    movsq"), RSI | RDI);
++        assert_eq!(writes("    movsl"), RSI | RDI);
++        assert_eq!(writes("    lodsq"), RAX | RSI);
++        assert_eq!(reads("    lodsq"), RSI);
++        // movslq is a sign-extending move, not a string primitive — the
++        // two differ by exactly one letter and one semantic universe.
++        assert_eq!(touches("    movslq %eax, %rax"), 0);
++    }
++
++    #[test]
++    fn cmpxchg8b_reads_the_payload_and_reloads_the_compare() {
++        assert_eq!(reads("    cmpxchg8b (%rdi)"), RAX | RBX | RCX | RDX);
++        assert_eq!(writes("    cmpxchg8b (%rdi)"), RAX | RDX);
++    }
++
++    #[test]
++    fn non_instructions_name_nothing() {
++        assert_eq!(touches(".LBB1:"), 0);
++        assert_eq!(touches(".cfi_startproc"), 0);
++        assert_eq!(touches("#APP"), 0);
++        assert_eq!(touches(""), 0);
++        assert_eq!(touches("frobnicate"), 0);
++        // lock alone contributes nothing; the prefixed mnemonic decides.
++        assert_eq!(touches("    lock"), 0);
++    }
++
++    #[test]
++    fn the_union_reaches_scan_register_refs() {
++        // The classified `reg_refs` of a bare `cqto` used to be 0 — the
++        // exact hole behind the stress-lab intexpr miscompile.
++        let info = classify_line("    cqto");
++        assert_eq!(info.reg_refs & RDX, RDX);
++        assert_eq!(info.reg_refs & RAX, RAX);
++        let info = classify_line("    idivq %r11");
++        assert_eq!(info.reg_refs & RDX, RDX);
++        assert_eq!(info.reg_refs & R11, R11);
++        let info = classify_line("    syscall");
++        assert_eq!(info.reg_refs & R11, R11);
++        // The Cmp kind funnels through the same scan (cmpxchg lives there).
++        let info = classify_line("    cmpxchgq %rbx, (%rdi)");
++        assert_eq!(info.reg_refs & RAX, RAX);
++    }
 +}
