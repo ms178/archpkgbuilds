@@ -1,5 +1,5 @@
 diff --git a/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs b/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
-index 6775795..47a4e20 100644
+index 6775795c..e20e6e49 100644
 --- a/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
 +++ b/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
 @@ -48,7 +48,7 @@
@@ -7,130 +7,154 @@ index 6775795..47a4e20 100644
  
  use super::super::types::*;
 -use super::helpers::{has_implicit_reg_usage, is_shift_or_rotate, replace_reg_family};
-+use super::helpers::{is_shift_or_rotate, replace_reg_family};
++use super::helpers::{has_implicit_reg_usage, is_shift_or_rotate, replace_reg_family, writes_family};
  use super::liveness::FileLiveness;
  use super::relay_and_lea::{
      function_range, is_relayable_family, plain_gp_operand, split_two_operands,
-@@ -151,12 +151,21 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
-                     let target = t.trim_start_matches(|c: char| c != ' ').trim();
-                     !target.starts_with('.') && matches!(d_fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10)
-                 }
-+                // An implicit read OR write of the destination family is an
-+                // unrenamable hazard: the textual rewrite cannot touch an
-+                // operand the instruction never names. `cqto` overwrites
-+                // `%rdx`, `syscall` clobbers `%rsi`/`%rdi`/`%r8`-`%r11`,
-+                // `cltq` reads `%rax`, `cpuid` rewrites `%rbx` — none of
-+                // these can be renamed and none may be missed. The central
-+                // oracle sees all of them; the old
-+                // `has_implicit_reg_usage(t) && d_fam <= 2` veto knew only a
-+                // hand-picked subset and silently coalesced across the rest.
-                 // A shift/rotate takes its variable count in %cl and nowhere
-                 // else: renaming that family produces `shlq %sil, %r8`, which
--                // does not exist. `has_implicit_reg_usage` does not cover the
--                // plain shifts, so check them separately.
-+                // does not exist. The count is named explicitly, so the
-+                // implicit oracle does not cover it; check it separately.
-                 _ => {
--                    (has_implicit_reg_usage(t) && d_fam <= 2)
-+                    implicit_reg_refs(t.as_bytes()) & d_mask != 0
-                         || (d_fam == 1 && is_shift_or_rotate(t))
-                 }
-             };
-@@ -435,4 +444,29 @@ mod tests {
-         ));
-         assert!(out.contains("movq %rdi, %rdx"), "{out}");
+@@ -191,9 +191,14 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
+             if infos[n].is_nop() {
+                 continue;
+             }
+-            // Rule 2: no later mention of the source family. A read is already
+-            // excluded by rule 1; a write would clobber the coalesced value.
+-            if infos[n].reg_refs & s_mask != 0 {
++            // Rule 2: no later mention or write of the source family. A read is
++            // already excluded by rule 1; ANY write — explicit or architectural
++            // implicit (`cqto` writes %rdx, `idivq` writes %rax:%rdx, `cpuid`,
++            // `rep stos`, `syscall`, ... even though the line names only %rax or
++            // nothing) — would clobber the coalesced value.
++            if infos[n].reg_refs & s_mask != 0
++                || writes_family(&infos[n], infos[n].trimmed(store.get(n)), s_fam)
++            {
+                 ok = false;
+                 break;
+             }
+@@ -283,6 +288,50 @@ mod tests {
+         assert!(out.contains("cmpl %esi, %ebx"), "{out}");
      }
+ 
 +    #[test]
-+    fn rsi_home_is_not_coalesced_across_a_syscall_clobber() {
-+        // `syscall` reads its argument registers (among them %rsi) and
-+        // returns in %rax while clobbering %rcx/%r11 — all without naming
-+        // any of them. Coalescing a %rsi home across one would delete the
-+        // copy and leave the kernel's pointer argument reading whatever
-+        // %rsi held before it was ever written. The old hand-picked veto
-+        // (`has_implicit_reg_usage(t) && d_fam <= 2`) never saw this: it
-+        // only protected %rax/%rcx/%rdx.
++    fn a_plain_rdx_homing_copy_coalesces() {
++        // Positive control for the negative test below: with no implicit
++        // writer between the homing copy and the reload, the coalescer
++        // rewrites the reload onto %rdx and deletes the copy.  Proves the
++        // pass actually performs this rewrite, so the next test cannot pass
++        // vacuously.
 +        let out = run(concat!(
 +            "foo:\n",
 +            ".cfi_startproc\n",
-+            "    movq %r9, %rsi\n",
-+            "    syscall\n",
-+            "    movq %rsi, %rbx\n",
-+            "    movq %rbx, %rax\n",
++            "    movq %rdx, %r8\n",
++            "    movzbl %r8b, %eax\n",
 +            "    ret\n",
 +            ".cfi_endproc\n",
 +        ));
-+        assert!(out.contains("syscall"), "{out}");
-+        assert!(
-+            out.contains("movq %r9, %rsi"),
-+            "coalescing across syscall is unsound:\n{out}"
-+        );
++        assert!(!out.contains("movq %rdx, %r8"), "{out}");
++        assert!(out.contains("movzbl %dl, %eax"), "{out}");
 +    }
- }
++
++    #[test]
++    fn param_home_survives_an_implicit_rdx_writer() {
++        // Reduced from the peephole stress lab (`intexpr` seed 1, -O1):
++        // `movq %rdx, %r8` homes the third parameter into a callee-saved
++        // register; `cqto` then writes %rdx IMPLICITLY (sign-extend %eax into
++        // %edx:%rax) even though the line names no register at all.  The
++        // textual scan saw the copy source as intact, so the coalescer
++        // renamed the reload `movzbl %r8b, %eax` onto %rdx and deleted the
++        // homing copy — the reload then read the sign extension instead of
++        // the parameter.  The implicit-write oracle must block the rename.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movq %rdx, %r8\n",
++            "    cqto\n",
++            "    movzbl %r8b, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movq %rdx, %r8"), "{out}");
++        assert!(!out.contains("movzbl %dl"), "{out}");
++    }
++
++
++
+     #[test]
+     fn rdx_is_not_coalesced_when_the_epilogue_returns_through_it() {
+         // 128-bit return: both halves are set explicitly, so %rdx carries part
 diff --git a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
-index f0bcca5..1970e4c 100644
+index f0bcca5f..24561b3e 100644
 --- a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
 +++ b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
-@@ -319,13 +319,30 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
+@@ -78,12 +78,16 @@ fn try_propagate_into(
+     }
+ 
+     let next_dest = get_dest_reg(&infos[j]);
++    let next_writes_src = writes_family(&infos[j], trimmed, src_id);
+ 
+     let src_name = REG_NAMES[0][src_id as usize];
+     let dst_name = REG_NAMES[0][dst_id as usize];
+ 
+-    // Case 1: next instruction writes to src_id
+-    if next_dest == src_id {
++    // Case 1: the next instruction writes the copy's SOURCE — explicitly or
++    // architecturally implicit (`cqto` writes %rdx without naming it; the old
++    // `next_dest == src_id` check let `movq %rdx, %r8; cqto; ...` keep the
++    // identity live and propagate the clobbered %rdx into a later use).
++    if next_dest == src_id || next_writes_src {
+         // Source register is being written by this instruction.
+         // Only safe if dst appears ONLY in a memory base position like (%dst).
+         let dst_paren = format!("({})", dst_name);
+@@ -319,6 +323,35 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
              }
          }
  
--        // Instructions with implicit register usage conservatively invalidate all.
-+        // Instructions with implicit register usage conservatively invalidate
-+        // all. The oracle pass below additionally retires exactly the
-+        // identities of implicit writers the boolean veto list does not name
-+        // (single-operand `imul`, string primitives, `loop`, ...): those
-+        // clobber architectural registers without tripping the blanket.
-         {
-             let cur_trimmed = infos[i].trimmed(store.get(i));
-             if has_implicit_reg_usage(cur_trimmed) {
-                 copy_src = [REG_NONE; 16];
-                 copy_src32 = [REG_NONE; 16];
-             }
-+            let implicit_writes = implicit_write_refs(cur_trimmed.as_bytes());
-+            for fam in 0..=REG_GP_MAX {
-+                if implicit_writes & (1u16 << fam) != 0 {
-+                    for k in 0..16u8 {
-+                        if k == fam || copy_src[k as usize] == fam {
-+                            copy_src[k as usize] = REG_NONE;
-+                        }
-+                        if k == fam || copy_src32[k as usize] == fam {
-+                            copy_src32[k as usize] = REG_NONE;
-+                        }
++        // Architectural implicit writes (xlatb -> %al, lahf -> %ah, a lone
++        // `movsb` -> %rsi/%rdi, `leave` -> %rsp/%rbp, `in` -> %rax, ...) name
++        // no register, so `dest_reg` above saw nothing and the tracked
++        // identity survived the clobber — a later `movq %r8, %rdx` then
++        // re-expanded to the clobbered source. All of these belong to the
++        // implicit-write set; only they are invalidated (precise), while the
++        // broad `has_implicit_reg_usage` clear below remains as the umbrella
++        // for the long-tail instructions the table deliberately groups.
++        {
++            let cur_trimmed = infos[i].trimmed(store.get(i));
++            let mut iw = implicit_write_refs(cur_trimmed.as_bytes());
++            while iw != 0 {
++                let f = iw.trailing_zeros() as usize;
++                copy_src[f] = REG_NONE;
++                for k in 0..16u8 {
++                    if copy_src[k as usize] as usize == f {
++                        copy_src[k as usize] = REG_NONE;
 +                    }
 +                }
++                copy_src32[f] = REG_NONE;
++                for k in 0..16u8 {
++                    if copy_src32[k as usize] as usize == f {
++                        copy_src32[k as usize] = REG_NONE;
++                    }
++                }
++                iw &= iw - 1;
 +            }
-         }
- 
-         i += 1;
++        }
++
+         // Instructions with implicit register usage conservatively invalidate all.
+         {
+             let cur_trimmed = infos[i].trimmed(store.get(i));
 diff --git a/src/backend/x86/codegen/peephole/passes/dead_code.rs b/src/backend/x86/codegen/peephole/passes/dead_code.rs
-index 2316890..1161daa 100644
+index 23168901..7624b028 100644
 --- a/src/backend/x86/codegen/peephole/passes/dead_code.rs
 +++ b/src/backend/x86/codegen/peephole/passes/dead_code.rs
-@@ -155,15 +155,16 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
-                 break;
-             }
- 
--            {
--                let trimmed_j = infos[j].trimmed(store.get(j));
--                if has_implicit_reg_usage(trimmed_j) {
--                    break;
--                }
-+            let trimmed_j = infos[j].trimmed(store.get(j));
-+            if has_implicit_reg_usage(trimmed_j) {
-+                break;
+@@ -163,7 +163,8 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
              }
  
              let refs_dst = infos[j].reg_refs & dst_mask != 0;
 -            let writes_dst = get_dest_reg(&infos[j]) == dst_reg;
-+            // Redefinition includes architectural implicit writes: `cqto`
-+            // overwrites %rdx, `idivq` rewrites %rax:%rdx — the classified
-+            // destination alone answers only half of that.
-+            let writes_dst = writes_family(&infos[j], trimmed_j, dst_reg);
++            let writes_dst =
++                writes_family(&infos[j], infos[j].trimmed(store.get(j)), dst_reg);
  
              if writes_dst {
                  let also_reads = match infos[j].kind {
 diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-index f0aacfc..d732fb0 100644
+index f0aacfc8..b41341cc 100644
 --- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
 +++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
 @@ -16,7 +16,7 @@
@@ -138,11 +162,11 @@ index f0aacfc..d732fb0 100644
  
  use super::super::types::*;
 -use super::helpers::{get_dest_reg, has_implicit_reg_usage};
-+use super::helpers::{has_implicit_reg_usage, writes_family};
++use super::helpers::{get_dest_reg, has_implicit_reg_usage, writes_family};
  use super::liveness::FileLiveness;
  use super::relay_and_lea::{
      is_relayable_family, plain_gp_operand, provably_dead_lv, split_two_operands,
-@@ -243,15 +243,17 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
+@@ -243,15 +243,20 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
              if line_writes_memory(t) {
                  break;
              }
@@ -152,23 +176,26 @@ index f0aacfc..d732fb0 100644
 -                if w != REG_NONE && addr_fams.contains(&w) {
 -                    break;
 -                }
-+            // A write to an address register invalidates the operand. The
-+            // mentions gate keeps the common case O(1); `writes_family`
-+            // supplies the exact answer for the lines it admits — including
-+            // implicit writes such as `cqto` overwriting an %rdx address.
++            // A write to an address register invalidates the operand (explicit
++            // or architectural implicit — `cqto`/`idivq` clobber %rdx without
++            // naming it).
 +            if infos[j].reg_refs & addr_mask != 0
-+                && addr_fams.iter().any(|&f| writes_family(&infos[j], t, f))
++                && addr_fams
++                    .iter()
++                    .any(|&f| writes_family(&infos[j], infos[j].trimmed(store.get(j)), f))
 +            {
 +                break;
              }
              // The first load's destination must still hold the value.
 -            if infos[j].reg_refs & dst_mask != 0 && get_dest_reg(&infos[j]) == dst_fam {
-+            if infos[j].reg_refs & dst_mask != 0 && writes_family(&infos[j], t, dst_fam) {
++            if infos[j].reg_refs & dst_mask != 0
++                && writes_family(&infos[j], infos[j].trimmed(store.get(j)), dst_fam)
++            {
                  break;
              }
              if let Some((op2, mem2, dst2, _)) = load_operand(t) {
 diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
-index 6b62737..69f209c 100644
+index 757a1ea2..d6868965 100644
 --- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
 +++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
 @@ -23,7 +23,7 @@
@@ -180,213 +207,52 @@ index 6b62737..69f209c 100644
  use super::liveness::FileLiveness;
  use super::relay_and_lea::{
      dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
-@@ -1190,7 +1190,19 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
+@@ -1204,7 +1204,7 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
                  if mentions_exact_name(tj, name64) {
                      break; // a 64-bit read observes the sign extension
                  }
 -                if get_dest_reg(&infos[j]) == dst_fam && !tj.starts_with("cmov") {
-+                // An implicit READ of the family observes the extension just
-+                // as much as a named 64-bit operand does: `cqto` consumes
-+                // all 64 bits of %rax, `idivq` reads %rax:%rdx. The
-+                // `reg_refs` union is what routes these lines here at all.
-+                if implicit_read_refs(tj.as_bytes()) & mask != 0 {
-+                    break;
-+                }
-+                // "Fully redefined" must mean a real write of the family.
-+                // `writes_family` is exact: a `cqto` is classified with %rax
-+                // as its primary destination, but %rax is its implicit input
-+                // — the only family it writes is %rdx — so it can never
-+                // retire a %rax identity here.
 +                if writes_family(&infos[j], tj, dst_fam) && !tj.starts_with("cmov") {
                      ok = true; // fully redefined before any wide read
                      break;
                  }
 diff --git a/src/backend/x86/codegen/peephole/passes/helpers.rs b/src/backend/x86/codegen/peephole/passes/helpers.rs
-index a9a96b0..ade932b 100644
+index 54200395..3491810d 100644
 --- a/src/backend/x86/codegen/peephole/passes/helpers.rs
 +++ b/src/backend/x86/codegen/peephole/passes/helpers.rs
-@@ -335,6 +335,49 @@ pub(super) fn get_dest_reg(info: &LineInfo) -> RegId {
+@@ -335,6 +335,30 @@ pub(super) fn get_dest_reg(info: &LineInfo) -> RegId {
      }
  }
  
-+/// Does the line classified as `info` (text `trimmed`) write ANY part of GP
++/// Does the line at `trimmed` (classified as `info`) write ANY part of GP
 +/// family `fam`?
 +///
 +/// `get_dest_reg` yields the single classified destination, which is the
 +/// explicit AT&T destination or the primary implicit one (`%rax` for
 +/// `cltq`/`cqto`/`div`/`mul`).  Instructions with a SECOND implicit output
-+/// (`cqto` → `%rdx`, `idivq` → `%rax:%rdx`, `cpuid`, `rep stos`, `syscall`,
-+/// ...) are invisible to that answer, and every copy-rewriting pass that
-+/// asked "is the copy source still intact at line j?" via
++/// (`cqto` → `%rdx`, `idivq` → `%rax:%rdx`, `cpuid`, `rdtsc`, `rep stos`,
++/// `syscall`, ...) are invisible to that answer, and every copy-rewriting
++/// pass that asked "is the copy source still intact at line j?" via
 +/// `get_dest_reg(j) == src` let `movq %rdx, %r8; ...; cqto; idivq; movzbl
 +/// %r8b` be rewritten to read the remainder in `%dl`.  Use this predicate for
-+/// every redefinition check.
-+///
-+/// Exactness contract (this predicate is safe to use on ACCEPTANCE paths —
-+/// "the register is fully redefined, the old value is unobservable" — where
-+/// an over-approximation would wrongly enable a transform):
-+///
-+/// * the architectural implicit write set ([`implicit_write_refs`]) is exact
-+///   and wins over the classified destination;
-+/// * the classified destination counts only if the line does not implicitly
-+///   READ the family: the classifier reports `%rax` as the primary
-+///   destination of `cqto`/`cdq`/`cqo`, but %rax is those instructions'
-+///   implicit INPUT — their only output is `%rdx`, which the oracle already
-+///   reported.  (An instruction that both reads and writes the family
-+///   implicitly — `idivq` on %rax, `cltq` — is decided by its write set, so
-+///   the read-guard only ever suppresses a classified answer for a family
-+///   the instruction genuinely only reads.)
++/// every redefinition check; it unions the classified destination with the
++/// architectural implicit write set from [`implicit_write_refs`].
 +#[inline]
 +pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
++    if get_dest_reg(info) == fam {
++        return true;
++    }
 +    if fam > REG_GP_MAX {
 +        return false;
 +    }
-+    let bit = 1u16 << fam;
-+    // 1. Architectural implicit writes: exact.
-+    if implicit_write_refs(trimmed.as_bytes()) & bit != 0 {
-+        return true;
-+    }
-+    // 2. The classified destination (explicit AT&T destination or the primary
-+    //    implicit one), suppressed when the instruction implicitly reads the
-+    //    family without writing it (the `cqto`-family %rax misclassification).
-+    get_dest_reg(info) == fam && implicit_read_refs(trimmed.as_bytes()) & bit == 0
++    implicit_write_refs(trimmed.as_bytes()) & (1u16 << fam) != 0
 +}
 +
  // ── Label/jump parsing ───────────────────────────────────────────────────────
  
  /// Parse ".LBB<number>:" label into its number, e.g. ".LBB123:" -> Some(123)
-@@ -474,3 +517,46 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
-     // Default: assume read-modify-write (conservative)
-     true
- }
-+
-+// ── tests: the redefinition predicate ────────────────────────────────────────
-+
-+#[cfg(test)]
-+mod writes_family_tests {
-+    use super::*;
-+
-+    #[test]
-+    fn is_exact_for_the_widening_branch() {
-+        let info = classify_line("    cqto");
-+        // The classifier names %rax as cqto's primary destination, but %rax
-+        // is the implicit INPUT; the only family written is %rdx.
-+        assert!(writes_family(&info, "cqto", 2));
-+        assert!(!writes_family(&info, "cqto", 0));
-+    }
-+
-+    #[test]
-+    fn covers_the_implicit_second_output() {
-+        let info = classify_line("    idivq %r11");
-+        assert!(writes_family(&info, "idivq %r11", 0));
-+        assert!(writes_family(&info, "idivq %r11", 2));
-+        assert!(!writes_family(&info, "idivq %r11", 3));
-+    }
-+
-+    #[test]
-+    fn still_answers_explicit_destinations() {
-+        let info = classify_line("    movq %rcx, %rax");
-+        assert!(writes_family(&info, "movq %rcx, %rax", 0));
-+        assert!(!writes_family(&info, "movq %rcx, %rax", 1));
-+        // An RMW of another family is not a write of the source family; a
-+        // read of a family the instruction never writes must not be one
-+        // either.
-+        let info = classify_line("    addq %rdx, %rcx");
-+        assert!(!writes_family(&info, "addq %rdx, %rcx", 2));
-+        assert!(writes_family(&info, "addq %rdx, %rcx", 1));
-+    }
-+
-+    #[test]
-+    fn rejects_non_gp_families() {
-+        let info = classify_line("    movsd %xmm0, %xmm1");
-+        assert!(!writes_family(&info, "movsd %xmm0, %xmm1", 25));
-+    }
-+}
-diff --git a/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs b/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
-index faeffaa..ef0c789 100644
---- a/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
-+++ b/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
-@@ -162,24 +162,12 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
-     {
-         return 0;
-     }
--    // Explicit implicit-operand instructions.
--    match mnemonic {
--        "cltq" | "cdqe" | "cwtl" | "cbtw" | "cbw" | "cwde" => return RAX,
--        "cqto" | "cqo" | "cltd" | "cdq" | "cwtd" | "cwd" => return RAX | RDX,
--        "rdtsc" | "rdtscp" => return RAX | RCX | RDX,
--        "cpuid" => return RAX | RBX | RCX | RDX,
--        "syscall" | "sysenter" => return RAX | RCX | R11,
--        "leave" | "enter" => return RSP | RBP,
--        "xgetbv" | "rdpmc" | "rdmsr" => return RAX | RDX,
--        _ => {}
--    }
--    if mnemonic.starts_with("div")
--        || mnemonic.starts_with("idiv")
--        || (mnemonic.starts_with("mul") && !mnemonic.starts_with("mulx"))
--        || (mnemonic.starts_with("imul") && !rest.contains(','))
--    {
--        return RAX | RDX;
--    }
-+    // Multi-destination / opaque: every mentioned GP family plus the
-+    // implicit accumulator pair (cmpxchg16b names no register at all).
-+    // These must run BEFORE the implicit oracle: `cmpxchg` has an implicit
-+    // accumulator AND a conditionally-written explicit destination, so the
-+    // implicit write set alone would under-approximate. (With the central
-+    // union, `info.reg_refs` here already includes the implicit bits too.)
-     if mnemonic.starts_with("xchg")
-         || mnemonic.starts_with("cmpxchg")
-         || mnemonic.starts_with("xadd")
-@@ -187,10 +175,21 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
-         || mnemonic.starts_with("mulx")
-         || mnemonic.starts_with("rep")
-     {
--        // Multi-destination / opaque: every mentioned GP family plus the
--        // implicit accumulator pair (cmpxchg16b names no register at all).
-         return info.reg_refs | RAX | RDX | RCX | ALL_STRING_REGS;
-     }
-+    // Explicit implicit-operand instructions: the central oracle in
-+    // `types.rs` is the single source of truth for architectural implicit
-+    // writes (this used to be a private duplicate that drifted — it knew
-+    // nothing of `cmpxchg8b`, conflated rdtsc with rdtscp's %rcx write, and
-+    // taxed every SSE `mulsd`/`divsd` with the integer accumulator pair,
-+    // blocking load fusions in FP code).  Instructions reaching this arm
-+    // either have no GP destination operand (`cqto`, `syscall`, `leave`,
-+    // the string primitives) or name only read operands (`divq %r11`), so
-+    // the implicit write set alone is the complete answer.
-+    let implicit = implicit_write_refs(t.as_bytes());
-+    if implicit != 0 {
-+        return implicit;
-+    }
-     // String instructions without operands (`movsb`, `stosq`, ...).
-     if !rest.contains('%') && !rest.contains('$') {
-         return ALL_GPR;
-@@ -1303,4 +1302,23 @@ mod tests {
-         let t = "    cmpxchg16b (%rdi)";
-         assert_eq!(may_write_families(t.trim(), &li(t)) & (RAX | RDX), RAX | RDX);
-     }
-+    #[test]
-+    fn may_write_model_is_exact_for_implicit_operands() {
-+        let li = |s: &str| classify_line(s);
-+        // The widening branch writes ONLY %rdx: %rax is its input. The old
-+        // private table returned RAX | RDX, freezing cache invalidation for
-+        // an accumulator it never touched.
-+        let t = "    cqto";
-+        assert_eq!(may_write_families(t.trim(), &li(t)), RDX);
-+        // rdtsc vs rdtscp: only the latter reports the TSC_AUX in %rcx.
-+        let t = "    rdtsc";
-+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
-+        let t = "    rdtscp";
-+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RCX | RDX);
-+        // SSE arithmetic does not inherit the integer accumulator pair.
-+        let t = "    mulsd %xmm0, %xmm1";
-+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
-+        let t = "    divsd %xmm1, %xmm0";
-+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
-+    }
- }
 diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index ce7c3d7..f324744 100644
+index ce7c3d70..390c9678 100644
 --- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 +++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 @@ -17,6 +17,7 @@ use super::super::types::*;
@@ -397,86 +263,86 @@ index ce7c3d7..f324744 100644
  };
  
  /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
-@@ -575,9 +576,13 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
-                                 && lr != 5
-                                 && lr != sr
+@@ -577,8 +578,15 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                              {
--                                // Middle line: writes %S, doesn't read %D, no memory access,
--                                // and is a plain register-dest instruction.
+                                 // Middle line: writes %S, doesn't read %D, no memory access,
+                                 // and is a plain register-dest instruction.
 -                                let mid_writes_s = get_dest_reg(&infos[m]) == sr
-+                                // Middle line: writes %S (explicitly, or
-+                                // implicitly — `cqto` overwrites %rdx without
-+                                // naming it), doesn't read %D, no memory
-+                                // access, and is a plain register-dest
-+                                // instruction.
-+                                let mid_t = infos[m].trimmed(store.get(m));
-+                                let mid_writes_s = writes_family(&infos[m], mid_t, sr)
-                                     && matches!(infos[m].kind, LineKind::Other { .. });
+-                                    && matches!(infos[m].kind, LineKind::Other { .. });
++                                // `writes_family` sees the architectural
++                                // implicit writers too (`idivq` rewrites %rdx
++                                // without naming it).
++                                let mid_writes_s = matches!(infos[m].kind, LineKind::Other { .. })
++                                    && writes_family(
++                                        &infos[m],
++                                        infos[m].trimmed(store.get(m)),
++                                        sr,
++                                    );
                                  let mid_refs_d = infos[m].reg_refs & (1u16 << lr) != 0;
                                  // leaq is address ARITHMETIC: `leaq 1(%r11), %r11`
-@@ -586,7 +591,6 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
-                                 // flags any non-frame paren base — for leaq
-                                 // that is an arithmetic source, not a load).
-                                 // Any other paren operand is a real access.
--                                let mid_t = infos[m].trimmed(store.get(m));
-                                 let mid_is_lea =
-                                     mid_t.starts_with("leaq ") || mid_t.starts_with("leal ");
-                                 let mid_has_mem = infos[m].rbp_offset != RBP_OFFSET_NONE
-@@ -1670,11 +1674,13 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
-             }
-             let t = infos[n].trimmed(store.get(n));
+                                 // reads no memory (has_indirect_mem is a
+@@ -1672,9 +1680,12 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
  
--            // Base or index redefined => the LEA's value is no longer
--            // reproducible from them; stop (uses collected so far are still
+             // Base or index redefined => the LEA's value is no longer
+             // reproducible from them; stop (uses collected so far are still
 -            // valid only if we fold nothing after this point).
 -            let writes = get_dest_reg(&infos[n]);
 -            if writes == base_family || writes == index_family {
-+            // Base or index redefined (explicitly or implicitly — `cqto`
-+            // overwrites %rdx without naming it) => the LEA's value is no
-+            // longer reproducible from them; stop (uses collected so far are
-+            // still valid only if we fold nothing after this point).
++            // valid only if we fold nothing after this point).  `writes_family`
++            // also sees architectural implicit writers: `idivq %r11` rewrites
++            // %rdx, which as a LEA base must end the window.
 +            if writes_family(&infos[n], t, base_family)
 +                || writes_family(&infos[n], t, index_family)
 +            {
                  break;
              }
              if infos[n].reg_refs & dst_mask != 0 {
-@@ -1702,7 +1708,10 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
+@@ -1701,8 +1712,10 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
+                     uses.push(n);
                  } else if mentions {
                      // A pure redefinition of %tmp ends its live range cleanly:
-                     // everything after belongs to a different value.
+-                    // everything after belongs to a different value.
 -                    if writes == dst_family && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
-+                    // `writes_family` also sees architectural implicit writes
-+                    // (`cqto` redefining an %rdx temporary).
++                    // everything after belongs to a different value.  Implicit
++                    // writers (`cqto` rewriting %rdx) end it just as cleanly.
 +                    if writes_family(&infos[n], t, dst_family)
 +                        && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
                      {
                          break;
                      }
+diff --git a/src/backend/x86/codegen/peephole/passes/loop_trampoline.rs b/src/backend/x86/codegen/peephole/passes/loop_trampoline.rs
+index da3aa30e..c7b3bba4 100644
+--- a/src/backend/x86/codegen/peephole/passes/loop_trampoline.rs
++++ b/src/backend/x86/codegen/peephole/passes/loop_trampoline.rs
+@@ -446,7 +446,13 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
+                         break;
+                     }
+                     let writes_reg = match infos[m].kind {
+-                        LineKind::Other { dest_reg } => dest_reg == reg,
++                        // Architectural implicit writers (`cqto`, `xlatb`,
++                        // lone `movsb`, `leave`, ...) get no `dest_reg`.
++                        LineKind::Other { .. } => writes_family(
++                            &infos[m],
++                            infos[m].trimmed(store.get(m)),
++                            reg,
++                        ),
+                         LineKind::LoadRbp { reg: r, .. } => r == reg,
+                         LineKind::SetCC { reg: r } => r == reg,
+                         LineKind::Pop { reg: r } => r == reg,
 diff --git a/src/backend/x86/codegen/peephole/passes/memory_fold.rs b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
-index 3fa0559..34e7351 100644
+index 3fa05598..9d6957f0 100644
 --- a/src/backend/x86/codegen/peephole/passes/memory_fold.rs
 +++ b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
-@@ -17,7 +17,7 @@
- 
+@@ -18,6 +18,7 @@
  use super::super::types::*;
  use super::helpers::{
--    get_dest_reg, implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line,
-+    implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, writes_family,
+     get_dest_reg, implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line,
++    writes_family,
  };
  
  /// True when a line transfers control or merges paths, so that textual line
-@@ -1215,11 +1215,14 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
-                 // would test/combine the WRONG slot. (The old code only
-                 // checked for stores to the same stack offset, missing
-                 // register re-writes such as `movl mem2, %eax` between
--                // `movl mem1, %eax` and `testl %eax, %eax`.) Checking
--                // `get_dest_reg` catches every register-writing instruction.
-+                // `movl mem1, %eax` and `testl %eax, %eax`.)
-+                // `writes_family` catches every register-writing instruction
-+                // — explicitly destination-named ones and architecturally
-+                // implicit ones alike (`cqto` overwriting %rdx, `idivq`
-+                // rewriting %rax:%rdx).
+@@ -1219,7 +1220,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
+                 // `get_dest_reg` catches every register-writing instruction.
                  let mut reg_rewritten = false;
                  for k in (i + 1)..j {
 -                    if get_dest_reg(&infos[k]) == load_reg {
@@ -484,170 +350,288 @@ index 3fa0559..34e7351 100644
                          reg_rewritten = true;
                          break;
                      }
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index 3fc9e5cd..ed08f2ca 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -1070,6 +1070,47 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_copy_chain_shortens_without_an_implicit_writer() {
++        // Positive control for the implicit-write test below: with nothing
++        // between, the copy chain `%rax -> %r8 -> %rdx` shortens to one move.
++        let asm = concat!(
++            "f:\n",
++            "    movq %rax, %r8\n",
++            "    movq %r8, %rdx\n",
++            "    ret\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("movq %rax, %rdx"), "{result}");
++        assert!(!result.contains("%r8"), "{result}");
++    }
++
++    #[test]
++    fn test_copy_chain_survives_an_implicit_accumulator_write() {
++        // `lahf` rewrites %ah without naming %rax, so a purely textual scan
++        // keeps the identity `%r8 == %rax` alive ACROSS the clobber and the
++        // follow-up `movq %r8, %rdx` is propagated/coalesced into a read of
++        // the clobbered accumulator (peephole stress lab `intexpr` seed 1,
++        // -O1 class).  The implicit-write oracle must break the chain: both
++        // moves survive, and no `%rax -> %rdx` rewrite appears.
++        let asm = concat!(
++            "f:\n",
++            "    movq %rax, %r8\n",
++            "    lahf\n",
++            "    movq %r8, %rdx\n",
++            "    movq %rdx, (%rdi)\n",
++            "    ret\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("movq %rax, %r8"), "{result}");
++        assert!(result.contains("movq %r8, %rdx"), "{result}");
++        assert!(!result.contains("movq %rax, %rdx"), "{result}");
++    }
++
+     #[test]
+     fn test_copy_propagates_into_source_clobbering_address_load() {
+         let asm = concat!(
+@@ -2039,6 +2080,37 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_store_forwarding_fires_without_an_implicit_writer() {
++        // Positive control for the lahf negative test below.
++        let asm = ["    movq %rax, -24(%rbp)", "    movq -24(%rbp), %rax"]
++            .join("\n")
++            + "\n";
++        let result = peephole_optimize(asm);
++        assert!(
++            !result.contains("-24(%rbp), %rax"),
++            "must forward store->load with no clobber in between: {}",
++            result
++        );
++    }
++
++    #[test]
++    fn test_lahf_invalidates_store_forwarding() {
++        // `lahf` writes %ah (the top byte of %rax) without naming any
++        // register: forwarding the slot value into %rax across it hands the
++        // program a value whose top byte the flags overwrote.  The
++        // implicit-write oracle must invalidate the mapping.
++        let asm = ["    movq %rax, -24(%rbp)", "    lahf", "    movq -24(%rbp), %rax"]
++            .join("\n")
++            + "\n";
++        let result = peephole_optimize(asm);
++        assert!(
++            result.contains("-24(%rbp), %rax"),
++            "must not forward rax across lahf (implicit write to %ah): {}",
++            result
++        );
++    }
++
+     #[test]
+     fn test_inline_asm_rdmsr_invalidates_store_forwarding() {
+         let asm = [
 diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
-index 274f497..a65075f 100644
+index 274f497a..cb60cda6 100644
 --- a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
 +++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
-@@ -51,6 +51,10 @@
- //! 1. **No barrier in `(i, k]`.** A label can be entered on another path where
- //!    `%S` holds something else.
- //! 2. **`%S` is not written in `(i, k]`.** Otherwise the two have diverged.
-+//!    Written implicitly counts too: `cqto`/`idivq` overwrite `%rdx` without
-+//!    naming it, `cpuid` rewrites `%rbx`, a `syscall` clobbers `%rcx` and
-+//!    `%r11` — [`helpers::writes_family`] answers this rule for both the
-+//!    classified destination and the architectural implicit write set.
- //! 3. **`%D` is not written in `(i, k)`.** A later write starts a new live
- //!    range that this copy does not feed.
- //! 4. **No use in `(i, k]` writes `%D` while reading it.** `addl %eax, %edx`
-@@ -70,7 +74,9 @@
+@@ -70,7 +70,7 @@
  //! `%dxl` and the assembler rejected the function.
  
  use super::super::types::*;
 -use super::helpers::{get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate};
-+use super::helpers::{
-+    get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family,
-+};
++use super::helpers::{get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family};
  use super::liveness::FileLiveness;
  
  /// High-byte names have no equivalent in the `%rsi`/`%rdi`/`%r8`+ families.
-@@ -335,26 +341,32 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
-             if infos[j].is_barrier() {
+@@ -336,8 +336,10 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
                  break;
              }
--            let dest_j = get_dest_reg(&infos[j]);
+             let dest_j = get_dest_reg(&infos[j]);
 -            // Rule 2: the source must still hold the copied value.
 -            if dest_j == sfam {
-+            let line = infos[j].trimmed(store.get(j));
 +            // Rule 2: the source must still hold the copied value.  The
 +            // implicit second output of `cqto`/`idivq`/`cpuid`/`rep stos`...
-+            // counts as a write even though `get_dest_reg` names only `%rax`
-+            // (stress lab `intexpr` seed 1, `-O1`: a narrow reload of the
-+            // parameter home was folded onto `%dl` and read the division
-+            // remainder).
-+            if writes_family(&infos[j], line, sfam) {
++            // counts as a write even though `dest_j` names only `%rax`.
++            if dest_j == sfam || writes_family(&infos[j], infos[j].trimmed(store.get(j)), sfam) {
                  break;
              }
              let mentions_d = infos[j].reg_refs & (1u16 << dfam) != 0;
-             if !mentions_d {
-                 // Rule 3: a write to %D with no read ends our range; the copy
-                 // is then dead and `dead_writes` will retire it.
--                if dest_j == dfam {
-+                if writes_family(&infos[j], line, dfam) {
-                     break;
-                 }
-                 continue;
-             }
--            // Rule 4: the use must not also write %D.
--            if dest_j == dfam {
-+            // Rule 4: the use must not also write %D (explicitly — `addl
-+            // %eax, %edx` — or implicitly, e.g. `idivq` overwriting a %rax
-+            // copy).
-+            if writes_family(&infos[j], line, dfam) {
-                 ok = false;
-                 break;
-             }
--            let line = infos[j].trimmed(store.get(j));
-             // Rule 6.
-             if has_implicit_reg_usage(line) || is_shift_or_rotate(line) {
-                 ok = false;
 diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
-index 4db9fa7..7e63b16 100644
+index 4db9fa74..52cb2dc6 100644
 --- a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
 +++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
-@@ -468,3 +468,91 @@ fn no_output_line_names_a_nonexistent_register() {
+@@ -468,3 +468,44 @@ fn no_output_line_names_a_nonexistent_register() {
          assert!(ok, "output names unknown register %{}:\n{}", name, out);
      }
  }
 +
-+// ── Rule 2/3/4: architectural implicit writes (the stress-lab regression) ───
-+
 +#[test]
-+fn a_copy_does_NOT_fold_across_a_division_that_clobbers_its_source() {
-+    // SOUNDNESS, stress lab `intexpr` seed 1 at -O1 (the ms178-1 regression):
-+    // `cqto`/`idivq %r11` overwrite %rdx without naming it in their operand
-+    // text. The window walk used to see "no mention of %rdx" between the
-+    // copy and the narrow reload and retargeted `movzbl %r8b, ...` to
-+    // `movzbl %dl, ...` — reading the division REMAINDER instead of the
-+    // parameter the copy had homed.
++fn an_8_bit_copy_folds_into_an_8_bit_use_positive() {
++    // Positive control for the negative test below: with no implicit writer
++    // between the copy and the use, the fold fires (copy deleted, use
++    // rewritten onto %al).  Proves the peephole pipeline actually performs
++    // the fold, so the next test cannot pass vacuously.
 +    let out = run(&f(concat!(
-+        "    movq %rdx, %r8\n",
-+        "    cqto\n",
-+        "    idivq %r11\n",
-+        "    movzbl %r8b, %eax\n",
-+        "    ret\n",
++        "    movb %al, %cl\n",
++        "    testb %cl, %cl\n",
++        "    je .L1\n",
++        ".L1:\n",
++        "    xorl %eax, %eax\n",
++        "    ret",
 +    )));
-+    assert!(
-+        out.contains("movzbl %r8b, %eax"),
-+        "reload must keep its home register:\n{}",
-+        out
-+    );
-+    assert_eq!(
-+        count(&out, "movzbl %dl"),
-+        0,
-+        "division remainder must not leak into the reload:\n{}",
-+        out
-+    );
++    assert_eq!(count(&out, "movb %al, %cl"), 0, "{}\n", out);
++    assert!(out.contains("testb %al, %al"), "{}\n", out);
 +}
 +
 +#[test]
-+fn a_copy_into_rdx_does_NOT_fold_across_an_idiv_that_rewrites_it() {
-+    // Rules 3/4 mirrored through the oracle: `idivq %rcx` rewrites
-+    // %rax:%rdx but names neither. Pre-union its reg_refs were {%rcx} only,
-+    // so the window walk sailed through and retargeted later %rdx uses at
-+    // the copy's source — feeding them the stale copy instead of the
-+    // remainder the division had just written. The use lands in %rbx so it
-+    // survives to the return (a dead use would be deleted, hiding the
-+    // defect); the return value must therefore come from the remainder in
-+    // %rdx, never from the stale %r9.
++fn copy_source_survives_an_implicit_accumulator_write() {
++    // A copy whose source register is written IMPLICITLY between the copy
++    // and the use must not be folded.  `xlatb` rewrites `%al` without naming
++    // it, so the textual scan (`get_dest_reg` names `%rax` only for sign-/
++    // zero-extension idioms, and `xlatb` names nothing at all) saw the
++    // source as intact and the fold handed the use the post-xlatb accumulator
++    // (peephole stress lab `intexpr` seed 1, -O1 class).  The implicit-write
++    // oracle must block the fold — the copy and the original use survive.
 +    let out = run(&f(concat!(
-+        "    movq %r9, %rdx\n",
-+        "    cqto\n",
-+        "    idivq %rcx\n",
-+        "    movq %rdx, %rbx\n",
-+        "    movq %rbx, %rax\n",
-+        "    ret\n",
++        "    movb %al, %cl\n",
++        "    xlatb\n",
++        "    testb %cl, %cl\n",
++        "    je .L1\n",
++        ".L1:\n",
++        "    xorl %eax, %eax\n",
++        "    ret",
 +    )));
-+    assert!(out.contains("idivq"), "{out}");
-+    assert_eq!(
-+        count(&out, "movq %r9, %rbx"),
-+        0,
-+        "stale copy source must not leak into the reload:\n{}",
-+        out
-+    );
-+    assert_eq!(
-+        count(&out, "movq %r9, %rax"),
-+        0,
-+        "stale copy source must not reach the return value:\n{}",
-+        out
-+    );
++    assert_eq!(count(&out, "movb %al, %cl"), 1, "{}\n", out);
++    assert!(out.contains("testb %cl, %cl"), "{}\n", out);
++    assert!(!out.contains("testb %al, %al"), "{}\n", out);
 +}
+diff --git a/src/backend/x86/codegen/peephole/passes/push_pop.rs b/src/backend/x86/codegen/peephole/passes/push_pop.rs
+index 4650379b..805dad32 100644
+--- a/src/backend/x86/codegen/peephole/passes/push_pop.rs
++++ b/src/backend/x86/codegen/peephole/passes/push_pop.rs
+@@ -4,6 +4,7 @@
+ //! that arise from the stack-based codegen model.
+ 
+ use super::super::types::*;
++use super::helpers::writes_family;
+ 
+ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+     let mut changed = false;
+@@ -26,7 +27,11 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
+                         if infos[k].is_nop() {
+                             continue;
+                         }
+-                        if instruction_modifies_reg_id(&infos[k], push_reg_id) {
++                        if instruction_modifies_reg_id(
++                            &infos[k],
++                            infos[k].trimmed(store.get(k)),
++                            push_reg_id,
++                        ) {
+                             safe = false;
+                             break;
+                         }
+@@ -98,7 +103,7 @@ fn instruction_modifies_stack(line: &str, info: &LineInfo) -> bool {
+ /// Fast check whether a line's instruction modifies a register identified by RegId.
+ /// Uses pre-parsed `LineInfo` fields to avoid string parsing in the hot path.
+ #[inline]
+-fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
++fn instruction_modifies_reg_id(info: &LineInfo, trimmed: &str, reg_id: RegId) -> bool {
+     match info.kind {
+         LineKind::StoreRbp { .. }
+         | LineKind::StoreXmmRbp { .. }
+@@ -120,17 +125,11 @@ fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
+         LineKind::Ret => false,
+         // Inline asm is opaque: assume it modifies every register.
+         LineKind::InlineAsm => true,
+-        LineKind::Other { dest_reg } => {
+-            if dest_reg == reg_id {
+-                return true;
+-            }
+-            // div/idiv also clobber rdx (family 2), and rax (family 0)
+-            // mul also clobbers rdx
+-            if dest_reg == 0 && reg_id == 2 {
+-                return true; // TODO: could be more precise
+-            }
+-            false
+-        }
++        // `writes_family` covers the classified destination AND the
++        // architectural implicit writers (div/idiv/mul clobber %rax:%rdx,
++        // `xlatb` rewrites %al, a lone `movsb` advances %rsi/%rdi, `leave`
++        // rewrites %rsp/%rbp, ...), all invisible to `dest_reg`.
++        LineKind::Other { .. } => writes_family(info, trimmed, reg_id),
+     }
+ }
+ 
+diff --git a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+index 3b9c0d64..e0a58b96 100644
+--- a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
++++ b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+@@ -14,6 +14,7 @@
+ //! re-extensions. Facts are propagated by width-preserving register copies and
+ //! cleared by instructions that may write a wider value.
+ 
++use super::helpers::*;
+ use super::super::types::*;
+ 
+ /// Register families we track for upper-32-zero status. Index = family id
+@@ -808,6 +809,24 @@ fn self_update(
+                 }
+             }
+         }
++        // Architectural implicit writers (`cqto` rewrites %rax:%rdx, `idivq
++        // %r11` rewrites %rax:%rdx, `xlatb` rewrites %al, a lone `movsb`
++        // advances %rsi/%rdi, ...) name no register, so the token loop above
++        // left their facts stale and a later `movslq %edx, %rdx` dedup could
++        // delete a real re-extension across the clobber (stress-lab class:
++        // the register was rewritten, the fact was not).
++        let mut iw = implicit_write_refs(t.as_bytes());
++        while iw != 0 {
++            let f = iw.trailing_zeros() as usize;
++            if f < upper32_zero.len() {
++                upper32_zero[f] = false;
++                is_byte[f] = false;
++                is_16[f] = false;
++                sext32[f] = false;
++                cleared = true;
++            }
++            iw &= iw - 1;
++        }
+         let _ = cleared;
+     }
+ }
+@@ -830,6 +849,20 @@ mod tests {
+         asm
+     }
+ 
++    #[test]
++    fn keeps_a_self_sign_extension_across_an_implicit_rdx_write() {
++        // `cqto` rewrites %rdx:%rax without naming a register, so the token
++        // scan left the sext32 fact stale and the second movslq was deleted
++        // as a no-op although it re-reads %edx after the division idiom
++        // clobbered %rdx (register rewritten, fact not).  Positive control:
++        // without cqto the second movslq IS removed (no-op), with cqto it
++        // survives.
++        let pos = run("    movslq %edx, %rdx\n    movslq %edx, %rdx\n");
++        assert_eq!(pos.matches("movslq %edx, %rdx").count(), 1, "{pos}");
++        let neg = run_maybe("    movslq %edx, %rdx\n    cqto\n    movslq %edx, %rdx\n");
++        assert_eq!(neg.matches("movslq %edx, %rdx").count(), 2, "{neg}");
++    }
 +
-+#[test]
-+fn a_copy_out_of_rax_folds_across_cqto_which_only_reads_it() {
-+    // The oracle is exact, not merely conservative: `cqto` reads %rax and
-+    // writes ONLY %rdx. The classified destination (%rax) used to end the
-+    // window at Rule 2 (`dest_j == sfam`) even though the instruction never
-+    // overwrites the copy source; the exact predicate lets the fold
-+    // through. (An `idivq`, which DOES rewrite %rax, still blocks it — see
-+    // the Rule 4 oracle. The use's destination is %ecx so the use itself
-+    // does not re-write the copy source, which Rule 2 must and does
-+    // continue to block.)
-+    let out = run(&f(concat!(
-+        "    movq %rax, %r8\n",
-+        "    cqto\n",
-+        "    movzbl %r8b, %bl\n",
-+        "    movq %rbx, %rax\n",
-+        "    ret\n",
-+    )));
-+    assert_eq!(count(&out, "movq %rax, %r8"), 0, "copy must fold:\n{}", out);
-+    assert!(
-+        out.contains("movzbl %al, %bl"),
-+        "use must retarget at the copy source:\n{}",
-+        out
-+    );
-+}
+     #[test]
+     fn removes_a_second_self_sign_extension_of_the_same_register() {
+         // The real gzip longest_match compare loop: a[i] and b[i] share one
 diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-index c9d26c1..8d4d7a7 100644
+index ad21570f..8858224f 100644
 --- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
 +++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
 @@ -49,7 +49,7 @@
@@ -659,36 +643,101 @@ index c9d26c1..8d4d7a7 100644
  use super::liveness::FileLiveness;
  
  /// Widest window (in non-NOP instructions) searched for the consumer of a LEA.
-@@ -471,8 +471,11 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
+@@ -474,7 +474,9 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                  let _ = folded;
                  break;
              }
 -            if infos[j].reg_refs & src_mask != 0 && get_dest_reg(&infos[j]) == src_fam {
--                break; // %S redefined before the use: the copy is not a relay
-+            // %S redefined (explicitly or implicitly — `cqto` overwrites
-+            // %rdx without naming it) before the use: the copy is not a
-+            // relay.
-+            if writes_family(&infos[j], infos[j].trimmed(store.get(j)), src_fam) {
-+                break;
++            if infos[j].reg_refs & src_mask != 0
++                && writes_family(&infos[j], infos[j].trimmed(store.get(j)), src_fam)
++            {
+                 break; // %S redefined before the use: the copy is not a relay
              }
              j += 1;
+@@ -624,12 +626,14 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo])
+                 break;
+             }
+             // A write to any register the address reads makes the LEA
+-            // irreproducible at the use site.
+-            if infos[j].reg_refs & addr_mask != 0 {
+-                let w = get_dest_reg(&infos[j]);
+-                if w != REG_NONE && addr_fams.contains(&w) {
+-                    break;
+-                }
++            // irreproducible at the use site (including architectural implicit
++            // writes: `cqto` clobbers %rdx without naming it).
++            if infos[j].reg_refs & addr_mask != 0
++                && addr_fams
++                    .iter()
++                    .any(|&f| writes_family(&infos[j], infos[j].trimmed(store.get(j)), f))
++            {
++                break;
+             }
+             if infos[j].reg_refs & dst_mask != 0 {
+                 // Only a BARE `(%T)` operand or a base/offset operand
+@@ -1003,7 +1007,7 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
+                 // A write of %rA closes the window (its value diverges from
+                 // %rB's); a later %rB read then fails the deadness proof and
+                 // rolls the candidate back.
+-                if get_dest_reg(&infos[k]) == a_fam {
++                if writes_family(&infos[k], infos[k].trimmed(store.get(k)), a_fam) {
+                     break;
+                 }
+                 k += 1;
+@@ -1016,7 +1020,7 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
+             }
+             // A read-modify-write of %rB would leave its result in the wrong
+             // register after a rename.
+-            if get_dest_reg(&infos[k]) == b_fam {
++            if writes_family(&infos[k], infos[k].trimmed(store.get(k)), b_fam) {
+                 abort = true;
+                 break;
+             }
+diff --git a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+index 8fdcff8d..e000db52 100644
+--- a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
++++ b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+@@ -346,17 +346,18 @@ fn gsf_handle_other(
+ 
+     if is_valid_gp_reg(dest_reg) {
+         invalidate_reg_flat(slot_entries, reg_offsets, dest_reg);
+-        if dest_reg == 0 {
+-            let trimmed = infos[i].trimmed(store.get(i));
+-            if trimmed.starts_with("div")
+-                || trimmed.starts_with("idiv")
+-                || trimmed.starts_with("mul")
+-                || trimmed == "cqto"
+-                || trimmed == "cqo"
+-                || trimmed == "cdq"
+-            {
+-                invalidate_reg_flat(slot_entries, reg_offsets, 2);
+-            }
++    }
++    // Architectural implicit writes (`xlatb` -> %al, `lahf` -> %ah, `movsb`
++    // -> %rsi/%rdi, `leave` -> %rsp/%rbp, div/idiv/mul -> %rax:%rdx, ...) are
++    // invisible to `dest_reg`; forwarding a slot mapping into one of them
++    // reads a clobbered value.  The old ad-hoc arm covered only div/idiv/mul/
++    // cqto (and only when dest_reg was already %rax) and over-approximated
++    // `divsd`; the mnemonic table is exact.
++    {
++        let mut iw = implicit_write_refs(infos[i].trimmed(store.get(i)).as_bytes());
++        while iw != 0 {
++            invalidate_reg_flat(slot_entries, reg_offsets, iw.trailing_zeros() as RegId);
++            iw &= iw - 1;
          }
+     }
+ 
 diff --git a/src/backend/x86/codegen/peephole/types.rs b/src/backend/x86/codegen/peephole/types.rs
-index bc91519..20291e2 100644
+index bc915191..2482d4b2 100644
 --- a/src/backend/x86/codegen/peephole/types.rs
 +++ b/src/backend/x86/codegen/peephole/types.rs
-@@ -1742,7 +1742,207 @@ pub(super) fn scan_register_refs(b: &[u8]) -> u16 {
+@@ -1742,7 +1742,164 @@ pub(super) fn scan_register_refs(b: &[u8]) -> u16 {
              i += 1;
          }
      }
 -    refs
-+    // Architectural implicit operands (`cqto`, `idivq %r11`, `cpuid`, string
-+    // primitives, ...) are invisible to the textual scan above; every consumer
-+    // of `reg_refs` must see the same instruction as the CPU executes it.
 +    refs | implicit_reg_refs(b)
 +}
-+
-+// ── Implicit register operands ───────────────────────────────────────────────
 +
 +/// Register families an instruction reads or writes WITHOUT naming them in
 +/// its operand text.
@@ -704,60 +753,16 @@ index bc91519..20291e2 100644
 +/// add `RAX | RDX | RCX | string regs` privately; folding the knowledge into
 +/// the classifier makes every consumer see the same truth.
 +///
-+/// The table records the implicit READS and the implicit WRITES separately:
-+/// [`implicit_reg_refs`] unions both (the "mentions" oracle — a set bit only
-+/// makes a pass more conservative), while [`implicit_write_refs`] and
-+/// [`implicit_read_refs`] project the exact halves for callers that must not
-+/// conflate reading with writing (redefinition checks vs. observation
-+/// checks).
++/// Over-approximation is always safe here: a set bit only makes a pass more
++/// conservative.  The table therefore includes both the implicit inputs and
++/// the implicit outputs of each instruction; [`implicit_write_refs`] returns
++/// the write-side subset for redefinition checks (an input-only instruction
++/// like `mulx` or `jrcxz` must not be treated as a writer).
 +///
 +/// Prefixes (`lock`, `rep`, `repe`, `repz`, `repne`, `repnz`) are skipped so
 +/// the mnemonic that follows is classified; the `rep` family additionally
-+/// contributes `%rcx` (count) — and `rep ret` / `rep nop` (pause) contribute
-+/// nothing.
-+///
-+/// Mnemonics are matched EXACTLY, never by prefix: `divsd`/`mulsd`/`mulpd`
-+/// are SSE instructions with fully explicit operands and must not inherit
-+/// the integer `div`/`mul` accumulator pair (the local liveness model's
-+/// prefix match over-approximates this; the oracle is exact).  The emitter
-+/// today only produces a subset of the table, but the oracle is written
-+/// against the ISA, so the next new emitter site is covered for free.
-+#[inline]
-+pub(super) fn implicit_reg_refs(b: &[u8]) -> u16 {
-+    let (reads, writes) = classify_implicit_operands(b);
-+    reads | writes
-+}
-+
-+/// Families an instruction implicitly READS without naming them in its
-+/// operand text.  An implicit read observes the register's current value:
-+/// acceptance-style checks ("this use observes the full 64-bit value") must
-+/// consult this projection, not [`implicit_reg_refs`], or a pure writer such
-+/// as `cqto` would be mistaken for a reader of the `%rax` family it merely
-+/// consumes as input... and conversely a redefinition check that used the
-+/// combined set would freeze coalescing across `cqto` for `%rax` copies that
-+/// are architecturally untouched.
-+#[inline]
-+pub(super) fn implicit_read_refs(b: &[u8]) -> u16 {
-+    classify_implicit_operands(b).0
-+}
-+
-+/// Families an instruction implicitly WRITES without naming them in its
-+/// operand text.  This is the exact write half of [`implicit_reg_refs`] —
-+/// the counterpart of the classified destination for instructions whose
-+/// second (or only) destination is architectural: `cqto` → `%rdx`,
-+/// `idivq %r11` → `%rax:%rdx`, `rep stosq` → `%rdi:%rcx`, `syscall` →
-+/// `%rax:%rcx:%r11`, ...
-+#[inline]
-+pub(super) fn implicit_write_refs(b: &[u8]) -> u16 {
-+    classify_implicit_operands(b).1
-+}
-+
-+/// One instruction's implicit (reads, writes) over the GP family numbering
-+/// (0 = %rax .. 15 = %r15), derived from its mnemonic.  Both halves are
-+/// EXACT for every instruction listed; unknown mnemonics yield (0, 0) —
-+/// callers that need a MAY model must add their own conservative fallback
-+/// (that is what `load_op_fuse::may_write_families` layers on top).
-+fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
++/// contributes `%rcx` (count) — and `rep ret` contributes nothing.
++fn implicit_register_tables(b: &[u8]) -> (u16, u16) {
 +    const RAX: u16 = 1 << 0;
 +    const RCX: u16 = 1 << 1;
 +    const RDX: u16 = 1 << 2;
@@ -770,7 +775,6 @@ index bc91519..20291e2 100644
 +    const R9: u16 = 1 << 9;
 +    const R10: u16 = 1 << 10;
 +    const R11: u16 = 1 << 11;
-+
 +    // Split "mnemonic [operands]" on the first blank.  Lines are already
 +    // trimmed on the left by the caller.
 +    fn mnemonic(b: &[u8]) -> (&[u8], &[u8]) {
@@ -784,252 +788,167 @@ index bc91519..20291e2 100644
 +        }
 +        (m, &b[i..])
 +    }
-+
 +    let (mut m, mut rest) = mnemonic(b);
 +    if m.is_empty() || m[0] == b'.' || m[m.len() - 1] == b':' || m[0] == b'#' {
-+        // Labels, directives and comments name no instruction.
 +        return (0, 0);
 +    }
-+    let mut reads: u16 = 0;
-+    let mut writes: u16 = 0;
++    let mut refs: u16 = 0;
 +    // Prefixes.
 +    loop {
 +        match m {
 +            b"lock" => {}
-+            b"rep" | b"repe" | b"repz" | b"repne" | b"repnz" => {
-+                // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
-+                // counted loops: they touch no register at all.
-+                let (m2, _) = mnemonic(rest);
-+                if m2 != b"ret" && m2 != b"retq" && m2 != b"nop" {
-+                    reads |= RCX; // count tested for zero
-+                    writes |= RCX; // count decremented
-+                }
-+            }
++            b"rep" | b"repe" | b"repz" | b"repne" | b"repnz" => refs |= RCX,
 +            _ => break,
 +        }
 +        let (m2, r2) = mnemonic(rest);
 +        if m2.is_empty() {
-+            return (reads, writes);
++            return (refs, 0);
 +        }
 +        m = m2;
 +        rest = r2;
 +    }
 +    let has_comma = rest.contains(&b',');
-+    let table: (u16, u16) = match m {
-+        // Sign-extension of the accumulator in place.
++    let (table_refs, table_writes): (u16, u16) = match m {
++        // Sign/zero-extension of the accumulator.
++        //   cbtw/cwtl/cltq/cbw/cwde/cdqe: read the narrow form, write RAX.
++        //   cwtd/cltd/cqto/cwd/cdq/cqo:   read RAX, write RDX (the dividend
++        //                                  half must never be treated as
++        //                                  intact across it).
 +        b"cbtw" | b"cwtl" | b"cltq" | b"cbw" | b"cwde" | b"cdqe" => (RAX, RAX),
-+        // Sign-extension into the data register: %rax is the INPUT.
-+        b"cwtd" | b"cltd" | b"cqto" | b"cwd" | b"cdq" | b"cqo" => (RAX, RDX),
-+        // Single-operand multiply/divide: rax:rdx implicit.  The byte forms
-+        // divide/multiply AX by r/m8 (quotient AL, remainder AH, product AX)
-+        // and never touch the %rdx family.
-+        b"divb" | b"idivb" | b"mulb" | b"imulb" => (RAX, RAX),
-+        b"div" | b"divw" | b"divl" | b"divq" | b"idiv" | b"idivw" | b"idivl" | b"idivq"
-+        | b"mul" | b"mulw" | b"mull" | b"mulq" => (RAX | RDX, RAX | RDX),
++        b"cwtd" | b"cltd" | b"cqto" | b"cwd" | b"cdq" | b"cqo" => (RAX | RDX, RDX),
++        // Single-operand multiply/divide: rax:rdx implicit.
++        b"div" | b"divb" | b"divw" | b"divl" | b"divq" | b"idiv" | b"idivb" | b"idivw"
++        | b"idivl" | b"idivq" | b"mul" | b"mulb" | b"mulw" | b"mull" | b"mulq" => {
++            (RAX | RDX, RAX | RDX)
++        }
 +        // imul with a single operand is the widening form (rax:rdx); the
 +        // two/three-operand forms name every register they touch.
-+        b"imul" | b"imulw" | b"imull" | b"imulq" if !has_comma => (RAX, RAX | RDX),
-+        // BMI2 mulx reads %rdx implicitly; both destinations are explicit.
++        b"imul" | b"imulb" | b"imulw" | b"imull" | b"imulq" if !has_comma => {
++            (RAX | RDX, RAX | RDX)
++        }
++        // BMI2 mulx reads %rdx implicitly, writes only its explicit dests.
 +        b"mulx" | b"mulxl" | b"mulxq" => (RDX, 0),
 +        // String instructions: %rsi source, %rdi destination, %rax data.  The
-+        // pointer registers are post-incremented, i.e. also written.
++        // address registers are advanced by the instruction, so they count as
++        // writes as well as reads.
 +        b"movsb" | b"movsw" | b"movsl" | b"movsq" | b"cmpsb" | b"cmpsw" | b"cmpsl" | b"cmpsq" => {
 +            (RSI | RDI, RSI | RDI)
 +        }
 +        b"stosb" | b"stosw" | b"stosl" | b"stosq" | b"scasb" | b"scasw" | b"scasl" | b"scasq" => {
 +            (RAX | RDI, RDI)
 +        }
-+        b"lodsb" | b"lodsw" | b"lodsl" | b"lodsq" => (RSI, RAX | RSI),
-+        b"insb" | b"insw" | b"insl" => (RDX, RDI),
++        b"lodsb" | b"lodsw" | b"lodsl" | b"lodsq" => (RAX | RSI, RSI),
++        b"insb" | b"insw" | b"insl" => (RDX | RDI, RDI),
 +        b"outsb" | b"outsw" | b"outsl" => (RDX | RSI, RSI),
-+        b"in" | b"inb" | b"inw" | b"inl" => (RDX, RAX),
++        b"in" | b"inb" | b"inw" | b"inl" => (RAX | RDX, RAX),
 +        b"out" | b"outb" | b"outw" | b"outl" => (RAX | RDX, 0),
 +        // Serialising / system instructions with fixed register interfaces.
-+        b"cpuid" => (RAX, RAX | RBX | RCX | RDX),
-+        b"rdtsc" => (0, RAX | RDX),
-+        b"rdtscp" => (0, RAX | RCX | RDX),
-+        b"rdpmc" | b"rdmsr" | b"xgetbv" => (RCX, RAX | RDX),
-+        b"wrmsr" | b"xsetbv" => (RAX | RDX | RCX, 0),
-+        b"monitor" | b"mwait" => (RAX | RCX | RDX, 0),
-+        // The xsave family passes its feature mask in %edx:%eax; state goes
-+        // to/from memory, never to a GP register.
-+        b"xsave" | b"xsaveopt" | b"xsavec" | b"xsaves" | b"xrstor" | b"xrstors" | b"xsave64"
-+        | b"xsaveopt64" | b"xsavec64" | b"xsaves64" | b"xrstor64" | b"xrstors64" => (RAX | RDX, 0),
-+        // syscall: number/return in %rax, arguments in rdi/rsi/rdx/r10/r8/r9,
-+        // and the kernel clobbers %rcx/%r11.
-+        b"syscall" => (RAX | RDX | RSI | RDI | R8 | R9 | R10, RAX | RCX | R11),
++        b"cpuid" => (RAX | RBX | RCX | RDX, RAX | RBX | RCX | RDX),
++        b"rdtsc" => (RAX | RDX, RAX | RDX),
++        b"rdtscp" => (RAX | RCX | RDX, RAX | RCX | RDX),
++        b"rdpmc" | b"rdmsr" => (RAX | RCX | RDX, RAX | RDX),
++        b"wrmsr" => (RAX | RCX | RDX, 0),
++        b"xgetbv" => (RAX | RCX | RDX, RAX | RDX),
++        b"xsetbv" => (RAX | RCX | RDX, 0),
++        b"monitor" => (RAX | RCX | RDX, 0),
++        b"mwait" => (RAX | RCX, 0),
++        // XSAVE stores/restores state; the mask comes from EDX:EAX.  No GP
++        // register is written.
++        b"xsave" | b"xsaveopt" | b"xsavec" | b"xsaves" | b"xrstor" | b"xrstors"
++        | b"xsave64" | b"xsaveopt64" | b"xsavec64" | b"xsaves64" | b"xrstor64" | b"xrstors64" => {
++            (RAX | RDX, 0)
++        }
++        // syscall: number/return in %rax, arguments in rdi/rsi/rdx/r10/r8/r9;
++        // the kernel preserves everything except rax/rcx/r11 in the SysV ABI.
++        b"syscall" => (RAX | RCX | RDX | RSI | RDI | R8 | R9 | R10 | R11, RAX | RCX | R11),
 +        b"sysenter" | b"sysexit" | b"sysret" | b"sysretq" => (RAX | RCX | RDX, RAX | RCX | RDX),
 +        // Software interrupt: the handler's register contract is unknown
 +        // (i386 `int $0x80` passes ebx/ecx/edx/esi/edi/ebp and returns eax).
-+        b"int" => (
-+            RAX | RBX | RCX | RDX | RSI | RDI | RBP,
-+            RAX | RBX | RCX | RDX | RSI | RDI | RBP,
-+        ),
-+        // Atomics with an implicit accumulator: %rax holds the compare value
-+        // and is reloaded when the exchange fails.
++        b"int" => (RAX | RBX | RCX | RDX | RSI | RDI | RBP, RAX | RBX | RCX | RDX | RSI | RDI | RBP),
++        // Atomics with an implicit accumulator.
 +        b"cmpxchg" | b"cmpxchgb" | b"cmpxchgw" | b"cmpxchgl" | b"cmpxchgq" => (RAX, RAX),
-+        // CMPXCHG8B/16B compares %edx:%eax (reloaded on failure) against
-+        // memory; %ecx:%ebx are the store payload, read-only.
 +        b"cmpxchg8b" | b"cmpxchg16b" => (RAX | RBX | RCX | RDX, RAX | RDX),
 +        // Misc legacy: table lookup, flags <-> %ah, counted loops.
-+        b"xlat" | b"xlatb" => (RBX, RAX),
-+        b"lahf" => (0, RAX),
++        b"xlat" | b"xlatb" => (RAX | RBX, RAX),
++        b"lahf" => (RAX, RAX),
 +        b"sahf" => (RAX, 0),
 +        b"loop" | b"loope" | b"loopz" | b"loopne" | b"loopnz" => (RCX, RCX),
 +        b"jrcxz" | b"jecxz" => (RCX, 0),
 +        // Frame instructions.
-+        b"enter" => (0, RSP | RBP),
-+        b"leave" | b"leaveq" => (RBP, RSP | RBP),
++        b"enter" | b"leave" | b"leaveq" => (RSP | RBP, RSP | RBP),
++        // x87 status/control stores without an explicit operand write %ax.
++        b"fnstsw" | b"fnstcw" | b"fstcw" => (RAX, RAX),
 +        _ => (0, 0),
 +    };
-+    (reads | table.0, writes | table.1)
++    (refs | table_refs, table_writes)
++}
++
++/// Implicit register READS and WRITES of the instruction (see
++/// [`implicit_register_tables`]).
++pub(super) fn implicit_reg_refs(b: &[u8]) -> u16 {
++    implicit_register_tables(b).0
++}
++
++/// Implicit register WRITES only (the write-side subset of the same table).
++/// Used by the redefinition predicates: an input-only instruction (`mulx`,
++/// `jrcxz`, `sahf`) must not count as a writer.
++pub(super) fn implicit_write_refs(b: &[u8]) -> u16 {
++    implicit_register_tables(b).1
  }
  
  /// Write an integer and the "(%rbp)" suffix into a buffer without using core::fmt.
-@@ -1806,3 +2006,146 @@ pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
+@@ -1806,3 +1963,54 @@ pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
      };
      REG_NAMES[row][id as usize]
  }
 +
-+// ── tests: the implicit-operand oracle ───────────────────────────────────────
-+
 +#[cfg(test)]
-+mod implicit_oracle_tests {
++mod tests {
 +    use super::*;
 +
-+    const RAX: u16 = 1 << 0;
-+    const RCX: u16 = 1 << 1;
-+    const RDX: u16 = 1 << 2;
-+    const RBX: u16 = 1 << 3;
-+    const RSI: u16 = 1 << 6;
-+    const RDI: u16 = 1 << 7;
-+    const R8: u16 = 1 << 8;
-+    const R9: u16 = 1 << 9;
-+    const R10: u16 = 1 << 10;
-+    const R11: u16 = 1 << 11;
-+
-+    fn reads(line: &str) -> u16 {
-+        implicit_read_refs(line.trim().as_bytes())
-+    }
-+    fn writes(line: &str) -> u16 {
-+        implicit_write_refs(line.trim().as_bytes())
-+    }
-+    fn touches(line: &str) -> u16 {
-+        implicit_reg_refs(line.trim().as_bytes())
++    #[test]
++    fn implicit_register_table_sides() {
++        // Refs include reads AND writes; the write side is the subset that
++        // redefinition checks must see (`cqto` clobbers %rdx; `mulx` and
++        // `jrcxz` only read).
++        assert_eq!(implicit_reg_refs(b"cqto"), (1 << 0) | (1 << 2));
++        assert_eq!(implicit_write_refs(b"cqto"), 1 << 2);
++        assert_eq!(implicit_reg_refs(b"idivq %r11"), (1 << 0) | (1 << 2));
++        assert_eq!(implicit_write_refs(b"idivq %r11"), (1 << 0) | (1 << 2));
++        assert_eq!(implicit_reg_refs(b"mulx %r9, %r8"), 1 << 2);
++        assert_eq!(implicit_write_refs(b"mulx %r9, %r8"), 0);
++        assert_eq!(implicit_reg_refs(b"imulq %r11"), (1 << 0) | (1 << 2));
++        assert_eq!(implicit_write_refs(b"imulq %r11"), (1 << 0) | (1 << 2));
++        assert_eq!(implicit_write_refs(b"imulq %r11, %r12"), 0);
++        assert_eq!(implicit_write_refs(b"imulq $3, %r11, %r12"), 0);
++        assert_eq!(implicit_reg_refs(b"rep movsb"), (1 << 1) | (1 << 6) | (1 << 7));
++        assert_eq!(implicit_write_refs(b"rep movsb"), (1 << 6) | (1 << 7));
++        assert_eq!(implicit_reg_refs(b"stosq"), (1 << 0) | (1 << 7));
++        assert_eq!(implicit_write_refs(b"stosq"), 1 << 7);
++        assert_eq!(implicit_reg_refs(b"jrcxz .L1"), 1 << 1);
++        assert_eq!(implicit_write_refs(b"jrcxz .L1"), 0);
++        assert_eq!(implicit_write_refs(b"xlatb"), 1 << 0);
++        assert_eq!(implicit_write_refs(b"lahf"), 1 << 0);
++        assert_eq!(implicit_write_refs(b"sahf"), 0);
++        assert_eq!(implicit_write_refs(b"loop .L1"), 1 << 1);
++        assert_eq!(implicit_write_refs(b"cmpxchg8b (%rdi)"), (1 << 0) | (1 << 2));
++        assert_eq!(implicit_write_refs(b"cpuid"), (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3));
++        assert_eq!(implicit_write_refs(b"syscall"), (1 << 0) | (1 << 1) | (1 << 11));
++        assert_eq!(implicit_write_refs(b"leave"), (1 << 4) | (1 << 5));
++        // Labels, directives and comments contribute nothing.
++        assert_eq!(implicit_reg_refs(b".LBB1:"), 0);
++        assert_eq!(implicit_reg_refs(b"# comment"), 0);
 +    }
 +
 +    #[test]
-+    fn the_widening_branch_writes_rdx_and_only_reads_rax() {
-+        // The heart of the stress-lab `intexpr` seed 1 miscompile: `cqto`
-+        // rewrote %rdx while being invisible to every textual scan.
-+        assert_eq!(touches("    cqto"), RAX | RDX);
-+        assert_eq!(reads("    cqto"), RAX);
-+        assert_eq!(writes("    cqto"), RDX);
-+        for m in ["cwtd", "cltd", "cqto", "cwd", "cdq", "cqo"] {
-+            assert_eq!(writes(m), RDX, "{m}");
-+            assert_eq!(reads(m), RAX, "{m}");
-+        }
-+    }
-+
-+    #[test]
-+    fn in_place_extensions_read_and_write_the_accumulator() {
-+        for m in ["cbtw", "cwtl", "cltq", "cbw", "cwde", "cdqe"] {
-+            assert_eq!(touches(m), RAX, "{m}");
-+        }
-+    }
-+
-+    #[test]
-+    fn integer_division_names_its_implicit_pair_exactly() {
-+        assert_eq!(writes("    idivq %r11"), RAX | RDX);
-+        assert_eq!(reads("    idivq %r11"), RAX | RDX);
-+        assert_eq!(writes("    divl %ecx"), RAX | RDX);
-+        // SSE divides/multiplies have fully explicit operands: a prefix
-+        // match against "div"/"mul" would tax every FP loop with a
-+        // phantom accumulator pair.
-+        assert_eq!(touches("    divsd %xmm0, %xmm1"), 0);
-+        assert_eq!(touches("    mulsd %xmm0, %xmm1"), 0);
-+        assert_eq!(touches("    mulpd %xmm0, %xmm1"), 0);
-+        // The byte forms divide/multiply AX: quotient AL, remainder AH,
-+        // product AX — the %rdx family is never touched.
-+        assert_eq!(writes("    idivb %r11b"), RAX);
-+        assert_eq!(writes("    mulb %cl"), RAX);
-+    }
-+
-+    #[test]
-+    fn single_operand_imul_is_the_widening_form() {
-+        assert_eq!(writes("    imulq %r11"), RAX | RDX);
-+        assert_eq!(reads("    imulq %r11"), RAX);
-+        // The two/three-operand forms name every register they touch.
-+        assert_eq!(touches("    imulq %rcx, %rax"), 0);
-+        assert_eq!(touches("    imulq $5, %rcx, %rax"), 0);
-+    }
-+
-+    #[test]
-+    fn system_instructions_have_their_contract() {
-+        // The kernel returns in %rax and destroys %rcx/%r11; the argument
-+        // registers are read-only inputs.
-+        assert_eq!(writes("    syscall"), RAX | RCX | R11);
-+        assert_eq!(reads("    syscall") & RDI, RDI);
-+        assert_eq!(reads("    syscall") & (R8 | R9 | R10), R8 | R9 | R10);
-+        assert_eq!(writes("    cpuid"), RAX | RBX | RCX | RDX);
-+        assert_eq!(writes("    rdtsc"), RAX | RDX);
-+        // rdtscp additionally returns the TSC_AUX in %rcx; rdtsc does not.
-+        assert_eq!(writes("    rdtscp"), RAX | RCX | RDX);
-+    }
-+
-+    #[test]
-+    fn rep_prefixes_contribute_the_count_register() {
-+        assert_eq!(touches("    rep stosq"), RCX | RAX | RDI);
-+        assert_eq!(writes("    rep stosq"), RCX | RDI);
-+        assert_eq!(writes("    repne scasq"), RCX | RDI);
-+        // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
-+        // counted loops: they touch no register at all.
-+        assert_eq!(touches("    rep ret"), 0);
-+        assert_eq!(touches("    rep nop"), 0);
-+    }
-+
-+    #[test]
-+    fn string_primitives_post_increment_their_pointers() {
-+        assert_eq!(writes("    movsq"), RSI | RDI);
-+        assert_eq!(writes("    movsl"), RSI | RDI);
-+        assert_eq!(writes("    lodsq"), RAX | RSI);
-+        assert_eq!(reads("    lodsq"), RSI);
-+        // movslq is a sign-extending move, not a string primitive — the
-+        // two differ by exactly one letter and one semantic universe.
-+        assert_eq!(touches("    movslq %eax, %rax"), 0);
-+    }
-+
-+    #[test]
-+    fn cmpxchg8b_reads_the_payload_and_reloads_the_compare() {
-+        assert_eq!(reads("    cmpxchg8b (%rdi)"), RAX | RBX | RCX | RDX);
-+        assert_eq!(writes("    cmpxchg8b (%rdi)"), RAX | RDX);
-+    }
-+
-+    #[test]
-+    fn non_instructions_name_nothing() {
-+        assert_eq!(touches(".LBB1:"), 0);
-+        assert_eq!(touches(".cfi_startproc"), 0);
-+        assert_eq!(touches("#APP"), 0);
-+        assert_eq!(touches(""), 0);
-+        assert_eq!(touches("frobnicate"), 0);
-+        // lock alone contributes nothing; the prefixed mnemonic decides.
-+        assert_eq!(touches("    lock"), 0);
-+    }
-+
-+    #[test]
-+    fn the_union_reaches_scan_register_refs() {
-+        // The classified `reg_refs` of a bare `cqto` used to be 0 — the
-+        // exact hole behind the stress-lab intexpr miscompile.
-+        let info = classify_line("    cqto");
-+        assert_eq!(info.reg_refs & RDX, RDX);
-+        assert_eq!(info.reg_refs & RAX, RAX);
-+        let info = classify_line("    idivq %r11");
-+        assert_eq!(info.reg_refs & RDX, RDX);
-+        assert_eq!(info.reg_refs & R11, R11);
-+        let info = classify_line("    syscall");
-+        assert_eq!(info.reg_refs & R11, R11);
-+        // The Cmp kind funnels through the same scan (cmpxchg lives there).
-+        let info = classify_line("    cmpxchgq %rbx, (%rdi)");
-+        assert_eq!(info.reg_refs & RAX, RAX);
++    fn scan_register_refs_unions_the_implicit_set() {
++        // The oracle that every text pass consults must see the architectural
++        // registers too: `cqto` touches `%rdx` even though no text says so.
++        assert_ne!(scan_register_refs(b"cqto") & (1 << 2), 0);
++        assert_ne!(scan_register_refs(b"idivq %r11") & (1 << 2), 0);
++        assert_ne!(scan_register_refs(b"rep movsb") & (1 << 1), 0);
++        // Explicit text still contributes as before.
++        assert_ne!(scan_register_refs(b"movq %rdx, %r8") & (1 << 2), 0);
++        assert_ne!(scan_register_refs(b"movq %rdx, %r8") & (1 << 8), 0);
 +    }
 +}
