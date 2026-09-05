@@ -1,340 +1,3010 @@
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index b5c795b..f1fe1e2 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -891,6 +891,19 @@ pub(crate) fn collect_folded_gep_links_all(func: &IrFunction) -> FxHashMap<u32,
-         out.entry(info.base.0).or_default().push(*dest);
-         out.entry(info.index.0).or_default().push(*dest);
-     }
-+    if std::env::var_os("CCC_DEBUG_FOLDED_INDEX").is_some() {
-+        let mut links: Vec<(&u32, &Vec<u32>)> = out.iter().collect();
-+        links.sort_unstable();
-+        eprintln!(
-+            "[FOLDLINKS] fn={} links={} indexed_gep_map={}",
-+            func.name,
-+            links.len(),
-+            m.len()
+diff --git a/docs/register-allocator.md b/docs/register-allocator.md
+index 09ed12e..cf72aff 100644
+--- a/docs/register-allocator.md
++++ b/docs/register-allocator.md
+@@ -53,6 +53,60 @@ Default eviction is **mode 3** (hotter incoming, victim next-use after
+ incoming end). Mode 5 (exchange) regressed gzip as a default and stays
+ opt-in.
+ 
++### Spill cost model
++
++Two distinct currencies coexist, and the difference is deliberate:
++
++| quantity | definition | used by |
++|----------|------------|---------|
++| `priority` | `(Σ_uses pgo_weight) × 10^min(max_loop_depth, 4)` | modes 1–3, worklist ordering |
++| `spill_cost_at(pos)` | `(Σ_{use > pos} 10^min(depth(block(use)),4) × pgo(use)) × cost_boost` | mode 6 |
++
++`priority` is a **global, single-scalar** estimate: the loop weight is the
++maximum depth over the def block and all use sites, applied uniformly to
++every use. A range with one inner-loop use is therefore priced like a range
++with twenty. `spill_cost_at` is the **position-relative, per-use-frequency**
++model that GCC (`REG_FREQ_FROM_BB`) and LLVM (`MachineBlockFrequencyInfo`)
++both use: each use is weighted by its own block, and uses at or before the
++scan position are excluded because they are sunk cost — they were already
++served from a register.
++
++Backing storage on `LiveRange`: `use_weights` (parallel to `uses`) and
++`suffix_cost` (suffix sums, so the query is a binary search plus one index).
++`cost_boost` is the policy multiplier for reads that are invisible in the IR
++use chain (folded SIB indices, GEP bases folded into addressing, coalesce
++leaders); `regalloc.rs`'s three `bump_*_priority` helpers maintain it
++alongside `priority`.
++
++**Compatibility contract.** When `use_weights` is empty — hand-built unit
++test ranges, synthetic vector intervals, Phase-2b span ranges — every
++accessor degrades to the unit-weight count, so `remaining_cost(pos)` equals
++the historical `future_uses(pos)` pointwise. `set_uses` clears any stale
++cost table so a replaced use list can never be mis-priced by a leftover
++parallel array.
++
++**Mode 6** keeps every soundness guard of mode 3 (steal-safety, never evict
++an ABI-hinted value, victim's next use strictly past `incoming.end`) and
++changes only the currency. It is opt-in pending a measured win; see
++`engineering/FOLLOWUP-2026-09-05-regalloc-cost-model-and-torture.md` §2.1 for
++the exact measurement plan and the guard-rails (gzip and the Adler DO8 loop
++are where the previous eviction experiments died).
++
++The position-relative order also subsumes the twice-reverted
++"zero-future-use dead victim" experiments. Those failed because they bolted
++a special case onto an unchanged *global* order; under a consistent
++position-relative order a dead victim is simply the cheapest one, and the
++profitability guard is expressed in the same currency as the ranking.
++
++### Reserved registers
++
++The ABI **static-chain** register (`%r10` on x86-64, `%ecx` on i686) is
++removed from every allocatable pool in functions that contain a
++`SetStaticChain`, because that instruction writes the register directly with
++no IR dest — nothing else tells the scan it is redefined before the call.
++Functions with only `GetStaticChain` are unaffected. See
++`reserve_static_chain_reg` in `stack_layout/regalloc_helpers.rs`.
++
+ `CCC_VERIFY_REGALLOC=1` hard-verifies segment interference, final
+ assignments, and eviction occupancy history over a corpus.
+ 
+diff --git a/engineering/FOLLOWUP-2026-09-05-regalloc-cost-model-and-torture.md b/engineering/FOLLOWUP-2026-09-05-regalloc-cost-model-and-torture.md
+new file mode 100644
+index 0000000..e94bb45
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-05-regalloc-cost-model-and-torture.md
+@@ -0,0 +1,444 @@
++# Follow-up work — 2026-09-05 — register-allocator architecture & torture-suite defects
++
++Base: `ms178/lccc` main @ `4927a77403ea080ac0a44daa718a9c7ffede53aa`
++(re-fetched at the end of the session; this is still the tip of `origin/main`,
++so the patch is rebased against the latest main by construction)
++Deliverable: `ms178-1.patch` (cumulative, applies clean on the base)
++Snapshot ledger: `artifacts/SNAPSHOT_LEDGER.md`
++
++---
++
++## 1. Accomplished this session
++
++### 1.1 Correctness — every GCC C torture failure on x86-64 and i686 was root-caused and fixed
++
++Baseline (pristine base, `gcc.c-torture/execute`, 1676 sources × `-O0,-O1,-O2,-O3,-Os`):
++
++| target | cases | baseline pass | baseline run-fail | after |
++|--------|-------|---------------|-------------------|-------|
++| x86-64 | 8380 | 8361 | **7** | **8368 pass, 0 run-fail** (5 ref-compile-skip, 7 ref-run-skip) |
++| i686   | 8380 | not runnable (no multilib in the sandbox) | **8** once runnable | **8355 pass, 0 run-fail** (20 ref-compile-skip, 5 ref-run-skip) |
++
++The i686 corpus is now runnable at all (the sandbox needed `gcc-multilib` +
++`libc6-dev-i386`; `scripts/x86_gcc_torture_i686.py` itself needed no change).
++Without them the runner reports 1676 `reference-compile-skip` and passes
++**vacuously** — check the pass count, not the exit status.
++
++The fifteen failures reduced to **five independent root causes**, each a genuine
++miscompile with a wider blast radius than the test that exposed it.
++
++---
++
++#### RC-1 — `iv_widen` admitted an int→float **conversion** into the integer widening closure
++
++*Exposed by* `20060420-1.c` (`-O2`, `-O3`). *Blast radius:* every
++`K * (float) i` / `(double) i` in a counted loop with an addressing use of `i`.
++
++`iv_widen.rs` classified a cast as a widening extension with
++
++```rust
++to_ty.size() >= 4 && to_ty != Ptr && is_unsigned_ty(to) == is_unsigned_ty(from)
++```
++
++`F32` satisfies all three (size 4, not `Ptr`, and `is_unsigned_ty` answers `false`
++for both `F32` and `I32`, so the "same sign" test succeeds). The cast was therefore
++**dropped** and its consumers re-classified as *integer* closure members:
++
++```
++BinOp { v11 = v10 * F32(11.0) : F32 }      ->  BinOp { v11 = i:I64 * I64(0) : I64 }
++```
++
++`widen_const(F32(11.0))` goes through `to_i64()`, which yields `0`. Every such
++product silently evaluated to **zero**.
++
++Fix — the closure is an *integer* recurrence, enforced at every admission point:
++
++* `Cast`: require `to_ty.is_integer()` before `WidenCast`; int→float now falls into
++  the `NarrowCast` arm, which correctly retains it as `Cast { from_ty: wide_ty }`
++  (i.e. `sitofp i64`), so the conversion is both correct *and* one instruction shorter.
++* `BinOp` / `Cmp` / `Select`: an `!ty.is_integer()` gate placed **before** the
++  `ty.size() >= 8` "wide chain op" shortcut — `F64`/`D64` also satisfy `size >= 8`
++  and slipped through it.
++* `widen_const` now returns `Option` and refuses non-integer constants instead of
++  fabricating `0`.
++* New `plan_is_integral()` re-checks the whole plan against the live IR inside
++  `verify_plan`, before any mutation. `NarrowCast` is exempt by design (its
++  `orig_ty` is the conversion *target*).
++* `escape_read_needs_narrow` was unconditionally letting `Cast`/`Cmp`/`Phi` read the
++  widened value; it now checks the reader's own declared type
++  (`wide_read_is_type_correct`). This was a second, independent instance of the same
++  width lie, caught by the new regression test's `escape_f32` case.
++
++Test: `tests/regression/iv_widen_float_conversion_closure.c` (10 shapes: f32/f64/long
++double, signed and unsigned IVs, both operand orders, mul/add/sub/div, a float select,
++a float compare, the IV escaping into a float, and the exact `20060420-1.c` shape with
++a cold `noreturn` call to keep the vectorizer away). **Verified to fail on the unfixed
++compiler** and pass at `-O0..-Os` and against GCC.
++
++---
++
++#### RC-2 — call arguments recorded a **storage-level** type instead of the value's real type
++
++*Exposed by* `pr59229.c`, `pr109938.c`, `pr109986.c` (all `-O0`).
++*Blast radius:* every `size_t` parameter fed by an `int` expression.
++
++`get_expr_type` answers a storage-level question and reports `I64` on LP64 for an
++`IntLiteral` operand, so `i + 1` was typed `I64` even though the emitted `BinOp`
++correctly carries `ty: I32`. That disagreement went straight into
++`CallInfo::arg_types`:
++
++```
++__builtin_memcmp(p, q, i + 1)
++  ->  args: [.., v:I32],  arg_types: [.., I64]     (no conversion at all)
++```
++
++At `-O0` the value lives in a 4-byte slot and the 8-byte argument load pulled the
++**adjacent slot** in as its high half:
++
++```asm
++movl %eax, -36(%rbp)     # length (4 bytes)
++movl $1,   -32(%rbp)     # neighbour
++movq -36(%rbp), %rdx     # %rdx = 0x1_00000007   <-- memcmp runs off both buffers
++```
++
++With a prototype in scope the same lie produced `Cast { from_ty: I64, to_ty: U64 }`
++— a same-width **no-op** where C requires `int -> size_t` to sign-extend first
++(C11 6.3.1.3), so a negative length was zero-extended.
++
++Fix:
++
++* `expr_calls.rs` and the `BuiltinKind::LibcAlias` path now derive the argument's
++  source type from `value_ir_type` — the query whose own doc comment says it exists
++  for exactly this ("conversion boundaries must use `value_ir_type`"). It differs
++  from `get_expr_type` only for `BinaryOp` and `!x`, i.e. precisely the expressions
++  whose materialised width can be narrower than their storage width.
++* New `builtins::libc_alias_param_types()` gives the `mem*`/`str*`/`*_chk` families
++  their real signatures, so a `__builtin_*` call performs the parameter conversions
++  even in a TU that never declared the libc symbol.
++
++Test: `tests/regression/builtin_size_t_arg_width.c`.
++
++---
++
++#### RC-3 — the ABI **static-chain register** was allocatable across a nested call
++
++*Exposed by* `920501-7.c` (`-O1`, `-O2`, `-O3`, `-Os`). *This is an RA defect.*
++
++`SetStaticChain` is lowered as a direct write of `%r10` (x86-64) / `%ecx` (i686)
++immediately before the call. It carries no IR dest, so nothing tells the linear scan
++that the register is redefined there:
++
++```asm
++movl 48(%rsp), %r10d
++subl $1, %r10d          # a-1 lives in %r10
++movq %r11, %r10         # SetStaticChain -- clobbers a-1
++movq %r11, %rdi         # arg0 relayed through the now-equal r11
++call x.y                # y(chain) instead of y(a-1): infinite recursion -> SIGSEGV
++```
++
++It failed at **any** recursion depth, so the `dg-add-options stack_size` framing was
++misleading; this was never a stack-depth problem.
++
++Fix: `reserve_static_chain_reg()` removes the chain register from
++`available_regs` / `caller_saved_regs` / `call_arg_regs` / `indirect_target_regs`
++for functions that actually contain a `SetStaticChain`. Functions with only
++`GetStaticChain` (a nested callee that never calls a sibling) are deliberately
++unaffected — the chain is read once at entry into an ordinary home, and reserving
++there would cost a register for nothing.
++
++Per-point modelling of one hard register was rejected: it would add interference
++surface to every ordinary function for a construct that is vanishingly rare.
++
++Tests: `tests/regression/nested_fn_static_chain_regalloc.c` (recursion + non-local
++goto, five live values across a nested call, loop-carried state across a nested call,
++a nested call in a conditional) plus three unit tests in `regalloc_helpers.rs`.
++
++---
++
++#### RC-5 — a fused div/rem pair was allowed to have the **same** flavour
++
++*Exposed by* eight i686 tests at `-O0`/`-O1`: `20040811-1.c`, `vla-dealloc-1.c`,
++`pr43220.c`, `981001-1.c`, `20000511-1.c`, `ssad-run.c`, `usad-run.c`.
++*Blast radius:* any basic block containing two div-like operations on identical
++operands that CSE did not fold.
++
++One `idivl`/`divl` yields the quotient in `%eax` and the remainder in `%edx`, so a
++fused pair is only meaningful when the two consumers want **different** halves.
++Every emitter derives the register split from the *head's* flavour alone —
++
++```rust
++let div_dest = if self_is_div { *dest } else { Value(partner_dest) };
++let rem_dest = if self_is_div { Value(partner_dest) } else { *dest };
++let _ = partner_from_eax;   // "flavour already encoded in the dest split above"
++```
++
++— i.e. they all *assume* the flavours differ (the AArch64 partner map does not even
++carry the tail's flavour). `compute_i686_divrem_pairs` never enforced it: it paired
++any two div-likes in a block with identical operands and matching signedness. Two
++same-flavour operations compute the *same value* — a CSE miss, not a fusion
++opportunity — and the tail was then stored from the wrong register:
++
++```asm
++movl %edi, %eax      # %edi held n / 1000, but this is x[n % 1000]
++shll $2, %eax
++addl -24(%ebp), %eax
++movl $2, (%eax)      # index up to 999 into an (n % 1000 + 1)-element VLA
++```
++
++The three VLA tests looked like stack-exhaustion failures (they carry
++`dg-add-options stack_size`), but they failed at **any** recursion/iteration count:
++the `%esp` save/restore around the VLA was correct all along, and the SIGSEGV was
++this out-of-bounds store.
++
++Fix: require `div_flavor(op_i) != div_flavor(op_j)` when pairing, in the shared
++`compute_i686_divrem_pairs` (so x86-64 and AArch64 are covered too), and turn the
++emitter's silent assumption into a `debug_assert_eq!(partner_from_eax, !self_is_div)`.
++
++Test: `tests/regression/divrem_pair_opposite_flavour.c` — two `SRem`s, two `SDiv`s,
++two `URem`s, two `UDiv`s, three-of-a-kind followed by a legitimate opposite-flavour
++pair, both orders of the pair that *should* fuse, the constant-divisor
++(magic-number) head path, and the exact repeated-`n % 1000`-indexes-a-VLA shape,
++all over negative/zero/large operands against `volatile` references.
++
++---
++
++#### RC-4 — a 256-bit reduction accumulator declared itself 128-bit
++
++*Exposed by* `tests/regression/vector_guard_sum.c`, which was **already failing on
++the pristine base** (`nat=279` vs GCC's `651`). Found by running the repo's own
++regression suite; verified pre-existing by rebuilding at `4927a77`.
++
++`IntrinsicOp::vector_result_width()` is the single authority for both the protected
++slot size and the width of every copy the backend emits for a vector value.
++`VecMaskedAddI32x8` folds eight I32 lanes into an I32x8 accumulator (`vpaddd %ymm`),
++but it had been grouped with its 128-bit **widening** sibling
++`VecWidenMaskedAddI32x4ToI64x2` (whose I64x2 result genuinely is 128-bit).
++
++Consequence: the accumulator's loop-carried copy was emitted as legacy
++`movdqa %xmm3, %xmm2`, which **preserves** bits 255:128 of the destination. The upper
++four lanes never advanced:
++
++```
++low half   = A[0..3] and A[8..11] masked  = 1 + 36+43+50+57 = 187
++high half  = never accumulated            = 0
++scalar tail A[16]                         = 92
++                                            187 + 92 = 279   <-- observed
++```
++
++The generalized unit test written for the fix then found **three more instances of
++the same copy-paste defect** in the same list: `VecLoadI64x4`, `VecAddI64x4` and
++`VecZeroI64x4` (4 × i64 = 32 bytes) were also declared 16, and
++`VecHorizontalAddI64x4` was listed at all — violating the table's own documented
++invariant that `VecHorizontalAdd*` reduces to a **scalar** and must never appear.
++Those four are latent today (x86 has no lowering for the `I64x4` family and
++`vec_interleave` deliberately excludes it), but they are loaded guns; all are fixed.
++
++Tests: two unit tests in `src/ir/intrinsics.rs`, one pinning the two masked
++reduction steps, one asserting generally that the declared width agrees with the lane
++count in the operation's name and that no `VecHorizontalAdd*` claims a vector width.
++
++---
++
++### 1.2 Register allocator — the cost model became position-relative and per-use
++
++This is the architectural half of the session. It changes *what the allocator
++believes a spill costs*, which is the heart of any allocator, without touching the
++backend's value→location model (so it carries no plumbing risk).
++
++**Three structural defects in the old model.**
++
++1. **One loop-depth scalar for a whole range.**
++   `priority = (Σ_uses pgo_weight) × 10^min(max_loop_depth, 4)`.
++   The depth is the *maximum* over the def block and all use sites, applied uniformly
++   to every use. A value with one use at depth 3 and twenty uses outside is priced
++   exactly like a value with twenty-one uses at depth 3. Both GCC
++   (`REG_FREQ_FROM_BB`) and LLVM (`MachineBlockFrequencyInfo`) weight **per use site**.
++
++2. **A global number used at a position-dependent decision.**
++   `select_evict_victim` compared `incoming.priority > victim.priority`. At scan
++   position `p`, the victim's uses *before* `p` are sunk cost — they were already
++   served from a register. Comparing lifetime totals systematically over-protects a
++   victim that is nearly dead.
++
++   This is the defect the repo previously groped at twice with a bolted-on
++   "zero-future-use dead victim" override (once as a ranking override, once as a
++   last resort). Both were measured and reverted because they perturbed the eviction
++   cascade in unrolled kernels (zlib-ng Adler DO8: 59.9 → 70.4 ms). They failed
++   because they were special cases layered on an *unchanged* global order. Making the
++   whole order position-relative subsumes the case: a dead victim is simply the
++   cheapest one, and the profitability guard is expressed in the same currency as the
++   ranking.
++
++3. **The spill-weight denominator was the fat envelope**, not the occupied length,
++   even though hole-aware segment coverage is already computed (RA-05).
++
++**What landed** (`src/backend/live_range.rs`):
++
++| addition | meaning |
++|----------|---------|
++| `use_weights: Vec<u64>` | per-use frequency: `10^min(depth(block(use)),4) × pgo(use)` |
++| `suffix_cost: Vec<u64>` | suffix sums, so `remaining_cost` is a binary search + one index |
++| `cost_boost: u64` | policy multiplier for reads invisible in the IR use chain |
++| `occupancy_len: u32` | Σ segment lengths, maintained by `set_segments` |
++| `remaining_cost(pos)` | weighted cost of uses **strictly after** `pos` |
++| `total_cost()`, `spill_cost_at(pos)`, `occupied_points()` | derived queries |
++| `set_uses_weighted()` | joint sort, duplicate use points **sum** their weights |
++| `point_loop_depths()` | the program-point → block-depth table (LLVM's `MBFI` analogue) |
++
++`select_evict_victim` gained **mode 6**, which keeps every soundness guard of mode 3
++(steal-safety, never evict an ABI-hinted value, victim's next use must be past
++`incoming.end`) and swaps only the *currency*: `spill_cost_at(incoming.start)`
++instead of the global `priority`.
++
++The three policy boosts in `regalloc.rs` (`bump_coalesce_group_priority`,
++`bump_folded_index_priority`, `bump_gep_base_priority`) now also scale `cost_boost`,
++so folded SIB indices, folded GEP bases and coalesce-group leaders keep their
++structural weight in the new currency.
++
++**Backwards compatibility is exact.** When `use_weights` is empty — hand-built unit
++test ranges, synthetic vector intervals, the Phase-2b span ranges — every accessor
++degrades to the unit-weight count, so `remaining_cost(pos) == future_uses(pos)`
++pointwise. `set_uses` clears any stale cost table. A dedicated unit test asserts the
++equivalence at every position, and another asserts that modes 1–3 reach an identical
++decision whether or not weights happen to be attached.
++
++**Default is unchanged (`CCC_EVICT_MODE=3`).** Mode 6 is opt-in until it has a
++measured win on the benchmark corpus. Given this repo's documented history of
++eviction-knob regressions, flipping the default without evidence would be exactly the
++mistake the negative-results ledger warns about. See §2.1.
++
++12 new unit tests in `live_range.rs` cover the cost table, its degradation path, the
++`cost_boost` saturation behaviour, `occupied_points`, and four mode-6 behaviours
++(evicts the value dead at the scan point; refuses a hotter *remaining* value; ranks by
++per-use frequency rather than max depth; keeps the mode-3 soundness guards).
++
++---
++
++### 1.3 Validation
++
++| gate | result |
++|------|--------|
++| `scripts/run_regression_suite.sh` | **624 PASS / 0 FAIL / 7 SKIP**, AB-diff failures 0 (baseline was 622 PASS / 1 FAIL) |
++| `gcc.c-torture/execute` x86-64, `-O0..-Os` | see §1.1 |
++| `gcc.c-torture/execute` i686, `-O0..-Os` | see §1.1 |
++| `cargo test --lib` (new tests) | 12 cost-model + 3 static-chain + 2 vector-width + 3 libc-signature |
++| new regression tests | 5 files, each verified to FAIL on the unfixed compiler and to match GCC at `-O0..-Os` on both targets |
++
++Every fix was snapshotted immediately after validation (`artifacts/SNAPSHOT_LEDGER.md`),
++and `/home/user/ms178-1.patch` is refreshed on every snapshot.
++
++---
++
++## 2. To-do — ordered by expected value
++
++### 2.1 Measure mode 6 and decide the default  *(highest value, lowest risk)*
++
++The machinery is in and tested; only the evidence is missing. Required before flipping
++`evict_mode()`'s default from 3 to 6:
++
++1. `scripts/ra_quality_census.py --json` with `CCC_EVICT_MODE` unset vs `=6`, over
++   `tests/benchmark/programs` + `tests/benchmark/kernel_corpus`. The census buckets
++   (`stkref`, `rrmov`, `push`, `insns`) are deterministic and are the right primary
++   signal on a VM with no PMU.
++2. `tests/benchmark/run_benchmarks.py --reps 21` paired, for the workloads the
++   BACKLOG names as RA-sensitive: `gzip_crc32`, `zlib_ng_adler32`, `nbody`,
++   `spectral_norm`, `mandelbrot`, `expat_xml_scan`, `sqlite_varint`.
++   Point a wrapper script at `--ccc` that sets `CCC_EVICT_MODE=6` to get paired
++   randomized rounds from the existing harness.
++3. Guard-rails: gzip must not regress (mode 5 died here), and the Adler DO8 loop must
++   not regress (the dead-victim experiments died there).
++
++Expect the largest movement in functions with long-lived values whose uses cluster
++early — `longest_match`'s preheader values are the canonical case.
++
++### 2.2 RA-06 — reload-at-next-use / in-place splitting
++
++Still the #1 generated-code gap (BACKLOG: 3–5× spill traffic). The cost model
++delivered here is the missing *input* to it: a Belady/next-use-distance spiller needs
++exactly `remaining_cost` and a next-use distance, both of which now exist per range.
++
++Recommended architecture (unchanged from the session's analysis, now better
++supported):
++
++* The volatile-alloca IR dance in `split_ranges.rs` is an explicit anti-goal and the
++  current heuristic is very narrow (simple GPR type, non-phi, all call sites in one
++  block, `uses >= 4*calls+5`).
++* Prefer decoupled **spill-then-color** (Braun–Hack, CGO 2009) over LLVM's
++  greedy-with-last-chance-recoloring: compute register pressure per program point,
++  and where pressure exceeds `k` apply Belady MIN using *global next-use distances*
++  to pick the value to spill, materialising the store at the spill point and the
++  reload immediately before the next use as a fresh SSA name. Phase 2 (the existing
++  scan / Tier-2 colorer) then runs on IR that is approximately `k`-colorable.
++* The one real blocker remains unchanged: the assignment result is a single
++  value→location map, so a value cannot be in a register at one point and a slot at
++  another. Splitting in the IR (new SSA names) sidesteps that, which is why the
++  IR-level formulation is the right one for this codebase.
++
++### 2.3 Extend the cost model with rematerialization
++
++`spill_cost_at` currently prices every value's spill identically per weighted use. A
++constant or a `GlobalAddr` costs almost nothing to spill because it can be
++rematerialized, and the backend already has `CCC_NO_GLOBAL_ADDR_REMAT`. Add a
++`RematKind` field populated from the defining instruction and scale `spill_cost_at`
++by it. This is LLVM's `LiveRangeEdit::canRematerializeAt` in miniature and directly
++serves BACKLOG RA-01/RA-01b.
++
++### 2.4 Use `occupied_points()` in `calculate_spill_weight`
++
++`occupancy_len` is now maintained but `calculate_spill_weight` still divides by the
++fat envelope. Switching the denominator is a one-line change that was deliberately
++*not* made here because it alters mode-3 behaviour and therefore needs its own
++measurement round. Do it as an isolated A/B.
++
++### 2.5 Per-use cost classes
++
++A use that can fold into a memory operand (`addl slot, %reg`) is much cheaper to
++spill than one that needs a reload into a register (a SIB base, a shift count). LLVM
++models this via `mayFoldMemoryOperand`. `RegAllocConfig::folded_index_uses` and
++`never_materialized` already carry most of the needed information; feeding it into
++`use_weights` would sharpen the model further.
++
++### 2.6 Remaining unfinished items from the session brief
++
++Not reached; the session was spent on the four miscompiles and the cost-model
++architecture, which were prerequisites (a defect-free baseline is required before any
++performance measurement is trustworthy).
++
++* Godbolt oracle comparison runs (`scripts/godbolt.py compare`,
++  `scripts/codegen_oracle.py`, `scripts/tune_oracle.py`) against GCC 16.2 /
++  Clang 23.1 / ICX / ICC. **The oracle is live and verified reachable from the
++  sandbox** (`scripts/godbolt.py list --filter 'gcc 16.2'` resolves `cg162`), so this
++  is ready to run.
++* The linker oracle's build/version preferences.
++* mold (X86+i686-only CMake preset) — not installed in this sandbox; the fastbuild
++  script correctly falls back to `gcc` + `bfd`. No `clang` either.
++* The BACKLOG's "10 worst results" table (gzip `longest_match` 118 stack refs,
++  zlib-ng Adler ~1.50×, nbody/spectral/mandelbrot 1.23/1.31/1.23, …) — these are
++  RA-01/RA-02/RA-03/RA-06 items and are gated on §2.1/§2.2.
++
++---
++
++## 3. Environment notes for the next agent
++
++* Rust **1.98.0** via rustup in `/home/user/.cargo`; **every new shell must
++  `export PATH=/home/user/.cargo/bin:$PATH`** (the `bash` tool sources no shell rc).
++* 8 GiB `/swapfile` is active (`scripts/ensure_swap.sh`, which `build_lccc_fast.sh`
++  calls itself).
++* 2 cores, 1.9 GiB RAM. `scripts/build_lccc_fast.sh` does a full build in ~2 min and
++  an **incremental rebuild in ~10–45 s** — the REACT cycle is fast; use it.
++* No `clang`, no `mold`, no `icx`, no `qemu`. `gcc` 14.2.0 is the local oracle;
++  Compiler Explorer covers the rest and **is reachable**.
++* `gcc-multilib` + `libc6-dev-i386` were installed via `sudo apt-get`, which works.
++  Without them the i686 torture runner reports 1676 `reference-compile-skip` and
++  passes **vacuously** — check the pass count, not just the exit status.
++* The GCC torture corpus lives at
++  `/home/user/src/gcc/gcc/testsuite/gcc.c-torture/execute` (1676 sources), provisioned
++  by `scripts/ensure_gcc_torture.sh`. A full 5-level run is ~11 min per target at `-j2`.
++* Useful diagnosis recipe used repeatedly this session:
++  `CCC_DISABLE_PASSES=<pass>` and the `CCC_NO_*` kill switches bisect a miscompile to
++  a single pass in seconds; `CCC_DUMP_EACH_PASS=1 CCC_DUMP_FUNC=<fn>` then shows the
++  exact IR delta that pass produced.
++* Always confirm whether a regression-suite failure is **pre-existing** by rebuilding
++  at the base commit (`git stash push -u -- src/ && git checkout <base> -- src/`)
++  before attributing it. `vector_guard_sum` was pre-existing; assuming otherwise
++  would have sent the session chasing its own changes.
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index 674e845..59e8fd0 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -56,6 +56,10 @@ How to gather data (mandatory):
+ | RA-02 | P0 | Keep match IVs (`scan`,`best`,`chain`) in GPR | `live_range.rs` next-use | **M** 248 B frame | stack-mem <20 on gzip `longest_match` | eviction mode 5 global |
+ | RA-03 | P0 | Adler DO8: the reassoc closed form materialises all eight byte temporaries. Refuse the form above the GPR budget or emit GCC's interleaved prefix-sum tree | `reassoc_accum.rs`, `live_range.rs` | **M** 91 vs GCC 63 insns; prefix-sum = ~26 insns, 0 stack | Adler kernel ≤1.15× GCC | unify incoming/victim cost blindly; another eviction knob (modes 2/4/5 measured worse) |
+ | RA-06 | P0 | **Reload-at-next-use + in-place splitting** (historically RA-06a) — the #1 perf gap (3–5× spill traffic). Gate on the `enable_splitting` stub; reuse the sweep-eviction traffic model; start with call-site splits; extend arithmetic-chain copy webs so ONE range carries a recurrence (the naive leader-promotion measured +28 % runtime — see DECISIONS.md) | `live_range.rs`, `regalloc.rs`, `split_ranges.rs` | **C** `live_range.rs:26` "no reload-at-next-use"; **M** adler 1.50× | gzip unregressed; adler ≤1.15×; spill traffic −30…−50 % | IR volatile alloca dance; Wimmer-style rewrite in one step |
++| RA-28 | P0 | **Measure `CCC_EVICT_MODE=6` and decide the default.** The position-relative, per-use-frequency cost model (`LiveRange::{use_weights,suffix_cost,cost_boost}`, `spill_cost_at`) landed with 12 unit tests and mode 6 wired into `select_evict_victim`; only the evidence is missing. Run `ra_quality_census.py --json` (mode 3 vs 6) over programs+kernel_corpus, then `run_benchmarks.py --reps 21` paired on the RA-sensitive set | `live_range.rs` `evict_mode` | **C** `priority` is one scalar for a whole range AND position-independent | census `stkref` down, gzip unregressed, Adler DO8 unregressed | flipping the default without the paired measurement (modes 2/4/5 and both dead-victim variants all died here) |
++| RA-29 | P1 | Feed **rematerializability** into `spill_cost_at`: a constant or `GlobalAddr` def costs almost nothing to spill and the backend already rematerializes them (`CCC_NO_GLOBAL_ADDR_REMAT`). Add `RematKind` from the defining instruction and scale the cost. Direct input to RA-01/RA-01b | `live_range.rs`, `globals.rs` | **C** every value priced identically per weighted use | match-mini GOT count, nbody stack refs | pricing remat at zero (the reload still costs an instruction) |
++| RA-30 | P2 | Switch `calculate_spill_weight`'s denominator from the fat envelope to `occupied_points()` (`occupancy_len` is now maintained by `set_segments`). One line, but it changes mode-3 ranking, so it needs its own A/B round | `live_range.rs` | **C** a huge envelope with tiny coverage looks cheap to spill | isolated A/B, no regression | bundling it with the RA-28 measurement |
++| RA-31 | P2 | Per-use **cost classes**: a use that folds into a memory operand is far cheaper to spill than one needing a reload into a register (SIB base, shift count). `folded_index_uses` / `never_materialized` already carry most of the information; feed it into `use_weights` (LLVM `mayFoldMemoryOperand`) | `regalloc.rs`, `live_range.rs` | **C** all uses weighted alike | census `stkref` | inventing fold rules the emitter does not implement |
+ | RA-07 | P1 | Call-site caller-saved save vs always r12 | `regalloc.rs` `caller_save_spans` | **C** Phase 2b slots | use spans more; prologue stk down | promote r11 to callee-saved |
+ | RA-08 | P1 | Affinity coalescing overlapping copies | `regalloc.rs` `build_coalesce_groups` | **C** disjoint-only | fewer movs, no extra spills | merge overlapping intervals |
+ | RA-09 | P2 | Residual Briggs on spilled | new | **C** | fewer reloads | rename the slot colorer as a GPR allocator |
+diff --git a/engineering/subsystems/register-allocation.md b/engineering/subsystems/register-allocation.md
+index b474843..b91550a 100644
+--- a/engineering/subsystems/register-allocation.md
++++ b/engineering/subsystems/register-allocation.md
+@@ -39,11 +39,36 @@ Default eviction mode 3. Mode 5 lost gzip and stays opt-in.
+ `enable_splitting` is retained as the RA-06 gate; in-scan reload-at-next-use
+ remains the top open item.
+ 
++**Mode 6 (opt-in): position-relative cost.** Modes 1–3 rank victims by the
++global `priority` = `(Σ_uses pgo_weight) × 10^min(max_loop_depth, 4)` — one
++scalar per range, so a single inner-loop use prices a range like twenty, and
++uses already behind the scan point still count. Mode 6 ranks by
++`LiveRange::spill_cost_at(incoming.start)`: per-use block frequency
++(`use_weights` / `suffix_cost`, the `MachineBlockFrequencyInfo` analogue),
++summed only over uses **strictly after** the scan point, times `cost_boost`
++(the policy multiplier the three `bump_*_priority` helpers maintain for reads
++invisible in the IR use chain). Same soundness guards as mode 3; only the
++currency changes. Ranges with no attached `use_weights` degrade exactly to
++the historical unit-weight `future_uses` count, so unenriched scans are
++bit-identical.
++
++The position-relative order subsumes the twice-reverted "zero-future-use
++dead victim" experiments (see [`../DECISIONS.md`](../DECISIONS.md)): those
++bolted a special case onto an unchanged global order, whereas here a dead
++victim is simply the cheapest one under one consistent order.
++
+ `RegAllocConfig` includes call/indirect exclusions, XMM regs, folded index
+ uses, and ABI physical hints.
+ 
+ PhysReg **(11) = %r10** (static chain), (10) = %r11.
+ 
++The static-chain register is **removed from every allocatable pool** in a
++function containing `SetStaticChain` (`reserve_static_chain_reg` in
++`stack_layout/regalloc_helpers.rs`): that instruction writes `%r10` / `%ecx`
++directly with no IR dest, so a value homed there and live across the nested
++call was silently clobbered (gcc.c-torture `920501-7.c`). `GetStaticChain`
++alone is not a trigger.
++
+ ## Open quality gaps
+ 
+ RA-06 reload-at-next-use + arithmetic-chain copy webs (adler 1.63× — the
+diff --git a/src/backend/i686/codegen/alu.rs b/src/backend/i686/codegen/alu.rs
+index dcc5db6..6cce687 100644
+--- a/src/backend/i686/codegen/alu.rs
++++ b/src/backend/i686/codegen/alu.rs
+@@ -1087,7 +1087,15 @@ impl I686Codegen {
+         } else {
+             *dest
+         };
+-        let _ = partner_from_eax; // flavour already encoded in the dest split above
++        // `compute_i686_divrem_pairs` only pairs OPPOSITE flavours, so the
++        // partner's half is exactly the complement of the head's. Assert the
++        // invariant rather than silently trusting it: when it was violated
++        // (two `SRem`s of the same operands) the tail's dest was stored from
++        // %eax and received the QUOTIENT.
++        debug_assert_eq!(
++            partner_from_eax, !self_is_div,
++            "divrem pair must have opposite flavours (head self_is_div={self_is_div})"
 +        );
-+        for (operand, dests) in links {
-+            eprintln!("[FOLDLINKS]   operand=v{} consumers={:?}", operand, dests);
-+        }
-+    }
-     out
+ 
+         let rem_home = self.dest_reg(&rem_dest).map(|p| p.0);
+         let div_home = self.dest_reg(&div_dest).map(|p| p.0);
+diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
+index 34af23d..255a288 100644
+--- a/src/backend/live_range.rs
++++ b/src/backend/live_range.rs
+@@ -63,6 +63,8 @@ use std::sync::OnceLock;
+ ///   back to the fat envelope and the allocator behaves exactly as before
+ ///   this field existed. Populated by `regalloc.rs` for GPR/XMM scans from
+ ///   `liveness.segments` (coalesce-owner unions for phi webs).
++/// - `use_weights` / `suffix_cost`: the **position-relative cost model**
++///   (see [`LiveRange::remaining_cost`]).
+ #[derive(Debug, Clone)]
+ pub struct LiveRange {
+     pub value_id: u32,
+@@ -89,8 +91,44 @@ pub struct LiveRange {
+     /// Hole-aware live coverage: sorted, disjoint, CLOSED intervals of
+     /// program points. Always a subset of `[start, end]`. See the struct doc.
+     pub segments: Vec<(u32, u32)>,
++    /// Per-use execution frequency, parallel to `uses`.
++    ///
++    /// `use_weights[i]` is the estimated execution count of the block that
++    /// contains `uses[i]` — `10^min(depth(block(uses[i])), 4)` scaled by the
++    /// PGO factor of that point. **Not** a single scalar for the whole range:
++    /// `priority` multiplies every use by `10^max_depth`, which values a
++    /// range with one inner-loop use exactly like a range with twenty.
++    /// GCC (`REG_FREQ_FROM_BB`) and LLVM (`MachineBlockFrequencyInfo`) both
++    /// weight per use site; this field is that model.
++    ///
++    /// Empty = no per-use data. Every accessor then degrades to the
++    /// unit-weight count, i.e. exactly the pre-existing behaviour, so
++    /// hand-built ranges (unit tests, synthetic vector intervals, phase-2b
++    /// span ranges) are bit-identical.
++    pub use_weights: Vec<u64>,
++    /// Suffix sums of `use_weights`: `suffix_cost[i] == Σ_{j≥i} use_weights[j]`,
++    /// with a terminating `0`. Length is `use_weights.len() + 1` whenever
++    /// `use_weights` is non-empty. Makes [`LiveRange::remaining_cost`] a
++    /// binary search plus one index.
++    pub suffix_cost: Vec<u64>,
++    /// Policy multiplier applied on top of the measured use costs.
++    ///
++    /// The allocator's policy layer (`regalloc.rs`) boosts values whose real
++    /// read frequency is invisible in the IR use chain — folded SIB indices,
++    /// GEP bases folded into addressing, coalesce-group leaders. Those
++    /// boosts historically only touched `priority`; the cost model needs the
++    /// same information, and multiplying is the composable way to express
++    /// "this value is read k× more often than the IR shows".
++    pub cost_boost: u64,
++    /// Number of program points actually covered by `segments` (Σ of
++    /// `e - s + 1`). `0` = unknown, use the fat envelope. The *occupied*
++    /// length, not the envelope, is the correct denominator for a
++    /// density-style spill weight: a value with a huge envelope but a tiny
++    /// live coverage barely occupies the register.
++    pub occupancy_len: u32,
  }
  
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 35f577f..dd37c03 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -4363,6 +4363,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                 assignments.len(),
-                 scan_ivs.len()
-             );
-+            // Assignment dump (CCC_RA_EXPLAIN_HOMES=1): every register-homed
-+            // value with its physical register, fat interval and hole-aware
-+            // segments. This is the primary tool for diagnosing "two values
-+            // share a register while both are live" classes of miscompile:
-+            // the segments printed here are exactly what the scan and the
-+            // verifier reason about, so a read the IR does not show (folded
-+            // SIB index, replayed cmp operand) is visible as a segment gap.
-+            if std::env::var_os("CCC_RA_EXPLAIN_HOMES").is_some() {
-+                let mut homes: Vec<(u32, PhysReg)> =
-+                    assignments.iter().map(|(&v, &r)| (v, r)).collect();
-+                homes.sort_unstable_by_key(|&(v, _)| v);
-+                for (v, reg) in homes {
-+                    let fat = iv_map.get(&v).copied();
-+                    let mut segs: Vec<(u32, u32)> = liveness
-+                        .segments
-+                        .iter()
-+                        .filter(|s| s.value_id == v)
-+                        .map(|s| (s.start, s.end))
-+                        .collect();
-+                    segs.sort_unstable();
-+                    eprintln!(
-+                        "[RA-EXPLAIN] home v{} reg={} fat={:?} segments={:?}",
-+                        v, reg.0, fat, segs
-+                    );
-+                }
++
+ impl LiveRange {
+     /// Create a placeholder range. [`build_live_ranges`] overwrites uses,
+     /// priority, hints and spill weight with the real facts.
+@@ -108,6 +146,10 @@ impl LiveRange {
+             spill_weight: loop_weight as f64 / live_span(interval.start, interval.end),
+             cascade: 0,
+             segments: Vec::new(),
++            use_weights: Vec::new(),
++            suffix_cost: Vec::new(),
++            cost_boost: 1,
++            occupancy_len: 0,
+         }
+     }
+ 
+@@ -116,15 +158,129 @@ impl LiveRange {
+     /// must lie within `[start, end]` — the interference tests rely on the
+     /// fat envelope as a conservative superset for mixed fat/segment pairs.
+     pub fn set_segments(&mut self, segments: Vec<(u32, u32)>) {
++        self.occupancy_len = segments
++            .iter()
++            .map(|&(s, e)| e.saturating_sub(s).saturating_add(1))
++            .fold(0u32, |a, b| a.saturating_add(b));
+         self.segments = segments;
+     }
+ 
++    /// Install `uses` together with their per-site execution frequencies.
++    ///
++    /// `weights[i]` belongs to `uses[i]` *before* sorting; the pair is sorted
++    /// jointly and duplicate points are merged by **summing** their weights
++    /// (an instruction reading the same value twice really does pay twice).
++    /// Then the suffix-cost prefix table is built.
++    pub fn set_uses_weighted(&mut self, uses: Vec<u32>, weights: Vec<u64>) {
++        debug_assert_eq!(
++            uses.len(),
++            weights.len(),
++            "set_uses_weighted: uses and weights must be parallel"
++        );
++        let mut pairs: Vec<(u32, u64)> = uses.into_iter().zip(weights).collect();
++        pairs.sort_unstable_by_key(|&(p, _)| p);
++        let mut pts: Vec<u32> = Vec::with_capacity(pairs.len());
++        let mut wts: Vec<u64> = Vec::with_capacity(pairs.len());
++        for (p, w) in pairs {
++            if pts.last() == Some(&p) {
++                let last = wts.last_mut().expect("pts and wts stay parallel");
++                *last = last.saturating_add(w);
++            } else {
++                pts.push(p);
++                wts.push(w);
 +            }
-             for iv in spills {
-                 let reason = if call_spanning.contains(&iv.value_id) {
-                     "callee-pressure"
-@@ -6800,10 +6826,35 @@ pub(crate) fn detect_phi_coalesce_groups(
-         let mut derived: FxHashSet<u32> = FxHashSet::default();
-         derived.insert(phi);
-         for earlier in &block.instructions[..def_idx] {
-+            // Mirror the backend's SIB `resolve_index` peel set exactly:
-+            // widening Cast, GEP, and the constant-operand scale/offset
-+            // arithmetic (`Shl`/`Mul` by a constant → SIB scale,
-+            // `Add`/`Sub` a constant → SIB displacement). Each of these is
-+            // folded away when the access absorbs the chain, so the root
-+            // register is re-read at the Load/Store. Missing the `Shl` arm
-+            // let `xs[i] = 1.0/(i+1)` share `i`'s register with `i+1`: the
-+            // folded `(%base,%i,8)` store then indexed with the incremented
-+            // value (fpweb_dot_and_sum / init_shift_index regression).
-+            let peelable_binop = matches!(
-+                earlier,
-+                Instruction::BinOp {
-+                    op: IrBinOp::Shl | IrBinOp::Mul | IrBinOp::Add | IrBinOp::Sub,
-+                    ..
-+                }
-+            ) && {
-+                let mut has_const = false;
-+                for_each_operand_in_instruction(earlier, |op| {
-+                    if matches!(op, Operand::Const(_)) {
-+                        has_const = true;
-+                    }
-+                });
-+                has_const
-+            };
-             if !matches!(
-                 earlier,
-                 Instruction::Cast { .. } | Instruction::GetElementPtr { .. }
--            ) {
-+            ) && !peelable_binop
-+            {
++        }
++        self.uses = pts;
++        self.rebuild_cost_table(wts);
++    }
++
++    /// Recompute `suffix_cost` from `weights` (which becomes `use_weights`).
++    fn rebuild_cost_table(&mut self, weights: Vec<u64>) {
++        let n = weights.len();
++        let mut suffix = vec![0u64; n + 1];
++        for i in (0..n).rev() {
++            suffix[i] = suffix[i + 1].saturating_add(weights[i]);
++        }
++        self.use_weights = weights;
++        self.suffix_cost = suffix;
++    }
++
++    /// Weighted cost of every use **strictly after** `pos`.
++    ///
++    /// This is the quantity a spill decision at scan position `pos` actually
++    /// trades away: uses at or before `pos` are sunk cost, already paid as
++    /// register reads. Comparing two ranges by their *global* totals (what
++    /// `priority` does) systematically over-protects a victim whose uses are
++    /// nearly all behind the scan point — the exact pathology the repo
++    /// previously papered over with a bolted-on "zero-future-use dead
++    /// victim" override (measured, reverted twice: see the note on
++    /// `select_evict_victim`). Making the cost *position-relative* subsumes
++    /// that special case inside one consistent order.
++    ///
++    /// Falls back to the unweighted future-use count when no per-use data is
++    /// attached, so unenriched ranges behave exactly as before.
++    pub fn remaining_cost(&self, pos: u32) -> u64 {
++        debug_assert_uses_sorted(&self.uses);
++        let i = self.uses.partition_point(|&u| u <= pos);
++        if self.suffix_cost.len() == self.uses.len() + 1 {
++            self.suffix_cost[i]
++        } else {
++            (self.uses.len() - i) as u64
++        }
++    }
++
++    /// Weighted cost of every use in the range (the `pos = 0`-exclusive
++    /// total). Equals `uses.len()` when no per-use data is attached.
++    pub fn total_cost(&self) -> u64 {
++        if let Some(&total) = self.suffix_cost.first() {
++            if self.suffix_cost.len() == self.uses.len() + 1 {
++                return total;
++            }
++        }
++        self.uses.len() as u64
++    }
++
++    /// The value the allocator loses by demoting this range at `pos`:
++    /// the remaining weighted use cost, scaled by the policy multiplier.
++    ///
++    /// Saturating so a pathological boost cannot wrap into a *low* cost and
++    /// make a hot value look free to spill.
++    pub fn spill_cost_at(&self, pos: u32) -> u64 {
++        self.remaining_cost(pos)
++            .saturating_mul(self.cost_boost.max(1))
++    }
++
++    /// Multiply the policy cost boost (see [`LiveRange::cost_boost`]).
++    /// Idempotent-safe under repeated calls only in the sense that the
++    /// caller decides the factor; the allocator never calls this twice for
++    /// the same reason.
++    pub fn boost_cost(&mut self, factor: u64) {
++        self.cost_boost = self.cost_boost.saturating_mul(factor.max(1));
++    }
++
++    /// Number of program points this range actually occupies a register for.
++    /// Segment coverage when known, the fat envelope otherwise.
++    pub fn occupied_points(&self) -> u32 {
++        if self.occupancy_len > 0 {
++            self.occupancy_len
++        } else {
++            self.end.saturating_sub(self.start).saturating_add(1)
++        }
++    }
++
+     /// Install `uses`, enforcing the sorted+unique invariant that the
+     /// binary-search helpers depend on.
++    ///
++    /// Drops any attached per-use cost table: the new use list invalidates
++    /// it, and a stale parallel array would silently mis-price the range.
++    /// Callers that have frequencies should use
++    /// [`LiveRange::set_uses_weighted`].
+     pub fn set_uses(&mut self, mut uses: Vec<u32>) {
+         uses.sort_unstable();
+         uses.dedup();
+         self.uses = uses;
++        self.use_weights.clear();
++        self.suffix_cost.clear();
+     }
+ 
+     /// Recalculate spill weight from the current priority and span.
+@@ -787,28 +943,42 @@ impl LinearScanAllocator {
+     /// Guards (all must pass, unless the victim is already dead at the scan
+     /// point — see below):
+     /// - steal-safe
+-    /// - `incoming.priority > victim.priority` (never evict a hotter value)
++    /// - the incoming must be *strictly more expensive to spill* than the
++    ///   victim (never evict a hotter value)
+     /// - mode 1 only: `victim.loop_depth < incoming.loop_depth`
+     /// - mode ≥ 3: victim's next use is strictly after `incoming.end`
+     ///
+-    /// Note (session 41): a "zero-future-use dead victim" search was
+-    /// prototyped here twice — as a ranking override and as a last resort
+-    /// when the guarded search finds nothing — and both variants were
+-    /// measured and REVERTED. The free demotion is real (the victim has no
+-    /// uses left), but firing it perturbs the eviction cascade in unrolled
+-    /// kernels: the zlib-ng Adler DO8 loop regressed 59.9 → 70.4 ms
+-    /// (+15%, 1.51× → 1.78× vs GCC) because byte temps that grabbed the
+-    /// freed registers shifted pressure onto the later partial-sum temps,
+-    /// which then spilled. The gzip `longest_match` preheader pathology is
+-    /// better served by Phase-1 hot-loop candidacy (see `regalloc.rs`
+-    /// `hot_loop_home`), which keeps the loop-carried values in
+-    /// callee-saved registers without touching the eviction ranking.
+-    /// `CCC_NO_DEAD_EVICT` no longer changes behaviour and is kept only
+-    /// for the documented experiment trail.
++    /// # Cost order (mode 6 vs modes 1–3)
++    ///
++    /// Modes 1–3 rank by the **global** `priority`
++    /// (`Σ uses × 10^max_loop_depth`). Mode 6 ranks by
++    /// [`LiveRange::spill_cost_at`] at the scan point: the *remaining*
++    /// per-use-frequency-weighted cost. Two independent corrections:
++    ///
++    /// 1. **Per-use frequency.** `priority` multiplies every use by
++    ///    `10^max_depth`, so one inner-loop use makes a range as expensive
++    ///    as twenty. The cost model weights each use by its own block.
++    /// 2. **Position relativity.** A victim's uses before the scan point are
++    ///    sunk cost — they were served from a register. Comparing global
++    ///    totals over-protects a nearly-dead victim.
++    ///
++    /// Correction (2) is what the twice-reverted "zero-future-use dead
++    /// victim" experiments were groping for. Both attempts bolted a special
++    /// case on top of the *unchanged* global order (as a ranking override,
++    /// then as a last resort), which perturbed the eviction cascade in
++    /// unrolled kernels: the zlib-ng Adler DO8 loop regressed 59.9 → 70.4 ms.
++    /// Mode 6 instead makes the whole order consistent, so a dead victim is
++    /// simply the cheapest one rather than an out-of-band override, and the
++    /// profitability guard uses the same currency as the ranking.
++    /// `CCC_NO_DEAD_EVICT` no longer changes behaviour and is kept only for
++    /// the documented experiment trail.
+     fn select_evict_victim(&self, incoming: &LiveRange, mode: i32) -> Option<usize> {
+         if self.active.is_empty() || mode <= 0 {
+             return None;
+         }
++        let cost_order = mode >= 6;
++        let pos = incoming.start;
++        let incoming_cost = incoming.spill_cost_at(pos);
+         let mut best_idx: Option<usize> = None;
+         let mut best_priority = u64::MAX;
+         let mut best_next_use = 0u32;
+@@ -829,7 +999,19 @@ impl LinearScanAllocator {
+             if interval.range.reg_hint.is_some() {
                  continue;
              }
-             let mut depends = false;
-@@ -6981,24 +7032,66 @@ pub(crate) fn detect_phi_coalesce_groups(
-                         )
-                 })
-             });
-+            // Liveness-model veto (the authoritative one): the source's
-+            // definition overwrites the phi's home, so the phi may not be
-+            // live at ANY program point strictly inside the update window
-+            // (after the source def, before the latch copy). The hole-aware
-+            // segments consulted here already include every RA-invisible
-+            // read the backend performs at a later position — folded SIB
-+            // index/base reads and replayed compare operands are stretched
-+            // into the segment union by the folded-index extension in
-+            // allocate_registers — so a read the syntactic window walk
-+            // cannot see (a Store whose address chain was peeled through
-+            // `Shl`/`Add` arithmetic) still shows up as a covering segment.
-+            // The syntactic closure above remains as a cheap first filter
-+            // and as coverage for the CCC_NO_FOLDED_INDEX_LIVENESS debug
-+            // configuration, where the extension is off.
-+            let phi_live_in_window = {
-+                let def_point = liveness.block_starts[source_block] + source_def_idx as u32;
-+                let copy_point = liveness.block_starts[block_idx] + copy_idx as u32;
-+                // Closed point ranges that make up the window.
-+                let mut windows: [(u32, u32); 2] = [(1, 0), (1, 0)];
-+                if same_block {
-+                    if copy_point > def_point + 1 {
-+                        windows[0] = (def_point + 1, copy_point - 1);
-+                    }
-+                } else {
-+                    let src_end = liveness.block_ends[source_block];
-+                    if src_end > def_point {
-+                        windows[0] = (def_point + 1, src_end);
-+                    }
-+                    let latch_start = liveness.block_starts[block_idx];
-+                    if copy_point > latch_start {
-+                        windows[1] = (latch_start, copy_point - 1);
+-            if incoming.priority <= interval.range.priority {
++            // Rank key. Mode 6: position-relative weighted spill cost.
++            // Modes 1-3: the historical global priority.
++            let priority = if cost_order {
++                interval.range.spill_cost_at(pos)
++            } else {
++                interval.range.priority
++            };
++            let bar = if cost_order {
++                incoming_cost
++            } else {
++                incoming.priority
++            };
++            if bar <= priority {
+                 continue;
+             }
+             if mode < 2 && interval.range.loop_depth >= incoming.loop_depth {
+@@ -839,7 +1021,6 @@ impl LinearScanAllocator {
+             if mode >= 3 && nxt <= incoming.end {
+                 continue;
+             }
+-            let priority = interval.range.priority;
+             let sw = interval.range.spill_weight;
+             let better = best_idx.is_none()
+                 || priority < best_priority
+@@ -1277,6 +1458,21 @@ fn allocstats_enabled() -> bool {
+ 
+ /// Cached `CCC_EVICT_MODE`. First parse wins for the process so a large TU
+ /// cannot observe a mid-compile env change as two different allocators.
++/// Eviction policy selector (`CCC_EVICT_MODE`).
++///
++/// | mode | victim search | rank key |
++/// |------|---------------|----------|
++/// | 0 | disabled (always demote the incoming) | — |
++/// | 1 | strictly-colder loop depth required | global `priority` |
++/// | 2 | no loop-depth guard | global `priority` |
++/// | 3 | **default** — victim's next use must be past `incoming.end` | global `priority` |
++/// | 5 | exchange ([`LinearScanAllocator::find_exchange_candidate`]) | future-use count |
++/// | 6 | same guards as 3 | **position-relative weighted spill cost** |
++///
++/// Mode 6 is the cost-model-correct order (see
++/// [`LinearScanAllocator::select_evict_victim`]). Mode 3 remains the default
++/// until mode 6 has a measured win on the benchmark corpus; mode 5 lost gzip
++/// and stays opt-in.
+ fn evict_mode() -> i32 {
+     static MODE: OnceLock<Option<i32>> = OnceLock::new();
+     let parsed = *MODE.get_or_init(|| {
+@@ -1295,6 +1491,7 @@ pub fn build_live_ranges(
+ ) -> Vec<LiveRange> {
+     let meta = collect_range_metadata(func, loop_depth);
+     let pgo_point_weights = pgo_point_weights(func);
++    let point_depths = point_loop_depths(func, loop_depth);
+ 
+     let mut ranges: Vec<LiveRange> = intervals
+         .iter()
+@@ -1315,12 +1512,24 @@ pub fn build_live_ranges(
+ 
+     for range in &mut ranges {
+         if let Some(uses) = meta.uses.get(&range.value_id) {
+-            range.set_uses(
+-                uses.iter()
+-                    .copied()
+-                    .filter(|&u| u >= range.start && u <= range.end)
+-                    .collect(),
+-            );
++            let kept: Vec<u32> = uses
++                .iter()
++                .copied()
++                .filter(|&u| u >= range.start && u <= range.end)
++                .collect();
++            // Per-use execution frequency: the loop depth of the block that
++            // contains THIS use, times its PGO factor. `point_depths` is the
++            // program-point -> block-depth table built alongside the same
++            // dense numbering `collect_range_metadata` walks.
++            let weights: Vec<u64> = kept
++                .iter()
++                .map(|&u| {
++                    let d = point_depths.get(u as usize).copied().unwrap_or(0);
++                    loop_depth_weight(d)
++                        .saturating_mul(pgo_point_weights.get(&u).copied().unwrap_or(1))
++                })
++                .collect();
++            range.set_uses_weighted(kept, weights);
+         }
+ 
+         let loop_weight = loop_depth_weight(range.loop_depth);
+@@ -1343,6 +1552,32 @@ pub fn build_live_ranges(
+     ranges
+ }
+ 
++/// Loop depth of the block owning each program point, in the dense numbering
++/// shared by [`build_live_ranges`], [`collect_range_metadata`] and
++/// [`pgo_point_weights`] (one point per instruction, then one per terminator,
++/// in block order).
++///
++/// This is the block-frequency table the per-use cost model needs. Keeping it
++/// as a flat `Vec` indexed by point makes the per-use lookup a bounds-checked
++/// index instead of a hash probe, and makes the numbering contract explicit
++/// in one place instead of implicit in three walks.
++fn point_loop_depths(func: &IrFunction, loop_depth: &[u32]) -> Vec<u32> {
++    let total: usize = func
++        .blocks
++        .iter()
++        .map(|b| b.instructions.len().saturating_add(1))
++        .sum();
++    let mut out = Vec::with_capacity(total);
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        let d = loop_depth.get(block_idx).copied().unwrap_or(0);
++        for _ in &block.instructions {
++            out.push(d);
++        }
++        out.push(d); // terminator point
++    }
++    out
++}
++
+ struct RangeMetadata {
+     def_block: FxHashMap<u32, usize>,
+     max_use_depth: FxHashMap<u32, u32>,
+@@ -1620,6 +1855,10 @@ mod tests {
+             spill_weight: priority as f64 / live_span(start, end),
+             cascade: 0,
+             segments: Vec::new(),
++            use_weights: Vec::new(),
++            suffix_cost: Vec::new(),
++            cost_boost: 1,
++            occupancy_len: 0,
+         };
+         r.set_uses(uses);
+         r
+@@ -2074,4 +2313,257 @@ mod tests {
+             2
+         );
+     }
++
++    // ======================================================================
++    // Position-relative cost model (per-use frequency + suffix costs)
++    // ======================================================================
++
++    /// Build a range whose uses carry explicit per-site frequencies.
++    fn lr_weighted(
++        value_id: u32,
++        start: u32,
++        end: u32,
++        uses_weights: Vec<(u32, u64)>,
++    ) -> LiveRange {
++        let mut r = lr(value_id, start, end, Vec::new(), 1);
++        let (u, w): (Vec<u32>, Vec<u64>) = uses_weights.into_iter().unzip();
++        r.set_uses_weighted(u, w);
++        r
++    }
++
++    /// With no per-use data attached every accessor must reproduce the
++    /// pre-existing unit-weight behaviour exactly. This is the compatibility
++    /// contract that keeps synthetic/hand-built ranges bit-identical.
++    #[test]
++    fn cost_model_degrades_to_use_counts_without_weights() {
++        let r = lr(1, 0, 100, vec![10, 20, 30, 40], 7);
++        assert!(r.use_weights.is_empty());
++        assert_eq!(r.total_cost(), 4);
++        assert_eq!(r.remaining_cost(0), 4);
++        assert_eq!(r.remaining_cost(10), 3);
++        assert_eq!(r.remaining_cost(30), 1);
++        assert_eq!(r.remaining_cost(40), 0);
++        assert_eq!(r.remaining_cost(999), 0);
++        // Identical to the historical future-use count at every position.
++        for pos in 0..=45u32 {
++            assert_eq!(
++                r.remaining_cost(pos),
++                u64::from(LinearScanAllocator::future_uses(&r, pos)),
++                "remaining_cost must equal future_uses at pos {pos}"
++            );
++        }
++    }
++
++    #[test]
++    fn suffix_costs_are_exact_and_position_relative() {
++        let r = lr_weighted(1, 0, 100, vec![(10, 1), (20, 10), (30, 100), (40, 1)]);
++        assert_eq!(r.use_weights, vec![1, 10, 100, 1]);
++        assert_eq!(r.suffix_cost, vec![112, 111, 101, 1, 0]);
++        assert_eq!(r.total_cost(), 112);
++        assert_eq!(r.remaining_cost(0), 112);
++        assert_eq!(r.remaining_cost(10), 111);
++        assert_eq!(r.remaining_cost(19), 111);
++        assert_eq!(r.remaining_cost(20), 101);
++        assert_eq!(r.remaining_cost(30), 1);
++        assert_eq!(r.remaining_cost(40), 0);
++    }
++
++    /// Two reads of the same value by one instruction really do cost twice.
++    #[test]
++    fn duplicate_use_points_sum_their_weights() {
++        let r = lr_weighted(1, 0, 50, vec![(10, 3), (10, 4), (20, 5)]);
++        assert_eq!(r.uses, vec![10, 20]);
++        assert_eq!(r.use_weights, vec![7, 5]);
++        assert_eq!(r.total_cost(), 12);
++        assert_eq!(r.remaining_cost(10), 5);
++    }
++
++    #[test]
++    fn unsorted_weighted_uses_are_sorted_jointly() {
++        let r = lr_weighted(1, 0, 50, vec![(30, 100), (10, 1), (20, 10)]);
++        assert_eq!(r.uses, vec![10, 20, 30]);
++        assert_eq!(r.use_weights, vec![1, 10, 100]);
++        assert_eq!(r.remaining_cost(15), 110);
++    }
++
++    #[test]
++    fn set_uses_invalidates_a_stale_cost_table() {
++        let mut r = lr_weighted(1, 0, 50, vec![(10, 1000)]);
++        assert_eq!(r.total_cost(), 1000);
++        r.set_uses(vec![10, 20, 30]);
++        assert!(r.use_weights.is_empty(), "stale weights must be dropped");
++        assert_eq!(r.total_cost(), 3, "falls back to the unit-weight count");
++        assert_eq!(r.remaining_cost(10), 2);
++    }
++
++    #[test]
++    fn cost_boost_scales_and_saturates() {
++        let mut r = lr_weighted(1, 0, 50, vec![(10, 2), (20, 3)]);
++        assert_eq!(r.spill_cost_at(0), 5);
++        r.boost_cost(64);
++        assert_eq!(r.cost_boost, 64);
++        assert_eq!(r.spill_cost_at(0), 320);
++        assert_eq!(r.spill_cost_at(10), 192);
++        // A zero factor must not zero out the cost.
++        r.boost_cost(0);
++        assert_eq!(r.cost_boost, 64);
++        // Saturation, never wraparound into a bogus *low* cost.
++        r.boost_cost(u64::MAX);
++        assert_eq!(r.spill_cost_at(0), u64::MAX);
++    }
++
++    #[test]
++    fn occupied_points_prefers_segment_coverage() {
++        let mut r = lr(1, 0, 1000, vec![5, 900], 1);
++        assert_eq!(r.occupied_points(), 1001, "no segments -> fat envelope");
++        r.set_segments(vec![(0, 9), (900, 909)]);
++        assert_eq!(r.occupancy_len, 20);
++        assert_eq!(r.occupied_points(), 20);
++    }
++
++    // ======================================================================
++    // Mode 6: position-relative eviction order
++    // ======================================================================
++
++    /// The defect mode-6 exists to fix.
++    ///
++    /// `victim` is a value with many uses that are ALL behind the scan point:
++    /// at position 50 it is dead, so demoting it is free. `incoming` has two
++    /// live uses ahead of it. The global-priority order (modes 1-3) protects
++    /// the victim because its *lifetime total* is larger, and spills the
++    /// incoming instead. The position-relative order sees the victim's
++    /// remaining cost is 0 and takes the register.
++    #[test]
++    fn mode6_evicts_the_value_that_is_dead_at_the_scan_point() {
++        let regs = vec![PhysReg(0)];
++        let mut victim = lr_weighted(1, 0, 200, vec![(1, 100), (2, 100), (3, 100)]);
++        victim.priority = 300;
++        let mut incoming = lr_weighted(2, 50, 120, vec![(60, 1), (110, 1)]);
++        incoming.priority = 2;
++
++        assert_eq!(victim.remaining_cost(50), 0, "victim is dead at the scan point");
++        assert_eq!(incoming.remaining_cost(50), 2);
++
++        // Global-priority order (mode 3): 2 <= 300, so the victim is immune
++        // and the incoming is demoted.
++        let mut a3 = LinearScanAllocator::new(vec![], regs.clone());
++        a3.init_registers();
++        a3.allocate_range(victim.clone());
++        assert_eq!(a3.select_evict_victim(&incoming, 3), None);
++
++        // Position-relative order (mode 6): the victim costs 0 to demote.
++        let mut a6 = LinearScanAllocator::new(vec![], regs);
++        a6.init_registers();
++        a6.allocate_range(victim);
++        assert_eq!(a6.select_evict_victim(&incoming, 6), Some(0));
++    }
++
++    /// Mode 6 must still refuse to evict a value that is genuinely hotter
++    /// from the scan point onward: the profitability guard is a strict
++    /// comparison in the same currency as the ranking.
++    #[test]
++    fn mode6_never_evicts_a_hotter_remaining_value() {
++        let regs = vec![PhysReg(0)];
++        // Victim keeps a hot inner-loop use ahead of the scan point.
++        let victim = lr_weighted(1, 0, 200, vec![(10, 1), (150, 1000)]);
++        let incoming = lr_weighted(2, 50, 190, vec![(60, 1), (70, 1)]);
++        assert!(victim.remaining_cost(50) > incoming.remaining_cost(50));
++
++        let mut a = LinearScanAllocator::new(vec![], regs);
++        a.init_registers();
++        a.allocate_range(victim);
++        assert_eq!(a.select_evict_victim(&incoming, 6), None);
++    }
++
++    /// Per-use frequency, not one scalar for the whole range: a value with a
++    /// single inner-loop use must not outrank a value with many.
++    #[test]
++    fn mode6_ranks_by_per_use_frequency_not_max_depth() {
++        let regs = vec![PhysReg(0), PhysReg(1)];
++        // `one_hot`: one use at depth 2 (weight 100) plus cold uses.
++        let mut one_hot = lr_weighted(1, 0, 300, vec![(100, 100), (101, 1), (102, 1)]);
++        // `many_hot`: four uses at depth 2.
++        let mut many_hot =
++            lr_weighted(2, 0, 300, vec![(100, 100), (101, 100), (102, 100), (103, 100)]);
++        // The legacy scalar model gives BOTH `10^2 * n_uses`, and `one_hot`
++        // (3 uses) would even look comparable to `many_hot` (4 uses).
++        one_hot.priority = 300;
++        many_hot.priority = 400;
++
++        let mut a = LinearScanAllocator::new(vec![], regs);
++        a.init_registers();
++        a.allocate_range(one_hot.clone());
++        a.allocate_range(many_hot.clone());
++
++        // An incoming hotter than `one_hot` but colder than `many_hot` must
++        // pick `one_hot` as the victim.
++        let incoming = lr_weighted(3, 50, 60, vec![(55, 200)]);
++        let pick = a.select_evict_victim(&incoming, 6).expect("a victim exists");
++        assert_eq!(
++            a.active[pick].range.value_id, 1,
++            "must evict the range with the lower REMAINING weighted cost"
++        );
++    }
++
++    /// Mode 6 keeps every soundness guard of mode 3: ABI-hinted values are
++    /// never evicted, and the victim's next use must be past `incoming.end`.
++    #[test]
++    fn mode6_keeps_the_mode3_soundness_guards() {
++        let regs = vec![PhysReg(0)];
++
++        // (a) ABI-hinted victim is immune even at zero remaining cost.
++        let mut hinted = lr_weighted(1, 0, 200, vec![(1, 100)]);
++        hinted.reg_hint = Some(PhysReg(0));
++        let incoming = lr_weighted(2, 50, 120, vec![(60, 1000)]);
++        let mut a = LinearScanAllocator::new(vec![], regs.clone());
++        a.init_registers();
++        a.allocate_range(hinted);
++        assert_eq!(a.select_evict_victim(&incoming, 6), None);
++
++        // (b) A victim needed DURING the incoming's lifetime is refused.
++        let victim = lr_weighted(3, 0, 200, vec![(1, 100), (80, 1)]);
++        let incoming2 = lr_weighted(4, 50, 120, vec![(60, 1000), (119, 1000)]);
++        assert!(victim.remaining_cost(50) < incoming2.remaining_cost(50));
++        let mut b = LinearScanAllocator::new(vec![], regs);
++        b.init_registers();
++        b.allocate_range(victim);
++        assert_eq!(
++            b.select_evict_victim(&incoming2, 6),
++            None,
++            "next use 80 lies inside [50,120]: reload thrash, refuse"
++        );
++    }
++
++    /// Modes 1-3 must be untouched by the cost model: same victim, same
++    /// refusal, whether or not per-use weights happen to be attached.
++    #[test]
++    fn legacy_modes_are_unaffected_by_attached_weights() {
++        let regs = vec![PhysReg(0)];
++        let build = |weighted: bool| {
++            let mut victim = if weighted {
++                lr_weighted(1, 0, 200, vec![(1, 1), (2, 1)])
++            } else {
++                lr(1, 0, 200, vec![1, 2], 2)
++            };
++            victim.priority = 2;
++            let mut incoming = if weighted {
++                lr_weighted(2, 50, 120, vec![(130, 1), (140, 1), (150, 1)])
++            } else {
++                lr(2, 50, 120, vec![130, 140, 150], 3)
++            };
++            incoming.priority = 3;
++            (victim, incoming)
++        };
++        for weighted in [false, true] {
++            let (victim, incoming) = build(weighted);
++            let mut a = LinearScanAllocator::new(vec![], regs.clone());
++            a.init_registers();
++            a.allocate_range(victim);
++            assert_eq!(
++                a.select_evict_victim(&incoming, 3),
++                Some(0),
++                "mode 3 decision must not depend on the cost table (weighted={weighted})"
++            );
++        }
++    }
+ }
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index dd37c03..7655282 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -809,15 +809,39 @@ pub(crate) fn compute_i686_divrem_pairs(
+             if used[i] {
+                 continue;
+             }
+-            let (_, _, lhs_i, rhs_i, signed_i, dest_i) = &cands[i];
++            let (_, op_i, lhs_i, rhs_i, signed_i, dest_i) = &cands[i];
+             // Nearest unused compatible partner ahead in this block.
+             let mut mate: Option<usize> = None;
+             for j in (i + 1)..cands.len() {
+                 if used[j] {
+                     continue;
+                 }
+-                let (_, _, lhs_j, rhs_j, signed_j, _) = &cands[j];
+-                if signed_i == signed_j && lhs_i == lhs_j && rhs_i == rhs_j {
++                let (_, op_j, lhs_j, rhs_j, signed_j, _) = &cands[j];
++                // OPPOSITE flavours only: one quotient, one remainder.
++                //
++                // A single `idivl`/`divl` produces the quotient in %eax and
++                // the remainder in %edx, so a pair is only meaningful when the
++                // two consumers want DIFFERENT halves. Every emitter derives
++                // the register split from the HEAD's flavour alone
++                // (`div_dest = if self_is_div { dest } else { partner }`,
++                // i686 `emit_divrem_pair_head`; the AArch64 map does not even
++                // carry the tail's flavour), i.e. they all *assume* the
++                // flavours differ — but nothing enforced it.
++                //
++                // Two same-flavour div-likes with identical operands compute
++                // the SAME value; that is a CSE miss, not a fusion
++                // opportunity. Pairing them handed the tail the wrong half:
++                // `x[n % 1000] = 2` read the quotient, so the index grew to
++                // 999 against a `n % 1000 + 1`-element VLA and scribbled off
++                // the stack (gcc.c-torture i686 `20040811-1.c`,
++                // `vla-dealloc-1.c`, `pr43220.c`; `981001-1.c` and
++                // `20000511-1.c` are the same defect through repeated
++                // `n / 2` / `b % c`).
++                if signed_i == signed_j
++                    && lhs_i == lhs_j
++                    && rhs_i == rhs_j
++                    && div_flavor(*op_i) != div_flavor(*op_j)
++                {
+                     mate = Some(j);
+                     break;
+                 }
+@@ -1441,7 +1465,12 @@ fn bump_coalesce_group_priority(
+                 .map(|m| use_count.get(m).copied().unwrap_or(0))
+                 .sum();
+             if total > r.priority {
++                // The cost model needs the same information: a coalesce
++                // leader is really read by every member of its web, not
++                // just through its own IR use chain.
++                let boost = total / r.priority.max(1);
+                 r.priority = total;
++                r.boost_cost(boost);
+                 r.calculate_spill_weight();
+             }
+         }
+@@ -1568,7 +1597,12 @@ fn bump_folded_index_priority(
+             .saturating_mul(consumers.len().max(1) as u64)
+             .saturating_mul(64);
+         if weight > range.priority {
++            // Folded index reads are invisible in the IR use chain; scale
++            // the position-relative cost by the same structural factor so
++            // mode 6 prices them like the multi-read values they are.
++            let boost = weight / range.priority.max(1);
+             range.priority = weight;
++            range.boost_cost(boost);
+             range.calculate_spill_weight();
+         }
+     }
+@@ -1590,7 +1624,11 @@ fn bump_gep_base_priority(
+         let weight = crate::backend::live_range::loop_depth_weight(r.loop_depth);
+         let boosted = r.priority.max(weight);
+         if boosted > r.priority {
++            // A GEP base folded into addressing is read at every folded
++            // access, not only at the GEP instructions the IR shows.
++            let boost = boosted / r.priority.max(1);
+             r.priority = boosted;
++            r.boost_cost(boost);
+             r.calculate_spill_weight();
+         }
+     }
+diff --git a/src/backend/stack_layout/regalloc_helpers.rs b/src/backend/stack_layout/regalloc_helpers.rs
+index 4a5207d..cacf27a 100644
+--- a/src/backend/stack_layout/regalloc_helpers.rs
++++ b/src/backend/stack_layout/regalloc_helpers.rs
+@@ -352,6 +352,41 @@ pub fn run_regalloc_and_merge_clobbers_ex(
+         Vec::new()
+     };
+     let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs);
++
++    // ── Static-chain register reservation (GNU C nested functions) ───────
++    //
++    // `SetStaticChain` is lowered as a DIRECT write of the ABI chain register
++    // (`%r10` on x86-64, `%ecx` on i686) immediately before the call, outside
++    // the allocator's model: it has no IR dest, so nothing tells the scan that
++    // the register dies there. Any value the scan homed in the chain register
++    // and that is still live across the call is silently destroyed.
++    //
++    // gcc.c-torture/execute/920501-7.c hit exactly this at -O1..-Os. In the
++    // recursive nested function `y`, the argument `a - 1` was homed in `%r10`:
++    //
++    //     movl 48(%rsp), %r10d
++    //     subl $1, %r10d          # a-1 lives in %r10
++    //     movq %r11, %r10         # SetStaticChain -- clobbers a-1
++    //     movq %r11, %rdi         # arg0 <- (relayed through the now-equal r11)
++    //     call x.y                # y(chain) instead of y(a-1): infinite
++    //                             # recursion -> SIGSEGV at ANY depth
++    //
++    // Reserving the register for functions that actually make nested calls is
++    // the right trade: the construct is rare, and per-point modelling of one
++    // hard register would add interference surface to every ordinary function
++    // for no benefit. Functions with only `GetStaticChain` (a nested callee
++    // that never calls a sibling) are unaffected — the chain is read once at
++    // entry into a normal home, and reserving there would cost a register for
++    // nothing.
++    let (available_regs, caller_saved_regs, call_arg_regs, indirect_target_regs) =
++        reserve_static_chain_reg(
++            func,
++            available_regs,
++            caller_saved_regs,
++            call_arg_regs,
++            indirect_target_regs,
++        );
++
+     let accumulator_policy = if caller_saved_regs.iter().any(|r| r.0 == 10)
+         || (caller_saved_regs.is_empty() && available_regs.iter().any(|r| r.0 == 1))
+         // riscv64 with the caller-saved a0–a7 pool open (s11 + a0 in the
+@@ -460,3 +495,138 @@ pub fn find_param_alloca(func: &IrFunction, param_idx: usize) -> Option<(Value,
+         })
+     })
+ }
++
++/// PhysReg id of the ABI static-chain register, or `None` when this target's
++/// chain register is not in any allocatable pool.
++///
++/// | target  | chain register | allocator id |
++/// |---------|----------------|--------------|
++/// | x86-64  | `%r10`         | `PhysReg(11)` |
++/// | i686    | `%ecx`         | `PhysReg(4)`  |
++/// | AArch64 | `x18`          | not allocatable |
++/// | RISC-V  | `t2`           | not allocatable |
++///
++/// AArch64 and RISC-V keep their chain register outside the allocator's
++/// register file entirely, so they need no reservation.
++pub fn static_chain_phys_reg() -> Option<PhysReg> {
++    if crate::common::types::target_is_32bit() {
++        // i686 `%ecx`. (The 32-bit ARM/RISC-V configurations do not reach the
++        // x86 pools; the caller only removes ids that are actually present.)
++        Some(PhysReg(4))
++    } else {
++        // x86-64 `%r10`.
++        Some(PhysReg(11))
++    }
++}
++
++/// Whether `func` performs a direct call to a nested function, i.e. contains a
++/// `SetStaticChain` that writes the ABI chain register before a call.
++///
++/// `GetStaticChain` alone (a nested callee reading its own chain at entry) is
++/// deliberately NOT a trigger: that is an ordinary def with a normal home.
++pub fn func_sets_static_chain(func: &IrFunction) -> bool {
++    func.blocks.iter().any(|b| {
++        b.instructions
++            .iter()
++            .any(|i| matches!(i, Instruction::SetStaticChain { .. }))
++    })
++}
++
++/// Remove the static-chain register from every allocatable pool when `func`
++/// makes a direct nested-function call. See the call site for the miscompile
++/// this prevents (gcc.c-torture/execute/920501-7.c).
++fn reserve_static_chain_reg(
++    func: &IrFunction,
++    available: Vec<PhysReg>,
++    caller_saved: Vec<PhysReg>,
++    call_arg: Vec<PhysReg>,
++    indirect_target: Vec<PhysReg>,
++) -> (Vec<PhysReg>, Vec<PhysReg>, Vec<PhysReg>, Vec<PhysReg>) {
++    if !func_sets_static_chain(func) {
++        return (available, caller_saved, call_arg, indirect_target);
++    }
++    let Some(chain) = static_chain_phys_reg() else {
++        return (available, caller_saved, call_arg, indirect_target);
++    };
++    let drop = |v: Vec<PhysReg>| -> Vec<PhysReg> {
++        v.into_iter().filter(|r| r.0 != chain.0).collect()
++    };
++    (
++        drop(available),
++        drop(caller_saved),
++        drop(call_arg),
++        drop(indirect_target),
++    )
++}
++
++#[cfg(test)]
++mod static_chain_reservation_tests {
++    use super::*;
++    use crate::ir::instruction::{BasicBlock, Operand, Terminator};
++    use crate::ir::reexports::{BlockId, Value};
++
++    fn func_with(instructions: Vec<Instruction>) -> IrFunction {
++        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
++        f.blocks = vec![BasicBlock {
++            label: BlockId(0),
++            instructions,
++            terminator: Terminator::Return(None),
++            source_spans: Vec::new(),
++        }];
++        f
++    }
++
++    #[test]
++    fn set_static_chain_is_detected_get_alone_is_not() {
++        assert!(!func_sets_static_chain(&func_with(vec![])));
++        assert!(!func_sets_static_chain(&func_with(vec![
++            Instruction::GetStaticChain { dest: Value(1) }
++        ])));
++        assert!(func_sets_static_chain(&func_with(vec![
++            Instruction::SetStaticChain {
++                src: Operand::Value(Value(1))
++            }
++        ])));
++    }
++
++    #[test]
++    fn chain_register_is_removed_from_every_pool() {
++        let chain = static_chain_phys_reg().expect("x86 targets publish a chain reg");
++        let pool = vec![PhysReg(1), chain, PhysReg(12)];
++        let f = func_with(vec![Instruction::SetStaticChain {
++            src: Operand::Value(Value(1)),
++        }]);
++        let (a, c, ca, it) = reserve_static_chain_reg(
++            &f,
++            pool.clone(),
++            pool.clone(),
++            pool.clone(),
++            pool.clone(),
++        );
++        for (name, v) in [
++            ("available", &a),
++            ("caller_saved", &c),
++            ("call_arg", &ca),
++            ("indirect_target", &it),
++        ] {
++            assert!(
++                !v.iter().any(|r| r.0 == chain.0),
++                "{name} pool must not keep the static-chain register"
++            );
++            assert_eq!(v.len(), 2, "{name} pool must keep every other register");
++        }
++    }
++
++    #[test]
++    fn pools_are_untouched_without_a_nested_call() {
++        let chain = static_chain_phys_reg().expect("x86 targets publish a chain reg");
++        let pool = vec![PhysReg(1), chain, PhysReg(12)];
++        let f = func_with(vec![Instruction::GetStaticChain { dest: Value(1) }]);
++        let (a, c, ca, it) =
++            reserve_static_chain_reg(&f, pool.clone(), pool.clone(), pool.clone(), pool.clone());
++        assert_eq!(a, pool);
++        assert_eq!(c, pool);
++        assert_eq!(ca, pool);
++        assert_eq!(it, pool);
++    }
++}
+diff --git a/src/frontend/sema/builtins.rs b/src/frontend/sema/builtins.rs
+index 0a43062..1814f47 100644
+--- a/src/frontend/sema/builtins.rs
++++ b/src/frontend/sema/builtins.rs
+@@ -3469,3 +3469,128 @@ pub fn normalize_atomic_size_suffix(name: &str) -> Option<&'static str> {
+         _ => None,
+     }
+ }
++
++/// Parameter types of the libc functions that `BuiltinKind::LibcAlias` maps to,
++/// for the families whose signature contains a **`size_t`** (or another
++/// parameter wider than `int`).
++///
++/// # Why this table exists
++///
++/// A `__builtin_memcmp(p, q, n)` call is legal in a translation unit that never
++/// declares `memcmp`, so the lowering cannot rely on a user prototype to supply
++/// the parameter conversions. Without them the `int`-typed length expression
++/// `i + 1` was handed to the callee as a raw 32-bit value in a `size_t` slot:
++///
++///   * at `-O0` the value lives in a 4-byte stack slot, and the 8-byte argument
++///     load pulled the adjacent slot in as the high half — `%rdx` became
++///     `0x1_00000007` and `memcmp` ran off the end of both buffers
++///     (gcc.c-torture/execute/`pr59229.c`);
++///   * a *negative* `int` length was zero-extended where C requires the
++///     `int -> size_t` conversion to sign-extend first.
++///
++/// # Scope
++///
++/// Only the entries whose parameters are genuinely wider than `int` are listed;
++/// families where every parameter is `int`/`double`/pointer need no conversion
++/// and are deliberately absent so the table stays reviewable. `Ptr` entries are
++/// placeholders that keep the positional index aligned — the lowering skips
++/// pointer slots (a pointer argument is never arithmetically converted).
++///
++/// `size_t` / `ssize_t` are pointer-width, so the table is target-dependent and
++/// must be queried, not cached.
++pub fn libc_alias_param_types(libc_name: &str) -> Option<Vec<crate::common::types::IrType>> {
++    use crate::common::types::{target_ptr_size, IrType};
++    // size_t: unsigned, pointer-width (LP64 -> U64, ILP32 -> U32).
++    let size_t = if target_ptr_size() == 8 {
++        IrType::U64
++    } else {
++        IrType::U32
++    };
++    let p = IrType::Ptr;
++    let i32t = IrType::I32;
++    let out: Vec<IrType> = match libc_name {
++        // void *memcpy(void *, const void *, size_t)
++        "memcpy" | "mempcpy" | "memmove" => vec![p, p, size_t],
++        // void *memset(void *, int, size_t)
++        "memset" => vec![p, i32t, size_t],
++        // int memcmp(const void *, const void *, size_t)
++        "memcmp" | "bcmp" => vec![p, p, size_t],
++        // void *memchr(const void *, int, size_t)
++        "memchr" | "rawmemchr" | "memrchr" => vec![p, i32t, size_t],
++        // char *strncpy/strncat(char *, const char *, size_t)
++        "strncpy" | "strncat" | "stpncpy" => vec![p, p, size_t],
++        // int strncmp(const char *, const char *, size_t)
++        "strncmp" | "strncasecmp" => vec![p, p, size_t],
++        // size_t strnlen(const char *, size_t)
++        "strnlen" => vec![p, size_t],
++        // void *__builtin___memcpy_chk(void *, const void *, size_t, size_t)
++        "__memcpy_chk" | "__mempcpy_chk" | "__memmove_chk" => vec![p, p, size_t, size_t],
++        "__memset_chk" => vec![p, i32t, size_t, size_t],
++        "__strncpy_chk" | "__strncat_chk" | "__stpncpy_chk" => vec![p, p, size_t, size_t],
++        "__strcpy_chk" | "__strcat_chk" | "__stpcpy_chk" => vec![p, p, size_t],
++        _ => return None,
++    };
++    Some(out)
++}
++
++#[cfg(test)]
++mod libc_alias_param_type_tests {
++    use super::libc_alias_param_types;
++    use crate::common::types::{target_ptr_size, IrType};
++
++    fn size_t() -> IrType {
++        if target_ptr_size() == 8 {
++            IrType::U64
++        } else {
++            IrType::U32
++        }
++    }
++
++    #[test]
++    fn size_taking_families_are_covered() {
++        // The regression that motivated the table.
++        assert_eq!(
++            libc_alias_param_types("memcmp"),
++            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
++        );
++        // memset's second parameter is `int`, NOT the char being stored.
++        assert_eq!(
++            libc_alias_param_types("memset"),
++            Some(vec![IrType::Ptr, IrType::I32, size_t()])
++        );
++        assert_eq!(
++            libc_alias_param_types("memcpy"),
++            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
++        );
++        assert_eq!(
++            libc_alias_param_types("strncmp"),
++            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
++        );
++        assert_eq!(libc_alias_param_types("strnlen"), Some(vec![IrType::Ptr, size_t()]));
++        // Both _chk length parameters are size_t.
++        assert_eq!(
++            libc_alias_param_types("__memcpy_chk"),
++            Some(vec![IrType::Ptr, IrType::Ptr, size_t(), size_t()])
++        );
++    }
++
++    #[test]
++    fn size_t_is_unsigned_so_int_lengths_sign_extend_then_widen() {
++        // A signed source converted to an UNSIGNED wider type must go through
++        // a sign extension (C11 6.3.1.3): `(size_t)(int)-1 == SIZE_MAX`. The
++        // table must therefore say `U64`, not `I64`; the cast emitter keys the
++        // extension off the SOURCE signedness.
++        let st = size_t();
++        assert!(!st.is_signed(), "size_t must be unsigned");
++        assert_eq!(st.size(), target_ptr_size(), "size_t must be pointer-width");
++    }
++
++    #[test]
++    fn families_without_wide_parameters_are_absent() {
++        // Everything here is int/double/pointer only: no conversion needed,
++        // and listing them would be unreviewable noise.
++        for n in ["strlen", "strcmp", "strcpy", "abs", "sqrt", "abort", "printf"] {
++            assert_eq!(libc_alias_param_types(n), None, "{n} must not be listed");
++        }
++    }
++}
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index 49aa4cb..8447557 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -1229,7 +1229,28 @@ impl IntrinsicOp {
+             | Pmovzxbw256 | Pmovzxbd256 | Pmovzxwd256
+             | Pmovsxbw256 | Pmovsxbd256 | Pmovsxwd256
+             | Psrawi256 | Psradi256 | Packssdw256 | Packuswb256
+-            | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256 => Some(32),
++            | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256
++            // `VecMaskedAddI32x8` folds eight I32 lanes into an I32x8
++            // accumulator: a 256-bit result, emitted with `vpaddd %ymm`.
++            // It was grouped with its 128-bit WIDENING sibling
++            // (`VecWidenMaskedAddI32x4ToI64x2`, whose I64x2 result really is
++            // 128-bit), which made every copy of the accumulator a legacy
++            // `movdqa %xmm`. That preserves bits 255:128 of the destination,
++            // so the upper four lanes of the accumulator never advanced and
++            // the guarded sum silently dropped half its terms
++            // (tests/regression/vector_guard_sum.c: 279 instead of 651). It
++            // also handed the value a 16-byte protected slot for 32 bytes of
++            // data.
++            | VecMaskedAddI32x8
++            // The `I64x4` family (4 x i64 = 32 bytes) was appended to the
++            // 128-bit list together with `VecHorizontalAddI64x4`. x86 has no
++            // lowering for them today (`intrinsics.rs` matches them to a
++            // no-op and `vec_interleave` keeps them out of the accumulator
++            // set), so the mistake is latent -- but a 256-bit shape declaring
++            // 16 bytes is a loaded gun: it hands the value a half-size
++            // protected slot and makes every copy a legacy `movdqa %xmm`
++            // that silently freezes the upper lanes. Classify by shape.
++            | VecLoadI64x4 | VecAddI64x4 | VecZeroI64x4 => Some(32),
+             // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
+             Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
+             | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
+@@ -1259,8 +1280,7 @@ impl IntrinsicOp {
+             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
+             | VecWidenAddI32x4ToI64x2
+             | VecWidenMaskedAddI32x4ToI64x2
+-            | VecMaskedAddI32x8
+-            | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
++            | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
+             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
+             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
+             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
+@@ -1429,3 +1449,104 @@ impl IntrinsicOp {
+         )
+     }
+ }
++
++#[cfg(test)]
++mod vector_result_width_tests {
++    use super::IntrinsicOp;
++
++    /// `vector_result_width` is the single authority that decides a vector
++    /// value's slot size AND the width of every copy the backend emits for it
++    /// (`vmovdqa %ymm` vs legacy `movdqa %xmm`). A too-narrow answer is a
++    /// silent miscompile, not merely a missed optimisation: a legacy
++    /// `movdqa %xmm` PRESERVES bits 255:128 of the destination, so a
++    /// loop-carried 256-bit accumulator stops advancing in its upper lanes.
++    ///
++    /// `VecMaskedAddI32x8` (I32x8 accumulator, `vpaddd %ymm`) was grouped with
++    /// its 128-bit widening sibling `VecWidenMaskedAddI32x4ToI64x2` (I64x2
++    /// accumulator) and reported 16. `tests/regression/vector_guard_sum.c`
++    /// summed 279 instead of 651 — exactly the low four lanes plus the scalar
++    /// remainder.
++    #[test]
++    fn masked_reduction_steps_report_their_real_accumulator_width() {
++        assert_eq!(
++            IntrinsicOp::VecMaskedAddI32x8.vector_result_width(),
++            Some(32),
++            "I32x8 accumulator is 256-bit"
++        );
++        assert_eq!(
++            IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2.vector_result_width(),
++            Some(16),
++            "I64x2 accumulator is 128-bit"
++        );
++        assert_eq!(
++            IntrinsicOp::VecWidenAddI32x4ToI64x2.vector_result_width(),
++            Some(16)
++        );
++    }
++
++    /// Every `*I32x8` / `*F64x4` / `*F32x8` / `*I64x4` reduction or arithmetic
++    /// op names its lane count in its identifier; the declared width must
++    /// agree with that name. This catches the copy-paste class of defect
++    /// generally instead of pinning one operation.
++    #[test]
++    fn declared_width_agrees_with_the_lane_count_in_the_name() {
++        // (op, name) pairs for the 256-bit auto-vectorizer family.
++        let wide: &[(IntrinsicOp, &str)] = &[
++            (IntrinsicOp::VecMaskedAddI32x8, "VecMaskedAddI32x8"),
++            (IntrinsicOp::VecAddI32x8, "VecAddI32x8"),
++            (IntrinsicOp::VecLoadI32x8, "VecLoadI32x8"),
++            (IntrinsicOp::VecZeroI32x8, "VecZeroI32x8"),
++            (IntrinsicOp::VecAddF64x4, "VecAddF64x4"),
++            (IntrinsicOp::VecMulF64x4, "VecMulF64x4"),
++            (IntrinsicOp::VecLoadF64x4, "VecLoadF64x4"),
++            (IntrinsicOp::VecAddF32x8, "VecAddF32x8"),
++            (IntrinsicOp::VecAddI64x4, "VecAddI64x4"),
++            (IntrinsicOp::VecLoadI64x4, "VecLoadI64x4"),
++            (IntrinsicOp::VecZeroI64x4, "VecZeroI64x4"),
++        ];
++        for (op, name) in wide {
++            assert_eq!(
++                op.vector_result_width(),
++                Some(32),
++                "{name}: a 256-bit lane shape must declare 32 bytes"
++            );
++        }
++        // `VecHorizontalAdd*` reduces to a SCALAR. The doc comment on
++        // `vector_result_width` states this explicitly ("ops whose result is
++        // a SCALAR must never be listed here even if their name sounds
++        // vector-ish"), yet `VecHorizontalAddI64x4` was listed as 128-bit --
++        // the only member of its family in the table. Misclassifying a scalar
++        // as a vector switches its codegen from value-load to `leaq`
++        // addressing (the volatile_access regression named in that comment).
++        for (op, name) in [
++            (IntrinsicOp::VecHorizontalAddI64x4, "VecHorizontalAddI64x4"),
++            (IntrinsicOp::VecHorizontalAddI64x2, "VecHorizontalAddI64x2"),
++            (IntrinsicOp::VecHorizontalAddI32x8, "VecHorizontalAddI32x8"),
++            (IntrinsicOp::VecHorizontalAddI32x4, "VecHorizontalAddI32x4"),
++            (IntrinsicOp::VecHorizontalAddF64x4, "VecHorizontalAddF64x4"),
++            (IntrinsicOp::VecHorizontalAddF64x2, "VecHorizontalAddF64x2"),
++            (IntrinsicOp::VecHorizontalAddF32x8, "VecHorizontalAddF32x8"),
++            (IntrinsicOp::VecHorizontalAddF32x4, "VecHorizontalAddF32x4"),
++        ] {
++            assert_eq!(
++                op.vector_result_width(),
++                None,
++                "{name} reduces to a scalar and must not claim a vector width"
++            );
++        }
++
++        let narrow: &[(IntrinsicOp, &str)] = &[
++            (IntrinsicOp::VecAddI32x4, "VecAddI32x4"),
++            (IntrinsicOp::VecAddF64x2, "VecAddF64x2"),
++            (IntrinsicOp::VecAddF32x4, "VecAddF32x4"),
++            (IntrinsicOp::VecAddI64x2, "VecAddI64x2"),
++        ];
++        for (op, name) in narrow {
++            assert_eq!(
++                op.vector_result_width(),
++                Some(16),
++                "{name}: a 128-bit lane shape must declare 16 bytes"
++            );
++        }
++    }
++}
+diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
+index 4ef8190..ce4287d 100644
+--- a/src/ir/lowering/expr_builtins.rs
++++ b/src/ir/lowering/expr_builtins.rs
+@@ -316,9 +316,39 @@ impl Lowerer {
+         let builtin_info = builtins::resolve_builtin(name)?;
+         match &builtin_info.kind {
+             BuiltinKind::LibcAlias(libc_name) => {
++                // Source types must describe the values `lower_expr` really
++                // produces (see the long note in `expr_calls.rs`):
++                // `get_expr_type` reports the storage-level width and lies
++                // about `i + 1`, which is an `int`.
+                 let mut arg_types: Vec<IrType> =
+-                    args.iter().map(|a| self.get_expr_type(a)).collect();
++                    args.iter().map(|a| self.value_ir_type(a)).collect();
+                 let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
++                // A `__builtin_*` call carries the libc function's signature
++                // whether or not the TU declared the libc symbol, so the
++                // parameter conversions are part of the builtin's contract.
++                // Without them `__builtin_memcmp(p, q, i + 1)` passed a raw
++                // 32-bit `int` where `size_t` was expected: at -O0 the 8-byte
++                // argument load read the neighbouring 4-byte slot as the high
++                // half (gcc.c-torture `pr59229.c`), and a negative length was
++                // zero-extended instead of sign-extended.
++                if let Some(params) = builtins::libc_alias_param_types(libc_name.as_str()) {
++                    for (i, &param_ty) in params.iter().enumerate() {
++                        if i >= arg_vals.len() {
++                            break;
++                        }
++                        let from = arg_types[i];
++                        if from == param_ty
++                            || from == IrType::Ptr
++                            || param_ty == IrType::Ptr
++                            || !from.is_integer()
++                            || !param_ty.is_integer()
++                        {
++                            continue;
++                        }
++                        arg_vals[i] = self.emit_implicit_cast(arg_vals[i].clone(), from, param_ty);
++                        arg_types[i] = param_ty;
 +                    }
 +                }
-+                liveness.segments.iter().any(|seg| {
-+                    seg.value_id == dest.0
-+                        && windows
-+                            .iter()
-+                            .any(|&(lo, hi)| lo <= hi && seg.start <= hi && lo <= seg.end)
-+                })
+                 let dest = self.fresh_value();
+                 // The builtin is callable without a prior libc prototype
+                 // (`__builtin_printf("%g", f)` in a TU that never includes
+diff --git a/src/ir/lowering/expr_calls.rs b/src/ir/lowering/expr_calls.rs
+index beaad5c..fc1c9ba 100644
+--- a/src/ir/lowering/expr_calls.rs
++++ b/src/ir/lowering/expr_calls.rs
+@@ -797,7 +797,32 @@ impl Lowerer {
+             .enumerate()
+             .map(|(i, a)| {
+                 let mut val = self.lower_expr(a);
+-                let mut arg_ty = self.get_expr_type(a);
++                // A call argument is a **conversion boundary**, so the source
++                // type must be the type of the value `lower_expr` actually
++                // produced, not the storage-level query.
++                //
++                // `get_expr_type` widens an arithmetic `BinaryOp` to the
++                // target's storage int (`I64` on LP64) because an `IntLiteral`
++                // operand reports `I64`. The emitted `BinOp` however carries
++                // the true C operation type (`i + 1` is `int`, `ty: I32`), so
++                // the two disagree and the disagreement is a *width lie*:
++                //
++                //   __builtin_memcmp(p, "abcdefg", i + 1)
++                //     -> Call memcmp, args [.., v8:I32], arg_types [.., I64]
++                //
++                // At -O0 `v8` lives in a 4-byte slot and the 8-byte argument
++                // load pulled the neighbouring slot in as the high half, so
++                // `%rdx` became `0x1_00000007` and memcmp ran off the end of
++                // both buffers (gcc.c-torture `pr59229.c`). With a prototype
++                // in scope the same lie produced `Cast { from_ty: I64,
++                // to_ty: U64 }` — a same-width no-op where C requires the
++                // **sign extension** of a negative `int` to `size_t`.
++                //
++                // `value_ir_type` is the query documented for exactly this
++                // (it differs from `get_expr_type` only for `BinaryOp` and
++                // `!x`, which are precisely the expressions whose materialised
++                // width can be narrower than their storage width).
++                let mut arg_ty = self.value_ir_type(a);
+ 
+                 // A raw GCC 128-bit vector builtin (__builtin_ia32_shufps,
+                 // __builtin_shufflevector, ...) yields its vector BY VALUE as a
+diff --git a/src/passes/iv_widen.rs b/src/passes/iv_widen.rs
+index 0df1cba..c4d6930 100644
+--- a/src/passes/iv_widen.rs
++++ b/src/passes/iv_widen.rs
+@@ -244,7 +244,28 @@ fn type_max_i128(ty: IrType) -> i128 {
+ /// bit 31 is set must become `0xFFFFFFFF` (4294967295), **not** `-1` — the
+ /// previous revision used `to_i64()` which sign-extends the raw bit pattern
+ /// and silently flipped such constants.
+-fn widen_const(c: IrConst, from_ty: IrType) -> IrConst {
++/// Widen an integer constant from `from_ty` to 64 bits with the extension
++/// kind implied by `from_ty`. Critical for unsigned: a `U32` constant whose
++/// bit 31 is set must become `0xFFFFFFFF` (4294967295), **not** `-1` — the
++/// previous revision used `to_i64()` which sign-extends the raw bit pattern
++/// and silently flipped such constants.
++///
++/// Returns `None` for a non-integer constant. A floating-point constant here
++/// means an *integer* closure member was admitted from a float-typed
++/// operation, which is a classifier bug: `to_i64()` on `F32(11.0)` yields
++/// `0`, which is how `11.0f * (float) i` once became a hard zero. Callers
++/// must decline the member rather than silently widen garbage.
++fn widen_const(c: IrConst, from_ty: IrType) -> Option<IrConst> {
++    if !matches!(
++        c,
++        IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero
++    ) {
++        debug_assert!(
++            false,
++            "iv_widen: non-integer constant {c:?} reached widen_const (from_ty {from_ty:?})"
++        );
++        return None;
++    }
+     let raw = c.to_i64().unwrap_or(0) as u64;
+     let bits = narrow_bit_width(from_ty);
+     let val = if is_unsigned_ty(from_ty) {
+@@ -259,7 +280,7 @@ fn widen_const(c: IrConst, from_ty: IrType) -> IrConst {
+         let shift = 64 - bits;
+         ((raw << shift) as i64 >> shift) as u64
+     };
+-    IrConst::I64(val as i64)
++    Some(IrConst::I64(val as i64))
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -828,6 +849,21 @@ fn analyze_iv(
+                     let cur_rhs = matches!(rhs, Operand::Value(v) if v.0 == cur.0);
+                     let other = if cur_lhs { rhs } else { lhs };
+ 
++                    // **Integer-closure invariant.** Every widening identity
++                    // in this pass (`ext(x op c) == ext(x) op ext(c)`, the
++                    // signed-overflow-is-UB theorem, the bitwise theorem) is
++                    // stated over *integers*. A float/decimal-typed operation
++                    // reading the member would need a value CONVERSION, not a
++                    // bit-level reinterpretation, and `widen_const` would turn
++                    // its FP constant into a garbage integer. Note the
++                    // wide-chain shortcut below keys off `ty.size() >= 8`,
++                    // which `F64`/`D64` also satisfy — so this gate must come
++                    // first, not after it.
++                    if !ty.is_integer() {
++                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
++                        continue;
++                    }
++
+                     // Wide-type chain ops (already 64-bit): pure pass-through,
+                     // nothing to widen — classify their uses.
+                     if ty.size() >= 8 {
+@@ -1074,6 +1110,11 @@ fn analyze_iv(
+                     if !matches!(src, Operand::Value(v) if v.0 == cur.0) {
+                         continue;
+                     }
++                    // `is_unsigned_ty` answers `false` for every non-integer
++                    // type, so a bare `same_sign` test cannot distinguish
++                    // `I32 -> I64` (a widening extension) from `I32 -> F32`
++                    // (a value *conversion*). Establish integer-ness first.
++                    let to_is_int = to_ty.is_integer();
+                     let same_sign = is_unsigned_ty(*to_ty) == is_unsigned_ty(*from_ty);
+                     // Cross-sign widening cast (U32→I64 / I32→U64). Members
+                     // are always 32-bit, so these two pairs are the complete
+@@ -1100,10 +1141,20 @@ fn analyze_iv(
+                         queue.push((*dest, false));
+                         continue;
+                     }
+-                    if to_ty.size() >= 4 && *to_ty != IrType::Ptr && same_sign {
+-                        // Widening cast (i8→i32, i32→i64, ...): the dest
+-                        // becomes wide; drop it and alias its uses to the
++                    if to_is_int && to_ty.size() >= 4 && *to_ty != IrType::Ptr && same_sign {
++                        // Widening *integer* cast (i8→i32, i32→i64, ...): the
++                        // dest becomes wide; drop it and alias its uses to the
+                         // underlying member.
++                        //
++                        // `to_is_int` is load-bearing. Without it `F32`
++                        // (size 4, `is_unsigned_ty` == false, hence
++                        // "same sign" as `I32`) was admitted here, so
++                        // `(float) i` was dropped and its consumers were
++                        // re-classified as *integer* members of the closure.
++                        // `11.0f * (float) i` then became
++                        // `Mul(i:I64, widen_const(F32(11.0)) = I64(0))`
++                        // — every such product silently evaluated to zero
++                        // (gcc.c-torture `20060420-1.c`).
+                         members.push(Member::of(
+                             *dest,
+                             MemberKind::WidenCast { operand: cur },
+@@ -1150,6 +1201,14 @@ fn analyze_iv(
+                     if !lhs_is_cur && !rhs_is_cur {
+                         continue;
+                     }
++                    // Integer-closure invariant (see the `BinOp` arm): an
++                    // FP-typed compare of an integer member is ill-typed IR
++                    // and neither widening nor the `Trunc` repair (which
++                    // would emit an int→float conversion) preserves it.
++                    if !ty.is_integer() {
++                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
++                        continue;
++                    }
+                     let other = if lhs_is_cur { rhs } else { lhs };
+                     if matches!(other, Operand::Value(v) if v.0 == cur.0) {
+                         // cmp(member, member): self-comparison — decline.
+@@ -1208,7 +1267,7 @@ fn analyze_iv(
+                 } => {
+                     let cur_is_true = matches!(true_val, Operand::Value(v) if v.0 == cur.0);
+                     let cur_is_false = matches!(false_val, Operand::Value(v) if v.0 == cur.0);
+-                    if cur_is_true || cur_is_false {
++                    if (cur_is_true || cur_is_false) && ty.is_integer() {
+                         // A member used as select *data*: admissible when the
+                         // other data operand is a const or an admitted member.
+                         let other_op = if cur_is_true { false_val } else { true_val };
+@@ -1323,7 +1382,7 @@ fn member_range(members: &[Member], v: Value) -> Option<Range> {
+ }
+ 
+ fn const_as_range(c: IrConst, ty: IrType) -> Option<Range> {
+-    let v = widen_const(c, ty).to_i64()? as i128;
++    let v = widen_const(c, ty)?.to_i64()? as i128;
+     Some(Range { lo: v, hi: v })
+ }
+ 
+@@ -1467,7 +1526,96 @@ fn prove_counted_bound(
+ /// any mutation. Analysis and apply run back-to-back so this always passes;
+ /// it exists to make the provenance explicit and to fail atomically if the IR
+ /// ever drifts from what the analysis saw.
++/// Integer-closure invariant over a whole plan.
++///
++/// Every widening identity used by this pass — `ext(x op c) == ext(x) op
++/// ext(c)`, the signed-overflow-is-UB theorem, the bitwise theorem, and the
++/// order-preservation of `sext`/`zext` — is a statement about *integers*.
++/// A member that is not integer-typed (or a constant that is not an integer
++/// constant) means the classifier admitted a value conversion as if it were
++/// a bit-level extension, and `widen_const` would fabricate a garbage
++/// integer for it. Reject the entire plan; the loop simply stays narrow.
++///
++/// Regression anchor: `Cast { I32 -> F32 }` used to pass the `WidenCast`
++/// test (`F32.size() == 4`, and `is_unsigned_ty` is `false` for both sides,
++/// so the "same sign" test succeeded), after which `11.0f * (float) i` was
++/// retyped to `Mul(i:I64, I64(0))` — a silent hard zero.
++fn plan_is_integral(func: &IrFunction, plan: &WidenPlan) -> bool {
++    let integral_const =
++        |c: &IrConst| matches!(c, IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero);
++    if !plan.phi_ty.is_integer() || !plan.wide_ty.is_integer() {
++        return false;
++    }
++    if let Operand::Const(c) = &plan.init {
++        if !integral_const(c) {
++            return false;
++        }
++    }
++    if let Operand::Const(c) = &plan.step {
++        if !integral_const(c) {
++            return false;
++        }
++    }
++    for m in &plan.members {
++        // A `NarrowCast` member is deliberately RETAINED as a conversion of
++        // the wide value (`Cast { from_ty: wide_ty, to_ty: m.orig_ty }`), so
++        // its `orig_ty` is the conversion *target* and may legitimately be
++        // non-integer (`(float) i` lands here). Every other member kind
++        // names a value that must physically hold the widened integer.
++        if matches!(m.kind, MemberKind::NarrowCast { .. }) {
++            continue;
++        }
++        if !m.orig_ty.is_integer() {
++            return false;
++        }
++        match &m.kind {
++            MemberKind::BinOpConst { c, .. } if !integral_const(c) => return false,
++            MemberKind::Select { b, .. } => {
++                if let Operand::Const(c) = b {
++                    if !integral_const(c) {
++                        return false;
++                    }
++                }
++            }
++            _ => {}
++        }
++        // The live IR must agree: the defining instruction's operating type
++        // is what the retype will overwrite with `wide_ty`.
++        if let Some((_, inst)) = find_def(func, m.value) {
++            let op_ty = match inst {
++                Instruction::BinOp { ty, .. } | Instruction::Select { ty, .. } => Some(*ty),
++                _ => None,
 +            };
-             let source_used_before_copy = !same_block
-                 && block.instructions[..copy_idx]
-                     .iter()
-                     .any(|middle| uses_value(middle, src.0));
-             if phi_used_in_window
-                 || phi_derived_used_in_window
-+                || phi_live_in_window
-                 || source_used_elsewhere
-                 || source_used_before_copy
-             {
-                 if debug {
-                     eprintln!(
--                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} derived_in_window={} cross_block={} src_before_copy={}",
-+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} derived_in_window={} live_in_window={} cross_block={} src_before_copy={}",
-                         dest.0,
-                         src.0,
-                         block_idx,
-                         source_block,
-                         phi_used_in_window,
-                         phi_derived_used_in_window,
-+                        phi_live_in_window,
-                         source_used_elsewhere,
-                         source_used_before_copy
-                     );
-diff --git a/tests/regression/fp_copy_web_interference.c b/tests/regression/fp_copy_web_interference.c
++            if let Some(t) = op_ty {
++                if !t.is_integer() {
++                    return false;
++                }
++            }
++        }
++    }
++    for c in &plan.cmps {
++        if let CmpAction::Widen { cmp_ty, other, .. } = c {
++            if !cmp_ty.is_integer() {
++                return false;
++            }
++            if let CmpOther::Const(k) = other {
++                if !integral_const(k) {
++                    return false;
++                }
++            }
++        }
++    }
++    true
++}
++
+ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
++    // Integer-closure invariant, re-checked on the *plan* right before any
++    // mutation: every widening identity this pass relies on is stated over
++    // integers, and `widen_const` cannot represent an FP constant. A single
++    // float-typed member is therefore a hard reject, not a partial apply.
++    if !plan_is_integral(func, plan) {
++        return false;
++    }
+     // Latch shape: the step operand must still be what we recorded.
+     let Some(step) = plan_step_operand(func, plan.phi_dest, plan.latch_dest) else {
+         return false;
+@@ -1658,7 +1806,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
+ 
+     // 1. Preheader: wide init.
+     let wide_init: Operand = match plan.init {
+-        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty)),
++        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty).unwrap_or(c)),
+         Operand::Value(v) => {
+             let d = fresh();
+             push_inst(
+@@ -1676,7 +1824,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
+ 
+     // 2. Preheader: wide step (invariant value only — consts fold inline).
+     let wide_step: Operand = match plan.step {
+-        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty)),
++        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty).unwrap_or(c)),
+         Operand::Value(v) => {
+             let d = fresh();
+             push_inst(
+@@ -1735,7 +1883,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
+                     {
+                         *ty = wide_ty;
+                         let cop = if *const_is_lhs { lhs } else { rhs };
+-                        *cop = Operand::Const(widen_const(*c, m.orig_ty));
++                        *cop = Operand::Const(widen_const(*c, m.orig_ty).unwrap_or(*c));
+                     }
+                 }
+             }
+@@ -1766,10 +1914,10 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
+                     {
+                         *ty = wide_ty;
+                         if let Operand::Const(c) = true_val {
+-                            *true_val = Operand::Const(widen_const(*c, m.orig_ty));
++                            *true_val = Operand::Const(widen_const(*c, m.orig_ty).unwrap_or(*c));
+                         }
+                         if let Operand::Const(c) = false_val {
+-                            *false_val = Operand::Const(widen_const(*c, m.orig_ty));
++                            *false_val = Operand::Const(widen_const(*c, m.orig_ty).unwrap_or(*c));
+                         }
+                     }
+                 }
+@@ -1833,7 +1981,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
+                 cmp_ty,
+             } => {
+                 let wide_other = match other {
+-                    CmpOther::Const(c) => Operand::Const(widen_const(*c, *cmp_ty)),
++                    CmpOther::Const(c) => Operand::Const(widen_const(*c, *cmp_ty).unwrap_or(*c)),
+                     CmpOther::InvariantValue { value, from_ty } => {
+                         match find_hoisted_cast(func, preheader_idx, *value, *from_ty, wide_ty) {
+                             Some(d) => Operand::Value(d),
+@@ -1934,7 +2082,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
+         // wide value: rewriting them would put a 32-bit truncation into a
+         // 64-bit slot.
+         for inst in func.blocks[bi].instructions.iter_mut() {
+-            if escape_read_needs_narrow(inst, member) {
++            if escape_read_needs_narrow(inst, member, wide_ty) {
+                 rewrite_operand_value(inst, member, Operand::Value(narrow));
+             }
+         }
+@@ -2177,14 +2325,42 @@ fn replace_all_uses_of_value(func: &mut IrFunction, old_val: Value, new_op: Oper
+ ///
+ /// Everything else (narrow binops, narrow select data, store values, call
+ /// arguments, return/switch values) is a narrow consumer and gets the trunc.
+-fn escape_read_needs_narrow(inst: &Instruction, member: Value) -> bool {
++/// Whether an operand slot declared as `slot_ty` may read the **widened**
++/// member directly instead of the re-truncated narrow value.
++///
++/// After widening, the member's SSA value physically holds `wide_ty`
++/// (`I64`/`U64` on LP64). A reader is only type-correct when its declared
++/// operand type is an integer/pointer slot of exactly that width: anything
++/// narrower would silently drop the upper half, and anything of a *different
++/// kind* (floating point, vector, `Void`) would reinterpret the bits.
++///
++/// The last case is not hypothetical. `for (i = 0; i < n; ++i) f((float) i)`
++/// lowers to `Cast { src: i, from_ty: I32, to_ty: F32 }`, which is **not** a
++/// closure member (an int→float conversion is not extension-transparent), so
++/// the plan never retypes its `from_ty`. Letting it read the widened `i`
++/// produced an `I32`-typed read of an `I64` value; the folder then collapsed
++/// the whole conversion to `0.0f` and `K * (float) i` silently evaluated to
++/// zero for every loop-carried `i` (gcc.c-torture `20060420-1.c`, and every
++/// `sum += a[i] * (float) i` shape).
++#[inline]
++fn wide_read_is_type_correct(slot_ty: IrType, wide_ty: IrType) -> bool {
++    matches!(slot_ty, IrType::Ptr) || (slot_ty.is_integer() && slot_ty.size() == wide_ty.size())
++}
++
++fn escape_read_needs_narrow(inst: &Instruction, member: Value, wide_ty: IrType) -> bool {
+     let reads = |op: &Operand| matches!(op, Operand::Value(v) if v.0 == member.0);
++    let narrow_slot = |ty: &IrType| !wide_read_is_type_correct(*ty, wide_ty);
+     match inst {
+-        // GEP offsets and intrinsic index arguments are address arithmetic.
++        // GEP offsets and intrinsic index arguments are address arithmetic:
++        // the backend types those slots at pointer width by construction.
+         Instruction::GetElementPtr { .. } | Instruction::Intrinsic { .. } => false,
+-        Instruction::BinOp { ty, lhs, rhs, .. } => ty.size() < 8 && (reads(lhs) || reads(rhs)),
+-        Instruction::Cmp { .. } => false,
+-        Instruction::Cast { .. } => false,
++        Instruction::BinOp { ty, lhs, rhs, .. } => narrow_slot(ty) && (reads(lhs) || reads(rhs)),
++        // `Cmp`/`Cast`/`Phi` used to be unconditionally wide-read. They are
++        // only wide-read when their own declared type says so; a `CmpAction`
++        // has already retyped (or re-truncated) every cmp the plan owns, so
++        // whatever still reads the member here was not retyped.
++        Instruction::Cmp { ty, lhs, rhs, .. } => narrow_slot(ty) && (reads(lhs) || reads(rhs)),
++        Instruction::Cast { from_ty, src, .. } => narrow_slot(from_ty) && reads(src),
+         // A Copy of a narrow member carries a narrow dest: it must read the
+         // truncation, not the wide value.
+         Instruction::Copy { .. } => true,
+@@ -2193,8 +2369,10 @@ fn escape_read_needs_narrow(inst: &Instruction, member: Value) -> bool {
+             true_val,
+             false_val,
+             ..
+-        } => ty.size() < 8 && (reads(true_val) || reads(false_val)),
+-        Instruction::Phi { .. } => false,
++        } => narrow_slot(ty) && (reads(true_val) || reads(false_val)),
++        Instruction::Phi { ty, incoming, .. } => {
++            narrow_slot(ty) && incoming.iter().any(|(op, _)| reads(op))
++        }
+         // Load reads a pointer, not the member; store values, calls, atomics
+         // and everything else are narrow consumers.
+         _ => true,
+@@ -3256,22 +3434,22 @@ mod tests {
+     fn test_unsigned_const_widen() {
+         assert_eq!(
+             widen_const(IrConst::I32(-1), IrType::U32),
+-            IrConst::I64(0xFFFF_FFFF),
++            Some(IrConst::I64(0xFFFF_FFFF)),
+             "U32 0xFFFFFFFF must zero-extend"
+         );
+         assert_eq!(
+             widen_const(IrConst::I32(-1), IrType::I32),
+-            IrConst::I64(-1),
++            Some(IrConst::I64(-1)),
+             "I32 -1 must sign-extend"
+         );
+         assert_eq!(
+             widen_const(IrConst::I8(-8), IrType::U8),
+-            IrConst::I64(0xF8),
++            Some(IrConst::I64(0xF8)),
+             "U8 0xF8 must zero-extend"
+         );
+         assert_eq!(
+             widen_const(IrConst::I8(-8), IrType::I8),
+-            IrConst::I64(-8),
++            Some(IrConst::I64(-8)),
+             "I8 -8 must sign-extend"
+         );
+     }
+diff --git a/tests/regression/builtin_size_t_arg_width.c b/tests/regression/builtin_size_t_arg_width.c
 new file mode 100644
-index 0000000..cd942dc
+index 0000000..1fae43b
 --- /dev/null
-+++ b/tests/regression/fp_copy_web_interference.c
-@@ -0,0 +1,84 @@
-+/* Regression: copy-connected FP webs whose members INTERFERE.
++++ b/tests/regression/builtin_size_t_arg_width.c
+@@ -0,0 +1,140 @@
++/*
++ * Call arguments are a conversion boundary: the recorded argument type must
++ * describe the value that was actually materialised.
 + *
-+ * Every function below is a scalar FP "copy web" after phi elimination
-+ * (Copy edges connect the values), yet the members hold DIFFERENT values at
-+ * the same time: Fibonacci/rotation swaps, a reduction result reused after
-+ * the remainder loop, prev/cur Newton tracking, a snapshot taken mid-loop.
-+ * A coalescer that unions copy edges without an interference check (fat
-+ * interval [min start, max end] shared by all members) gives them ONE XMM
-+ * register and the latch copy of one member destroys the other.  Executed
-+ * against GCC at -O2/-O3 by the suite; also exercised with
-+ * -march=x86-64-v3 (AVX reduction + remainder tails) via the .flags sidecar.
++ * Two historic defects, one root cause.
++ *
++ * `get_expr_type` answers a *storage-level* question and reports `I64` on LP64
++ * for an `IntLiteral` operand, so an arithmetic `BinaryOp` such as `i + 1` was
++ * typed `I64` even though the emitted `BinOp` correctly carries `ty: I32`.
++ * That disagreement was recorded straight into `CallInfo::arg_types`:
++ *
++ *   1. `__builtin_memcmp(p, q, i + 1)` produced
++ *      `args: [.., v:I32], arg_types: [.., I64]` with no conversion at all,
++ *      because the LibcAlias builtin path had no libc signature to convert
++ *      against. At -O0 the 32-bit value lives in a 4-byte stack slot and the
++ *      8-byte argument load pulled the ADJACENT slot in as its high half:
++ *      `%rdx` became `0x1_00000007` and memcmp ran off both buffers
++ *      (gcc.c-torture/execute/pr59229.c, pr109938.c, pr109986.c).
++ *
++ *   2. With a prototype in scope the same lie produced
++ *      `Cast { from_ty: I64, to_ty: U64 }` — a same-width no-op — where C
++ *      requires `int -> size_t` to SIGN-extend first (C11 6.3.1.3), so a
++ *      negative length was zero-extended into a merely-large value instead of
++ *      SIZE_MAX-relative.
++ *
++ * The test pins both: a runtime-length compare through the builtin and through
++ * a real prototype, the `sizeof(x) != 0` comparison-operand shape from the PR
++ * tests (a `Cmp` materialises an I32 while the storage query says I64), and
++ * the negative-int-to-size_t conversion, checked against values the compiler
++ * cannot constant-fold.
 + */
 +#include <stdio.h>
-+#include <math.h>
-+/* 1. FP swap web: a and b are copy-connected but interfere. */
-+__attribute__((noinline)) double fib_d(long n) {
-+    double a = 0.0, b = 1.0;
-+    for (long i = 0; i < n; i++) { double t = a + b; a = b; b = t; }
-+    return a;
++#include <string.h>
++
++extern int printf(const char *, ...);
++
++int g_len;                 /* global so the length is not a known constant */
++volatile int v_neg = -1;
++
++/* Observes the size_t its caller actually passed. */
++__attribute__((noinline)) unsigned long observe_size(unsigned long n) { return n; }
++
++__attribute__((noinline)) int builtin_cmp(const char *p, const char *q) {
++    /* size_t parameter fed by an `int` expression. */
++    return __builtin_memcmp(p, q, g_len + 1);
 +}
-+__attribute__((noinline)) float fib_f(long n) {
-+    float a = 0.0f, b = 1.0f;
-+    for (long i = 0; i < n; i++) { float t = a + b; a = b; b = t; }
-+    return a;
++
++__attribute__((noinline)) int proto_cmp(const char *p, const char *q) {
++    return memcmp(p, q, (size_t) (g_len + 1));
 +}
-+/* 2. Reduction combine value reused after the remainder loop. */
-+__attribute__((noinline)) double red_reuse(const double *x, int n, int m) {
-+    double s = 0.0;
-+    for (int i = 0; i < n; i++) s += x[i];
-+    double t = s;
-+    for (int i = 0; i < m; i++) t += x[i] * 0.5;
-+    return s - t;
++
++__attribute__((noinline)) int builtin_cmp_cmpexpr(const char *p, const char *q) {
++    /* The pr109938/pr109986 shape: the length operand is a COMPARISON, which
++     * materialises a 4-byte value while the storage-level query says I64. */
++    return __builtin_memcmp(p, q, sizeof(int) != 0);
 +}
-+__attribute__((noinline)) float red_reuse_f(const float *x, int n, int m) {
-+    float s = 0.0f;
-+    for (int i = 0; i < n; i++) s += x[i];
-+    float t = s;
-+    for (int i = 0; i < m; i++) t += x[i] * 0.5f;
-+    return s - t;
++
++__attribute__((noinline)) void builtin_set(char *p, int fill) {
++    __builtin_memset(p, fill, g_len + 1);
 +}
-+/* 3. Newton with prev tracking (prev/cur copy web, both live). */
-+__attribute__((noinline)) double newton(double a, int iters) {
-+    double cur = a, prev = 0.0;
-+    for (int i = 0; i < iters; i++) { prev = cur; cur = 0.5 * (cur + a / cur); }
-+    return cur - prev;
++
++__attribute__((noinline)) void builtin_cpy(char *d, const char *s) {
++    __builtin_memcpy(d, s, g_len + 1);
 +}
-+/* 4. Lost-copy: value copied, then original modified, both used. */
-+__attribute__((noinline)) double lost_copy(const double *x, int n) {
-+    double acc = 0.0, snap = 0.0;
-+    for (int i = 0; i < n; i++) {
-+        if (i % 7 == 3) snap = acc;   /* copy of acc while acc keeps changing */
-+        acc += x[i];
-+    }
-+    return acc * 3.0 + snap;
-+}
-+/* 5. Three-way rotation web. */
-+__attribute__((noinline)) double rot3(const double *x, int n) {
-+    double a = 1.0, b = 2.0, c = 3.0;
-+    for (int i = 0; i < n; i++) { double t = a; a = b + x[i]; b = c; c = t; }
-+    return a * 1.0 + b * 10.0 + c * 100.0;
-+}
-+/* 6. Vector reduction + scalar remainder where the combine is also returned. */
-+__attribute__((noinline)) double dot_and_sum(const double *x, const double *y, int n, double *sum_out) {
-+    double d = 0.0;
-+    for (int i = 0; i < n; i++) d += x[i] * y[i];
-+    double s = d;
-+    for (int i = 0; i < n; i++) s += y[i];
-+    *sum_out = d;
-+    return s;
-+}
++
 +int main(void) {
-+    static double x[257], xs[257]; static float xf[257];
-+    for (int i = 0; i < 257; i++) { x[i] = (i % 13) * 0.25 - 1.5; xf[i] = (float)x[i]; xs[i] = 1.0 / (i + 1); }
-+    printf("fib_d %.1f\n", fib_d(30));
-+    printf("fib_f %.1f\n", fib_f(20));
-+    printf("red_reuse %.6f %.6f %.6f\n", red_reuse(x, 257, 7), red_reuse(x, 16, 16), red_reuse(x, 3, 100));
-+    printf("red_reuse_f %.6f %.6f\n", red_reuse_f(xf, 257, 7), red_reuse_f(xf, 33, 5));
-+    printf("newton %.9f %.9f\n", newton(2.0, 6), newton(9.0, 1));
-+    printf("lost_copy %.6f %.6f\n", lost_copy(x, 257), lost_copy(x, 4));
-+    printf("rot3 %.6f %.6f\n", rot3(x, 257), rot3(x, 5));
-+    double so; double r = dot_and_sum(x, xs, 257, &so);
-+    printf("dot_and_sum %.6f %.6f\n", r, so);
-+    return 0;
++    const char *ref = "abcdefg";
++    char buf[8] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 0};
++    char dst[8];
++    int fails = 0;
++
++    for (g_len = 0; g_len < 7; ++g_len) {
++        if (builtin_cmp(buf, ref) != 0) {
++            printf("builtin_memcmp(len=%d) != 0\n", g_len + 1);
++            ++fails;
++        }
++        if (proto_cmp(buf, ref) != 0) {
++            printf("proto memcmp(len=%d) != 0\n", g_len + 1);
++            ++fails;
++        }
++        if (builtin_cmp_cmpexpr(buf, ref) != 0) {
++            printf("builtin_memcmp(cmpexpr len) != 0 at g_len=%d\n", g_len);
++            ++fails;
++        }
++        /* A real difference must still be reported. */
++        buf[g_len] ^= 0x20;
++        if (builtin_cmp(buf, ref) == 0) {
++            printf("builtin_memcmp missed a difference at %d\n", g_len);
++            ++fails;
++        }
++        buf[g_len] ^= 0x20;
++
++        memset(dst, 0x7f, sizeof dst);
++        builtin_cpy(dst, ref);
++        if (memcmp(dst, ref, (size_t) g_len + 1) != 0 ||
++            (unsigned char) dst[g_len + 1] != 0x7fu) {
++            printf("builtin_memcpy wrote the wrong extent at g_len=%d\n", g_len);
++            ++fails;
++        }
++
++        memset(dst, 0x7f, sizeof dst);
++        builtin_set(dst, 'Z');
++        {
++            int k, ok = 1;
++            for (k = 0; k <= g_len; ++k)
++                if (dst[k] != 'Z')
++                    ok = 0;
++            if (!ok || (unsigned char) dst[g_len + 1] != 0x7fu) {
++                printf("builtin_memset wrote the wrong extent at g_len=%d\n", g_len);
++                ++fails;
++            }
++        }
++    }
++
++    /*
++     * int -> size_t must sign-extend, so (size_t)(-1) is SIZE_MAX and
++     * (size_t)(-1 + 1) is 0. A zero-extending (or truncating) conversion would
++     * yield 0xFFFFFFFF and 0.
++     */
++    {
++        unsigned long want_max = (unsigned long) (long) v_neg;
++        unsigned long got = observe_size(v_neg);
++        if (got != want_max) {
++            printf("int->size_t: got %lu want %lu\n", got, want_max);
++            ++fails;
++        }
++        if (observe_size(v_neg - 1) != (unsigned long) (long) (v_neg - 1)) {
++            printf("int->size_t on an expression is wrong\n");
++            ++fails;
++        }
++        /* And through the builtin's own signature. */
++        if (__builtin_memcmp(buf, ref, (unsigned long) (v_neg + 1)) != 0) {
++            printf("__builtin_memcmp with a zero-length (v_neg+1) is wrong\n");
++            ++fails;
++        }
++    }
++
++    printf("builtin_size_t_arg_width: %s\n", fails ? "FAIL" : "OK");
++    return fails != 0;
 +}
-diff --git a/tests/regression/fp_copy_web_interference.flags b/tests/regression/fp_copy_web_interference.flags
+diff --git a/tests/regression/divrem_pair_opposite_flavour.c b/tests/regression/divrem_pair_opposite_flavour.c
 new file mode 100644
-index 0000000..2241738
+index 0000000..6823a04
 --- /dev/null
-+++ b/tests/regression/fp_copy_web_interference.flags
-@@ -0,0 +1 @@
-+-O3 -march=x86-64-v3 -lm
-diff --git a/tests/regression/phi_coalesce_folded_shl_index.c b/tests/regression/phi_coalesce_folded_shl_index.c
-new file mode 100644
-index 0000000..ee9b2f1
---- /dev/null
-+++ b/tests/regression/phi_coalesce_folded_shl_index.c
-@@ -0,0 +1,71 @@
-+/* Regression: phi-latch coalescing vs. a folded SIB index peeled through Shl.
++++ b/tests/regression/divrem_pair_opposite_flavour.c
+@@ -0,0 +1,192 @@
++/*
++ * A fused div/rem pair must have OPPOSITE flavours.
 + *
-+ * The loop stores twice with the same `i<<3` offset (`x[i]`, `xs[i]`), and the
-+ * second store's VALUE consumes `i+1` — the same expression as the IV
-+ * increment, which CSE merges into ONE value that phi elimination then copies
-+ * back into `i` at the latch.  The phi-latch coalescer may give `i+1` the IV's
-+ * register (a destructive in-place `addl $1`) only when nothing reads the OLD
-+ * `i` after that update.  The `xs[i]` store does: its address is formed at the
-+ * store as `(%base,%i,8)` because the backend folds `GEP(base, Shl(i,3))` into
-+ * the SIB operand and re-reads `i` there — a read the IR does not show, since
-+ * the GEP consumed `Shl(i,3)` and the syntactic closure only followed
-+ * Cast/GEP, not the Shl.
++ * One `idivl`/`divl` yields the quotient in %eax and the remainder in %edx, so
++ * fusing two div-like operations only makes sense when the two consumers want
++ * DIFFERENT halves. Every backend emitter derives the register split from the
++ * HEAD's flavour alone (i686 `emit_divrem_pair_head`:
++ * `div_dest = if self_is_div { dest } else { partner }`; the AArch64 partner
++ * map does not even carry the tail's flavour) — i.e. they all *assume* the
++ * flavours differ. `compute_i686_divrem_pairs` never enforced it: it paired any
++ * two div-likes in a block with identical operands and matching signedness.
 + *
-+ * Before the fix: xs[] was shifted by one element (xs[i] = 1/i, xs[0] = 0).
-+ * Fixed by (a) mirroring the backend's peel set (Shl/Mul/Add/Sub by a
-+ * constant) in the hidden-read closure and (b) the authoritative segment
-+ * veto: the phi may not be live at any point inside the update window
-+ * according to the hole-aware segments, which already carry the folded-index
-+ * extension.
++ * Two same-flavour operations with identical operands compute the SAME value
++ * (a CSE miss, not a fusion opportunity), and the tail was then stored from the
++ * wrong register:
++ *
++ *     x[n % 1000] = 2;      ->   movl %edi, %eax    # %edi held n / 1000
++ *                                shll $2, %eax
++ *                                addl -24(%ebp), %eax
++ *                                movl $2, (%eax)    # index up to 999 into a
++ *                                                   # (n % 1000 + 1)-element VLA
++ *
++ * On i686 this took out eight gcc.c-torture tests at -O0/-O1:
++ * `20040811-1.c`, `vla-dealloc-1.c`, `pr43220.c` (repeated `n % 1000` against a
++ * VLA -> stack scribble -> SIGSEGV), `981001-1.c` (repeated `n / 2`),
++ * `20000511-1.c` (repeated `b % c`), and `ssad-run.c` / `usad-run.c`.
++ *
++ * Every shape below keeps two div-likes of the SAME operands in one basic block
++ * so the pairing scan sees them, and checks the value against a `volatile`
++ * reference the compiler cannot fold.
 + */
 +#include <stdio.h>
 +
-+static double x[257], xs[257];
++extern int printf(const char *, ...);
 +
-+__attribute__((noinline)) static void fill(int n) {
-+    for (int i = 0; i < n; i++) {
-+        x[i] = (i % 13) * 0.25 - 1.5;
-+        xs[i] = 1.0 / (i + 1);
-+    }
++volatile int v1000 = 1000, v2 = 2, v7 = 7;
++volatile unsigned vu = 1000u;
++
++/* --- 1. two SRems of the same operands (the VLA shape) ---------------- */
++__attribute__((noinline)) int two_srem(int n, int d) {
++    int a = n % d;
++    int b = n % d;
++    return a * 31 + b;
 +}
 +
-+/* Same shape with the increment displaced into the address chain
-+ * (`p[i+1]` → SIB displacement peel) and a 4-byte element. */
-+__attribute__((noinline)) static void fill_disp(int *a, int *b, int n) {
-+    for (int i = 0; i < n - 1; i++) {
-+        a[i] = i * 3;
-+        b[i + 1] = a[i] + (i + 1);
-+    }
++/* --- 2. two SDivs of the same operands (981001-1) --------------------- */
++__attribute__((noinline)) int two_sdiv(int n, int d) {
++    int a = n / d;
++    int b = n / d;
++    return a * 31 + b;
 +}
 +
-+/* Scaled-by-multiply index (`Mul` peel) with the IV re-read at the store. */
-+__attribute__((noinline)) static void fill_mul(short *a, long *b, int n) {
-+    for (int i = 0; i < n; i++) {
-+        a[i * 2] = (short)i;
-+        b[i] = a[i * 2] * (long)(i + 1);
-+    }
++/* --- 3. two URems / two UDivs ----------------------------------------- */
++__attribute__((noinline)) unsigned two_urem(unsigned n, unsigned d) {
++    unsigned a = n % d;
++    unsigned b = n % d;
++    return a * 31u + b;
++}
++__attribute__((noinline)) unsigned two_udiv(unsigned n, unsigned d) {
++    unsigned a = n / d;
++    unsigned b = n / d;
++    return a * 31u + b;
++}
++
++/* --- 4. three of a kind, then the genuine opposite-flavour pair ------- */
++__attribute__((noinline)) int three_then_pair(int n, int d) {
++    int a = n % d;
++    int b = n % d;
++    int c = n % d;
++    int q = n / d; /* this one legitimately fuses with a remainder */
++    return ((a + b + c) * 31 + q);
++}
++
++/* --- 5. the pair that SHOULD fuse still has to be correct ------------- */
++__attribute__((noinline)) int div_then_rem(int n, int d) {
++    int q = n / d;
++    int r = n % d;
++    return q * 1000 + r;
++}
++__attribute__((noinline)) int rem_then_div(int n, int d) {
++    int r = n % d;
++    int q = n / d;
++    return q * 1000 + r;
++}
++
++/* --- 6. constant divisor (the magic-number head path) ----------------- */
++__attribute__((noinline)) int two_srem_const(int n) {
++    int a = n % 1000;
++    int b = n % 1000;
++    return a * 31 + b;
++}
++__attribute__((noinline)) int const_div_then_rem(int n) {
++    int q = n / 1000;
++    int r = n % 1000;
++    return q * 100000 + r;
++}
++
++/* --- 7. the exact torture shape: repeated `n % 1000` indexing a VLA --- */
++void *volatile keep;
++__attribute__((noinline)) int vla_repeat_mod(int n) {
++    int x[n % 1000 + 1];
++    x[0] = 1;
++    x[n % 1000] = 2; /* must be the REMAINDER, never the quotient */
++    keep = x;
++    return x[n % 1000] + x[0];
 +}
 +
 +int main(void) {
-+    fill(257);
-+    unsigned long h = 0;
-+    for (int i = 0; i < 257; i++) {
-+        h = h * 1000003u ^ (unsigned long)(x[i] * 4.0 + 8.0);
-+        h = h * 1000003u ^ (unsigned long)(xs[i] * 1e6);
++    int fails = 0;
++    const int ns[] = {0, 1, 7, 999, 1000, 1001, 123456, -1, -7, -1000, -123456};
++    const int ds[] = {2, 3, 7, 1000};
++
++    for (unsigned i = 0; i < sizeof ns / sizeof ns[0]; ++i) {
++        for (unsigned k = 0; k < sizeof ds / sizeof ds[0]; ++k) {
++            int n = ns[i], d = ds[k];
++            volatile int vn = n, vd = d;
++            int wr = vn % vd, wq = vn / vd;
++
++            if (two_srem(n, d) != wr * 31 + wr) {
++                printf("two_srem(%d,%d) = %d want %d\n", n, d, two_srem(n, d), wr * 31 + wr);
++                ++fails;
++            }
++            if (two_sdiv(n, d) != wq * 31 + wq) {
++                printf("two_sdiv(%d,%d) = %d want %d\n", n, d, two_sdiv(n, d), wq * 31 + wq);
++                ++fails;
++            }
++            if (three_then_pair(n, d) != (wr + wr + wr) * 31 + wq) {
++                printf("three_then_pair(%d,%d) = %d want %d\n", n, d, three_then_pair(n, d),
++                       (wr + wr + wr) * 31 + wq);
++                ++fails;
++            }
++            if (div_then_rem(n, d) != wq * 1000 + wr) {
++                printf("div_then_rem(%d,%d) = %d want %d\n", n, d, div_then_rem(n, d),
++                       wq * 1000 + wr);
++                ++fails;
++            }
++            if (rem_then_div(n, d) != wq * 1000 + wr) {
++                printf("rem_then_div(%d,%d) = %d want %d\n", n, d, rem_then_div(n, d),
++                       wq * 1000 + wr);
++                ++fails;
++            }
++        }
 +    }
-+    printf("fill %.4f %.4f %.4f %.6f %lu\n", x[0], xs[0], xs[1], xs[256], h);
 +
-+    static int a[64], b[64];
-+    fill_disp(a, b, 64);
-+    long s = 0;
-+    for (int i = 0; i < 64; i++) s += a[i] * 7 + b[i];
-+    printf("fill_disp %d %d %d %ld\n", a[5], b[1], b[63], s);
++    {
++        const unsigned uns[] = {0u, 1u, 999u, 1000u, 4000000000u};
++        const unsigned uds[] = {3u, 1000u, 65537u};
++        for (unsigned i = 0; i < sizeof uns / sizeof uns[0]; ++i)
++            for (unsigned k = 0; k < sizeof uds / sizeof uds[0]; ++k) {
++                volatile unsigned un = uns[i], ud = uds[k];
++                unsigned wr = un % ud, wq = un / ud;
++                if (two_urem(uns[i], uds[k]) != wr * 31u + wr) {
++                    printf("two_urem(%u,%u) wrong\n", uns[i], uds[k]);
++                    ++fails;
++                }
++                if (two_udiv(uns[i], uds[k]) != wq * 31u + wq) {
++                    printf("two_udiv(%u,%u) wrong\n", uns[i], uds[k]);
++                    ++fails;
++                }
++            }
++    }
 +
-+    static short sa[128];
-+    static long lb[64];
-+    fill_mul(sa, lb, 64);
-+    long t = 0;
-+    for (int i = 0; i < 64; i++) t += lb[i] + sa[i * 2];
-+    printf("fill_mul %d %ld %ld %ld\n", sa[6], lb[3], lb[63], t);
-+    return 0;
++    for (unsigned i = 0; i < sizeof ns / sizeof ns[0]; ++i) {
++        int n = ns[i];
++        volatile int vn = n;
++        int wr = vn % 1000, wq = vn / 1000;
++        if (two_srem_const(n) != wr * 31 + wr) {
++            printf("two_srem_const(%d) = %d want %d\n", n, two_srem_const(n), wr * 31 + wr);
++            ++fails;
++        }
++        if (const_div_then_rem(n) != wq * 100000 + wr) {
++            printf("const_div_then_rem(%d) = %d want %d\n", n, const_div_then_rem(n),
++                   wq * 100000 + wr);
++            ++fails;
++        }
++    }
++
++    /* The VLA shape, over a range that makes a quotient index fatal.
++     * When n % 1000 == 0 both stores hit x[0], so the expected sum is 4. */
++    for (int n = 0; n < 5000; n += 137) {
++        int want = (n % 1000 == 0) ? 4 : 3;
++        int got = vla_repeat_mod(n);
++        if (got != want) {
++            printf("vla_repeat_mod(%d) = %d want %d\n", n, got, want);
++            ++fails;
++            break;
++        }
++    }
++
++    printf("divrem_pair_opposite_flavour: %s\n", fails ? "FAIL" : "OK");
++    return fails != 0;
++}
+diff --git a/tests/regression/iv_widen_float_conversion_closure.c b/tests/regression/iv_widen_float_conversion_closure.c
+new file mode 100644
+index 0000000..8cbbb76
+--- /dev/null
++++ b/tests/regression/iv_widen_float_conversion_closure.c
+@@ -0,0 +1,262 @@
++/*
++ * iv_widen: an int->float conversion of a widened induction variable is a
++ * value CONVERSION, never a bit-level extension.
++ *
++ * Historic defect (found by gcc.c-torture/execute/20060420-1.c, -O2/-O3):
++ * `iv_widen.rs` admitted `Cast { from_ty: I32, to_ty: F32 }` as a
++ * `MemberKind::WidenCast` because the admission test was
++ *
++ *     to_ty.size() >= 4 && to_ty != Ptr && is_unsigned_ty(to) == is_unsigned_ty(from)
++ *
++ * and `F32` satisfies all three (size 4, not Ptr, and `is_unsigned_ty` is
++ * `false` for both `F32` and `I32`). The cast was therefore DROPPED and its
++ * consumers re-classified as integer closure members, so
++ *
++ *     float e = 11 * (float) i;      ->   Mul(i:I64, widen_const(F32(11.0)))
++ *                                    ->   Mul(i:I64, I64(0))          == 0
++ *
++ * i.e. every `K * (float) i` in a counted loop with an addressing use of `i`
++ * silently evaluated to ZERO. The same hole let float-typed `BinOp`s of width
++ * 8 (`F64`, `D64`) pass the `ty.size() >= 8` "wide chain op" shortcut.
++ *
++ * This test pins the whole family: signed/unsigned IVs, f32/f64/long double,
++ * both operand orders, multiply/add/subtract/divide, a float select, a
++ * float compare, and the induction variable escaping the loop into a float.
++ * Every loop keeps a GEP use of `i` so the widening candidacy (which
++ * requires an addressing anchor) actually fires.
++ *
++ * Reference values are computed with a `volatile` step so no optimizer can
++ * constant-fold the expected side into the same wrong closed form.
++ */
++#include <stdio.h>
++
++#define N 16
++
++static float src_f[N];
++static double src_d[N];
++static unsigned char bytes[N];
++
++/* --- 1. the exact 20060420-1.c shape: K * (float) i ------------------- */
++static void mul_f32(float *dst, const float *a, int n) {
++    int i;
++    for (i = 0; i < n; ++i)
++        dst[i] = a[i] + 11 * (float) i;
++}
++
++/* --- 2. constant on the right, and a second scale in the same body ---- */
++static void mul_f32_rhs(float *dst, const float *a, int n) {
++    int i;
++    for (i = 0; i < n; ++i)
++        dst[i] = a[i] + (float) i * 11 + 12 * (float) i;
++}
++
++/* --- 3. double, and a subtraction (Sub is also a "const scale" arm) --- */
++static void mul_f64(double *dst, const double *a, int n) {
++    int i;
++    for (i = 0; i < n; ++i)
++        dst[i] = a[i] + 7.5 * (double) i - 2.5 * (double) i;
++}
++
++/* --- 4. unsigned IV (the zext path) with a float divide ---------------- */
++static void div_u32(float *dst, const float *a, unsigned n) {
++    unsigned i;
++    for (i = 0; i < n; ++i)
++        dst[i] = a[i] + (float) i / 4.0f;
++}
++
++/* --- 5. narrow (u8) loads feeding a float scale, IV also indexes ------- */
++static void byte_scale(float *dst, const unsigned char *b, int n) {
++    int i;
++    for (i = 0; i < n; ++i)
++        dst[i] = (float) b[i] * 3 + 5 * (float) i;
++}
++
++/* --- 6. float SELECT whose data operands derive from the IV ----------- */
++static void select_f32(float *dst, const float *a, int n) {
++    int i;
++    for (i = 0; i < n; ++i) {
++        float lo = 2 * (float) i;
++        float hi = 3 * (float) i;
++        dst[i] = a[i] + ((i & 1) ? hi : lo);
++    }
++}
++
++/* --- 7. float COMPARE against an IV-derived value --------------------- */
++static int cmp_f32(const float *a, int n) {
++    int i, hits = 0;
++    for (i = 0; i < n; ++i)
++        if (a[i] > 9 * (float) i)
++            hits += i;
++    return hits;
++}
++
++/* --- 8. long double (F128 carrier) scale ------------------------------ */
++static void mul_ld(double *dst, const double *a, int n) {
++    int i;
++    for (i = 0; i < n; ++i)
++        dst[i] = (double) ((long double) a[i] + (long double) 13 * (long double) i);
++}
++
++/* --- 9. the IV escapes the loop as a float (escape-truncation path) ---- */
++static float escape_f32(const float *a, int n) {
++    int i;
++    float last = 0.0f;
++    for (i = 0; i < n; ++i)
++        last = a[i];
++    /* `i` is live out and is consumed by a conversion, not an extension. */
++    return last + 6 * (float) i;
++}
++
++/*
++ * --- 10. the *exact* 20060420-1.c shape ------------------------------
++ *
++ * A cold `noreturn` exit inside the loop keeps the vectorizer away, so the
++ * residual scalar counted loop reaches iv_widen and the in-loop
++ * `Cast { I32 -> F32 }` is presented to the closure classifier. This is the
++ * arm that produced `Mul(i:I64, I64(0))`; without the cold call the loop is
++ * vectorized and the defect hides.
++ */
++extern void iv_widen_report_mismatch(int i, float got, float want);
++
++static int cold_exit_scale(const float *a, int n) {
++    int i;
++    for (i = 0; i < n; ++i) {
++        float e = 11 * (float) i;
++        if (a[i] != e)
++            iv_widen_report_mismatch(i, a[i], e);
++    }
++    return i;
++}
++
++static int mismatches;
++static int first_bad_i = -1;
++static float first_bad_got, first_bad_want;
++
++void iv_widen_report_mismatch(int i, float got, float want) {
++    if (first_bad_i < 0) {
++        first_bad_i = i;
++        first_bad_got = got;
++        first_bad_want = want;
++    }
++    ++mismatches;
++}
++
++int main(void) {
++    volatile int one = 1;
++    int i, fails = 0;
++    float out[N];
++    double outd[N];
++
++    for (i = 0; i < N; ++i) {
++        src_f[i] = (float) (i * one) * 0.5f;
++        src_d[i] = (double) (i * one) * 0.25;
++        bytes[i] = (unsigned char) (i * one + 3);
++    }
++
++    mul_f32(out, src_f, N);
++    for (i = 0; i < N; ++i) {
++        float want = src_f[i] + 11.0f * (float) (i * one);
++        if (out[i] != want) {
++            printf("mul_f32[%d] = %g want %g\n", i, out[i], want);
++            ++fails;
++        }
++    }
++
++    mul_f32_rhs(out, src_f, N);
++    for (i = 0; i < N; ++i) {
++        float want = src_f[i] + (float) (i * one) * 11.0f + 12.0f * (float) (i * one);
++        if (out[i] != want) {
++            printf("mul_f32_rhs[%d] = %g want %g\n", i, out[i], want);
++            ++fails;
++        }
++    }
++
++    mul_f64(outd, src_d, N);
++    for (i = 0; i < N; ++i) {
++        double want = src_d[i] + 7.5 * (double) (i * one) - 2.5 * (double) (i * one);
++        if (outd[i] != want) {
++            printf("mul_f64[%d] = %g want %g\n", i, outd[i], want);
++            ++fails;
++        }
++    }
++
++    div_u32(out, src_f, (unsigned) N);
++    for (i = 0; i < N; ++i) {
++        float want = src_f[i] + (float) (unsigned) (i * one) / 4.0f;
++        if (out[i] != want) {
++            printf("div_u32[%d] = %g want %g\n", i, out[i], want);
++            ++fails;
++        }
++    }
++
++    byte_scale(out, bytes, N);
++    for (i = 0; i < N; ++i) {
++        float want = (float) bytes[i] * 3.0f + 5.0f * (float) (i * one);
++        if (out[i] != want) {
++            printf("byte_scale[%d] = %g want %g\n", i, out[i], want);
++            ++fails;
++        }
++    }
++
++    select_f32(out, src_f, N);
++    for (i = 0; i < N; ++i) {
++        float want = src_f[i] + ((i & 1) ? 3.0f * (float) (i * one) : 2.0f * (float) (i * one));
++        if (out[i] != want) {
++            printf("select_f32[%d] = %g want %g\n", i, out[i], want);
++            ++fails;
++        }
++    }
++
++    {
++        int hits = cmp_f32(src_f, N), want = 0;
++        for (i = 0; i < N; ++i)
++            if (src_f[i] > 9.0f * (float) (i * one))
++                want += i;
++        if (hits != want) {
++            printf("cmp_f32 = %d want %d\n", hits, want);
++            ++fails;
++        }
++    }
++
++    mul_ld(outd, src_d, N);
++    for (i = 0; i < N; ++i) {
++        double want =
++            (double) ((long double) src_d[i] + (long double) 13 * (long double) (i * one));
++        if (outd[i] != want) {
++            printf("mul_ld[%d] = %g want %g\n", i, outd[i], want);
++            ++fails;
++        }
++    }
++
++    {
++        float got = escape_f32(src_f, N);
++        float want = src_f[N - 1] + 6.0f * (float) (N * one);
++        if (got != want) {
++            printf("escape_f32 = %g want %g\n", got, want);
++            ++fails;
++        }
++    }
++
++    /*
++     * Feed `cold_exit_scale` exactly the values it expects, so a correct
++     * compiler reports zero mismatches. A compiler that folds
++     * `11 * (float) i` to zero reports N-1 of them (i == 0 agrees by luck).
++     */
++    {
++        float ref[N];
++        for (i = 0; i < N; ++i)
++            ref[i] = 11.0f * (float) (i * one);
++        if (cold_exit_scale(ref, N) != N) {
++            printf("cold_exit_scale returned the wrong trip count\n");
++            ++fails;
++        }
++        if (mismatches != 0) {
++            printf("cold_exit_scale: %d mismatch(es), first i=%d got %g want %g\n", mismatches,
++                   first_bad_i, first_bad_got, first_bad_want);
++            ++fails;
++        }
++    }
++
++    printf("iv_widen_float_conversion_closure: %s\n", fails ? "FAIL" : "OK");
++    return fails != 0;
++}
+diff --git a/tests/regression/nested_fn_static_chain_regalloc.c b/tests/regression/nested_fn_static_chain_regalloc.c
+new file mode 100644
+index 0000000..8ef272f
+--- /dev/null
++++ b/tests/regression/nested_fn_static_chain_regalloc.c
+@@ -0,0 +1,139 @@
++/*
++ * The ABI static-chain register must not be an allocatable home in a function
++ * that makes a direct nested-function call.
++ *
++ * `SetStaticChain` is lowered as a DIRECT write of the chain register (`%r10`
++ * on x86-64, `%ecx` on i686) immediately before the call. It carries no IR
++ * dest, so nothing told the linear scan that the register is redefined there,
++ * and any value homed in it that was still live across the call was silently
++ * destroyed.
++ *
++ * gcc.c-torture/execute/920501-7.c caught the x86-64 case at -O1..-Os: in the
++ * recursive nested function the argument `a - 1` was homed in `%r10`, the
++ * chain write clobbered it, and the relay peephole then legitimately rewrote
++ * the argument copy to read the chain register, so the recursion was called
++ * with a pointer instead of the decremented counter and never terminated.
++ *
++ *     movl 48(%rsp), %r10d
++ *     subl $1, %r10d          # a-1 lives in %r10
++ *     movq %r11, %r10         # SetStaticChain -- clobbers a-1
++ *     movq %r11, %rdi         # arg0 reads the chain: y(chain), not y(a-1)
++ *
++ * The shapes below all put real register pressure across a nested call, so a
++ * value WILL land in the chain register if it is left in the pool: several
++ * live values crossing the call, a loop that keeps state across it, and a
++ * non-local goto (which additionally needs the chain itself to survive).
++ */
++#include <stdio.h>
++
++extern int printf(const char *, ...);
++
++/* --- 1. the 920501-7 shape: recursion + non-local goto ---------------- */
++__attribute__((noinline)) int nlg_depth(int a) {
++    __label__ done;
++    void rec(int n) {
++        if (n == 0)
++            goto done;
++        rec(n - 1);
++    }
++    rec(a);
++done:;
++    return a;
++}
++
++/* --- 2. many live values across a direct nested call ------------------ */
++__attribute__((noinline)) long pressure(long a, long b, long c, long d, long e) {
++    long acc = 0;
++    void bump(long k) { acc += k; }
++    /* Every one of a..e must survive the chain-register write. */
++    bump(a);
++    bump(b);
++    bump(c);
++    bump(d);
++    bump(e);
++    return acc + a * 2 + b * 3 + c * 5 + d * 7 + e * 11;
++}
++
++/* --- 3. loop-carried state across a nested call ----------------------- */
++__attribute__((noinline)) long loop_across_chain(const long *v, int n) {
++    long sum = 0, prod = 1;
++    void step(long x) {
++        sum += x;
++        prod = prod * 2 + (x & 1);
++    }
++    for (int i = 0; i < n; ++i) {
++        long scaled = v[i] * 3 + i;
++        step(scaled);
++        sum += scaled ^ i; /* `scaled` and `i` must survive the call */
++    }
++    return sum * 1000 + prod;
++}
++
++/* --- 4. nested call in a conditional, chain reused afterwards --------- */
++__attribute__((noinline)) int branchy(int a, int b) {
++    int hits = 0;
++    void note(int k) { hits += k; }
++    if (a > b)
++        note(a - b);
++    else
++        note(b - a);
++    note(a & b);
++    return hits * 10 + (a > b ? 1 : 2);
++}
++
++int main(void) {
++    int fails = 0;
++    long v[6] = {3, -4, 11, 0, 7, -2};
++
++    for (int d = 0; d <= 6; ++d) {
++        int got = nlg_depth(d);
++        if (got != d) {
++            printf("nlg_depth(%d) = %d\n", d, got);
++            ++fails;
++        }
++    }
++
++    {
++        long got = pressure(1, 2, 3, 4, 5);
++        long want = (1 + 2 + 3 + 4 + 5) + 1 * 2 + 2 * 3 + 3 * 5 + 4 * 7 + 5 * 11;
++        if (got != want) {
++            printf("pressure = %ld want %ld\n", got, want);
++            ++fails;
++        }
++    }
++
++    {
++        long sum = 0, prod = 1;
++        for (int i = 0; i < 6; ++i) {
++            long scaled = v[i] * 3 + i;
++            sum += scaled;
++            prod = prod * 2 + (scaled & 1);
++            sum += scaled ^ i;
++        }
++        long want = sum * 1000 + prod;
++        long got = loop_across_chain(v, 6);
++        if (got != want) {
++            printf("loop_across_chain = %ld want %ld\n", got, want);
++            ++fails;
++        }
++    }
++
++    {
++        struct { int a, b, want; } cases[] = {
++            {9, 4, (9 - 4 + (9 & 4)) * 10 + 1},
++            {4, 9, (9 - 4 + (4 & 9)) * 10 + 2},
++            {7, 7, (0 + (7 & 7)) * 10 + 2},
++        };
++        for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; ++k) {
++            int got = branchy(cases[k].a, cases[k].b);
++            if (got != cases[k].want) {
++                printf("branchy(%d,%d) = %d want %d\n", cases[k].a, cases[k].b, got,
++                       cases[k].want);
++                ++fails;
++            }
++        }
++    }
++
++    printf("nested_fn_static_chain_regalloc: %s\n", fails ? "FAIL" : "OK");
++    return fails != 0;
 +}
