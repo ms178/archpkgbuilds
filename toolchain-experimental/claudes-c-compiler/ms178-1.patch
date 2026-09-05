@@ -1,779 +1,634 @@
-diff --git a/src/backend/x86/cpu_model.rs b/src/backend/x86/cpu_model.rs
-index 249796b7..9671eeeb 100644
---- a/src/backend/x86/cpu_model.rs
-+++ b/src/backend/x86/cpu_model.rs
-@@ -334,7 +334,40 @@ pub struct X86Tune {
-     pub fma_latency: u8,
-     pub fadd_latency: u8,
-     pub fmul_latency: u8,
-+    /// Physical FMA-capable SIMD pipes.  Each pipe is `simd_datapath_bits`
-+    /// wide, so a 256-bit op on a 128-bit machine (Zen1, Gracemont) holds a
-+    /// pipe for two cycles — see [`X86Tune::simd_pipes_for`].
-     pub fma_pipes: u8,
-+    /// Physical packed-FP *add* pipes.  `[uops.info]` VADDPS ymm port
-+    /// usage: SNB/IVB/HSW/BDW **p1 only** (one adder); SKL..RKL p01 (adds
-+    /// run on both FMA units); ADL-P/RPL/SPR/ARL p15 (two dedicated
-+    /// adders); Gracemont two 128-bit FP pipes; every Zen FP2+FP3.  The
-+    /// prior version of this file assumed two adders on every row, which
-+    /// over-provisioned Haswell/Broadwell FADD reductions by 2×.
-+    pub fadd_pipes: u8,
-+    /// Vector integer ALU pipes for VPADDD-class ops.  `[uops.info]`
-+    /// VPADDD ymm: HSW..ADL-P/ARL-P p015 (3); SNB/IVB p15 on 128-bit only
-+    /// (no AVX2 → 2); Gracemont two 128-bit pipes; Zen1..Zen5 FP0..FP3
-+    /// (4, rTP 0.25).
-+    pub vec_int_alu_pipes: u8,
-+    /// Native SIMD execution width in bits.  `[Agner microarchitecture]`
-+    /// / `[AMD SOG]`: SNB..ADL/RPL/ARL client 256 (AVX-512 fused off on
-+    /// ADL/RPL), SKX/ICL/SPR 512, Gracemont 128 (two 128-bit FP pipes;
-+    /// 256-bit ops are double-pumped), Zen1 128, Zen2/3/4 256 (Zen4
-+    /// double-pumps AVX-512), Zen5 desktop 512.  LLVM encodes the same
-+    /// fact as `TuningPrefer128Bit`/`Prefer256Bit`, GCC as
-+    /// `-mprefer-vector-width`; here it is data the decisions derive from
-+    /// ([`X86Tune::prefer_vector_bits`], [`X86Tune::simd_pipes_for`]).
-+    pub simd_datapath_bits: u16,
-+    /// Load pipes that can feed SIMD registers per cycle, and the width of
-+    /// each.  `[Intel ORM]`/`[Agner]`: SNB/IVB 2 × 128 (a 256-bit load
-+    /// occupies both ports); HSW/BDW/SKL 2 × 256; SKX/ICL 2 × 512; GLC/RPC
-+    /// (ADL/RPL) 3 × 256 (three load AGUs p2/p3/p11); SPR 3 × 256; LNC
-+    /// 3 × 256; Gracemont 2 × 128.  `[AMD SOG]`: Zen1 2 × 128; Zen2 2 ×
-+    /// 256; Zen3/Zen4 2 × 256 vector loads per cycle (the third AGU is
-+    /// scalar-only); Zen5 2 × 512.
-+    pub vec_load_ports: u8,
-+    pub vec_load_port_bits: u16,
- 
-     // ------------------------------------------------------------------
-     // Memory.  `[cpuid]` ERMS (Enhanced REP MOVSB): IVB+ Intel, all Zen.
-@@ -363,6 +396,36 @@ pub struct X86Tune {
-     pub ecore: Option<ECoreTune>,
- }
- 
-+/// Loop-carried operation class of a vectorised reduction, for
-+/// [`X86Tune::reduction_interleave`].
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub enum ReductionOp {
-+    /// `acc = fma(a, b, acc)` — FMA latency, FMA pipes (or add units where
-+    /// FMA is absent).
-+    Fma,
-+    /// `acc = acc + x` in floating point.
-+    FAdd,
-+    /// `acc = acc + x` on integer lanes (latency 1).
-+    IntAdd,
-+    /// `acc = max(acc, x)` on integer lanes (latency 1, two pipes).
-+    IntMax,
-+}
-+
-+/// Shape of one vectorised reduction loop body (one original iteration).
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub struct ReductionShape {
-+    pub op: ReductionOp,
-+    /// Vector register width of the accumulator (128 or 256).
-+    pub vector_bits: u16,
-+    /// Accumulator phis in the loop (each performs one `op` per iteration).
-+    pub accumulators: u32,
-+    /// Vector loads per iteration.
-+    pub loads_per_iter: u32,
-+    /// Vector µops per iteration including the loads and the accumulator
-+    /// ops, excluding loop control (modelled as 2: IV add + fused cmp/jcc).
-+    pub uops_per_iter: u32,
-+}
-+
- /// How a constant-size block copy / fill should be lowered.
- #[derive(Clone, Copy, Debug, PartialEq, Eq)]
- pub enum CopyStrategy {
-@@ -667,6 +730,13 @@ impl X86Cpu {
-                 fadd_latency: 3,
-                 fmul_latency: 5,
-                 fma_pipes: 0,
-+                // [uops.info] VADDPS ymm SNB: p1 only; 256-bit loads take both
-+                // 128-bit load ports; no AVX2 → 128-bit integer SIMD on p15.
-+                fadd_pipes: 1,
-+                vec_int_alu_pipes: 2,
-+                simd_datapath_bits: 256,
-+                vec_load_ports: 2,
-+                vec_load_port_bits: 128,
-                 erms,
-                 fsrm: false,
-                 avx256_unaligned_split: true,
-@@ -700,6 +770,11 @@ impl X86Cpu {
-                 pmulld_latency: 10,
-                 fma_latency: 5,
-                 fma_pipes: 2,
-+                // [uops.info] HSW: VADDPS still p1 only (the two FMA units do
-+                // not add until SKL); VPADDD ymm p015; two 256-bit load ports.
-+                fadd_pipes: 1,
-+                vec_int_alu_pipes: 3,
-+                vec_load_port_bits: 256,
-                 avx256_unaligned_split: false,
-                 // [Intel ARK] i7-4790K: 32K/8w, 256K/8w, 8M/16w; [Agner] L2
-                 // 11, L3 ~34; 4.4 GHz × ~80 ns.
-@@ -726,6 +801,8 @@ impl X86Cpu {
-                 div64_rtp_x100: 825,
-                 fma_latency: 4,
-                 fadd_latency: 4,
-+                // [uops.info] SKL: VADDPS on p01 (both FMA units).
-+                fadd_pipes: 2,
-                 fmul_latency: 4,
-                 rob_entries: 224,
-                 lsd_uops: 0,
-@@ -741,12 +818,20 @@ impl X86Cpu {
-                 // [Intel ARK] Xeon Platinum 8280: 32K/8w, 1M/16w, 1.375M/core
-                 // (38.5M/11w); [Agner] L2 14, L3 ~70 (mesh); 4.0 GHz × 90 ns.
-                 cache: cache(32, 8, 4, 1024, 16, 14, 39424, 11, 70, 360),
-+                // [Intel ORM] SKX: 512-bit FMA on p0+p1 fused (+p5 on the
-+                // 2-FMA SKUs); two 64-byte loads per cycle.
-+                simd_datapath_bits: 512,
-+                vec_load_port_bits: 512,
-                 ..Skylake.tune()
-             },
-             IceLake => X86Tune {
-                 cpu: IceLake,
-                 name: "icelake-client",
-                 dispatch_width: 5,
-+                // [Intel ORM] Sunny Cove: 512-bit FMA on p01 fused, two
-+                // 64-byte loads per cycle.
-+                simd_datapath_bits: 512,
-+                vec_load_port_bits: 512,
-                 mispredict_penalty: 16,
-                 popcnt_false_dep: false,
-                 shift_cl_uops: 2,
-@@ -771,6 +856,12 @@ impl X86Cpu {
-                 cpu: AlderLake,
-                 name: "alderlake",
-                 dispatch_width: 6,
-+                // [Intel ORM] Golden Cove: three load AGUs (p2/p3/p11), each
-+                // 256-bit; AVX-512 fused off → 256-bit datapath; VADDPS on the
-+                // dedicated p15 adders (fadd_pipes stays 2).
-+                simd_datapath_bits: 256,
-+                vec_load_ports: 3,
-+                vec_load_port_bits: 256,
-                 mispredict_penalty: 17,
-                 lea3_rtp_x100: 20,
-                 // [uops.info] VADDPS ymm on ADL-P: latency 2 (p15 adders).
-@@ -801,6 +892,9 @@ impl X86Cpu {
-                 // (105M/15w); mesh L3 ~80 cycles; 3.8 GHz × ~110 ns.
-                 cache: cache(48, 12, 5, 2048, 16, 16, 107520, 15, 80, 420),
-                 ecore: None,
-+                // [Intel ORM] Golden Cove server: AVX-512 enabled, two FMA
-+                // units; 512-bit loads at 2/cycle (= 3 × 256 / 512 rounded).
-+                simd_datapath_bits: 512,
-                 ..AlderLake.tune()
-             },
-             ArrowLake => X86Tune {
-@@ -850,6 +944,13 @@ impl X86Cpu {
-                 pmulld_latency: 4,
-                 fma_latency: 6,
-                 fadd_latency: 3,
-+                // [Agner] Gracemont: two 128-bit FP/FMA pipes, two 128-bit
-+                // load pipes; 256-bit ops and loads are double-pumped.
-+                fadd_pipes: 2,
-+                vec_int_alu_pipes: 2,
-+                simd_datapath_bits: 128,
-+                vec_load_ports: 2,
-+                vec_load_port_bits: 128,
-                 fmul_latency: 4,
-                 fma_pipes: 2,
-                 erms: true,
-@@ -889,7 +990,16 @@ impl X86Cpu {
-                 fma_latency: 5,
-                 fadd_latency: 3,
-                 fmul_latency: 4,
--                fma_pipes: 1,
-+                // [AMD SOG] Zen1: FP0/FP1 FMA and FP2/FP3 ADD, all 128-bit;
-+                // VPADDD on all four pipes; two 128-bit load pipes.  256-bit
-+                // ops are split, which `simd_datapath_bits: 128` expresses
-+                // (the previous row folded that into `fma_pipes: 1`).
-+                fma_pipes: 2,
-+                fadd_pipes: 2,
-+                vec_int_alu_pipes: 4,
-+                simd_datapath_bits: 128,
-+                vec_load_ports: 2,
-+                vec_load_port_bits: 128,
-                 erms: true,
-                 fsrm: false,
-                 avx256_unaligned_split: false,
-@@ -905,6 +1015,9 @@ impl X86Cpu {
-                 cpu: Znver2,
-                 name: "znver2",
-                 fma_pipes: 2,
-+                // [AMD SOG] Zen2: 256-bit FP datapath, two 256-bit loads/cycle.
-+                simd_datapath_bits: 256,
-+                vec_load_port_bits: 256,
-                 fmul_latency: 3,
-                 rob_entries: 224,
-                 uop_cache_uops: 4096,
-@@ -943,6 +1056,10 @@ impl X86Cpu {
-                 cpu: Znver5,
-                 name: "znver5",
-                 dispatch_width: 8,
-+                // [AMD SOG Zen5] full 512-bit FP datapath on the desktop/
-+                // server dies (mobile Strix Point is 256); two 512-bit loads.
-+                simd_datapath_bits: 512,
-+                vec_load_port_bits: 512,
-                 mispredict_penalty: 14,
-                 div64_latency_min: 10,
-                 // [uops.info] VADDPS ymm on Zen 5: latency 2.
-@@ -988,6 +1105,13 @@ impl X86Cpu {
-                 fadd_latency: 4,
-                 fmul_latency: 5,
-                 fma_pipes: 1,
-+                // Envelope: one FP adder (SNB..BDW), 128-bit datapath and
-+                // 2 × 128-bit loads (SNB/Zen1/Gracemont), 2 vector ALUs.
-+                fadd_pipes: 1,
-+                vec_int_alu_pipes: 2,
-+                simd_datapath_bits: 128,
-+                vec_load_ports: 2,
-+                vec_load_port_bits: 128,
-                 erms: false,
-                 fsrm: false,
-                 avx256_unaligned_split: false,
-@@ -1110,18 +1234,129 @@ impl X86Tune {
-         bmi2
-     }
- 
-+    /// Effective number of `pipes` available to one `vector_bits`-wide
-+    /// operation per cycle: a 256-bit op on a 128-bit datapath (Zen1,
-+    /// Gracemont) holds its pipe for two cycles, so two physical pipes
-+    /// sustain one such op per cycle.
-+    #[inline]
-+    pub fn simd_pipes_for(&self, pipes: u8, vector_bits: u16) -> f64 {
-+        let dp = self.simd_datapath_bits.max(128) as f64;
-+        let scale = (dp / vector_bits.max(128) as f64).min(1.0);
-+        pipes as f64 * scale
-+    }
-+
-+    /// Sustained `vector_bits`-wide loads per cycle from L1D.
-+    #[inline]
-+    pub fn vector_loads_per_cycle(&self, vector_bits: u16) -> f64 {
-+        let w = self.vec_load_port_bits.max(128) as f64;
-+        let scale = (w / vector_bits.max(128) as f64).min(1.0);
-+        self.vec_load_ports.max(1) as f64 * scale
-+    }
-+
-+    /// Vector width (bits) that runs at full rate on this part — the
-+    /// number GCC exposes as `-mprefer-vector-width` and LLVM as
-+    /// `TuningPrefer128Bit/256Bit`.  Hybrid rows follow the P-core: the
-+    /// E-core double-pumps but does not *penalise* 256-bit code beyond
-+    /// the halved rate, and the hot code is scheduled on the P-core.
-+    #[inline]
-+    pub fn prefer_vector_bits(&self) -> u16 {
-+        self.simd_datapath_bits.clamp(128, 512)
-+    }
-+
-     /// Independent accumulators needed to saturate the FMA pipes on a
--    /// reduction (Little's law: latency × pipes).  0 = no FMA.
-+    /// 256-bit reduction (Little's law: latency × effective pipes).
-+    /// 0 = no FMA.
-     #[inline]
-     pub fn fma_reduction_accumulators(&self) -> u8 {
--        self.fma_latency.saturating_mul(self.fma_pipes.max(1))
-+        (self.fma_latency as f64 * self.simd_pipes_for(self.fma_pipes, 256).max(1.0)).ceil()
-+            as u8
-     }
- 
--    /// Independent accumulators for an FADD reduction (two adders on every
--    /// row).
-+    /// Independent accumulators for a 256-bit FADD reduction (latency ×
-+    /// effective adder pipes; one adder on SNB..BDW, two elsewhere).
-     #[inline]
-     pub fn fadd_reduction_accumulators(&self) -> u8 {
--        self.fadd_latency.saturating_mul(2)
-+        (self.fadd_latency as f64 * self.simd_pipes_for(self.fadd_pipes, 256).max(1.0)).ceil()
-+            as u8
-+    }
-+
-+    /// Interleave factor (independent accumulator chains per reduction
-+    /// phi) for a vectorised reduction loop, from a roofline of the loop
-+    /// body on this row.
-+    ///
-+    /// With `k` chains per accumulator one *group* iteration (k original
-+    /// iterations) takes
-+    ///
-+    /// ```text
-+    /// T(k) = max( latency,                          // each chain: 1 op / iteration
-+    ///             (k·uops + 2) / dispatch_width,    // front end (+ IV add, fused cmp/jcc)
-+    ///             k·loads / loads_per_cycle,         // L1D load ports
-+    ///             k·accs  / eff_pipes )              // execution pipes of the op
-+    /// ```
-+    ///
-+    /// cycles, i.e. `T(k)/k` cycles per original iteration, which is
-+    /// non-increasing in `k`.  The smallest `k ∈ {1,2,4,8}` within 5 % of
-+    /// the cost at the register cap is chosen; the cap keeps
-+    /// `k × accs ≤ 8` so eight of the sixteen SIMD registers stay free for
-+    /// loads, broadcasts and the address temporaries the allocator needs.
-+    ///
-+    /// Two floors, both LLVM parity (`X86TTIImpl::getMaxInterleaveFactor`
-+    /// returns 4 with AVX, 2 without): a 256-bit loop never interleaves
-+    /// below 4 and a 128-bit loop never below 2 when the cap allows.  The
-+    /// nominal `dispatch_width` in `T(k)` assumes ideal µop delivery; the
-+    /// floor covers the sustained-below-nominal reality (DSB/LSD bandwidth,
-+    /// taken-branch bubbles) that the roofline does not see, exactly the
-+    /// loop-overhead amortisation LLVM's constant buys.
-+    ///
-+    /// Worked examples (see the unit tests): FMA dot product, 2 loads/op,
-+    /// 256-bit — Skylake (lat 4, 2 × 256-bit loads, 4-wide) → 4: the loop
-+    /// is load-bound at 1 FMA/cycle and 4 chains already reach it; Raptor
-+    /// Lake (3 loads/cycle, 6-wide) → 8: 4 chains leave the third load
-+    /// port idle (1.0 vs 1.5 FMA/cycle).  Integer add reductions stay at
-+    /// 4 everywhere (latency 1).
-+    pub fn reduction_interleave(&self, shape: ReductionShape) -> u32 {
-+        let bits = shape.vector_bits.max(128);
-+        let accs = shape.accumulators.max(1);
-+        let (latency, pipes) = match shape.op {
-+            ReductionOp::Fma if self.fma_latency > 0 => (self.fma_latency, self.fma_pipes),
-+            // No FMA on this row (SNB/IVB): the reduction is mul + add on
-+            // separate units; the add is the loop-carried op.
-+            ReductionOp::Fma => (self.fadd_latency, self.fadd_pipes),
-+            ReductionOp::FAdd => (self.fadd_latency, self.fadd_pipes),
-+            ReductionOp::IntAdd => (1, self.vec_int_alu_pipes),
-+            // PMAXSD runs on p01 (SKL+) / p1 (HSW) / two Zen pipes.
-+            ReductionOp::IntMax => (1, self.vec_int_alu_pipes.min(2)),
-+        };
-+        let latency = latency.max(1) as f64;
-+        let eff_pipes = self.simd_pipes_for(pipes.max(1), bits).max(0.5);
-+        let loads_per_cycle = self.vector_loads_per_cycle(bits).max(0.5);
-+        let width = self.issue_width() as f64;
-+        let uops = shape.uops_per_iter.max(accs) as f64;
-+        let loads = shape.loads_per_iter as f64;
-+        let accs_f = accs as f64;
-+        let t = |k: u32| -> f64 {
-+            let k = k as f64;
-+            latency
-+                .max((k * uops + 2.0) / width)
-+                .max(k * loads / loads_per_cycle)
-+                .max(k * accs_f / eff_pipes)
-+        };
-+        const REG_BUDGET: u32 = 8;
-+        let cap = (REG_BUDGET / accs).max(1);
-+        let cap_pow2 = if cap >= 8 { 8 } else if cap >= 4 { 4 } else if cap >= 2 { 2 } else { 1 };
-+        let best = t(cap_pow2) / cap_pow2 as f64;
-+        let mut chosen = cap_pow2;
-+        for k in [1u32, 2, 4] {
-+            if k > cap_pow2 {
-+                break;
-+            }
-+            if t(k) / k as f64 <= best * 1.05 {
-+                chosen = k;
-+                break;
-+            }
-+        }
-+        let floor = if bits >= 256 { 4 } else { 2 };
-+        chosen.max(floor.min(cap_pow2))
-     }
- 
-     /// Instruction budget per arm for branch → select (if-)conversion when
-@@ -1396,6 +1631,45 @@ impl X86Tune {
-         kv("popcnt_false_dep", self.popcnt_false_dep.to_string());
-         kv("lzcnt_tzcnt_false_dep", self.lzcnt_tzcnt_false_dep.to_string());
-         kv("shift_cl_uops", self.shift_cl_uops.to_string());
-+        kv("fadd_pipes", self.fadd_pipes.to_string());
-+        kv("vec_int_alu_pipes", self.vec_int_alu_pipes.to_string());
-+        kv("simd_datapath_bits", self.simd_datapath_bits.to_string());
-+        kv("vec_load_ports", self.vec_load_ports.to_string());
-+        kv("vec_load_port_bits", self.vec_load_port_bits.to_string());
-+        kv("derived.prefer_vector_bits", self.prefer_vector_bits().to_string());
-+        kv(
-+            "derived.reduction_interleave_fma_dot_256",
-+            self.reduction_interleave(ReductionShape {
-+                op: ReductionOp::Fma,
-+                vector_bits: 256,
-+                accumulators: 1,
-+                loads_per_iter: 2,
-+                uops_per_iter: 2,
-+            })
-+            .to_string(),
-+        );
-+        kv(
-+            "derived.reduction_interleave_fadd_sum_256",
-+            self.reduction_interleave(ReductionShape {
-+                op: ReductionOp::FAdd,
-+                vector_bits: 256,
-+                accumulators: 1,
-+                loads_per_iter: 1,
-+                uops_per_iter: 1,
-+            })
-+            .to_string(),
-+        );
-+        kv(
-+            "derived.reduction_interleave_iadd_sum_256",
-+            self.reduction_interleave(ReductionShape {
-+                op: ReductionOp::IntAdd,
-+                vector_bits: 256,
-+                accumulators: 1,
-+                loads_per_iter: 1,
-+                uops_per_iter: 1,
-+            })
-+            .to_string(),
-+        );
-         kv("lea3_latency", self.lea3_latency.to_string());
-         kv("lea3_rtp_x100", self.lea3_rtp_x100.to_string());
-         kv("lea3_uops", self.lea3_uops.to_string());
-@@ -1752,6 +2026,15 @@ mod tests {
-             assert!(g.uop_cache_uops <= t.uop_cache_uops, "{:?}", cpu);
-             assert!(g.dispatch_width <= t.dispatch_width, "{:?}", cpu);
-             assert!(g.fma_pipes <= t.fma_pipes.max(1), "{:?}", cpu);
-+            assert!(g.fadd_pipes <= t.fadd_pipes, "{:?}", cpu);
-+            assert!(g.vec_int_alu_pipes <= t.vec_int_alu_pipes, "{:?}", cpu);
-+            assert!(g.simd_datapath_bits <= t.simd_datapath_bits, "{:?}", cpu);
-+            assert!(
-+                u32::from(g.vec_load_ports) * u32::from(g.vec_load_port_bits)
-+                    <= u32::from(t.vec_load_ports) * u32::from(t.vec_load_port_bits),
-+                "{:?}",
-+                cpu
-+            );
-             assert!(g.fma_latency >= t.fma_latency, "{:?}", cpu);
-             assert!(g.load_latency >= t.load_latency, "{:?}", cpu);
-             assert!(g.cache.l2.kib <= t.cache.l2.kib, "{:?}", cpu);
-@@ -2006,9 +2289,144 @@ mod tests {
-         assert_eq!(X86Cpu::Znver1.tune().fma_reduction_accumulators(), 5);
-         assert_eq!(X86Cpu::Znver3.tune().fma_reduction_accumulators(), 8);
-         assert_eq!(X86Cpu::SandyBridge.tune().fma_reduction_accumulators(), 0);
-+        // Gracemont: two 128-bit FMA pipes → one 256-bit FMA per cycle.
-+        assert_eq!(X86Cpu::Gracemont.tune().fma_reduction_accumulators(), 6);
-         // Golden Cove's 2-cycle adders halve the FADD chain split vs SKL.
-         assert_eq!(X86Cpu::AlderLake.tune().fadd_reduction_accumulators(), 4);
-         assert_eq!(X86Cpu::Skylake.tune().fadd_reduction_accumulators(), 8);
-+        // [uops.info] VADDPS ymm on HSW/BDW is p1 only: one adder, not two.
-+        assert_eq!(X86Cpu::Haswell.tune().fadd_reduction_accumulators(), 3);
-+        assert_eq!(X86Cpu::Broadwell.tune().fadd_reduction_accumulators(), 3);
-+        assert_eq!(X86Cpu::SandyBridge.tune().fadd_reduction_accumulators(), 3);
-+        // Zen1 physical pipes are 2 × 128: 256-bit FADD → 3 × 1.
-+        assert_eq!(X86Cpu::Znver1.tune().fadd_reduction_accumulators(), 3);
-+        assert_eq!(X86Cpu::Znver3.tune().fadd_reduction_accumulators(), 6);
-+    }
-+
-+    #[test]
-+    fn simd_datapath_and_load_ports_are_consistent() {
-+        for cpu in X86Cpu::ALL {
-+            let t = cpu.tune();
-+            assert!(matches!(t.simd_datapath_bits, 128 | 256 | 512), "{:?}", cpu);
-+            assert!(matches!(t.vec_load_port_bits, 128 | 256 | 512), "{:?}", cpu);
-+            assert!((1..=4).contains(&t.vec_load_ports), "{:?}", cpu);
-+            assert!((1..=4).contains(&t.fadd_pipes), "{:?}", cpu);
-+            assert!((2..=4).contains(&t.vec_int_alu_pipes), "{:?}", cpu);
-+            // A load port is never narrower than the datapath it feeds by
-+            // more than one halving (SNB: 256-bit FP, 128-bit load ports).
-+            assert!(t.vec_load_port_bits * 2 >= t.simd_datapath_bits, "{:?}", cpu);
-+        }
-+        let rpl = X86Cpu::RaptorLake.tune();
-+        assert_eq!(rpl.vector_loads_per_cycle(256), 3.0);
-+        assert_eq!(rpl.simd_pipes_for(2, 256), 2.0);
-+        assert_eq!(rpl.prefer_vector_bits(), 256);
-+        let gm = X86Cpu::Gracemont.tune();
-+        assert_eq!(gm.vector_loads_per_cycle(256), 1.0);
-+        assert_eq!(gm.simd_pipes_for(2, 256), 1.0);
-+        assert_eq!(gm.prefer_vector_bits(), 128);
-+        let z1 = X86Cpu::Znver1.tune();
-+        assert_eq!(z1.prefer_vector_bits(), 128);
-+        assert_eq!(z1.simd_pipes_for(2, 256), 1.0);
-+        assert_eq!(X86Cpu::SkylakeAvx512.tune().prefer_vector_bits(), 512);
-+        assert_eq!(X86Cpu::Znver4.tune().prefer_vector_bits(), 256);
-+        assert_eq!(X86Cpu::Znver5.tune().prefer_vector_bits(), 512);
-+        assert_eq!(X86Cpu::Generic.tune().prefer_vector_bits(), 128);
-+    }
-+
-+    #[test]
-+    fn reduction_interleave_follows_the_roofline() {
-+        let dot = ReductionShape {
-+            op: ReductionOp::Fma,
-+            vector_bits: 256,
-+            accumulators: 1,
-+            loads_per_iter: 2,
-+            uops_per_iter: 2,
-+        };
-+        let sum_f = ReductionShape {
-+            op: ReductionOp::FAdd,
-+            vector_bits: 256,
-+            accumulators: 1,
-+            loads_per_iter: 1,
-+            uops_per_iter: 1,
-+        };
-+        let sum_i = ReductionShape {
-+            op: ReductionOp::IntAdd,
-+            ..sum_f
-+        };
-+        let max_i = ReductionShape {
-+            op: ReductionOp::IntMax,
-+            ..sum_f
-+        };
-+        // FMA dot product: Skylake is load-port bound (2 loads/cycle, 2 per
-+        // FMA → 1 FMA/cycle) and 4 chains cover a 4-cycle latency exactly.
-+        assert_eq!(X86Cpu::Skylake.tune().reduction_interleave(dot), 4);
-+        // Haswell's FMA is 5 cycles: 4 chains reach only 0.8 FMA/cycle of
-+        // the same 1.0 load bound, so it needs 5 → 8 chains (Broadwell too).
-+        assert_eq!(X86Cpu::Haswell.tune().reduction_interleave(dot), 8);
-+        assert_eq!(X86Cpu::Broadwell.tune().reduction_interleave(dot), 8);
-+        // Raptor Lake / Alder Lake / Sapphire Rapids: three load ports lift
-+        // the bound to 1.5 FMA/cycle, which needs 6 → 8 chains.
-+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(dot), 8);
-+        assert_eq!(X86Cpu::AlderLake.tune().reduction_interleave(dot), 8);
-+        assert_eq!(X86Cpu::SapphireRapids.tune().reduction_interleave(dot), 8);
-+        // Zen3/4: two 256-bit loads/cycle → 1 FMA/cycle at latency 4 → 4.
-+        assert_eq!(X86Cpu::Znver3.tune().reduction_interleave(dot), 4);
-+        assert_eq!(X86Cpu::Znver4.tune().reduction_interleave(dot), 4);
-+        // Zen1: 256-bit loads at 1/cycle → 0.5 FMA/cycle × latency 5 → 4.
-+        assert_eq!(X86Cpu::Znver1.tune().reduction_interleave(dot), 4);
-+        // SNB (no FMA): mul + add chains on one adder, one 256-bit load per
-+        // cycle → the LLVM floor of 4.
-+        assert_eq!(X86Cpu::SandyBridge.tune().reduction_interleave(dot), 4);
-+        // FP sum: one load per add.  SKL adds at latency 4 on two pipes with
-+        // two loads/cycle → 8 chains; Golden Cove's 2-cycle adders need 4.
-+        assert_eq!(X86Cpu::Skylake.tune().reduction_interleave(sum_f), 8);
-+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(sum_f), 4);
-+        assert_eq!(X86Cpu::Znver3.tune().reduction_interleave(sum_f), 8);
-+        // Haswell: a single adder → 1 add/cycle × latency 3 → the floor 4.
-+        assert_eq!(X86Cpu::Haswell.tune().reduction_interleave(sum_f), 4);
-+        // Integer add / max (latency 1): never above the floor.
-+        for cpu in X86Cpu::ALL {
-+            assert_eq!(cpu.tune().reduction_interleave(sum_i), 4, "{:?}", cpu);
-+            assert_eq!(cpu.tune().reduction_interleave(max_i), 4, "{:?}", cpu);
-+        }
-+        // 128-bit shapes: floor 2, SKL FP sum still wants 8 (lat 4 × 2 pipes
-+        // = 8 at 2 loads/cycle).
-+        let sum_f128 = ReductionShape {
-+            vector_bits: 128,
-+            ..sum_f
-+        };
-+        assert_eq!(X86Cpu::Skylake.tune().reduction_interleave(sum_f128), 8);
-+        // Generic: one adder on a 128-bit datapath → 1 add/cycle × lat 4 → 4.
-+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(sum_f128), 4);
-+        let sum_i128 = ReductionShape {
-+            vector_bits: 128,
-+            ..sum_i
-+        };
-+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(sum_i128), 2);
-+        // Raptor Lake: three 128-bit loads and three vector ALUs per cycle
-+        // sustain 3 adds/cycle, so 2 chains leave a third of it idle → 4.
-+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(sum_i128), 4);
-+        // Register cap: two accumulator phis share the 8-register budget.
-+        let dot2 = ReductionShape {
-+            accumulators: 2,
-+            loads_per_iter: 4,
-+            uops_per_iter: 4,
-+            ..dot
-+        };
-+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(dot2), 4);
-+        let dot4 = ReductionShape {
-+            accumulators: 4,
-+            loads_per_iter: 8,
-+            uops_per_iter: 8,
-+            ..dot
-+        };
-+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(dot4), 2);
-+        // Generic (no -mtune): the envelope sustains one 256-bit load per
-+        // cycle (2 × 128-bit ports), so every 256-bit shape is load-bound by
-+        // 4 chains — the historical constant is reproduced exactly.
-+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(sum_f), 4);
-+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(dot), 4);
-+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(sum_i), 4);
-     }
- 
-     #[test]
-diff --git a/src/passes/vec_interleave.rs b/src/passes/vec_interleave.rs
-index 5725a759..ab9a6ee5 100644
---- a/src/passes/vec_interleave.rs
-+++ b/src/passes/vec_interleave.rs
-@@ -75,6 +75,8 @@
- //! `LCCC_DEBUG_VECTORIZE=1` / `LCCC_WHY_NOT_VECTORIZE=1`.
- //!
- //! Pass name for CCC_DISABLE_PASSES: "vec_interleave".
-+#[allow(unused_imports)]
-+use crate::backend::x86::cpu_model::{ReductionOp, ReductionShape, X86Tune};
- use crate::common::fx_hash::{FxHashMap, FxHashSet};
- use crate::common::types::IrType;
- use crate::ir::analysis::CfgAnalysis;
-@@ -103,29 +105,30 @@ struct AccOp {
-     zero: Option<IntrinsicOp>,
-     /// Whether the element type is floating point (needs `fp_reassoc`).
-     is_fp: bool,
--    /// Preferred number of independent chains for this op's latency class.
--    preferred_if: u32,
-+    /// Loop-carried operation class for the CPU model's roofline.
-+    red_op: ReductionOp,
-+    /// Accumulator register width in bits (128 = XMM, 256 = YMM).
-+    bits: u16,
- }
- 
- fn acc_op_info(op: IntrinsicOp) -> Option<AccOp> {
-     use IntrinsicOp as O;
-     // Note: `VecAddI64x4` is deliberately absent — the x86 emitter has no
-     // lowering for it (unimplemented no-op), so nothing may ever select it.
--    let (kind, combine, zero, is_fp, preferred_if) = match op {
--        O::VecFmaF64x4 | O::VecAddF64x4 => {
--            (AccKind::Add, O::VecAddF64x4, Some(O::VecZeroF64x4), true, 4)
--        }
--        O::VecFmaF32x8 | O::VecAddF32x8 => {
--            (AccKind::Add, O::VecAddF32x8, Some(O::VecZeroF32x8), true, 4)
--        }
--        O::VecAddF64x2 => (AccKind::Add, O::VecAddF64x2, Some(O::VecZeroF64x2), true, 4),
--        O::VecAddF32x4 => (AccKind::Add, O::VecAddF32x4, Some(O::VecZeroF32x4), true, 4),
--        O::VecAddI32x8 => (AccKind::Add, O::VecAddI32x8, Some(O::VecZeroI32x8), false, 4),
--        O::VecAddI32x4 => (AccKind::Add, O::VecAddI32x4, Some(O::VecZeroI32x4), false, 4),
-+    use ReductionOp as R;
-+    let (kind, combine, zero, is_fp, red_op, bits) = match op {
-+        O::VecFmaF64x4 => (AccKind::Add, O::VecAddF64x4, Some(O::VecZeroF64x4), true, R::Fma, 256),
-+        O::VecAddF64x4 => (AccKind::Add, O::VecAddF64x4, Some(O::VecZeroF64x4), true, R::FAdd, 256),
-+        O::VecFmaF32x8 => (AccKind::Add, O::VecAddF32x8, Some(O::VecZeroF32x8), true, R::Fma, 256),
-+        O::VecAddF32x8 => (AccKind::Add, O::VecAddF32x8, Some(O::VecZeroF32x8), true, R::FAdd, 256),
-+        O::VecAddF64x2 => (AccKind::Add, O::VecAddF64x2, Some(O::VecZeroF64x2), true, R::FAdd, 128),
-+        O::VecAddF32x4 => (AccKind::Add, O::VecAddF32x4, Some(O::VecZeroF32x4), true, R::FAdd, 128),
-+        O::VecAddI32x8 => (AccKind::Add, O::VecAddI32x8, Some(O::VecZeroI32x8), false, R::IntAdd, 256),
-+        O::VecAddI32x4 => (AccKind::Add, O::VecAddI32x4, Some(O::VecZeroI32x4), false, R::IntAdd, 128),
-         O::VecAddI64x2 | O::VecWidenAddI32x4ToI64x2 => {
--            (AccKind::Add, O::VecAddI64x2, Some(O::VecZeroI64x2), false, 4)
-+            (AccKind::Add, O::VecAddI64x2, Some(O::VecZeroI64x2), false, R::IntAdd, 128)
+diff --git a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
+index 1970e4c..acb7b6f 100644
+--- a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
++++ b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
+@@ -275,6 +275,17 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
+             continue;
          }
--        O::VecMaxI32x8 => (AccKind::Max, O::VecMaxI32x8, None, false, 2),
-+        O::VecMaxI32x8 => (AccKind::Max, O::VecMaxI32x8, None, false, R::IntMax, 256),
-         _ => return None,
-     };
-     Some(AccOp {
-@@ -133,7 +136,8 @@ fn acc_op_info(op: IntrinsicOp) -> Option<AccOp> {
-         combine,
-         zero,
-         is_fp,
--        preferred_if,
-+        red_op,
-+        bits,
-     })
- }
  
-@@ -538,10 +542,15 @@ fn operand_mentions_any(insts: &[Instruction], id: u32) -> bool {
-     insts.iter().any(|i| operand_mentions(i, &|x| x == id))
- }
- 
--/// Interleave factor: forced by `CCC_VEC_INTERLEAVE`, else the latency class
--/// of the accumulator ops, halved for two-accumulator loops (register
--/// pressure: 2×4 YMM accumulators plus load temporaries would spill).
--fn choose_factor(c: &Candidate) -> u32 {
-+/// Interleave factor: forced by `CCC_VEC_INTERLEAVE`, else the active CPU
-+/// row's roofline ([`X86Tune::reduction_interleave`]) evaluated on the
-+/// measured body shape (vector loads and vector µops per iteration).  The
-+/// op class is the *slowest* accumulator's (FMA > FADD > integer), so a
-+/// mixed loop is provisioned for its longest chain.  Two-accumulator loops
-+/// are capped at 2 (the register cap in the model would allow 4, but the
-+/// allocator spilled the 2 × 4 YMM accumulators plus load temporaries when
-+/// this pass was first measured — see `docs/FOLLOWUP_CPU_MODEL.md`).
-+fn choose_factor(func: &IrFunction, c: &Candidate) -> u32 {
-     if let Some(forced) = std::env::var("CCC_VEC_INTERLEAVE")
-         .ok()
-         .and_then(|s| s.parse::<u32>().ok())
-@@ -549,19 +558,102 @@ fn choose_factor(c: &Candidate) -> u32 {
-     {
-         return forced;
-     }
--    let base = c
--        .accs
--        .iter()
--        .map(|a| a.info.preferred_if)
--        .min()
--        .unwrap_or(2);
-+    let shape = body_shape(func, c);
-+    let model = crate::backend::x86::cpu_model::active().reduction_interleave(shape);
-+    let factor = model.min(X86_VEC_CHAIN_REG_CAP);
-+    if why_not() && factor != model {
-+        eprintln!(
-+            "[VEC-IL] roofline wants x{model} for {:?}, clamped to x{factor} by \
-+             X86_VEC_CHAIN_REG_CAP (vector RA capability)",
-+            shape
-+        );
-+    }
-     match c.accs.len() {
--        1 => base,
--        2 => base.min(2),
-+        1 => factor,
-+        2 => factor.min(2),
-         _ => 1,
-     }
- }
- 
-+/// Backend capability cap on chains per accumulator, independent of the
-+/// CPU model.  Measured this session (`dot1.c`, `-O3 -ffast-math
-+/// -march=x86-64-v3 -mtune=raptorlake`, `CCC_VEC_INTERLEAVE=8`): the x86
-+/// vector allocator homes six loop-carried YMM chains in `%ymm2..%ymm7`
-+/// and sends the seventh and eighth FMA results through stack slots
-+/// (`vmovdqu %ymm0, -32(%rbp)` … reload at the back edge), which puts a
-+/// store-forwarding round trip on two of the eight chains: T ≈ 9 cycles
-+/// per group of 8 (0.9 FMA/cycle) versus 4 cycles per group of 4 (1.0
-+/// FMA/cycle).  Until the allocator keeps eight chains resident (see
-+/// `docs/FOLLOWUP_CPU_MODEL.md`, item 1), 4 is the largest factor that is
-+/// a pure win; the roofline in [`X86Tune::reduction_interleave`] already
-+/// asks for 8 on Raptor Lake/Alder Lake/Sapphire Rapids and on every
-+/// Skylake-class FADD reduction, so raising this constant is the only
-+/// change needed once the allocator is fixed.
-+const X86_VEC_CHAIN_REG_CAP: u32 = 4;
-+
-+/// Reduction shape of the candidate's body for the CPU model: vector loads
-+/// and vector µops per original iteration (the IV increment and the
-+/// header compare are loop control, modelled separately by the row).
-+fn body_shape(func: &IrFunction, c: &Candidate) -> ReductionShape {
-+    let mut loads = 0u32;
-+    let mut uops = 0u32;
-+    for (i, inst) in func.blocks[c.body].instructions.iter().enumerate() {
-+        if i == c.iv_inc_idx {
++        // Inline asm is opaque: `"=r"` outputs and clobbers may redefine any
++        // register and the text is pinned (never rewritten).  Every recorded
++        // copy is stale afterwards; the classified `dest_reg` is REG_NONE for
++        // this kind, so the generic invalidation below would keep them alive.
++        if infos[i].kind == LineKind::InlineAsm {
++            copy_src = [REG_NONE; 16];
++            copy_src32 = [REG_NONE; 16];
++            i += 1;
 +            continue;
 +        }
-+        match inst {
-+            Instruction::Intrinsic { op, .. } => {
-+                uops += 1;
-+                if is_vector_load_op(*op) {
-+                    loads += 1;
-+                }
++
+         // Not a copy instruction. Try to propagate active copies into this instruction.
+         let dest_reg = get_dest_reg(&infos[i]);
+ 
+diff --git a/src/backend/x86/codegen/peephole/passes/helpers.rs b/src/backend/x86/codegen/peephole/passes/helpers.rs
+index 38b5447..e2c5c20 100644
+--- a/src/backend/x86/codegen/peephole/passes/helpers.rs
++++ b/src/backend/x86/codegen/peephole/passes/helpers.rs
+@@ -367,6 +367,15 @@ pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool
+     if fam > REG_GP_MAX {
+         return false;
+     }
++    // Inline asm is opaque: an `"=r"` output or a clobber may land in ANY
++    // family, and nothing in the classified `LineInfo` names it (the kind is
++    // `InlineAsm`, not `Other { dest_reg }`).  The only sound answer to
++    // "may this line write `fam`?" is yes.  (The stress lab's framecall
++    // family caught `movq 32(%rsp), %r11` being forwarded from a `%rcx`
++    // that an intervening `#APP` block had redefined.)
++    if info.kind == LineKind::InlineAsm {
++        return true;
++    }
+     let bit = 1u16 << fam;
+     // 1. Architectural implicit writes: exact.
+     if implicit_write_refs(trimmed.as_bytes()) & bit != 0 {
+@@ -393,6 +402,12 @@ pub(super) fn writes_family_full(info: &LineInfo, trimmed: &str, fam: RegId) ->
+     if fam > REG_GP_MAX {
+         return false;
+     }
++    // Opaque inline asm can never PROVE a full redefinition (it may read the
++    // old value first); acceptance paths must treat it as "unknown", i.e.
++    // false, while `writes_family` above treats it as "may write".
++    if info.kind == LineKind::InlineAsm {
++        return false;
++    }
+     let bit = 1u16 << fam;
+     // 1. Architectural implicit writes at full width: exact (see
+     //    `implicit_full_write_refs` for the exclusions).
+diff --git a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+index 8fdcff8..d15e390 100644
+--- a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
++++ b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+@@ -573,6 +573,16 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
+             // valid (a later GP reload of the same slot may still forward).
+             LineKind::LoadXmmRbp { .. } => {}
+ 
++            // Inline asm is opaque: its outputs and clobbers may redefine any
++            // register and it may store through any pointer.  Every
++            // slot<->register mapping is stale afterwards.  (Stress-lab
++            // framecall family: `p2` spilled to 32(%rsp) from %rcx, a later
++            // `#APP` block wrote a different value into %rcx, and the reload
++            // was forwarded as `movq %rcx, %r11`.)
++            LineKind::InlineAsm => {
++                invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
 +            }
-+            Instruction::BinOp { .. } => uops += 1,
-+            _ => {}
++
+             _ => {}
+         }
+     }
+diff --git a/src/backend/x86/codegen/peephole/types.rs b/src/backend/x86/codegen/peephole/types.rs
+index c8d5513..9d375d0 100644
+--- a/src/backend/x86/codegen/peephole/types.rs
++++ b/src/backend/x86/codegen/peephole/types.rs
+@@ -219,7 +219,13 @@ impl LineInfo {
+             // logical slot offsets consistent across pushfq/popfq, but the
+             // barrier only costs a little optimization locality, never
+             // correctness.
+-            LineKind::Push { .. } | LineKind::Pop { .. }
++            LineKind::Push { .. } | LineKind::Pop { .. } |
++            // Inline asm is opaque (outputs/clobbers may redefine any register,
++            // memory may be written through any pointer).  Making it a barrier
++            // keeps every copy/slot/flag-tracking pass sound without each pass
++            // having to know the kind (three of them did not: store_forwarding,
++            // copy_propagation and `writes_family`).
++            LineKind::InlineAsm
+         )
+     }
+     #[inline]
+diff --git a/src/passes/narrow.rs b/src/passes/narrow.rs
+index bd8ce06..ebd0a73 100644
+--- a/src/passes/narrow.rs
++++ b/src/passes/narrow.rs
+@@ -698,6 +698,38 @@ fn narrow_binops_with_cast(
+                     continue;
+                 }
+ 
++                // Shift counts are the one operand whose *value* (not just its
++                // low bits) decides whether narrowing is exact.  The width
++                // argument above ("same low T bits") holds only for counts in
++                // [0, T.width): `zext(x:U32):U64 >> 40` is 0 for every x, but
++                // the narrowed `x >> 40` is out of range in U32 (x86 masks the
++                // count to 8).  Likewise `Shl` by >= T.width has all-zero low
++                // T bits.  Decide per count:
++                //   * constant in range         -> narrow as usual
++                //   * constant >= width (< 64)  -> fold: LShr/Shl to 0,
++                //                                  AShr to `x >> (width-1)`
++                //   * variable count            -> narrow only when the count
++                //                                  is provably masked below
++                //                                  the width (`n & c`, c<width)
++                let mut shift_rhs_override: Option<Operand> = None;
++                let mut fold_to_zero = false;
++                if matches!(binop_info.op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
++                    let width_bits = (to_ty.size() * 8) as i64;
++                    match shift_count_class(&binop_info.rhs, width_bits, binop_map) {
++                        ShiftCount::InRange => {}
++                        ShiftCount::ConstOutOfRange => match binop_info.op {
++                            IrBinOp::AShr => {
++                                shift_rhs_override = Some(Operand::Const(IrConst::from_i64(
++                                    width_bits - 1,
++                                    *to_ty,
++                                )));
++                            }
++                            _ => fold_to_zero = true,
++                        },
++                        ShiftCount::Unknown => continue,
++                    }
++                }
++
+                 // BinOp result must only be used by this narrowing cast
+                 if use_counts[src_id] != 1 {
+                     continue;
+@@ -713,10 +745,30 @@ fn narrow_binops_with_cast(
+                     continue;
+                 }
+ 
++                if fold_to_zero {
++                    // The 64-bit shift produced a value whose low T bits are
++                    // all zero; the truncating cast is therefore a constant.
++                    // (The original BinOp becomes dead and DCE removes it.)
++                    let narrow_dest = *dest;
++                    let narrow_ty = *to_ty;
++                    *inst = Instruction::Copy {
++                        dest: narrow_dest,
++                        src: Operand::Const(IrConst::zero(narrow_ty)),
++                    };
++                    changes += 1;
++                    let dest_id = narrow_dest.0 as usize;
++                    if dest_id <= max_id {
++                        narrowed_map[dest_id] = Some(narrow_ty);
++                    }
++                    continue;
++                }
++
+                 let narrow_lhs =
+                     try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
+-                let narrow_rhs =
+-                    try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map);
++                let narrow_rhs = match &shift_rhs_override {
++                    Some(o) => Some(o.clone()),
++                    None => try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map),
++                };
+ 
+                 if let (Some(new_lhs), Some(new_rhs)) = (narrow_lhs, narrow_rhs) {
+                     let narrow_dest = *dest;
+@@ -1025,6 +1077,67 @@ fn is_widened_from_matching_type(
+     false
+ }
+ 
++/// Classification of a shift count against a narrow width.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum ShiftCount {
++    /// Provably in `[0, width)`: the narrow shift is exact.
++    InRange,
++    /// A constant in `[width, 64)`: the wide shift is a known fill
++    /// (zero for Shl/LShr, sign for AShr), so the result can be folded.
++    ConstOutOfRange,
++    /// Anything else (negative/huge constants, unbounded variables):
++    /// narrowing would change the value; leave the wide shift alone.
++    Unknown,
++}
++
++/// Classify a shift count operand for narrowing to `width_bits`.
++///
++/// A variable count is `InRange` only when its defining instruction is
++/// `And(_, c)` / `And(c, _)` with a non-negative constant `c < width_bits`
++/// (the C idiom `x >> (n & 31)`); every other variable count is `Unknown`
++/// because the wide shift and the narrow shift disagree for counts in
++/// `[width, 64)`.
++fn shift_count_class(
++    rhs: &Operand,
++    width_bits: i64,
++    binop_map: &[Option<BinOpDef>],
++) -> ShiftCount {
++    let const_val = |c: &IrConst| -> Option<i64> {
++        match c {
++            IrConst::I64(v) => Some(*v),
++            IrConst::I32(v) => Some(*v as i64),
++            IrConst::I16(v) => Some(*v as i64),
++            IrConst::I8(v) => Some(*v as i64),
++            IrConst::Zero => Some(0),
++            _ => None,
++        }
++    };
++    match rhs {
++        Operand::Const(c) => match const_val(c) {
++            Some(v) if (0..width_bits).contains(&v) => ShiftCount::InRange,
++            Some(v) if (width_bits..64).contains(&v) => ShiftCount::ConstOutOfRange,
++            _ => ShiftCount::Unknown,
++        },
++        Operand::Value(v) => {
++            let id = v.0 as usize;
++            let Some(Some(def)) = binop_map.get(id) else {
++                return ShiftCount::Unknown;
++            };
++            if def.op != IrBinOp::And {
++                return ShiftCount::Unknown;
++            }
++            let mask = match (&def.lhs, &def.rhs) {
++                (_, Operand::Const(c)) | (Operand::Const(c), _) => const_val(c),
++                _ => None,
++            };
++            match mask {
++                Some(m) if (0..width_bits).contains(&m) => ShiftCount::InRange,
++                _ => ShiftCount::Unknown,
++            }
 +        }
 +    }
-+    // Every x86 vector ALU op folds one memory operand, so one load per
-+    // accumulator op disappears into the op's fused µop; count it once.
-+    let uops = uops.saturating_sub(loads.min(c.accs.len() as u32));
-+    // Rank: FMA (longest chain) > FADD > integer add > integer max.
-+    let rank = |r: ReductionOp| match r {
-+        ReductionOp::Fma => 3,
-+        ReductionOp::FAdd => 2,
-+        ReductionOp::IntAdd => 1,
-+        ReductionOp::IntMax => 0,
-+    };
-+    let op = c
-+        .accs
-+        .iter()
-+        .map(|a| a.info.red_op)
-+        .max_by_key(|r| rank(*r))
-+        .unwrap_or(ReductionOp::IntAdd);
-+    let bits = c.accs.iter().map(|a| a.info.bits).max().unwrap_or(256);
-+    ReductionShape {
-+        op,
-+        vector_bits: bits,
-+        accumulators: c.accs.len() as u32,
-+        loads_per_iter: loads,
-+        uops_per_iter: uops,
-+    }
 +}
 +
-+fn is_vector_load_op(op: IntrinsicOp) -> bool {
-+    use IntrinsicOp as O;
-+    matches!(
-+        op,
-+        O::VecLoadF64x4
-+            | O::VecLoadF64x2
-+            | O::VecLoadF32x8
-+            | O::VecLoadF32x4
-+            | O::VecLoadI32x8
-+            | O::VecLoadI32x4
-+            | O::VecLoadI64x2
-+            | O::VecLoadI64x4
-+            | O::VecLoadWidenI32ToI64x2
-+    )
-+}
-+
- fn set_dest(inst: &mut Instruction, new: Value) {
-     match inst {
-         Instruction::BinOp { dest, .. }
-@@ -965,7 +1057,7 @@ pub(crate) fn run(func: &mut IrFunction, fp_reassoc: bool) -> usize {
-     // blocks and rewires its own preheader, so the others stay valid.
-     let mut n = 0;
-     for c in cands {
--        let factor = choose_factor(&c);
-+        let factor = choose_factor(func, &c);
-         if factor >= 2 && transform(func, &c, factor, debug) {
-             n += 1;
+ /// Try to narrow an operand from I64 to a target type.
+ /// Returns the narrowed operand if possible, None otherwise.
+ ///
+@@ -1642,4 +1755,209 @@ mod tests {
+             other => panic!("Expected narrowed BinOp LShr U32, got {:?}", other),
          }
+     }
++    /// Build `Cast(U32->U64) ; BinOp(op, zext, count, U64) ; Cast(U64->U32)`
++    /// for the out-of-range shift-count tests below.
++    fn shift_through_zext(op: IrBinOp, count: Operand, extra: Vec<Instruction>) -> IrFunction {
++        let mut insts = vec![Instruction::Cast {
++            dest: Value(1),
++            src: Operand::Value(Value(0)),
++            from_ty: IrType::U32,
++            to_ty: IrType::U64,
++        }];
++        insts.extend(extra);
++        insts.push(Instruction::BinOp {
++            dest: Value(2),
++            op,
++            lhs: Operand::Value(Value(1)),
++            rhs: count,
++            ty: IrType::U64,
++        });
++        insts.push(Instruction::Cast {
++            dest: Value(3),
++            src: Operand::Value(Value(2)),
++            from_ty: IrType::U64,
++            to_ty: IrType::U32,
++        });
++        make_func_with_blocks(vec![BasicBlock {
++            label: BlockId(0),
++            instructions: insts,
++            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
++            source_spans: Vec::new(),
++        }])
++    }
++
++    #[test]
++    fn test_narrow_lshr_count_ge_width_folds_to_zero() {
++        // Stress-lab finding (narrow family, seed 3): `(uint32_t)(zext(x) >> 56)`
++        // was narrowed to `x >> 56` in U32, which x86 executes as `x >> 24`.
++        // The 64-bit shift of a zero-extended 32-bit value by >= 32 is 0.
++        let mut func =
++            shift_through_zext(IrBinOp::LShr, Operand::Const(IrConst::I64(56)), Vec::new());
++        let changes = narrow_function(&mut func);
++        assert!(changes > 0, "out-of-range count must be folded, not narrowed");
++        match &func.blocks[0].instructions[2] {
++            Instruction::Copy { dest: Value(3), src: Operand::Const(c) } => {
++                assert_eq!(c.to_i64(), Some(0), "fold value must be zero, got {:?}", c);
++            }
++            other => panic!("expected Copy of zero, got {:?}", other),
++        }
++        // The pass must never have produced a U32 shift by 56.
++        for inst in &func.blocks[0].instructions {
++            if let Instruction::BinOp { op: IrBinOp::LShr, ty: IrType::U32, rhs, .. } = inst {
++                panic!("narrowed shift with out-of-range count {:?}", rhs);
++            }
++        }
++    }
++
++    #[test]
++    fn test_narrow_shl_count_ge_width_folds_to_zero() {
++        // `(uint32_t)(zext(x) << 40)`: low 32 bits are all zero for every x.
++        let mut func =
++            shift_through_zext(IrBinOp::Shl, Operand::Const(IrConst::I64(40)), Vec::new());
++        narrow_function(&mut func);
++        assert!(
++            matches!(
++                &func.blocks[0].instructions[2],
++                Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0)
++            ),
++            "got {:?}",
++            func.blocks[0].instructions[2]
++        );
++    }
++
++    #[test]
++    fn test_narrow_ashr_count_ge_width_clamps() {
++        // `(int32_t)(sext(x) >> 45)` equals `x >> 31` in I32 (sign fill).
++        let mut func = make_func_with_blocks(vec![BasicBlock {
++            label: BlockId(0),
++            instructions: vec![
++                Instruction::Cast {
++                    dest: Value(1),
++                    src: Operand::Value(Value(0)),
++                    from_ty: IrType::I32,
++                    to_ty: IrType::I64,
++                },
++                Instruction::BinOp {
++                    dest: Value(2),
++                    op: IrBinOp::AShr,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Const(IrConst::I64(45)),
++                    ty: IrType::I64,
++                },
++                Instruction::Cast {
++                    dest: Value(3),
++                    src: Operand::Value(Value(2)),
++                    from_ty: IrType::I64,
++                    to_ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
++            source_spans: Vec::new(),
++        }]);
++        narrow_function(&mut func);
++        match &func.blocks[0].instructions[2] {
++            Instruction::BinOp { op: IrBinOp::AShr, ty: IrType::I32, rhs, .. } => {
++                assert_eq!(
++                    match rhs {
++                        Operand::Const(c) => c.to_i64(),
++                        _ => None,
++                    },
++                    Some(31),
++                    "AShr count must clamp to width-1, got {:?}",
++                    rhs
++                );
++            }
++            other => panic!("expected clamped I32 AShr, got {:?}", other),
++        }
++    }
++
++    #[test]
++    fn test_narrow_shift_variable_count_declined_unless_masked() {
++        // Unbounded variable count: the wide and narrow shifts disagree for
++        // counts in [32, 64), so narrowing must be declined.
++        let mut func = shift_through_zext(
++            IrBinOp::LShr,
++            Operand::Value(Value(4)),
++            vec![Instruction::Cast {
++                dest: Value(4),
++                src: Operand::Value(Value(5)),
++                from_ty: IrType::U32,
++                to_ty: IrType::U64,
++            }],
++        );
++        narrow_function(&mut func);
++        assert!(
++            matches!(
++                &func.blocks[0].instructions[3],
++                Instruction::Cast { from_ty: IrType::U64, to_ty: IrType::U32, .. }
++            ),
++            "unbounded variable count must not be narrowed: {:?}",
++            func.blocks[0].instructions[3]
++        );
++
++        // Masked count (`n & 31`): the classifier proves the count in range.
++        // Whether the shift is then narrowed depends on the count operand
++        // itself being narrowable (Phase 4 only narrows values that feed a
++        // truncating cast), so the end-to-end check is the soundness one: no
++        // U32 shift may ever carry a count operand that is not itself U32.
++        let binop_map: Vec<Option<BinOpDef>> = vec![
++            None,
++            None,
++            None,
++            None,
++            Some(BinOpDef {
++                op: IrBinOp::And,
++                lhs: Operand::Value(Value(5)),
++                rhs: Operand::Const(IrConst::I64(31)),
++            }),
++        ];
++        assert_eq!(
++            shift_count_class(&Operand::Value(Value(4)), 32, &binop_map),
++            ShiftCount::InRange
++        );
++        let wide_mask: Vec<Option<BinOpDef>> = vec![
++            None,
++            None,
++            None,
++            None,
++            Some(BinOpDef {
++                op: IrBinOp::And,
++                lhs: Operand::Value(Value(5)),
++                rhs: Operand::Const(IrConst::I64(63)),
++            }),
++        ];
++        assert_eq!(
++            shift_count_class(&Operand::Value(Value(4)), 32, &wide_mask),
++            ShiftCount::Unknown
++        );
++        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(31)), 32, &[]), ShiftCount::InRange);
++        assert_eq!(
++            shift_count_class(&Operand::Const(IrConst::I64(32)), 32, &[]),
++            ShiftCount::ConstOutOfRange
++        );
++        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(64)), 32, &[]), ShiftCount::Unknown);
++        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(-1)), 32, &[]), ShiftCount::Unknown);
++
++        let mut func = shift_through_zext(
++            IrBinOp::LShr,
++            Operand::Value(Value(4)),
++            vec![Instruction::BinOp {
++                dest: Value(4),
++                op: IrBinOp::And,
++                lhs: Operand::Value(Value(5)),
++                rhs: Operand::Const(IrConst::I64(31)),
++                ty: IrType::U64,
++            }],
++        );
++        narrow_function(&mut func);
++        for inst in &func.blocks[0].instructions {
++            if let Instruction::BinOp { op: IrBinOp::LShr, ty: IrType::U32, rhs, .. } = inst {
++                assert!(
++                    matches!(rhs, Operand::Const(_)),
++                    "a narrowed shift must not carry a wide count operand: {:?}",
++                    rhs
++                );
++            }
++        }
++    }
+ }
+diff --git a/tests/regression/narrow_shift_count_ge_width.c b/tests/regression/narrow_shift_count_ge_width.c
+new file mode 100644
+index 0000000..0daafbb
+--- /dev/null
++++ b/tests/regression/narrow_shift_count_ge_width.c
+@@ -0,0 +1,64 @@
++/* Regression: passes/narrow.rs Phase 4 narrowed a 64-bit shift of a
++ * zero/sign-extended 32-bit value into a 32-bit shift without checking that
++ * the count fits the narrow width.  `(uint32_t)(zext(x) >> 56)` became
++ * `x >> 56` in U32, which x86 executes as `x >> 24` (count masked to 5 bits).
++ *
++ * Found by tests/stress (narrow family, seed 3).  Covers LShr/Shl/AShr with
++ * constant counts on both sides of the width boundary, a runtime count that
++ * crosses the width, and the masked-count idiom. Expected values are the
++ * C-standard ones; every case is checked against a constant. */
++#include <stdint.h>
++#include <stdio.h>
++
++__attribute__((noinline)) int8_t lab_case(uint16_t p0) {
++    uint16_t v0 = p0;
++    uint64_t v1 = (uint64_t)((-v0) ^ ((uint32_t)2147483648u));
++    uint32_t v2 = (uint32_t)(v1 >> 56);
++    return (int8_t)((uint64_t)v0 + (uint64_t)v1 + (uint64_t)v2);
++}
++__attribute__((noinline)) uint32_t lshr_zext_56(uint32_t x) { return (uint32_t)((uint64_t)x >> 56); }
++__attribute__((noinline)) uint32_t lshr_zext_32(uint32_t x) { return (uint32_t)((uint64_t)x >> 32); }
++__attribute__((noinline)) uint32_t lshr_zext_31(uint32_t x) { return (uint32_t)((uint64_t)x >> 31); }
++__attribute__((noinline)) uint32_t shl_zext_40(uint32_t x)  { return (uint32_t)((uint64_t)x << 40); }
++__attribute__((noinline)) uint32_t shl_zext_33(uint32_t x)  { return (uint32_t)((uint64_t)x << 33); }
++__attribute__((noinline)) uint32_t shl_zext_1(uint32_t x)   { return (uint32_t)((uint64_t)x << 1); }
++__attribute__((noinline)) int32_t  ashr_sext_45(int32_t x)  { return (int32_t)((int64_t)x >> 45); }
++__attribute__((noinline)) int32_t  ashr_sext_63(int32_t x)  { return (int32_t)((int64_t)x >> 63); }
++__attribute__((noinline)) int32_t  ashr_sext_7(int32_t x)   { return (int32_t)((int64_t)x >> 7); }
++__attribute__((noinline)) uint32_t lshr_var(uint32_t x, unsigned n)   { return (uint32_t)((uint64_t)x >> n); }
++__attribute__((noinline)) uint32_t shl_var(uint32_t x, unsigned n)    { return (uint32_t)((uint64_t)x << n); }
++__attribute__((noinline)) uint32_t lshr_masked(uint32_t x, unsigned n){ return (uint32_t)((uint64_t)x >> (n & 31)); }
++__attribute__((noinline)) uint16_t lshr_u16_20(uint16_t x)  { return (uint16_t)((uint64_t)x >> 20); }
++__attribute__((noinline)) uint8_t  shl_u8_9(uint8_t x)      { return (uint8_t)((uint64_t)x << 9); }
++
++static volatile uint16_t a0 = 57;
++static volatile uint32_t big = 0xDEADBEEFu;
++static volatile int32_t neg = -123456789;
++static volatile unsigned n40 = 40, n3 = 3, n35 = 35;
++
++int main(void) {
++    int fails = 0;
++#define CHECK(expr, want) do { unsigned long long g = (unsigned long long)(expr), w = (unsigned long long)(want); \
++        if (g != w) { fails++; printf("FAIL %-22s got %llu want %llu\n", #expr, g, w); } } while (0)
++    CHECK(lab_case(a0), 0);
++    CHECK(lshr_zext_56(big), 0u);
++    CHECK(lshr_zext_32(big), 0u);
++    CHECK(lshr_zext_31(big), 1u);
++    CHECK(shl_zext_40(big), 0u);
++    CHECK(shl_zext_33(big), 0u);
++    CHECK(shl_zext_1(big), 0xBD5B7DDEu);
++    CHECK((uint32_t)ashr_sext_45(neg), 0xFFFFFFFFu);
++    CHECK((uint32_t)ashr_sext_63(neg), 0xFFFFFFFFu);
++    CHECK((uint32_t)ashr_sext_45(12345), 0u);
++    CHECK((uint32_t)ashr_sext_7(neg), (uint32_t)(-123456789 >> 7));
++    CHECK(lshr_var(big, n40), 0u);
++    CHECK(lshr_var(big, n3), 0xDEADBEEFu >> 3);
++    CHECK(shl_var(big, n35), 0u);
++    CHECK(shl_var(big, n3), (uint32_t)(0xDEADBEEFu << 3));
++    CHECK(lshr_masked(big, n40), 0xDEADBEEFu >> (40 & 31));
++    CHECK(lshr_masked(big, n35), 0xDEADBEEFu >> (35 & 31));
++    CHECK(lshr_u16_20(0xFFFF), 0u);
++    CHECK(shl_u8_9(0xFF), 0u);
++    if (fails == 0) puts("ALL OK");
++    return fails;
++}
+diff --git a/tests/regression/peephole_inline_asm_barrier.c b/tests/regression/peephole_inline_asm_barrier.c
+new file mode 100644
+index 0000000..53b2b27
+--- /dev/null
++++ b/tests/regression/peephole_inline_asm_barrier.c
+@@ -0,0 +1,86 @@
++/* Regression: the x86 text peephole kept slot<->register and copy mappings
++ * alive across `#APP`/`#NO_APP` inline-asm regions.  An asm output
++ * ("=&r") redefining a register that a prior store had been recorded from
++ * let global_store_forwarding rewrite the reload of the OLD value as a
++ * register copy of the NEW one (framecall stress family, seed 0):
++ *
++ *     movq %rcx, 32(%rsp)      ; p2 (asm #2 output) spilled
++ *     #APP ... (writes %rcx) #NO_APP   ; asm #3 output, different value
++ *     movq 32(%rsp), %r11  ==>  movq %rcx, %r11      (WRONG)
++ *
++ * Fix: InlineAsm is a barrier for every state-tracking pass
++ * (types.rs is_barrier, store_forwarding, copy_propagation, writes_family).
++ * The shapes below exercise store forwarding, copy propagation and
++ * callee-saved clobbers through asm with outputs, in-place operands ("+r"),
++ * memory clobbers and register clobbers.  Expected values are computed by
++ * plain C on the same inputs in a separate translation-unit-free way (the
++ * reference arithmetic uses only volatile inputs and no asm). */
++#include <stdint.h>
++#include <stdio.h>
++
++__attribute__((noinline)) static uint64_t mix(uint64_t x) { return (x * 0x9E3779B97F4A7C15ull) ^ (x >> 29); }
++
++/* Shape 1: the exact stress-lab reproducer (constant args, inlined). */
++static inline uint64_t fc1(uint64_t p0, uint64_t p1, uint64_t p2, uint64_t p3, uint64_t p4) {
++    uint64_t r0 = mix(p4 ^ p3);
++    { uint64_t t; __asm__ volatile("movq %1, %0\n\txorq %%r14, %%r14\n\taddq $3, %0" : "=&r"(t) : "r"(p2) : "r14", "cc"); p2 = t; }
++    uint64_t r1 = mix(p1 ^ p4);
++    { uint64_t t; __asm__ volatile("movq %1, %0\n\txorq %%r13, %%r13\n\taddq $3, %0" : "=&r"(t) : "r"(p2) : "r13", "cc"); p2 = t; }
++    uint64_t r2 = mix(p3 ^ p1);
++    { uint64_t t; __asm__ volatile("movq %1, %0\n\txorq %%r15, %%r15\n\taddq $3, %0" : "=&r"(t) : "r"(r0) : "r15", "cc"); r0 = t; }
++    uint64_t r3 = mix(p0 ^ p2);
++    { uint64_t t; __asm__ volatile("movq %1, %0\n\txorq %%r15, %%r15\n\taddq $3, %0" : "=&r"(t) : "r"(r0) : "r15", "cc"); r0 = t; }
++    return (r3 * 1u) ^ (r1 * 2u) ^ (r2 * 3u) ^ (p4 * 4u) ^ (p2 * 5u) ^ (r0 * 6u) ^ (p3 * 7u) ^ (p0 * 8u) ^ (p1 * 9u);
++}
++static uint64_t fc1_ref(uint64_t p0, uint64_t p1, uint64_t p2, uint64_t p3, uint64_t p4) {
++    uint64_t r0 = mix(p4 ^ p3); p2 += 3;
++    uint64_t r1 = mix(p1 ^ p4); p2 += 3;
++    uint64_t r2 = mix(p3 ^ p1); r0 += 3;
++    uint64_t r3 = mix(p0 ^ p2); r0 += 3;
++    return (r3 * 1u) ^ (r1 * 2u) ^ (r2 * 3u) ^ (p4 * 4u) ^ (p2 * 5u) ^ (r0 * 6u) ^ (p3 * 7u) ^ (p0 * 8u) ^ (p1 * 9u);
++}
++
++/* Shape 2: copy propagation across an in-place ("+r") asm operand. */
++__attribute__((noinline)) uint64_t inplace(uint64_t a, uint64_t b) {
++    uint64_t c = a;                       /* copy c <- a */
++    __asm__ volatile("addq %1, %0" : "+r"(c) : "r"(b) : "cc");  /* c redefined in place */
++    return c ^ (a << 1);                  /* must read the NEW c, not a */
++}
++
++/* Shape 3: asm writes a value through memory ("memory" clobber) that a
++ * prior store had left in a register mapping. */
++__attribute__((noinline)) uint64_t memclobber(uint64_t a, uint64_t b) {
++    uint64_t slot = a;
++    uint64_t *p = &slot;
++    __asm__ volatile("movq %1, (%0)" : : "r"(p), "r"(b) : "memory");
++    return slot + a;                      /* slot is now b */
++}
++
++/* Shape 4: many live values + asm clobbering callee-saved registers. */
++__attribute__((noinline)) uint64_t clobbers(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++    uint64_t x = mix(a), y = mix(b), z = mix(c), w = mix(d), v = mix(e), u = mix(f);
++    __asm__ volatile("xorq %%rbx, %%rbx\n\txorq %%r12, %%r12\n\txorq %%r13, %%r13\n\txorq %%r14, %%r14\n\txorq %%r15, %%r15"
++                     : : : "rbx", "r12", "r13", "r14", "r15", "cc");
++    return x ^ (y << 1) ^ (z << 2) ^ (w << 3) ^ (v << 4) ^ (u << 5) ^ a ^ b ^ c ^ d ^ e ^ f;
++}
++static uint64_t clobbers_ref(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++    uint64_t x = mix(a), y = mix(b), z = mix(c), w = mix(d), v = mix(e), u = mix(f);
++    return x ^ (y << 1) ^ (z << 2) ^ (w << 3) ^ (v << 4) ^ (u << 5) ^ a ^ b ^ c ^ d ^ e ^ f;
++}
++
++static volatile uint64_t A = 2664053391046770798ull, B = 2444141519646934967ull, C = 14274212106794373783ull,
++                         D = 4968186882940395168ull, E = 9980036131371284697ull, F = 0x1234567890abcdefull;
++
++int main(void) {
++    int fails = 0;
++#define CHECK(name, got, want) do { unsigned long long g = (got), w = (want); \
++        if (g != w) { fails++; printf("FAIL %s got %llu want %llu\n", name, g, w); } } while (0)
++    CHECK("fc1-const", fc1(2664053391046770798ull, 2444141519646934967ull, 14274212106794373783ull,
++                           4968186882940395168ull, 9980036131371284697ull), 733194002982536891ull);
++    CHECK("fc1-rt", fc1(A, B, C, D, E), fc1_ref(A, B, C, D, E));
++    CHECK("inplace", inplace(A, B), (A + B) ^ (A << 1));
++    CHECK("memclobber", memclobber(A, B), A + B);
++    CHECK("clobbers", clobbers(A, B, C, D, E, F), clobbers_ref(A, B, C, D, E, F));
++    if (fails == 0) puts("ALL OK");
++    return fails;
++}
+diff --git a/tests/stress/run_stress.py b/tests/stress/run_stress.py
+index d3e0c4d..b40a481 100644
+--- a/tests/stress/run_stress.py
++++ b/tests/stress/run_stress.py
+@@ -65,6 +65,18 @@ from families import Case, Param  # noqa: E402
+ import abi_family  # noqa: E402
+ 
+ REPO = HERE.parents[1]
++
++# The peephole-hazard families (flags / narrow / memalias / tailcall /
++# framecall / speculate / shiftchain) live next to the other codegen tooling
++# in scripts/ and register themselves into ``families.FAMILIES`` on import.
++# They were shipped without this import, so ``--families`` never knew them
++# and the whole battery silently never ran.  Import is best-effort so a
++# trimmed checkout without scripts/ still runs the generic families.
++sys.path.insert(0, str(REPO / "scripts"))
++try:
++    import peephole_families  # noqa: E402,F401  (registers on import)
++except ImportError as _e:  # pragma: no cover - trimmed checkout
++    print(f"note: peephole families unavailable ({_e})", file=sys.stderr)
+ DEFAULT_LCCC = REPO / "target" / "fastbuild" / "lccc"
+ 
+ 
