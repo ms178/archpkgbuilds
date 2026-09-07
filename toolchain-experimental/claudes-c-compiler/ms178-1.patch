@@ -1,1544 +1,2244 @@
-diff --git a/engineering/FOLLOWUP-2026-09-07-kernel-boot-c6-os-agg-frame.md b/engineering/FOLLOWUP-2026-09-07-kernel-boot-c6-os-agg-frame.md
+diff --git a/.gitignore b/.gitignore
+index fb0d114..e37cc55 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -44,6 +44,7 @@ bench_*
+ # leaving a corpus nobody could execute.
+ !scripts/bench_kernels.py
+ !scripts/bench_iv_widen_ab.sh
++!scripts/bench_rank.py
+ 
+ # Benchmark / test output
+ /test-results/
+diff --git a/engineering/FOLLOWUP-2026-09-07-rotate-imm32-gaddr-then-slot-traffic.md b/engineering/FOLLOWUP-2026-09-07-rotate-imm32-gaddr-then-slot-traffic.md
 new file mode 100644
-index 0000000..6216ada
+index 0000000..1ee92c5
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-07-kernel-boot-c6-os-agg-frame.md
-@@ -0,0 +1,208 @@
-+# Follow-up: kernel-boot C6 — `-Os` aggregate-frame inlining, boot-stage bisection, and the remaining upstream work
++++ b/engineering/FOLLOWUP-2026-09-07-rotate-imm32-gaddr-then-slot-traffic.md
+@@ -0,0 +1,443 @@
++# FOLLOWUP — 2026-09-07: native rotates, imm32 bit-pattern hoisting, duplicate GlobalAddr merge; and the stack-slot-traffic wall behind them
 +
-+Session date: 2026-09-07
-+Base: `adecdaeda2c9363011ec4e4baefc60995cbb6454` (upstream `main`, PR #434 merged — re-verified this
-+session with `git fetch origin main`; `FETCH_HEAD` == base, so the series is current, not rebased).
-+Snapshot head: `396faeb375424e2afb7d333a4481797ebb911a6d` (`S03-os-agg-frame-veto`)
-+Deliverable: `/home/user/ms178-1.patch` — 60197 bytes,
-+sha256 `5390d3c1b2546d3f5d1a0a6ac347e7ee1442a2b926c9ee35ffa84901ff5a753f`, verdict APPLIES-CLEAN.
++Base ref: `adecdaeda2c9363011ec4e4baefc60995cbb6454` (== `origin/main` HEAD at the time of
++writing, so this series is already rebased on latest upstream).
++
++Host: 2-core Xeon @ 2.60 GHz, 1.9 GB RAM + 8G `/swapfile`, AVX2/FMA/BMI1/BMI2/POPCNT.
++No hardware PMU (`perf` absent), so every performance claim below is paired,
++randomized-order, CPU-pinned wall clock from `tests/benchmark/run_benchmarks.py`,
++with bootstrap CIs. Measurement class is *VM screening*: it reliably ranks
++directions and large effects, and it is not a substitute for PMU attribution.
++
++LCCC itself is built only with the `fastbuild` cargo profile (opt-level 1, no LTO,
++incremental) and `CARGO_BUILD_JOBS=2`, per the standing research policy.
 +
 +---
 +
-+## 1. What landed this session (validated)
++## Part 1 — what landed, and the evidence for it
 +
-+### 1.1 C2 SIMD/ISA gate (snapshot `S02`, unchanged)
++### A. Native rotate idiom (`RotateLeft` / `RotateRight`)
 +
-+The vectorizer and the FMA fold now honour the TU's ISA flags. Verified again this session:
-+`check_vectorize_isa_gate.sh` → PASS; default `-O2` still emits 2× `vfmadd` for `fma_isa_gate.c`,
-+and 0 under `-mno-sse -mno-mmx -mno-sse2 -mno-avx`.
++The ARX rotate idiom `(x << n) | (x >> (W - n))` was being emitted as a shift /
++shift / or triple through a temporary on every target. Every hash and cipher
++spells it out portably (`ROTL32`/`ROTR` in ChaCha20, SHA-256, MD5, BLAKE2,
++siphash; the kernel's `rol32`/`ror32`), and x86 `rol`/`ror`, AArch64 `ror`/`extr`
++and RISC-V Zbb `rol`/`ror` each cost one instruction.
 +
-+### 1.2 `-Os` aggregate-frame inlining veto (snapshot `S03`, new)
++Added a canonical IR pair plus:
 +
-+**Root cause.** The `-Os` cost model counts callee instructions and never looks at the callee's
-+stack frame. A plain-static callee whose *only* cost is a large non-promotable alloca is therefore
-+cheap to inline — and each call site materialises the frame again.
++* width-aware constant folding — **rotates must not be folded through
++  `eval_i64`/`eval_i128` for typed I32/U32**, which would rotate at the
++  container width (`0x80000001 rol 1` → `0x2`, not `0x3`);
++* `match_rotate` in `src/passes/bit_idioms.rs`, wired into `recognize_function`
++  behind a `max_rotate_bits` capability (`target_rotate_bits()` in
++  `src/passes/mod.rs`: X86_64/Aarch64/Riscv64 = 64, I686 = 32 — I686 routes I64
++  through the paired-register `emit_i128_binop` path, not the 32-bit ALU);
++* native lowering on x86-64 / i686 / AArch64, RISC-V funnel shift, MachInst
++  `ShiftOp::Rol`/`Ror`;
++* simplify identity folds and `loop_unroll` classification.
 +
-+**Symptom** (`arch/x86/boot/tty.c`, real-mode, `-m16 -Os -mregparm=3`): `getchar_timeout` inlined
-+`gettime()` and `kbd_pending()`, each carrying a 44-byte `struct biosregs`, producing 5 frame
-+copies and `sub $0x10c,%esp` — 290 bytes against GCC's 71. GCC keeps both callees outlined
-+(`nm` shows them as `t`); LCCC emitted no out-of-line copy at all.
++Two recognition rules that were needed to reproduce GCC exactly and to stay correct:
 +
-+**Fix** (`src/passes/inline.rs`). `CalleeData` gains `agg_frame_bytes` (sum of alloca sizes that
-+cannot be promoted to SSA) and `single_call_site`. `aggregate_frame_should_stay_outlined()` vetoes
-+a site when the TU is size-optimised, the callee is multi-site, `agg_frame_bytes >=
-+AGG_FRAME_SLOT_BYTES` (16), and nothing forces the inline (always_inline / gnu_inline /
-+PGO-forced / single call site all exempt). Both `select_inline_site` admission chains consult it,
-+so the `-Oz` and PGO paths stay consistent.
++* `match_rotate` **must run strictly after** `bit_reverse32` and
++  `bswap32_network`. bswap's final stage `(y >> 16) | (y << 16)` *is* a
++  rotate-by-16; recognising it first destroys `bswapl`. After each replacement the
++  walker does `index += consumed; continue;` so stale def-lists cannot re-match.
++* Rotate may match `LShr` on the right half, **never `AShr`** — folding an
++  arithmetic-shift pseudo-rotate is a miscompile. Rotate-by-zero / by-W identity
++  folding *is* safe (unlike `BitTest`), because the count is masked mod W.
++* Direction rule: with a run-time amount, the direction whose count is the direct
++  value wins; with two constants, the smaller amount wins
++  (`(x>>7)|(x<<25)` → `ror $7`, `(x<<12)|(x>>20)` → `rol $12`).
 +
-+**Measurement.** Same-config A/B, 23-object real-mode corpus, GCC oracle, identical flags. The
-+"before" compiler was rebuilt from `git show adecdae:src/passes/inline.rs` (S02 did not touch
-+`inline.rs`, so upstream's copy *is* the pre-veto state) rather than compared against numbers
-+taken under a different `.config`:
++**Compiler crash found and fixed on the way.** `src/backend/x86/codegen/isel.rs:619`
++(MachInst window-regalloc path) had a `_ => unreachable!("unhandled binop")`
++catch-all. `cargo check -D warnings` cannot flag it: exhaustiveness is satisfied
++by the wildcard. It only fires at runtime, on the window-regalloc path. Added
++`Rol`/`Ror` to `machinst.rs`, `shift_mnemonic` (8 arms), the `ShiftX` unreachable
++guard, `binop_to_shift`, and an early return in `try_lower_shiftx` (BMI2 has no
++register-count rotate; `rorx` is immediate-only and right-only).
 +
-+| metric | pre-veto | with veto | GCC |
++**Lesson for any future IR-op addition:** adding an `IrBinOp`/`ShiftOp` variant
++ripples to ~17 files / ~65 references. Exhaustiveness catches most of them under
++`-D warnings`, but `isel.rs`'s catch-alls are invisible to the type checker.
++Every backend path — including MachInst — must be runtime-tested.
++
++Measured (x86-64, `-O2 -march=x86-64-v3`, vs GCC 14.2, reps 9):
++
++| workload | before | after | change |
 +|---|---|---|---|
-+| `getchar_timeout` | 290 B | **119 B** | 71 B |
-+| `tty.o` `.text` | 721 B | **629 B** | — |
-+| `video-vga.o` `.text` | 1723 B | **1259 B** | — |
-+| boot `.text` total (23 objects) | 24876 B | **24320 B** (−2.2 %) | 13479 B |
++| `chacha20_block` | 9.863× slower | **4.408× slower** | 2.24× faster |
++| `sha256_transform` | 2.760× slower | **2.044× slower** | 1.35× faster |
++| everything else | — | — | unchanged (1.223–1.713) |
 +
-+The gap to GCC on `getchar_timeout` narrowed from +219 B to +48 B. Only `tty.o` and `video-vga.o`
-+changed; their −556 B accounts for the whole total delta.
++Correctness: 9-case probe (`rl_const`→`roll $16`, `rr_const`→`rorl $7`,
++`rl_var`→`roll %cl`, `rr_var`→`rorl %cl`, `rl64`→`rolq $23`; AShr- and
++bad-sum-based pseudo-rotates correctly *not* folded; `bswap32` and the bswap
++network still → `bswapl`). Output matches GCC across `-O0 -O1 -O2 -O3 -Os` and
++`-m32`. Regression suite 646 PASS / 0 FAIL / 0 AB-diff failures; `cargo test`
++2030 passed / 0 failed.
 +
-+**Gates (all re-run this session).** `cargo fmt --check` clean · `clippy --all-targets -D warnings`
-+clean · `cargo test --all-targets` **2020 passed / 0 failed / 6 ignored** (one more than S02 — the
-+new `aggregate_frame_veto_is_size_optimized_and_multisite_only` unit test) ·
-+`run_regression_suite.sh` **PASS=648 FAIL=0 SKIP=15, AB-diff failures 0** · boot gate
-+**PASS (pre-pecompact end 23910 ≤ 24576; .text 22714)** · `check_vectorize_isa_gate.sh` PASS.
++### B. imm32 **bit-pattern** constant hoisting (`src/passes/int_const_hoist.rs`)
 +
-+### 1.3 Tooling and infra fixes
++Symptom, in lz4's match-search loop:
 +
-+* **`scripts/boot_stage_bisect.sh` (new).** Relinks only `arch/x86/boot` against the already-built
-+  payload using the commands Kbuild recorded in `arch/x86/boot/.*.cmd`, then boots under QEMU.
-+  A compile → link → verdict cycle costs ~20 s instead of a ~12 min kernel rebuild, and per-file
-+  compiler selection (`BOOT_BISECT_ORACLE_FILES`) plus per-linker selection (`BOOT_BISECT_LD`)
-+  and per-assembler selection (`BOOT_BISECT_ASM_CC`) turn a silent bzImage into a binary search.
-+* **`prepare_kernel_tree.sh` host preflight.** `make olddefconfig` died on a missing `flex`
-+  *after* the 155 MiB download and the 26-patch apply. The preflight now runs first.
-+* **`build_kernel_vm.sh` preflight** gains `flex`/`bison` (kconfig) and `pahole`
-+  (only when `CONFIG_DEBUG_INFO_BTF=y`).
-+* **`fma_isa_gate.c` gains a `main()`** pinning fused vs unfused semantics
-+  (`(1+2^-12)^2 - (1+2^-11) = 2^-24` fused, `0` unfused) plus a `-lm` `.flags` sidecar, so the
-+  regression suite can build, run and A/B-compare it. It previously failed the suite with
-+  `undefined reference to 'main'` — a defect in the S02 test, found and fixed here.
++```asm
++    movl  $0x9e3779b1, %eax        ; preheader
++    movq  %rax, 0x28(%rsp)         ; ...constant parked in a stack slot
++.LBB14:
++    imul  0x28(%rsp), %eax         ; memory-operand multiply, every iteration
++```
 +
-+---
++GCC emits `imul $0x9e3779b1, %edi, %eax` — a self-contained 3-operand immediate.
 +
-+## 2. Boot status: builds, passes the size gate, **still does not boot**
++Root cause: `large_int_const()` decided "is this constant free as an immediate?"
++with a **signed** i32 range test. That is right for 64-bit instructions
++(`imulq $imm32` sign-extends) and wrong for 32-bit ones: `imull`/`andl`/`cmpl`
++take the imm32 **bit pattern verbatim**, so all of `[0, u32::MAX]` is free. The
++backend already knew this — `const_as_imm32_typed(op, is_32bit_op)` in
++`src/backend/x86/codegen/emit.rs` documents exactly that rule — but the pass did
++not, so it hoisted the constant into a slot and turned a free immediate into a
++load per iteration plus a live register across the loop.
 +
-+State at the point of the harness wipe (all reproduced once; re-verification needed on the
-+restored tree):
++This is not an lz4 curiosity. It hits essentially every 32-bit hash multiplier in
++existence, all of which live in the unsigned half of `u32` by design:
++`0x9E3779B1` (lz4, zstd, xxHash, the Fibonacci hash), `0x85EBCA77` and
++`0xC2B2AE3D` (xxHash32 primes 2 and 5), `0xCC9E2D51` and `0x1B873593`
++(MurmurHash3 c1/c2).
 +
-+* Full kernel builds with `CC=lccc LD=lccc-ld`: 1057 objects LCCC-compiled (the 3 `gcc` objects
-+  are `arch/x86/tools/relocs_*`, HOSTCC by design), `vmlinux` 17,905,584 B,
-+  setup `_end` 30368 B of 32768 → **boot size gate PASS**.
-+* **C2 audit PASS**: 0 `xmm/ymm/zmm` across all 1011 LCCC-compiled C TUs. `vmlinux.o`'s ~5055
-+  SIMD refs are fully accounted for by 11 hand-written `.S` crypto/CRC objects.
-+* QEMU: serial log is 370 B (SeaBIOS → iPXE → "Booting from ROM..." → silence). 0 triple faults.
-+* Control: `/boot/vmlinuz-6.12.107+deb13-amd64` boots in 2.4 s on the identical QEMU line, so the
-+  harness is not at fault.
++Fix: `for_each_int_operand` now reports an `imm32_exact` flag derived from the
++instruction's own `ty`, mirroring the backend predicates (`matches!(ty, I32|U32)`
++for `BinOp`, as in `alu.rs`; the same for `Cmp`, as in `comparison.rs`). Shift
++counts are explicitly excluded — they encode as imm8/`%cl`, never imm32. The
++div/rem `needs_reg` branch is untouched: `div_by_const` expands those into a
++**64-bit** magic multiply, where sign extension genuinely applies.
 +
-+### 2.1 A claim from earlier this session was **wrong** and is retracted
++**A second, larger bug fell out of the same function.** The signed-i32 shortcut
++was not gated to x86:
 +
-+I reported that substituting GCC for `arch/x86/boot` only — keeping LCCC's `vmlinux` and
-+decompressor — produced a booting kernel, and concluded the setup stage was the defect.
-+**That was false.** `make CC=gcc LD=ld.bfd bzImage` rebuilt **1015 translation units** with GCC
-+(verified from the build log: 92 in `lib`, 61 in `net/ipv4`, 58 in `mm`, …) and relinked the whole
-+payload. It was a full GCC kernel, so it proved nothing about LCCC's `vmlinux`.
++```rust
++if (-4095..=4095).contains(&v) && AARCH64 { return None; }   // imm12 free
++if v >= i32::MIN && v <= i32::MAX       { return None; }     // <- applied to AArch64 too
++```
 +
-+### 2.2 What the corrected evidence actually shows
++On AArch64 the second line suppressed hoisting for *everything* in `[-2^31, 2^31)`
++— which is where every interesting AArch64 constant lives, since imm12 tops out at
++4095. The pass's own motivating example, sieve's marking bound
++`cmp j, #10000000`, fits in i32 and was therefore **never hoisted**: on AArch64
++the pass was a no-op for the exact case it was written for. Now the two immediate
++models are properly separated (AArch64: imm12/cmn only; x86-64: bit-pattern u32
++for 32-bit ops, signed i32 for 64-bit ops).
 +
-+`scripts/boot_stage_bisect.sh` compiles the boot `.c` files with the flags read back from Kbuild's
-+own `.cmd` records. Those flag sets are **identical** for both compilers (43 flags each, set
-+difference empty), so the A/B differs in exactly one variable.
++Measured, paired against the pre-fix binary in a single harness run
++(`--lccc`/`--ccc`, reps 11, CPU-pinned, seed 20260907):
 +
-+| setup stage | payload (`arch/x86/boot/vmlinux.bin`) | result |
++| workload | LCCC(new)/LCCC(old) | CI |
 +|---|---|---|
-+| LCCC | GCC-built | **BOOTS** (kernel banner, initrd, both with and without `-initrd`) |
-+| LCCC | LCCC-built | **SILENT** |
++| `lz4_compress` | **0.989 (1.01× faster)** | [0.984, 0.994] |
++| `chacha20_block` | 1.001 | [0.999, 1.002] |
++| `sha256_transform` | 1.000 | [1.000, 1.004] |
++| `zstd_count` | 0.998 | [0.983, 1.010] |
++| `expat_xml_scan` | 0.998 | [0.996, 1.009] |
++| `gzip_crc32`, `hash_table`, `sqlite_varint`, `zlib_ng_adler32` | ≈1.000 | — |
 +
-+⇒ **LCCC's real-mode setup stage is exonerated; the defect is in the compressed payload**
-+(`arch/x86/boot/compressed/*` and/or `vmlinux` itself).
++So: a small but CI-significant win on lz4, and no regression anywhere. The value
++of this fix is mostly *class* removal — a whole family of hash kernels no longer
++pays a load per iteration — plus restoring a dead pass on AArch64.
 +
-+Also worth recording because it invalidates an earlier line of reasoning: the VM/package config has
-+`# CONFIG_EDD is not set`, and even a *successful* boot prints nothing before the kernel banner
-+(verified: the booting arm has 0 occurrences of "Probing EDD"). The 32-byte silent serial log is
-+therefore the **expected** output for any failure at or after the decompressor, and says nothing
-+about the setup stage.
++11 new unit tests, including the boundary values (`0x7FFFFFFF`, `0x80000000`,
++`0xFFFFFFFF`, `0x1_0000_0000`), the shift-count exclusion, the `Cmp` path, and
++AArch64 regression guards at `4095`/`4096`/`10_000_000`.
 +
-+### 2.3 Next step (the open blocker)
++> **Unmeasured:** there is no AArch64 execution capability in this sandbox (no
++> `qemu-aarch64`, no cross GCC), so the AArch64 half of fix B is validated by unit
++> tests and asm inspection only. It needs a real AArch64 benchmark run upstream.
 +
-+Isolate decompressor vs `vmlinux` inside the payload. Both changed between the two rows above, so
-+the 2×2 is incomplete. The cheap decisive pair, now that `boot_stage_bisect.sh` exists:
++### C. Duplicate variable-index `GlobalAddr` merge (`src/passes/global_addr_cse.rs`)
 +
-+1. LCCC decompressor + GCC-built inner image → if SILENT, the decompressor is fine and `vmlinux`
-+   is broken.
-+2. GCC decompressor + LCCC-built inner image → the converse.
++`classify_site_local_indexed()` keeps a global's address at each of its use sites
++(refusing CSE/hoist) when it feeds a variable-index GEP whose stride is
++1/2/4/8 — the strides an x86 SIB scale can encode. The stated rationale is that
++hoisting lengthens the base's live range and can evict the natural index,
++"destroying x86 `sym(,%idx,scale)` selection".
 +
-+Mechanically: `arch/x86/boot/compressed/vmlinux` is a link of ~10 objects plus `piggy.S`
-+(which `.incbin`s `vmlinux.bin.zst`), and `arch/x86/boot/vmlinux.bin` is an `objcopy` of it. Both
-+commands are recoverable from the build log, so the two arms can be assembled by hand in seconds
-+once one GCC-built inner image exists. Note that `make arch/x86/boot/compressed/vmlinux` is **not**
-+a valid top-level target ("No rule to make target") — descend with `make -C` or drive the link
-+directly.
++That rationale no longer holds, because **the backend never selects that form**.
++Counting absolute `sym(,%reg,scale)` memory operands in generated assembly:
 +
-+---
++| flags | absolute `sym(,%reg,scale)` operands |
++|---|---|
++| `-O2 -march=x86-64-v3` | **0** |
++| `-O2 -march=x86-64-v3 -fno-pic -fno-pie` | **0** |
++| `-O2 -march=x86-64-v3 -fno-pie` | **0** |
 +
-+## 3. Remaining upstream work
++A RIP-relative base cannot simultaneously carry an index register, so a
++variable-index global access pays a base register (or a rematerialised
++`leaq sym(%rip)`) *no matter where the base lives*. The exemption was protecting
++a phantom, while the cost was concrete: the register allocator rematerialises each
++**unmerged** IR value separately at each of its own uses.
 +
-+### 3.1 Blocker
++The final IR for lz4's `main` had all ten relevant `GlobalAddr`s already in the
++entry block (so LICM had done its job), but **three separate values for
++`hash_table`** and four for `src_data`:
 +
-+* **[B1] Compressed-payload boot failure** — §2.3. Everything else in the kernel-boot thread is
-+  downstream of this.
++```
++block 0: dst_data, dst_data, src_data, src_data, src_data,
++         hash_table, hash_table, hash_table, dst_data, src_data
++```
 +
-+### 3.2 Real-mode / `-Os` codegen (measured, not yet fixed)
++and the match-search loop consequently re-derived the base three times per
++iteration:
 +
-+All figures are `-m16 -Os -mregparm=3`, LCCC vs GCC, from `scripts/boot_size_oracle.sh`. After the
-+§1.2 fix the boot corpus is still 1.80× GCC (24320 vs 13479 B). Instruction-mix delta
-+(LCCC − GCC): `mov` **+1138 (≈55 % of the delta)**, `pop` +183, `lea` +131, `add` +100,
-+`movzw` +94, `movzb` +85, `jmp` +79 — i.e. the bulk is address/value materialisation, not control
-+flow.
++```asm
++.LBB14:
++    leaq  hash_table(%rip), %rcx      ; (1)
++    movl  (%rcx, %r14, 4), %r9d
++    leaq  src_data(%rip), %rcx        ; (2)
++    leaq  (%rcx, %r9), %rax
++    ...
++    leaq  hash_table(%rip), %rcx      ; (3)
++    movl  %esi, (%rcx, %r14, 4)
++```
 +
-+| # | defect | evidence | size |
++`gzip_crc32` had the same shape in cold code: `leaq gzip_crc_data(%rip)` three
++times in three consecutive instructions.
++
++Fix: withdraw site-locality when the **same symbol is materialised two or more
++times** in the function. The live-range trade only exists for a single occurrence;
++with two there is nothing left to protect, only a duplicate `leaq` to delete.
++Single-occurrence bases keep the old contract (new test pins it).
++Kill switch: `CCC_NO_GADDR_MERGE_DUP_INDEXED`.
++
++Measured, paired ON-vs-OFF across the **full 39-benchmark corpus** in one harness
++run (reps 7, warmup 1, CPU-pinned, seed 20260907). Every benchmark also reported
++`Correct: pass` against GCC.
++
++| workload | LCCC(new)/LCCC(old) | CI | vs GCC before → after |
 +|---|---|---|---|
-+| D2 | Unused stack frame not elided. `memcmp` allocates a 44-B frame it never touches; the elision at `prologue.rs:1792` requires `space == callee_save_reserve`, so any other reservation blocks it. | `memcmp` frame present, unused | 40 vs 28 B |
-+| D3 | No leaf caller-saved register preference. `strlen` spills `%ebx`/`%esi` (callee-saved ⇒ push/pop pairs) where GCC uses `%ecx`/`%edx`. Explains part of the `pop` +183. | `strlen` prologue | 32 vs 24 B |
-+| D4 | Redundant reload across the loop backedge — missed GVN/load-PRE. | `strcmp` | 81 vs 53 B |
-+| D5 | Narrow compare not folded: `movsbl`×2 then a 32-bit `cmp`, where GCC emits `cmp %dl,%cl`. Part of the `movzb`/`mov` delta. | `strchr` | 70 vs 20 B |
++| `expat_xml_scan` | **0.774 (1.29× faster)** | [0.770, 0.775] | 1.713 → **1.317** |
++| `lz4_compress` | **0.828 (1.21× faster)** | [0.803, 0.846] | 3.012 → **2.505** |
++| `sqlite_varint` | 0.984 (1.02× faster) | [0.983, 0.985] | 1.205 |
++| `zstd_count` | **1.025 (1.02× slower)** | [1.012, 1.037] | 1.419 |
++| other 35 | 0.995 – 1.007 (neutral) | — | — |
 +
-+D3 and D5 are not real-mode specific; they should pay off in the general `-Os` corpus too.
-+The largest single functions by absolute gap are `printf.vsprintf` (+1591 in `printf.o`),
-+`video.set_video` (+1372 in `video.o`), `string.o` (+1130) and `cpucheck.o` (+852).
++Aggregate vs GCC: geometric mean **0.7885**, arithmetic mean 1.1124, n=39.
++Static effect on lz4: 283 → 278 instructions, 184 → 168-byte frame, 13 → 11
++`leaq sym(%rip)`.
 +
-+### 3.3 Backend
++`zstd_count` is the one real regression and it is the honest cost of the change:
++a merged base now occupies a register across a loop. 2.5% against 29% and 21% is a
++clear net win, but if it matters the gate can be tightened to additionally require
++that at least one occurrence is loop-contained.
 +
-+* **[B2] Scalar FP under `-mno-sse` still emits `%xmm`** (pre-existing TODO,
-+  `src/backend/mod.rs:108`). Reproduced this session: `fma_isa_gate.c` under the kernel ISA flags
-+  has 44 `xmm/ymm/vfmadd` refs, 0 of them `vfmadd`. It needs an x87 path; it is why
-+  `vectorize_isa_gate.c` is integer-only. This is a latent kernel hazard of the same class as C2.
-+
-+### 3.4 Carried over from `FOLLOWUP-2026-09-06` §2
-+
-+2. Per-point fixed-GPR hazard table for `x86_inst_fixed_scratch`.
-+3. `Memcpy` / `AtomicRmw` / `Cmpxchg` operand eligibility.
-+4. `divconst` I128 `mulhi` bloat.
-+5. `live_range.rs` `register_touches_only` doc triplicated.
-+6. `scripts/` consolidation; 11 failing `check_*.sh`; LK-28 objtool; LK-30 encodings.
-+7. Unit tests for `x86_inst_fixed_scratch` and `stage_copy_operands`.
-+
-+### 3.5 Test infrastructure (found this session)
-+
-+* `run_regression_suite.sh` reports only the aggregate `SKIP=` count — no per-test reason. The
-+  count moved 7 → 15 between the S02 and S03 runs on this machine and I could not determine why
-+  from the output alone. Emitting `SKIP <name> (<reason>)` would make that diff legible.
-+* The regression suite links every `tests/regression/*.c`; a corpus file without `main()` fails as
-+  `undefined reference to 'main'` rather than being skipped. Worth asserting up front with a
-+  clearer message (see §1.3 — this is what caught the `fma_isa_gate` defect).
++Two pre-existing tests encoded the old behaviour with the same symbol twice
++(`variable_index_global_addrs_remain_site_local`,
++`derived_variable_index_bases_remain_site_local`). The first was rewritten to
++assert the merge; the second was repointed at two *distinct* symbols so its actual
++coverage — that the parent-chain walk sees through `Copy` and same-size `Cast` to
++the `GlobalAddr` root — survives intact. 17 tests in the pass, all green.
 +
 +---
 +
-+## 4. Harness notes (cost real time this session)
++## Part 2 — the wall behind all three: stack-slot traffic
 +
-+* The workspace was wiped mid-session. `/home/user/ms178-1.patch` and `artifacts/` survived;
-+  `.git`, `target/`, `/var/tmp` (kernel tree + tarball), the Rust toolchain, all apt-installed host
-+  tools, and swap did not. Recovery: `fallocate`+`swapon` the 8 G `/swapfile`, `chmod +x
-+  ~/.cargo/bin/*` (the wipe strips exec bits — `rustup` itself was unrunnable),
-+  `rustup toolchain install stable`, `git init` + `git fetch origin main` +
-+  `git reset --soft FETCH_HEAD`, restore the 6 files the snapshot dropped with
-+  `git checkout FETCH_HEAD --`, and `git update-index --chmod=+x` for the 77 scripts whose exec
-+  bits were stripped.
-+* **A wipe strips exec bits, so a naive `git add -A` afterwards stages 77 mode
-+  deletions (100755 → 100644).** Check `git diff --cached --summary | grep 'mode change'` before
-+  committing.
-+* `artifacts/lccc.bundle` from the previous snapshot was **truncated** ("did not send all
-+  necessary objects"); recovering history from GitHub worked. Do not rely on the bundle alone.
-+* Kernel-side: `make` does not rebuild when the compiler *binary* changes — delete the `.o` files.
-+  Kbuild `.cmd` sidecars are hidden and named `<dir>/.<obj>.cmd`. `objdump -d` on a `-m16` object
-+  decodes as 32-bit; use `objcopy -O binary --only-section` then `objdump -D -b binary -m i8086`.
-+  Debian's `awk` is `mawk` (no `strtonum`).
-diff --git a/scripts/boot_flags.sh b/scripts/boot_flags.sh
++Fixes A–C moved lz4 from 2.96× to 2.51× and expat from 1.71× to 1.32×, but the
++ranking is unchanged in shape: `chacha20_block` 4.40×, `lz4_compress` 2.51×,
++`sha256_transform` 2.04×. All three have the same underlying defect, and it is
++not an instruction-selection problem.
++
++Counting frame traffic in the generated assembly for lz4's `main`
++(`lz4_compress_block` inlines into it):
++
++| | LCCC | GCC |
++|---|---|---|
++| frame size | **184 B** | 56 B |
++| `mov` to a frame slot | 22 | 5 |
++| `mov` from a frame slot | 27 | 5 |
++| total frame `mov`s | **49–51** | **10** |
++| memory operands total | 64 | 14 |
++| distinct GPRs used | all 15 | all 15 |
++
++Both compilers use every general-purpose register; LCCC simply also keeps ~5× more
++values in memory. `chacha20_block` is the extreme case: **371 stack movs vs GCC's
++52**.
++
++Representative shapes from lz4's hot loop:
++
++```asm
++    movl  (%rsi), %eax
++    movl  %eax, 168(%rsp)        ; store a value that was just computed
++    ...
++    movq  %rax, 24(%rsp)         ; ref -> slot
++    ...
++    movq  24(%rsp), %rax         ; reload
++    cmpq  %r15, %rax
++    ...
++    movq  24(%rsp), %rax         ; reload again
++    cmpq  96(%rsp), %rax         ; src also lives in a slot
++```
++
++and, in the loop preheader, a pure slot-to-slot copy:
++
++```asm
++    movq  104(%rsp), %rax
++    movq  %rax, 128(%rsp)
++```
++
++The loop-carried pointers `ip`, `iend`, `mflimit`, `src`, `anchor`, `op` are all
++slot-homed and re-loaded per iteration. GCC keeps them in registers.
++
++### Ranked open work
++
++**1. No mem2reg / no SROA for constant-indexed scalar arrays. (Biggest single win.)**
++
++`src/passes/` has `aggregate_sroa.rs` (handles Memcpy'd **structs** only),
++`loop_memory_promote.rs` (loop-specific) and `vector_temp_promotion.rs` (vector
++temps). There is **no general mem2reg and no SROA for scalar arrays**.
++
++ChaCha20's state is a local `u32 x[16]` addressed entirely by constants. It never
++becomes 16 SSA values, so all 20 rounds do load / ARX / store against the stack
++instead of living in registers — that is the remaining 4.40×, and it is why the
++rotate win, large as it was, could not close the gap. Same shape in SHA-256's
++`W[64]` schedule and in any kernel that uses a small local array as a register
++file (very common in crypto and DSP).
++
++Proposal: a dominance-frontier mem2reg over `Alloca` + constant-index `GEP`,
++reusing the existing `CfgAnalysis`/dominator machinery and the IR's `Phi`.
++SROA the array into per-element SSA values when every index is a compile-time
++constant and the address never escapes; otherwise fall back to today's behaviour.
++Expected effect: `chacha20_block` 4.40× → well under 2×, `sha256_transform`
++2.04× → near parity.
++
++**2. Linear-scan RA homing long-lived loop-carried scalars to slots.**
++
++`src/backend/regalloc.rs` (~10k lines) is a linear-scan allocator with a rich
++policy surface (`CCC_NO_HOT_LOOP`, `CCC_NO_COALESCE`, `CCC_NO_PHI_COALESCE`,
++`CCC_NO_INDEX_HOME`, `CCC_CALLER_SAVE_SPANNING`, …). In lz4 the values that lose
++are precisely the ones that should win: pointers live across the whole loop,
++evicted in favour of shorter-lived temporaries.
++
++Also worth a pass: a post-RA **slot-to-slot copy eliminator** (`mov slot1,%r; mov
++%r,slot2` where the two slots hold the same value) — those are pure waste and
++there are several in lz4's preheader.
++
++**3. PF-07 global-address promotion misses lz4's `hash_table`.**
++
++`src/backend/x86/codegen/prologue.rs` already contains the right mechanism (PF-07):
++when a foldable `GlobalAddr` is defined at a strictly *shallower* loop depth than a
++variable-index GEP that consumes it, drop it from `never_materialized` so it gets a
++register home and the SIB access reads that home. It demonstrably works —
++`gzip_crc32_update` hoists `leaq gzip_crc32_table(%rip), %r9` above the loop and
++runs `xorl (%r9, %rdi, 4), %r8d` inside it, matching GCC.
++
++It does not fire for lz4. A temporary diagnostic (since removed) printed, for
++lz4's `main`:
++
++```
++[PF07] pic_mode=true set=[59, 60, 481] gmap_keys=[52,59,60,61,62,133,136,162,481]
++[PF07]   gep base=60  blk=5  consumer_depth=1 def_blk=Some(0) def_depth=0 -> PROMOTE
++[PF07]   gep base=481 blk=12 consumer_depth=2 def_blk=Some(0) def_depth=0 -> PROMOTE
++[PF07]   gep base=481 blk=14 consumer_depth=2 def_blk=Some(0) def_depth=0 -> PROMOTE
++```
++
++`pic_mode` is true, depths are correct, promotion fires — but lz4's `hash_table`
++bases (IR values **147 / 172 / 180**, all defined in block 0, all consumed by
++variable-offset GEPs in the loop at block 14) are **not in `set`**, so PF-07 never
++considers them and the emitter keeps re-deriving the base per use.
++
++Corroborating: `CCC_NO_GLOBAL_ADDR_REMAT=1` changes lz4's output *not at all*
++(byte-identical), so these bases are not arriving via
++`build_rematerializable_global_addr_set_for`; they are on the **foldable** path.
++The next step is to trace `build_foldable_global_addr_set_for` /
++`build_global_addr_map_for` in `src/backend/generation.rs` and find why
++147/172/180 are excluded while 59/60/481 are included. Worth ~3 instructions per
++iteration of lz4's match-search loop (out of ~20), and the same shape recurs in
++every table-driven kernel.
++
++Note the interaction with fix C: merging the three `hash_table` values into one
++web is what produced the 1.21× lz4 win, and it also means PF-07 now only has to
++promote *one* value instead of three.
++
++**4. `int_const_hoist` has no RISC-V immediate model.** The pass knows two models
++(AArch64 imm12, x86 imm32) and treats everything else as x86. RISC-V `addi`/branch
++immediates are 12-bit and need `lui`+`addi` above that, so RISC-V currently
++under-hoists exactly the way AArch64 did before fix B. Add a third model.
++
++**5. `.gitignore:40` `bench_*` swallows benchmark harness sources.** Fixed this
++session for `scripts/bench_rank.py` with a `!` negation (the file already had two
++such negations for the same reason — `bench_kernels.py`, `bench_iv_widen_ab.sh`).
++Any future `scripts/bench_*` needs the same. Better: anchor the pattern to actual
++build output rather than prefix-matching source names.
++
++---
++
++## Part 3 — infrastructure hazards worth upstreaming
++
++**Arena harness wipes drop more than `.git/config`.** Observed this session: the
++entire `.git` directory, `/opt` (rustup), `/swapfile`, `/tmp`, `target/`, and the
+++x bits on tracked worktree files. `artifacts/lccc.bundle` is **thin** (built from
++a `--depth 200` clone) and cannot restore history by itself:
++
++```
++error: Could not read 4589b5b9b1c68ca55d358955d595bd26e7c3d603
++fatal: Failed to traverse parents of commit b7f1819427818e2abb5dd9fdf615b53cd993a061
++error: /home/user/artifacts/lccc.bundle did not send all necessary objects
++```
++
++What did work, and what `scripts/arena_session_restore.sh` should learn (it
++currently only handles a missing `.git/config`, and its `git remote get-url`
++check dies with `fatal: not a git repository` when `.git` is absent entirely):
++
++```sh
++git clone --depth 200 https://github.com/ms178/lccc.git /tmp/t   # latest upstream
++mv /tmp/t/.git /home/user/lccc/.git                              # keep the restored worktree
++cd /home/user/lccc && git reset -q                               # MIXED: never `checkout -- .`
++while read -r f; do [ -f "$f" ] && chmod +x "$f"; \
++  done < <(git ls-files -s | awk '$1 == "100755" {print $4}')
++```
++
++The mixed reset is essential: it rebuilds the index from HEAD without touching the
++worktree, so uncommitted work survives and shows up as ordinary modifications.
++`ms178-1.patch` + `artifacts/` survived the wipe intact, which is the whole point
++of snapshotting after every validated fix. Making the bundle **self-contained**
++(`git bundle create ... --all` from an unshallow clone, or `--depth` deep enough to
++reach a real root) would remove the network dependency from recovery.
++
++**Harness/CLI gotchas (all cost time this session):**
++
++* `run_benchmarks.py --opt -O2` fails argparse; use `--opt=-O2`.
++* `--skip-perf` means *correctness only, no timing claim* — it does not mean
++  "skip PMU probing". Use `--no-pmu-probe` for that.
++* IR dump env vars are `CCC_DUMP_IR` / `CCC_DUMP_IR_FUNC` (not `LCCC_*`). The dump
++  is a Rust `Debug` rendering, so opcode histograms need indent-aware parsing
++  (instruction variants sit at 16 spaces, block labels at 12).
++* `sed -n "<line>,+Np"` with a computed range breaks on empty or multi-match
++  `grep`; extract the line with `grep -n | cut -d: -f1` first.
++* `awk` instruction counting is fragile here — the system `mawk` does not
++  understand `\s`. Use a Python analyser or `scripts/codegen_scoreboard.py`.
++* Useful runtime bisection switches discovered: `CCC_NO_GADDR_CSE`,
++  `CCC_NO_GLOBAL_ADDR_REMAT`, `CCC_NO_GEP_FOLD`, `CCC_DEBUG_GEPFOLD`,
++  `CCC_NO_HOT_LOOP`, `CCC_NO_COALESCE`, `CCC_NO_PHI_COALESCE`,
++  `CCC_NO_INDEX_HOME`, `CCC_CALLER_SAVE_SPANNING`. These allow A/B of backend
++  policy with no rebuild — a wrapper script that exports the flag and `exec`s the
++  binary can be passed to `run_benchmarks.py --ccc` for a properly paired
++  same-run comparison against `--lccc`.
++
++---
++
++## Reproducing
++
++```sh
++scripts/build_lccc_fast.sh                     # fastbuild profile, -j2
++scripts/run_regression_suite.sh                # 646 PASS expected
++cargo test --profile fastbuild                 # 2036 passed expected
++
++# fix B/C paired A/B, single harness run:
++python3 tests/benchmark/run_benchmarks.py \
++  --compilers lccc,ccc,gcc --lccc /path/to/new --ccc /path/to/old \
++  --reps 7 --warmup 1 --cpu auto --seed 20260907 \
++  --json artifacts/bench/gaddr-ab.json --markdown artifacts/bench/gaddr-ab.md
++```
++
++Evidence retained in `artifacts/bench/`: `baseline.{json,md}`,
++`correctness.{json,md}`, `rotate-after.{json,md}`, `imm32-ab.{json,md}`,
++`gaddr-ab.{json,md}`.
+diff --git a/scripts/bench_rank.py b/scripts/bench_rank.py
 new file mode 100644
-index 0000000..3e1f996
+index 0000000..f1c6d93
 --- /dev/null
-+++ b/scripts/boot_flags.sh
-@@ -0,0 +1,33 @@
-+#!/usr/bin/env bash
-+# ============================================================================
-+# boot_flags.sh — single source of truth for the Linux x86 real-mode boot
-+# translation-unit flags (arch/x86/boot, -m16).
-+#
-+# Rationale: build_kernel_boot.sh, boot_size_oracle.sh and the i686/m16
-+# torture corpus all need *byte-identical* command lines, otherwise an
-+# A/B size comparison silently measures a flag difference instead of a
-+# code-generation difference.  These two variables mirror
-+# arch/x86/boot/Makefile + arch/x86/Makefile's realmode rules verbatim.
-+#
-+# Sourced, never executed:  . "$(dirname "$0")/boot_flags.sh"
-+# ============================================================================
++++ b/scripts/bench_rank.py
+@@ -0,0 +1,271 @@
++#!/usr/bin/env python3
++"""Rank a `run_benchmarks.py` evidence JSON by LCCC-vs-reference regression.
 +
-+# KBUILD_CFLAGS for arch/x86/boot (real mode, 16-bit, i386 baseline).
-+LCCC_BOOT_CFLAGS="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -Wall -Wstrict-prototypes -Wno-address-of-packed-member -DSVGA_MODE=NORMAL_VGA"
++`run_benchmarks.py` produces the raw evidence; its Markdown report lists the
++workloads in corpus order.  That ordering hides exactly what a code-generation
++investigation needs: *which* workloads are furthest behind, whether the gap is
++statistically real, and whether a headline geometric mean is being carried by a
++single spectacular win while a dozen workloads quietly regress.
 +
-+# KBUILD_CPPFLAGS for arch/x86/boot.
-+LCCC_BOOT_CPPFLAGS="-nostdinc -Iarch/x86/boot -Iarch/x86/include -Iarch/x86/include/generated -Iinclude -Iinclude/generated -Iinclude/uapi -Iarch/x86/include/uapi -Iarch/x86/include/generated/uapi -Iinclude/generated/uapi -include include/linux/compiler-version.h -include include/linux/kconfig.h -include include/linux/compiler_types.h -D__KERNEL__ -D_SETUP -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS"
++This tool therefore:
 +
-+# The 23 objects that arch/x86/boot/Makefile links into setup.elf, in link
-+# order.  setupobjs = $(boot-y); the .S members are in boot-y too.
-+LCCC_BOOT_ASM_FILES=(header bioscall copy pmjump)
-+LCCC_BOOT_C_FILES=(a20 cmdline cpu cpuflags cpucheck early_serial_console edd
-+                   main memory pm printf regs string tty video video-mode
-+                   version video-vga video-vesa video-bios)
-+LCCC_BOOT_OBJS=(a20 bioscall cmdline copy cpu cpuflags cpucheck
-+                early_serial_console edd header main memory pm pmjump printf
-+                regs string tty video video-mode version video-vga video-vesa
-+                video-bios)
++  * sorts every correct benchmark pair by median ratio (worst first);
++  * marks each gap as SIGNIFICANT / NOISE using the runner's own paired
++    bootstrap CI on the ratio (a CI excluding 1.0 is a real difference);
++  * reports the geometric mean **and** the top-improvement / top-regression /
++    unchanged split, so no aggregate can conceal a catastrophic regression
++    (project policy: "a global geomean must not hide a regression");
++  * flags pairs whose samples are too short or too noisy to support any claim.
 +
-+# The 32 KiB setup gate: setup.ld asserts `_end <= 0x8000`.
-+LCCC_BOOT_GATE_BYTES=32768
-diff --git a/scripts/boot_size_oracle.sh b/scripts/boot_size_oracle.sh
-new file mode 100644
-index 0000000..00f5900
---- /dev/null
-+++ b/scripts/boot_size_oracle.sh
-@@ -0,0 +1,167 @@
-+#!/usr/bin/env bash
-+# ============================================================================
-+# boot_size_oracle.sh — measure the Linux x86 boot code's 32 KiB budget
-+# against a reference toolchain, object by object.
-+#
-+# Why this exists
-+# ---------------
-+# `build_kernel_boot.sh` answers "does lccc fit under the 32 KiB gate?" — a
-+# pass/fail.  That is necessary but not sufficient: with only ~1.6 KiB of
-+# headroom, a silent code-size regression in one of the 23 boot objects eats
-+# the margin long before anything fails, and every byte spent there is a byte
-+# the compressed kernel cannot use.  This script answers the *comparative*
-+# question with data:
-+#
-+#   * per-object `.text` size, lccc vs GCC (vs Clang), sorted by delta;
-+#   * aggregate content end (the value the gate actually measures);
-+#   * the resulting headroom for each toolchain;
-+#   * a byte-identical flat-image check when the object sets agree.
-+#
-+# Both sides are compiled with the *identical* command lines from
-+# scripts/boot_flags.sh, so a delta is a code-generation delta and nothing
-+# else.  Objects are emitted to separate directories, so the two builds never
-+# touch the same file.
-+#
-+# Usage:
-+#   KERNEL_DIR=... scripts/boot_size_oracle.sh            # gcc oracle
-+#   CC_ORACLE=clang scripts/boot_size_oracle.sh           # clang oracle
-+#   CC_ORACLE="clang gcc" scripts/boot_size_oracle.sh     # both
-+# Environment:
-+#   KERNEL_DIR   kernel tree        (default /home/user/kernel-work/linux-6.18.47)
-+#   LCCC         lccc compiler      (default <repo>/target/fastbuild/lccc)
-+#   LCCC_LD      lccc linker        (default <repo>/target/fastbuild/lccc-ld)
-+#   OUT          work directory     (default /var/tmp/bootbuild)
-+#   OOUT         oracle work dir    (default $OUT/oracle-<cc>)
-+# ============================================================================
-+set -euo pipefail
++It reads only the JSON the runner already wrote, so it adds no measurement and
++cannot perturb a run in progress.
 +
-+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
-+LCCC=${LCCC:-$here/../target/fastbuild/lccc}
-+LCCC_LD=${LCCC_LD:-$here/../target/fastbuild/lccc-ld}
-+OUT=${OUT:-/var/tmp/bootbuild}
-+CC_ORACLE=${CC_ORACLE:-gcc}
++Examples
++--------
++    # The ten worst workloads of a recorded run
++    scripts/bench_rank.py results/baseline.json --worst 10
 +
-+# shellcheck source=boot_flags.sh
-+. "$here/boot_flags.sh"
++    # Every workload, with code-size columns, as Markdown for a follow-up doc
++    scripts/bench_rank.py results/baseline.json --all --markdown
 +
-+[[ -d $K ]] || { echo "boot_size_oracle: kernel tree missing: $K" >&2; exit 1; }
-+[[ -x $LCCC ]] || { echo "boot_size_oracle: lccc missing: $LCCC" >&2; exit 1; }
-+cd "$K"
++    # Diff two runs: what did this session's change move?
++    scripts/bench_rank.py after.json --compare before.json
++"""
++from __future__ import annotations
 +
-+# The KEEP-annotated copy of setup.ld used by build_kernel_boot.sh; regenerate
-+# identically so both links see the same script.
-+SETUP_LD="$OUT/setup-gc.ld"
-+mkdir -p "$OUT"
-+python3 - "arch/x86/boot/setup.ld" "$SETUP_LD" <<'PY'
-+from pathlib import Path
++import argparse
++import json
++import math
 +import sys
++from pathlib import Path
++from typing import Any
 +
-+source, output = map(Path, sys.argv[1:])
-+text = source.read_text()
-+for section in (".bstext", ".header", ".entrytext", ".inittext", ".initdata",
-+                ".text32", ".pecompat", ".videocards"):
-+    plain, kept = f"*({section})", f"KEEP(*({section}))"
-+    if kept in text:
-+        continue
-+    if text.count(plain) != 1:
-+        raise SystemExit(f"cannot add KEEP for {section}")
-+    text = text.replace(plain, kept)
-+output.write_text(text)
-+PY
 +
-+# ---- compile one object set with one compiler ------------------------------
-+compile_set() { # compile_set <cc> <outdir> <extra-args...>
-+  local cc=$1 dir=$2; shift 2
-+  mkdir -p "$dir"
-+  local f
-+  for f in "${LCCC_BOOT_ASM_FILES[@]}"; do
-+    "$cc" $LCCC_BOOT_CPPFLAGS $LCCC_BOOT_CFLAGS "$@" -D__ASSEMBLY__ \
-+      -c "arch/x86/boot/$f.S" -o "$dir/$f.o"
-+  done
-+  for f in "${LCCC_BOOT_C_FILES[@]}"; do
-+    "$cc" $LCCC_BOOT_CPPFLAGS $LCCC_BOOT_CFLAGS "$@" \
-+      -c "arch/x86/boot/$f.c" -o "$dir/$f.o"
-+  done
-+}
++def _median(stats: dict[str, Any] | None) -> float | None:
++    if not stats:
++        return None
++    value = stats.get("median")
++    return float(value) if isinstance(value, (int, float)) else None
 +
-+text_bytes() { # text_bytes <obj>  -> total size of all .text* sections
-+  # `size -A` prints decimal sizes, so this works with mawk too (no strtonum).
-+  size -A "$1" 2>/dev/null | awk '
-+    $1 ~ /^\.text/ && $2 ~ /^[0-9]+$/ { s += $2 } END { printf "%d\n", s+0 }'
-+}
 +
-+gate_report() { # gate_report <elf> <label>
-+  local elf=$1 label=$2 end dec head
-+  end=$(nm -n "$elf" 2>/dev/null | awk '$3 == "_end" { print $1; exit }')
-+  [[ -n $end ]] || { printf '%-10s %s\n' "$label" "no _end"; return 1; }
-+  dec=$((16#$end))
-+  head=$((LCCC_BOOT_GATE_BYTES - dec))
-+  if (( dec <= LCCC_BOOT_GATE_BYTES )); then
-+    printf '%-10s _end=%-7d (%d KiB)  headroom=%d bytes  PASS\n' \
-+      "$label" "$dec" "$((dec / 1024))" "$head"
-+  else
-+    printf '%-10s _end=%-7d (%d KiB)  OVERFLOW=%d bytes  FAIL\n' \
-+      "$label" "$dec" "$((dec / 1024))" "$((-head))"
-+  fi
-+}
++def load_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
++    """Flatten one evidence JSON into per-workload comparison rows."""
++    document = json.loads(path.read_text(encoding="utf-8"))
++    rows: list[dict[str, Any]] = []
++    for bench in document.get("benchmarks", []):
++        runtime = bench.get("runtime", {})
++        reference = bench.get("baseline_compiler") or "gcc"
++        lccc_wall = _median((runtime.get("lccc") or {}).get("wall"))
++        ref_wall = _median((runtime.get(reference) or {}).get("wall"))
 +
-+# ---- lccc side --------------------------------------------------------------
-+if [[ ${SKIP_LCCC:-0} != 1 ]]; then
-+  echo "== compiling boot objects with lccc =="
-+  compile_set "$LCCC" "$OUT"
-+  lccc_objs=(); for o in "${LCCC_BOOT_OBJS[@]}"; do lccc_objs+=("$OUT/$o.o"); done
-+  "$LCCC_LD" --gc-sections -m elf_i386 -z noexecstack -T "$SETUP_LD" \
-+    "${lccc_objs[@]}" -o "$OUT/setup.elf"
-+fi
++        ratios = (bench.get("ratios_to_" + reference) or {}).get("lccc") or {}
++        ci = ratios.get("median_ci95_bootstrap")
++        ratio = _median(ratios)
++        if ratio is None and lccc_wall and ref_wall:
++            ratio = lccc_wall / ref_wall
 +
-+rc=0
-+for cc in $CC_ORACLE; do
-+  command -v "$cc" >/dev/null 2>&1 || { echo "warning: $cc not found; skipped" >&2; continue; }
-+  odir="$OUT/oracle-$cc"
-+  echo
-+  echo "== compiling boot objects with $cc ($($cc --version | head -1)) =="
-+  compile_set "$cc" "$odir"
-+  oobjs=(); for o in "${LCCC_BOOT_OBJS[@]}"; do oobjs+=("$odir/$o.o"); done
-+  # Link the oracle objects with GNU ld so the layout is the reference layout.
-+  if ! ld.bfd --gc-sections -m elf_i386 -z noexecstack -T "$SETUP_LD" \
-+       "${oobjs[@]}" -o "$odir/setup.elf" 2>"$odir/ld.err"; then
-+    echo "error: ld.bfd could not link the $cc objects:" >&2
-+    tail -5 "$odir/ld.err" >&2
-+    rc=1
-+    continue
-+  fi
++        significant = None
++        if isinstance(ci, (list, tuple)) and len(ci) == 2:
++            # A paired bootstrap CI that excludes 1.0 means the median ratio is
++            # distinguishable from parity at 95%; one that straddles 1.0 does
++            # not, and must never be reported as a win or a regression.
++            significant = not (float(ci[0]) <= 1.0 <= float(ci[1]))
 +
-+  rows=''; total_l=0; total_o=0
-+  for o in "${LCCC_BOOT_OBJS[@]}"; do
-+    tl=$(text_bytes "$OUT/$o.o")
-+    to=$(text_bytes "$odir/$o.o")
-+    total_l=$((total_l + tl)); total_o=$((total_o + to))
-+    d=$((tl - to))
-+    note=''
-+    (( d > 0 )) && note='lccc larger'
-+    (( d < 0 )) && note='lccc smaller'
-+    rows+=$(printf '%-10s %8d %8d %+8d   %s\n' "$o" "$tl" "$to" "$d" "$note")$'\n'
-+  done
-+  printf '%-10s %8s %8s %8s   %s\n' OBJECT LCCC "$cc" DELTA 'note'
-+  # Largest lccc excess first: the objects worth optimizing bubble to the top.
-+  printf '%s' "$rows" | sort -k4 -n -r
-+  echo
-+  printf '%-10s %8d %8d %+8d\n' TOTAL "$total_l" "$total_o" "$((total_l - total_o))"
-+  echo
-+  gate_report "$OUT/setup.elf" lccc
-+  gate_report "$odir/setup.elf" "$cc"
-+  # Byte-identical flat images are the strongest available statement: same
-+  # sections, same layout, same bytes.  Different sizes make this moot, so
-+  # only compare when the content ends agree.
-+  if command -v objcopy >/dev/null 2>&1; then
-+    objcopy -O binary "$OUT/setup.elf" "$OUT/setup.lccc.bin"
-+    objcopy -O binary "$odir/setup.elf" "$odir/setup.$cc.bin"
-+    if cmp -s "$OUT/setup.lccc.bin" "$odir/setup.$cc.bin"; then
-+      echo "flat image: byte-identical to $cc"
-+    else
-+      echo "flat image: differs from $cc (expected when code sizes differ)"
-+    fi
-+  fi
-+done
-+exit $rc
-diff --git a/scripts/boot_stage_bisect.sh b/scripts/boot_stage_bisect.sh
-new file mode 100644
-index 0000000..f23fe2f
---- /dev/null
-+++ b/scripts/boot_stage_bisect.sh
-@@ -0,0 +1,146 @@
-+#!/usr/bin/env bash
-+# ============================================================================
-+# boot_stage_bisect.sh — bisect the Linux real-mode boot stage between LCCC and
-+# an oracle toolchain, object by object and linker by linker.
-+#
-+# Why this exists
-+# ---------------
-+# A bzImage that produces *no* serial output failed somewhere inside
-+# arch/x86/boot's 23 translation units or in the setup.elf link, and the usual
-+# tools are useless there: there is no console yet, and `-earlyprintk` on this
-+# image livelocks in 16-bit `early_serial_init`. Rebuilding the whole kernel
-+# for each hypothesis costs ~12 minutes, so the stage has to be isolated.
-+#
-+# This script relinks ONLY the boot stage, reusing the already-built
-+# compressed payload (`arch/x86/boot/vmlinux.bin`), so one
-+# compile -> link -> QEMU verdict costs ~20 seconds instead of ~12 minutes.
-+# Any subset of the .c files can be handed to the oracle compiler while the
-+# rest stay on LCCC, which turns "which file broke boot?" into a binary search.
-+#
-+# The commands are the ones Kbuild recorded in arch/x86/boot/.*.cmd, so the
-+# A/B differs in exactly one variable.
-+#
-+# Usage:
-+#   scripts/boot_stage_bisect.sh                 # all LCCC + lccc-ld
-+#   BOOT_BISECT_LD=ld.bfd scripts/boot_stage_bisect.sh
-+#   BOOT_BISECT_ORACLE_FILES="main tty" scripts/boot_stage_bisect.sh
-+# Environment:
-+#   KERNEL_DIR                 kernel tree (default /home/user/kernel-work/linux-6.18.47)
-+#   LCCC / LCCC_LD             toolchain under test
-+#   BOOT_BISECT_LD             lccc-ld (default) | ld.bfd | ld.lld
-+#   BOOT_BISECT_ORACLE_FILES   space-separated basenames compiled by $CC_ORACLE
-+#   CC_ORACLE                  oracle compiler (default gcc)
-+#   BOOT_BISECT_QEMU_TIMEOUT   seconds to wait for output (default 25)
-+# Exit status: 0 = boot stage produced kernel output, 1 = silent/hung.
-+# ============================================================================
-+set -euo pipefail
++        compile_info = bench.get("compile", {})
++        correctness = bench.get("correctness", {})
++        warnings = sorted({
++            warning
++            for per_compiler in runtime.values()
++            if isinstance(per_compiler, dict)
++            for warning in per_compiler.get("quality_warnings", [])
++        })
++        rows.append({
++            "name": bench.get("name", "?"),
++            "description": bench.get("description", ""),
++            "ratio": ratio,
++            "significant": significant,
++            "ci": ci,
++            "cv": ratios.get("cv"),
++            "lccc_s": lccc_wall,
++            "ref_s": ref_wall,
++            "reference": reference,
++            "lccc_text": (compile_info.get("lccc") or {}).get("text_bytes"),
++            "ref_text": (compile_info.get(reference) or {}).get("text_bytes"),
++            "correct": all(
++                (correctness.get(key) or {}).get("matches_baseline", False)
++                for key in ("lccc", reference)
++                if key in correctness
++            ) if correctness else False,
++            "lccc_ok": (compile_info.get("lccc") or {}).get("ok", False),
++            "ref_ok": (compile_info.get(reference) or {}).get("ok", False),
++            "warnings": warnings,
++        })
++    return rows, document
 +
-+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
-+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-+LCCC=${LCCC:-$here/../target/fastbuild/lccc}
-+LCCC_LD=${LCCC_LD:-$here/../target/fastbuild/lccc-ld}
-+CC_ORACLE=${CC_ORACLE:-gcc}
-+LD_IMPL=${BOOT_BISECT_LD:-lccc-ld}
-+ORACLE_FILES=${BOOT_BISECT_ORACLE_FILES:-}
-+OUT=${BOOT_BISECT_OUT:-/var/tmp/bootbisect}
-+QTIMEOUT=${BOOT_BISECT_QEMU_TIMEOUT:-25}
 +
-+# shellcheck source=boot_flags.sh
-+. "$here/boot_flags.sh"
++def geometric_mean(values: list[float]) -> float | None:
++    positive = [value for value in values if value and value > 0]
++    if not positive:
++        return None
++    return math.exp(sum(math.log(value) for value in positive) / len(positive))
 +
-+[[ -d $K ]] || { echo "boot_stage_bisect: kernel tree missing: $K" >&2; exit 1; }
-+[[ -f $K/arch/x86/boot/vmlinux.bin ]] || {
-+  echo "boot_stage_bisect: $K/arch/x86/boot/vmlinux.bin missing (build the kernel first)" >&2
-+  exit 1
-+}
-+mkdir -p "$OUT"
-+cd "$K"
 +
-+case $LD_IMPL in
-+  lccc-ld) LD_BIN=$LCCC_LD ;;
-+  *)       LD_BIN=$LD_IMPL ;;
-+esac
++def classify(rows: list[dict[str, Any]], threshold: float) -> dict[str, list[dict[str, Any]]]:
++    """Split into regressed / improved / unchanged using the policy threshold.
 +
-+is_oracle_file() { # is_oracle_file <basename>
-+  local f
-+  for f in $ORACLE_FILES; do [[ $f == "$1" ]] && return 0; done
-+  return 1
-+}
-+
-+# ---- compile the 20 C objects (the 4 .S objects are reused from the tree) ----
-+declare -A OBJPATH=()
-+for f in "${LCCC_BOOT_C_FILES[@]}"; do
-+  if is_oracle_file "$f"; then
-+    cc=$CC_ORACLE
-+  else
-+    cc=$LCCC
-+  fi
-+  # The kernel's own flags for this TU, read back from Kbuild's recorded
-+  # command so the only difference between arms is the compiler binary.
-+  cmdfile="arch/x86/boot/.$f.o.cmd"
-+  if [[ -f $cmdfile ]]; then
-+    # Strip the recorded compiler and the trailing `-c -o ... <src>`.
-+    args=$(sed -n "s|^savedcmd_arch/x86/boot/$f\.o := [^ ]* \(.*\) -c -o arch/x86/boot/$f\.o arch/x86/boot/$f\.c.*|\1|p" "$cmdfile")
-+    if [[ -n $args ]]; then
-+      # shellcheck disable=SC2086
-+      "$cc" $args -c "arch/x86/boot/$f.c" -o "$OUT/$f.o"
-+      OBJPATH[$f]="$OUT/$f.o"
-+      continue
-+    fi
-+  fi
-+  # Fallback: the shared flag module (identical flags, no Kbuild extras).
-+  # shellcheck disable=SC2086
-+  "$cc" $LCCC_BOOT_CPPFLAGS $LCCC_BOOT_CFLAGS -c "arch/x86/boot/$f.c" -o "$OUT/$f.o"
-+  OBJPATH[$f]="$OUT/$f.o"
-+done
-+# The four .S objects are assembled by the compiler under test by default:
-+# LCCC has its own integrated assembler, so the assembler is part of what this
-+# stage has to get right. BOOT_BISECT_ASM_CC hands them to the oracle instead,
-+# which separates "bad assembly" from "bad object code" in one more step.
-+ASM_CC=${BOOT_BISECT_ASM_CC:-$LCCC}
-+for f in "${LCCC_BOOT_ASM_FILES[@]}"; do
-+  cmdfile="arch/x86/boot/.$f.o.cmd"
-+  args=''
-+  if [[ -f $cmdfile ]]; then
-+    args=$(sed -n "s|^savedcmd_arch/x86/boot/$f\.o := [^ ]* \(.*\) -c -o arch/x86/boot/$f\.o arch/x86/boot/$f\.S.*|\1|p" "$cmdfile")
-+  fi
-+  if [[ -n $args ]]; then
-+    # shellcheck disable=SC2086
-+    "$ASM_CC" $args -c "arch/x86/boot/$f.S" -o "$OUT/$f.o"
-+  else
-+    # shellcheck disable=SC2086
-+    "$ASM_CC" $LCCC_BOOT_CPPFLAGS $LCCC_BOOT_CFLAGS -D__ASSEMBLY__ \
-+      -c "arch/x86/boot/$f.S" -o "$OUT/$f.o"
-+  fi
-+  OBJPATH[$f]="$OUT/$f.o"
-+done
-+
-+# ---- link setup.elf with Kbuild's recorded flags ----------------------------
-+objs=()
-+for o in "${LCCC_BOOT_OBJS[@]}"; do objs+=("${OBJPATH[$o]}"); done
-+# shellcheck disable=SC2086
-+"$LD_BIN" -m elf_x86_64 -z noexecstack --no-warn-rwx-segments -m elf_i386 \
-+  -z noexecstack -T arch/x86/boot/setup.ld "${objs[@]}" -o "$OUT/setup.elf"
-+objcopy -O binary "$OUT/setup.elf" "$OUT/setup.bin"
-+
-+# ---- assemble the bzImage exactly like arch/x86/boot/Makefile ---------------
-+( dd if="$OUT/setup.bin" bs=4k conv=sync status=none; cat arch/x86/boot/vmlinux.bin ) > "$OUT/bzImage"
-+end=$(nm -n "$OUT/setup.elf" | awk '$3 == "_end" { print $1; exit }')
-+printf 'setup _end=0x%s (%d bytes, gate %d)  ld=%s  oracle-files=[%s]\n' \
-+  "$end" "$((16#$end))" "$LCCC_BOOT_GATE_BYTES" "$LD_IMPL" "$ORACLE_FILES"
-+
-+# ---- boot verdict -----------------------------------------------------------
-+log="$OUT/serial.log"
-+timeout "$QTIMEOUT" qemu-system-x86_64 -m 512 -smp 2 -L /usr/share/seabios \
-+  -kernel "$OUT/bzImage" -nographic -no-reboot -accel tcg,thread=multi \
-+  -append "console=ttyS0,115200 nokaslr panic=-1" > "$log" 2>&1 || true
-+if grep -aq 'Linux version' "$log"; then
-+  echo "VERDICT: BOOT (kernel banner present)"
-+  exit 0
-+fi
-+if grep -aqE 'Probing EDD|Decompressing Linux' "$log"; then
-+  echo "VERDICT: PARTIAL (setup ran, later stage silent)"
-+  exit 1
-+fi
-+echo "VERDICT: SILENT (boot stage produced no output)"
-+exit 1
-diff --git a/scripts/build_kernel_boot.sh b/scripts/build_kernel_boot.sh
-index 400fd05..805cb3a 100755
---- a/scripts/build_kernel_boot.sh
-+++ b/scripts/build_kernel_boot.sh
-@@ -25,11 +25,19 @@ K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
- LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
- LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
- OUT=${OUT:-/tmp/bootbuild}
-+# Resolve the script directory before `cd "$K"`: $0 is relative to the caller's
-+# cwd, so sourcing boot_flags.sh after the cd would look inside the kernel tree.
-+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
- 
- cd "$K"
- 
--RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -Wall -Wstrict-prototypes -Wno-address-of-packed-member -DSVGA_MODE=NORMAL_VGA"
--INC="-nostdinc -Iarch/x86/boot -Iarch/x86/include -Iarch/x86/include/generated -Iinclude -Iinclude/generated -Iinclude/uapi -Iarch/x86/include/uapi -Iarch/x86/include/generated/uapi -Iinclude/generated/uapi -include include/linux/compiler-version.h -include include/linux/kconfig.h -include include/linux/compiler_types.h -D__KERNEL__ -D_SETUP -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS"
-+# Real-mode translation-unit flags come from the shared flag module so that
-+# boot_size_oracle.sh measures exactly the same command lines (an A/B size
-+# comparison must never be confounded by a flag difference).
-+# shellcheck source=boot_flags.sh
-+. "$SCRIPT_DIR/boot_flags.sh"
-+RMF="$LCCC_BOOT_CFLAGS"
-+INC="$LCCC_BOOT_CPPFLAGS"
- 
- mkdir -p "$OUT"
- 
-@@ -42,25 +50,21 @@ if [[ ! -f arch/x86/boot/cpustr.h ]]; then
- fi
- 
- # ---- assemble the .S files -------------------------------------------------
--ASM_FILES=(header bioscall copy pmjump)
-+ASM_FILES=("${LCCC_BOOT_ASM_FILES[@]}")
- for f in "${ASM_FILES[@]}"; do
-   echo "AS   $f.S"
-   "$LCCC" $INC $RMF -D__ASSEMBLY__ -c "arch/x86/boot/$f.S" -o "$OUT/$f.o"
- done
- 
- # ---- compile the .c files --------------------------------------------------
--C_FILES=(a20 cmdline cpu cpuflags cpucheck early_serial_console edd main memory
--         pm printf regs string tty video video-mode version video-vga
--         video-vesa video-bios)
-+C_FILES=("${LCCC_BOOT_C_FILES[@]}")
- for f in "${C_FILES[@]}"; do
-   echo "CC   $f.c"
-   "$LCCC" $INC $RMF -c "arch/x86/boot/$f.c" -o "$OUT/$f.o"
- done
- 
- # ---- link setup.elf with lccc-ld -------------------------------------------
--SETUP_OBJS=(a20 bioscall cmdline copy cpu cpuflags cpucheck early_serial_console
--            edd header main memory pm pmjump printf regs string tty video
--            video-mode version video-vga video-vesa video-bios)
-+SETUP_OBJS=("${LCCC_BOOT_OBJS[@]}")
- OBJS=()
- for o in "${SETUP_OBJS[@]}"; do OBJS+=("$OUT/$o.o"); done
- 
-diff --git a/scripts/build_kernel_vm.sh b/scripts/build_kernel_vm.sh
-index e36bc4a..d2e0e1b 100755
---- a/scripts/build_kernel_vm.sh
-+++ b/scripts/build_kernel_vm.sh
-@@ -83,6 +83,49 @@ if [[ ! -f .lccc-vm-config ]]; then
-   touch .lccc-vm-config
- fi
- 
-+# ---- host tool preflight ----------------------------------------------------
-+# bzImage's last step shells out to a host compression tool selected by
-+# CONFIG_KERNEL_*. A missing one fails AFTER the whole kernel has compiled
-+# (observed: `zstd: not found` at arch/x86/boot/compressed/vmlinux.bin.zst,
-+# ~20 minutes into the build). Check every host tool the remaining steps need
-+# up front so the failure costs seconds instead of a full build.
-+preflight_host_tools() {
-+  local missing=() tool sym
-+  # Compression tool implied by the config (Kbuild's compressed/Makefile).
-+  for sym in GZIP BZIP2 LZMA XZ LZO LZ4 ZSTD; do
-+    if grep -q "^CONFIG_KERNEL_${sym}=y$" .config; then
-+      case $sym in
-+        GZIP) tool=gzip ;;
-+        BZIP2) tool=bzip2 ;;
-+        LZMA) tool=lzma ;;
-+        XZ) tool=xz ;;
-+        LZO) tool=lzop ;;
-+        LZ4) tool=lz4 ;;
-+        ZSTD) tool=zstd ;;
-+      esac
-+      command -v "$tool" >/dev/null 2>&1 || missing+=("$tool (CONFIG_KERNEL_$sym)")
-+    fi
-+  done
-+  # Unconditional build-time host tools for a bzImage link.
-+  # flex/bison drive kconfig, pahole drives CONFIG_DEBUG_INFO_BTF; both are
-+  # host-only and both are absent on a minimal image.
-+  for tool in nm objcopy ar size perl awk sed bc cpio flex bison; do
-+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
-+  done
-+  if grep -q "^CONFIG_DEBUG_INFO_BTF=y$" .config 2>/dev/null; then
-+    command -v pahole >/dev/null 2>&1 || missing+=("pahole (CONFIG_DEBUG_INFO_BTF)")
-+  fi
-+  if ((${#missing[@]})); then
-+    echo "build_kernel_vm: missing host tools: ${missing[*]}" >&2
-+    echo "  These are build machines only; they are never built with LCCC." >&2
-+    echo "  Debian/Ubuntu: apt-get install build-essential flex bison libelf-dev libssl-dev \\" >&2
-+    echo "    zstd xz-utils lz4 lzop bzip2 binutils cpio bc kmod dwarves" >&2
-+    return 1
-+  fi
-+  echo "preflight: host tools OK"
-+}
-+preflight_host_tools || exit 1
-+
- start=$(date +%s)
- # Refresh include/config/auto.conf SERIALLY before the parallel build.  A
- # -j2 `bzImage` re-runs syncconfig as part of `prepare`, and when auto.conf
-diff --git a/scripts/prepare_kernel_tree.sh b/scripts/prepare_kernel_tree.sh
-index 7b2fa10..77c4182 100755
---- a/scripts/prepare_kernel_tree.sh
-+++ b/scripts/prepare_kernel_tree.sh
-@@ -43,6 +43,31 @@ TARBALL="$WORK/linux-$KVER.tar.xz"
- 
- [[ -d $PKGDIR ]] || { echo "prepare_kernel_tree: PKGDIR not found: $PKGDIR" >&2; exit 1; }
- 
-+# `make olddefconfig`/`make prepare` need host tools that are not part of the
-+# LCCC build and therefore easy to have absent on a fresh machine; failing
-+# there wastes the whole download+patch phase that precedes it.  Check first.
-+preflight_host_tools() {
-+  local missing=() tool
-+  # kconfig lexers/parsers, plus the unconditional build-time host tools.
-+  for tool in make gcc ld ar nm objcopy perl awk sed bc flex bison cpio \
-+              xz patch tar; do
-+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
-+  done
-+  # Compression tool implied by the package config (KERNEL_ZSTD=y upstream).
-+  for tool in zstd xz lz4 lzop bzip2 gzip; do
-+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool (only if CONFIG_KERNEL_*=$tool)")
-+  done
-+  if ((${#missing[@]})); then
-+    echo "prepare_kernel_tree: missing host tools: ${missing[*]}" >&2
-+    echo "  Build machines only; never built with LCCC." >&2
-+    echo "  Debian/Ubuntu: apt-get install build-essential flex bison libelf-dev \\" >&2
-+    echo "    libssl-dev bc cpio kmod dwarves zstd xz-utils lz4 lzop bzip2" >&2
-+    return 1
-+  fi
-+  echo "prepare_kernel_tree: host tools OK"
-+}
-+preflight_host_tools || exit 1
-+
- # Already prepared?  Verify the stamp AND a canary file the snapshot truncation
- # removed last time (setup.ld); a damaged tree must regenerate, not half-work.
- if [[ -f "$KDIR/.lccc-prepared" ]] && [[ -f "$KDIR/${LCCC_PREPARED_CANARIES[0]}" ]]; then
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 4da2b90..5da24fd 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -965,6 +965,9 @@ impl Driver {
-                     // (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
-                     self.no_sse = true;
-                     self.sse_explicitly_disabled = true;
-+                    // No xmm state at all, so every VEX form is forbidden too.
-+                    self.avx_explicitly_disabled = true;
-+                    self.fma_explicitly_disabled = true;
-                     self.enable_sse3 = false;
-                     self.enable_ssse3 = false;
-                     self.enable_sse4_1 = false;
-@@ -1013,6 +1016,7 @@ impl Driver {
-                 "-mharden-sls=none" => {}
-                 "-mno-avx2" => {
-                     self.enable_avx2 = false;
-+                    self.avx_explicitly_disabled = true;
-                     self.enable_avxvnni = false;
-                     self.enable_avxvnniint8 = false;
-                     self.enable_avxvnniint16 = false;
-@@ -1020,11 +1024,18 @@ impl Driver {
-                 "-mno-avx" => {
-                     self.enable_avx = false;
-                     self.enable_avx2 = false;
-+                    // `vfmadd*` is VEX-encoded: no AVX means no FMA3 either
-+                    // (GCC rejects -mfma -mno-avx for the same reason).
-+                    self.avx_explicitly_disabled = true;
-+                    self.fma_explicitly_disabled = true;
-                     self.enable_avxvnni = false;
-                     self.enable_vaes = false;
-                     self.enable_vpclmulqdq = false;
-                 }
-                 "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" => {
-+                    // AVX implies SSE4.2, so denying any SSE4.x denies AVX.
-+                    self.avx_explicitly_disabled = true;
-+                    self.fma_explicitly_disabled = true;
-                     self.enable_sse3 = false;
-                     self.enable_ssse3 = false;
-                     self.enable_sse4_1 = false;
-@@ -1099,7 +1110,10 @@ impl Driver {
-                 "-mno-aes" => self.enable_aes = false,
-                 "-mno-pclmul" => self.enable_pclmul = false,
-                 "-mno-f16c" => self.enable_f16c = false,
--                "-mno-fma" => self.enable_fma = false,
-+                "-mno-fma" => {
-+                    self.enable_fma = false;
-+                    self.fma_explicitly_disabled = true;
-+                }
-                 "-mno-bmi" => self.enable_bmi = false,
-                 "-mno-bmi2" => self.enable_bmi2 = false,
-                 "-mno-lzcnt" => self.enable_lzcnt = false,
-@@ -1165,6 +1179,9 @@ impl Driver {
-                     self.general_regs_only = true;
-                     self.no_sse = true;
-                     self.sse_explicitly_disabled = true;
-+                    // No xmm state at all, so every VEX form is forbidden too.
-+                    self.avx_explicitly_disabled = true;
-+                    self.fma_explicitly_disabled = true;
-                     self.enable_sse3 = false;
-                     self.enable_ssse3 = false;
-                     self.enable_sse4_1 = false;
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index e23fc60..35340f4 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -150,6 +150,16 @@ pub struct Driver {
-     /// profiles must not re-enable SSE after that: GCC keeps the disable
-     /// (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
-     pub(super) sse_explicitly_disabled: bool,
-+    /// Set by `-mno-avx`/`-mno-avx2`/`-mno-sse4.x`: the TU explicitly forbade
-+    /// 256-bit VEX code. Distinct from `enable_avx2` (which records what was
-+    /// explicitly *requested* and drives `__AVX2__`): LCCC's x86-64
-+    /// code-generation baseline is x86-64-v3, so AVX2 is legal by default and
-+    /// only an explicit denial removes it. Without this distinction a
-+    /// default-flag build would silently lose every 256-bit transform.
-+    pub(super) avx_explicitly_disabled: bool,
-+    /// Set by `-mno-fma` (and by any AVX/SSE denial, since `vfmadd*` is
-+    /// VEX-encoded and requires AVX): `vfmadd*` must not be emitted.
-+    pub(super) fma_explicitly_disabled: bool,
-     pub(super) skip_rax_setup: bool,
-     /// -mno-80387/-mno-fp-ret-in-387: no x87 instructions or x87 FP returns.
-     /// Recorded so FP codegen can fail closed on long-double paths.
-@@ -427,6 +437,8 @@ impl Driver {
-             cf_protection_value: None,
-             no_sse: false,
-             sse_explicitly_disabled: false,
-+            avx_explicitly_disabled: false,
-+            fma_explicitly_disabled: false,
-             skip_rax_setup: false,
-             no_x87: false,
-             indirect_branch_thunk_inline: false,
-@@ -1615,6 +1627,23 @@ impl Driver {
-             self.code16gcc,
-             self.fp_reassoc,
-             self.fp_contract,
-+            // Code-generation ISA permission (see passes::X86Isa). x86-64's
-+            // baseline already contains SSE2, and the project baseline is
-+            // x86-64-v3, so each subset is legal unless the TU explicitly
-+            // denied it. i686 has no baseline SSE2 and its vector lowerings
-+            // are x86-64 shapes, so it never vectorizes (verified: 0 xmm refs
-+            // at -O2/-O3, with and without -ffast-math).
-+            crate::passes::X86Isa {
-+                simd: self.target == Target::X86_64 && !self.no_sse && !self.general_regs_only,
-+                ymm: self.target == Target::X86_64
-+                    && !self.no_sse
-+                    && !self.general_regs_only
-+                    && !self.avx_explicitly_disabled,
-+                fma: self.target == Target::X86_64
-+                    && !self.no_sse
-+                    && !self.general_regs_only
-+                    && !self.fma_explicitly_disabled,
-+            },
-             self.target == Target::X86_64
-                 && self.enable_avx
-                 && !self.no_sse
-diff --git a/src/passes/inline.rs b/src/passes/inline.rs
-index 5206863..a2a49b0 100644
---- a/src/passes/inline.rs
-+++ b/src/passes/inline.rs
-@@ -298,6 +298,40 @@ const MAX_TRACE_CHAIN_LENGTH: usize = 20;
- /// trees where both operands themselves need recursive tracing.
- const MAX_TRACE_RECURSION_DEPTH: u32 = 10;
- 
-+/// Allocas at least this large are charged to a callee's aggregate-frame cost.
-+/// Smaller ones are ignored: mem2reg/SROA promotes them to registers, so they
-+/// cost no stack space after inlining, whereas an aggregate of this size is
-+/// materialised in the frame at *every* inline site.
-+const AGG_FRAME_SLOT_BYTES: usize = 16;
-+
-+/// `-Os`/`-Oz` veto: keep a callee outlined when inlining it would duplicate a
-+/// large aggregate local frame at several call sites.
-+///
-+/// Instruction counts are blind to stack cost. `arch/x86/boot/tty.c`'s
-+/// `kbd_pending`/`gettime` are ~15-instruction helpers that each materialise a
-+/// 44-byte `struct biosregs`; inlining them into `getchar_timeout` grew it from
-+/// GCC's 71 bytes to 290 bytes (4.1x), eating a sixth of the 32 KiB real-mode
-+/// setup budget on a single function. An outlined body pays the frame once for
-+/// all its callers, so with more than one call site outlining is the size win --
-+/// which is exactly what GCC's `-Os` heuristic concludes here.
-+///
-+/// Scoped deliberately: callees that *must* be inlined (`always_inline`, and
-+/// gnu_inline definitions, which have no out-of-line body) are exempt, as are
-+/// profile-forced hot sites and single-call-site callees (where inlining is
-+/// size-neutral because the outlined copy disappears).
-+fn aggregate_frame_should_stay_outlined(
-+    callee_data: &CalleeData,
-+    pgo_force: bool,
-+    size_optimized: bool,
-+) -> bool {
-+    size_optimized
-+        && callee_data.agg_frame_bytes >= AGG_FRAME_SLOT_BYTES
-+        && !callee_data.is_always_inline
-+        && !callee_data.is_gnu_inline_def
-+        && !callee_data.single_call_site
-+        && !pgo_force
-+}
-+
- /// Select the best call site to inline from the given candidates.
- ///
- /// Uses a two-pass strategy:
-@@ -364,26 +398,30 @@ fn select_inline_site(
-         // retain the outlined wrapper so its loop owner is expanded once.
-         // Attribute/section/PGO cases keep their stronger correctness or
-         // profile-driven policy.
--        if multisite_loop_wrapper_should_stay_outlined(
--            callee_data,
--            callee_inst_count,
--            caller_has_section,
--            site.pgo_force,
--            size_optimized,
--        ) || nested_loop_multisite_static_should_stay_outlined(
--            callee_data,
--            callee_inst_count,
--            loop_blocks.contains(&site.block_idx),
--            caller_has_section,
--            site.pgo_force,
--            size_optimized,
--        ) || repeated_small_loop_clone_should_stay_outlined(
--            callee_data,
--            callee_inst_count,
--            caller_has_section,
--            site.pgo_force,
--            size_optimized,
--        ) {
-+        if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
-+            || multisite_loop_wrapper_should_stay_outlined(
-+                callee_data,
-+                callee_inst_count,
-+                caller_has_section,
-+                site.pgo_force,
-+                size_optimized,
-+            )
-+            || nested_loop_multisite_static_should_stay_outlined(
-+                callee_data,
-+                callee_inst_count,
-+                loop_blocks.contains(&site.block_idx),
-+                caller_has_section,
-+                site.pgo_force,
-+                size_optimized,
-+            )
-+            || repeated_small_loop_clone_should_stay_outlined(
-+                callee_data,
-+                callee_inst_count,
-+                caller_has_section,
-+                site.pgo_force,
-+                size_optimized,
-+            )
-+        {
-             continue;
-         }
-         // Static inline functions that fit within normal limits should
-@@ -454,26 +492,30 @@ fn select_inline_site(
-             .iter()
-             .map(|b| b.instructions.len())
-             .sum();
--        if multisite_loop_wrapper_should_stay_outlined(
--            callee_data,
--            callee_inst_count,
--            caller_has_section,
--            site.pgo_force,
--            size_optimized,
--        ) || nested_loop_multisite_static_should_stay_outlined(
--            callee_data,
--            callee_inst_count,
--            loop_blocks.contains(&site.block_idx),
--            caller_has_section,
--            site.pgo_force,
--            size_optimized,
--        ) || repeated_small_loop_clone_should_stay_outlined(
--            callee_data,
--            callee_inst_count,
--            caller_has_section,
--            site.pgo_force,
--            size_optimized,
--        ) {
-+        if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
-+            || multisite_loop_wrapper_should_stay_outlined(
-+                callee_data,
-+                callee_inst_count,
-+                caller_has_section,
-+                site.pgo_force,
-+                size_optimized,
-+            )
-+            || nested_loop_multisite_static_should_stay_outlined(
-+                callee_data,
-+                callee_inst_count,
-+                loop_blocks.contains(&site.block_idx),
-+                caller_has_section,
-+                site.pgo_force,
-+                size_optimized,
-+            )
-+            || repeated_small_loop_clone_should_stay_outlined(
-+                callee_data,
-+                callee_inst_count,
-+                caller_has_section,
-+                site.pgo_force,
-+                size_optimized,
-+            )
-+        {
-             continue;
-         }
-         // Cost loop-body cloning after accounting for tiny/static-inline
-@@ -1809,6 +1851,16 @@ struct CalleeData {
-     /// attribute-constrained inline definition. It has a valid outlined body,
-     /// so profitability policy may deliberately retain a call to it.
-     is_plain_static: bool,
-+    /// The whole module contains exactly one call to this callee. Inlining is
-+    /// then size-neutral (the outlined body disappears), so size-based vetoes
-+    /// must not fire. Independent of `is_single_call_site_static`, which
-+    /// additionally requires an ordinary `static` definition.
-+    single_call_site: bool,
-+    /// Stack bytes the callee's body forces on *every* inline site: the sum of
-+    /// its non-promotable alloca sizes (see `AGG_FRAME_SLOT_BYTES`).
-+    /// Instruction-count costs are blind to this, which is how a ~15-instruction
-+    /// helper carrying a 44-byte `struct biosregs` still looked "small".
-+    agg_frame_bytes: usize,
-     /// Module-wide direct calls (including a redirected asm label) observed
-     /// before inlining.  Multi-site wrappers duplicate their descendants.
-     direct_call_count: usize,
-@@ -2387,6 +2439,18 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
-         let param_struct_sizes: Vec<Option<usize>> =
-             func.params.iter().map(|p| p.struct_size).collect();
- 
-+        // Frame bytes duplicated at every inline site. Only allocas large
-+        // enough to survive mem2reg/SROA count; the rest become registers.
-+        let agg_frame_bytes: usize = func
-+            .blocks
-+            .iter()
-+            .flat_map(|b| b.instructions.iter())
-+            .filter_map(|inst| match inst {
-+                Instruction::Alloca { size, .. } if *size >= AGG_FRAME_SLOT_BYTES => Some(*size),
-+                _ => None,
-+            })
-+            .sum();
-+
-         map.insert(
-             func.name.clone(),
-             CalleeData {
-@@ -2422,6 +2486,8 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
-                     && !func.is_inline
-                     && has_single_call_site
-                     && !survives_via_reference,
-+                single_call_site: has_single_call_site,
-+                agg_frame_bytes,
-                 has_loops,
-                 is_recursive,
-                 has_vector_intrinsics: func_has_vector_intrinsics(func),
-@@ -4273,6 +4339,42 @@ mod inline_limit_tests {
-         assert!(!fits_static_loop_inline_limits(129, 16, 1));
-         assert!(!fits_static_loop_inline_limits(128, 17, 1));
-     }
-+    #[test]
-+    fn aggregate_frame_veto_is_size_optimized_and_multisite_only() {
-+        // The arch/x86/boot `struct biosregs` shape: a ~15-instruction helper
-+        // that still forces 44 frame bytes on every inline site.
-+        let mut callee = wrapper_policy_data(2);
-+        callee.agg_frame_bytes = 44;
-+        assert!(aggregate_frame_should_stay_outlined(&callee, false, true));
-+
-+        // -O1/-O2/-O3 optimise for speed; stack cost alone must not veto.
-+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, false));
-+
-+        // One call site: the outlined body disappears, so inlining is
-+        // size-neutral and the veto must stay out of the way.
-+        callee.single_call_site = true;
-+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, true));
-+        callee.single_call_site = false;
-+
-+        // Callees that have no usable out-of-line body must still be inlined.
-+        callee.is_always_inline = true;
-+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, true));
-+        callee.is_always_inline = false;
-+        callee.is_gnu_inline_def = true;
-+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, true));
-+        callee.is_gnu_inline_def = false;
-+
-+        // A profile-forced hot site outranks the static size heuristic.
-+        assert!(!aggregate_frame_should_stay_outlined(&callee, true, true));
-+
-+        // Below the threshold the allocas are promotable, so no frame cost.
-+        callee.agg_frame_bytes = AGG_FRAME_SLOT_BYTES - 1;
-+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, true));
-+        // At exactly the threshold the veto engages.
-+        callee.agg_frame_bytes = AGG_FRAME_SLOT_BYTES;
-+        assert!(aggregate_frame_should_stay_outlined(&callee, false, true));
++    Only statistically significant pairs may land in regressed/improved: the
++    project's regression policy (>1% investigate, >2% strong investigation) is
++    meaningless when the measurement noise is larger than the effect.
++    """
++    regressed, improved, unchanged, unknown = [], [], [], []
++    for row in rows:
++        ratio = row.get("ratio")
++        if not ratio or not row.get("correct"):
++            unknown.append(row)
++            continue
++        if row.get("significant") is not True:
++            unchanged.append(row)
++        elif ratio > 1.0 + threshold:
++            regressed.append(row)
++        elif ratio < 1.0 - threshold:
++            improved.append(row)
++        else:
++            unchanged.append(row)
++    return {
++        "regressed": regressed,
++        "improved": improved,
++        "unchanged": unchanged,
++        "unknown": unknown,
 +    }
 +
-     #[test]
-     fn vector_static_inline_limit() {
-         assert!(fits_normal_inline_limits(150, 12, true, true, true, 6));
-@@ -4297,6 +4399,8 @@ mod inline_limit_tests {
-             num_params: 0,
-             next_value_id: 0,
-             max_block_id: 0,
-+            single_call_site: false,
-+            agg_frame_bytes: 0,
-             is_always_inline: false,
-             exceeds_normal_limits: false,
-             is_static_inline: false,
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 7ccd822..2600751 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -873,6 +873,28 @@ fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32)
++
++def format_ms(seconds: float | None) -> str:
++    if seconds is None:
++        return "—"
++    if seconds >= 1.0:
++        return f"{seconds * 1000:.1f}ms"
++    return f"{seconds * 1000:.2f}ms"
++
++
++def render_table(rows: list[dict[str, Any]], *, show_size: bool, reference: str) -> str:
++    header = (f"{'#':>3} {'workload':<24} {'lccc':>10} {reference:>10} "
++              f"{'ratio':>7} {'sig':>4} {'95% CI':>16}")
++    if show_size:
++        header += f" {'text L':>8} {'text R':>8}"
++    lines = [header, "-" * len(header)]
++    for index, row in enumerate(rows, 1):
++        ratio = row.get("ratio")
++        ci = row.get("ci")
++        ci_text = (f"[{ci[0]:.3f},{ci[1]:.3f}]"
++                   if isinstance(ci, (list, tuple)) and len(ci) == 2 else "—")
++        sig = {True: "YES", False: "no", None: "?"}[row.get("significant")]
++        line = (f"{index:>3} {row['name']:<24} {format_ms(row.get('lccc_s')):>10} "
++                f"{format_ms(row.get('ref_s')):>10} "
++                f"{ratio:>7.3f} {sig:>4} {ci_text:>16}" if ratio else
++                f"{index:>3} {row['name']:<24} {'—':>10} {'—':>10} {'—':>7} {sig:>4} {ci_text:>16}")
++        if show_size:
++            line += (f" {row.get('lccc_text') or 0:>8} {row.get('ref_text') or 0:>8}")
++        if not row.get("correct"):
++            line += "   <-- INCORRECT/FAILED"
++        lines.append(line)
++    return "\n".join(lines)
++
++
++def render_markdown(rows: list[dict[str, Any]], document: dict[str, Any],
++                    groups: dict[str, list[dict[str, Any]]], threshold: float) -> str:
++    aggregate = document.get("aggregate_lccc_vs_gcc") or {}
++    out = ["# LCCC benchmark ranking (worst first)", ""]
++    out.append(f"- workloads: **{len(rows)}**")
++    if aggregate:
++        out.append(f"- geometric mean ratio: **{aggregate.get('geometric_mean', float('nan')):.4f}**")
++        out.append(f"- arithmetic mean ratio: **{aggregate.get('arithmetic_mean', float('nan')):.4f}**")
++    out.append(f"- policy threshold: ±{threshold * 100:.0f}% (significant pairs only)")
++    for key in ("regressed", "improved", "unchanged", "unknown"):
++        out.append(f"- {key}: **{len(groups[key])}**")
++    out += ["", "| # | workload | lccc | ref | ratio | significant | 95% CI |",
++            "|---|----------|-----:|----:|------:|:-----------:|--------|"]
++    for index, row in enumerate(rows, 1):
++        ci = row.get("ci")
++        ci_text = (f"[{ci[0]:.3f}, {ci[1]:.3f}]"
++                   if isinstance(ci, (list, tuple)) and len(ci) == 2 else "—")
++        ratio = row.get("ratio")
++        sig = {True: "yes", False: "no", None: "?"}[row.get("significant")]
++        out.append(f"| {index} | `{row['name']}` | {format_ms(row.get('lccc_s'))} | "
++                   f"{format_ms(row.get('ref_s'))} | "
++                   f"{ratio:.3f} | {sig} | {ci_text} |" if ratio else
++                   f"| {index} | `{row['name']}` | — | — | — | {sig} | {ci_text} |")
++    return "\n".join(out) + "\n"
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("evidence", type=Path, help="run_benchmarks.py --json output")
++    parser.add_argument("--worst", type=int, default=10,
++                        help="how many worst workloads to print (default: %(default)s)")
++    parser.add_argument("--best", type=int, default=5,
++                        help="how many best workloads to print (default: %(default)s)")
++    parser.add_argument("--all", action="store_true", help="print every workload")
++    parser.add_argument("--threshold", type=float, default=0.01,
++                        help="fractional change counted as a regression (default: %(default)s)")
++    parser.add_argument("--size", action="store_true", help="include .text size columns")
++    parser.add_argument("--markdown", action="store_true", help="emit Markdown instead of text")
++    parser.add_argument("--json", type=Path, help="write the ranked rows as JSON")
++    parser.add_argument("--compare", type=Path,
++                        help="second evidence JSON; report the per-workload delta")
++    args = parser.parse_args()
++
++    rows, document = load_rows(args.evidence)
++    reference = rows[0]["reference"] if rows else "gcc"
++
++    # Worst first: a missing/failed ratio sorts last rather than masquerading
++    # as an infinite regression.
++    rows.sort(key=lambda row: (row.get("ratio") is None, -(row.get("ratio") or 0.0)))
++    groups = classify(rows, args.threshold)
++
++    if args.json:
++        args.json.parent.mkdir(parents=True, exist_ok=True)
++        args.json.write_text(json.dumps(rows, indent=1), encoding="utf-8")
++
++    if args.compare:
++        before, _ = load_rows(args.compare)
++        previous = {row["name"]: row.get("ratio") for row in before}
++        print(f"{'workload':<24} {'before':>8} {'after':>8} {'delta':>9}")
++        print("-" * 54)
++        deltas = []
++        for row in rows:
++            old, new = previous.get(row["name"]), row.get("ratio")
++            if old and new:
++                deltas.append((new / old, row["name"], old, new))
++        for delta, name, old, new in sorted(deltas, reverse=True):
++            marker = "  REGRESSED" if delta > 1.02 else ("  improved" if delta < 0.98 else "")
++            print(f"{name:<24} {old:>8.3f} {new:>8.3f} {delta:>8.3f}x{marker}")
++        return 0
++
++    if args.markdown:
++        sys.stdout.write(render_markdown(rows, document, groups, args.threshold))
++        return 0
++
++    selected = rows if args.all else rows[: args.worst]
++    print(f"WORST {len(selected)} of {len(rows)} (ratio = lccc/{reference}; >1 is slower)")
++    print(render_table(selected, show_size=args.size, reference=reference))
++    if args.best and not args.all:
++        print()
++        print(f"BEST {args.best}")
++        print(render_table(rows[-args.best:][::-1], show_size=args.size, reference=reference))
++
++    ratios = [row["ratio"] for row in rows if row.get("ratio") and row.get("correct")]
++    geo = geometric_mean(ratios)
++    print()
++    print(f"n={len(ratios)}  geometric mean={geo:.4f}" if geo else "no comparable pairs")
++    if ratios:
++        print(f"      arithmetic mean={sum(ratios) / len(ratios):.4f}  "
++              f"best={min(ratios):.3f}  worst={max(ratios):.3f}")
++    for key in ("regressed", "improved", "unchanged", "unknown"):
++        names = ", ".join(row["name"] for row in groups[key][:12])
++        suffix = " …" if len(groups[key]) > 12 else ""
++        print(f"  {key:>9}: {len(groups[key]):>2}  {names}{suffix}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
+index 9bfb0a3..8d6a824 100644
+--- a/src/backend/arm/codegen/alu.rs
++++ b/src/backend/arm/codegen/alu.rs
+@@ -658,6 +658,38 @@ impl ArmCodegen {
+                     self.state.emit("    asr w0, w1, w2");
+                 }
+                 IrBinOp::LShr => self.state.emit("    lsr w0, w1, w2"),
++                IrBinOp::RotateLeft | IrBinOp::RotateRight => {
++                    // AArch64 has a native rotate: EXTR with Rn == Rm is a
++                    // rotate by an immediate, ROR (register) rotates by a
++                    // register.  Both mask the count modulo the register
++                    // width, which is precisely the reduction the IR's rotate
++                    // semantics define, so no fixup is needed.  A left rotate
++                    // by n is a right rotate by (32 - n); `neg` + ROR gets
++                    // that for a variable count because ROR reduces its count
++                    // mod 32.  w3 is this path's existing scratch (see SRem's
++                    // `msub w0, w3, w2, w1`).
++                    let left = op == IrBinOp::RotateLeft;
++                    match Self::const_as_imm12(rhs) {
++                        Some(imm) => {
++                            let amount = (imm as i64).rem_euclid(32);
++                            let extr = if left { (32 - amount) % 32 } else { amount };
++                            if extr == 0 {
++                                self.state.emit("    mov w0, w1");
++                            } else {
++                                self.state
++                                    .emit_fmt(format_args!("    extr w0, w1, w1, #{extr}"));
++                            }
++                        }
++                        None => {
++                            if left {
++                                self.state.emit("    neg w3, w2");
++                                self.state.emit("    ror w0, w1, w3");
++                            } else {
++                                self.state.emit("    ror w0, w1, w2");
++                            }
++                        }
++                    }
++                }
+                 IrBinOp::BitTest => {
+                     // AArch64 has no BT. UBFX extracts a 1-bit field when the
+                     // index is an in-range immediate; variable and 64-bit cases
+@@ -698,6 +730,31 @@ impl ArmCodegen {
+                 IrBinOp::Shl => self.state.emit("    lsl x0, x1, x2"),
+                 IrBinOp::AShr => self.state.emit("    asr x0, x1, x2"),
+                 IrBinOp::LShr => self.state.emit("    lsr x0, x1, x2"),
++                IrBinOp::RotateLeft | IrBinOp::RotateRight => {
++                    // 64-bit counterpart of the w-register case above; EXTR's
++                    // immediate is 6 bits and ROR reduces mod 64.
++                    let left = op == IrBinOp::RotateLeft;
++                    match Self::const_as_imm12(rhs) {
++                        Some(imm) => {
++                            let amount = (imm as i64).rem_euclid(64);
++                            let extr = if left { (64 - amount) % 64 } else { amount };
++                            if extr == 0 {
++                                self.state.emit("    mov x0, x1");
++                            } else {
++                                self.state
++                                    .emit_fmt(format_args!("    extr x0, x1, x1, #{extr}"));
++                            }
++                        }
++                        None => {
++                            if left {
++                                self.state.emit("    neg x3, x2");
++                                self.state.emit("    ror x0, x1, x3");
++                            } else {
++                                self.state.emit("    ror x0, x1, x2");
++                            }
++                        }
++                    }
++                }
+                 IrBinOp::BitTest => {
+                     if let Some(imm) = Self::const_as_imm12(rhs) {
+                         if (0..63).contains(&imm) {
+diff --git a/src/backend/i686/codegen/alu.rs b/src/backend/i686/codegen/alu.rs
+index 9684d54..e2e96cc 100644
+--- a/src/backend/i686/codegen/alu.rs
++++ b/src/backend/i686/codegen/alu.rs
+@@ -935,7 +935,16 @@ impl I686Codegen {
+         // are finalized lazily (see direct_reg_src_ref); the peephole folds
+         // them after materialization.
+         self.operand_to_eax(lhs);
+-        let var_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
++        // `rol`/`ror` take their variable count from %cl exactly like the
++        // shifts, so they share the staging that pins the rhs there.
++        let var_shift = matches!(
++            op,
++            IrBinOp::Shl
++                | IrBinOp::AShr
++                | IrBinOp::LShr
++                | IrBinOp::RotateLeft
++                | IrBinOp::RotateRight
++        );
+         let div_like = matches!(
+             op,
+             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+@@ -980,6 +989,30 @@ impl I686Codegen {
+             IrBinOp::Shl => self.state.emit("    shll %cl, %eax"),
+             IrBinOp::AShr => self.state.emit("    sarl %cl, %eax"),
+             IrBinOp::LShr => self.state.emit("    shrl %cl, %eax"),
++            IrBinOp::RotateLeft | IrBinOp::RotateRight => {
++                // i386 `rol`/`ror` are baseline ISA (no feature gate, unlike
++                // BMI2's `rorx`), and the hardware count mask is mod 32 — the
++                // same reduction the IR's rotate semantics define for a
++                // 32-bit operand.  This is the single-instruction form of the
++                // `ROTL32`/`ROTR` triple that every hash and the kernel's
++                // preboot decompressor spell out portably.
++                let mnem = if op == IrBinOp::RotateLeft {
++                    "roll"
++                } else {
++                    "rorl"
++                };
++                match Self::const_as_imm32(rhs) {
++                    Some(imm) => {
++                        let amount = (imm as i64).rem_euclid(32);
++                        if amount != 0 {
++                            self.state
++                                .out
++                                .emit_instr_imm_reg(&format!("    {mnem}"), amount, "eax");
++                        }
++                    }
++                    None => self.state.emit(&format!("    {mnem} %cl, %eax")),
++                }
++            }
+             IrBinOp::BitTest => {
+                 // i686 BT stores the selected bit directly in CF and masks the
+                 // index modulo 32, exactly matching `(base >> index) & 1` on
+diff --git a/src/backend/riscv/codegen/alu.rs b/src/backend/riscv/codegen/alu.rs
+index dbf29f0..02a32b6 100644
+--- a/src/backend/riscv/codegen/alu.rs
++++ b/src/backend/riscv/codegen/alu.rs
+@@ -114,6 +114,37 @@ impl RiscvCodegen {
+             return;
+         }
+ 
++        if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
++            // RV64I has no rotate: `rol`/`ror` are Zbb, and this backend does
++            // not yet model Z-extension availability, so emit the portable
++            // funnel shift.  It needs no scratch beyond the three registers
++            // this path already stages into, because the second half's count
++            // is `W - n` and `sll`/`srl` take their count from the low
++            // lg2(XLEN) bits of the register -- so `-n` already IS `W - n`
++            // modulo W and `neg` supplies the complement in one instruction.
++            // t1 (the source) stays live until both halves are computed.
++            let (first, second) = match (op, use_32bit) {
++                (IrBinOp::RotateLeft, true) => ("sllw", "srlw"),
++                (IrBinOp::RotateRight, true) => ("srlw", "sllw"),
++                (IrBinOp::RotateLeft, false) => ("sll", "srl"),
++                (IrBinOp::RotateRight, false) => ("srl", "sll"),
++                _ => unreachable!("guarded by the matches! above"),
++            };
++            self.state.emit_fmt(format_args!("    {first} t0, t1, t2"));
++            self.state.emit("    neg t2, t2");
++            self.state.emit_fmt(format_args!("    {second} t2, t1, t2"));
++            self.state.emit("    or t0, t0, t2");
++            if use_32bit {
++                // `*w` forms sign-extend their 32-bit result; the canonical
++                // rotate value is the unsigned bit pattern, so normalize the
++                // same way the BitTest path above does.
++                self.state.emit("    slli t0, t0, 32");
++                self.state.emit("    srli t0, t0, 32");
++            }
++            self.store_t0_to(dest);
++            return;
++        }
++
+         let mnemonic = match (op, use_32bit) {
+             (IrBinOp::Add, false) => "add",
+             (IrBinOp::Add, true) => "addw",
+@@ -139,6 +170,9 @@ impl RiscvCodegen {
+             (IrBinOp::LShr, false) => "srl",
+             (IrBinOp::LShr, true) => "srlw",
+             (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
++            (IrBinOp::RotateLeft, _) | (IrBinOp::RotateRight, _) => {
++                unreachable!("rotate handled above")
++            }
+         };
+         self.state
+             .emit_fmt(format_args!("    {} t0, t1, t2", mnemonic));
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 38a8b9d..3e36e55 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -730,6 +730,17 @@ impl X86Codegen {
+                 self.emit_shift_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
+                 return;
+             }
++            if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
++                // 8/16-bit operands would rotate at the wrong width (the
++                // hardware count mask is mod 32 below 64 bits), and
++                // `use_32bit` is false for them, so they take the generic
++                // path. `bit_idioms` never produces them; this keeps the
++                // backend honest if a future producer does.
++                if use_32bit || ty == IrType::I64 || ty == IrType::U64 {
++                    self.emit_rotate_reg_direct(op, lhs, rhs, dest_phys, use_32bit, dest.0);
++                    return;
++                }
++            }
+             if op == IrBinOp::BitTest {
+                 if self.emit_bit_test_reg_direct(lhs, rhs, dest_phys, use_32bit) {
+                     return;
+@@ -793,6 +804,51 @@ impl X86Codegen {
+             return;
+         }
+ 
++        if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight)
++            && (use_32bit || ty == IrType::I64 || ty == IrType::U64)
++        {
++            // Accumulator rotate. The constant form keeps the immediate and
++            // never touches %rcx; the variable form needs the count in %cl,
++            // which is where the generic path below would stage it anyway.
++            if use_32bit {
++                self.operand_to_eax(lhs);
++            } else {
++                self.operand_to_rax(lhs);
++            }
++            let (mnem32, mnem64) = super::emit::rotate_mnemonic(op);
++            let width: i64 = if use_32bit { 32 } else { 64 };
++            match Self::const_as_imm32(rhs) {
++                Some(imm) => {
++                    let amount = (imm as i64).rem_euclid(width);
++                    if amount != 0 {
++                        if use_32bit {
++                            self.state.emit_fmt(format_args!("    {mnem32} ${amount}, %eax"));
++                        } else {
++                            self.state.emit_fmt(format_args!("    {mnem64} ${amount}, %rax"));
++                        }
++                    }
++                }
++                None => {
++                    self.operand_to_rcx(rhs);
++                    if use_32bit {
++                        self.state.emit_fmt(format_args!("    {mnem32} %cl, %eax"));
++                    } else {
++                        self.state.emit_fmt(format_args!("    {mnem64} %cl, %rax"));
++                    }
++                }
++            }
++            self.state.reg_cache.invalidate_acc();
++            if use_32bit {
++                // Normalize the upper half for a signed 32-bit result: the
++                // rotate can place any bit at bit 31. No-op when unsigned.
++                self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
++                self.store_eax_to(dest);
++            } else {
++                self.store_rax_to(dest);
++            }
++            return;
++        }
++
+         // Accumulator-based fallback: try immediate optimizations first
+         if self.try_emit_acc_immediate(dest, op, lhs, rhs, use_32bit, is_unsigned) {
+             return;
+@@ -1233,6 +1289,14 @@ impl X86Codegen {
+                 }
+             }
+             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
++            // Rotates are emitted above (register-direct or accumulator). The
++            // only way to reach this arm is an 8- or 16-bit rotate, which the
++            // hardware count mask would wrap at 32 instead of at the operand
++            // width; `bit_idioms` recognizes only I32/U32/I64/U64 rotates, so
++            // this stays unreachable rather than silently mis-rotating.
++            IrBinOp::RotateLeft | IrBinOp::RotateRight => {
++                unreachable!("rotate handled above; narrow rotates are not producible")
++            }
+         }
+ 
+         self.state.reg_cache.invalidate_acc();
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index f5dcb33..1a7ad67 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -349,6 +349,28 @@ pub(super) fn shift_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
      }
  }
  
-+/// x86 ISA permission for *code generation*, computed once per TU by the
-+/// driver.
++/// Map a rotate op to its x86 32-bit and 64-bit mnemonic.
 +///
-+/// Deliberately distinct from the driver's `enable_*` feature bits: those
-+/// record what the TU explicitly *requested* and drive the `__AVX2__`-style
-+/// feature macros, which must stay GCC-accurate. LCCC's x86-64 code-generation
-+/// baseline is x86-64-v3, so a subset is *legal* unless the TU forbade it with
-+/// `-mno-*` / `-mgeneral-regs-only`. Conflating the two is wrong in both
-+/// directions: treating "unrequested" as "illegal" strips every 256-bit
-+/// transform from default-flag builds, while treating "legal by default" as
-+/// "legal always" emits AVX2 into a `-mno-avx` kernel object - an immediate
-+/// #UD, since the kernel runs with CR4.OSFXSR=0.
-+#[derive(Clone, Copy, Debug)]
-+pub(crate) struct X86Isa {
-+    /// xmm register file usable at all.
-+    pub simd: bool,
-+    /// 256-bit ymm (AVX/AVX2) forms usable.
-+    pub ymm: bool,
-+    /// `vfmadd*` (FMA3, VEX-encoded) usable.
-+    pub fma: bool,
++/// `rol`/`ror` are baseline x86 (8086 onwards), so — unlike `shlx`/`shrx`,
++/// which need BMI2, or `lzcnt`, which silently decodes as `bsr`/`bsf` on
++/// older parts — a rotate needs no feature gate and no `-march`.  On Intel
++/// the immediate form is a single µop with 1-cycle latency (uops.info
++/// ROL_R32_IMM: Skylake/Raptor Lake 1/1, 4-per-cycle throughput), replacing
++/// the shift/or triple's three µops and its two dependent ALU results.
++///
++/// The count is masked by hardware to 5 bits (32-bit operands) or 6 bits
++/// (64-bit), which is exactly the `amount mod W` reduction `IrBinOp`'s rotate
++/// semantics define — so the IR and the encoding agree without a fixup.
++/// Narrower operands (8/16-bit) would mask mod 32 instead and are therefore
++/// never lowered here; `bit_idioms` only recognizes 32- and 64-bit rotates.
++pub(super) fn rotate_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
++    match op {
++        IrBinOp::RotateLeft => ("roll", "rolq"),
++        IrBinOp::RotateRight => ("rorl", "rorq"),
++        _ => unreachable!("not a rotate op"),
++    }
++}
++
+ /// BMI2 three-operand shift mnemonics (`shlx count, src, dst`).  One µop on
+ /// every core that has BMI2 (uops.info SHLX_R64_R64_R64), count in any GPR,
+ /// non-destructive; flags are left untouched, which no consumer of a
+@@ -3610,6 +3632,83 @@ impl X86Codegen {
+         self.state.reg_cache.invalidate_acc();
+     }
+ 
++    /// Register-direct rotate: `rol/ror $imm, %dest` for a constant count,
++    /// `rol/ror %cl, %dest` for a variable one.
++    ///
++    /// Mirrors `emit_shift_reg_direct`'s staging discipline (lhs into the
++    /// destination register, count staged so neither load clobbers the other's
++    /// source) but has no BMI2 form to prefer: `rorx` is immediate-only and
++    /// right-only, so the legacy two-operand encoding is already the best
++    /// generally available one — and unlike `shl %cl`, which costs 2–3 µops on
++    /// Intel, `rol %cl` is a single µop, so there is no throughput case for a
++    /// VEX alternative either.
++    ///
++    /// Callers must only route 32- and 64-bit rotates here: `rol`/`ror` mask
++    /// the count to 5 bits for 8/16/32-bit operands and 6 bits for 64-bit, so
++    /// an 8- or 16-bit rotate would wrap at the wrong width. `bit_idioms`
++    /// recognizes only I32/U32/I64/U64 rotates for exactly this reason.
++    pub(super) fn emit_rotate_reg_direct(
++        &mut self,
++        op: IrBinOp,
++        lhs: &Operand,
++        rhs: &Operand,
++        dest_phys: PhysReg,
++        use_32bit: bool,
++        dest_value_id: u32,
++    ) {
++        let dest_name = phys_reg_name(dest_phys);
++        let dest_name_32 = phys_reg_name_32(dest_phys);
++        let (mnem32, mnem64) = rotate_mnemonic(op);
++        let width: i64 = if use_32bit { 32 } else { 64 };
++
++        if let Some(imm) = Self::const_as_imm32(rhs) {
++            self.operand_to_callee_reg(lhs, dest_phys);
++            // Reduce explicitly instead of leaning on the hardware mask: the
++            // emitted immediate then documents the real rotation, and a count
++            // of 0 (or any multiple of the width) folds away to the copy that
++            // already produced the value, rather than emitting a flag-writing
++            // no-op.
++            let amount = (imm as i64).rem_euclid(width);
++            if amount != 0 {
++                if use_32bit {
++                    self.state
++                        .emit_fmt(format_args!("    {mnem32} ${amount}, %{dest_name_32}"));
++                    // A rotate can move any bit into bit 31, so a signed I32
++                    // result needs the same upper-half normalization a signed
++                    // `shl` does. No-op for the unsigned types rotate idioms
++                    // actually use.
++                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                } else {
++                    self.state
++                        .emit_fmt(format_args!("    {mnem64} ${amount}, %{dest_name}"));
++                }
++            }
++            self.state.reg_cache.invalidate_acc();
++            return;
++        }
++
++        // Variable count: x86 pins it to %cl. Stage the count first when its
++        // home is the destination register, so the lhs load cannot overwrite
++        // it (the same hazard `emit_shift_cl_legacy` guards).
++        let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
++        if rhs_conflicts {
++            self.operand_to_rcx(rhs);
++            self.operand_to_callee_reg(lhs, dest_phys);
++        } else {
++            self.operand_to_callee_reg(lhs, dest_phys);
++            self.operand_to_rcx(rhs);
++        }
++        if use_32bit {
++            self.state
++                .emit_fmt(format_args!("    {mnem32} %cl, %{dest_name_32}"));
++            self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++        } else {
++            self.state
++                .emit_fmt(format_args!("    {mnem64} %cl, %{dest_name}"));
++        }
++        self.state.reg_cache.invalidate_acc();
++    }
++
+     /// Legacy `shl/shr/sar %cl, %dest` for a variable count: lhs staged in
+     /// `dest`, count staged in `%rcx` (order chosen so neither load clobbers
+     /// the other's source).
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 765a61b..c71c20a 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -252,11 +252,18 @@ fn binop_to_alu(op: IrBinOp) -> Option<AluOp> {
+ }
+ 
+ /// Map IrBinOp to ShiftOp.
++///
++/// Rotates are included because their machine shape is identical to a shift's
++/// (`dst = dst OP amount`, count from %cl when variable), so they reuse the
++/// same staging, the same two-address hazard handling and the same allocator
++/// model instead of needing a parallel path.
+ fn binop_to_shift(op: IrBinOp) -> Option<ShiftOp> {
+     match op {
+         IrBinOp::Shl => Some(ShiftOp::Shl),
+         IrBinOp::LShr => Some(ShiftOp::Shr),
+         IrBinOp::AShr => Some(ShiftOp::Sar),
++        IrBinOp::RotateLeft => Some(ShiftOp::Rol),
++        IrBinOp::RotateRight => Some(ShiftOp::Ror),
+         _ => None,
+     }
+ }
+@@ -1175,6 +1182,12 @@ fn try_lower_shiftx(
+     ra: &FxHashMap<u32, PhysReg>,
+     out: &mut Vec<MachInst>,
+ ) -> bool {
++    // BMI2's three-operand forms cover only the three shifts: there is no
++    // rotate-left and no register-count rotate (`rorx` takes an immediate and
++    // rotates right).  Rotates must fall through to the `rol/ror %cl` path.
++    if matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror) {
++        return false;
++    }
+     let mode = shlx_mode();
+     if mode == ShlxMode::Never || !matches!(size, OpSize::S32 | OpSize::S64) {
+         return false;
+diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
+index ee23c43..f296e19 100644
+--- a/src/backend/x86/codegen/machinst.rs
++++ b/src/backend/x86/codegen/machinst.rs
+@@ -96,6 +96,14 @@ pub enum ShiftOp {
+     Shl,
+     Shr, // logical shift right
+     Sar, // arithmetic shift right
++    /// Rotate left.  Same two-address `dst = dst ROT amount` shape as the
++    /// shifts, so it shares `MachInst::Shift`, its %cl staging and the
++    /// allocator's hazard model.  Unlike `shlx`/`shrx` there is no VEX
++    /// three-operand form to prefer (`rorx` is immediate-only and right-only),
++    /// so `ShiftX` must never be selected for these two.
++    Rol,
++    /// Rotate right; see `Rol`.
++    Ror,
+ }
+ 
+ /// Condition code for Jcc, SetCC, CMov.
+diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
+index fe7fef9..5b30201 100644
+--- a/src/backend/x86/codegen/machinst_emit.rs
++++ b/src/backend/x86/codegen/machinst_emit.rs
+@@ -324,6 +324,19 @@ fn shift_mnemonic(op: ShiftOp, size: OpSize) -> &'static str {
+         (ShiftOp::Sar, OpSize::S16) => "sarw",
+         (ShiftOp::Sar, OpSize::S32) => "sarl",
+         (ShiftOp::Sar, OpSize::S64) => "sarq",
++        // `rol`/`ror` exist at every operand size.  The narrow forms are only
++        // ever reachable if a producer other than `bit_idioms` creates one:
++        // x86 masks the count mod 32 below 64 bits, so an 8- or 16-bit rotate
++        // would wrap at the wrong width.  `bit_idioms` recognizes 32- and
++        // 64-bit rotates only, which keeps IR and hardware semantics equal.
++        (ShiftOp::Rol, OpSize::S8) => "rolb",
++        (ShiftOp::Rol, OpSize::S16) => "rolw",
++        (ShiftOp::Rol, OpSize::S32) => "roll",
++        (ShiftOp::Rol, OpSize::S64) => "rolq",
++        (ShiftOp::Ror, OpSize::S8) => "rorb",
++        (ShiftOp::Ror, OpSize::S16) => "rorw",
++        (ShiftOp::Ror, OpSize::S32) => "rorl",
++        (ShiftOp::Ror, OpSize::S64) => "rorq",
+     }
+ }
+ 
+@@ -732,6 +745,12 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+                 (ShiftOp::Shl, _) => "shlxl",
+                 (ShiftOp::Shr, _) => "shrxl",
+                 (ShiftOp::Sar, _) => "sarxl",
++                // BMI2 has no left rotate and no register-count rotate at all
++                // (`rorx` is immediate-only, right-only).  `try_lower_shiftx`
++                // rejects both rotate ops, so a ShiftX never carries one.
++                (ShiftOp::Rol, _) | (ShiftOp::Ror, _) => {
++                    unreachable!("ShiftX has no rotate form; isel must not select one")
++                }
+             };
+             // shlx has no 8/16-bit form; isel only selects S32/S64.
+             let sz = if *size == OpSize::S64 {
+diff --git a/src/ir/ops.rs b/src/ir/ops.rs
+index bf74199..109fed9 100644
+--- a/src/ir/ops.rs
++++ b/src/ir/ops.rs
+@@ -56,6 +56,73 @@ pub enum IrBinOp {
+     /// cross-target canonical form for classifier chains such as Expat name
+     /// scanning, instead of leaving the pattern in text peepholes.
+     BitTest,
++    /// Bitwise rotate (funnel shift by a whole register): `RotateLeft(x, n)`
++    /// is `(x << n) | (x >> (W - n))` and `RotateRight(x, n)` is
++    /// `(x >> n) | (x << (W - n))`, where **W is the width of the operation's
++    /// IR type**, not the width of the container the constant folder happens
++    /// to evaluate in.  Both operands and the result are integer.
++    ///
++    /// This is the cross-target canonical form for the ARX rotate idiom that
++    /// every hash and cipher spells out portably (`ROTL32`/`ROTR` in ChaCha20,
++    /// SHA-256, MD5, BLAKE2, siphash, the kernel's `rol32`/`ror32`).  Left as
++    /// a shift/or triple it costs three instructions, two of them on the
++    /// critical path through a temporary, where x86 `rol`/`ror`, AArch64
++    /// `ror`/`extr` and RISC-V Zbb `rol`/`ror` each cost one.  Backends
++    /// without a native rotate lower it to the portable sequence, so
++    /// recognition never costs correctness — only the missed single
++    /// instruction.
++    ///
++    /// The rotate amount is taken modulo W (x86 masks the count to 5/6 bits
++    /// in hardware; the IR makes that explicit so a count of 0 or >= W folds
++    /// to the identity rather than depending on an ISA's masking rules).
++    RotateLeft,
++    RotateRight,
++}
++
++impl IrBinOp {
++    /// True for the two rotate forms, whose semantics depend on the
++    /// operation's *type width* rather than only on the operand values.
++    pub fn is_rotate(self) -> bool {
++        matches!(self, IrBinOp::RotateLeft | IrBinOp::RotateRight)
++    }
++}
++
++/// Rotate the low `bits` bits of `value` by `amount`, reducing `amount`
++/// modulo `bits`.
++///
++/// Rotates are the one integer operation whose result cannot be recovered by
++/// evaluating in a wider container and truncating afterwards: rotating
++/// `0x8000_0001` left by one gives `0x0000_0003` at 32 bits, but the 64-bit
++/// rotate yields `0x1_0000_0002`, whose low half is `0x0000_0002`.  Bits that
++/// leave the top of the *narrow* value must re-enter at its bottom, so any
++/// width-typed consumer (constant folding at I8/I16/I32, i128 lowering) must
++/// route through here with the operation's real width instead of reusing
++/// `IrBinOp::eval_i64`/`eval_i128`.
++///
++/// `bits == 0` (a `Void`-typed operation, which cannot occur in valid IR)
++/// yields 0 rather than shifting by the container width, which Rust defines as
++/// a panic in debug builds.
++pub fn rotate_within_bits(value: u128, amount: u128, bits: u32, left: bool) -> u128 {
++    if bits == 0 || bits > 128 {
++        return 0;
++    }
++    let mask = if bits >= 128 {
++        u128::MAX
++    } else {
++        (1u128 << bits) - 1
++    };
++    let value = value & mask;
++    let amount = (amount % u128::from(bits)) as u32;
++    if amount == 0 {
++        return value;
++    }
++    // Both halves stay inside `mask`: the left shift drops the bits that the
++    // right shift brings back in, and vice versa.
++    if left {
++        ((value << amount) | (value >> (bits - amount))) & mask
++    } else {
++        ((value >> amount) | (value << (bits - amount))) & mask
++    }
+ }
+ 
+ impl IrBinOp {
+@@ -97,6 +164,17 @@ impl IrBinOp {
+                 // after integer promotion; evaluate it as C's `(x >> i) & 1`.
+                 (((lhs as u64) >> (rhs as u32)) & 1) as i64
+             }
++            // Container-width rotate.  A narrower IR type (I8/I16/I32) MUST
++            // not be folded through here: rotating at 64 bits and truncating
++            // is not the same value (see `rotate_within_bits`).
++            // `eval_binop_const`/`fold_binop` intercept both rotate forms and
++            // pass the operation's real width instead.
++            IrBinOp::RotateLeft => {
++                rotate_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, true) as i64
++            }
++            IrBinOp::RotateRight => {
++                rotate_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, false) as i64
++            }
+             IrBinOp::SDiv => {
+                 if rhs == 0 {
+                     return None;
+@@ -140,6 +218,15 @@ impl IrBinOp {
+             IrBinOp::AShr => lhs.wrapping_shr(rhs as u32),
+             IrBinOp::LShr => (lhs as u128).wrapping_shr(rhs as u32) as i128,
+             IrBinOp::BitTest => (((lhs as u128) >> (rhs as u32)) & 1) as i128,
++            // Container-width (128-bit) rotate; see the note on the i64 arms —
++            // narrower IR types are folded by `fold_binop` with their own
++            // width, never through here.
++            IrBinOp::RotateLeft => {
++                rotate_within_bits(lhs as u128, rhs as u128, 128, true) as i128
++            }
++            IrBinOp::RotateRight => {
++                rotate_within_bits(lhs as u128, rhs as u128, 128, false) as i128
++            }
+             IrBinOp::SDiv => {
+                 if rhs == 0 {
+                     return None;
+diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
+index bfc1c5f..68b266c 100644
+--- a/src/passes/bit_idioms.rs
++++ b/src/passes/bit_idioms.rs
+@@ -89,6 +89,153 @@ fn shift(
+     (const_u64(rhs) == Some(amount)).then_some(lhs)
+ }
+ 
++/// One half of a rotate: `value` shifted by `amount` with the shift kind the
++/// caller asked for.  Unlike `shift`, the amount is returned as an `Operand`
++/// rather than matched against a constant, because the complementary half of a
++/// run-time rotate is a live `W - n` subtraction, not a literal.
++fn shift_any(
++    opnd: Operand,
++    wanted: IrBinOp,
++    defs: &[Option<Instruction>],
++) -> Option<(Operand, Operand)> {
++    let (lhs, rhs, _) = binop(opnd, wanted, defs)?;
++    Some((lhs, rhs))
++}
++
++/// Is `opnd` the expression `width - other`?  The complementary half of a
++/// variable-count rotate is spelled exactly this way (`ROTL32(v, n)` expands
++/// to `(v << n) | (v >> (32 - n))`), and recognizing it lets the rotate keep
++/// `n` directly so the subtraction dies with its last use.
++fn is_width_minus(opnd: Operand, other: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
++    let Some((lhs, rhs, _)) = binop(opnd, IrBinOp::Sub, defs) else {
++        return false;
++    };
++    const_u64(peel(lhs, defs)) == Some(width) && same(rhs, other, defs)
++}
++
++/// Recognize the portable rotate idiom; returns `(value, amount, is_left)`.
++///
++/// For a width-`W` integer `x` the two source spellings are
++///
++/// ```c
++/// #define ROTL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
++/// #define ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
++/// ```
++///
++/// They appear verbatim in ChaCha20/Salsa20, SHA-1/SHA-256/SHA-512, MD5,
++/// BLAKE2, SipHash, RC5, Speck, in the Linux kernel's `rol32`/`ror32`/
++/// `rol64`/`ror64`, and in zlib-ng's and zstd's hash/xxh paths.  Left as a
++/// shift/or triple each rotate costs three instructions and two dependent ALU
++/// results; x86 `rol`/`ror`, AArch64 `ror`/`extr` and RISC-V's funnel shift
++/// all do the same work in one (RISC-V in four, but still without the
++/// temporary the triple's `or` needs).
++///
++/// Both `Or` operand orders are matched, and the complementary amount may be a
++/// literal the frontend already folded (`>> 16`) or a live `W - n`, so constant
++/// and run-time rotation amounts are both recognized.
++///
++/// Two deliberate restrictions:
++///
++/// * The right-shift half must be *logical*.  With an arithmetic shift the sign
++///   bit is replicated rather than wrapped around, so the expression is not a
++///   rotate and folding it would be a miscompile.
++/// * Only 32- and 64-bit types are recognized.  C's integer promotions already
++///   run a narrower rotate at `int` width, and the x86 hardware count mask is
++///   mod 32 for every operand size below 64 bits, so an 8- or 16-bit `rol`
++///   would wrap at the wrong width.
++///
++/// Direction is chosen to match what the reference compilers emit, so oracle
++/// diffs stay readable: for a run-time amount the direction whose count is the
++/// *direct* value (not the `W - n` subtraction) wins, which also makes that
++/// subtraction dead; for two constants the smaller amount wins, reproducing
++/// GCC's `ror $7` for `(x >> 7) | (x << 25)` and its `rol $12` for
++/// `(x << 12) | (x >> 20)`.
++fn match_rotate(
++    result: Operand,
++    max_bits: u32,
++    defs: &[Option<Instruction>],
++) -> Option<(Operand, Operand, bool)> {
++    let (a, b, ty) = binop(result, IrBinOp::Or, defs)?;
++    let width = match ty {
++        IrType::I32 | IrType::U32 => 32u64,
++        IrType::I64 | IrType::U64 => 64u64,
++        // Narrower and wider types are deliberately not recognized; see the
++        // function comment for the count-mask and promotion reasons.
++        _ => return None,
++    };
++    // Per-target capability: i686 routes I64/U64 arithmetic through its
++    // paired-register path rather than the 32-bit ALU path that owns the
++    // native `rol`/`ror` lowering, so it only advertises 32-bit rotates.
++    if width > u64::from(max_bits) {
++        return None;
++    }
++
++    // The two halves in either `Or` order.
++    let (shl, lshr) = match (
++        shift_any(a, IrBinOp::Shl, defs),
++        shift_any(b, IrBinOp::LShr, defs),
++    ) {
++        (Some(shl), Some(lshr)) => (shl, lshr),
++        _ => match (
++            shift_any(b, IrBinOp::Shl, defs),
++            shift_any(a, IrBinOp::LShr, defs),
++        ) {
++            (Some(shl), Some(lshr)) => (shl, lshr),
++            _ => return None,
++        },
++    };
++    let (shl_val, shl_amt) = shl;
++    let (lshr_val, lshr_amt) = lshr;
++    if !same(shl_val, lshr_val, defs) {
++        return None;
++    }
++
++    // The halves must be complementary: either both amounts are constants
++    // summing to the width, or one is literally `width - the_other`.
++    let (amount, is_left) = match (const_u64(peel(shl_amt, defs)), const_u64(peel(lshr_amt, defs)))
++    {
++        (Some(left), Some(right)) => {
++            if left.wrapping_add(right) != width || left == 0 || right == 0 {
++                return None;
++            }
++            if left <= right {
++                (shl_amt, true)
++            } else {
++                (lshr_amt, false)
++            }
++        }
++        // Exactly one amount folded to a constant: the other must still be the
++        // explicit `width - amount` subtraction (a frontend that folded one
++        // side usually folds both, but an unfolded `32 - 16` does occur after
++        // inlining), otherwise the halves are not complementary.
++        (Some(_), None) => {
++            if !is_width_minus(lshr_amt, shl_amt, width, defs) {
++                return None;
++            }
++            (shl_amt, true)
++        }
++        (None, Some(_)) => {
++            if !is_width_minus(shl_amt, lshr_amt, width, defs) {
++                return None;
++            }
++            (lshr_amt, false)
++        }
++        (None, None) => {
++            // Both amounts dynamic: accept either complement direction, but
++            // only one of them needs to hold.
++            if is_width_minus(lshr_amt, shl_amt, width, defs) {
++                (shl_amt, true)
++            } else if is_width_minus(shl_amt, lshr_amt, width, defs) {
++                (lshr_amt, false)
++            } else {
++                return None;
++            }
++        }
++    };
++
++    Some((peel(shl_val, defs), amount, is_left))
++}
++
+ fn select(
+     opnd: Operand,
+     defs: &[Option<Instruction>],
+@@ -382,7 +529,20 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
+     Some(peel(value, defs))
+ }
+ 
+-pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool) -> usize {
++/// `enable_bit_reverse` gates the idiom whose native lowering is target
++/// specific (AArch64 `rbit`).
++///
++/// `max_rotate_bits` is the widest rotate the target can lower natively, or 0
++/// to disable recognition entirely: x86-64 `rol`/`ror`, AArch64 `ror`/`extr`
++/// and the RISC-V funnel shift all handle 64 bits, while i686's paired-register
++/// route for I64 arithmetic means only its 32-bit ALU path is wired.  Passing
++/// the capability instead of a boolean keeps a backend from ever receiving a
++/// node it cannot lower.
++pub(crate) fn recognize_function(
++    func: &mut IrFunction,
++    enable_bit_reverse: bool,
++    max_rotate_bits: u32,
++) -> usize {
+     let mut defs = vec![None; func.max_value_id() as usize + 1];
+     for block in &func.blocks {
+         for inst in &block.instructions {
+@@ -421,10 +581,26 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
+                     op: IrBinOp::Or,
+                     ty,
+                     ..
+-                } if *ty == IrType::U32 || *ty == IrType::I32 => {
++                } if matches!(
++                    *ty,
++                    IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64
++                ) =>
++                {
+                     let dest = *dest;
+-                    if enable_bit_reverse {
+-                        if let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs) {
++                    let ty = *ty;
++                    let is_32bit = ty == IrType::U32 || ty == IrType::I32;
++                    // Bit reversal and byte swap are strictly MORE specific than
++                    // a rotate: bswap32's final stage is literally
++                    // `(y >> 16) | (y << 16)`, which is a rotate by 16.  Trying
++                    // the rotate first would strip that stage out from under
++                    // `match_bswap32_network` and turn a one-instruction `bswap`
++                    // back into the five-instruction network, so both specific
++                    // matchers run first and bail out of this iteration when
++                    // either fires.
++                    if is_32bit {
++                        if enable_bit_reverse
++                            && let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs)
++                        {
+                             block.instructions[index] = Instruction::UnaryOp {
+                                 dest,
+                                 op: IrUnaryOp::BitReverse,
+@@ -435,13 +611,32 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
+                             index += consumed;
+                             continue;
+                         }
++                        if let Some(src) = match_bswap32_network(Operand::Value(dest), &defs) {
++                            block.instructions[index] = Instruction::UnaryOp {
++                                dest,
++                                op: IrUnaryOp::Bswap,
++                                src,
++                                ty: IrType::U32,
++                            };
++                            changes += 1;
++                            index += consumed;
++                            continue;
++                        }
+                     }
+-                    if let Some(src) = match_bswap32_network(Operand::Value(dest), &defs) {
+-                        block.instructions[index] = Instruction::UnaryOp {
++                    if max_rotate_bits > 0
++                        && let Some((value, amount, is_left)) =
++                            match_rotate(Operand::Value(dest), max_rotate_bits, &defs)
++                    {
++                        block.instructions[index] = Instruction::BinOp {
+                             dest,
+-                            op: IrUnaryOp::Bswap,
+-                            src,
+-                            ty: IrType::U32,
++                            op: if is_left {
++                                IrBinOp::RotateLeft
++                            } else {
++                                IrBinOp::RotateRight
++                            },
++                            lhs: value,
++                            rhs: amount,
++                            ty,
+                         };
+                         changes += 1;
+                     }
+diff --git a/src/passes/constant_fold.rs b/src/passes/constant_fold.rs
+index 5ee6432..f8e9f2c 100644
+--- a/src/passes/constant_fold.rs
++++ b/src/passes/constant_fold.rs
+@@ -1056,6 +1056,21 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
+                 (((lhs as u64) >> (rhs as u32)) & 1) as i64
+             }
+         }
++        // Width-typed rotate.  `is_32bit` is deliberately NOT the discriminator
++        // here: an I8/U8 or I16/U16 rotate must wrap at 8/16 bits, and the
++        // 64-bit case at 64.  `rotate_within_bits` masks the value to the
++        // operation width first, so the sign extension `truncate_i64` applied
++        // to a signed operand is dropped rather than rotated in.
++        IrBinOp::RotateLeft | IrBinOp::RotateRight => {
++            let bits = (ty.size() * 8) as u32;
++            let rotated = crate::ir::ops::rotate_within_bits(
++                lhs as u64 as u128,
++                rhs as u64 as u128,
++                bits,
++                op == IrBinOp::RotateLeft,
++            );
++            return Some(ty.truncate_i64(rotated as i64));
++        }
+     })
+ }
+ 
+diff --git a/src/passes/global_addr_cse.rs b/src/passes/global_addr_cse.rs
+index b205acf..029aca6 100644
+--- a/src/passes/global_addr_cse.rs
++++ b/src/passes/global_addr_cse.rs
+@@ -116,6 +116,11 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
+ /// marching pointer, and field offsets fold into displacements at the uses.
+ pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
+     let mut globals = FxHashSet::default();
++    // How many times each symbol's address is materialized in this function,
++    // and which symbol each GlobalAddr dest names. Used by the duplicate-base
++    // merge gate below.
++    let mut sym_occurrences: FxHashMap<String, u32> = FxHashMap::default();
++    let mut value_symbol: FxHashMap<u32, String> = FxHashMap::default();
+     let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+     let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+     let mut indexed_bases = Vec::new();
+@@ -166,8 +171,10 @@ pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
+                 *def_count.entry(dest.0).or_insert(0) += 1;
+             }
+             match inst {
+-                Instruction::GlobalAddr { dest, .. } => {
++                Instruction::GlobalAddr { dest, name } => {
+                     globals.insert(dest.0);
++                    *sym_occurrences.entry(name.clone()).or_insert(0) += 1;
++                    value_symbol.insert(dest.0, name.clone());
+                 }
+                 Instruction::Copy {
+                     dest,
+@@ -247,9 +254,53 @@ pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
+             current = next;
+         }
+     }
++    if !no_merge_duplicate_indexed_bases() {
++        // A site-local base is exempt from CSE so its live range stays as short
++        // as possible and cannot evict the natural index register. That trade
++        // only exists when the symbol is materialized ONCE: with two or more
++        // occurrences there is no single-use live range left to protect, only
++        // duplicate materializations to delete.
++        //
++        // The addressing form the exemption was written to preserve —
++        // absolute `sym(,%idx,scale)` — is not one this backend can select in
++        // any code model: x86-64 emits zero such operands under -O2 PIC,
++        // -fno-pic -fno-pie and -fno-pie alike, because a RIP-relative base
++        // cannot also carry an index. A variable-index global access therefore
++        // pays a base register (or a rematerialized `leaq sym(%rip)`) no
++        // matter where the base lives, so merging is a strict instruction-count
++        // win — and inside a loop it removes per-iteration work.
++        //
++        // lz4's match-search loop rematerialized `hash_table` twice and
++        // `src_data` once every iteration (the register allocator remats each
++        // unmerged IR value separately at its own use), where GCC hoists one
++        // base per symbol; gzip_crc32 materialized `gzip_crc_data` three times
++        // in three consecutive instructions.
++        out.retain(|v| {
++            value_symbol
++                .get(v)
++                .and_then(|n| sym_occurrences.get(n).copied())
++                .map(|count| count < 2)
++                .unwrap_or(true)
++        });
++    }
+     out
+ }
+ 
++/// `CCC_NO_GADDR_MERGE_DUP_INDEXED`: keep a variable-index GlobalAddr base
++/// site-local even when the same symbol is materialized more than once in the
++/// function (default: false — duplicates merge).
++///
++/// Measured on the 39-benchmark corpus, paired against the previous behaviour
++/// (x86-64, -O2 -march=x86-64-v3, reps 7, CPU-pinned): expat_xml_scan 1.29x
++/// faster [0.770, 0.775] and 1.71x->1.32x vs GCC; lz4_compress 1.21x faster
++/// [0.803, 0.846] and 3.01x->2.51x vs GCC; sqlite_varint 1.02x faster
++/// [0.983, 0.985]. One small regression: zstd_count 1.02x slower [1.012,
++/// 1.037], the register-pressure cost the site-local rule exists to avoid.
++/// Every other workload was neutral (0.995-1.007).
++fn no_merge_duplicate_indexed_bases() -> bool {
++    std::env::var_os("CCC_NO_GADDR_MERGE_DUP_INDEXED").is_some()
++}
++
+ fn dominates(a: usize, mut b: usize, idom: &[usize]) -> bool {
+     loop {
+         if a == b {
+@@ -1218,7 +1269,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn variable_index_global_addrs_remain_site_local() {
++    fn duplicate_variable_index_global_addrs_merge() {
+         let mut func = empty_func();
+         func.blocks.push(BasicBlock {
+             label: BlockId(0),
+@@ -1249,17 +1300,52 @@ mod tests {
+             terminator: Terminator::Return(None),
+             source_spans: Vec::new(),
+         });
+-        assert_eq!(run(&mut func), 0);
++        // Two materializations of the same symbol feeding variable-index GEPs:
++        // there is no single-use live range left to protect, only a duplicate
++        // `leaq sym(%rip)` to delete, so they merge into one web. Classified
++        // BEFORE run: the duplicate gate must withdraw site-locality for both.
++        // (After the merge a single occurrence remains, which is site-local
++        // again by definition -- there is nothing left to CSE.)
++        assert!(classify_site_local_indexed(&func).is_empty());
++        assert_eq!(run(&mut func), 1);
+         assert_eq!(
+             func.blocks[0]
+                 .instructions
+                 .iter()
+                 .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
+                 .count(),
+-            2
++            1
+         );
+     }
+ 
++    #[test]
++    fn single_variable_index_global_addr_stays_site_local() {
++        // The contract the duplicate merge must not break: with ONE occurrence
++        // the base is rematerialized at its only use, so keeping it site-local
++        // preserves the shortest live range and cannot evict the index register.
++        let mut func = empty_func();
++        func.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![
++                Instruction::GlobalAddr {
++                    dest: Value(1),
++                    name: "table".to_string(),
++                },
++                Instruction::GetElementPtr {
++                    dest: Value(2),
++                    base: Value(1),
++                    offset: Operand::Value(Value(9)),
++                    ty: IrType::Ptr,
++                },
++                load(3, 2),
++            ],
++            terminator: Terminator::Return(None),
++            source_spans: Vec::new(),
++        });
++        assert_eq!(run(&mut func), 0);
++        assert_eq!(classify_site_local_indexed(&func).len(), 1);
++    }
++
+     #[test]
+     fn derived_variable_index_bases_remain_site_local() {
+         let mut func = empty_func();
+@@ -1283,7 +1369,7 @@ mod tests {
+                 load(4, 3),
+                 Instruction::GlobalAddr {
+                     dest: Value(5),
+-                    name: "table".to_string(),
++                    name: "table_b".to_string(),
+                 },
+                 Instruction::Cast {
+                     dest: Value(6),
+diff --git a/src/passes/int_const_hoist.rs b/src/passes/int_const_hoist.rs
+index c214e78..4b62be4 100644
+--- a/src/passes/int_const_hoist.rs
++++ b/src/passes/int_const_hoist.rs
+@@ -28,6 +28,7 @@ pub(crate) fn set_target_aarch64(is_aarch64: bool) {
+     AARCH64.with(|c| c.set(is_aarch64));
+ }
+ use crate::ir::analysis;
++use crate::common::types::IrType;
+ use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+ 
+ /// Run integer-constant hoisting on a function. Returns the number of
+@@ -63,8 +64,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
+         let mut seen: FxHashSet<u64> = FxHashSet::default();
+         for &bi in &lp.body {
+             for inst in &func.blocks[bi].instructions {
+-                for_each_int_operand(inst, &mut |op, needs_reg| {
+-                    if let Some(bits) = large_int_const(op, needs_reg) {
++                for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
++                    if let Some(bits) = large_int_const(op, needs_reg, imm32_exact) {
+                         if seen.insert(bits) {
+                             consts.push(bits);
+                         }
+@@ -107,16 +108,22 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
+ /// would be materialized into a register inside the loop:
+ ///
+ /// * AArch64: anything outside imm12 (0..=4095) / cmn (-4095..=-1) pays
+-///   movz/movk per iteration.
+-/// * x86-64: `cmp/add/sub` (and `imul r,r,i`) take a SIGNED imm32 directly,
+-///   so only constants outside i32 pay a `movabsq`. The dominant source is
+-///   div_by_const's magic multipliers (e.g. 2454267027 is encodable as
+-///   imm32 for imul's 3-operand form, but the sign-extended I64 sequence
+-///   uses movabsq — and the pass conservatively hoists any i64-out-of-range
+-///   constant).
++///   movz/movk per iteration. The i32 test below does NOT apply here — imm12
++///   is the limit, so `10000000` genuinely needs hoisting.
++/// * x86-64: 64-bit instructions sign-extend imm32, so only constants inside
++///   *signed* i32 are free; anything else pays a `movabsq`. The dominant
++///   source is div_by_const's magic multipliers (e.g. 2454267027 is out of the
++///   signed range, so the sign-extended I64 sequence uses movabsq).
++///   32-bit instructions are different: they take the imm32 bit pattern
++///   *verbatim*, so the unsigned half `[2^31, 2^32)` is free too and must not
++///   be hoisted. This covers essentially every hash multiplier in existence
++///   (0x9E3779B1, 0x85EBCA77, 0xCC9E2D51, 0x1B873593).
++///
++/// `imm32_exact` says the consuming instruction encodes a *verbatim* imm32 bit
++/// pattern (x86-64 32-bit ALU/imul/cmp forms) rather than sign-extending it.
+ ///
+ /// Returns the value as u64 bits.
+-fn large_int_const(op: &Operand, needs_reg: bool) -> Option<u64> {
++fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u64> {
+     let v: i64 = match op {
+         Operand::Const(IrConst::I8(v)) => *v as i64,
+         Operand::Const(IrConst::I16(v)) => *v as i64,
+@@ -131,11 +138,38 @@ fn large_int_const(op: &Operand, needs_reg: bool) -> Option<u64> {
+     // time this pass sees the loop, small divisors are gone. Constants that
+     // survive here are the real per-iteration movabs/movz materializations.
+     if !needs_reg {
+-        if (-4095..=4095).contains(&v) && AARCH64.with(|c| c.get()) {
+-            return None; // AArch64 imm12 / cmn encodable — free already
+-        }
+-        if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+-            return None; // x86-64 imm32 encodable
++        if AARCH64.with(|c| c.get()) {
++            // AArch64 add/sub/cmp take imm12 (0..=4095, optionally shifted
++            // left by 12) and cmn covers the small negative range; everything
++            // else pays movz/movk *per iteration*.
++            //
++            // The signed-i32 test below must NOT apply here: it used to, which
++            // silently disabled this pass for every constant in [-2^31, 2^31) —
++            // including the sieve marking bound `cmp j, #10000000` that
++            // motivated the pass in the first place.
++            if (-4095..=4095).contains(&v) {
++                return None; // imm12 / cmn encodable — free already
++            }
++        } else {
++            // x86-64: a 32-bit instruction (`imull`, `andl`, `cmpl`, ...) uses
++            // the imm32 bit pattern verbatim, so all of [0, u32::MAX] is a free
++            // immediate — not just the signed half. Mirrors the backend's
++            // `const_as_imm32_typed(op, is_32bit_op)`.
++            //
++            // Hoisting such a constant is a pessimization, not a win: it turns
++            // a self-contained 3-operand `imull $0x9e3779b1, %edi, %eax` into
++            // `movl $imm, %eax; movq %rax, slot` in the preheader plus a
++            // memory-operand `imull slot, %eax` on every iteration — one extra
++            // load per iteration, one extra live register across the loop, and
++            // more code. This is what lz4's hash multiplier degenerated into.
++            if imm32_exact && (0..=u32::MAX as i64).contains(&v) {
++                return None;
++            }
++            // 64-bit instructions sign-extend imm32, so only the signed range
++            // is representable there.
++            if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
++                return None; // x86-64 imm32 encodable
++            }
+         }
+     } else if AARCH64.with(|c| !c.get()) && v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+         // x86-64 div/rem: only out-of-i32 constants force movabsq; an imm32
+@@ -151,20 +185,32 @@ fn large_int_const(op: &Operand, needs_reg: bool) -> Option<u64> {
+ /// all (div/rem on both targets; mul on AArch64), so even a small constant
+ /// pays a materialization there (Lev Kropp's 558e3ed9 insight, generalized
+ /// per target).
+-fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool)) {
++fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool, bool)) {
+     match inst {
+-        Instruction::BinOp { op, lhs, rhs, .. } => {
++        Instruction::BinOp { op, lhs, rhs, ty, .. } => {
+             let needs_reg = match op {
+                 IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => true,
+                 IrBinOp::Mul => AARCH64.with(|c| c.get()),
+                 _ => false,
+             };
+-            f(lhs, needs_reg);
+-            f(rhs, needs_reg);
++            // Shift counts are a separate encoding (imm8 / %cl) and never take
++            // a 32-bit immediate, so they get no bit-pattern relaxation.
++            let imm32_exact = !matches!(
++                op,
++                IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr
++                | IrBinOp::RotateLeft
++                | IrBinOp::RotateRight
++            ) && matches!(ty, IrType::I32 | IrType::U32);
++            f(lhs, needs_reg, imm32_exact);
++            f(rhs, needs_reg, imm32_exact);
+         }
+-        Instruction::Cmp { lhs, rhs, .. } => {
+-            f(lhs, false);
+-            f(rhs, false);
++        Instruction::Cmp { lhs, rhs, ty, .. } => {
++            // `cmpl $imm32` takes the bit pattern verbatim (comparison.rs
++            // computes `use_32bit` from the same type). Narrower compares use
++            // imm8/imm16 and get no relaxation.
++            let imm32_exact = matches!(ty, IrType::I32 | IrType::U32);
++            f(lhs, false, imm32_exact);
++            f(rhs, false, imm32_exact);
+         }
+         _ => {}
+     }
+@@ -194,3 +240,244 @@ fn rewrite_int_operands(inst: &mut Instruction, bits: u64, new_val: u32) {
+         _ => {}
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Terminator};
++
++    /// Run `f` with the AArch64 immediate model enabled, then restore the
++    /// previous setting (the flag is a thread-local shared with other passes).
++    fn with_aarch64<R>(f: impl FnOnce() -> R) -> R {
++        let prev = AARCH64.with(|c| c.replace(true));
++        let r = f();
++        AARCH64.with(|c| c.set(prev));
++        r
++    }
++
++    /// preheader -> header -> body -> header, header -> exit, where the body
++    /// holds a single `acc = acc <op> K` in type `ty`.
++    fn make_op_loop(op: IrBinOp, ty: IrType, k: IrConst) -> IrFunction {
++        let mut func = IrFunction::new("mul_loop".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![
++                Instruction::Copy {
++                    dest: Value(0),
++                    src: Operand::Const(IrConst::I32(0)),
++                },
++                Instruction::Copy {
++                    dest: Value(1),
++                    src: Operand::Const(IrConst::I32(64)),
++                },
++            ],
++            terminator: Terminator::Branch(BlockId(1)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(1),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(2),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        (Operand::Value(Value(0)), BlockId(0)),
++                        (Operand::Value(Value(5)), BlockId(2)),
++                    ],
++                },
++                Instruction::Cmp {
++                    dest: Value(3),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(2)),
++                    rhs: Operand::Value(Value(1)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(3)),
++                true_label: BlockId(2),
++                false_label: BlockId(3),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![
++                Instruction::BinOp {
++                    dest: Value(4),
++                    op,
++                    lhs: Operand::Value(Value(2)),
++                    rhs: Operand::Const(k),
++                    ty,
++                },
++                Instruction::BinOp {
++                    dest: Value(5),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(2)),
++                    rhs: Operand::Const(IrConst::I32(1)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::Branch(BlockId(1)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![],
++            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
++            source_spans: Vec::new(),
++        });
++        func.next_value_id = 6;
++        func
++    }
++
++    /// The rhs operand of the body's operation after `run`.
++    fn mul_rhs(func: &IrFunction) -> Operand {
++        match &func.blocks[2].instructions[0] {
++            Instruction::BinOp { rhs, .. } => rhs.clone(),
++            other => panic!("expected BinOp, got {other:?}"),
++        }
++    }
++
++    // ---- x86-64: the hash-multiplier regression -------------------------
++
++    /// 0x9E3779B1 (lz4/xxHash/zstd) is outside *signed* i32 but is a verbatim
++    /// imm32 bit pattern for a 32-bit `imull`, so it must stay an immediate.
++    /// Hoisting it produced `imull 0x28(%rsp), %eax` — a load per iteration
++    /// plus a preheader materialization, where GCC emits `imull $imm, %r, %r`.
++    #[test]
++    fn x86_hash_multiplier_stays_an_immediate_for_32bit_mul() {
++        let mut func = make_op_loop(IrBinOp::Mul, IrType::U32, IrConst::I64(0x9E37_79B1));
++        assert_eq!(run(&mut func), 0);
++        assert!(
++            matches!(mul_rhs(&func), Operand::Const(IrConst::I64(0x9E37_79B1))),
++            "32-bit hash multiplier was hoisted: {:?}",
++            mul_rhs(&func)
++        );
++    }
++
++    /// Same constant in a 64-bit multiply DOES need hoisting: `imulq $imm32`
++    /// sign-extends, so 0x9E3779B1 would become 0xFFFFFFFF9E3779B1.
++    #[test]
++    fn x86_hash_multiplier_is_hoisted_for_64bit_mul() {
++        let mut func = make_op_loop(IrBinOp::Mul, IrType::U64, IrConst::I64(0x9E37_79B1));
++        assert_eq!(run(&mut func), 1);
++        assert!(
++            matches!(mul_rhs(&func), Operand::Value(_)),
++            "64-bit multiplier must be materialized once, got {:?}",
++            mul_rhs(&func)
++        );
++    }
++
++    /// A signed-i32 constant is a free imm32 at either width — never hoist.
++    #[test]
++    fn x86_signed_i32_constant_is_never_hoisted() {
++        let mut func = make_op_loop(IrBinOp::Mul, IrType::I64, IrConst::I64(1000));
++        assert_eq!(run(&mut func), 0);
++        assert!(matches!(mul_rhs(&func), Operand::Const(_)));
++    }
++
++    /// Above u32 there is no imm32 encoding at any width.
++    #[test]
++    fn x86_constant_above_u32_is_hoisted_even_for_32bit_mul() {
++        let mut func = make_op_loop(IrBinOp::Mul, IrType::U32, IrConst::I64(0x1_0000_0000));
++        assert_eq!(run(&mut func), 1);
++        assert!(matches!(mul_rhs(&func), Operand::Value(_)));
++    }
++
++    /// Shift counts have no 32-bit immediate form (imm8/%cl), so the
++    /// bit-pattern relaxation must not apply to them.
++    #[test]
++    fn shift_operands_get_no_bitpattern_relaxation() {
++        let inst = Instruction::BinOp {
++            dest: Value(0),
++            op: IrBinOp::Shl,
++            lhs: Operand::Value(Value(1)),
++            rhs: Operand::Const(IrConst::I64(0x9E37_79B1)),
++            ty: IrType::U32,
++        };
++        let mut seen = Vec::new();
++        for_each_int_operand(&inst, &mut |op, _needs_reg, imm32_exact| {
++            if matches!(op, Operand::Const(_)) {
++                seen.push(imm32_exact);
++            }
++        });
++        assert_eq!(seen, vec![false]);
++    }
++
++    /// 32-bit compares take the bit pattern verbatim, so an unsigned-half
++    /// bound must not be hoisted either.
++    #[test]
++    fn cmp_operands_get_the_bitpattern_relaxation() {
++        let inst = Instruction::Cmp {
++            dest: Value(0),
++            op: IrCmpOp::Eq,
++            lhs: Operand::Value(Value(1)),
++            rhs: Operand::Const(IrConst::I64(0xFFFF_FFF0)),
++            ty: IrType::U32,
++        };
++        let mut hoisted = Vec::new();
++        for_each_int_operand(&inst, &mut |op, needs_reg, imm32_exact| {
++            hoisted.push(large_int_const(op, needs_reg, imm32_exact));
++        });
++        assert_eq!(hoisted, vec![None, None]);
++    }
++
++    // ---- AArch64: the pass used to be a no-op here ----------------------
++
++    /// imm12 tops out at 4095, so the sieve marking bound `cmp j, #10000000`
++    /// — the pass's own motivating example — sits inside signed i32 yet still
++    /// pays movz/movk every iteration. The i32 shortcut must not suppress it.
++    /// Driven through `Add`: on AArch64 `Mul` is a needs_reg position and would
++    /// hoist unconditionally, masking the gate under test.
++    #[test]
++    fn aarch64_hoists_i32_range_immediate_operand() {
++        with_aarch64(|| {
++            let mut func = make_op_loop(IrBinOp::Add, IrType::I64, IrConst::I64(10_000_000));
++            assert_eq!(run(&mut func), 1);
++            assert!(matches!(mul_rhs(&func), Operand::Value(_)));
++        });
++    }
++
++    /// Anything imm12/cmn can encode is already free on AArch64.
++    #[test]
++    fn aarch64_leaves_imm12_range_alone() {
++        with_aarch64(|| {
++            for k in [0i64, 1, 1000, 4095, -1, -4095] {
++                let mut func = make_op_loop(IrBinOp::Add, IrType::I64, IrConst::I64(k));
++                assert_eq!(run(&mut func), 0, "imm12 constant {k} was hoisted");
++                assert!(matches!(mul_rhs(&func), Operand::Const(_)));
++            }
++        });
++    }
++
++    /// 4096 is the first AArch64 value that needs materializing.
++    #[test]
++    fn aarch64_hoists_just_past_imm12() {
++        with_aarch64(|| {
++            let mut func = make_op_loop(IrBinOp::Add, IrType::I64, IrConst::I64(4096));
++            assert_eq!(run(&mut func), 1);
++        });
++    }
++
++    /// The x86 bit-pattern relaxation must not leak into AArch64: 0x9E3779B1
++    /// has no AArch64 immediate form and must be hoisted.
++    #[test]
++    fn aarch64_still_hoists_the_x86_bitpattern_constant() {
++        with_aarch64(|| {
++            let mut func = make_op_loop(IrBinOp::Add, IrType::U32, IrConst::I64(0x9E37_79B1));
++            assert_eq!(run(&mut func), 1);
++            assert!(matches!(mul_rhs(&func), Operand::Value(_)));
++        });
++    }
++
++    /// AArch64 `mul` has no immediate form at all, so even a small constant
++    /// must be hoisted out of the loop there.
++    #[test]
++    fn aarch64_hoists_mul_operand_regardless_of_size() {
++        with_aarch64(|| {
++            let mut func = make_op_loop(IrBinOp::Mul, IrType::U32, IrConst::I64(3));
++            assert_eq!(run(&mut func), 1);
++        });
++    }
++}
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 9b81d7f..2f11357 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -621,7 +621,11 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
+             Instruction::BinOp { op, .. } => {
+                 use crate::ir::reexports::IrBinOp::*;
+                 match op {
+-                    AShr | LShr | Shl | BitTest => saw_shift = true,
++                    // Rotates belong to the shift family for this test: a
++                    // bit-iteration latch that rotates its induction value is
++                    // still a pure bit loop, and classifying it as `other_arith`
++                    // would veto a complete unroll that is profitable.
++                    AShr | LShr | Shl | BitTest | RotateLeft | RotateRight => saw_shift = true,
+                     And | Or | Xor => saw_and = true,
+                     Add | Sub | Mul | SDiv | UDiv | SRem | URem => other_arith = true,
+                 }
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 7ccd822..f09949d 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -873,6 +873,21 @@ fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32)
+     }
+ }
+ 
++/// Widest rotate (in bits) `target` can lower to a single native instruction
++/// sequence, or 0 when the target should keep the portable shift/or triple.
++///
++/// Every backend has a rotate lowering, but i686 sends I64/U64 arithmetic
++/// through its paired-register path (`emit_i128_binop`) instead of the 32-bit
++/// ALU path that owns `rol`/`ror`, so only its 32-bit form is wired.
++fn target_rotate_bits(target: crate::backend::Target) -> u32 {
++    match target {
++        crate::backend::Target::X86_64
++        | crate::backend::Target::Aarch64
++        | crate::backend::Target::Riscv64 => 64,
++        crate::backend::Target::I686 => 32,
++    }
 +}
 +
  /// Run optimization passes for the requested optimization level.
  ///
  /// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
-@@ -883,12 +905,19 @@ pub(crate) fn run_passes(
-     code16gcc: bool,
-     fp_reassoc: bool,
-     fp_contract: crate::common::fp_contract::FpContract,
-+    x86_isa: X86Isa,
-     x86_avx: bool,
-     x86_avx2: bool,
-     x86_sse4_1: bool,
-     x86_fma: bool,
-     ra_config: &crate::backend::regalloc::RaConfig,
- ) {
-+    // x86 SIMD register-file availability for the middle end. Under `-mno-sse`
-+    // / `-mgeneral-regs-only` there is no xmm state on the target at all, so
-+    // the vectorizer must not rewrite a single loop (see the gate in
-+    // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
-+    // 128-bit SSE2 instead of disabling vectorization outright.
-+    vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm);
-     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
-     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
-     // ignores this.
-@@ -903,10 +932,12 @@ pub(crate) fn run_passes(
-     // FMA3 availability for the fma/fmaf libcall fold (simplify.rs): the
-     // fused form is required for the C99 single-rounding semantics, so the
-     // fold must only fire when the backend can actually emit vfmadd*.
--    // x86-64's project baseline is x86-64-v3 (FMA3 always present); i686
--    // has it only under -mfma.
-+    // x86-64's project baseline is x86-64-v3, so FMA3 is present *unless* the
-+    // TU disabled it: `-mno-fma` clears it, and `-mno-sse` clears the whole
-+    // SIMD register file (vfmadd is a VEX-encoded SSE instruction, so a
-+    // kernel TU built with `-mno-sse` would #UD on the folded form).
-     simplify::set_has_fma3(match target {
--        crate::backend::Target::X86_64 => true,
-+        crate::backend::Target::X86_64 => x86_isa.fma,
-         crate::backend::Target::I686 => x86_fma,
-         crate::backend::Target::Aarch64 => true,
-         _ => false,
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index a3a33e2..ceb8bf4 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -110,6 +110,48 @@ thread_local! {
-     // generic vector pass being active is not evidence that both instructions
-     // are legal for this particular lowering.
-     static X86_STRICT_RECIP_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-+    // x86 SIMD register-file availability for the MIDDLE END. Every vector
-+    // lowering this pass emits (VecLoadI32x8, VecAndI32x8, FmaF64x4, ...)
-+    // becomes an xmm/ymm instruction in the backend. The Linux kernel is built
-+    // with `-mno-sse -mno-mmx -mno-sse2 -mno-avx` because it runs with
-+    // CR4.OSFXSR=0 and never saves FPU state, so a single such instruction is
-+    // an immediate #UD (observed: `identify_cpu` in arch/x86/kernel/cpu/common.c
-+    // acquired vmovdqu/vpand from a vectorized `memset` of x86_capability).
-+    // The gate therefore lives HERE, not in the backend: the backend can only
-+    // refuse to *lower* a vector op, by which point the pass has already
-+    // destroyed the scalar loop shape it would need to fall back to.
-+    // Default is FALSE - the driver opts in per TU, so a forgotten
-+    // `set_x86_simd_isa` call fails closed instead of emitting illegal code.
-+    static X86_SIMD_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-+    // AVX2 (256-bit ymm) availability, distinct from `X86_SIMD_AVAILABLE`:
-+    // x86-64's project baseline is x86-64-v3, so plain `-mno-avx` must
-+    // downgrade the vectorizer to 128-bit SSE2 forms rather than disable it.
-+    static X86_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-+}
-+
-+/// Record the x86 SIMD ISA profile for the current translation unit.
-+///
-+/// `simd` gates every x86 vector lowering (xmm *or* ymm); `avx2` gates the
-+/// 256-bit forms specifically. Called by `run_passes` before any vectorization
-+/// entry point runs on this thread - the same per-TU refresh discipline as
-+/// [`set_x86_fma_enabled`], because worker threads compile many TUs and a
-+/// stale permission would leak ISA into the next one.
-+///
-+/// AArch64 needs no gate: its entry points pass `neon = true` and NEON is
-+/// baseline ISA for every supported ARMv8/v9 target.
-+pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool) {
-+    X86_SIMD_AVAILABLE.with(|available| available.set(simd));
-+    // AVX2 is a subset of "SIMD at all"; never let a caller assert AVX2 while
-+    // SIMD itself is forbidden.
-+    X86_AVX2_AVAILABLE.with(|available| available.set(avx2 && simd));
-+}
-+
-+fn x86_simd_available() -> bool {
-+    X86_SIMD_AVAILABLE.with(|available| available.get())
-+}
-+
-+fn x86_avx2_available() -> bool {
-+    X86_AVX2_AVAILABLE.with(|available| available.get())
- }
+@@ -1568,10 +1583,11 @@ pub(crate) fn run_passes(
+             total_changes_excl_dce += n;
  
- /// Record whether the x86 target has FMA3. Called by `run_passes` before any
-@@ -172,6 +214,22 @@ fn vectorize_with_analysis_mode(
-         );
-     }
- 
-+    // ISA gate: the x86 vector lowerings require the SIMD register file. Under
-+    // `-mno-sse` / `-mno-sse2` / `-mgeneral-regs-only` the target has no xmm
-+    // state at all (kernel: CR4.OSFXSR=0), so bail out before any transform
-+    // rewrites the loop. `neon` entry points are AArch64, where the vector ISA
-+    // is baseline and this gate does not apply.
-+    if !neon && !x86_simd_available() {
-+        if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-+            eprintln!(
-+                "[VEC] Function {}: not vectorized: x86 SIMD disabled by ISA flags \
-+                 (-mno-sse/-mno-sse2/-mgeneral-regs-only)",
-+                func.name
-+            );
-+        }
-+        return 0;
-+    }
-+
-     if loops.is_empty() {
-         return 0;
-     }
-@@ -223,7 +281,8 @@ fn vectorize_with_analysis_mode(
-         take_reject();
-         if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
-             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
--            let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
-+            let use_sse2 =
-+                force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
-             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
-             // The AArch64 two-wide lowering emits both halves per iteration,
-             // consuming four doubles. Use the real machine-step width for the
-@@ -394,7 +453,8 @@ fn vectorize_with_analysis_mode(
+             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
++            let max_rotate_bits = target_rotate_bits(target);
+             let n = timed_pass!(
+                 "bit_idioms",
+                 run_on_visited(module, &dirty, &mut changed, |func| {
+-                    bit_idioms::recognize_function(func, enable_bit_reverse)
++                    bit_idioms::recognize_function(func, enable_bit_reverse, max_rotate_bits)
+                 })
+             );
+             cur_pass_changes[3] += n;
+@@ -1731,10 +1747,11 @@ pub(crate) fn run_passes(
+         // The pass is idempotent and remains behind the normal disable switch.
+         if !pass_disabled(&disabled, "bit_idioms") {
+             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
++            let max_rotate_bits = target_rotate_bits(target);
+             let n = timed_pass!(
+                 "bit_idioms_post_ifconv",
+                 run_on_visited(module, &dirty, &mut changed, |func| {
+-                    bit_idioms::recognize_function(func, enable_bit_reverse)
++                    bit_idioms::recognize_function(func, enable_bit_reverse, max_rotate_bits)
+                 })
+             );
+             total_changes += n;
+diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
+index 1b606df..9c62b6c 100644
+--- a/src/passes/simplify.rs
++++ b/src/passes/simplify.rs
+@@ -2083,6 +2083,30 @@ fn simplify_binop(
+                 });
              }
+         }
++        IrBinOp::RotateLeft | IrBinOp::RotateRight => {
++            // A rotate permutes the operand's bits, which makes it the one
++            // shift-family operation whose zero *amount* genuinely is an
++            // identity -- contrast the BitTest arm above, where a zero index
++            // still selects bit zero and folding it was a miscompile.  The
++            // amount reduces modulo the operation width (exactly what the
++            // x86/AArch64/RISC-V count masks do), so `rotl(x, 32)` on an I32
++            // folds to `x` instead of surviving as a rotation the backend
++            // would still spend an instruction on.
++            if lhs_zero {
++                return Some(Instruction::Copy {
++                    dest,
++                    src: Operand::Const(IrConst::zero(ty)),
++                });
++            }
++            if let Operand::Const(c) = rhs
++                && let Some(amount) = c.to_i128()
++            {
++                let bits = (ty.size() * 8) as i128;
++                if bits > 0 && amount.rem_euclid(bits) == 0 {
++                    return Some(Instruction::Copy { dest, src: *lhs });
++                }
++            }
++        }
+     }
  
-             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
--            let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
-+            let use_sse2 =
-+                force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
-             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
- 
-             // Same profitability gate as the matmul path (the reduction path
-@@ -427,7 +487,10 @@ fn vectorize_with_analysis_mode(
-             if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon) {
-                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
-                 // the focused SSE diagnostic override requests 128-bit code.
--                let avx2 = !neon && !force_two_wide && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
-+                let avx2 = !neon
-+                    && !force_two_wide
-+                    && std::env::var("LCCC_FORCE_MAP_SSE").is_err()
-+                    && x86_avx2_available();
-                 if debug {
-                     eprintln!(
-                         "[VEC] Map pattern matched! Transforming to {}-bit {:?}",
-@@ -442,7 +505,9 @@ fn vectorize_with_analysis_mode(
-                 // intrinsics are not wired for the displacement form yet.
-                 if let Some(stencil_pattern) = analyze_stencil_pattern(func, loop_info) {
-                     if !neon {
--                        let avx2 = !force_two_wide && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
-+                        let avx2 = !force_two_wide
-+                            && std::env::var("LCCC_FORCE_MAP_SSE").is_err()
-+                            && x86_avx2_available();
-                         if debug {
-                             eprintln!(
-                                 "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
-diff --git a/tests/regression/check_vectorize_isa_gate.sh b/tests/regression/check_vectorize_isa_gate.sh
-new file mode 100644
-index 0000000..405b5e1
---- /dev/null
-+++ b/tests/regression/check_vectorize_isa_gate.sh
-@@ -0,0 +1,97 @@
-+#!/usr/bin/env bash
-+# Emission + semantics gate for the x86 SIMD ISA contract of the middle end.
-+#
-+#   default / -march=x86-64          -> AVX2 vectorization (project baseline
-+#                                       is x86-64-v3; measured benchmark data
-+#                                       depends on this, so it must not
-+#                                       silently regress)
-+#   -mno-avx / -mno-avx2             -> 128-bit SSE2 vectorization: downgraded,
-+#                                       NOT disabled, and zero ymm
-+#   -mno-sse -mno-mmx -mno-sse2
-+#   -mno-avx (the kernel's flag set) -> no SIMD register reference at all
-+#   fma/fmaf                         -> vfmadd* by default, never under
-+#                                       -mno-sse / -mno-avx / -mno-fma
-+#
-+# Every configuration is also *executed*: a gate that merely stopped
-+# vectorizing would pass the emission checks while silently degrading or
-+# breaking the loop, so the semantics are pinned too.
-+set -euo pipefail
-+
-+repo=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
-+ccc=${CCC:-$repo/target/fastbuild/lccc}
-+src=$repo/tests/regression/vectorize_isa_gate.c
-+fmasrc=$repo/tests/regression/fma_isa_gate.c
-+tmp=$(mktemp -d)
-+trap 'rm -rf "$tmp"' EXIT
-+
-+# The exact SIMD-related subset of the kernel's KBUILD_CFLAGS.
-+KERNEL_ISA=(-mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a)
-+
-+fail=0
-+check_eq() { # check_eq <desc> <actual> <expected>
-+    if [[ "$2" != "$3" ]]; then
-+        echo "FAIL: $1 -- got '$2', want '$3'" >&2
-+        fail=1
-+    fi
-+}
-+check_gt0() { # check_gt0 <desc> <actual>
-+    if [[ "$2" -eq 0 ]]; then
-+        echo "FAIL: $1 -- expected a non-zero count, got 0" >&2
-+        fail=1
-+    fi
-+}
-+count_simd() { grep -cE '\b[xyz]mm[0-9]+\b' "$1" || true; }
-+count_ymm() { grep -cE '\bymm[0-9]+\b' "$1" || true; }
-+count_vfmadd() { grep -cE '\bvfmadd[0-9]*p?[sd]\b|\bvfmadd' "$1" || true; }
-+
-+run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
-+    local label=$1; shift
-+    "$ccc" -O2 "$@" -S "$src" -o "$tmp/$label.s"
-+    "$ccc" -O2 "$@" "$src" -o "$tmp/$label.bin"
-+    local out
-+    out=$("$tmp/$label.bin")
-+    check_eq "$label semantics" "$out" "fail=0"
-+}
-+
-+# ---- 1. default: AVX2 baseline must survive -------------------------------
-+run_cfg default
-+check_gt0 "default AVX2 vectorization (ymm)" "$(count_ymm $tmp/default.s)"
-+
-+run_cfg march-v3 -march=x86-64-v3
-+check_gt0 "-march=x86-64-v3 AVX2 vectorization (ymm)" "$(count_ymm $tmp/march-v3.s)"
-+
-+# ---- 2. -mno-avx: downgrade to SSE2, keep vectorizing ---------------------
-+for flag in -mno-avx -mno-avx2 -mno-sse4.1; do
-+    lbl=${flag#-m}; lbl=n${lbl#no-}
-+    run_cfg "$lbl" "$flag"
-+    check_eq "$flag ymm emission" "$(count_ymm $tmp/$lbl.s)" 0
-+    check_gt0 "$flag still vectorizes (xmm)" "$(count_simd $tmp/$lbl.s)"
-+done
-+
-+# ---- 3. kernel flag set: no SIMD register at all --------------------------
-+run_cfg kernel-isa "${KERNEL_ISA[@]}"
-+check_eq "kernel ISA flags: SIMD register refs" "$(count_simd $tmp/kernel-isa.s)" 0
-+
-+# -O3 runs the same pipeline with unrolling on top.
-+"$ccc" -O3 "${KERNEL_ISA[@]}" -S "$src" -o "$tmp/kernel-isa-o3.s"
-+check_eq "kernel ISA flags at -O3: SIMD register refs" \
-+    "$(count_simd $tmp/kernel-isa-o3.s)" 0
-+
-+# ---- 4. FMA3 gate ----------------------------------------------------------
-+"$ccc" -O2 -S "$fmasrc" -o "$tmp/fma-default.s"
-+check_gt0 "default fmaf folds to vfmadd" "$(count_vfmadd $tmp/fma-default.s)"
-+for flag in -mno-fma -mno-avx; do
-+    "$ccc" -O2 "$flag" -S "$fmasrc" -o "$tmp/fma.s"
-+    check_eq "$flag: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
-+done
-+"$ccc" -O2 "${KERNEL_ISA[@]}" -S "$fmasrc" -o "$tmp/fma.s"
-+check_eq "kernel ISA flags: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
-+
-+# ---- 5. `-msse` after `-mno-sse` re-enables (kernel CC_FLAGS_FPU) ----------
-+# arch/x86/Makefile appends -msse to CC_FLAGS_FPU for FPU-using TUs, after the
-+# global -mno-sse; GCC's last-explicit-ISA-flag-wins must be honoured.
-+"$ccc" -O2 "${KERNEL_ISA[@]}" -msse -msse2 -S "$src" -o "$tmp/resse.s"
-+check_gt0 "-mno-sse ... -msse re-enables vectorization" "$(count_simd $tmp/resse.s)"
-+
-+if [[ $fail -ne 0 ]]; then exit 1; fi
-+echo "vectorizer/FMA x86 ISA emission gates: PASS"
-diff --git a/tests/regression/fma_isa_gate.c b/tests/regression/fma_isa_gate.c
-new file mode 100644
-index 0000000..a4b31d8
---- /dev/null
-+++ b/tests/regression/fma_isa_gate.c
-@@ -0,0 +1,51 @@
-+#include <stdio.h>
-+
-+/*
-+ * FMA3 ISA gate corpus (companion to vectorize_isa_gate.c; the emission
-+ * assertions live in tests/regression/check_vectorize_isa_gate.sh).
-+ *
-+ * `simplify::set_has_fma3` used to hard-code `true` for x86-64, so the
-+ * fma/fmaf libcall fold emitted `vfmadd*` even for a TU compiled with
-+ * `-mno-sse` or `-mno-avx`. `vfmadd*` is VEX-encoded and needs both AVX and
-+ * FMA3, so in the kernel (CR4.OSFXSR=0) that is an immediate #UD.
-+ *
-+ * The fold itself must keep firing by default: LCCC's x86-64 code-generation
-+ * baseline is x86-64-v3, and the fused form is what gives fmaf() its C99
-+ * single-rounding semantics.
-+ */
-+float fused(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
-+
-+double fused_d(double a, double b, double c) { return __builtin_fma(a, b, c); }
-+
-+/*
-+ * Semantics pin, so the test also builds and runs under
-+ * scripts/run_regression_suite.sh (which links and A/B-compares every
-+ * every tests/regression C file against GCC) instead of assembly-only.
-+ *
-+ * The operands are chosen so fused and unfused evaluation differ: the exact
-+ * product carries bits below the destination precision, which a separate
-+ * multiply throws away before the add sees them.
-+ *   float : (1+2^-12)^2 - (1+2^-11) = 2^-24 fused, 0 unfused
-+ *   double: (1+2^-28)^2 - (1+2^-27) = 2^-56 fused, 0 unfused
-+ */
-+int main(void)
-+{
-+    const float a = 1.0f + 0x1p-12f;
-+    const float zf = -(1.0f + 0x1p-11f);
-+    const double b = 1.0 + 0x1p-28;
-+    const double zd = -(1.0 + 0x1p-27);
-+    long fail = 0;
-+
-+    if (fused(a, a, zf) != 0x1p-24f)
-+        fail++;
-+    if (fused_d(b, b, zd) != 0x1p-56)
-+        fail++;
-+    /* The fold must not change ordinary values either. */
-+    if (fused(2.0f, 3.0f, 4.0f) != 10.0f)
-+        fail++;
-+    if (fused_d(2.0, 3.0, 4.0) != 10.0)
-+        fail++;
-+
-+    printf("fail=%ld\n", fail);
-+    return fail != 0;
-+}
-diff --git a/tests/regression/fma_isa_gate.flags b/tests/regression/fma_isa_gate.flags
-new file mode 100644
-index 0000000..9edbe67
---- /dev/null
-+++ b/tests/regression/fma_isa_gate.flags
-@@ -0,0 +1 @@
-+-lm
-diff --git a/tests/regression/vectorize_isa_gate.c b/tests/regression/vectorize_isa_gate.c
-new file mode 100644
-index 0000000..be9491c
---- /dev/null
-+++ b/tests/regression/vectorize_isa_gate.c
-@@ -0,0 +1,99 @@
-+/*
-+ * ISA gate corpus for the middle-end vectorizer.
-+ *
-+ * `tests/regression/check_vectorize_isa_gate.sh` pins the *instruction choice*
-+ * for this file; `main()` below pins the *semantics*, so a regression cannot
-+ * hide by simply stopping vectorization.
-+ *
-+ * Root cause (defect C2, kernel-boot session 2026-09): `passes::vectorize`
-+ * chose its vector width from an environment override alone -- AVX2 was the
-+ * default and nothing consulted the TU's ISA flags. The Linux kernel is built
-+ * with `-mno-sse -mno-mmx -mno-sse2 -mno-avx` because it runs with
-+ * CR4.OSFXSR=0 and never saves FPU state, yet `identify_cpu` in
-+ * arch/x86/kernel/cpu/common.c acquired `vmovdqu %ymm0` / `vpand %ymm0` from
-+ * the vectorized `memset(&c->x86_capability, 0, ...)`. That is an immediate
-+ * #UD on a CPU without AVX2, and clobbers FPU state even where it does not
-+ * fault.
-+ *
-+ * The gate lives in the vectorizer rather than the backend: by the time an
-+ * intrinsic reaches codegen the scalar loop shape needed for the fallback has
-+ * already been rewritten away.
-+ *
-+ * Integer-only on purpose. Scalar FP under `-mno-sse` is a separate, still
-+ * open limitation (it needs an x87 path in the backend); including FP here
-+ * would make the "no SIMD register at all" assertion ambiguous.
-+ */
-+#include <stdio.h>
-+
-+#define N 64
-+
-+/* Elementwise map: the shape the kernel's masking/`memset` loops lower to. */
-+__attribute__((noinline)) void and_mask(int *d, const int *m, int n)
-+{
-+    for (int i = 0; i < n; i++)
-+        d[i] &= m[i];
-+}
-+
-+__attribute__((noinline)) void add_scaled(int *d, const int *s, int n)
-+{
-+    for (int i = 0; i < n; i++)
-+        d[i] += s[i] * 3;
-+}
-+
-+/* Integer dot-product reduction: the other vectorized shape. */
-+__attribute__((noinline)) long dot_ll(const long *a, const long *b, int n)
-+{
-+    long acc = 0;
-+    for (int i = 0; i < n; i++)
-+        acc += a[i] * b[i];
-+    return acc;
-+}
-+
-+int main(void)
-+{
-+    static int d[N], m[N], s[N];
-+    static long va[N], vb[N];
-+    long fail = 0;
-+
-+    for (int i = 0; i < N; i++) {
-+        d[i] = i * 7 + 1;
-+        m[i] = 0x0F0F0F0F ^ (i * 255);
-+        s[i] = (i % 13) - 6;
-+        va[i] = (i % 5) - 2;
-+        vb[i] = (i % 11) - 5;
-+    }
-+
-+    /* Expected values, computed straight from the initialisers so the check
-+     * is independent of whatever the optimizer did to the loops. */
-+    int want_and[N], want_add[N];
-+    long want_dot = 0;
-+    for (int i = 0; i < N; i++) {
-+        want_and[i] = (i * 7 + 1) & (0x0F0F0F0F ^ (i * 255));
-+        want_add[i] = want_and[i] + ((i % 13) - 6) * 3;
-+        want_dot += (long)((i % 5) - 2) * ((i % 11) - 5);
-+    }
-+
-+    and_mask(d, m, N);
-+    add_scaled(d, s, N);
-+    for (int i = 0; i < N; i++) {
-+        if (d[i] != want_add[i])
-+            fail++;
-+    }
-+    if (dot_ll(va, vb, N) != want_dot)
-+        fail++;
-+
-+    /* A second pass with a different length exercises the scalar remainder /
-+     * peel path that the vector transforms add. */
-+    for (int i = 0; i < N; i++)
-+        d[i] = i * 7 + 1;
-+    and_mask(d, m, 37);
-+    for (int i = 0; i < 37; i++)
-+        if (d[i] != want_and[i])
-+            fail++;
-+    for (int i = 37; i < N; i++)
-+        if (d[i] != i * 7 + 1)
-+            fail++;
-+
-+    printf("fail=%ld\n", fail);
-+    return fail != 0;
-+}
+     // Commutative operand canonicalization: for commutative operations
