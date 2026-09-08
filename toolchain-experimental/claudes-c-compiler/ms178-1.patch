@@ -1,316 +1,2467 @@
-From 0f11b97be6db17ef5ab96a4d79b6222a568a3bd4 Mon Sep 17 00:00:00 2001
-From: arena-agent <arena-agent@users.noreply.github.com>
-Date: Tue, 8 Sep 2026 14:08:19 +0000
-Subject: [PATCH] MaskConj select vectorization, GEP rematerialization for
- remainder bases, FMA SIB scratch-collision fix
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-vectorize.rs: MaskConj{is_and,l,r} folds nested shared-arm selects over compare
-masks into one packed And/Or + a single blend (case-fold family: 3.5-4x vs main
-at -O3 v3, eqor now beats gcc). MAP_MAX_NODES 12->16. GetElementPtr joins the
-clonable pure-chain nodes in plan_invariant_chain (with set_cloned_dest and a
-hand-rewrite of the cloned GEP base, which for_each_operand_mut never visits):
-their dominance gate had declined every matmul FMA transform (bench matmul
-3.13x slower than main); with the arm, 4x vfmadd231pd returns at parity.
-
-x86 intrinsics: FmaF64x4HoistedSIB resolved operand homes via operand_reg but
-reloaded home-less operands into fixed rax/rdx/rsi scratches — a home in a later
-scratch register got clobbered, emitting vmovupd (%rsi,%rsi) (address 2*j) and
-miscompiling remainder-shaped FMA loops (segfault at 2*j; latent on main under
-register pressure). Reloads now pick a pool register that is no operand home
-and no already-chosen destination.
-
-Tests: vectorize_mask_conj (positive/anti shapes, n=0..33 sweeps) and
-vectorize_fma_remainder_257 (odd-N remainder differential, single instance).
----
- src/backend/x86/codegen/intrinsics.rs |  66 +++++++--
- src/passes/vectorize.rs               | 191 +++++++++++++++++++++++++-
- tests/correctness/run_correctness.py  |  68 +++++++++
- 3 files changed, 305 insertions(+), 20 deletions(-)
-
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index abe6e04a..16c478e4 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -2955,23 +2955,59 @@ impl X86Codegen {
-                     args[2].clone()
-                 };
+diff --git a/.github/scripts/ci-codegen-baseline.json b/.github/scripts/ci-codegen-baseline.json
+index 440e8fc8..02b8fe94 100644
+--- a/.github/scripts/ci-codegen-baseline.json
++++ b/.github/scripts/ci-codegen-baseline.json
+@@ -1,57 +1,57 @@
+ {
+   "gzip_crc32": {
+-    "insns": 81,
++    "insns": 77,
+     "stackmem": 0,
+-    "pushes": 6,
+-    "moves": 20,
++    "pushes": 5,
++    "moves": 18,
+     "ymm": 0,
+     "fma": 0
+   },
+   "zlib_ng_adler32": {
+-    "insns": 240,
+-    "stackmem": 4,
++    "insns": 233,
++    "stackmem": 11,
+     "pushes": 6,
+-    "moves": 72,
++    "moves": 60,
+     "ymm": 0,
+     "fma": 0
+   },
+   "expat_xml_scan": {
+-    "insns": 204,
++    "insns": 203,
+     "stackmem": 20,
+     "pushes": 6,
+-    "moves": 43,
++    "moves": 42,
+     "ymm": 0,
+     "fma": 0
+   },
+   "sqlite_varint": {
+-    "insns": 326,
++    "insns": 302,
+     "stackmem": 11,
+     "pushes": 7,
+-    "moves": 90,
++    "moves": 66,
+     "ymm": 0,
+     "fma": 0
+   },
+   "glibc_memcmp": {
+-    "insns": 226,
+-    "stackmem": 28,
++    "insns": 206,
++    "stackmem": 22,
+     "pushes": 11,
+-    "moves": 56,
++    "moves": 51,
+     "ymm": 0,
+     "fma": 0
+   },
+   "hash_table": {
+-    "insns": 157,
++    "insns": 147,
+     "stackmem": 0,
+     "pushes": 9,
+-    "moves": 50,
++    "moves": 40,
+     "ymm": 0,
+     "fma": 0
+   },
+   "stencil5": {
+-    "insns": 115,
++    "insns": 113,
+     "stackmem": 6,
+     "pushes": 6,
+-    "moves": 20,
++    "moves": 18,
+     "ymm": 6,
+     "fma": 0
+   }
+diff --git a/engineering/evidence/godbolt/chacha20-2026-09-08/ANALYSIS.md b/engineering/evidence/godbolt/chacha20-2026-09-08/ANALYSIS.md
+new file mode 100644
+index 00000000..8923880c
+--- /dev/null
++++ b/engineering/evidence/godbolt/chacha20-2026-09-08/ANALYSIS.md
+@@ -0,0 +1,94 @@
++# ChaCha20 oracle comparison — 2026-09-08 (post-unified-revision f7cfbd74)
++
++Flags: `-O2 -march=x86-64-v3` (scoreboard convention). Oracle asm via
++`scripts/godbolt.py compare` (artifacts in this directory; manifest records
++resolved compiler ids). Runtimes measured on the Ice Lake-SP VM (taskset -c 0,
++paired runs; oracle binaries assembled locally — GCC/Clang artifacts lack
++their `.bss` under the godbolt filter, so local gcc-14 builds stand in for
++their scalar runtimes; ICX's artifact is complete and output-verified).
++
++| Compiler | chacha20_core insns | runtime | strategy |
++|---|---:|---:|---|
++| **LCCC (this tree)** | 376 | **415 ms** | scalar ARX, state in stack slots, folded memory operands |
++| GCC 16.2 (oracle asm) | 195 | — (gcc-14 scalar stand-in: **278 ms**) | **auto-vectorized** (`vmovdqu .. %ymm`, vpshufd lane ops in core) |
++| Clang 23.1 (oracle asm) | 187 | — (scalar-class) | vectorized forms in artifact |
++| ICX latest (oracle asm) | 63 | **237 ms** (output `ff1bc75f6884e79f` verified) | **full SSE2 lane vectorization**: 4 columns in xmm, `vpshufb`/`vpshufd` lane rotations, double-round loop, ~34 insns/iteration × 10 |
++
++## Verdict
++
++LCCC's scalar kernel is the best SCALAR shape LCCC has produced (main: 1239 ms
++→ 415 ms; gate 480→461 insns), but **all three oracles beat it**: GCC-16.2 and
++Clang-23.1 auto-vectorize the quarter-round structure at `-O2 -march=v3`, and
++ICX's 63-instruction kernel is the classic OpenSSL-style SIMD ChaCha. To
++"beat every compiler" on this workload LCCC needs ARX lane vectorization —
++a new idiom family, not a tuning of the current one.
++
++## Why the scalar kernel sits at 415 ms (measured, not inferred)
++
++* The 16-word state lives in stack slots; every ARX operand is a folded
++  memory operand (`addl 128(%rsp), %esi`). The loop-carried chain pays
++  L1 store-to-load forwarding at each round head.
++* The admission cap arms at allowed=0 because the loop's block-local peak is
++  17 (the scheduler interleaves the 4 independent quarter-round chains of a
++  column round for ILP: 17 concurrent chain values against a 14-register
++  pool).
++* **The span/short split is NOT the lever**: a full homed-span sweep
++  (`CCC_RA_LOOP_SPAN_RESERVE` 0/2/4/6/8/10) measures 416/449/438/416/416/423
++  ms — flat. Whatever the split, some values sit in slots and the chain pays
++  the same forwarding.
++* The peak-17 set was identified instruction-by-instruction: rotate results
++  and add results of the interleaved QR chains (genuine simultaneity, not a
++  counting artifact; phi-materialized state updates were excluded and the
++  peak did not move).
++
++## Follow-up design: ARX lane vectorization (the competitive answer)
++
++The ICX/GCC transform, in LCCC's vectorizer terms:
++
++1. **Pattern**: an inner loop whose body is 2n quarter-round groups over 4k
++   SSA state values, where the second group applies the SAME operations to a
++   lane-permuted instance of the same state (ChaCha's diagonal round =
++   column round with lanes rotated 1..3). Rotations must already be native
++   `RotateLeft` (they are, since PR #440).
++2. **Pack**: the 4 column words into one xmm at the loop head
++   (`vpunpckldq`-style or vpshufd), with `vpshufb` masks standing in for the
++   lane permutations between rounds (the diagonal selection).
++3. **Map**: each ARX op maps 1:1 to `vpaddd`/`vpxor`/`vpslld|vpsrld|vpor`
++   (or `vprold` with EVEX). The rotate-by-constant has no SSE2 form —
++   lower as shift/or pairs exactly as ICX's artifact does.
++4. **Unpack + add**: `vpshufd`-inverse unpack and `vpaddd` against the
++   input state at the loop exit (ICX's tail).
++5. **Cost model**: the scalar body must be ≥ the vector body's latency × 4
++   lanes... trivially true for ARX; the gate is pattern-match success and
++   AVX2/SSE2 availability.
++
++This is the same shape family as the existing map/reduction machinery's
++"same op tree applied to a permuted instance" — the permutation-aware map
++parser extension is the natural implementation vehicle.
++
++---
++
++## Addendum 2026-09-08 (later session): rebased onto PR #448 (4f4f417d)
++
++PR #448 landed the #442 lineage upstream directly (a superset of the port I
++had carried). Red-team findings on 4f4f417d, all empirically confirmed:
++
++| Defect in upstream main | Impact | Fix in this revision |
++|---|---|---|
++| cmp-replay readable() fall-through | latent miscompile (loop_rotate class) | fail-closed prune (prologue.rs) |
++| FMA dominance planner lacks a GEP arm | matmul 15.1ms, FMA vectorization lost (2x) | GEP planned/cloned; matmul 5.8ms (-61%) |
++| no structural auto-arm | chacha20 726ms | strict-pigeonhole arm + remcost ceiling; 414ms (-43%) |
++| (refinement) my earlier valve victim guards | sha256 754ms with them | dropped — #448's span-lock valve subsumes them; 492ms (-13%) |
++| dead-operand commute rule (mine, 2026-09-08) | tls_seg +24% | REMOVED — buys nothing on this tree (crc32 155.3 vs 155.4) |
++| movz truncation + mask distribution absent | crc32 176.5ms | kept; crc32 152.5ms (-14%) |
++
++Final full-corpus A/B vs 4f4f417d (40 workloads, paired runs): worst delta
+++0.9% (noise); wins: matmul -61%, chacha20 -43%, tce_sum -29%,
++linux_find_bit -25%, nbody -21%, expat -20%, sqlite_varint -20%,
++glibc_memcmp -18%, gzip_crc32 -14%, sha256 -13%, strlen -12%, sieve -11%.
++zlib_ng_adler32: instructions 240->233, stack slots 4->11, runtime flat
++(its NMAX loop is a genuine strict-pigeonhole: shorts peak 10 vs a
++7-register main-wave pool; baseline refreshed per the gate's contract).
++
++The ARX lane-vectorization follow-up design below is unchanged and remains
++the path to beating ICX's 237ms.
+diff --git a/engineering/evidence/godbolt/chacha20-2026-09-08/cclang2310.s b/engineering/evidence/godbolt/chacha20-2026-09-08/cclang2310.s
+new file mode 100644
+index 00000000..bd8571c1
+--- /dev/null
++++ b/engineering/evidence/godbolt/chacha20-2026-09-08/cclang2310.s
+@@ -0,0 +1,305 @@
++.LCPI0_0:
++  .long 3840405776
++  .long 358169553
++  .long 3900952779
++  .long 1312575650
++.LCPI0_2:
++  .long 134744072
++  .long 151587081
++  .long 168430090
++  .long 185273099
++.LCPI0_1:
++  .long 1634760805
++  .long 857760878
++  .long 2036477234
++  .long 1797285236
++  .long 67372036
++  .long 84215045
++  .long 101058054
++  .long 117901063
++main:
++  pushq %rbp
++  pushq %r15
++  pushq %r14
++  pushq %r13
++  pushq %r12
++  pushq %rbx
++  subq $136, %rsp
++  leaq check_known_vector.test_in(%rip), %rsi
++  movq %rsp, %rdi
++  callq chacha20_core
++  vmovdqu (%rsp), %ymm0
++  vmovdqu 32(%rsp), %ymm1
++  vextracti128 $1, %ymm1, %xmm1
++  vpblendd $12, %xmm1, %xmm0, %xmm0
++  vpxor .LCPI0_0(%rip), %xmm0, %xmm0
++  vptest %xmm0, %xmm0
++  movl $2, %ebp
++  jne .LBB0_6
++  vmovaps .LCPI0_1(%rip), %ymm0
++  vmovups %ymm0, (%rsp)
++  vmovdqa .LCPI0_2(%rip), %xmm0
++  vmovdqa %xmm0, 32(%rsp)
++  movabsq $81985530642677487, %rax
++  movq %rax, 52(%rsp)
++  movl $-1985229329, 60(%rsp)
++  movl $67372036, %ebp
++  xorl %ebx, %ebx
++  leaq 64(%rsp), %r14
++  movq %rsp, %r15
++  xorl %r12d, %r12d
++.LBB0_2:
++  xorl %r13d, %r13d
++.LBB0_3:
++  movl %r13d, %eax
++  xorl %r12d, %eax
++  movl %eax, 48(%rsp)
++  movq %r14, %rdi
++  movq %r15, %rsi
++  vzeroupper
++  callq chacha20_core
++  movl 64(%rsp), %eax
++  movl 92(%rsp), %ecx
++  movzbl %al, %edx
++  shlq $32, %rax
++  movl 124(%rsp), %esi
++  orq %rax, %rsi
++  shlq $16, %rcx
++  xorq %rsi, %rcx
++  addq %rcx, %rbx
++  xorl %edx, %ebp
++  movl %ebp, 16(%rsp)
++  incl %r13d
++  cmpl $131072, %r13d
++  jne .LBB0_3
++  incl %r12d
++  cmpl $16, %r12d
++  jne .LBB0_2
++  leaq .L.str(%rip), %rdi
++  xorl %ebp, %ebp
++  movq %rbx, %rsi
++  xorl %eax, %eax
++  callq printf@PLT
++.LBB0_6:
++  movl %ebp, %eax
++  addq $136, %rsp
++  popq %rbx
++  popq %r12
++  popq %r13
++  popq %r14
++  popq %r15
++  popq %rbp
++  vzeroupper
++  retq
++
++chacha20_core:
++  pushq %rbp
++  pushq %r15
++  pushq %r14
++  pushq %r13
++  pushq %r12
++  pushq %rbx
++  movq %rdi, -8(%rsp)
++  movl (%rsi), %ebx
++  movl 4(%rsi), %r11d
++  movl 8(%rsi), %r10d
++  movl 12(%rsi), %r9d
++  movl 16(%rsi), %ebp
++  movl 20(%rsi), %r13d
++  movl 24(%rsi), %edx
++  movl 28(%rsi), %eax
++  movl %eax, -36(%rsp)
++  movl 32(%rsi), %r8d
++  movl 36(%rsi), %ecx
++  movl 40(%rsi), %eax
++  movl %eax, -44(%rsp)
++  movl 44(%rsi), %eax
++  movl %eax, -40(%rsp)
++  movl %edx, %eax
++  movl 48(%rsi), %r12d
++  movl 52(%rsi), %edi
++  movl 56(%rsi), %r14d
++  movq %rsi, -16(%rsp)
++  movl 60(%rsi), %esi
++  movl %esi, -32(%rsp)
++  movl $10, %esi
++.LBB1_1:
++  movl %esi, -20(%rsp)
++  addl %ebp, %ebx
++  xorl %ebx, %r12d
++  rorxl $16, %r12d, %esi
++  addl %esi, %r8d
++  xorl %r8d, %ebp
++  rorxl $20, %ebp, %ebp
++  addl %ebp, %ebx
++  xorl %ebx, %esi
++  rorxl $24, %esi, %esi
++  addl %esi, %r8d
++  xorl %r8d, %ebp
++  rorxl $25, %ebp, %edx
++  movl %edx, -28(%rsp)
++  addl %r13d, %r11d
++  xorl %r11d, %edi
++  rorxl $16, %edi, %edi
++  addl %edi, %ecx
++  xorl %ecx, %r13d
++  rorxl $20, %r13d, %ebp
++  addl %ebp, %r11d
++  xorl %r11d, %edi
++  rorxl $24, %edi, %edi
++  addl %edi, %ecx
++  movl %ecx, -24(%rsp)
++  xorl %ecx, %ebp
++  rorxl $25, %ebp, %r13d
++  addl %eax, %r10d
++  xorl %r10d, %r14d
++  rorxl $16, %r14d, %ebp
++  movl -44(%rsp), %edx
++  addl %ebp, %edx
++  xorl %edx, %eax
++  rorxl $20, %eax, %r14d
++  addl %r14d, %r10d
++  xorl %r10d, %ebp
++  rorxl $24, %ebp, %ebp
++  addl %ebp, %edx
++  xorl %edx, %r14d
++  rorxl $25, %r14d, %r14d
++  movl -36(%rsp), %eax
++  addl %eax, %r9d
++  movl -32(%rsp), %r15d
++  xorl %r9d, %r15d
++  rorxl $16, %r15d, %r12d
++  movl -40(%rsp), %ecx
++  addl %r12d, %ecx
++  xorl %ecx, %eax
++  rorxl $20, %eax, %r15d
++  addl %r15d, %r9d
++  xorl %r9d, %r12d
++  rorxl $24, %r12d, %r12d
++  addl %r12d, %ecx
++  xorl %ecx, %r15d
++  rorxl $25, %r15d, %r15d
++  addl %r13d, %ebx
++  xorl %ebx, %r12d
++  rorxl $16, %r12d, %r12d
++  addl %r12d, %edx
++  xorl %edx, %r13d
++  rorxl $20, %r13d, %r13d
++  addl %r13d, %ebx
++  xorl %ebx, %r12d
++  rorxl $24, %r12d, %r12d
++  movl %r12d, -32(%rsp)
++  addl %r12d, %edx
++  movl %edx, -44(%rsp)
++  xorl %edx, %r13d
++  rorxl $25, %r13d, %r13d
++  addl %r14d, %r11d
++  xorl %r11d, %esi
++  rorxl $16, %esi, %esi
++  addl %esi, %ecx
++  xorl %ecx, %r14d
++  rorxl $20, %r14d, %r14d
++  addl %r14d, %r11d
++  xorl %r11d, %esi
++  rorxl $24, %esi, %r12d
++  movl -20(%rsp), %esi
++  addl %r12d, %ecx
++  movl %ecx, -40(%rsp)
++  xorl %ecx, %r14d
++  movl -24(%rsp), %ecx
++  rorxl $25, %r14d, %eax
++  addl %r15d, %r10d
++  xorl %r10d, %edi
++  rorxl $16, %edi, %edi
++  addl %edi, %r8d
++  xorl %r8d, %r15d
++  rorxl $20, %r15d, %r14d
++  addl %r14d, %r10d
++  xorl %r10d, %edi
++  rorxl $24, %edi, %edi
++  addl %edi, %r8d
++  xorl %r8d, %r14d
++  rorxl $25, %r14d, %r14d
++  movl %r14d, -36(%rsp)
++  movl -28(%rsp), %edx
++  addl %edx, %r9d
++  xorl %r9d, %ebp
++  rorxl $16, %ebp, %ebp
++  addl %ebp, %ecx
++  xorl %ecx, %edx
++  rorxl $20, %edx, %r15d
++  addl %r15d, %r9d
++  xorl %r9d, %ebp
++  rorxl $24, %ebp, %r14d
++  addl %r14d, %ecx
++  xorl %ecx, %r15d
++  rorxl $25, %r15d, %ebp
++  decl %esi
++  jne .LBB1_1
++  movq -16(%rsp), %rsi
++  addl (%rsi), %ebx
++  movq -8(%rsp), %r15
++  movl %ebx, (%r15)
++  addl 4(%rsi), %r11d
++  movl %r11d, 4(%r15)
++  addl 8(%rsi), %r10d
++  movl %r10d, 8(%r15)
++  addl 12(%rsi), %r9d
++  movl %r9d, 12(%r15)
++  addl 16(%rsi), %ebp
++  movl %ebp, 16(%r15)
++  addl 20(%rsi), %r13d
++  movl %r13d, 20(%r15)
++  addl 24(%rsi), %eax
++  movl %eax, 24(%r15)
++  movl -36(%rsp), %r9d
++  addl 28(%rsi), %r9d
++  movl %r9d, 28(%r15)
++  addl 32(%rsi), %r8d
++  movl %r8d, 32(%r15)
++  addl 36(%rsi), %ecx
++  movl %ecx, 36(%r15)
++  movl -44(%rsp), %eax
++  addl 40(%rsi), %eax
++  movl %eax, 40(%r15)
++  movl -40(%rsp), %eax
++  addl 44(%rsi), %eax
++  movl %eax, 44(%r15)
++  addl 48(%rsi), %r12d
++  movl %r12d, 48(%r15)
++  addl 52(%rsi), %edi
++  movl %edi, 52(%r15)
++  addl 56(%rsi), %r14d
++  movl %r14d, 56(%r15)
++  movl -32(%rsp), %eax
++  addl 60(%rsi), %eax
++  movl %eax, 60(%r15)
++  popq %rbx
++  popq %r12
++  popq %r13
++  popq %r14
++  popq %r15
++  popq %rbp
++  retq
++
++.L.str:
++  .asciz "%016llx\n"
++
++check_known_vector.test_in:
++  .long 1634760805
++  .long 857760878
++  .long 2036477234
++  .long 1797285236
++  .long 50462976
++  .long 117835012
++  .long 185207048
++  .long 252579084
++  .long 319951120
++  .long 387323156
++  .long 454695192
++  .long 522067228
++  .long 1
++  .long 150994944
++  .long 1241513984
++  .long 0
++
+diff --git a/engineering/evidence/godbolt/chacha20-2026-09-08/gcc16.2.s b/engineering/evidence/godbolt/chacha20-2026-09-08/gcc16.2.s
+new file mode 100644
+index 00000000..381fdaea
+--- /dev/null
++++ b/engineering/evidence/godbolt/chacha20-2026-09-08/gcc16.2.s
+@@ -0,0 +1,349 @@
++chacha20_core:
++  pushq %rbp
++  movq %rsp, %rbp
++  pushq %r15
++  pushq %r14
++  movq %rsi, %r14
++  pushq %r13
++  pushq %r12
++  pushq %rbx
++  andq $-32, %rsp
++  subq $8, %rsp
++  movq %rdi, -88(%rsp)
++  movq (%rsi), %rax
++  movq 16(%r14), %rcx
++  movq 24(%r14), %rdx
++  movq 8(%rsi), %rsi
++  vmovdqu 32(%r14), %ymm0
++  movq %rax, -56(%rsp)
++  movl %eax, %r13d
++  movq %rcx, -40(%rsp)
++  movl -52(%rsp), %r9d
++  vmovdqa %ymm0, -24(%rsp)
++  movl -40(%rsp), %r10d
++  movl -8(%rsp), %ecx
++  movq %rsi, -48(%rsp)
++  movl -24(%rsp), %edi
++  movq %rdx, -32(%rsp)
++  movl -36(%rsp), %r11d
++  movl -32(%rsp), %eax
++  movl -16(%rsp), %ebx
++  movl $10, -80(%rsp)
++  movl -28(%rsp), %r15d
++  movl -4(%rsp), %edx
++  movq %r14, -96(%rsp)
++  movl -20(%rsp), %esi
++  movl -48(%rsp), %r8d
++  movl %ebx, -60(%rsp)
++  movl -12(%rsp), %r12d
++  movl -44(%rsp), %ebx
++  movl %eax, -72(%rsp)
++  movl -60(%rsp), %r14d
++  movl (%rsp), %eax
++  movl %r15d, -76(%rsp)
++  movl 4(%rsp), %r15d
++.L2:
++  addl %r11d, %r9d
++  addl %r10d, %r13d
++  xorl %r9d, %edx
++  xorl %r13d, %ecx
++  rorx $16, %edx, %edx
++  addl %edx, %esi
++  rorx $16, %ecx, %ecx
++  addl %ecx, %edi
++  xorl %esi, %r11d
++  xorl %edi, %r10d
++  rorx $20, %r11d, %r11d
++  addl %r11d, %r9d
++  rorx $20, %r10d, %r10d
++  addl %r10d, %r13d
++  xorl %r9d, %edx
++  xorl %r13d, %ecx
++  rorx $24, %edx, %edx
++  addl %edx, %esi
++  rorx $24, %ecx, %ecx
++  addl %ecx, %edi
++  xorl %esi, %r11d
++  movl %esi, -68(%rsp)
++  movl -72(%rsp), %esi
++  xorl %edi, %r10d
++  movl %edi, -60(%rsp)
++  rorx $25, %r10d, %edi
++  rorx $25, %r11d, %r11d
++  addl %r11d, %r13d
++  addl %esi, %r8d
++  movl %edi, -64(%rsp)
++  xorl %r8d, %eax
++  rorx $16, %eax, %eax
++  addl %eax, %r14d
++  xorl %r14d, %esi
++  rorx $20, %esi, %edi
++  movl -76(%rsp), %esi
++  addl %edi, %r8d
++  xorl %r8d, %eax
++  leal (%rsi,%rbx), %r10d
++  rorx $24, %eax, %eax
++  addl %eax, %r14d
++  xorl %r10d, %r15d
++  xorl %r14d, %edi
++  rorx $16, %r15d, %ebx
++  addl %ebx, %r12d
++  rorx $25, %edi, %edi
++  xorl %r12d, %esi
++  rorx $20, %esi, %esi
++  addl %esi, %r10d
++  xorl %r10d, %ebx
++  rorx $24, %ebx, %ebx
++  addl %ebx, %r12d
++  xorl %r12d, %esi
++  xorl %r13d, %ebx
++  addl %edi, %r9d
++  xorl %r9d, %ecx
++  rorx $16, %ebx, %ebx
++  addl %ebx, %r14d
++  rorx $25, %esi, %esi
++  rorx $16, %ecx, %ecx
++  addl %ecx, %r12d
++  xorl %r14d, %r11d
++  addl %esi, %r8d
++  xorl %r12d, %edi
++  rorx $20, %r11d, %r11d
++  addl %r11d, %r13d
++  xorl %r8d, %edx
++  rorx $20, %edi, %edi
++  addl %edi, %r9d
++  xorl %r13d, %ebx
++  rorx $16, %edx, %edx
++  xorl %r9d, %ecx
++  rorx $24, %ebx, %r15d
++  addl %r15d, %r14d
++  rorx $24, %ecx, %ecx
++  addl %ecx, %r12d
++  xorl %r14d, %r11d
++  xorl %r12d, %edi
++  rorx $25, %r11d, %r11d
++  rorx $25, %edi, %ebx
++  movl -60(%rsp), %edi
++  movl %ebx, -72(%rsp)
++  addl %edx, %edi
++  xorl %edi, %esi
++  rorx $20, %esi, %esi
++  addl %esi, %r8d
++  xorl %r8d, %edx
++  rorx $24, %edx, %edx
++  addl %edx, %edi
++  xorl %edi, %esi
++  rorx $25, %esi, %ebx
++  movl %ebx, -76(%rsp)
++  movl -64(%rsp), %ebx
++  movl -68(%rsp), %esi
++  addl %r10d, %ebx
++  movl -64(%rsp), %r10d
++  xorl %ebx, %eax
++  rorx $16, %eax, %eax
++  addl %eax, %esi
++  xorl %esi, %r10d
++  rorx $20, %r10d, %r10d
++  addl %r10d, %ebx
++  xorl %ebx, %eax
++  rorx $24, %eax, %eax
++  addl %eax, %esi
++  xorl %esi, %r10d
++  subl $1, -80(%rsp)
++  rorx $25, %r10d, %r10d
++  jne .L2
++  movl %r14d, -60(%rsp)
++  movq -96(%rsp), %r14
++  movl %r13d, -64(%rsp)
++  movl %r13d, -56(%rsp)
++  movl -60(%rsp), %r13d
++  movl %eax, -68(%rsp)
++  movl %r13d, -16(%rsp)
++  movl -72(%rsp), %r13d
++  movl %eax, (%rsp)
++  movq -88(%rsp), %rax
++  movl %r13d, -32(%rsp)
++  movl -76(%rsp), %r13d
++  movl %r15d, 4(%rsp)
++  movl %r13d, -28(%rsp)
++  leaq -4(%rax), %r13
++  subq %r14, %r13
++  movl %r11d, -36(%rsp)
++  movl %r9d, -52(%rsp)
++  movl %ecx, -8(%rsp)
++  movl %r12d, -12(%rsp)
++  movl %r8d, -48(%rsp)
++  movl %edx, -4(%rsp)
++  movl %edi, -24(%rsp)
++  movl %ebx, -44(%rsp)
++  movl %esi, -20(%rsp)
++  movl %r10d, -40(%rsp)
++  cmpq $24, %r13
++  jbe .L3
++  vmovdqu (%r14), %ymm0
++  vpaddd -56(%rsp), %ymm0, %ymm0
++  vmovdqu %ymm0, (%rax)
++  vmovdqu 32(%r14), %ymm0
++  vpaddd -24(%rsp), %ymm0, %ymm0
++  vmovdqu %ymm0, 32(%rax)
++.L6:
++  vzeroupper
++  leaq -40(%rbp), %rsp
++  popq %rbx
++  popq %r12
++  popq %r13
++  popq %r14
++  popq %r15
++  popq %rbp
++  ret
++.L3:
++  movl -64(%rsp), %r13d
++  addl (%r14), %r13d
++  movl %r13d, %eax
++  movq -88(%rsp), %r13
++  movl %eax, 0(%r13)
++  addl 4(%r14), %r9d
++  movl %r9d, 4(%r13)
++  addl 8(%r14), %r8d
++  movl %r8d, 8(%r13)
++  addl 12(%r14), %ebx
++  movl %ebx, 12(%r13)
++  addl 16(%r14), %r10d
++  movl %r10d, 16(%r13)
++  addl 20(%r14), %r11d
++  movl %r11d, 20(%r13)
++  movl -72(%rsp), %r8d
++  addl 24(%r14), %r8d
++  movl %r8d, 24(%r13)
++  movl -76(%rsp), %r8d
++  addl 28(%r14), %r8d
++  movl %r8d, 28(%r13)
++  addl 32(%r14), %edi
++  movl %edi, 32(%r13)
++  addl 36(%r14), %esi
++  movl %esi, 36(%r13)
++  movl -60(%rsp), %esi
++  addl 40(%r14), %esi
++  movl %esi, 40(%r13)
++  movl 44(%r14), %esi
++  addl %r12d, %esi
++  movl %esi, 44(%r13)
++  addl 48(%r14), %ecx
++  movl %ecx, 48(%r13)
++  addl 52(%r14), %edx
++  movl %edx, 52(%r13)
++  movl -68(%rsp), %eax
++  addl 56(%r14), %eax
++  movl %eax, 56(%r13)
++  movl 60(%r14), %eax
++  addl %r15d, %eax
++  movl %eax, 60(%r13)
++  jmp .L6
++.LC4:
++  .string "%016llx\n"
++main:
++  subq $168, %rsp
++  movl $test_in.0, %esi
++  leaq 64(%rsp), %rdi
++  call chacha20_core
++  cmpl $-454561520, 64(%rsp)
++  jne .L10
++  cmpl $358169553, 68(%rsp)
++  je .L18
++.L10:
++  movl $2, %eax
++  addq $168, %rsp
++  ret
++.L18:
++  cmpl $-394014517, 120(%rsp)
++  jne .L10
++  movq %rbx, 136(%rsp)
++  movq %rbp, 144(%rsp)
++  movq %r12, 152(%rsp)
++  movq %r13, 160(%rsp)
++  cmpl $1312575650, 124(%rsp)
++  je .L19
++  movq 136(%rsp), %rbx
++  movq 144(%rsp), %rbp
++  movq 152(%rsp), %r12
++  movq 160(%rsp), %r13
++  jmp .L10
++.L19:
++  vmovdqa .LC0(%rip), %xmm0
++  movl $67372036, %r13d
++  xorl %ebp, %ebp
++  xorl %ebx, %ebx
++  movabsq $723401728363923721, %rax
++  movl $185273099, 44(%rsp)
++  movq %rax, 36(%rsp)
++  movabsq $81985530642677487, %rax
++  vmovdqa %xmm0, (%rsp)
++  vmovdqa .LC1(%rip), %xmm0
++  movq %rax, 52(%rsp)
++  movl $-1985229329, 60(%rsp)
++  vmovdqu %xmm0, 20(%rsp)
++.L11:
++  xorl %r12d, %r12d
++.L13:
++  movl %r12d, %eax
++  movq %rsp, %rsi
++  leaq 64(%rsp), %rdi
++  movl %r13d, 16(%rsp)
++  xorl %ebp, %eax
++  addl $1, %r12d
++  movl %eax, 48(%rsp)
++  call chacha20_core
++  movl 64(%rsp), %edx
++  movl 92(%rsp), %eax
++  movq %rdx, %rcx
++  salq $16, %rax
++  movzbl %dl, %edx
++  salq $32, %rcx
++  xorl %edx, %r13d
++  xorq %rcx, %rax
++  movl 124(%rsp), %ecx
++  xorq %rcx, %rax
++  addq %rax, %rbx
++  cmpl $131072, %r12d
++  jne .L13
++  addl $1, %ebp
++  cmpl $16, %ebp
++  jne .L11
++  movq %rbx, %rsi
++  movl $.LC4, %edi
++  xorl %eax, %eax
++  call printf
++  movq 136(%rsp), %rbx
++  xorl %eax, %eax
++  movq 144(%rsp), %rbp
++  movq 152(%rsp), %r12
++  movq 160(%rsp), %r13
++  addq $168, %rsp
++  ret
++test_in.0:
++  .long 1634760805
++  .long 857760878
++  .long 2036477234
++  .long 1797285236
++  .long 50462976
++  .long 117835012
++  .long 185207048
++  .long 252579084
++  .long 319951120
++  .long 387323156
++  .long 454695192
++  .long 522067228
++  .long 1
++  .long 150994944
++  .long 1241513984
++  .long 0
++.LC0:
++  .long 1634760805
++  .long 857760878
++  .long 2036477234
++  .long 1797285236
++.LC1:
++  .long 84215045
++  .long 101058054
++  .long 117901063
++  .long 134744072
+diff --git a/engineering/evidence/godbolt/chacha20-2026-09-08/icx.s b/engineering/evidence/godbolt/chacha20-2026-09-08/icx.s
+new file mode 100644
+index 00000000..fa5900a6
+--- /dev/null
++++ b/engineering/evidence/godbolt/chacha20-2026-09-08/icx.s
+@@ -0,0 +1,322 @@
++.LCPI0_0:
++  .long 1634760805
++  .long 857760878
++  .long 2036477234
++  .long 1797285236
++  .long 67372036
++  .long 84215045
++  .long 101058054
++  .long 117901063
++.LCPI0_1:
++  .long 134744072
++  .long 151587081
++  .long 168430090
++  .long 185273099
++main:
++  pushq %rbp
++  pushq %r15
++  pushq %r14
++  pushq %r13
++  pushq %r12
++  pushq %rbx
++  subq $152, %rsp
++  vstmxcsr 16(%rsp)
++  orl $32832, 16(%rsp)
++  vldmxcsr 16(%rsp)
++  leaq 16(%rsp), %rdi
++  movl $check_known_vector.test_in, %esi
++  callq chacha20_core
++  cmpl $-454561520, 16(%rsp)
++  jne .LBB0_2
++  cmpl $358169553, 20(%rsp)
++  jne .LBB0_2
++  cmpl $-394014517, 72(%rsp)
++  movl $2, %ebx
++  jne .LBB0_3
++  cmpl $1312575650, 76(%rsp)
++  jne .LBB0_3
++  vmovups .LCPI0_0(%rip), %ymm0
++  vmovups %ymm0, 16(%rsp)
++  vmovups .LCPI0_1(%rip), %xmm0
++  vmovups %xmm0, 48(%rsp)
++  movabsq $81985530642677487, %rax
++  movq %rax, 68(%rsp)
++  movl $-1985229329, 76(%rsp)
++  xorl %r15d, %r15d
++  movl $67372036, %ebp
++  leaq 80(%rsp), %rbx
++  xorl %eax, %eax
++.LBB0_7:
++  movq %rax, 8(%rsp)
++  xorl %r13d, %r13d
++.LBB0_8:
++  movl %r13d, %eax
++  movq 8(%rsp), %rcx
++  xorl %ecx, %eax
++  movq %rcx, %r12
++  movl %eax, 64(%rsp)
++  movq %rbx, %rdi
++  leaq 16(%rsp), %rsi
++  vzeroupper
++  callq chacha20_core
++  movl 80(%rsp), %ebx
++  movl 108(%rsp), %eax
++  movl 140(%rsp), %ecx
++  shlq $16, %rax
++  movzbl %bl, %r14d
++  shlq $32, %rbx
++  orq %rcx, %rbx
++  xorq %rax, %rbx
++  addq %r15, %rbx
++  xorl %ebp, %r14d
++  movl %r14d, 32(%rsp)
++  leal 1(%r13), %eax
++  xorl %r12d, %eax
++  movl %eax, 64(%rsp)
++  leaq 80(%rsp), %rdi
++  leaq 16(%rsp), %rsi
++  callq chacha20_core
++  movl 80(%rsp), %r15d
++  movl 108(%rsp), %eax
++  movl 140(%rsp), %ecx
++  shlq $16, %rax
++  movzbl %r15b, %ebp
++  shlq $32, %r15
++  orq %rcx, %r15
++  xorq %rax, %r15
++  xorl %r14d, %ebp
++  movl %ebp, 32(%rsp)
++  leal 2(%r13), %eax
++  xorl %r12d, %eax
++  movl %eax, 64(%rsp)
++  leaq 80(%rsp), %rdi
++  leaq 16(%rsp), %rsi
++  callq chacha20_core
++  movl 80(%rsp), %r12d
++  movl 108(%rsp), %eax
++  movl 140(%rsp), %ecx
++  shlq $16, %rax
++  movzbl %r12b, %r14d
++  shlq $32, %r12
++  orq %rcx, %r12
++  xorq %rax, %r12
++  addq %r15, %r12
++  addq %rbx, %r12
++  leaq 80(%rsp), %rbx
++  xorl %ebp, %r14d
++  movl %r14d, 32(%rsp)
++  leal 3(%r13), %eax
++  xorl 8(%rsp), %eax
++  movl %eax, 64(%rsp)
++  movq %rbx, %rdi
++  leaq 16(%rsp), %rsi
++  callq chacha20_core
++  movl 80(%rsp), %r15d
++  movl 108(%rsp), %eax
++  movl 140(%rsp), %ecx
++  shlq $16, %rax
++  movzbl %r15b, %ebp
++  shlq $32, %r15
++  orq %rcx, %r15
++  xorq %rax, %r15
++  addq %r12, %r15
++  xorl %r14d, %ebp
++  movl %ebp, 32(%rsp)
++  addl $4, %r13d
++  cmpl $131072, %r13d
++  jne .LBB0_8
++  movq 8(%rsp), %rcx
++  leal 1(%rcx), %eax
++  cmpl $15, %ecx
++  jne .LBB0_7
++  xorl %ebx, %ebx
++  movl $.L.str, %edi
++  movq %r15, %rsi
++  xorl %eax, %eax
++  callq printf
++  jmp .LBB0_3
++.LBB0_2:
++  movl $2, %ebx
++.LBB0_3:
++  movl %ebx, %eax
++  addq $152, %rsp
++  popq %rbx
++  popq %r12
++  popq %r13
++  popq %r14
++  popq %r15
++  popq %rbp
++  retq
++
++.LCPI1_0:
++  .byte 6
++  .byte 7
++  .byte 4
++  .byte 5
++  .byte 10
++  .byte 11
++  .byte 8
++  .byte 9
++  .byte 14
++  .byte 15
++  .byte 12
++  .byte 13
++  .byte 2
++  .byte 3
++  .byte 0
++  .byte 1
++.LCPI1_1:
++  .byte 14
++  .byte 15
++  .byte 12
++  .byte 13
++  .byte 2
++  .byte 3
++  .byte 0
++  .byte 1
++  .byte 6
++  .byte 7
++  .byte 4
++  .byte 5
++  .byte 10
++  .byte 11
++  .byte 8
++  .byte 9
++.LCPI1_2:
++  .byte 7
++  .byte 4
++  .byte 5
++  .byte 6
++  .byte 11
++  .byte 8
++  .byte 9
++  .byte 10
++  .byte 15
++  .byte 12
++  .byte 13
++  .byte 14
++  .byte 3
++  .byte 0
++  .byte 1
++  .byte 2
++.LCPI1_3:
++  .byte 3
++  .byte 0
++  .byte 1
++  .byte 2
++  .byte 7
++  .byte 4
++  .byte 5
++  .byte 6
++  .byte 11
++  .byte 8
++  .byte 9
++  .byte 10
++  .byte 15
++  .byte 12
++  .byte 13
++  .byte 14
++.LCPI1_4:
++  .byte 2
++  .byte 3
++  .byte 0
++  .byte 1
++  .byte 6
++  .byte 7
++  .byte 4
++  .byte 5
++  .byte 10
++  .byte 11
++  .byte 8
++  .byte 9
++  .byte 14
++  .byte 15
++  .byte 12
++  .byte 13
++chacha20_core:
++  vmovdqu 32(%rsi), %xmm5
++  vpshufd $147, 16(%rsi), %xmm6
++  vpshufd $78, (%rsi), %xmm7
++  vpshufd $57, 48(%rsi), %xmm8
++  movl $10, %eax
++  vmovdqu .LCPI1_0(%rip), %xmm0
++  vmovdqu .LCPI1_1(%rip), %xmm1
++  vmovdqu .LCPI1_2(%rip), %xmm2
++  vmovdqu .LCPI1_3(%rip), %xmm3
++  vmovdqu .LCPI1_4(%rip), %xmm4
++.LBB1_1:
++  vpshufb %xmm1, %xmm8, %xmm8
++  vpshufd $57, %xmm7, %xmm7
++  vpaddd %xmm6, %xmm7, %xmm7
++  vpshufb %xmm0, %xmm7, %xmm9
++  vpxor %xmm9, %xmm8, %xmm8
++  vpaddd %xmm5, %xmm8, %xmm5
++  vpshufd $147, %xmm5, %xmm9
++  vpxor %xmm6, %xmm9, %xmm6
++  vpsrld $20, %xmm6, %xmm9
++  vpslld $12, %xmm6, %xmm6
++  vpor %xmm6, %xmm9, %xmm6
++  vpaddd %xmm7, %xmm6, %xmm7
++  vpshufb %xmm2, %xmm7, %xmm9
++  vpshufb %xmm3, %xmm8, %xmm8
++  vpxor %xmm8, %xmm9, %xmm8
++  vpaddd %xmm5, %xmm8, %xmm5
++  vpshufd $147, %xmm5, %xmm9
++  vpxor %xmm6, %xmm9, %xmm6
++  vpsrld $25, %xmm6, %xmm9
++  vpslld $7, %xmm6, %xmm6
++  vpor %xmm6, %xmm9, %xmm6
++  vpshufd $147, %xmm7, %xmm7
++  vpaddd %xmm6, %xmm7, %xmm7
++  vpshufb %xmm4, %xmm7, %xmm9
++  vpshufb %xmm0, %xmm8, %xmm8
++  vpxor %xmm9, %xmm8, %xmm8
++  vpaddd %xmm5, %xmm8, %xmm5
++  vpxor %xmm6, %xmm5, %xmm6
++  vpsrld $20, %xmm6, %xmm9
++  vpslld $12, %xmm6, %xmm6
++  vpor %xmm6, %xmm9, %xmm6
++  vpaddd %xmm7, %xmm6, %xmm7
++  vpshufb %xmm3, %xmm7, %xmm9
++  vpshufb %xmm3, %xmm8, %xmm8
++  vpxor %xmm8, %xmm9, %xmm8
++  vpaddd %xmm5, %xmm8, %xmm5
++  vpxor %xmm6, %xmm5, %xmm6
++  vpsrld $25, %xmm6, %xmm9
++  vpslld $7, %xmm6, %xmm6
++  vpor %xmm6, %xmm9, %xmm6
++  decl %eax
++  jne .LBB1_1
++  vpshufd $78, %xmm7, %xmm0
++  vpshufd $57, %xmm6, %xmm1
++  vinserti128 $1, %xmm1, %ymm0, %ymm0
++  vpshufd $147, %xmm8, %xmm1
++  vinserti128 $1, %xmm1, %ymm5, %ymm1
++  vpaddd (%rsi), %ymm0, %ymm0
++  vmovdqu %ymm0, (%rdi)
++  vpaddd 32(%rsi), %ymm1, %ymm0
++  vmovdqu %ymm0, 32(%rdi)
++  vzeroupper
++  retq
++
++.L.str:
++  .asciz "%016llx\n"
++
++check_known_vector.test_in:
++  .long 1634760805
++  .long 857760878
++  .long 2036477234
++  .long 1797285236
++  .long 50462976
++  .long 117835012
++  .long 185207048
++  .long 252579084
++  .long 319951120
++  .long 387323156
++  .long 454695192
++  .long 522067228
++  .long 1
++  .long 150994944
++  .long 1241513984
++  .long 0
++
+diff --git a/engineering/evidence/godbolt/chacha20-2026-09-08/lccc.s b/engineering/evidence/godbolt/chacha20-2026-09-08/lccc.s
+new file mode 100644
+index 00000000..174f18af
+--- /dev/null
++++ b/engineering/evidence/godbolt/chacha20-2026-09-08/lccc.s
+@@ -0,0 +1,542 @@
++.section .rodata
++.Lstr0:
++    .byte 37, 48, 49, 54, 108, 108, 120, 10, 0
++
++.section .rodata
++.align 16
++.type check_known_vector.test_in.0, @object
++.size check_known_vector.test_in.0, 64
++check_known_vector.test_in.0:
++    .long 1634760805
++    .long 857760878
++    .long 2036477234
++    .long 1797285236
++    .long 50462976
++    .long 117835012
++    .long 185207048
++    .long 252579084
++    .long 319951120
++    .long 387323156
++    .long 454695192
++    .long 522067228
++    .long 1
++    .long 150994944
++    .long 1241513984
++    .zero 4
++
++.text
++.p2align 4
++.type chacha20_core, @function
++chacha20_core:
++.cfi_startproc
++    pushq %rbx
++    pushq %r12
++    pushq %r13
++    pushq %r14
++    pushq %r15
++    pushq %rbp
++    subq $232, %rsp
++    .cfi_def_cfa_offset 288
++    movq %rdi, 216(%rsp)
++    movq %rsi, 208(%rsp)
++    movl (%rsi), %eax
++    movq %rax, 200(%rsp)
++    movq 208(%rsp), %rax
++    leaq 4(%rax), %rax
++    movq %rax, %rdi
++    movl (%rax), %eax
++    movq %rax, 120(%rsp)
++    movq 208(%rsp), %rax
++    leaq 8(%rax), %rax
++    movq %rax, %rsi
++    movl (%rax), %eax
++    movq %rax, 160(%rsp)
++    movq 208(%rsp), %rax
++    leaq 12(%rax), %rax
++    movq %rax, %rdx
++    movl (%rax), %eax
++    movq %rax, 80(%rsp)
++    movq 208(%rsp), %rax
++    leaq 16(%rax), %rax
++    movq %rax, %r8
++    movl (%rax), %eax
++    movq %rax, 128(%rsp)
++    movq 208(%rsp), %rax
++    leaq 20(%rax), %rax
++    movq %rax, %r9
++    movl (%rax), %eax
++    movq %rax, 168(%rsp)
++    movq 208(%rsp), %rax
++    leaq 24(%rax), %rax
++    movq %rax, %r11
++    movl (%rax), %eax
++    movq %rax, 88(%rsp)
++    movq 208(%rsp), %rax
++    leaq 28(%rax), %rax
++    movq %rax, %r10
++    movl (%rax), %eax
++    movq %rax, 136(%rsp)
++    movq 208(%rsp), %rax
++    leaq 32(%rax), %rax
++    movq %rax, %rdi
++    movl (%rax), %eax
++    movq %rax, 176(%rsp)
++    movq 208(%rsp), %rax
++    leaq 36(%rax), %rax
++    movq %rax, %rsi
++    movl (%rax), %eax
++    movq %rax, 96(%rsp)
++    movq 208(%rsp), %rax
++    leaq 40(%rax), %rax
++    movq %rax, %rdx
++    movl (%rax), %eax
++    movq %rax, 144(%rsp)
++    movq 208(%rsp), %rax
++    leaq 44(%rax), %rax
++    movq %rax, %r8
++    movl (%rax), %eax
++    movq %rax, 184(%rsp)
++    movq 208(%rsp), %rax
++    leaq 48(%rax), %rax
++    movq %rax, %r9
++    movl (%rax), %eax
++    movq %rax, 104(%rsp)
++    movq 208(%rsp), %rax
++    leaq 52(%rax), %rax
++    movq %rax, %r11
++    movl (%rax), %eax
++    movq %rax, 152(%rsp)
++    movq 208(%rsp), %rax
++    leaq 56(%rax), %rax
++    movq %rax, %r10
++    movl (%rax), %eax
++    movq %rax, 192(%rsp)
++    movq 208(%rsp), %rax
++    leaq 60(%rax), %rax
++    movq %rax, %rdi
++    movl (%rax), %eax
++    movq %rax, 112(%rsp)
++    movq $0, 72(%rsp)
++.LBB1:
++    movl 72(%rsp), %eax
++    cmpl $10, %eax
++jge .LBB3
++.p2align 4,,10
++.p2align 3
++.LBB2:
++    movl 200(%rsp), %esi
++    addl 128(%rsp), %esi
++    movl 104(%rsp), %edx
++    xorl %esi, %edx
++    roll $16, %edx
++    movl 176(%rsp), %r8d
++    addl %edx, %r8d
++    movl 128(%rsp), %r9d
++    xorl %r8d, %r9d
++    roll $12, %r9d
++    addl %r9d, %esi
++    xorl %esi, %edx
++    roll $8, %edx
++    addl %edx, %r8d
++    xorl %r8d, %r9d
++    roll $7, %r9d
++    movl 120(%rsp), %r11d
++    addl 168(%rsp), %r11d
++    movl 152(%rsp), %r10d
++    xorl %r11d, %r10d
++    roll $16, %r10d
++    movl 96(%rsp), %edi
++    addl %r10d, %edi
++    movl 168(%rsp), %ebx
++    xorl %edi, %ebx
++    roll $12, %ebx
++    addl %ebx, %r11d
++    xorl %r11d, %r10d
++    roll $8, %r10d
++    addl %r10d, %edi
++    xorl %edi, %ebx
++    roll $7, %ebx
++    movl 160(%rsp), %r12d
++    addl 88(%rsp), %r12d
++    movl 192(%rsp), %r13d
++    xorl %r12d, %r13d
++    roll $16, %r13d
++    movl 144(%rsp), %r14d
++    addl %r13d, %r14d
++    movl 88(%rsp), %r15d
++    xorl %r14d, %r15d
++    roll $12, %r15d
++    addl %r15d, %r12d
++    xorl %r12d, %r13d
++    roll $8, %r13d
++    addl %r13d, %r14d
++    xorl %r14d, %r15d
++    roll $7, %r15d
++    movl 80(%rsp), %ebp
++    addl 136(%rsp), %ebp
++    movl %ebp, %eax
++    xorl 112(%rsp), %eax
++    roll $16, %eax
++    movl %eax, 68(%rsp)
++    movl 184(%rsp), %eax
++    addl 68(%rsp), %eax
++    movl %eax, 64(%rsp)
++    movl 136(%rsp), %eax
++    xorl 64(%rsp), %eax
++    roll $12, %eax
++    movl %eax, 60(%rsp)
++    addl %eax, %ebp
++    movl %ebp, %eax
++    xorl 68(%rsp), %eax
++    roll $8, %eax
++    movl %eax, 68(%rsp)
++    movl 64(%rsp), %eax
++    addl 68(%rsp), %eax
++    movl %eax, 56(%rsp)
++    movl 60(%rsp), %eax
++    xorl 56(%rsp), %eax
++    roll $7, %eax
++    movl %eax, 64(%rsp)
++    addl %ebx, %esi
++    movl %esi, %eax
++    xorl 68(%rsp), %eax
++    roll $16, %eax
++    movl %eax, 68(%rsp)
++    addl 68(%rsp), %r14d
++    xorl %r14d, %ebx
++    roll $12, %ebx
++    addl %ebx, %esi
++    movl %esi, %eax
++    xorl 68(%rsp), %eax
++    roll $8, %eax
++    movq %rax, 112(%rsp)
++    addl 112(%rsp), %r14d
++    xorl %r14d, %ebx
++    movl %ebx, %eax
++    roll $7, %eax
++    movq %rax, 168(%rsp)
++    addl %r15d, %r11d
++    xorl %r11d, %edx
++    roll $16, %edx
++    movl 56(%rsp), %ebx
++    addl %edx, %ebx
++    xorl %ebx, %r15d
++    roll $12, %r15d
++    addl %r15d, %r11d
++    xorl %r11d, %edx
++    roll $8, %edx
++    addl %edx, %ebx
++    xorl %ebx, %r15d
++    movl %r15d, %eax
++    roll $7, %eax
++    movq %rax, 88(%rsp)
++    addl 64(%rsp), %r12d
++    xorl %r12d, %r10d
++    roll $16, %r10d
++    addl %r10d, %r8d
++    movl 64(%rsp), %r15d
++    xorl %r8d, %r15d
++    roll $12, %r15d
++    addl %r15d, %r12d
++    xorl %r12d, %r10d
++    roll $8, %r10d
++    addl %r10d, %r8d
++    xorl %r8d, %r15d
++    movl %r15d, %eax
++    roll $7, %eax
++    movq %rax, 136(%rsp)
++    addl %r9d, %ebp
++    xorl %ebp, %r13d
++    roll $16, %r13d
++    addl %r13d, %edi
++    xorl %edi, %r9d
++    roll $12, %r9d
++    addl %r9d, %ebp
++    xorl %ebp, %r13d
++    roll $8, %r13d
++    addl %r13d, %edi
++    xorl %edi, %r9d
++    movl %r9d, %eax
++    roll $7, %eax
++    movq %rax, 128(%rsp)
++    movl 72(%rsp), %eax
++    addl $1, %eax
++    cltq
++    movq %rax, 72(%rsp)
++    movq %rsi, 200(%rsp)
++    movq %r13, 192(%rsp)
++    movq %rbx, 184(%rsp)
++    movq %r8, 176(%rsp)
++    movq %r12, 160(%rsp)
++    movq %r10, 152(%rsp)
++    movq %r14, 144(%rsp)
++    movq %r11, 120(%rsp)
++    movq %rdx, 104(%rsp)
++    movq %rdi, 96(%rsp)
++    movq %rbp, 80(%rsp)
++    movl %eax, %eax
++    cmpl $10, %eax
++jl .LBB2
++.LBB3:
++    movq 208(%rsp), %rcx
++    movl (%rcx), %eax
++    addl 200(%rsp), %eax
++    movq 216(%rsp), %rcx
++    movl %eax, (%rcx)
++    movq 216(%rsp), %rdx
++    leaq 4(%rdx), %rdx
++    movq 208(%rsp), %rax
++    leaq 4(%rax), %rax
++    movq %rax, %r8
++    movl (%rax), %eax
++    addl 120(%rsp), %eax
++    movl %eax, (%rdx)
++    movq 216(%rsp), %r11
++    leaq 8(%r11), %r11
++    movq 208(%rsp), %rax
++    leaq 8(%rax), %rax
++    movq %rax, %r10
++    movl (%rax), %eax
++    addl 160(%rsp), %eax
++    movl %eax, (%r11)
++    movq 216(%rsp), %rsi
++    leaq 12(%rsi), %rsi
++    movq 208(%rsp), %rax
++    leaq 12(%rax), %rax
++    movq %rax, %rdx
++    movl (%rax), %eax
++    addl 80(%rsp), %eax
++    movl %eax, (%rsi)
++    movq 216(%rsp), %r9
++    leaq 16(%r9), %r9
++    movq 208(%rsp), %rax
++    leaq 16(%rax), %rax
++    movq %rax, %r11
++    movl (%rax), %eax
++    addl 128(%rsp), %eax
++    movl %eax, (%r9)
++    movq 216(%rsp), %rdi
++    leaq 20(%rdi), %rdi
++    movq 208(%rsp), %rax
++    leaq 20(%rax), %rax
++    movq %rax, %rsi
++    movl (%rax), %eax
++    addl 168(%rsp), %eax
++    movl %eax, (%rdi)
++    movq 216(%rsp), %r8
++    leaq 24(%r8), %r8
++    movq 208(%rsp), %rax
++    leaq 24(%rax), %rax
++    movq %rax, %r9
++    movl (%rax), %eax
++    addl 88(%rsp), %eax
++    movl %eax, (%r8)
++    movq 216(%rsp), %r10
++    leaq 28(%r10), %r10
++    movq 208(%rsp), %rax
++    leaq 28(%rax), %rax
++    movq %rax, %rdi
++    movl (%rax), %eax
++    addl 136(%rsp), %eax
++    movl %eax, (%r10)
++    movq 216(%rsp), %rdx
++    leaq 32(%rdx), %rdx
++    movq 208(%rsp), %rax
++    leaq 32(%rax), %rax
++    movq %rax, %r8
++    movl (%rax), %eax
++    addl 176(%rsp), %eax
++    movl %eax, (%rdx)
++    movq 216(%rsp), %r11
++    leaq 36(%r11), %r11
++    movq 208(%rsp), %rax
++    leaq 36(%rax), %rax
++    movq %rax, %r10
++    movl (%rax), %eax
++    addl 96(%rsp), %eax
++    movl %eax, (%r11)
++    movq 216(%rsp), %rsi
++    leaq 40(%rsi), %rsi
++    movq 208(%rsp), %rax
++    leaq 40(%rax), %rax
++    movq %rax, %rdx
++    movl (%rax), %eax
++    addl 144(%rsp), %eax
++    movl %eax, (%rsi)
++    movq 216(%rsp), %r9
++    leaq 44(%r9), %r9
++    movq 208(%rsp), %rax
++    leaq 44(%rax), %rax
++    movq %rax, %r11
++    movl (%rax), %eax
++    addl 184(%rsp), %eax
++    movl %eax, (%r9)
++    movq 216(%rsp), %rdi
++    leaq 48(%rdi), %rdi
++    movq 208(%rsp), %rax
++    leaq 48(%rax), %rax
++    movq %rax, %rsi
++    movl (%rax), %eax
++    addl 104(%rsp), %eax
++    movl %eax, (%rdi)
++    movq 216(%rsp), %r8
++    leaq 52(%r8), %r8
++    movq 208(%rsp), %rax
++    leaq 52(%rax), %rax
++    movq %rax, %r9
++    movl (%rax), %eax
++    addl 152(%rsp), %eax
++    movl %eax, (%r8)
++    movq 216(%rsp), %r10
++    leaq 56(%r10), %r10
++    movq 208(%rsp), %rax
++    leaq 56(%rax), %rax
++    movq %rax, %rdi
++    movl (%rax), %eax
++    addl 192(%rsp), %eax
++    movl %eax, (%r10)
++    movq 216(%rsp), %rdx
++    leaq 60(%rdx), %rdx
++    movq 208(%rsp), %rax
++    leaq 60(%rax), %rax
++    movq %rax, %r8
++    movl (%rax), %eax
++    addl 112(%rsp), %eax
++    movl %eax, (%rdx)
++    addq $232, %rsp
++    popq %rbp
++    popq %r15
++    popq %r14
++    popq %r13
++    popq %r12
++    popq %rbx
++    ret
++.cfi_endproc
++.size chacha20_core, .-chacha20_core
++
++.globl main
++.p2align 4
++.type main, @function
++main:
++.cfi_startproc
++    pushq %rbx
++    pushq %r12
++    pushq %r13
++    pushq %r14
++    pushq %r15
++    pushq %rbp
++    subq $232, %rsp
++    .cfi_def_cfa_offset 288
++    leaq check_known_vector.test_in.0(%rip), %r11
++    leaq 32(%rsp), %rdi
++    movq %r11, %rax
++    movq %r11, %rsi
++    call chacha20_core
++    movl 32(%rsp), %r11d
++    cmpl $3840405776, %r11d
++jne .LBB8
++.LBB5:
++    movl 36(%rsp), %r8d
++    cmpl $358169553, %r8d
++jne .LBB8
++.LBB6:
++    movl 88(%rsp), %edi
++    cmpl $3900952779, %edi
++jne .LBB8
++.LBB7:
++    movl 92(%rsp), %edx
++    cmpl $1312575650, %edx
++    movl $0, %ecx
++    movl $1, %r11d
++    cmovnel %ecx, %r11d
++    testl %r11d, %r11d
++jne .LBB10
++    jmp .LBB9
++.LBB8:
++.LBB9:
++    movl $2, %eax
++.L__lccc_epilogue_1:
++    addq $232, %rsp
++    popq %rbp
++    popq %r15
++    popq %r14
++    popq %r13
++    popq %r12
++    popq %rbx
++    ret
++.LBB10:
++    movl $1634760805, 160(%rsp)
++    movl $857760878, 164(%rsp)
++    movl $2036477234, 168(%rsp)
++    movl $1797285236, 172(%rsp)
++    movl $67372036, 176(%rsp)
++    movl $84215045, 180(%rsp)
++    movl $101058054, 184(%rsp)
++    movl $117901063, 188(%rsp)
++    movl $134744072, 192(%rsp)
++    movl $151587081, 196(%rsp)
++    movl $168430090, 200(%rsp)
++    movl $185273099, 204(%rsp)
++    movl $0, 208(%rsp)
++    movl $3735928559, 212(%rsp)
++    movl $19088743, 216(%rsp)
++    movl $2309737967, 220(%rsp)
++    xorl %r10d, %r10d
++    xorl %r15d, %r15d
++.LBB11:
++    cmpl $16, %r15d
++jae .LBB16
++.p2align 4,,10
++.p2align 3
++.LBB12:
++    movq %r10, %rbp
++    movq $0, 24(%rsp)
++.LBB13:
++    movq 24(%rsp), %rax
++    cmpl $131072, %eax
++jae .LBB15
++.p2align 4,,10
++.p2align 3
++.LBB14:
++    movl %r15d, %eax
++    xorl 24(%rsp), %eax
++    movl %eax, 208(%rsp)
++    leaq 96(%rsp), %rdi
++    leaq 160(%rsp), %rsi
++    call chacha20_core
++    movl 96(%rsp), %r11d
++    movl %r11d, %r8d
++    shlq $32, %r8
++    movl 156(%rsp), %r9d
++    xorq %r9, %r8
++    movl 124(%rsp), %edi
++    shlq $16, %rdi
++    xorq %rdi, %r8
++    addq %r8, %rbp
++    andl $255, %r11d
++    movl 176(%rsp), %eax
++    xorl %r11d, %eax
++    movl %eax, 176(%rsp)
++    movq 24(%rsp), %rax
++    addl $1, %eax
++    movq %rax, 24(%rsp)
++    cmpl $131072, %eax
++jb .LBB14
++.LBB15:
++    addl $1, %r15d
++    movq %rbp, %r10
++    cmpl $16, %r15d
++jb .LBB12
++.LBB16:
++    leaq .Lstr0(%rip), %rdx
++    movq %rdx, %rdi
++    movq %r10, %rsi
++    xorl %eax, %eax
++    call printf@PLT
++    xorl %eax, %eax
++    jmp .L__lccc_epilogue_1
++.cfi_endproc
++.size main, .-main
++
++
++.section .note.GNU-stack,"",@progbits
+diff --git a/engineering/evidence/godbolt/chacha20-2026-09-08/manifest.json b/engineering/evidence/godbolt/chacha20-2026-09-08/manifest.json
+new file mode 100644
+index 00000000..697268f2
+--- /dev/null
++++ b/engineering/evidence/godbolt/chacha20-2026-09-08/manifest.json
+@@ -0,0 +1,44 @@
++{
++  "schema": 1,
++  "source": "tests/benchmark/programs/chacha20_block.c",
++  "source_sha256": "43d5ea728d902af8451fa6ae02e75bd7bd27eb9b79953c6fdfc09b65cf0ef875",
++  "function": null,
++  "remote_flags": "-O3 -march=x86-64-v3",
++  "local_flags": "-O3 -march=x86-64-v3",
++  "oracles": [
++    {
++      "key": "lccc",
++      "id": "target/fastbuild/lccc",
++      "name": "local LCCC",
++      "flags": "-O3 -march=x86-64-v3",
++      "instructions": 474
++    },
++    {
++      "key": "gcc16.2",
++      "id": "cg162",
++      "name": "x86-64 gcc 16.2",
++      "semver": "16.2",
++      "compilerType": "",
++      "flags": "-O3 -march=x86-64-v3",
++      "instructions": 310
++    },
++    {
++      "key": "cclang2310",
++      "id": "cclang2310",
++      "name": "x86-64 clang 23.1.0",
++      "semver": "23.1.0",
++      "compilerType": "clang",
++      "flags": "-O3 -march=x86-64-v3",
++      "instructions": 257
++    },
++    {
++      "key": "icx",
++      "id": "cicxlatest",
++      "name": "x86-64 icx (latest)",
++      "semver": "(latest)",
++      "compilerType": "clang-intel",
++      "flags": "-O3 -march=x86-64-v3",
++      "instructions": 193
++    }
++  ]
++}
+diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
+index 6d70d2f0..2ebdc24e 100644
+--- a/src/backend/live_range.rs
++++ b/src/backend/live_range.rs
+@@ -133,6 +133,24 @@ pub struct LiveRange {
+     /// on callee-saved registers for the whole 10-round loop while 12
+     /// state webs were demoted.
+     pub span_has_in_loop_use: bool,
++    /// Largest body size (latch_end - header_start, in instruction
++    /// positions) among the loop extents this range spans. Demoting a
++    /// span whose in-loop reads are exposed costs a reload per read per
++    /// iteration; whether that is amortizable depends on how much other
++    /// work the loop body contains. Used by the structural admission
++    /// cap's arming decision.
++    pub span_max_extent_len: u32,
++    /// True when EVERY use of this range is an addressing fold point
++    /// (GEP/Load/Store base recorded in `folded_at`): the value never
++    /// feeds an ALU operand. Such a range's register holds a base that
++    /// memory operands consume; it is not part of the loop's
++    /// register-bound arithmetic pressure, and spilling it merely moves
++    /// the base into an addressing reload. Pressure models and the
++    /// span-pressure valve must ignore it: counting fold-only bases as
++    /// loop pressure armed the structural cap for zlib_ng_adler32's
++    /// foldable byte loads (18 "shorts" that never needed 18 registers)
++    /// and demoted its marching pointer for nothing.
++    pub fold_only_uses: bool,
+     /// In-loop use points per pass (web-wide, max over spanned loops) —
+     /// the span's reload density inside the loop it spans. Feeds the
+     /// admission ceiling: a span read many times per pass pays that many
+@@ -219,6 +237,8 @@ impl LiveRange {
+             span_reserve: 0,
+             span_cost_bar: 0,
+             span_has_in_loop_use: false,
++            span_max_extent_len: 0,
++            fold_only_uses: false,
+             span_in_loop_uses: 0,
+             span_exposed_uses: 0,
+             span_recurrence: false,
+@@ -569,6 +589,26 @@ pub(crate) fn mark_loop_spanning(
+     // state, e.g. arith_loop's 32 live-out ints) measures a peak near zero
+     // and its spans keep the pool, which is what makes the cap safe to
+     // leave on universally.
++    // Fold-only ranges: every use is an addressing fold point. Computed
++    // before the peaks pass because pressure must exclude them (a base
++    // consumed exclusively by memory operands is not register-bound
++    // arithmetic pressure; its spill becomes an addressing reload).
++    let mut fold_only: FxHashSet<u32> = FxHashSet::default();
++    for r in ranges.iter() {
++        let mut all_uses_folded = !r.uses.is_empty();
++        for &u in &r.uses {
++            if !folded_at
++                .get(&u)
++                .is_some_and(|vids| vids.contains(&r.value_id))
++            {
++                all_uses_folded = false;
++                break;
++            }
++        }
++        if all_uses_folded {
++            fold_only.insert(r.value_id);
++        }
++    }
+     let mut peaks: Vec<u32> = Vec::with_capacity(loop_extents.len());
+     // Per extent: peak concurrency AND the shorts' total weighted cost —
+     // the latter prices what one reserved register buys for them (their
+@@ -580,8 +620,37 @@ pub(crate) fn mark_loop_spanning(
+         let mut shorts_cost = 0u64;
+         for r in ranges.iter() {
+             if r.start >= header_start && r.end <= latch_end {
+-                events.push((r.start, 1));
+-                events.push((r.end.saturating_add(1), -1));
++                // Fold-only bases (every use an addressing fold) are not
++                // register-bound pressure: a spill turns them into an
++                // addressing reload, not a dependence-chain stall, and
++                // their consumers can often absorb the slot directly.
++                // Counting them made adler32's unrolled byte loads look
++                // like 18 registers of demand.
++                if fold_only.contains(&r.value_id) {
++                    continue;
++                }
++                // Segment-aware concurrency: the allocator assigns by
++                // real live segments (RA-05), not fat envelopes, and a
++                // peak computed on fat envelopes wildly overcounts
++                // interleaved short lifetimes — an unrolled
++                // load-add-chain's 16 byte temporaries share registers
++                // through their holes and never occupy 16 registers at
++                // once, but their envelopes all overlap the loop body
++                // (zlib_ng_adler32 measured a fake peak of 18 against a
++                // 14-register pool, arming the structural cap for
++                // nothing). Fat ranges (no segment data) contribute
++                // their whole envelope, exactly as before.
++                if r.segments.is_empty() {
++                    events.push((r.start, 1));
++                    events.push((r.end.saturating_add(1), -1));
++                } else {
++                    for &(seg_start, seg_end) in &r.segments {
++                        if seg_start >= header_start && seg_end <= latch_end {
++                            events.push((seg_start, 1));
++                            events.push((seg_end.saturating_add(1), -1));
++                        }
++                    }
++                }
+                 shorts_cost = shorts_cost.saturating_add(r.total_cost());
+             }
+         }
+@@ -621,13 +690,12 @@ pub(crate) fn mark_loop_spanning(
+         let mut exposed = 0u32;
+         let mut last_point: Option<u32> = None;
+         for &u in &r.uses {
++            let folded_here = folded_at
++                .get(&u)
++                .is_some_and(|vids| vids.contains(&r.value_id));
+             if loop_extents.iter().any(|&(hs, le)| u >= hs && u <= le) {
+                 n += 1;
+-                if last_point != Some(u)
+-                    && !folded_at
+-                        .get(&u)
+-                        .is_some_and(|vids| vids.contains(&r.value_id))
+-                {
++                if last_point != Some(u) && !folded_here {
+                     exposed += 1;
+                 }
+             }
+@@ -643,12 +711,14 @@ pub(crate) fn mark_loop_spanning(
+         let mut spans = false;
+         let mut reserve = 0u32;
+         let mut bar = 0u64;
++        let mut max_extent_len = 0u32;
+         let mut in_loop_use = false;
+         for (((header_start, latch_end), peak), b) in loop_extents.iter().zip(&peaks).zip(&bars) {
+             if range.start <= *header_start && range.end >= *latch_end {
+                 spans = true;
+                 reserve = reserve.max(*peak);
+                 bar = bar.max(*b);
++                max_extent_len = max_extent_len.max(latch_end.saturating_sub(*header_start));
+                 // (the leader's own in-extent uses are summarized in
+                 // `any_use_in_extent`, consulted after the extent loop)
+             }
+@@ -690,6 +760,7 @@ pub(crate) fn mark_loop_spanning(
+                 }
+             }
+         }
++        range.fold_only_uses = fold_only.contains(&range.value_id);
+         if spans {
+             range.spans_loop = true;
+             range.span_in_loop_uses = in_loop_uses;
+@@ -698,6 +769,7 @@ pub(crate) fn mark_loop_spanning(
+             range.span_marked = true;
+             range.span_reserve = reserve.max(1);
+             range.span_cost_bar = bar;
++            range.span_max_extent_len = max_extent_len;
+             range.span_has_in_loop_use = in_loop_use;
+         }
+     }
+@@ -708,6 +780,13 @@ pub(crate) fn mark_loop_spanning(
+ /// `allocate_range`).
+ const MAX_SPAN_EXPOSED_USES: u32 = 2;
  
--                let c_name = if let Some(r) = self.operand_reg(&args[0]) {
--                    super::emit::phys_reg_name(r)
--                } else {
--                    self.operand_to_reg(&args[0], "rax");
--                    "rax"
-+                // Intrinsic-scratch pool (the caller-saved GP registers
-+                // the emitter may clobber around intrinsics; see the
-+                // FmaF64x4 scratch contract above). A reload fallback must
-+                // never land on a register already holding one of this
-+                // instruction's own operands: the C row base homed in %rsi
-+                // while a spilled j-offset reloaded into the fixed %rsi
-+                // scratch emitted `vmovupd (%rsi,%rsi)` — address 2*offset —
-+                // and miscompiled remainder-shaped FMA loops (segfault at
-+                // 2*j). Probe every operand's home up front so each reload
-+                // avoids all of them, not just the names resolved earlier.
-+                let c_home = self.operand_reg(&args[0]).map(super::emit::phys_reg_name);
-+                let b_home = self.operand_reg(&args[1]).map(super::emit::phys_reg_name);
-+                let off_home = self
-+                    .operand_reg(&off_operand)
-+                    .map(super::emit::phys_reg_name);
-+                let homes = [c_home, b_home, off_home];
-+                let pool = ["rax", "rcx", "rdx", "rsi", "rdi"];
-+                let home_taken = |r: &str| homes.iter().any(|h| *h == Some(r));
-+                let c_name = match c_home {
-+                    Some(name) => name,
-+                    None => {
-+                        let r = pool
-+                            .iter()
-+                            .find(|r| !home_taken(r))
-+                            .copied()
-+                            .expect("five-reg scratch pool, at most two operand homes");
-+                        self.operand_to_reg(&args[0], r);
-+                        r
-+                    }
-                 };
--                let b_name = if let Some(r) = self.operand_reg(&args[1]) {
--                    super::emit::phys_reg_name(r)
--                } else {
--                    self.operand_to_reg(&args[1], "rdx");
--                    "rdx"
-+                let b_name = match b_home {
-+                    Some(name) => name,
-+                    None => {
-+                        let r = pool
-+                            .iter()
-+                            .find(|r| !home_taken(r) && **r != c_name)
-+                            .copied()
-+                            .expect("five-reg scratch pool, at most two operand homes");
-+                        self.operand_to_reg(&args[1], r);
-+                        r
-+                    }
-                 };
--                let off_name = if let Some(r) = self.operand_reg(&off_operand) {
--                    super::emit::phys_reg_name(r)
--                } else {
--                    self.operand_to_reg(&off_operand, "rsi");
--                    "rsi"
-+                let off_name = match off_home {
-+                    Some(name) => name,
-+                    None => {
-+                        let r = pool
-+                            .iter()
-+                            .find(|r| !home_taken(r) && **r != c_name && **r != b_name)
-+                            .copied()
-+                            .expect("five-reg scratch pool, at most two operand homes");
-+                        self.operand_to_reg(&off_operand, r);
-+                        r
-+                    }
-                 };
++/// Ceiling on a span's remaining weighted cost for it to be demotable
++/// under structural auto-arming or evictable by the span-pressure valve.
++/// The measured separation among ADMISSION demotees: chacha20's ARX webs
++/// cost 11-21 while every workload that must not lose its spans costs
++/// 110-1100 (zlib_ng_adler32's checksum webs) — two orders of magnitude.
++const MAX_SPAN_REMCOST: u64 = 100;
++
+ /// Ceiling on a span's remaining future-use points for it to be evictable
+ /// by the span-pressure valve (see `find_span_valve_victim`).
+ const MAX_VALVE_SPAN_FUTURE_USES: u32 = 2;
+@@ -1406,11 +1485,94 @@ impl LinearScanAllocator {
+         // Seeded occupancy from earlier waves is not counted against the
+         // cap (the seed carries no value identity); the arg-staging waves
+         // that seed the main scan hold few registers for long.
+-        if range.spans_loop && self.ra_config.loop_span_reserve > 0 {
++        // In-loop-useless spans, pigeonhole-gated and independent of the
++        // reserve knob: when the worklist's spans alone could fill the
++        // pool, a register held across a whole loop by a value with NO
++        // read inside any loop it spans is pure loss — every reload is
++        // outside the loop (staged once, cold), while the register is
++        // denied to the loop's block-local ranges and to the machinst
++        // window allocator's scratch pool for the entire body. Every
++        // loop extent is a natural loop (back-edge-derived), so this is
++        // automatically heat-gated: cold straight-line code never
++        // demotes. chacha20_core's two loop-invariant pointer spans sat
++        // on callee-saved registers for the whole 10-round loop.
++        if range.spans_loop
++            && range.span_marked
++            && !range.span_has_in_loop_use
++            && self.total_spans >= self.available_regs.len()
++            // Under the explicit knob the historical contract demotes
++            // every in-loop-useless span; under structural auto-arming
++            // the same MAX_SPAN_REMCOST ceiling as worth_capping applies
++            // — an in-loop-useless span can still be expensive to stage
++            // once at its cold reload sites (zlib_ng_adler32's inlined
++            // NMAX loop: the loop-invariant pointers cost 110-1100 and
++            // demoting them bought nothing, +7 stack slots and +12%
++            // runtime measured 2026-09-08; chacha20's two pointer spans
++            // cost 10-20 and their demotion is part of the ARX win).
++            && (self.ra_config.loop_span_reserve > 0
++                || range.remaining_cost(range.start) <= MAX_SPAN_REMCOST)
++        {
++            self.allocate_spill_slot(range.value_id);
++            return;
++        }
++        // Structural auto-arming: the admission cap runs even with the
++        // policy knob at 0 when the span's own measurement shows a loop
++        // whose block-local shorts could fill the ENTIRE pool on their
++        // own — the absolute pigeonhole: with more shorts wanting
++        // registers simultaneously than registers exist, some
++        // per-iteration spill is forced no matter what the spans do, and
++        // demoting the excess spans up front (position-independent,
++        // priced by the exposed-use model) is strictly better than
++        // letting the scan's arrival order decide who spills
++        // positionally. This is the mechanism that carries the ARX
++        // shape: chacha20's quarter-round loop measures 17 concurrent
++        // register-bound shorts against a 14-register pool, so its 16
++        // loop-spanning state webs are capped at admission and the
++        // shorts cycle through the freed registers (456 vs 491 insns).
++        // Below the absolute threshold nothing changes: the shorts fit
++        // alongside the spans with room to spare (adler32's byte loop at
++        // reserve 9 and 4 after fold-only exclusion, crc32, varint —
++        // measured: demoting there only added reload traffic, +17
++        // stackmem in the golden gate), and the historical knob remains
++        // available as an explicit override.
++        // Amortization floor: a demoted span's exposed reloads are paid
++        // once per read PER ITERATION, so the trade only clears when the
++        // loop body has enough other work for them to amortize against.
++        // zlib_ng_adler32's inlined check loop (reserve 18 after fat-
++        // envelope overcounting was fixed, body ~25 positions) demoted
++        // its pointers and paid +14 stackmem in the golden gate for
++        // shorts that were never register-starved in the first place;
++        // chacha20's quarter-round body (~150 positions) pays ~24
++        // reloads against ~600 instructions of register-hungry ARX work
++        // and wins massively. 96 positions is the empirical line between
++        // those two bodies — roughly a full LSD/DSB delivery window.
++        const STRUCTURAL_MIN_EXTENT_LEN: u32 = 96;
++        let structural_pressure = range.spans_loop
++            && self.ra_config.loop_span_reserve == 0
++            // STRICT pigeonhole: the loop's block-local shorts, on their
++            // own, outnumber the whole pool. When they merely FILL it
++            // (zlib_ng_adler32's NMAX loop: peak 10 against 10) the scan
++            // can home every short once the spans sort themselves out,
++            // and pre-demoting spans only moves who spills (measured:
++            // +7 stack slots, runtime flat). When they EXCEED it
++            // (chacha20's interleaved quarter-round chains: peak 17
++            // against 14) some short spills no matter what, and the
++            // cap's cheap-first demotion is what hands the registers to
++            // the shorts instead of the arrival order (chacha20 771ms ->
++            // 442ms measured on 4f4f417d).
++            && (range.span_reserve as usize) > self.available_regs.len()
++            && range.span_max_extent_len >= STRUCTURAL_MIN_EXTENT_LEN;
++        if range.spans_loop && (self.ra_config.loop_span_reserve > 0 || structural_pressure) {
+             // Measured per-loop requirement, clamped by the policy knob:
+             // the knob is a ceiling (and 0 disables), the measurement is
+-            // the loop's own block-local peak concurrency.
+-            let reserve = (range.span_reserve as usize).min(self.ra_config.loop_span_reserve);
++            // the loop's own block-local peak concurrency. Under
++            // structural auto-arming the knob is absent and the
++            // measurement IS the reserve.
++            let reserve = if self.ra_config.loop_span_reserve > 0 {
++                (range.span_reserve as usize).min(self.ra_config.loop_span_reserve)
++            } else {
++                range.span_reserve as usize
++            };
+             let allowed = self.available_regs.len().saturating_sub(reserve);
+             // In-loop-useless spans are demoted first, before the count
+             // check: their reloads all sit outside the loop (staged once,
+@@ -1453,8 +1615,35 @@ impl LinearScanAllocator {
+             // to demote) had this test backwards for both shapes: it
+             // blocked chacha20's 1-2-read webs while admitting sha256's
+             // 6-read ones.
++            // Absolute demotion ceiling under auto-arming (2026-09-08):
++            // the bar alone cannot separate the ARX shape from the
++            // unrolled-accumulator shape, because the bar is DERIVED from
++            // the same loop's shorts — an unrolled byte-load chain's
++            // single-use temporaries carry huge weighted costs, so the
++            // bar grows with exactly the loop that should not be
++            // demoted (zlib_ng_adler32's inlined NMAX loop: bar 7750,
++            // its checksum webs cost 110-1100, and demoting them bought
++            // nothing — the loop's shorts were never register-starved;
++            // it merely paid their reload traffic as +14 stack slots).
++            // chacha20's ARX state webs cost 11-21 against bar 89 — a
++            // ~50x separation no relative bar can express. Under
++            // auto-arming (no explicit knob) a span is demotable only
++            // when its whole remaining weighted cost is trivial; the
++            // explicit knob keeps the bar-only contract.
++            let structural_arm = self.ra_config.loop_span_reserve == 0;
++            let absolute_remcost_ok =
++                !structural_arm || range.remaining_cost(range.start) <= MAX_SPAN_REMCOST;
+             let worth_capping = !range.span_recurrence
+                 && range.span_exposed_uses <= MAX_SPAN_EXPOSED_USES
++                // A FOLDED in-loop read (in-loop use count above the
++                // exposed count) must keep its register: spilling does
++                // not produce a priced reload, it DESTROYS the memory-
++                // operand fold and stages the base into a register
++                // before every use — unpriced, per-iteration cost. This
++                // is the adler32 marching-pointer lesson from the valve
++                // experiments, applied at admission where it belongs.
++                && range.span_exposed_uses >= range.span_in_loop_uses
++                && absolute_remcost_ok
+                 && (range.span_cost_bar == 0
+                     || range.remaining_cost(range.start) < range.span_cost_bar);
+             if self.total_spans > allowed && worth_capping {
+@@ -1568,13 +1757,6 @@ impl LinearScanAllocator {
+                 if self.try_evict(evict_idx, range) {
+                     return;
+                 }
+-                // Unreachable in practice: the search checked every
+-                // refusal condition try_evict re-tests (steal safety
+-                // against this very incoming, no mutation in between, and
+-                // an active interval always holds its register). If a
+-                // future guard ever diverges, the safe fallback is to
+-                // spill the incoming — never to continue with a moved
+-                // value.
+                 self.allocate_spill_slot(incoming_id);
+                 return;
+             }
+@@ -1767,12 +1949,7 @@ impl LinearScanAllocator {
+     }
  
-                 if disp == 0 {
+     /// Evict `active[evict_idx]`, give its register to `incoming`.
+-    ///
+-    /// Returns false and leaves state unchanged if the victim has no
+-    /// assignment or the steal is unsound. On success the victim is
+-    /// demoted to a spill slot and moved to `handled`.
+-    ///
+-    /// `swap_remove` reorders `active`; order is not semantic.
++
+     fn try_evict(&mut self, evict_idx: usize, incoming: LiveRange) -> bool {
+         if evict_idx >= self.active.len() {
+             return false;
+@@ -2646,8 +2823,10 @@ mod tests {
+     fn valve_protects_recurrence_carried_spans() {
+         // arith_loop's shape: the span IS the carried chain (its next value
+         // is computed from itself). Demoting it puts the spill store→reload
+-        // on the chain itself. The valve must refuse and fall through to
+-        // the ordinary path, which spills the weaker incoming short.
++        // on the chain itself. The ordinary path keeps the carried span
++        // homed and spills the weaker incoming short (the removed
++        // positional valve never demoted these either; the admission cap's
++        // recurrence guard carries the same invariant).
+         let mut span = valve_span(1, vec![100, 900]);
+         span.span_recurrence = true;
+         let ranges = vec![span, lr(2, 120, 130, vec![125], 20)];
+@@ -2665,10 +2844,10 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn valve_ignores_spans_with_too_many_future_uses() {
++    fn ordinary_path_keeps_read_rich_spans_homed() {
+         // sha256's shape: the span still has several reads to serve inside
+         // the loop. Evicting it trades N folded reloads for one short's
+-        // register — the valve's ceiling refuses, ordinary eviction decides.
++        // register — the ordinary cost path keeps it homed.
+         let ranges = vec![
+             valve_span(1, (100..140).collect()),
+             lr(2, 120, 130, vec![125], 20),
+@@ -2851,6 +3030,8 @@ mod tests {
+             span_reserve: 0,
+             span_cost_bar: 0,
+             span_has_in_loop_use: false,
++            fold_only_uses: false,
++            span_max_extent_len: 0,
+             span_in_loop_uses: 0,
+             span_exposed_uses: 0,
+             span_recurrence: false,
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index b9dddb70..2cd92d63 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -385,6 +385,51 @@ pub fn lower_binop(
+ 
+     // ── Simple ALU operations (two-address form) ─────────────────────
+     if let Some(alu_op) = binop_to_alu(op) {
++        // `x & 0xff` / `x & 0xffff` with a register-homed LHS and a
++        // destination register distinct from it lowers to a CROSS-
++        // REGISTER zero-extension (movzbl/movzwl) rather than
++        // `and $imm`: the truncating mask is the classic table-index
++        // idiom (`table[(crc ^ byte) & 0xff]`), and the result register
++        // feeds a scaled AGU operand on the loop-carried chain. A cross-
++        // register movz is eliminated at rename on Ice Lake+ (the byte
++        // copy is resolved in the renamer, removing a full execution
++        // cycle from the recurrence), while `and $imm` — and a SAME-
++        // register movz, which cannot be renamed onto a distinct
++        // physical register — always execute (2026-09-08 A/B on
++        // Ice Lake-SP: gzip_crc32's kernel loop measured 168 ms with
++        // `and $0xff`, 150 ms with `movzbl %al,%edi`, identical
++        // instruction counts and dependence depth otherwise; GCC 16.2
++        // emits the movz form). Only fired when dst differs from the
++        // LHS home for exactly that reason.
++        if op == IrBinOp::And && matches!(size, OpSize::S32 | OpSize::S64) {
++            let mask = match rhs {
++                Operand::Const(c) => Some(const_to_i64(c)),
++                _ => None,
++            };
++            let from = match mask {
++                Some(0xff) => Some(OpSize::S8),
++                Some(0xffff) => Some(OpSize::S16),
++                _ => None,
++            };
++            if let (Some(from), Operand::Value(lv)) = (from, lhs) {
++                let lhs_home = value_to_reg(lv, ra);
++                if matches!(lhs_home, MachReg::Phys(_))
++                    && matches!(dst, MachReg::Phys(_))
++                    && dst != lhs_home
++                {
++                    // movzbl/movzwl name the destination at 32 bits and
++                    // the machine zero-extends the full register, so the
++                    // result equals the masked value at every width.
++                    out.push(MachInst::Movzx {
++                        src: MachOperand::Reg(lhs_home),
++                        dst,
++                        from_size: from,
++                        to_size: OpSize::S32,
++                    });
++                    return true;
++                }
++            }
++        }
+         if op == IrBinOp::Mul {
+             if let Some(imm) = const_as_imm32_size(rhs, size) {
+                 if let Some(scale) = lea_scale_for_mul(imm) {
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index 6a4a6cbd..dc0a9b84 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -1459,7 +1459,21 @@ impl X86Codegen {
+                             if acc_no_home.contains(&v.0) {
+                                 return false;
+                             }
+-                            !self.state.never_materialized_values.contains(&v.0)
++                            // No slot, no register home, not an
++                            // accumulator assignment: the value has NO
++                            // readable location at the replay position,
++                            // which sits far from its def. The
++                            // historical fall-through trusted "every
++                            // non-never-materialized value gets a spill
++                            // slot" — false for skip-set members the RA
++                            // refused an accumulator assignment and
++                            // never spilled (loop_rotate_pressure_gate:
++                            // an inlined recurrence's exit value reached
++                            // the replayed compare through exactly this
++                            // hole and the cmov read a reused register).
++                            // Prune: the Cmp materializes its boolean at
++                            // its own position, which is always correct.
++                            false
+                         }
+                     }
+                 };
+diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
+index 7b1de665..3ec94a4f 100644
+--- a/src/passes/bit_idioms.rs
++++ b/src/passes/bit_idioms.rs
+@@ -752,6 +752,31 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
+ /// `(count & 31) mod width`), but AArch64 and RISC-V only rotate at the full
+ /// register width, so their sub-word idioms must stay in shift form.  It gates
+ /// the truncation-aware narrow-rotate pattern.
++/// True when `op`'s value provably fits in `bits` bits (zero-extended into
++/// the carrying type), so `op & (2^bits - 1) == op`.
++///
++/// Provable shapes: an unsigned narrow constant, a widening `Cast` whose
++/// SOURCE type is an unsigned narrow integer (a zero-extension of a value in
++/// `[0, 2^bits)`), and a direct `Load` of an unsigned narrow type. A cast
++/// from a SIGNED narrow type sign-extends and can be negative in the wide
++/// domain — refused.
++fn fits_low_bits(op: Operand, bits: u32, defs: &[Option<Instruction>]) -> bool {
++    let mask = (1u64 << bits) - 1;
++    match op {
++        Operand::Const(_) => const_u64(op).is_some_and(|v| v <= mask),
++        Operand::Value(v) => match defs.get(v.0 as usize).and_then(Option::as_ref) {
++            Some(Instruction::Cast { src, from_ty, .. }) => {
++                let from_ok = matches!((from_ty, bits), (IrType::U8, 8) | (IrType::U16, 16));
++                from_ok && fits_low_bits(*src, bits, defs)
++            }
++            Some(Instruction::Load { ty, .. }) => {
++                matches!((ty, bits), (IrType::U8, 8) | (IrType::U16, 16))
++            }
++            _ => false,
++        },
++    }
++}
++
+ pub(crate) fn recognize_function(
+     func: &mut IrFunction,
+     enable_bit_reverse: bool,
+@@ -759,17 +784,44 @@ pub(crate) fn recognize_function(
+     min_rotate_bits: u32,
+ ) -> usize {
+     let mut defs = vec![None; func.max_value_id() as usize + 1];
+-    for block in &func.blocks {
+-        for inst in &block.instructions {
++    // (block index, instruction index) of each value's defining instruction,
++    // for in-place rewrites of the PRODUCER while visiting the consumer.
++    let mut def_loc = vec![None; func.max_value_id() as usize + 1];
++    // Total read counts (operands + address uses + terminator operands), for
++    // single-use proofs when repurposing a producer's operation.
++    let mut use_counts = vec![0u32; func.max_value_id() as usize + 1];
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for (ii, inst) in block.instructions.iter().enumerate() {
+             if let Some(dest) = inst.dest() {
+                 defs[dest.0 as usize] = Some(inst.clone());
++                def_loc[dest.0 as usize] = Some((bi, ii));
+             }
++            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
++                if let Operand::Value(v) = op {
++                    use_counts[v.0 as usize] += 1;
++                }
++            });
++            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
++                use_counts[v.0 as usize] += 1;
++            });
+         }
++        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
++            if let Operand::Value(v) = op {
++                use_counts[v.0 as usize] += 1;
++            }
++        });
+     }
+ 
+     let mut changes = 0;
+     let mut next_value_id = func.max_value_id().saturating_add(1);
+-    for block in &mut func.blocks {
++    // Deferred cross-block rewrites (mask distribution): the producer and
++    // consumer may live in different blocks; both mutations are applied
++    // after the scan ends so no &mut borrow of `func.blocks` overlaps the
++    // loop's. Entries: (producer block, producer index, new producer
++    // instruction, consumer block, consumer index, new consumer
++    // instruction).
++    let mut pending_masks: Vec<(usize, usize, Instruction, usize, usize, Instruction)> = Vec::new();
++    for (block_bi, block) in func.blocks.iter_mut().enumerate() {
+         let mut index = 0;
+         while index < block.instructions.len() {
+             let mut consumed = 1;
+@@ -832,6 +884,97 @@ pub(crate) fn recognize_function(
+                 }
+             }
+ 
++            // Mask distribution over a zero-extended operand:
++            // `(a ^ b) & 0xff` -> `(a & 0xff) ^ b` when b is a zero-extended
++            // byte (same for `|`, and for 0xffff/`movzwl`). See
++            // `fits_low_bits` for the range proof. The rewrite moves the mask
++            // onto the recurrence operand — where x86 lowers it to a
++            // rename-eliminable cross-register movz that only READS the
++            // recurrence register — and off the xor result, where the mask
++            // always executes on the loop-carried chain (`and $255` or a
++            // same-register movz, both uneliminable).
++            if let Instruction::BinOp {
++                dest,
++                op: IrBinOp::And,
++                lhs: Operand::Value(x),
++                rhs: mask_op @ Operand::Const(_),
++                ty,
++                ..
++            } = &block.instructions[index]
++            {
++                let dest = *dest;
++                let x = *x;
++                let mask_op = *mask_op;
++                let ty = *ty;
++                let bits = match const_u64(mask_op) {
++                    Some(0xff) => 8,
++                    Some(0xffff) => 16,
++                    _ => 0,
++                };
++                if bits != 0
++                    && matches!(ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64)
++                    && use_counts.get(x.0 as usize).copied() == Some(1)
++                {
++                    let xor = defs.get(x.0 as usize).and_then(Option::as_ref).cloned();
++                    if let Some(Instruction::BinOp {
++                        op: op @ (IrBinOp::Xor | IrBinOp::Or),
++                        lhs: Operand::Value(a),
++                        rhs: Operand::Value(b),
++                        ty: x_ty,
++                        ..
++                    }) = xor
++                    {
++                        let a = a;
++                        let b = b;
++                        let op = op;
++                        let x_ty = x_ty;
++                        if x_ty == ty {
++                            let a_fits = fits_low_bits(Operand::Value(a), bits, &defs);
++                            let b_fits = fits_low_bits(Operand::Value(b), bits, &defs);
++                            // Exactly one side carries the narrow value; the
++                            // other receives the mask. Both fitting is
++                            // already optimal as-is (both and-free), and
++                            // masking either side would only add work.
++                            if a_fits != b_fits {
++                                let (masked, narrow) = if b_fits { (a, b) } else { (b, a) };
++                                // Rewrite the producer: xor/or -> and-with-mask;
++                                // rewrite the consumer: and -> xor/or.
++                                if let Some((pbi, pii)) =
++                                    def_loc.get(x.0 as usize).copied().flatten()
++                                {
++                                    if matches!(
++                                        defs.get(x.0 as usize),
++                                        Some(Some(Instruction::BinOp { dest: d, .. })) if *d == x
++                                    ) {
++                                        pending_masks.push((
++                                            pbi,
++                                            pii,
++                                            Instruction::BinOp {
++                                                dest: x,
++                                                op: IrBinOp::And,
++                                                lhs: Operand::Value(masked),
++                                                rhs: mask_op,
++                                                ty,
++                                            },
++                                            block_bi,
++                                            index,
++                                            Instruction::BinOp {
++                                                dest,
++                                                op,
++                                                lhs: Operand::Value(x),
++                                                rhs: Operand::Value(narrow),
++                                                ty,
++                                            },
++                                        ));
++                                        changes += 1;
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++
+             match &block.instructions[index] {
+                 Instruction::BinOp {
+                     dest,
+@@ -1057,6 +1200,32 @@ pub(crate) fn recognize_function(
+         }
+     }
+     func.next_value_id = next_value_id.max(func.next_value_id);
++    for (pbi, pii, new_prod, cbi, cii, new_cons) in pending_masks {
++        let x_dest = match &new_prod {
++            Instruction::BinOp { dest, .. } => *dest,
++            _ => unreachable!("mask distribution producer is always a BinOp"),
++        };
++        let c_dest = match &new_cons {
++            Instruction::BinOp { dest, .. } => *dest,
++            _ => unreachable!("mask distribution consumer is always a BinOp"),
++        };
++        if let Some(pb) = func.blocks.get_mut(pbi) {
++            if matches!(
++                pb.instructions.get(pii),
++                Some(Instruction::BinOp { dest: d, .. }) if *d == x_dest
++            ) {
++                pb.instructions[pii] = new_prod;
++            }
++        }
++        if let Some(cb) = func.blocks.get_mut(cbi) {
++            if matches!(
++                cb.instructions.get(cii),
++                Some(Instruction::BinOp { dest: d, .. }) if *d == c_dest
++            ) {
++                cb.instructions[cii] = new_cons;
++            }
++        }
++    }
+     changes
+ }
+ 
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 9c923b70..807747f5 100644
+index 9c923b70..b3ae2ea3 100644
 --- a/src/passes/vectorize.rs
 +++ b/src/passes/vectorize.rs
-@@ -3663,6 +3663,20 @@ enum MapExpr {
-         l: Box<MapExpr>,
-         r: Box<MapExpr>,
-     },
-+    /// Lane-mask conjunction (`&&`) / disjunction (`||`) of two compare
-+    /// masks — the if-converted shape of a short-circuit condition feeding a
-+    /// ternary: `c1 ? (c2 ? t : f) : f` with a shared false arm folds to
-+    /// `Select(MaskConj(and, c1, c2), t, f)` (shared TRUE arm → `or`).
-+    /// Integer dword lanes only (the mask AND/OR reuses the packed integer
-+    /// And/Or the arithmetic path already emits). Both sides are compares or
-+    /// nested conjunctions — side-effect-free by construction, so the
-+    /// non-short-circuit AND/OR is exact. Emitted as one blendv over the
-+    /// combined mask instead of two chained blends.
-+    MaskConj {
-+        is_and: bool,
-+        l: Box<MapExpr>,
-+        r: Box<MapExpr>,
-+    },
- }
- 
- impl MapExpr {
-@@ -3674,6 +3688,7 @@ impl MapExpr {
-             MapExpr::Cmp(_, l, r) => 1 + l.node_count() + r.node_count(),
-             MapExpr::Select(c, t, f) => 1 + c.node_count() + t.node_count() + f.node_count(),
-             MapExpr::MinMax { l, r, .. } => 1 + l.node_count() + r.node_count(),
-+            MapExpr::MaskConj { l, r, .. } => 1 + l.node_count() + r.node_count(),
-         }
-     }
- }
-@@ -3794,6 +3809,22 @@ impl<'a> MapEmitCtx<'a> {
-                 });
-                 Some(dest)
-             }
-+            MapExpr::MaskConj { is_and, l, r } => {
-+                // Both children emit compare masks (all-ones / all-zeros per
-+                // lane); AND/OR of masks is the lane-exact && / ||.
-+                let lv = self.emit(l)?;
-+                let rv = self.emit(r)?;
-+                let mask_op = if *is_and { &IrBinOp::And } else { &IrBinOp::Or };
-+                let vec_op = (self.bin_op)(mask_op)?;
-+                let dest = self.fresh();
-+                self.vec_insts.push(Instruction::Intrinsic {
-+                    dest: Some(dest),
-+                    op: vec_op,
-+                    dest_ptr: None,
-+                    args: vec![Operand::Value(lv), Operand::Value(rv)],
-+                });
-+                Some(dest)
-+            }
-             MapExpr::MinMax { is_max, l, r } => {
-                 let lv = self.emit(l)?;
-                 let rv = self.emit(r)?;
-@@ -4232,7 +4263,12 @@ fn analyze_map_pattern(
-         }
-         parsed?
-     };
--    const MAP_MAX_NODES: usize = 12;
-+    // 16 admits the recovered `&&`/`||` mask shapes (a two-compare
-+    // range-fold ternary parses to exactly 12 nodes; a three-condition
-+    // chain to 16) while still bounding pathological trees. The budget
-+    // guards compile time only: the emit cache is a linear scan, so cost
-+    // is O(nodes^2) with a trivially small constant.
-+    const MAP_MAX_NODES: usize = 16;
-     if expr.node_count() > MAP_MAX_NODES {
-         set_reject("map expression tree too large");
-         return None;
-@@ -4780,6 +4816,42 @@ fn parse_map_expr(
-             if !matches!(cond_expr, MapExpr::Cmp(_, _, _)) {
-                 return None;
-             }
-+            // Short-circuit condition recovery: if_convert lowers
-+            // `(c1 && c2) ? t : f` into NESTED selects over the shared arm —
-+            // `c1 ? (c2 ? t : f) : f` — and `(c1 || c2) ? t : f` into
-+            // `c1 ? t : (c2 ? t : f)`. Recover the single-blend form: one
-+            // AND/OR-combined mask, one blendv (the SSE2-oracle lowering —
-+            // GCC's `pand` + one `pblendvb`), instead of two chained blends.
-+            // Hand-written selects with the same shared-arm shape are
-+            // semantically identical, so the fold needs no provenance check.
-+            let is_mask =
-+                |e: &MapExpr| matches!(e, MapExpr::Cmp(_, _, _) | MapExpr::MaskConj { .. });
-+            if let MapExpr::Select(inner_cond, inner_t, inner_f) = &t {
-+                if is_mask(inner_cond) && is_mask(&cond_expr) && **inner_f == f {
-+                    return Some(MapExpr::Select(
-+                        Box::new(MapExpr::MaskConj {
-+                            is_and: true,
-+                            l: Box::new(cond_expr),
-+                            r: inner_cond.clone(),
-+                        }),
-+                        inner_t.clone(),
-+                        Box::new(f),
-+                    ));
-+                }
-+            }
-+            if let MapExpr::Select(inner_cond, inner_t, inner_f) = &f {
-+                if is_mask(inner_cond) && is_mask(&cond_expr) && **inner_t == t {
-+                    return Some(MapExpr::Select(
-+                        Box::new(MapExpr::MaskConj {
-+                            is_and: false,
-+                            l: Box::new(cond_expr),
-+                            r: inner_cond.clone(),
-+                        }),
-+                        Box::new(t),
-+                        inner_f.clone(),
-+                    ));
-+                }
-+            }
-             Some(MapExpr::Select(
-                 Box::new(cond_expr),
-                 Box::new(t),
-@@ -4859,6 +4931,12 @@ fn map_tree_ops_available(
-                 && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                 && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-         }
-+        MapExpr::MaskConj { is_and, l, r } => {
-+            // The mask AND/OR rides the packed integer And/Or op table.
-+            bin_op(if *is_and { &IrBinOp::And } else { &IrBinOp::Or }).is_some()
-+                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-+                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-+        }
-     }
- }
- 
-@@ -4869,6 +4947,9 @@ fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
-         MapExpr::BinOp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
-         MapExpr::Sqrt(x) => expr_uses_stream(x, stream),
-         MapExpr::Cmp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
-+        MapExpr::MaskConj { l, r, .. } => {
-+            expr_uses_stream(l, stream) || expr_uses_stream(r, stream)
-+        }
-         MapExpr::Select(c, t, f) => {
-             expr_uses_stream(c, stream)
-                 || expr_uses_stream(t, stream)
-@@ -8585,6 +8666,16 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern)
-         return 0;
-     }
- 
-+    // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
-+    // remainder must be able to reference every base with a dominating
-+    // definition (see fma_remainder_references_sound).
-+    if !fma_remainder_references_sound(func, pattern) {
-+        if debug {
-+            eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
-+        }
-+        return 0;
-+    }
-+
-     // Keep track of the next available Value and BlockId
-     let mut next_val_id = func.next_value_id;
-     let mut next_label = func.next_label;
-@@ -9198,6 +9289,16 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
-         return 0;
-     }
- 
-+    // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
-+    // remainder must be able to reference every base with a dominating
-+    // definition (see fma_remainder_references_sound).
-+    if !fma_remainder_references_sound(func, pattern) {
-+        if debug {
-+            eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
-+        }
-+        return 0;
-+    }
-+
-     // Keep track of the next available Value and BlockId
-     let mut next_val_id = func.next_value_id;
-     let mut next_label = func.next_label;
-@@ -9904,8 +10005,9 @@ enum RemainderRefPlan {
-     UseOriginal(Value),
-     /// The definition lies inside the loop but is a pure, non-trapping,
-     /// loop-invariant chain (`GlobalAddr` / `LabelAddr` / `Copy` / `Cast` /
--    /// integer `Add/Sub/Mul/And/Or/Xor/Shl/AShr/LShr` over constants and
--    /// other such values). The chain is cloned into the vector-exit block,
-+    /// `GetElementPtr` / integer `Add/Sub/Mul/And/Or/Xor/Shl/AShr/LShr`
-+    /// over constants and other such values). The chain is cloned into the
-+    /// vector-exit block,
-     /// which dominates the whole remainder. `chain` items are in dependency
-     /// order, each still naming its ORIGINAL dest and operands; the builder
-     /// assigns fresh dests and rewrites in-chain operands.
-@@ -10024,6 +10126,32 @@ fn plan_invariant_chain(
-             plan_operand_chain(func, src, loop_blocks, chain, depth, done)?;
-             chain.push((v, Instruction::Copy { dest: v, src: *src }));
+@@ -10087,6 +10087,38 @@ fn plan_invariant_chain(
+                 },
+             ));
          }
 +        Instruction::GetElementPtr {
 +            base, offset, ty, ..
 +        } => {
-+            // `dest = base + offset` is pure address arithmetic: it cannot
-+            // trap, has no side effects, and a clone recomputes the exact
-+            // address on every path that reaches it. The matmul-style
-+            // lowering materializes the row base (`&C[i]`) as an in-loop
-+            // GEP over loop-invariant operands; without this arm the
-+            // dominance gate declines the whole transform (missed FMA
-+            // vectorization, observed 3.1x on matmul at -O2). Both
-+            // operands are planned first so the chain stays deps-first.
-+            match plan_remainder_reference_inner(func, *base, loop_blocks, depth + 1, done)? {
-+                RemainderRefPlan::UseOriginal(_) => {}
-+                RemainderRefPlan::Rematerialize { chain: more, .. } => chain.extend(more),
-+            }
++            // GEP is pure address arithmetic — the same clone-safety
++            // class as the integer BinOps above (non-trapping on every
++            // input, no memory read, no object identity). The BASE is a
++            // value-use (planned like any chain operand through the
++            // value path), the OFFSET an ordinary operand. Without this
++            // arm every hoisted row-pointer GEP in a vectorized loop's
++            // preheader — matmul's `&C[i][j]` after LICM — fails the
++            // dominance plan and the FMA transforms refuse the WHOLE
++            // loop: matmul measured 2x slower (14.3ms vs 6.1ms, 18
++            // vector instructions lost) on exactly this gate.
 +            plan_operand_chain(func, offset, loop_blocks, chain, depth, done)?;
++            plan_operand_chain(
++                func,
++                &Operand::Value(*base),
++                loop_blocks,
++                chain,
++                depth,
++                done,
++            )?;
 +            chain.push((
 +                v,
 +                Instruction::GetElementPtr {
@@ -321,34 +2472,34 @@ index 9c923b70..807747f5 100644
 +                },
 +            ));
 +        }
-         Instruction::Cast {
-             src,
-             from_ty,
-@@ -10144,6 +10272,14 @@ fn materialize_remainder_reference(
+         // Phi (loop-carried state), Load, Alloca (a clone is a second,
+         // distinct object), Call, Intrinsic, atomics: not rematerializable.
+         _ => return None,
+@@ -10135,6 +10167,11 @@ fn materialize_remainder_reference(
+             let mut clones: FxHashMap<u32, Value> = FxHashMap::default();
+             let mut result = original;
+             for (orig_dest, mut inst) in chain {
++                // A GEP's BASE is a value-use, not an Operand: the
++                // operand walk below never renames it. Remap it
++                // explicitly (the planner guarantees the base is either
++                // an original value defined outside the loop or an
++                // earlier chain member).
+                 let fresh = Value(*next_val_id);
+                 *next_val_id += 1;
+                 inst.for_each_operand_mut(|op| {
+@@ -10144,6 +10181,11 @@ fn materialize_remainder_reference(
                          }
                      }
                  });
-+                // `GetElementPtr::base` is a raw `Value`, not an `Operand`,
-+                // so `for_each_operand_mut` never visits it; rewrite it
-+                // against the same clone map by hand.
 +                if let Instruction::GetElementPtr { base, .. } = &mut inst {
-+                    if let Some(&nb) = clones.get(&base.0) {
-+                        *base = nb;
++                    if let Some(&nw) = clones.get(&base.0) {
++                        *base = nw;
 +                    }
 +                }
                  set_cloned_dest(&mut inst, fresh);
                  clones.insert(orig_dest.0, fresh);
                  result = fresh;
-@@ -10154,7 +10290,7 @@ fn materialize_remainder_reference(
-     }
- }
- 
--/// Rename a cloned instruction's dest. The planner only emits the five
-+/// Rename a cloned instruction's dest. The planner only emits the six
- /// pure shapes; any other instruction here is a planner/builder
- /// disagreement and must stop the build rather than mis-name a definition.
- fn set_cloned_dest(inst: &mut Instruction, dest: Value) {
-@@ -10163,7 +10299,8 @@ fn set_cloned_dest(inst: &mut Instruction, dest: Value) {
+@@ -10163,7 +10205,8 @@ fn set_cloned_dest(inst: &mut Instruction, dest: Value) {
          | Instruction::LabelAddr { dest: d, .. }
          | Instruction::Copy { dest: d, .. }
          | Instruction::Cast { dest: d, .. }
@@ -358,143 +2509,3 @@ index 9c923b70..807747f5 100644
          _ => unreachable!("set_cloned_dest: instruction shape the planner never emits"),
      }
  }
-@@ -13746,6 +13883,11 @@ fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
-             // into abs(v) — a silent wrong answer (the subtrahend `v + 1`
-             // is not `v`).
-             if let MapExpr::Cmp(op, l, r) = &**cond {
-+                // Exact abs fold, with the subtrahend CHECKED: `l < 0 ? -l
-+                // : l` is max(l, -l) lane for lane ONLY when the true arm
-+                // negates `l` itself. Matching `Sub(0, _)` by its lhs alone
-+                // misfolds `v < 0 ? 0 - (v + 1) : v` into abs(v) — a silent
-+                // wrong answer (the subtrahend `v + 1` is not `v`).
-                 let is_neg_of = |e: &MapExpr, target: &MapExpr| {
-                     matches!(
-                         e,
-@@ -14991,6 +15133,45 @@ fn emit_map_scalar_tree(
-             });
-             Some(Operand::Value(dest))
-         }
-+        MapExpr::MaskConj { is_and, l, r } => {
-+            // Non-short-circuit mirror of `c1 && c2` / `c1 || c2`: both
-+            // sides are compares (side-effect-free by construction), so the
-+            // bitwise AND/OR of the two 0/1 boolean values is exact.
-+            // Compare results are zero-extended setcc values; the 32-bit
-+            // AND/OR of two such values stays a clean 0/1.
-+            let lv = emit_map_scalar_tree(
-+                l,
-+                src_bases,
-+                pattern,
-+                byte_offset.clone(),
-+                remainder_insts,
-+                next_val_id,
-+            )?;
-+            let rv = emit_map_scalar_tree(
-+                r,
-+                src_bases,
-+                pattern,
-+                byte_offset,
-+                remainder_insts,
-+                next_val_id,
-+            )?;
-+            let (Operand::Value(lv), Operand::Value(rv)) = (lv, rv) else {
-+                return None;
-+            };
-+            let dest = {
-+                let v = Value(*next_val_id);
-+                *next_val_id += 1;
-+                v
-+            };
-+            remainder_insts.push(Instruction::BinOp {
-+                dest,
-+                op: if *is_and { IrBinOp::And } else { IrBinOp::Or },
-+                lhs: Operand::Value(lv),
-+                rhs: Operand::Value(rv),
-+                ty: IrType::I32,
-+            });
-+            Some(Operand::Value(dest))
-+        }
-         MapExpr::Select(cond, t, f) => {
-             let cv = emit_map_scalar_tree(
-                 cond,
-diff --git a/tests/correctness/run_correctness.py b/tests/correctness/run_correctness.py
-index 4210525d..1468b9c0 100644
---- a/tests/correctness/run_correctness.py
-+++ b/tests/correctness/run_correctness.py
-@@ -947,6 +947,74 @@ int main(void){
-   return 0;
- }
- """, ["-O3", "-march=x86-64-v3"], None),
-+
-+    # ── Mask conjunction/disjunction in maps: `(c1 && c2) ? t : f` and
-+    # `(c1 || c2) ? t : f` over compare masks fold to one packed And/Or
-+    # of the two masks and a single blend, instead of two chained
-+    # selects (two blends). Positive shapes: range fold (&& of two
-+    # compares against constants), the || negated-range form, and eq||eq
-+    # over lane values. Anti-shapes: `0-(v+1)` under an && (must not be
-+    # abs-folded — the true arm is not the negation of the compared
-+    # value), and a nested select whose arms are NOT shared (the fold
-+    # must not fuse them; the result stays a plain nested select or the
-+    # scalar mirror, either way bit-exact). The n=0..33 sweeps exercise
-+    # the remainder-loop scalar mirrors of every shape.
-+    ("vectorize_mask_conj", r"""
-+#include <stdio.h>
-+#include <string.h>
-+static void t_range (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v>=65 && v<=90) ? v+32 : v;}}
-+static void t_orneg  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<65 || v>90) ? v : v+32;}}
-+static void t_eqor   (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v==32 || v==9) ? 45 : v;}}
-+static void t_absin  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<0 && v<-1) ? 0-(v+1) : v;}}
-+static void t_noshare(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<10 ? (v<5 ? v+1 : v+2) : v+3;}}
-+static void t_ornest (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v>0 || (v<-100 && v>-200)) ? v*2 : v;}}
-+#define N 2051
-+static int a[N]; static int b[N];
-+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
-+int main(void){
-+  unsigned s=424242;
-+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)(s%251)-125; }
-+  a[0]=64; a[1]=65; a[2]=90; a[3]=91; a[4]=32; a[5]=9; a[6]=45; a[7]=-2147483647-1; a[8]=2147483647; a[9]=0;
-+  memset(b,0xAB,sizeof b); t_range(a,b,N); printf("range %08x\n",h(b,sizeof b));
-+  memset(b,0xAB,sizeof b); t_orneg(a,b,N); printf("orneg %08x\n",h(b,sizeof b));
-+  memset(b,0xAB,sizeof b); t_eqor(a,b,N); printf("eqor %08x\n",h(b,sizeof b));
-+  memset(b,0xAB,sizeof b); t_absin(a,b,N); printf("absin %08x\n",h(b,sizeof b));
-+  memset(b,0xAB,sizeof b); t_noshare(a,b,N); printf("noshare %08x\n",h(b,sizeof b));
-+  memset(b,0xAB,sizeof b); t_ornest(a,b,N); printf("ornest %08x\n",h(b,sizeof b));
-+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_range(a,b,n); printf("r%d %08x\n",n,h(b,n*4)); }
-+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_orneg(a,b,n); printf("o%d %08x\n",n,h(b,n*4)); }
-+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_absin(a,b,n); printf("i%d %08x\n",n,h(b,n*4)); }
-+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_noshare(a,b,n); printf("x%d %08x\n",n,h(b,n*4)); }
-+  return 0;
-+}
-+""", ["-O3", "-march=x86-64-v3"], None),
-+
-+    # ── FMA-transform remainder coverage: N=257/259 leave tail columns
-+    # after the 4-wide vector loop; the scalar remainder must recompute
-+    # the same row bases the vector body used (the remainder-reference
-+    # planner rematerializes the in-loop GEP chain into the vector-exit
-+    # block). Two instances in one program: the second covers the
-+    # inlined-transform shape that exposed the FmaF64x4HoistedSIB
-+    # scratch-collision miscompile (a C-row home in %rsi clobbered by the
-+    # spilled j-offset's fixed %rsi reload → `vmovupd (%rsi,%rsi)`,
-+    # segfault at 2*j; see engineering/FOLLOWUP-2026-09-08-S04 §4).
-+    ("vectorize_fma_remainder_257", r"""
-+#include <stdio.h>
-+#include <string.h>
-+static double C1[257][257], A1[257][257], B1[257][257];
-+static double C2[259][259], A2[259][259], B2[259][259];
-+static void mm1(void){ for (int i=0;i<257;i++) for (int k=0;k<257;k++) for (int j=0;j<257;j++) C1[i][j] += A1[i][k]*B1[k][j]; }
-+static void mm2(void){ for (int i=0;i<259;i++) for (int k=0;k<259;k++) for (int j=0;j<259;j++) C2[i][j] += A2[i][k]*B2[k][j]; }
-+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
-+int main(void){
-+  for(int i=0;i<257;i++) for(int j=0;j<257;j++){ A1[i][j]=(double)(((i*31+j*7)%13)-6); B1[i][j]=(double)(((i*5+j*11)%11)-5); C1[i][j]=(double)((i+j)%7); }
-+  for(int i=0;i<259;i++) for(int j=0;j<259;j++){ A2[i][j]=(double)(((i*13+j*3)%17)-8); B2[i][j]=(double)(((i*7+j*5)%19)-9); C2[i][j]=(double)((i+2*j)%5); }
-+  mm1(); mm2();
-+  printf("m1 %08x\n", h(C1, sizeof C1));
-+  printf("m2 %08x\n", h(C2, sizeof C2));
-+  return 0;
-+}
-+""", ["-O2"], None),
- ]
- 
- # Multi-file test (handled specially)
--- 
-2.47.3
-
