@@ -1,9 +1,9 @@
 diff --git a/engineering/FOLLOWUP-2026-09-08-OP05CD-BYTE-LANE-MAPS.md b/engineering/FOLLOWUP-2026-09-08-OP05CD-BYTE-LANE-MAPS.md
 new file mode 100644
-index 0000000..b3f3ac8
+index 0000000..af731f2
 --- /dev/null
 +++ b/engineering/FOLLOWUP-2026-09-08-OP05CD-BYTE-LANE-MAPS.md
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,714 @@
 +# FOLLOWUP 2026-09-08 — OP-05c..f: range fusion, i8-lane maps, if-combine, class union, runtime byte splats
 +
 +Session scope: the byte case-fold family (`gzip`, `expat`, `curl`, `SQLite`
@@ -394,6 +394,94 @@ index 0000000..b3f3ac8
 +The range fusion firing at word width with no width-specific code is the
 +clearest evidence that the parameterisation is real and not three copies.
 +
++### 1.4j The SECOND CI failure: if-combine had no cost model
++
++The codegen-quality gate in `bench.yml` — which `ci_local.sh` did not mirror —
++failed with `expat_xml_scan: insns 203 -> 252 (+24.1%)`.
++
++**Root cause.**  If-combine converts a control dependence into a data
++dependence, and I shipped it with no profitability test at all: it fired on
++every loop-body chain it could recognise.  `expat_utf8_name_length` is a
++UTF-8 scanner whose loop body contains **five `break`s**, so it can never be
++vectorized; predicating its
++`(ptr[1] & 0xc0) != 0x80 || (width > 2 && ...) || (width > 3 && ...)` chain
++made the common path — which exits on the first test — perform all the work
++of the last.  58 -> 90 instructions in that function alone.
++
++**Fix.**  A profitability gate expressing the transform's actual purpose:
++
++* **exactly one exiting block.**  That block carries the loop control and its
++  branch must survive; every other conditional branch in the body is a value
++  computation predication can remove.  Several exiting blocks means
++  data-dependent exits that predication cannot remove, so the branches stay
++  and the combine is pure added work.  Note the exiting block is NOT required
++  to be the header: after loop rotation the live exit is the LATCH, and
++  requiring the header rejected every rotated loop — including the classifier
++  this transform exists for.
++* **no calls or inline asm in the body** — a barrier the vectorizer cannot
++  cross, so straight-line-ness cannot pay for itself.
++
++I also tried a stronger, "measure don't predict" gate: apply the combines on
++a private clone, run the combine/diamond fixpoint, and keep them only if the
++body became branch-free.  It is recorded here because it *failed* for an
++instructive reason — the probe can only run `if_convert`'s own fixpoint,
++while the real pipeline interleaves `cfg_simplify`, `copy_prop` and
++`bool_thread` between rounds, and those are what expose the later diamonds.
++The probe therefore under-approximated and rejected the classifier.  The
++structural gate above is weaker in theory and correct in practice.
++
++Result: `expat_xml_scan` back to exactly its 203-instruction baseline, all
++seven golden workloads PASS, and the classifier got BETTER (the load now
++folds into the `vpor`).  `scripts/ci_local.sh` now mirrors `bench.yml` too —
++a mirror that covers one workflow is not a mirror.
++
++### 1.4k OP-06 — induction-variable fusion (follow-up 3.2)
++
++Every packed map body carried two proportional induction variables: the
++element counter (bounded by `floor(limit / VF)`) and the byte offset used for
++addressing.  It incremented both and compared the one NOT used for
++addressing:
++
++```
++addq $1,  %r9      ; element counter
++addq $32, %r11     ; byte offset  == %r9 * 32
++cmpq %r8, %r9
++```
++
++Two changes retire the counter:
++
++1. **The exit test is retargeted onto the byte IV.**  The counter runs over
++   `0 ..< T`, so the byte IV runs over `0, S, ..., (T-1)*S` with
++   `S = VF * elem_size`, and the loop must continue exactly while
++   `byte_iv < T*S`.  `T*S` is loop-invariant and is materialised in the
++   preheader.
++2. **The remainder's resume index is derived from the byte IV** by a shift
++   (`byte_iv / elem_size`, and nothing at all for byte lanes) instead of a
++   multiply of the counter.  Without this the counter still had a reader and
++   survived DCE.
++
++**Signedness is load-bearing.**  For a signed loop (`int i; i < n`) the trip
++count `T = floor(n / VF)` is NEGATIVE when `n` is, and the loop must run zero
++times.  A signed byte compare reproduces that exactly (`byte_iv >= 0 > T*S`
++is false on the first test); the unsigned form reads the negative limit as an
++enormous positive bound and runs off the end of the array.  My first version
++used `Ult` unconditionally and segfaulted `affine_map_vectorization` — the
++predicate now follows the source's signedness, and `<=` needs no adjustment
++because `byte_iv` takes exactly the `T+1` values `0, S, ..., T*S`.
++
++Measured on the casefold family, `-O3 -march=x86-64-v3`, hot-loop
++instructions per input byte:
++
++| kernel | LCCC before | **LCCC now** | GCC 16.2 | Clang 23.1 | ICC | ICX |
++|---|---|---|---|---|---|---|
++| `fold_lower` / `fold_upper` | 0.3125 | **0.2812** (9 / 32 B) | 1.2500 | 0.2422 (4x unrolled) | 2.00 / 1.375 | 0.6250 |
++| `classify_alpha` | 0.3125 | **0.2500** (8 / 32 B) | 0.3125 | 0.2109 (4x unrolled) | 4.2500 | 0.5625 |
++| `clamp_bytes` | 0.2500 | **0.1875** (6 / 32 B) | 0.1875 | 0.1172 (4x unrolled) | 0.4375 | 0.3750 |
++
++LCCC now beats GCC on the classifier and both case folds, and matches it
++exactly on the clamp.  Every remaining gap to Clang is its 4x unrolling of
++identical per-element work.
++
 +### 1.5 Defects found and fixed (all were latent miscompiles)
 +
 +1. **`build_map_remainder_loop` hardcoded `elem_bytes = 4`** for every
@@ -542,48 +630,37 @@ index 0000000..b3f3ac8
 +
 +## 3. TODO for future agents
 +
-+Follow-ups 3.1 (memfold-aware resolution), 3.4 (`vpbroadcastb` + promotion
-+range recovery), 3.5 (`vpminsb`/`vpmaxsb`), 3.6 (16-bit lanes) and the
-+testing half of 3.7 are **DONE** this session -- see 1.4e through 1.4i.
-+Three items remain, in value order.
++Follow-ups 3.1 (memfold-aware resolution), 3.2 (IV fusion), 3.4
++(`vpbroadcastb` + promotion range recovery), 3.5 (`vpminsb`/`vpmaxsb`), 3.6
++(16-bit lanes) and the testing half of 3.7 are all **DONE** -- see 1.4e
++through 1.4k.  Two items remain.
 +
-+### 3.1 Redundant second induction variable  (HIGH — every map loop)
++### 3.1 Unroll the packed map body 2x  (MEDIUM — the only gap left to Clang)
 +
-+Every vectorized map loop still carries both a trip counter and a byte
-+offset:
++Clang's remaining lead on every byte kernel is 4x unrolling of identical
++per-element work; after OP-06 the loop overhead is 3 instructions out of
++6-9, so it now DOMINATES the tight kernels.  Two independent 32-byte streams
++would halve that share and fill both load ports:
 +
-+```
-+addq $1, %r9      ; trip counter
-+addq $32, %r11    ; byte offset  == %r9 * 32
-+cmpq %r8, %r9
-+```
++| kernel | now | 2x unrolled (projected) | Clang (4x) |
++|---|---|---|---|
++| `clamp_bytes` | 6 / 32 B = 0.1875 | 9 / 64 B = 0.1406 | 0.1172 |
++| `fold_lower` | 9 / 32 B = 0.2812 | 15 / 64 B = 0.2344 | 0.2422 |
++| `classify_alpha` | 8 / 32 B = 0.2500 | 13 / 64 B = 0.2031 | 0.2109 |
 +
-+GCC emits one (`addq $32, %rax ; cmpq %rax, %rdx`).  This is one instruction
-+per iteration in ALL map kernels: the byte, word and dword clamps would go
-+7 -> 6 (GCC parity) and `fold_lower` 10 -> 9.
++i.e. 2x unrolling alone would take the case fold and the classifier past
++Clang and bring the clamp within 20%.
 +
-+Deliberately NOT attempted in two sessions now, and the reason should be
-+respected: the source IV is bounded by `floor(limit / VF)` and the remainder
-+loop derives its start index from it, so removing it rewires the loop's exit
-+semantics AND the remainder entry together.  Getting it wrong is a silent
-+wrong answer for specific trip counts — the hardest failure mode to notice.
++Not attempted here, for a reason worth recording: after OP-06 the remainder
++loop must cover up to `2*VF - 1` elements instead of `VF - 1`, so the
++`T = floor(limit / (2*VF))` computation, the resume-index shift and the
++remainder's own trip bound all change together — the same three-way coupling
++that made OP-06 segfault on the first attempt.  It needs its own session with
++the trip-count sweeps (which already run every n from 0 at four element
++widths) as the primary gate, plus a code-size heuristic so small-trip loops
++do not pay for a body they never execute.
 +
-+Recipe: give the SOURCE IV the step `VF` (not 1) and bound it by
-+`limit - limit % VF`; address as `base + iv * elem_size` through the SIB
-+scale, which is legal for elem_size in {1,2,4,8} and covers every element
-+type the map path admits; the remainder start is then the IV itself with no
-+shift.  Validate with the existing trip-count sweeps (they already cover
-+every n from 0 up at four element widths) plus the differential oracle.
-+
-+### 3.2 Unroll the packed map body 2×  (MEDIUM)
-+
-+Clang's remaining lead on every byte kernel is 4× unrolling of identical
-+per-element work.  Two independent 32-byte streams would amortise the loop
-+overhead (3 of 7-10 instructions) and fill both load ports.  Expect
-+`fold_lower` ~15 / 64 B = 0.234 insn/B, beating Clang's 0.242.  Gate on
-+trip-count and code-size heuristics.
-+
-+### 3.3 A shift rule for the demotion  (LOW)
++### 3.2 A shift rule for the demotion  (LOW)
 +
 +Byte lanes have no packed shift at all, so `>>`/`<<` must stay refused there.
 +WORD lanes do have `psllw`/`psrlw`/`psraw`, so `vec_word_lane_map.c`'s
@@ -593,7 +670,7 @@ index 0000000..b3f3ac8
 +value's high bits would otherwise shift in), and an arithmetic right shift
 +only inside `[-32768, 32767]`.
 +
-+### 3.4 Remaining structural debt
++### 3.3 Remaining structural debt
 +
 +* **`is_two_operand_binary` in `copy_coalescing.rs` is misnamed** — it lists
 +  256-bit three-operand VEX ops as well, and it omits Cmp/Blendv for a
@@ -642,10 +719,10 @@ index 0000000..b3f3ac8
 +| `tests/regression/vec_byte_lane_map{,_sse2}.c` | new |
 +| `tests/regression/vec_class_union_ifcombine{,_sse2}.c` | new — union folds AND the two deliberate refusals |
 diff --git a/engineering/STATE.md b/engineering/STATE.md
-index 3e297d4..2b83c79 100644
+index 3e297d4..401eeb5 100644
 --- a/engineering/STATE.md
 +++ b/engineering/STATE.md
-@@ -36,6 +36,33 @@ The benchmark corpus contains **39 deterministic workloads** (33 historical + 6
+@@ -36,6 +36,44 @@ The benchmark corpus contains **39 deterministic workloads** (33 historical + 6
  - **Aggregate LCCC / GCC Geometric Mean:** **`0.8598`** (LCCC faster overall than GCC 14.2 across the 39 benchmarks).
  - **Aggregate LCCC / Fastest Ref Geometric Mean:** **`0.8936`**.
  - **Correctness:** **39 / 39 (100%)** bit-identical to reference compilers.
@@ -663,15 +740,26 @@ index 3e297d4..2b83c79 100644
 +
 +| kernel | LCCC | GCC 16.2 | Clang 23.1 | ICC | ICX |
 +|---|---|---|---|---|---|
-+| `fold_lower` | **0.3125** | 1.2500 | 0.2422 (4× unrolled) | 2.0000 | 0.6250 |
-+| `fold_upper` | **0.3125** | 1.2500 | 0.2422 (4× unrolled) | 1.3750 | 0.6250 |
-+| `clamp_bytes` | 0.2500 | 0.1875 | 0.1172 (4× unrolled) | 0.4375 | 0.3750 |
-+| `classify_alpha` | **0.3125** (was scalar) | 0.3125 | 0.2109 (4× unrolled) | 4.2500 | 0.5625 |
++| `fold_lower` | **0.2812** (9 / 32 B) | 1.2500 | 0.2422 (4× unrolled) | 2.0000 | 0.6250 |
++| `fold_upper` | **0.2812** | 1.2500 | 0.2422 (4× unrolled) | 1.3750 | 0.6250 |
++| `clamp_bytes` | **0.1875** (6 / 32 B) | 0.1875 | 0.1172 (4× unrolled) | 0.4375 | 0.3750 |
++| `classify_alpha` | **0.2500** (8 / 32 B, was scalar) | 0.3125 | 0.2109 (4× unrolled) | 4.2500 | 0.5625 |
++| `short` clamp (16-bit) | **0.2188** (7 / 32 B) | — | — | — | — |
++| `int` clamp (32-bit) | **0.2188** (7 / 32 B) | — | — | — | — |
 +
-+LCCC wins or ties every non-unrolled competitor: 2.0× vs ICX and 4.0× vs
-+GCC on the case folds, 1.8× vs ICX and level with GCC on the classifier,
-+1.5× vs ICX on the clamp.  Clang's remaining lead everywhere is 4× unrolling
-+of identical per-element work — see the follow-up doc's TODO 3.2/3.3.
++LCCC beats every non-unrolled competitor on every kernel: 2.2× vs ICX and
++4.4× vs GCC on the case folds, 2.3× vs ICX and 1.25× vs GCC on the
++classifier, 2.0× vs ICX and level with GCC on the clamp.  Clang's remaining
++lead everywhere is 4× unrolling of identical per-element work — the single
++open item (follow-up doc TODO 3.1), projected to flip the case fold and the
++classifier once done.
++
++**Measure loop kernels with `scripts/hot_loop_metric.py`, and run
++`scripts/ci_local.sh` before every push** — it mirrors all sixteen gates of
++the `test`, `bench` and `clippy` jobs.  Two CI failures this program were
++caused by validating against a subset: an AVX2 `!=` mask miscompile that only
++the differential oracle saw, and a +24% instruction-count regression that
++only the codegen-quality gate (in `bench.yml`, not `ci.yml`) saw.
 +
 +The `isalpha` classifier now lowers to three packed instructions
 +(`vpor` c|32, `vpaddb` bias, `vpcmpgtb`) via the single-bit window union plus
@@ -681,10 +769,10 @@ index 3e297d4..2b83c79 100644
  
 diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
 new file mode 100755
-index 0000000..898b916
+index 0000000..a8b061f
 --- /dev/null
 +++ b/scripts/ci_local.sh
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,155 @@
 +#!/usr/bin/env bash
 +# Run every gate the GitHub `test` and `clippy` jobs run, in the same order,
 +# with the same environment, against the local tree.
@@ -703,7 +791,7 @@ index 0000000..898b916
 +# Running "the tests I remember" is therefore not a validation strategy.
 +# Run this script before every push; it is the contract.
 +#
-+#   ./scripts/ci_local.sh              # everything
++#   ./scripts/ci_local.sh              # everything (test + bench + clippy)
 +#   ./scripts/ci_local.sh --fast       # skip the two slowest oracles
 +#   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
 +#
@@ -816,6 +904,16 @@ index 0000000..898b916
 +    echo "SKIP  linker fuzz (target/fastbuild/lccc-ld not built)"
 +    SKIPPED=$((SKIPPED + 2))
 +fi
++
++# --------------------------------------------------------------- job:bench --
++# The bench workflow carries the CODEGEN-QUALITY gate, which the test job does
++# not.  Leaving it out of this mirror is exactly how a +24% instruction-count
++# regression on expat_xml_scan reached CI green-on-test / red-on-bench: the
++# if-combine pass was predicating short-circuit chains in a UTF-8 scanner that
++# can never be vectorized.  A mirror that covers only one workflow is not a
++# mirror.
++gate "codegen-quality-gate" fast \
++    python3 .github/scripts/ci-codegen-gate.py --lccc "$LCCC"
 +
 +# ------------------------------------------------------------- job:clippy --
 +gate "rustfmt" fast cargo fmt --all -- --check
@@ -2660,11 +2758,24 @@ index 614755e..9221bdf 100644
              "VecSubI32x4" => IntrinsicOp::VecSubI32x4,
              "VecSubI32x8" => IntrinsicOp::VecSubI32x8,
              "VecSubI64x2" => IntrinsicOp::VecSubI64x2,
+diff --git a/src/ir/module.rs b/src/ir/module.rs
+index c7334ea..4e69d65 100644
+--- a/src/ir/module.rs
++++ b/src/ir/module.rs
+@@ -174,7 +174,7 @@ impl GlobalInit {
+ }
+ 
+ /// An IR function.
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct IrFunction {
+     pub name: String,
+     pub return_type: IrType,
 diff --git a/src/passes/if_convert.rs b/src/passes/if_convert.rs
-index e1dc280..e0cc7df 100644
+index e1dc280..af60754 100644
 --- a/src/passes/if_convert.rs
 +++ b/src/passes/if_convert.rs
-@@ -702,6 +702,275 @@ fn clone_addr_chain_into_merge(
+@@ -702,6 +702,416 @@ fn clone_addr_chain_into_merge(
  }
  
  /// Single pass of if-conversion. Returns number of diamonds converted.
@@ -2860,6 +2971,147 @@ index e1dc280..e0cc7df 100644
 +    None
 +}
 +
++/// Apply this loop's short-circuit combines, but only if they pay off.
++///
++/// # The trade
++///
++/// If-combine converts a control dependence into a data dependence: `a && b`
++/// stops branching around `b` and evaluates it unconditionally.  That is a
++/// WIN only when the loop body ends up straight-line, because then the map /
++/// reduction vectorizer can take it and the body runs 8-32 elements at a
++/// time.  It is a LOSS otherwise: the branch stays, and every iteration now
++/// pays for operands the short circuit used to skip.
++///
++/// The loss is not theoretical.  `expat_utf8_name_length`
++/// (`tests/benchmark/programs/expat_xml_scan.c`) is a UTF-8 scanner whose
++/// loop body contains FIVE `break`s, so it can never be vectorized.
++/// Combining its
++/// `(ptr[1] & 0xc0) != 0x80 || (width > 2 && ...) || (width > 3 && ...)`
++/// chain grew the function 58 -> 90 instructions and made the common path —
++/// which exits on the first test — do all the work of the last.  The
++/// codegen-quality gate caught it as +24% on the whole workload.
++///
++/// # The test
++///
++/// Exactly the property that separates the two cases: after applying this
++/// loop's combines, does every remaining internal conditional branch become
++/// diamond/triangle-convertible — i.e. does the body become branch-free?
++///
++/// That is answered by SIMULATION, not prediction: the combines are applied
++/// for real and rolled back if the answer is no.  The interaction between a
++/// combine and the diamond converter is precisely what a hand-written
++/// heuristic gets wrong — in the classifier case the combine leaves one
++/// conditional branch which the diamond converter then removes, so a rule
++/// like "the combine must remove them all" would reject the very case the
++/// transform exists for.
++///
++/// Rollback is exact: `apply_if_combine` writes only the four blocks named
++/// by each candidate (pred, inner, the shared target's phis and the
++/// retargeted target's phis), so snapshotting those blocks and the value
++/// counter restores the function bit-for-bit.  Cheap pre-filters run first
++/// so the snapshot is only paid for on loops that could plausibly qualify.
++///
++/// Returns the number of combines actually applied (0 when rolled back).
++fn try_if_combine_loop(
++    func: &mut IrFunction,
++    succs: &analysis::FlatAdj,
++    nl: &crate::passes::loop_analysis::NaturalLoop,
++    cands: &[IfCombine],
++) -> usize {
++    // Pre-filter 1: a call or inline asm in the body is a barrier the
++    // vectorizer cannot cross, so straight-line-ness cannot pay for itself.
++    // (Loads and stores are fine — they are the point.)
++    let dbg = std::env::var("CCC_DEBUG_IFCOMBINE").is_ok();
++    for &b in &nl.body {
++        for inst in &func.blocks[b].instructions {
++            if matches!(
++                inst,
++                Instruction::Call { .. } | Instruction::InlineAsm { .. }
++            ) {
++                if dbg {
++                    eprintln!(
++                        "[IFCOMB] {} loop@{}: reject (call/asm)",
++                        func.name, nl.header
++                    );
++                }
++                return 0;
++            }
++        }
++    }
++    // Pre-filter 2: the loop must have exactly ONE exiting block.
++    //
++    // That block carries the loop control and its branch must survive; every
++    // OTHER conditional branch in the body is a value computation that
++    // predication can remove.  A body with `break`/`return` has several
++    // exiting blocks, i.e. data-dependent exits that predication cannot
++    // remove, so the branches survive whatever we do and the combine is pure
++    // added work.
++    //
++    // Note the exiting block is NOT required to be the header: loop rotation
++    // leaves the canonical bottom-tested shape, where the guard is in the
++    // header's predecessor and the live exit is the LATCH.  Requiring the
++    // header here rejected every rotated loop — including the ASCII
++    // classifier this transform exists for.
++    let mut exiting: Option<usize> = None;
++    for &b in &nl.body {
++        let leaves = succs
++            .row(b)
++            .iter()
++            .any(|&t| !nl.body.contains(&(t as usize)));
++        if leaves {
++            if exiting.is_some() {
++                if dbg {
++                    eprintln!(
++                        "[IFCOMB] {} loop@{}: reject (multiple exiting blocks)",
++                        func.name, nl.header
++                    );
++                }
++                return 0;
++            }
++            exiting = Some(b);
++        }
++    }
++    let Some(exiting) = exiting else {
++        return 0;
++    };
++    // The exiting block's branch IS the loop control; folding it into a
++    // chain would restructure the exit, which is not what this transform is
++    // for.  Fail closed on the whole loop rather than partially applying.
++    if cands
++        .iter()
++        .any(|c| c.pred_idx == exiting || c.inner_idx == exiting)
++    {
++        if dbg {
++            eprintln!(
++                "[IFCOMB] {} loop@{}: reject (candidate touches the exiting block {})",
++                func.name, nl.header, exiting
++            );
++        }
++        return 0;
++    }
++
++    if dbg {
++        eprintln!(
++            "[IFCOMB] {} loop@{}: accept, {} candidate(s), exiting={}",
++            func.name,
++            nl.header,
++            cands.len(),
++            exiting
++        );
++    }
++    // Accepted: apply this round's candidates.  The caller's fixpoint comes
++    // back for the next level of the chain and re-derives the same decision.
++    let mut next_real = func.next_value_id;
++    let mut applied = 0usize;
++    for c in cands {
++        if apply_if_combine(func, c, &mut next_real) {
++            applied += 1;
++        }
++    }
++    func.next_value_id = next_real;
++    applied
++}
++
 +/// Is `op` provably 0 or 1?  Only then is a bitwise `and`/`or` the logical
 +/// connective (see `detect_if_combine` clause 3).
 +fn is_boolean_condition(ctx: &IfConvCtx<'_>, op: &Operand) -> bool {
@@ -2940,7 +3192,7 @@ index e1dc280..e0cc7df 100644
  fn if_convert_once(func: &mut IrFunction) -> usize {
      let num_blocks = func.blocks.len();
      if num_blocks < 3 {
-@@ -722,6 +991,78 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
+@@ -722,6 +1132,105 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
      // defs are the ones the detectors will actually see.
      let ctx = IfConvCtx::build(func);
  
@@ -2967,43 +3219,70 @@ index e1dc280..e0cc7df 100644
 +    // GCC resolves the same conflict by ordering (`ifcombine` runs after
 +    // VRP); scoping to loop bodies is the equivalent guarantee here and is
 +    // independent of how many times the pass pipeline re-enters this pass.
-+    let loop_body_blocks: FxHashSet<usize> = {
-+        let cfg = analysis::CfgAnalysis::build(func);
++    let loop_cfg = analysis::CfgAnalysis::build(func);
++    let natural_loops = if std::env::var("CCC_NO_IFCOMBINE").is_ok() {
++        Vec::new()
++    } else {
 +        crate::passes::loop_analysis::find_natural_loops(
-+            num_blocks, &cfg.preds, &cfg.succs, &cfg.idom,
++            num_blocks,
++            &loop_cfg.preds,
++            &loop_cfg.succs,
++            &loop_cfg.idom,
 +        )
-+        .into_iter()
-+        .flat_map(|l| l.body.into_iter())
-+        .collect()
 +    };
-+    let cands: Vec<IfCombine> = (0..num_blocks)
-+        .filter(|i| loop_body_blocks.contains(i))
-+        .filter_map(|i| detect_if_combine(&ctx, i))
-+        .collect();
-+    if !cands.is_empty() {
++    // Per LOOP, not per candidate: whether a combine pays off is a property
++    // of the whole loop (does its body become branch-free?), so candidates
++    // are grouped by loop and accepted or rejected together.
++    let mut per_loop: Vec<(usize, Vec<IfCombine>)> = Vec::new();
++    for (li, nl) in natural_loops.iter().enumerate() {
++        let mut seen: crate::common::fx_hash::FxHashSet<usize> =
++            crate::common::fx_hash::FxHashSet::default();
++        let mut loop_cands: Vec<IfCombine> = Vec::new();
++        // Every body block is a candidate PRED, the header included: in the
++        // canonical rotated shape the header is exactly where the value
++        // computation (and therefore the head of the `&&`/`||` chain) lives.
++        // Excluding it rejected the ASCII classifier outright.
++        let mut ordered: Vec<usize> = nl.body.iter().copied().collect();
++        ordered.sort_unstable();
++        for b in ordered {
++            if let Some(c) = detect_if_combine(&ctx, b) {
++                // Overlapping candidates would invalidate each other; keep
++                // the first for each pred/inner pair.
++                if seen.insert(c.pred_idx) && seen.insert(c.inner_idx) {
++                    loop_cands.push(c);
++                }
++            }
++        }
++        if std::env::var("CCC_DEBUG_IFCOMBINE").is_ok() {
++            eprintln!(
++                "[IFCOMB] {} loop@{} body={:?}: {} candidate(s)",
++                func.name,
++                nl.header,
++                {
++                    let mut v: Vec<usize> = nl.body.iter().copied().collect();
++                    v.sort_unstable();
++                    v
++                },
++                loop_cands.len()
++            );
++        }
++        if !loop_cands.is_empty() {
++            per_loop.push((li, loop_cands));
++        }
++    }
++    if !per_loop.is_empty() {
 +        // `ctx` borrows `func`; drop it before mutating.
 +        drop(ctx);
 +        let mut combines = 0usize;
-+        let mut next_val = func.next_value_id;
-+        let mut touched: crate::common::fx_hash::FxHashSet<usize> =
-+            crate::common::fx_hash::FxHashSet::default();
-+        for cand in &cands {
-+            if touched.contains(&cand.pred_idx) || touched.contains(&cand.inner_idx) {
-+                continue;
-+            }
-+            if apply_if_combine(func, cand, &mut next_val) {
-+                touched.insert(cand.pred_idx);
-+                touched.insert(cand.inner_idx);
-+                combines += 1;
-+            }
++        for (li, loop_cands) in &per_loop {
++            combines += try_if_combine_loop(func, &loop_cfg.succs, &natural_loops[*li], loop_cands);
 +        }
-+        func.next_value_id = next_val;
 +        if combines > 0 {
 +            // The CFG changed; let the caller's fixpoint loop rebuild it
 +            // before looking for diamonds.
 +            return rewrites + combines;
 +        }
-+        // Nothing applied (all candidates were stale): fall through.
++        // Everything was rejected or stale: fall through to the diamonds.
 +        return rewrites + if_convert_diamonds(func);
 +    }
 +    drop(ctx);
@@ -3019,7 +3298,7 @@ index e1dc280..e0cc7df 100644
      // Collect diamond candidates
      let mut diamonds: Vec<DiamondInfo> = Vec::new();
  
-@@ -734,8 +1075,9 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
+@@ -734,8 +1243,9 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
      }
  
      if diamonds.is_empty() {
@@ -3030,7 +3309,7 @@ index e1dc280..e0cc7df 100644
  
      // Apply conversions. Track modified blocks to avoid applying overlapping diamonds
      // (e.g., nested ternaries where converting one invalidates another).
-@@ -764,7 +1106,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
+@@ -764,7 +1274,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
      // (they'll have no instructions and just an unconditional branch)
      // This is handled by the CFG simplification pass that runs after us.
  
@@ -3040,7 +3319,7 @@ index e1dc280..e0cc7df 100644
  
  /// Information about a detected diamond pattern.
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 38e9803..81089be 100644
+index 38e9803..a172d75 100644
 --- a/src/passes/vectorize.rs
 +++ b/src/passes/vectorize.rs
 @@ -3722,6 +3722,16 @@ struct MapEmitCtx<'a> {
@@ -6935,7 +7214,7 @@ index 38e9803..81089be 100644
              _ => None,
          }
      };
-@@ -14268,7 +15633,14 @@ fn transform_map_vector(
+@@ -14268,17 +15633,34 @@ fn transform_map_vector(
      // The SAME folded tree drives the packed body, the ops-availability
      // check, and the scalar remainder mirror, so all three stay
      // lane-exact with respect to each other.
@@ -6951,8 +7230,192 @@ index 38e9803..81089be 100644
          fold_int_minmax(&pattern.expr)
      } else {
          pattern.expr.clone()
-@@ -14445,6 +15817,28 @@ fn transform_map_vector(
+     };
  
++    // Reserve the byte IV's SSA ids up front: the remainder mirror names it
++    // (it recovers its resume index from the byte offset, not from the
++    // element counter -- see OP-06 below), and the mirror is built before the
++    // packed loop is touched so a failure leaves the function untouched.
++    let byte_iv = Value(next_val_id);
++    next_val_id += 1;
++    let byte_iv_next = Value(next_val_id);
++    next_val_id += 1;
+     let Some(remainder) = build_map_remainder_loop(
+         func,
+         pattern,
+         &expr,
+         vec_width,
++        byte_iv,
++        elem_size,
+         &mut next_val_id,
+         &mut next_label,
+     ) else {
+@@ -14410,10 +15792,6 @@ fn transform_map_vector(
+     // unsigned exit semantics and for scalar-remainder recovery; the byte IV
+     // gives both memory streams one SIB/NEON indexed address with no per-
+     // iteration cast, multiply, or GEP materialization.
+-    let byte_iv = Value(next_val_id);
+-    next_val_id += 1;
+-    let byte_iv_next = Value(next_val_id);
+-    next_val_id += 1;
+     let preheader_label = func.blocks[preheader_idx].label;
+     let latch_label = func.blocks[pattern.latch_idx].label;
+     let phi_pos = func.blocks[pattern.header_idx]
+@@ -14443,8 +15821,181 @@ fn transform_map_vector(
+         });
+     changes += 2;
+ 
++    // ---- OP-06: fuse the two induction variables ------------------------
++    //
++    // The loop now carries BOTH an element counter (the source IV, bounded by
++    // floor(limit / VF)) and the byte offset created above, and they are
++    // exactly proportional: `byte_iv == iv * VF * elem_size`.  Every packed
++    // map body therefore paid two `add`s and compared the one that is NOT
++    // used for addressing:
++    //
++    //     addq $1,  %r9      ; element counter
++    //     addq $32, %r11     ; byte offset
++    //     cmpq %r8, %r9
++    //
++    // GCC emits one.  Retargeting the exit test onto the byte IV makes the
++    // counter dead inside the loop, and DCE removes its phi and its `add`.
++    //
++    // Soundness.  The counter runs over `0 ..< T` where `T = floor(limit/VF)`
++    // (the rewrite just above), so the byte IV runs over `0, S, ..., (T-1)*S`
++    // with `S = VF * elem_size` and the loop must continue exactly while
++    // `byte_iv < T * S`.  `T * S` is loop-invariant and is materialised in
++    // the preheader.  The comparison is UNSIGNED on I64: both operands are
++    // non-negative by construction (a byte offset and a count of iterations
++    // times a positive stride), and unsigned avoids any question about the
++    // product's sign near the top of the range.
++    //
++    // The transform is applied only when `T * S` cannot overflow I64, which
++    // for a constant limit is checked exactly and for a dynamic limit is
++    // guaranteed by construction: `T <= limit` and the loop already indexes
++    // `limit * elem_size` bytes of real memory, so `T * S <= limit *
++    // elem_size` fits in the address space.
++    let stride_bytes = i64::from(elem_size) * vec_width as i64;
++    let fused_iv = {
++        // The exit comparison lives in the loop and tests an IV-derived value
++        // against `divided_limit`.  Find it; if its shape is not the one the
++        // rewrite above produced, leave both IVs alone (fail closed).
++        let mut site: Option<(usize, usize, bool)> = None; // (block, inst, iv_on_lhs)
++        for &block_idx in &pattern.loop_blocks {
++            for (ii, inst) in func.blocks[block_idx].instructions.iter().enumerate() {
++                if let Instruction::Cmp { lhs, rhs, .. } = inst {
++                    let l_iv = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
++                    let r_iv = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
++                    if l_iv && *rhs == divided_limit {
++                        site = Some((block_idx, ii, true));
++                    } else if r_iv && *lhs == divided_limit {
++                        site = Some((block_idx, ii, false));
++                    }
++                }
++            }
++        }
++        site
++    };
++    if let Some((cmp_block, cmp_idx, iv_on_lhs)) = fused_iv {
++        // Materialise `T * S` in the preheader.
++        let byte_limit = match &divided_limit {
++            Operand::Const(c) => c
++                .to_i64()
++                .and_then(|t| t.checked_mul(stride_bytes))
++                .map(|n| Operand::Const(IrConst::I64(n))),
++            Operand::Value(t) => {
++                // widen the (possibly 32-bit) count to I64, then scale
++                let widened = if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
++                    let w = Value(next_val_id);
++                    next_val_id += 1;
++                    func.blocks[preheader_idx]
++                        .instructions
++                        .push(Instruction::Cast {
++                            dest: w,
++                            src: Operand::Value(*t),
++                            from_ty: pattern.iv_ty,
++                            to_ty: IrType::I64,
++                        });
++                    w
++                } else {
++                    *t
++                };
++                let scaled = Value(next_val_id);
++                next_val_id += 1;
++                func.blocks[preheader_idx]
++                    .instructions
++                    .push(Instruction::BinOp {
++                        dest: scaled,
++                        op: IrBinOp::Mul,
++                        lhs: Operand::Value(widened),
++                        rhs: Operand::Const(IrConst::I64(stride_bytes)),
++                        ty: IrType::I64,
++                    });
++                Some(Operand::Value(scaled))
++            }
++        };
++        if let Some(byte_limit) = byte_limit {
++            // SIGNEDNESS IS LOAD-BEARING and must follow the source
++            // predicate.  For a signed loop (`int i; i < n`) the trip count
++            // `T = floor(n / VF)` is NEGATIVE when `n` is, and the loop must
++            // then run zero times.  A signed byte compare reproduces that
++            // exactly (`byte_iv >= 0 > T * S` is false on the first test); an
++            // unsigned one reads the negative limit as an enormous positive
++            // bound and runs away off the end of the array -- a segfault the
++            // `affine_map_vectorization` gate caught immediately.
++            //
++            // For an unsigned source predicate the count is non-negative by
++            // construction and the unsigned compare is the faithful one.
++            //
++            // `<=` needs no adjustment either way: `byte_iv` takes the values
++            // `0, S, ..., T*S`, which is exactly the T+1 trips `i <= T` means.
++            let (lt_op, gt_op) = match pattern.exit_cmp_op {
++                IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => {
++                    (IrCmpOp::Ult, IrCmpOp::Ugt)
++                }
++                _ => (IrCmpOp::Slt, IrCmpOp::Sgt),
++            };
++            let inclusive = matches!(
++                pattern.exit_cmp_op,
++                IrCmpOp::Ule | IrCmpOp::Sle | IrCmpOp::Uge | IrCmpOp::Sge
++            );
++            if let Instruction::Cmp {
++                op, lhs, rhs, ty, ..
++            } = &mut func.blocks[cmp_block].instructions[cmp_idx]
++            {
++                *ty = IrType::I64;
++                if iv_on_lhs {
++                    *op = if inclusive {
++                        if lt_op == IrCmpOp::Ult {
++                            IrCmpOp::Ule
++                        } else {
++                            IrCmpOp::Sle
++                        }
++                    } else {
++                        lt_op
++                    };
++                    *lhs = Operand::Value(byte_iv);
++                    *rhs = byte_limit;
++                } else {
++                    // `limit > iv` in the source spelling: keep the operand
++                    // order so the branch polarity the header depends on is
++                    // unchanged, and mirror the predicate.
++                    *op = if inclusive {
++                        if gt_op == IrCmpOp::Ugt {
++                            IrCmpOp::Uge
++                        } else {
++                            IrCmpOp::Sge
++                        }
++                    } else {
++                        gt_op
++                    };
++                    *lhs = byte_limit;
++                    *rhs = Operand::Value(byte_iv);
++                }
++                changes += 1;
++            }
++        }
++    }
++
      let dst_address = (dst_base, Operand::Value(byte_iv));
  
 +    // Mask-arithmetic strength reduction (see `strength_reduce_mask_select`)
@@ -6980,7 +7443,7 @@ index 38e9803..81089be 100644
      // Replace the scalar store with only the packed operations present in the
      // source expression.  DCE removes the now-unreachable scalar dataflow.
      {
-@@ -14459,13 +15853,26 @@ fn transform_map_vector(
+@@ -14459,13 +16010,26 @@ fn transform_map_vector(
              cmp_op: &cmp_op,
              minmax_op: &minmax_op,
              blendv_op,
@@ -7008,7 +7471,78 @@ index 38e9803..81089be 100644
              if debug {
                  eprintln!("[VEC-MAP]   Tree emission failed");
              }
-@@ -14973,7 +16380,12 @@ fn build_map_remainder_loop(
+@@ -14843,6 +16407,8 @@ fn build_map_remainder_loop(
+     pattern: &MapPattern,
+     expr: &MapExpr,
+     vec_width: u64,
++    byte_iv: Value,
++    elem_size: u32,
+     next_val_id: &mut u32,
+     next_label: &mut u32,
+ ) -> Option<RemainderLoop> {
+@@ -14916,17 +16482,50 @@ fn build_map_remainder_loop(
+     // The vector exit carries only the resume-IV computation: any
+     // rematerialized base chains live in the remainder header, where the
+     // alias guard's fail edge joins, so every entry dominates their defs.
+-    let vec_exit_block = BasicBlock {
+-        label: vec_exit_label,
+-        instructions: vec![Instruction::BinOp {
+-            dest: i_rem_start,
+-            op: IrBinOp::Mul,
+-            lhs: Operand::Value(pattern.iv),
+-            rhs: Operand::Const(iv_width_const),
+-            ty: pattern.iv_ty,
+-        }],
+-        terminator: Terminator::Branch(remainder_header_label),
+-        source_spans: vec![],
++    // OP-06: recover the resume index from the BYTE IV, not the element
++    // counter.
++    //
++    // The packed loop's exit test is retargeted onto the byte offset, so the
++    // element counter has no other reader; deriving the resume index from it
++    // here would keep it -- and its per-iteration `add` -- alive for nothing.
++    // At the vector exit `byte_iv == T * VF * elem_size` and the remainder
++    // resumes at element `T * VF`, i.e. `byte_iv / elem_size`.  `elem_size`
++    // is a power of two, so that is a shift, and nothing at all for bytes.
++    let vec_exit_block = {
++        let mut insts = Vec::with_capacity(2);
++        let shift = elem_size.trailing_zeros();
++        let resume_i64 = if shift == 0 {
++            byte_iv
++        } else {
++            let v = fresh();
++            insts.push(Instruction::BinOp {
++                dest: v,
++                op: IrBinOp::LShr,
++                lhs: Operand::Value(byte_iv),
++                rhs: Operand::Const(IrConst::I64(i64::from(shift))),
++                ty: IrType::I64,
++            });
++            v
++        };
++        if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
++            insts.push(Instruction::Cast {
++                dest: i_rem_start,
++                src: Operand::Value(resume_i64),
++                from_ty: IrType::I64,
++                to_ty: pattern.iv_ty,
++            });
++        } else {
++            insts.push(Instruction::Copy {
++                dest: i_rem_start,
++                src: Operand::Value(resume_i64),
++            });
++        }
++        BasicBlock {
++            label: vec_exit_label,
++            instructions: insts,
++            terminator: Terminator::Branch(remainder_header_label),
++            source_spans: vec![],
++        }
+     };
+ 
+     let remainder_header_block = BasicBlock {
+@@ -14973,7 +16572,12 @@ fn build_map_remainder_loop(
      } else {
          i_rem_iv
      };
@@ -7022,7 +7556,7 @@ index 38e9803..81089be 100644
      remainder_insts.push(Instruction::BinOp {
          dest: offset_v,
          op: IrBinOp::Mul,
-@@ -15211,975 +16623,2114 @@ fn emit_map_scalar_tree(
+@@ -15211,975 +16815,2114 @@ fn emit_map_scalar_tree(
              });
              Some(Operand::Value(dest))
          }
