@@ -1,5 +1,249 @@
+diff --git a/.github/workflows/bench.yml b/.github/workflows/bench.yml
+index aab3ee6e..a4816b98 100644
+--- a/.github/workflows/bench.yml
++++ b/.github/workflows/bench.yml
+@@ -33,8 +33,14 @@ jobs:
+             ~/.cargo/git
+           key: ${{ runner.os }}-cargo-bench-deps-${{ hashFiles('**/Cargo.lock') }}
+ 
++      # Build with the project's `fastbuild` Cargo profile (opt-level 1,
++      # no LTO, incremental) — the same profile every other CI job uses, so
++      # the benchmarked compiler comes from one shared, cache-friendly
++      # profile definition instead of a release-profile opt-level override.
++      # The profile only affects the speed of the compiler BINARY, never the
++      # code it generates for the timed C workloads.
+       - name: Build LCCC
+-        run: ./scripts/build_lccc_o1_j2.sh
++        run: ./scripts/build_lccc_fast.sh
+ 
+       - name: Detect GCC include path
+         id: gcc
+@@ -49,7 +55,7 @@ jobs:
+           GCC_INC: ${{ steps.gcc.outputs.inc }}
+         run: |
+           echo "Compiling rec2iter correctness test..."
+-          target/release/lccc -I"$GCC_INC" -O2 -o /tmp/fib_rec2iter tests/fib_rec2iter.c
++          target/fastbuild/lccc -I"$GCC_INC" -O2 -o /tmp/fib_rec2iter tests/fib_rec2iter.c
+           echo "Running (includes fib(90) — impossible without rec2iter)..."
+           /tmp/fib_rec2iter
+ 
+@@ -66,7 +72,7 @@ jobs:
+           # no --only selection this is the complete checked-in corpus:
+           # synthetic kernels plus every pinned workload-derived kernel.
+           python3 .github/scripts/ci-bench.py \
+-            --lccc target/release/lccc \
++            --lccc target/fastbuild/lccc \
+             --compilers lccc,gcc \
+             --reps 9 \
+             --warmup 1 \
+@@ -92,7 +98,7 @@ jobs:
+         run: |
+           set -o pipefail
+           python3 .github/scripts/ci-codegen-gate.py \
+-            --lccc target/release/lccc 2>&1 | tee codegen-gate.txt
++            --lccc target/fastbuild/lccc 2>&1 | tee codegen-gate.txt
+ 
+       - name: Upload benchmark results
+         if: always()
+diff --git a/engineering/AUDIT-2026-09-08-PR444-redteam.md b/engineering/AUDIT-2026-09-08-PR444-redteam.md
+new file mode 100644
+index 00000000..554b157f
+--- /dev/null
++++ b/engineering/AUDIT-2026-09-08-PR444-redteam.md
+@@ -0,0 +1,132 @@
++# Red-team audit of PR #444 (hot-loop alignment, GAS `.p2align` parity) + CI-green rebase
++
++Base: upstream main `b6d6e7bd` (Merge PR #444). Auditor: the PR #445 session
++(`ms178-1.patch` S01+S02 lineage; rebased deliverable =
++`b6d6e7bd` + 258473bd (S02) + 1bba858a (policy hardening / race fix / CI)).
++Every verdict below was verified programmatically: A/B builds of the exact
++commits (`20261722`, `64534d1`, `9d2119c`, `2c9b6e16`), the 122-case
++GCC-differential hash battery, `cargo test` hammer runs, and `RUSTFLAGS=-D
++warnings` reproductions of both CI failures.
++
++## Context
++
++PR #444 (`2c9b6e16`) and my PR #445 (`1aba0bd8` ≡ `9d2119c`) solved the SAME
++problem domain independently and landed within hours of each other:
++
++| Area | PR #444 (merged upstream) | PR #445 (mine) |
++|---|---|---|
++| `.p2align` grammar | full GAS `N[,fill][,max-skip]`, byte-count `.align`/`.balign`, clamped exponent 63, 776/776 asmdiff vs a locally built GNU as 2.47 | 3-operand form + parser-level `AlignChain` run-merging |
++| Relaxation safety | markers recorded even for zero padding; max-skip re-evaluated against the relaxed offset; overflow-safe `div_ceil` alignment math | chain re-evaluated jointly post-relaxation |
++| Directive policy | GCC-16.2-derived: vector loop = plain `.p2align 5`; scalar = `.p2align 4,,10`+`.p2align 3`; -Os none; PGO hot-only | bounded chains: vector 32B-cap-15 → 16B-cap-15; scalar 16B; outer 16/8 caps 10/7; tiny-trip ≤ 4 unaligned; PGO defers |
++| Flags | `-falign-loops/jumps/functions[=N[:M]]`, GCC grammar, power-of-2 validation | `-falign-loops[=N[:max]]` only |
++| PGO | hotness gates loop + join alignment | deferred to `pgo::layout` |
++| `identical_blocks` | 4-piece soundness fix: directive transparency, entry-region pseudo-predecessors, fall-through-entry deletion guard, empty-preds-never-merge, merged duplicates keep trailing directives | directive transparency only; the entry-region hole documented as a known limitation |
++| Extra fixes | `loop_unroll` side-effecting-latch/escaping-def unroll rejection (a real -O3 miscompile), `fold_staged_imm_into_alu` peephole, `is_vector_op` classification, dead `machinst_emit` path removal | — (mine had none of these) |
++| Tooling | `scripts/check_loop_alignment.py` (CFG-reconstructing audit), 21-case `.p2align` casefile, `outer_loop_shapes.c` + `vectorize_int_map_lanes.c` corpora | GCC-differential hash battery (scratch), correctness-suite additions |
++
++## Verdict: PR #444 is the better S01. Adopted wholesale; two real gaps found and fixed on top.
++
++**Why #444 wins on the overlapping ground (all verified, not conceded from
++reading):**
++
++1. **Oracle discipline.** They verified every assembler semantic against a
++   real GNU as 2.47 binary (776/776 differential) before writing code —
++   including the corner I would never have probed: `.p2align 4,,10` that
++   declines to pad STILL raises `sh_addralign` to 16; `.p2align 63` at a
++   nonzero offset is an error, at offset 0 it silently does nothing; the fill
++   truncates to a byte; an empty middle field selects default fill. My
++   implementation was self-consistent but oracle-untested at these corners.
++2. **The identical_blocks fix is the fix my own code said was needed.** My
++   S01 shipped transparency-only and left a comment: "a general fix needs
++   entry-region/island tracking in the block scan." #444 implemented exactly
++   that (per-function NUL-prefixed pseudo labels for entry-region jumps AND
++   the positional entry fall-through), then added two more soundness rails:
++   a block with a fall-through entry can never be the deleted duplicate
++   (identical pred SETS cannot prove entries rewritable — P can jump to the
++   canonical and fall through into the duplicate), and empty predecessor
++   sets never merge (defense in depth covering `loop`-instruction targets).
++   My session's earlier attempt at the empty-pred guard broke the positive
++   control (`non_jump_table_blocks_still_merge`) because I had no
++   entry-region model to make legit blocks non-empty — the missing piece
++   #444 supplied.
++3. **The unroll miscompile fix is a genuine find** (outer-loop row sums
++   stored in the latch dropped by ×2 partial unroll — 20/20 deterministic),
++   validated across 12 opt/march combos, with unit tests and a positive
++   control. Nothing in my PR covers it.
++4. **Flag surface.** `-falign-jumps`/`-falign-functions` with GCC grammar
++   (including the `N:M` max-skip and the `max_skip >= align` normalization)
++   is a strict superset of mine.
++5. **Architecture.** A `src/passes/` pass with a `LoopAlignConfig` input
++   struct, driven from `driver::pipeline` post-layout, beats my backend-side
++   hook: one policy location, PGO-input not PGO-parallel, A/B-testable.
++
++**Where #444 is weaker than mine — both fixed in 1bba858a:**
++
++1. **Unbounded 32-byte padding for vector loops.** GCC 16.2 does this, but it
++   costs up to 31 bytes of one-shot NOP per vectorized loop, and lccc's own
++   PGO ledger measured *unbounded* 32-byte alignment as a net loss on gzip
++   `longest_match` (that history is why #444's scalar cascade is bounded).
++   ICX and Clang 23.1 both stop at 16 bytes. The merged policy now emits
++   `.p2align 5,,15` + `.p2align 4`: the 32-byte DSB win whenever the natural
++   offset is within one 16-byte quantum of it (the common case), the
++   ICX/Clang 16-byte form otherwise, worst-case padding halved from 31 to 15
++   bytes. `check_loop_alignment.py` asserts the new contract in both
++   directions (a missing tier fails; so does an unexpected one).
++2. **Constant tiny-trip loops were padded.** GCC and Clang leave
++   `for (i = 0; i < 3; i++)` unaligned — the one-shot padding cannot pay
++   back over ≤ 4 iterations. The pass now proves a constant trip bound from
++   the header exit comparison (`iv < Const(n)` and the mirrored
++   `Const(n) > iv`; only compares feeding the header terminator count) and
++   skips alignment for n ≤ 4. A `-falign-loops=N` override is an explicit
++   user contract and wins over the exclusion. The audit corpus gained
++   `tiny_trip_call` (constant trip 3, kept from unrolling by an opaque call)
++   asserting the loop survives to codegen AND stays unpadded.
++
++**Integration seams verified on the rebased tree:**
++
++- My S02 intrinsics (`VecCmpI32x8/x4`, `VecBlendvI32x8/x4`, `VecMinI32x8`)
++  are all in `produces_vector_value`/`vector_result_width`, so #444's
++  `is_vector_op` classifies int-cond-map loops as VECTOR loops → they receive
++  the (now bounded) vector cascade, not the scalar one.
++- My `.p2align 4` lane-const bias labels flow through #444's writer, whose
++  record-marker-even-when-padding-is-zero behavior is exactly what keeps
++  them 16-aligned after jump relaxation (my S01 needed the same property;
++  #444's is GAS-verified).
++- Sequential marker evaluation in `fixup_alignment_markers` +
++  `shift_offsets_after` gives chained directives GAS's moving-offset
++  semantics, which is what my parser-level `AlignChain` item existed for —
++  the explicit merge structure was unnecessary and is dropped with S01.
++
++## The PR #445 CI failures — root causes (both reproduced, both fixed)
++
++1. **Clippy job: `cargo fmt --all -- --check` failed.** My hand-written S01
++   (elf_writer_common/generation/backend loop_align) was never rustfmt'd.
++   Reproduced locally (`Diff in ...` ×N). Fixed by running `cargo fmt` and
++   folding the result into the rebased commits; `--check` is clean.
++2. **Test Suite job: `cargo test ... -j 2` exit 101.** NOT a code defect in
++   the PR: a pre-existing **test-infrastructure race** in
++   `machinst_tests::run_emitted` that CI's 4-core runner (4 test threads)
++   hits and a 2-thread dev box usually does not. Probe scratch directories
++   were named `/tmp/lccc-machinst-exec-{pid}-{body.len()}`: two tests whose
++   generated probe bodies have the same byte length (e.g. the 3-line imul3
++   probe and its neighbors) shared a directory, and whichever finished first
++   `remove_dir_all`'ed it while the other's `as` ran → `can't create
++   .../f.o: No such file or directory` → panic → exit 101. Reproduced
++   locally at `--test-threads>=4` (~40% of runs over 15 iterations, always a
++   different sibling test); 0/20 after the fix at 16 threads. The fix gives
++   every probe site a unique directory (`probe_dir(tag)`: pid + atomic
++   counter), matching the remedy `linker_common/args.rs` already adopted for
++   this documented flake class. This also de-flakes upstream main, which
++   carries the same latent race.
++   (Verification that it is NOT compiler code: the exact CI command
++   `cargo test --profile fastbuild --all-targets --locked -j 2` passes on the
++   PR tree in this environment — 2070/0 — at 1, 2, 4, 8, and 16 test
++   threads, with i686 multilib installed and with `RUSTFLAGS=-D warnings`;
++   the failure only ever appeared at ≥ 4 threads via the temp-dir collision.)
++
++## CI hardening delivered alongside
++
++- `bench.yml` now builds with `scripts/build_lccc_fast.sh` and points every
++  gate at `target/fastbuild/lccc` (was: release-profile opt-level override +
++  `target/release/lccc`) — one profile definition shared with ci.yml; the
++  profile shapes the compiler binary, never the generated code.
+diff --git a/scripts/check_loop_alignment.py b/scripts/check_loop_alignment.py
+index 1c4d8765..1854b9b1 100644
+--- a/scripts/check_loop_alignment.py
++++ b/scripts/check_loop_alignment.py
+@@ -6,9 +6,14 @@ Programmatic verification of the hot-loop alignment policy decided by
+ shapes with the local compiler, then checks the EMITTED ASSEMBLY (not the
+ IR) for the oracle-derived directive contract:
+ 
+-  * a loop whose body contains SIMD instructions is preceded by an
+-    unconditional 32-byte alignment (``.p2align 5``) — GCC 16.2 emits
+-    exactly this for every vectorized loop header;
++  * a loop whose body contains SIMD instructions is preceded by the bounded
++    vector cascade ``.p2align 5,,15`` + ``.p2align 4`` (32 bytes when at
++    most 15 padding bytes are needed, else 16) — GCC 16.2's 32-byte
++    vector-loop alignment with the padding cost capped at half of GCC's
++    worst case, degrading to the ICX/Clang 16-byte form;
++  * a loop whose header exit comparison proves a constant trip count <= 4
++    is left unaligned (GCC and Clang leave constant-trip-3 loops alone:
++    the one-shot padding cannot pay back over at most four iterations);
+   * a scalar loop header is preceded by the bounded cascade
+     ``.p2align 4,,10`` + ``.p2align 3`` (16 bytes when <= 10 padding bytes
+     are needed, otherwise 8) — GCC's ASM_OUTPUT_MAX_SKIP_ALIGN shape;
+@@ -91,6 +96,22 @@ unsigned scalar_hash(const unsigned *restrict k, int n) {
+         h = (h ^ k[i]) * 16777619u;
+     return h;
+ }
++""",
++        "scalar",
++    ),
++    (
++        # Constant trip 3 with an opaque call in the body: the call keeps
++        # the unroller from dissolving the loop, so a genuinely tiny loop
++        # reaches codegen and must stay UNPADDED (GCC/Clang parity).
++        "tiny_trip_call",
++        """
++extern int weigh(int v);
++int tiny_trip_call(const int *restrict a) {
++    int acc = 0;
++    for (int j = 0; j < 3; j++)
++        acc += weigh(a[j]);
++    return acc;
++}
+ """,
+         "scalar",
+     ),
+@@ -328,7 +349,12 @@ def run(lccc: Path, verbose: bool) -> int:
+             )
+             for tgt, dirs in loops.items():
+                 if kind == "vector":
+-                    want = [".p2align 5"]
++                    want = [".p2align 5,,15", ".p2align 4"]
++                elif fname == "tiny_trip_call":
++                    # A constant trip count <= 4 must suppress padding
++                    # entirely (the exclusion is the CONTRACT, not an
++                    # accident): assert the negative direction too.
++                    want = []
+                 else:
+                     want = [".p2align 4,,10", ".p2align 3"]
+                 check(
 diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
-index fe9c883..fca2921 100644
+index fe9c883d..fca29217 100644
 --- a/src/backend/arm/codegen/intrinsics.rs
 +++ b/src/backend/arm/codegen/intrinsics.rs
 @@ -1077,6 +1077,7 @@ impl ArmCodegen {
@@ -10,680 +254,8 @@ index fe9c883..fca2921 100644
              | IntrinsicOp::VecMulF32x8
              | IntrinsicOp::VecMulI32x8
              | IntrinsicOp::VecSqrtF32x8
-diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index 4363d20..ba5340f 100644
---- a/src/backend/elf_writer_common.rs
-+++ b/src/backend/elf_writer_common.rs
-@@ -225,8 +225,11 @@ struct AlignMarker {
- 
- #[derive(Clone, Debug)]
- enum AlignMarkerKind {
--    /// .balign N — pad to N-byte boundary.
--    Align(u32),
-+    /// A `.p2align`/`.balign` chain: consecutive alignment directives that
-+    /// GAS evaluates sequentially against the moving offset (e.g. GCC's
-+    /// `.p2align 4,,10` + `.p2align 3` or lccc's bounded loop-header
-+    /// chains). Post-relaxation fixup replays the whole chain jointly.
-+    AlignChain(Vec<crate::backend::x86::assembler::parser::AlignTierSpec>),
-     /// .org label + offset — advance to a fixed position, filling with `fill`.
-     ///
-     /// `fill` is load-bearing: GAS pads `.org` with its fill byte (default 0)
-@@ -938,7 +941,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
-             | AsmItem::OptionDirective(_)
-             | AsmItem::Symver(_, _, _)
-             | AsmItem::Empty
--            | AsmItem::Align(_)
-+            | AsmItem::Align { .. }
-+            | AsmItem::AlignChain { .. }
-             | AsmItem::Org(_, _, _) => {}
-             _ => self.last_item_was_insn = false,
-         }
-@@ -1027,30 +1031,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
- 
-                 self.ensure_symbol(name, sec_idx, offset);
-             }
--            AsmItem::Align(n) => {
--                let after_insn = self.last_item_was_insn;
-+            AsmItem::Align {
-+                align,
-+                fill,
-+                max_skip,
-+            } => {
-+                let tier = crate::backend::x86::assembler::parser::AlignTierSpec {
-+                    align: *align,
-+                    fill: *fill,
-+                    max_skip: *max_skip,
-+                };
-                 if let Some(sec_idx) = self.current_section {
--                    let section = &mut self.sections[sec_idx];
--                    let align = *n as u64;
--                    if align > section.alignment {
--                        section.alignment = align;
--                    }
--                    let current = section.data.len() as u64;
--                    let aligned = (current + align - 1) & !(align - 1);
--                    let padding = (aligned - current) as usize;
--                    // Record alignment marker for post-relaxation fixup
--                    if padding > 0 && align > 1 {
--                        section.align_markers.push(AlignMarker {
--                            offset: current as usize,
--                            padding,
--                            kind: AlignMarkerKind::Align(*n),
--                            after_insn,
--                        });
--                    }
--                    let is_exec = section.flags & SHF_EXECINSTR != 0;
--                    section
--                        .data
--                        .extend_from_slice(&section_padding(padding, is_exec, after_insn));
-+                    self.apply_align_chain(sec_idx, &[tier]);
-+                }
-+            }
-+            AsmItem::AlignChain { tiers } => {
-+                if let Some(sec_idx) = self.current_section {
-+                    self.apply_align_chain(sec_idx, tiers);
-                 }
-             }
-             AsmItem::Byte(vals) => {
-@@ -3097,6 +3094,79 @@ impl<A: X86Arch> ElfWriterCore<A> {
-         }
-     }
- 
-+    /// Evaluate a `.p2align` chain exactly as GAS does: sequentially, each
-+    /// tier against the offset its predecessors left, skipping tiers whose
-+    /// max-skip cap cannot be met. Returns the concatenated padding bytes and
-+    /// the offset the chain started at. `after_insn` describes the item that
-+    /// preceded the chain (only the first tier's NOP ladder may use it; later
-+    /// tiers follow padding, which is data, so they get the plain-0x90-first
-+    /// ladder GAS uses after data).
-+    fn evaluate_align_chain(
-+        &self,
-+        sec_idx: usize,
-+        start_offset: usize,
-+        tiers: &[crate::backend::x86::assembler::parser::AlignTierSpec],
-+        after_insn: bool,
-+    ) -> Vec<u8> {
-+        let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
-+        let mut current = start_offset;
-+        let mut out: Vec<u8> = Vec::new();
-+        let mut first_tier = true;
-+        for tier in tiers {
-+            let a = tier.align as usize;
-+            if a <= 1 {
-+                first_tier = false;
-+                continue;
-+            }
-+            let end = (current + a - 1) & !(a - 1);
-+            let pad = end - current;
-+            if let Some(max) = tier.max_skip {
-+                if pad > max as usize {
-+                    // GAS max-skip: the tier does nothing at all.
-+                    first_tier = false;
-+                    continue;
-+                }
-+            }
-+            let tier_after_insn = after_insn && first_tier;
-+            let bytes = match tier.fill {
-+                Some(byte) => vec![byte; pad],
-+                None => section_padding(pad, is_exec, tier_after_insn),
-+            };
-+            current += bytes.len();
-+            out.extend_from_slice(&bytes);
-+            first_tier = false;
-+        }
-+        out
-+    }
-+
-+    /// Apply an alignment chain at the section's current end: bump the
-+    /// section alignment, emit the padding, and record one marker covering
-+    /// the whole chain so post-relaxation fixup can replay it jointly.
-+    fn apply_align_chain(
-+        &mut self,
-+        sec_idx: usize,
-+        tiers: &[crate::backend::x86::assembler::parser::AlignTierSpec],
-+    ) {
-+        let after_insn = self.last_item_was_insn;
-+        let section = &mut self.sections[sec_idx];
-+        for tier in tiers {
-+            if tier.align as u64 > section.alignment {
-+                section.alignment = tier.align as u64;
-+            }
-+        }
-+        let start = section.data.len();
-+        let bytes = self.evaluate_align_chain(sec_idx, start, tiers, after_insn);
-+        if !bytes.is_empty() {
-+            self.sections[sec_idx].align_markers.push(AlignMarker {
-+                offset: start,
-+                padding: bytes.len(),
-+                kind: AlignMarkerKind::AlignChain(tiers.to_vec()),
-+                after_insn,
-+            });
-+            self.sections[sec_idx].data.extend_from_slice(&bytes);
-+        }
-+    }
-+
-     fn fixup_alignment_markers(&mut self, sec_idx: usize) {
-         if self.sections[sec_idx].align_markers.is_empty() {
-             return;
-@@ -3107,8 +3177,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
-             .align_markers
-             .sort_by_key(|m| m.offset);
- 
--        let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
--
-         let mut marker_idx = 0;
-         loop {
-             if marker_idx >= self.sections[sec_idx].align_markers.len() {
-@@ -3119,23 +3187,30 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 .kind
-                 .clone();
- 
--            let needed_end = match &kind {
--                AlignMarkerKind::Align(align) => {
--                    let a = *align as usize;
--                    if a <= 1 {
--                        marker_idx += 1;
--                        continue;
--                    }
--                    (current_offset + a - 1) & !(a - 1)
-+            // Re-derive the padding this marker needs at the post-relaxation
-+            // offset, plus the exact bytes to regenerate it with.
-+            let existing_padding = self.sections[sec_idx].align_markers[marker_idx].padding;
-+            let (needed_padding, new_bytes): (usize, Vec<u8>) = match &kind {
-+                // Replay the whole chain jointly from the moved offset; each
-+                // tier is re-checked against its own max-skip cap, which is
-+                // what GAS's sequential evaluation would do at this offset.
-+                AlignMarkerKind::AlignChain(tiers) => {
-+                    let after_insn =
-+                        self.sections[sec_idx].align_markers[marker_idx].after_insn;
-+                    let bytes =
-+                        self.evaluate_align_chain(sec_idx, current_offset, tiers, after_insn);
-+                    let len = bytes.len();
-+                    (len, bytes)
-                 }
-                 AlignMarkerKind::Org {
-                     label,
-                     addend,
--                    fill: _,
-+                    fill,
-                 } => {
--                    if label.is_empty() {
-+                    let needed_end = if label.is_empty() {
-                         *addend as usize
--                    } else if let Some(&(l_sec, l_off)) = self.label_positions.get(label.as_str()) {
-+                    } else if let Some(&(l_sec, l_off)) = self.label_positions.get(label.as_str())
-+                    {
-                         if l_sec == sec_idx {
-                             (l_off as i64 + *addend) as usize
-                         } else {
-@@ -3145,13 +3220,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                     } else {
-                         marker_idx += 1;
-                         continue;
--                    }
-+                    };
-+                    let pad = needed_end.saturating_sub(current_offset);
-+                    (pad, vec![*fill; pad])
-                 }
-             };
- 
--            let needed_padding = needed_end.saturating_sub(current_offset);
--            let existing_padding = self.sections[sec_idx].align_markers[marker_idx].padding;
--
-             if needed_padding != existing_padding {
-                 // Regenerate the ENTIRE padding run rather than splicing the
-                 // delta. Executable padding is a sequence of multi-byte NOP
-@@ -3161,15 +3235,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 // length.
-                 let start = current_offset;
-                 let old_end = start + existing_padding;
--                let after_insn = self.sections[sec_idx].align_markers[marker_idx].after_insn;
--                // `.org` / org-style `.fill LABEL+N-.` pad with the fill
--                // byte, not multi-byte NOPs, even in an executable section.
--                let new_bytes = match &kind {
--                    AlignMarkerKind::Org { fill, .. } => vec![*fill; needed_padding],
--                    AlignMarkerKind::Align(_) => {
--                        section_padding(needed_padding, is_exec, after_insn)
--                    }
--                };
-                 debug_assert_eq!(new_bytes.len(), needed_padding);
-                 if old_end <= self.sections[sec_idx].data.len() {
-                     self.sections[sec_idx]
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 5df8dc2..66827bf 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -4100,6 +4100,17 @@ fn generate_function(
-     let mut last_debug_line: u32 = 0;
-     cg.state().current_program_point = 0;
- 
-+    // Hot-loop alignment analysis (heuristic, no-profile builds): bounded
-+    // .p2align chains in front of loop headers. PGO builds keep the
-+    // profile-driven map below — profile data already knows which loops are
-+    // hot, and re-deriving that heuristically would only fight it.
-+    let loop_aligns = if crate::pgo::block_align_active() {
-+        None
-+    } else {
-+        cg.loop_alignment_policy()
-+            .and_then(|policy| crate::backend::loop_align::analyze_function(func, policy))
-+    };
-+
-     for (block_idx, block) in func.blocks.iter().enumerate() {
-         if Some(block.label) != entry_label {
-             cg.state().reg_cache.invalidate_all();
-@@ -4115,6 +4126,13 @@ fn generate_function(
-                 if let Some(log2) = crate::pgo::block_align(block.label.0) {
-                     cg.state().emit_fmt(format_args!(".p2align {}", log2));
-                 }
-+            } else if let Some(plan) = loop_aligns
-+                .as_ref()
-+                .and_then(|analysis| analysis.plan_for(block.label.0))
-+            {
-+                for tier in &plan.tiers {
-+                    cg.state().emit_fmt(format_args!("    {}", tier.directive()));
-+                }
-             }
-             cg.state().out.emit_block_label(block.label.0);
-         }
-diff --git a/src/backend/loop_align.rs b/src/backend/loop_align.rs
-new file mode 100644
-index 0000000..a07c3ac
---- /dev/null
-+++ b/src/backend/loop_align.rs
-@@ -0,0 +1,368 @@
-+//! Hot-loop alignment: bounded `.p2align` chains in front of loop headers.
-+//!
-+//! # Why loop alignment exists
-+//!
-+//! Every serious x86 compiler (GCC, Clang/LLVM, ICC, ICX) pads the first
-+//! instruction of a loop to an instruction-fetch boundary at `-O2`/`-O3`.
-+//! Measured on Compiler Explorer (see `engineering/` session notes for the
-+//! full transcripts):
-+//!
-+//! * GCC 16.2 `-O2/-O3` emits a `.p2align 5 / .p2align 4 / .p2align 3` chain
-+//!   before *innermost* loops (empirically: unconditional 32-byte alignment —
-+//!   GAS resolves the chain to its largest member), a 16/8 chain before
-+//!   *outer* loop headers, and the bounded form `.p2align 4,,10` +
-+//!   `.p2align 3` before scalar remainder loops. Constant tiny-trip loops
-+//!   (e.g. `for (i = 0; i < 3; ...)`) are left unaligned.
-+//! * Clang 23.1 `-O3` emits a plain `.p2align 4` before loop headers that
-+//!   survive MachineBlockPlacement's hotness gate.
-+//! * ICX emits `.p2align 4, 0x90`; ICC classic emits `.align 16,0x90` and
-+//!   even names its hot loop labels `..LNhot`.
-+//!
-+//! On Skylake-derived cores (incl. Raptor Lake) the dominant effects are:
-+//!
-+//! 1. **uop-cache (DSB) line granularity is 32 bytes.** A loop whose first
-+//!    instruction starts at a 32-byte boundary occupies a whole uop-cache
-+//!    line from its first byte; no line is wasted on pre-loop code.
-+//! 2. **The 16-byte decoder fetch windows.** A 16-aligned loop top never
-+//!    shares a fetch window with the preheader's tail, so the first
-+//!    iteration does not decode dead bytes.
-+//! 3. **The LSD** locks small aligned loops and replays them without
-+//!    re-fetching; alignment keeps the loop body contiguous in the uop cache.
-+//!
-+//! The cost is I-cache/DSB pressure and code size: every padding byte is a
-+//! byte of hot cache that executes only once (loop entry). That is why this
-+//! pass uses *bounded* chains (`.p2align N,,max`) instead of GCC 16's
-+//! empirically unbounded 32-byte padding: lccc's own PGO experiments
-+//! measured full 32-byte alignment of every hot header as SLOWER than
-+//! 16-byte alignment on gzip compress (multi-byte NOP bloat, ~11% growth of
-+//! `longest_match`), while GCC's and LLVM's defaults are 16-byte based.
-+//!
-+//! # Design
-+//!
-+//! * The analysis runs in the backend, at `generate_function` time, on the
-+//!   FINAL block order. Loop headers are found with the same
-+//!   dominator-backed natural-loop discovery the optimizer passes use
-+//!   (`passes::loop_analysis::find_merged_natural_loops`) — never by ad-hoc
-+//!   backward-edge guessing, which misclassifies irreducible edges.
-+//! * Policy is tiered by what the loop *is*:
-+//!   - **Innermost + vectorized body** (any `Vec*`/`Fma*`/vector-load
-+//!     intrinsic in the body): try 32 bytes with a 15-byte cap, falling back
-+//!     to 16 bytes with a 15-byte cap. Worst case equals plain 16-alignment;
-+//!     best case puts the hottest loops at a uop-cache line start. These are
-+//!     the loops the vectorizer produced precisely because they are hot.
-+//!   - **Other innermost loops**: plain 16-byte alignment (`.p2align 4`),
-+//!     matching Clang's measured default. Padding is inherently ≤ 15 bytes.
-+//!   - **Outer loop headers**: bounded `.p2align 4,,10` + `.p2align 3,,7`
-+//!     (GCC's bounded form). Outer headers execute once per *outer*
-+//!     iteration; the win is smaller, so the cap is tighter.
-+//!   * Loops with a visible constant trip count ≤ 4 stay unaligned (GCC and
-+//!     Clang both leave `for (i=0;i<3;i++)` alone; the padding cannot pay
-+//!     back over ≤4 iterations).
-+//! * `-falign-loops=N[:max]` overrides every tier with one user-specified
-+//!   chain (GCC-compatible subset); `-fno-align-loops` disables the pass.
-+//! * When PGO block-alignment data is active it takes precedence entirely:
-+//!   the profile already knows which loops are hot, and the 16-byte choice
-+//!   there is a measured result (see `pgo::layout`).
-+//! * `CCC_NO_ALIGN_LOOPS=1` disables the pass for A/B measurement;
-+//!   `CCC_ALIGN_DEBUG=1` prints one line per decision.
-+//!
-+//! The emitted directives are resolved by the assembler (GAS or lccc's own,
-+//! both support the three-operand form since this pass landed). Keeping the
-+//! decision as *directives* rather than pre-counted bytes means branch
-+//! relaxation inside the assembler can still shrink code without breaking
-+//! the alignment — the assembler re-derives padding after relaxation via
-+//! the align-marker fixup.
-+
-+use crate::common::fx_hash::FxHashMap;
-+use crate::ir::analysis::CfgAnalysis;
-+use crate::ir::reexports::{IrFunction, Terminator};
-+use crate::passes::loop_analysis;
-+
-+/// One bounded alignment tier: pad to `1 << log2` bytes unless that would
-+/// require more than `max_skip` bytes of padding (GAS `.p2align log2,,max`
-+/// semantics: the tier then does nothing at all).
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub(crate) struct AlignTier {
-+    pub log2: u8,
-+    pub max_skip: Option<u32>,
-+}
-+
-+impl AlignTier {
-+    pub fn log2(log2: u8) -> Self {
-+        Self { log2, max_skip: None }
-+    }
-+
-+    pub fn bounded(log2: u8, max_skip: u32) -> Self {
-+        Self {
-+            log2,
-+            max_skip: Some(max_skip),
-+        }
-+    }
-+
-+    /// The directive text for this tier (without leading whitespace).
-+    pub fn directive(&self) -> String {
-+        match self.max_skip {
-+            Some(max) => format!(".p2align {},,{}", self.log2, max),
-+            None => format!(".p2align {}", self.log2),
-+        }
-+    }
-+}
-+
-+/// The chain of tiers to emit immediately before one loop-header label.
-+/// Tiers are emitted in order; the assembler applies the first one whose
-+/// cap permits, later ones become no-ops on an already-aligned offset.
-+#[derive(Clone, Debug)]
-+pub(crate) struct LoopAlignPlan {
-+    pub tiers: Vec<AlignTier>,
-+}
-+
-+impl LoopAlignPlan {
-+    pub fn new(tiers: Vec<AlignTier>) -> Self {
-+        Self { tiers }
-+    }
-+
-+    pub fn is_empty(&self) -> bool {
-+        self.tiers.is_empty()
-+    }
-+}
-+
-+/// Alignment policy: which tier chains apply to which loop class.
-+///
-+/// Built by the driver (see `CodegenOptions::align_loops`); the default
-+/// `-O2`/`-O3` x86 policy is [`LoopAlignPolicy::default_x86`].
-+#[derive(Clone, Debug)]
-+pub(crate) struct LoopAlignPolicy {
-+    /// Innermost loops whose body contains vector intrinsics.
-+    pub vector_chain: Vec<AlignTier>,
-+    /// Every other innermost loop.
-+    pub scalar_chain: Vec<AlignTier>,
-+    /// Headers of loops that contain other loops.
-+    pub outer_chain: Vec<AlignTier>,
-+}
-+
-+impl LoopAlignPolicy {
-+    /// The measured default for x86-64/i686 at -O2/-O3 (see module docs).
-+    pub fn default_x86() -> Self {
-+        Self {
-+            vector_chain: vec![
-+                AlignTier::bounded(5, 15), // 32 B when reachable within 15 B
-+                AlignTier::bounded(4, 15), // else 16 B when reachable within 15 B
-+            ],
-+            scalar_chain: vec![AlignTier::log2(4)], // plain 16 B, ≤ 15 B padding
-+            outer_chain: vec![
-+                AlignTier::bounded(4, 10), // 16 B when ≤ 10 B
-+                AlignTier::bounded(3, 7),  // else 8 B when ≤ 7 B
-+            ],
-+        }
-+    }
-+
-+    /// A single user-specified chain for every aligned loop
-+    /// (`-falign-loops=N[:max]`).
-+    pub fn uniform(log2: u8, max_skip: Option<u32>) -> Self {
-+        let tier = match max_skip {
-+            Some(max) => AlignTier::bounded(log2, max),
-+            None => AlignTier::log2(log2),
-+        };
-+        let chain = vec![tier];
-+        Self {
-+            vector_chain: chain.clone(),
-+            scalar_chain: chain.clone(),
-+            outer_chain: chain,
-+        }
-+    }
-+}
-+
-+/// Per-function analysis result: block label id → alignment plan.
-+pub(crate) struct LoopAlignAnalysis {
-+    pub plans: FxHashMap<u32, LoopAlignPlan>,
-+}
-+
-+impl LoopAlignAnalysis {
-+    pub fn plan_for(&self, label: u32) -> Option<&LoopAlignPlan> {
-+        self.plans.get(&label)
-+    }
-+}
-+
-+/// Whether an intrinsic op is a vector/SIMD operation, i.e. evidence that
-+/// the loop body was produced by (or for) the vectorizer and runs in
-+/// xmm/ymm registers.
-+///
-+/// The `Vec*` family has 100+ variants and grows with every vectorizer
-+/// feature; matching on the Debug name keeps this predicate total over
-+/// future variants instead of silently missing new ones (a missed variant
-+/// would only downgrade a vector loop to the scalar chain, but a stale
-+/// hard-coded list is still a bug magnet).
-+fn intrinsic_is_vector(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
-+    let name = format!("{op:?}");
-+    name.starts_with("Vec")
-+        || name.starts_with("FmaF")
-+        || name.starts_with("BroadcastLoad")
-+        || matches!(
-+            op,
-+            crate::ir::intrinsics::IntrinsicOp::LoadF64x4
-+                | crate::ir::intrinsics::IntrinsicOp::LoadF64x2
-+                | crate::ir::intrinsics::IntrinsicOp::LoadI32x8
-+                | crate::ir::intrinsics::IntrinsicOp::LoadI32x4
-+                | crate::ir::intrinsics::IntrinsicOp::Loaddqu
-+                | crate::ir::intrinsics::IntrinsicOp::Storedqu
-+        )
-+}
-+
-+/// Visible constant trip count of a counted loop from its *exit* comparison:
-+/// `Some(n)` when the compare that feeds the header's conditional branch is
-+/// `< Const(n)` (or the mirrored `Const(n) >` form). Comparisons that do not
-+/// guard the backedge are ignored — a stray constant compare inside the
-+/// header must not disqualify alignment.
-+/// Remainder loops divided by the vector width keep their scaled bound, so
-+/// this deliberately measures the *runtime* iteration count, which is what
-+/// alignment payback depends on.
-+fn header_constant_trip_bound(func: &IrFunction, header_idx: usize) -> Option<i64> {
-+    let header = func.blocks.get(header_idx)?;
-+    let exit_cond = match &header.terminator {
-+        Terminator::CondBranch { cond, .. } => match cond {
-+            crate::ir::reexports::Operand::Value(v) => Some(*v),
-+            _ => None,
-+        },
-+        _ => None,
-+    }?;
-+    for inst in &header.instructions {
-+        if let crate::ir::reexports::Instruction::Cmp {
-+            dest,
-+            op,
-+            lhs,
-+            rhs,
-+            ..
-+        } = inst
-+        {
-+            if *dest != exit_cond {
-+                continue;
-+            }
-+            let (limit, flipped) = match rhs {
-+                crate::ir::reexports::Operand::Const(c) => (c, false),
-+                // The mirrored form `Const(n) > iv` bounds the trip count too.
-+                crate::ir::reexports::Operand::Value(_) => match lhs {
-+                    crate::ir::reexports::Operand::Const(c) => (c, true),
-+                    _ => continue,
-+                },
-+            };
-+            let limit = limit.to_i64()?;
-+            let is_lt = match op {
-+                crate::ir::ops::IrCmpOp::Slt | crate::ir::ops::IrCmpOp::Ult => !flipped,
-+                crate::ir::ops::IrCmpOp::Sgt | crate::ir::ops::IrCmpOp::Ugt => flipped,
-+                _ => continue,
-+            };
-+            if is_lt {
-+                return Some(limit);
-+            }
-+        }
-+    }
-+    None
-+}
-+
-+/// Analyze one function and produce the alignment plans for its loop
-+/// headers. Returns `None` when nothing should be aligned (no policy, no
-+/// loops, cold section, or the A/B kill switch is set).
-+pub(crate) fn analyze_function(
-+    func: &IrFunction,
-+    policy: &LoopAlignPolicy,
-+) -> Option<LoopAlignAnalysis> {
-+    if std::env::var("CCC_NO_ALIGN_LOOPS").is_ok() {
-+        return None;
-+    }
-+    // Cold functions were placed in .text.unlikely by PGO layout; padding
-+    // code that rarely executes is pure I-cache waste.
-+    if func
-+        .section
-+        .as_deref()
-+        .is_some_and(|s| s.contains("unlikely"))
-+    {
-+        return None;
-+    }
-+    if func.blocks.len() < 2 {
-+        return None;
-+    }
-+
-+    let debug = std::env::var("CCC_ALIGN_DEBUG").is_ok();
-+    let cfg = CfgAnalysis::build(func);
-+    let loops = loop_analysis::find_merged_natural_loops(
-+        cfg.num_blocks,
-+        &cfg.preds,
-+        &cfg.succs,
-+        &cfg.idom,
-+    );
-+    if loops.is_empty() {
-+        return None;
-+    }
-+    let nest = loop_analysis::LoopNest::analyze(cfg.num_blocks, &loops);
-+
-+    let mut plans: FxHashMap<u32, LoopAlignPlan> = FxHashMap::default();
-+    for (loop_idx, natural_loop) in loops.iter().enumerate() {
-+        let header_idx = natural_loop.header;
-+        let header_label = func.blocks[header_idx].label;
-+        let is_innermost = nest.children[loop_idx].is_empty();
-+        // Which chain applies: vectorized inner loops are the hottest code
-+        // the compiler generates and get the 32-byte attempt; other loops
-+        // get the conservative chains.
-+        let has_vector_body = natural_loop.body.iter().any(|&block_idx| {
-+            func.blocks[block_idx].instructions.iter().any(|inst| {
-+                matches!(
-+                    inst,
-+                    crate::ir::reexports::Instruction::Intrinsic { op, .. }
-+                        if intrinsic_is_vector(op)
-+                )
-+            })
-+        });
-+        // Loops that visibly run ≤ 4 iterations never pay the padding back
-+        // (GCC/Clang leave constant-trip-3 loops unaligned too).
-+        if let Some(bound) = header_constant_trip_bound(func, header_idx) {
-+            if bound <= 4 {
-+                if debug {
-+                    eprintln!(
-+                        "[align] {} loop header block {}: tiny trip bound {} — skipped",
-+                        func.name, header_idx, bound
-+                    );
-+                }
-+                continue;
-+            }
-+        }
-+        let chain: &[AlignTier] = if has_vector_body && is_innermost {
-+            &policy.vector_chain
-+        } else if is_innermost {
-+            &policy.scalar_chain
-+        } else {
-+            &policy.outer_chain
-+        };
-+        if chain.is_empty() {
-+            continue;
-+        }
-+        if debug {
-+            let class = if has_vector_body && is_innermost {
-+                "inner-vector"
-+            } else if is_innermost {
-+                "inner-scalar"
-+            } else {
-+                "outer"
-+            };
-+            eprintln!(
-+                "[align] {} loop header block {} ({}): {}",
-+                func.name,
-+                header_idx,
-+                class,
-+                chain
-+                    .iter()
-+                    .map(|t| t.directive())
-+                    .collect::<Vec<_>>()
-+                    .join(" + ")
-+            );
-+        }
-+        plans
-+            .entry(header_label.0)
-+            .or_insert_with(|| LoopAlignPlan::new(chain.to_vec()));
-+    }
-+
-+    if plans.is_empty() {
-+        None
-+    } else {
-+        Some(LoopAlignAnalysis { plans })
-+    }
-+}
-diff --git a/src/backend/mod.rs b/src/backend/mod.rs
-index 64d79de..4c8dfd7 100644
---- a/src/backend/mod.rs
-+++ b/src/backend/mod.rs
-@@ -15,6 +15,7 @@ pub(crate) mod cast; // Cast and float operation classification
- pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
- pub(crate) mod generation; // Module/function/instruction dispatch
- pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
-+pub(crate) mod loop_align; // Hot-loop alignment policy and analysis (bounded .p2align chains)
- pub(crate) mod stack_layout; // Stack layout: slot assignment, alloca coalescing, regalloc helpers
- pub(crate) mod state; // CodegenState, StackSlot, SlotAddr
- pub(crate) mod traits; // ArchCodegen trait with default implementations
-@@ -111,6 +112,10 @@ pub(crate) struct CodegenOptions {
-     /// Byte alignment for function entry labels (`.p2align log2`). 0 = none.
-     /// GCC/Clang use 16 at -O1..-O3 and none at -Os/-Oz.
-     pub(crate) function_alignment: u32,
-+    /// Hot-loop alignment policy (`-falign-loops`). `None` disables loop
-+    /// alignment entirely (also the default at -O0/-O1/-Os/-Oz). See
-+    /// `backend::loop_align` for the measured tier design.
-+    pub(crate) align_loops: Option<crate::backend::loop_align::LoopAlignPolicy>,
-     /// -mskip-rax-setup: omit the `xorl %eax,%eax` / `movb $n,%al` reporting the
-     /// number of live SSE argument registers to a variadic callee. Only honoured
-     /// together with `no_sse`, where no such register can be in use.
 diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 01be6c8..6f86f0b 100644
+index 01be6c87..05d06f6c 100644
 --- a/src/backend/regalloc.rs
 +++ b/src/backend/regalloc.rs
 @@ -5548,6 +5548,27 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
@@ -768,22 +340,19 @@ index 01be6c8..6f86f0b 100644
              4 => matches!(
                  op,
                  O::VecMulF32x4
-@@ -6525,7 +6561,13 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
+@@ -6525,7 +6561,10 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                      | O::VecMinF64x2
                      | O::VecMaxF64x2
              ),
 -            6 => matches!(op, O::VecMulI32x4 | O::VecAddI32x4),
 +            6 => matches!(
 +                op,
-+                O::VecMulI32x4
-+                    | O::VecAddI32x4
-+                    | O::VecCmpI32x4
-+                    | O::VecBlendvI32x4
++                O::VecMulI32x4 | O::VecAddI32x4 | O::VecCmpI32x4 | O::VecBlendvI32x4
 +            ),
              _ => false,
          }
      };
-@@ -6632,6 +6674,31 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+@@ -6632,6 +6671,31 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
              | O::VecBlendvF64x2
              | O::VecMinF64x2
              | O::VecMaxF64x2 => Some(5),
@@ -815,7 +384,7 @@ index 01be6c8..6f86f0b 100644
              _ => None,
          }
      };
-@@ -6685,6 +6752,32 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+@@ -6685,6 +6749,32 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                      | O::VecMaxF64x2
                      | O::VecStoreF64x2
              ),
@@ -849,7 +418,7 @@ index 01be6c8..6f86f0b 100644
          }
      };
 diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
-index 4f882d4..f9b31ca 100644
+index 4f882d48..f9b31cac 100644
 --- a/src/backend/stack_layout/copy_coalescing.rs
 +++ b/src/backend/stack_layout/copy_coalescing.rs
 @@ -1668,6 +1668,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
@@ -900,7 +469,7 @@ index 4f882d4..f9b31ca 100644
          // Packed min/max are NON-commutative (MINPS/MAXPS return the second
          // source on unordered/equal lanes), so a fold is only order-safe in
 diff --git a/src/backend/stack_layout/graph_coloring.rs b/src/backend/stack_layout/graph_coloring.rs
-index 5b8134d..0a535cf 100644
+index 5b8134de..0a535cf4 100644
 --- a/src/backend/stack_layout/graph_coloring.rs
 +++ b/src/backend/stack_layout/graph_coloring.rs
 @@ -166,7 +166,10 @@ pub(super) fn color_stack_slots(
@@ -926,10 +495,10 @@ index 5b8134d..0a535cf 100644
              state.value_locations.insert(value, StackSlot(slot));
              colors.push((slot, live.clone()));
 diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
-index 2490d4e..7648068 100644
+index 2490d4ee..50416bb1 100644
 --- a/src/backend/stack_layout/slot_assignment.rs
 +++ b/src/backend/stack_layout/slot_assignment.rs
-@@ -874,12 +874,21 @@ pub(super) fn assign_tier3_block_local_slots(
+@@ -874,12 +874,20 @@ pub(super) fn assign_tier3_block_local_slots(
          // path's alignment note).
          for blv in block_local_values {
              let bs = block_space.entry(blv.block_idx).or_insert(0);
@@ -946,14 +515,13 @@ index 2490d4e..7648068 100644
                  *bs
              };
 -            let (_, new_space) = assign_slot(before, blv.slot_size, 0);
-+            let (_, new_space) =
-+                assign_slot(before, blv.slot_size, if vec_align { 16 } else { 0 });
++            let (_, new_space) = assign_slot(before, blv.slot_size, if vec_align { 16 } else { 0 });
 +            // new_space already includes the closure's FPO shift for the
 +            // align-16 entries, so the bs advance absorbs it exactly.
              *bs = new_space.max(before + blv.slot_size);
              if new_space > *max_block_local_space {
                  *max_block_local_space = new_space;
-@@ -887,13 +896,39 @@ pub(super) fn assign_tier3_block_local_slots(
+@@ -887,13 +895,35 @@ pub(super) fn assign_tier3_block_local_slots(
              deferred_slots.push(DeferredSlot {
                  dest_id: blv.dest_id,
                  size: blv.slot_size,
@@ -974,11 +542,7 @@ index 2490d4e..7648068 100644
 +    // new_space.
 +    let fpo_vec_shift = {
 +        let probe = assign_slot(0, 16, 16).0;
-+        if probe < 0 {
-+            (-16 - probe).max(0)
-+        } else {
-+            0
-+        }
++        if probe < 0 { (-16 - probe).max(0) } else { 0 }
 +    };
 +    // Effective window of a deferred entry: align-16 entries sit +shift
 +    // into their pool reservation (the finalize mapping rounds the END up
@@ -994,7 +558,7 @@ index 2490d4e..7648068 100644
      // Pre-compute per-block last-use and definition instruction indices.
      let block_local_set: FxHashSet<u32> = block_local_values.iter().map(|v| v.dest_id).collect();
      let mut last_use: FxHashMap<u32, usize> = FxHashMap::default();
-@@ -1070,14 +1105,34 @@ pub(super) fn assign_tier3_block_local_slots(
+@@ -1070,14 +1100,34 @@ pub(super) fn assign_tier3_block_local_slots(
              } else {
                  &mut free_4
              };
@@ -1035,7 +599,7 @@ index 2490d4e..7648068 100644
                  reused
              } else {
                  // Natural alignment inside the pool is what keeps the final
-@@ -1087,12 +1142,23 @@ pub(super) fn assign_tier3_block_local_slots(
+@@ -1087,12 +1137,23 @@ pub(super) fn assign_tier3_block_local_slots(
                  // shifting it ONTO the following small slot's bytes (the
                  // rot() v11/v14 [40,48) vs [44,48) overlap). Reused offsets
                  // are already size-aligned by construction.
@@ -1061,7 +625,7 @@ index 2490d4e..7648068 100644
                  if debug_protect && !can_reuse {
                      eprintln!(
                          "[PROTECT-T3] SSA {} is protected, forced new slot at offset {}",
-@@ -1108,7 +1174,10 @@ pub(super) fn assign_tier3_block_local_slots(
+@@ -1108,7 +1169,10 @@ pub(super) fn assign_tier3_block_local_slots(
              deferred_slots.push(DeferredSlot {
                  dest_id,
                  size: slot_size,
@@ -1073,7 +637,7 @@ index 2490d4e..7648068 100644
                  block_offset: offset,
              });
          }
-@@ -1186,7 +1255,10 @@ pub(super) fn assign_tier2_liveness_packed_slots(
+@@ -1186,7 +1250,10 @@ pub(super) fn assign_tier2_liveness_packed_slots(
      // therefore never the default.
      if !coalesce || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some() || has_builtin_setjmp(func) {
          for mbv in multi_block_values {
@@ -1085,7 +649,7 @@ index 2490d4e..7648068 100644
              state.value_locations.insert(mbv.dest_id, StackSlot(slot));
              *non_local_space = new_space;
          }
-@@ -1231,9 +1303,25 @@ pub(super) fn finalize_deferred_slots(
+@@ -1231,9 +1298,25 @@ pub(super) fn finalize_deferred_slots(
          // Find the maximum alignment required by any deferred slot and align
          // non_local_space to it. This prevents alignment rounding in assign_slot
          // from causing adjacent slots to overlap when nls is not aligned.
@@ -1112,7 +676,7 @@ index 2490d4e..7648068 100644
              .max()
              .unwrap_or(8);
          // ALWAYS 8-align the deferred-region base: Tier-2 small slots leave
-@@ -1241,11 +1329,19 @@ pub(super) fn finalize_deferred_slots(
+@@ -1241,11 +1324,19 @@ pub(super) fn finalize_deferred_slots(
          // values are 8-aligned only relative to an 8-aligned base. With a
          // 4-mod-8 base, finalize's alignment rounding shifts wide slots onto
          // small slots' bytes (rot() v11/v14 overlap).
@@ -1133,218 +697,11 @@ index 2490d4e..7648068 100644
          if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
              eprintln!(
                  "[SLOTS]   block-region base aligned_nls={} max_block_local_space={} n_deferred={}",
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 814b526..e8fda9e 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -2348,6 +2348,13 @@ pub trait ArchCodegen {
-         None
-     }
- 
-+    /// Hot-loop alignment policy, or None when the target does not align
-+    /// loop headers. The x86 backend overrides it from CodegenOptions
-+    /// (`-falign-loops`, default-on at -O2/-O3).
-+    fn loop_alignment_policy(&self) -> Option<&crate::backend::loop_align::LoopAlignPolicy> {
-+        None
-+    }
-+
-     fn function_type_directive(&self) -> &'static str {
-         "@function"
-     }
-diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
-index b2c87ed..62cdca7 100644
---- a/src/backend/x86/assembler/parser.rs
-+++ b/src/backend/x86/assembler/parser.rs
-@@ -9,6 +9,19 @@ use crate::backend::asm_preprocess::{self, CommentStyle};
- use crate::backend::elf;
- use std::fmt;
- 
-+/// One tier of a `.p2align N[, fill[, max]]` directive (see `AsmItem::Align`
-+/// and `AsmItem::AlignChain`).
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub struct AlignTierSpec {
-+    /// Byte boundary (already converted from the `.p2align` exponent).
-+    pub align: u32,
-+    /// Explicit single-byte fill value; `None` = GAS default (NOPs in
-+    /// executable sections, zeroes elsewhere).
-+    pub fill: Option<u8>,
-+    /// Maximum padding bytes; `None` pads unboundedly.
-+    pub max_skip: Option<u32>,
-+}
-+
- /// A parsed assembly item (one per line, roughly).
- #[derive(Debug, Clone)]
- pub enum AsmItem {
-@@ -30,8 +43,27 @@ pub enum AsmItem {
-     Size(String, SizeExpr),
-     /// Label definition: `name:`
-     Label(String),
--    /// Alignment: `.align N`
--    Align(u32),
-+    /// Alignment: `.align N[, fill[, max]]`
-+    Align {
-+        /// Byte boundary (already converted from the `.p2align` exponent).
-+        align: u32,
-+        /// Explicit single-byte fill value. `None` means GAS's default: NOP
-+        /// sequences in executable sections, zeroes elsewhere.
-+        fill: Option<u8>,
-+        /// Maximum padding bytes; `None` pads unboundedly. When padding to the
-+        /// boundary would exceed this cap, no alignment happens at all.
-+        max_skip: Option<u32>,
-+    },
-+    /// A run of consecutive alignment directives with nothing but blank lines
-+    /// between them. GAS evaluates such a chain sequentially — each directive
-+    /// sees the offset its predecessors left — and compilers rely on that for
-+    /// bounded fallback chains (`.p2align 5,,15` + `.p2align 4,,15`,
-+    /// GCC's `.p2align 4,,10` + `.p2align 3`). Keeping the run as one item
-+    /// lets the ELF writer and its post-relaxation fixup re-evaluate the
-+    /// whole chain jointly instead of re-deriving one tier in isolation.
-+    AlignChain {
-+        tiers: Vec<AlignTierSpec>,
-+    },
-     /// Emit bytes: `.byte val, val, ...` (can contain label expressions)
-     Byte(Vec<DataValue>),
-     /// Emit 16-bit values: `.short val, ...` (can be symbol references)
-@@ -434,7 +466,63 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
-         }
-     }
- 
--    Ok(items)
-+    // Merge runs of consecutive alignment directives (blank lines between
-+    // them are transparent) into a single chain item. GAS evaluates such
-+    // runs sequentially against the moving offset; compilers emit them as
-+    // bounded fallback chains (GCC `.p2align 4,,10` + `.p2align 3`, lccc's
-+    // own `.p2align 5,,15` + `.p2align 4,,15`). One item per chain is what
-+    // lets the ELF writer re-evaluate the whole chain jointly after jump
-+    // relaxation instead of re-deriving one tier against a stale offset.
-+    let mut merged: Vec<AsmItem> = Vec::with_capacity(items.len());
-+    for item in items {
-+        match item {
-+            AsmItem::Align {
-+                align,
-+                fill,
-+                max_skip,
-+            } => {
-+                let tier = AlignTierSpec {
-+                    align,
-+                    fill,
-+                    max_skip,
-+                };
-+                // A chain stays open across blank lines: they emit no bytes.
-+                while matches!(merged.last(), Some(AsmItem::Empty)) {
-+                    merged.pop();
-+                }
-+                match merged.last_mut() {
-+                    Some(AsmItem::AlignChain { tiers }) => tiers.push(tier),
-+                    Some(AsmItem::Align { .. }) => {
-+                        let first = match merged.pop() {
-+                            Some(AsmItem::Align {
-+                                align,
-+                                fill,
-+                                max_skip,
-+                            }) => AlignTierSpec {
-+                                align,
-+                                fill,
-+                                max_skip,
-+                            },
-+                            _ => unreachable!("matched an Align tail"),
-+                        };
-+                        merged.push(AsmItem::AlignChain {
-+                            tiers: vec![first, tier],
-+                        });
-+                    }
-+                    _ => merged.push(AsmItem::Align {
-+                        align,
-+                        fill,
-+                        max_skip,
-+                    }),
-+                }
-+            }
-+            // Blank lines are kept verbatim; the Align arm pops them when a
-+            // chain continues through them.
-+            _ => merged.push(item),
-+        }
-+    }
-+
-+    Ok(merged)
- }
- 
- /// Strip trailing comment from a line using x86 comment style (`#`).
-@@ -575,15 +663,54 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
-         ".type" => parse_type_directive(args),
-         ".size" => parse_size_directive(args),
-         ".align" | ".p2align" | ".balign" => {
--            let val_str = args.split(',').next().unwrap_or("1").trim();
-+            // `.p2align alignment[, fill[, max]]` (and `.align`/`.balign` with
-+            // the same trailing operands, measured in bytes on x86 GAS).
-+            //
-+            // Operand 2 (`fill`) selects the padding byte. It is only honored
-+            // as a single byte: the word/longword variants `.p2alignw/l` are
-+            // a different directive family. GAS ignores `fill` in executable
-+            // sections only when it is omitted (NOPs are emitted instead);
-+            // an explicit fill (ICX emits `.p2align 4, 0x90`) is used
-+            // verbatim, so honoring it keeps lccc byte-compatible with
-+            // compiler-produced assembly.
-+            //
-+            // Operand 3 (`max`) is the maximum number of padding bytes: if
-+            // reaching the boundary would skip more, GAS performs no
-+            // alignment at all. This is the form GCC/Clang emit for bounded
-+            // loop alignment (`.p2align 4,,10`), so without it lccc silently
-+            // mis-assembles their output by padding unboundedly.
-+            let mut parts = args.split(',');
-+            let val_str = parts.next().unwrap_or("1").trim();
-             let val: u32 =
-                 parse_integer_expr(val_str).map_err(|_| format!("bad alignment: {}", args))? as u32;
-+            // Trailing operands may be empty placeholders (`,,15`), which GAS
-+            // treats as "default" for that operand.
-+            let fill = parts
-+                .next()
-+                .map(|s| s.trim())
-+                .filter(|s| !s.is_empty())
-+                .map(|s| {
-+                    parse_integer_expr(s).map_err(|_| format!("bad alignment fill: {}", s))
-+                })
-+                .transpose()?
-+                .map(|v: i64| v as u8);
-+            let max_skip = parts
-+                .next()
-+                .map(|s| s.trim())
-+                .filter(|s| !s.is_empty())
-+                .map(|s| {
-+                    parse_integer_expr(s)
-+                        .map_err(|_| format!("bad alignment max-skip: {}", s))
-+                })
-+                .transpose()?
-+                .map(|v: i64| v.max(0) as u32);
-             // .p2align is power-of-2, .align/.balign on x86 gas is byte count
--            if directive == ".p2align" {
--                Ok(AsmItem::Align(1 << val))
--            } else {
--                Ok(AsmItem::Align(val))
--            }
-+            let boundary = if directive == ".p2align" { 1u32 << val } else { val };
-+            Ok(AsmItem::Align {
-+                align: boundary,
-+                fill,
-+                max_skip,
-+            })
-         }
-         ".org" => {
-             // `.org new-lc, fill` -- the fill byte is optional and defaults to
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index c0941ec..111c22b 100644
+index c0941ecb..f5f57528 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
-@@ -453,6 +453,8 @@ pub struct X86Codegen {
-     /// Whether SSE is disabled (-mno-sse). When true, variadic prologues skip
-     /// XMM saves and va_start sets fp_offset to overflow immediately.
-     pub(super) function_alignment: u32,
-+    /// Hot-loop alignment policy (`-falign-loops`); None disables the pass.
-+    pub(super) align_loops: Option<crate::backend::loop_align::LoopAlignPolicy>,
-     pub(super) skip_rax_setup: bool,
-     /// The current function contains a Call/CallIndirect. With frame-pointer
-     /// omission a frame-less (raw_space == 0) function still needs an 8-byte
-@@ -473,6 +475,12 @@ pub struct X86Codegen {
+@@ -473,6 +473,12 @@ pub struct X86Codegen {
      /// flushed to .rodata by emit_vector_const_rodata after the function body.
      pub(super) vec_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8), String>,
      pub(super) vec_const_counter: u32,
@@ -1357,15 +714,7 @@ index c0941ec..111c22b 100644
      /// True when the target has BMI1; enables scalar ANDN fusion.
      pub(super) bmi1_enabled: bool,
      /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
-@@ -899,6 +907,7 @@ impl X86Codegen {
-             reg_assignments: FxHashMap::default(),
-             used_callee_saved: Vec::new(),
-             function_alignment: 0,
-+            align_loops: None,
-             skip_rax_setup: false,
-             func_has_calls: false,
-             fp_contract: crate::common::fp_contract::FpContract::default(),
-@@ -906,6 +915,7 @@ impl X86Codegen {
+@@ -906,6 +912,7 @@ impl X86Codegen {
              no_sse: false,
              vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
              vec_const_counter: 0,
@@ -1373,15 +722,7 @@ index c0941ec..111c22b 100644
              bmi1_enabled: false,
              lzcnt_enabled: false,
              popcnt_enabled: false,
-@@ -1015,6 +1025,7 @@ impl X86Codegen {
-         self.set_mcount(opts.mcount);
-         self.set_cf_protection_branch(opts.cf_protection_branch);
-         self.function_alignment = opts.function_alignment;
-+        self.align_loops = opts.align_loops.clone();
-         self.skip_rax_setup = opts.skip_rax_setup;
-         self.set_no_sse(opts.no_sse);
-         self.set_code_model_kernel(opts.code_model_kernel);
-@@ -1055,9 +1066,42 @@ impl X86Codegen {
+@@ -1055,9 +1062,42 @@ impl X86Codegen {
          format!("{}(%rip)", label)
      }
  
@@ -1425,7 +766,7 @@ index c0941ec..111c22b 100644
              return;
          }
          let sect = self.state.current_text_section.clone();
-@@ -1082,6 +1126,40 @@ impl X86Codegen {
+@@ -1082,6 +1122,39 @@ impl X86Codegen {
                      .emit_fmt(format_args!("    .long {}", *value as i32)),
              }
          }
@@ -1459,14 +800,13 @@ index c0941ec..111c22b 100644
 +                _ => *value as u32 as i64,
 +            };
 +            for _ in 0..count {
-+                self.state
-+                    .emit_fmt(format_args!("    {} {}", directive, v));
++                self.state.emit_fmt(format_args!("    {} {}", directive, v));
 +            }
 +        }
          self.state
              .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
          // Keep the counter monotonic across functions so every .LvcN label is
-@@ -1089,6 +1167,7 @@ impl X86Codegen {
+@@ -1089,6 +1162,7 @@ impl X86Codegen {
          // which is flushed together). Resetting per function would emit
          // duplicate .rodata labels that resolve to the wrong width.
          self.vec_const_labels.clear();
@@ -1474,19 +814,8 @@ index c0941ec..111c22b 100644
      }
  
      /// Format a stack slot reference as "offset(%rbp)" or "offset(%rsp)" depending
-@@ -6647,6 +6726,10 @@ impl ArchCodegen for X86Codegen {
-         }
-     }
- 
-+    fn loop_alignment_policy(&self) -> Option<&crate::backend::loop_align::LoopAlignPolicy> {
-+        self.align_loops.as_ref()
-+    }
-+
-     // All remaining methods delegate to self.method_name_impl(args...)
-     delegate_to_impl! {
-         // CCC_ENABLE_VECREG live-out flush (default no-op on other backends)
 diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index b0bc1ed..b58db61 100644
+index b0bc1ed0..abe6e04a 100644
 --- a/src/backend/x86/codegen/intrinsics.rs
 +++ b/src/backend/x86/codegen/intrinsics.rs
 @@ -17,6 +17,16 @@ use crate::backend::state::StackSlot;
@@ -1598,7 +927,7 @@ index b0bc1ed..b58db61 100644
                  // Peek register residency BEFORE invalidating the peephole —
                  // otherwise every map/store pair pays a dead vmovdqu round-trip.
                  let in_reg = matches!(&args[0], Operand::Value(v)
-@@ -5119,6 +5189,138 @@ impl X86Codegen {
+@@ -5119,6 +5189,140 @@ impl X86Codegen {
          self.sse_store_dest(dest, "xmm0");
      }
  
@@ -1724,10 +1053,12 @@ index b0bc1ed..b58db61 100644
 +                let mn = if eq { "pcmpeqd" } else { "pcmpgtd" };
 +                // %xmm0 holds the greater-side operand (b for lt, a for
 +                // le); the src is the other side: dst > src.
-+                self.state.emit_fmt(format_args!("    {} {}, %xmm0", mn, src));
++                self.state
++                    .emit_fmt(format_args!("    {} {}, %xmm0", mn, src));
 +            }
 +            if invert {
-+                self.state.emit_fmt(format_args!("    pcmpeqd %xmm1, %xmm1"));
++                self.state
++                    .emit_fmt(format_args!("    pcmpeqd %xmm1, %xmm1"));
 +                self.state.emit_fmt(format_args!("    pxor %xmm1, %xmm0"));
 +            }
 +            self.sse_store_dest(dest, "xmm0");
@@ -1737,7 +1068,7 @@ index b0bc1ed..b58db61 100644
      /// Lane-mask select (AVX): `args = [false_vec, true_vec, mask]`,
      /// `vblendvps mask, true(reg/mem), false(reg), dst`.  The false vector
      /// streams through %ymm0; the mask and the true vector are read from
-@@ -5199,13 +5401,39 @@ impl X86Codegen {
+@@ -5199,13 +5403,39 @@ impl X86Codegen {
      ///   orps xmm1, xmm0
      /// The false vector is read from its home / slot / fold as the
      /// `andnps` memory or register source, so only %xmm0/%xmm1 are written.
@@ -1782,371 +1113,91 @@ index b0bc1ed..b58db61 100644
          // No leading flush: a deferred mask still held in %xmm0 must keep
          // its cache hit (the mask load below consumes it in place).  The
          // mask/true loads then commit or consume any other pending store,
-diff --git a/src/backend/x86/codegen/peephole/passes/identical_blocks.rs b/src/backend/x86/codegen/peephole/passes/identical_blocks.rs
-index 7f7a129..98f2f9a 100644
---- a/src/backend/x86/codegen/peephole/passes/identical_blocks.rs
-+++ b/src/backend/x86/codegen/peephole/passes/identical_blocks.rs
-@@ -14,6 +14,20 @@
- //! the other path's inputs. We therefore require that two blocks share the
- //! EXACT SAME SET of predecessor blocks before merging. Identical predecessors
- //! guarantee identical live-in state, so the merge is semantics-preserving.
-+//!
-+//! KNOWN LIMITATION (pred visibility): the predecessor scan only attributes
-+//! edges whose source lies inside a tracked `.LBB` block. Code in function
-+//! entry regions (before the first `.LBB` label) and after non-`.LBB` local
-+//! labels (`.Lmset_loop_*` memset islands, `.Lvc*` pools, …) is untracked, so
-+//! jumps from there contribute NO predecessor. Two blocks whose in-edges are
-+//! all invisible therefore compare equal on EMPTY predecessor sets and can
-+//! still merge. That is the pass's working mode for entry-adjacent dispatch
-+//! (see test non_jump_table_blocks_still_merge) and is only sound because such
-+//! blocks' register state at the jump sites usually coincides; a general fix
-+//! needs entry-region/island tracking in the block scan. Alignment directives
-+//! between blocks no longer erase fall-through edges (see is_inert_directive),
-+//! which was the one case where the erasure was a pure analysis bug rather
-+//! than an inherent limitation.
+diff --git a/src/backend/x86/codegen/machinst_tests.rs b/src/backend/x86/codegen/machinst_tests.rs
+index b58f9218..78f362f8 100644
+--- a/src/backend/x86/codegen/machinst_tests.rs
++++ b/src/backend/x86/codegen/machinst_tests.rs
+@@ -950,6 +950,29 @@ fn instruction_corpus() -> Vec<MachInst> {
+     v
+ }
  
- use super::super::types::*;
- use crate::common::fx_hash::{FxHashMap, FxHashSet};
-@@ -37,6 +51,45 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
- //      merged blocks and all their predecessors to be "clean" (single-entry,
- //      no internal labels), so the register values at entry are path-independent.
- 
-+/// Directives that are inert for control-flow and register-state analysis:
-+/// they emit no semantically relevant instructions into the text stream
-+/// (`.p2align`/`.balign`/`.align` emit NOP padding; `.loc`/`.file` emit
-+/// debug metadata). A block boundary scan must treat them as transparent,
-+/// exactly like NOP lines — breaking a block at such a directive silently
-+/// ERASES the fall-through edge between the two blocks around it, and the
-+/// predecessor analysis then believes the following block has no
-+/// predecessors at all.
++/// Unique scratch directory for an assembly/execution probe.
 +///
-+/// Observed miscompile (vectorize_int_map_lanes, -O3 -march=x86-64-v3): the
-+/// loop-header alignment pass emits `.p2align 4` between a loop guard's
-+/// conditional branch and the preheader label; identical_blocks lost the
-+/// fall-through edge, saw 25 byte-identical memset preheaders with EMPTY
-+/// predecessor sets, merged them, and every merged-away preheader NOPed its
-+/// `rdi`/`rcx`/`ymm0` setup straight into the store loop → SIGSEGV.
++/// Probes from DIFFERENT tests run concurrently under `cargo test`'s default
++/// thread pool. The historical naming — `lccc-machinst-exec-{pid}-{body.len()}`
++/// — mapped two concurrently running probes whose generated bodies happened
++/// to have the same byte length onto the SAME directory, and whichever probe
++/// finished first `remove_dir_all`ed it out from under the other: the
++/// assembler then died with `can't create .../f.o: No such file or directory`
++/// and the test panicked. The flake was invisible at low `-j`/test-thread
++/// counts and reproducible on busy CI runners (more test threads), where it
++/// turned a green suite red non-deterministically.
 +///
-+/// `.cfi_*` is deliberately NOT in this set: unwind directives are
-+/// function-scoped metadata that must survive block merging verbatim, and
-+/// no lccc codegen path emits them between `.LBB` blocks. Keeping them as
-+/// block terminators preserves the pre-existing (and tested) behavior.
-+fn is_inert_directive(trimmed: &str) -> bool {
-+    trimmed.starts_with(".loc")
-+        || trimmed.starts_with(".file")
-+        || trimmed.starts_with(".p2align")
-+        || trimmed.starts_with(".balign")
-+        || trimmed.starts_with(".align")
++/// Uniqueness here is process id (across test binaries) plus a
++/// monotonically increasing per-process counter (across concurrent tests and
++/// retries), so no two probes can ever share a directory; `tag` keeps the
++/// directory name diagnosable in `/tmp`.
++fn probe_dir(tag: &str) -> std::path::PathBuf {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    static PROBE_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
++    let n = PROBE_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
++    std::env::temp_dir().join(format!("lccc-{tag}-{}-{n}", std::process::id()))
 +}
 +
-+/// A line inside a block range that carries no block semantics: a NOP or an
-+/// inert directive. Every content consumer below (boundary scan, terminator
-+/// scan, hash, text identity, cleanliness) skips exactly these, so a block's
-+/// identity never depends on its padding.
-+fn line_is_transparent(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
-+    if infos[j].is_nop() {
-+        return true;
-+    }
-+    infos[j].kind == LineKind::Directive && is_inert_directive(infos[j].trimmed(store.get(j)))
-+}
-+
- /// Does this instruction set the EFLAGS (condition flags)?
- fn sets_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
-     match infos[i].kind {
-@@ -173,7 +226,10 @@ fn block_is_flag_dependent(
- /// would split it, so its register state at exit is path-independent.
- fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
-     for j in (start + 1)..end {
--        if infos[j].is_nop() {
-+        // Transparent lines (NOPs, inert directives) carry no block
-+        // semantics: they cannot branch or define a label, so they do not
-+        // affect the single-entry straight-line property.
-+        if line_is_transparent(store, infos, j) {
-             continue;
-         }
-         match infos[j].kind {
-@@ -240,8 +296,11 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
-                             // merge (then delete) epilogue blocks it shouldn't
-                             // (gzip -g -O2: treat_file lost its epilogue+ret
-                             // and fell through into create_outfile -> SIGSEGV).
-+                            // The same is true for alignment directives (see
-+                            // is_inert_directive): breaking the block there
-+                            // erases the fall-through edge to the next block.
-                             let dl = infos[end].trimmed(store.get(end));
--                            if dl.starts_with(".loc") || dl.starts_with(".file") {
-+                            if is_inert_directive(dl) {
-                                 end += 1;
-                                 continue;
-                             }
-@@ -285,11 +344,14 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
-     //   - X falls through into B (X.end == B.start and X's last non-NOP
-     //     instruction is not an unconditional jmp / ret).
-     let mut preds: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
--    // Determine the block-terminating instruction per block.
-+    // Determine the block-terminating instruction per block. Inert
-+    // directives are skipped: a `ret` followed by `.cfi_endproc` (or an
-+    // aligned block's trailing `.p2align`) must still classify as a Ret /
-+    // real terminator, not as a fall-through-capable Directive line.
-     let mut block_terminator: Vec<LineKind> = vec![LineKind::Empty; blocks.len()];
-     for (bidx, &(start, end, _, _)) in blocks.iter().enumerate() {
-         for k in (start + 1..end).rev() {
--            if infos[k].is_nop() {
-+            if line_is_transparent(store, infos, k) {
-                 continue;
-             }
-             block_terminator[bidx] = infos[k].kind;
-@@ -354,7 +416,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
-         let mut hasher = 0u64;
-         let mut instr_count = 0u32;
-         for j in (start + 1)..end {
--            if infos[j].is_nop() {
-+            if line_is_transparent(store, infos, j) {
-                 continue;
-             }
-             let line = store.get(j);
-@@ -485,7 +547,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
-         let canonical_preds = preds.get(&canonical_label).cloned().unwrap_or_default();
- 
-         let canonical_instrs: Vec<String> = ((*can_start + 1)..*can_end)
--            .filter(|&j| !infos[j].is_nop())
-+            .filter(|&j| !line_is_transparent(store, infos, j))
-             .map(|j| store.get(j).to_string())
-             .collect();
- 
-@@ -517,7 +579,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
-             }
- 
-             let other_instrs: Vec<String> = ((other_start + 1)..other_end)
--                .filter(|&j| !infos[j].is_nop())
-+                .filter(|&j| !line_is_transparent(store, infos, j))
-                 .map(|j| store.get(j).to_string())
-                 .collect();
- 
-@@ -532,10 +594,15 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
- 
-                 redirects.insert(other_label.clone(), canonical_label.clone());
-                 for j in other_start..other_end {
--                    if !infos[j].is_nop() {
--                        mark_nop(&mut infos[j]);
--                        changed = true;
-+                    if line_is_transparent(store, infos, j) {
-+                        // Inert directives survive the merge: a trailing
-+                        // `.p2align` pads the LIVE successor's label, and
-+                        // deleting it would silently defeat that block's
-+                        // alignment.
-+                        continue;
-                     }
-+                    mark_nop(&mut infos[j]);
-+                    changed = true;
-                 }
-             }
-         }
-@@ -732,4 +799,73 @@ mod tests {
-         let defs = out.matches("call ext_a").count();
-         assert_eq!(defs, 1, "expected 1 surviving call block:\n{out}");
+ /// Locate an assembler, preferring the project's pinned **GAS 2.47**.
+ ///
+ /// The differential is only as authoritative as the assembler behind it: a
+@@ -1056,7 +1079,7 @@ fn every_emitted_instruction_is_accepted_by_the_real_assembler() {
      }
-+
-+    /// Alignment directives between a fall-through predecessor and a block
-+    /// must not erase the fall-through edge from the predecessor analysis.
-+    /// This is the exact shape of the loop-header alignment miscompile
-+    /// (vectorize_int_map_lanes at -O3 -march=x86-64-v3), reduced to ONE
-+    /// function so func_id separation cannot mask it: `.p2align 4` between
-+    /// each guard block's branch and its preheader label made the
-+    /// byte-identical memset preheaders all show EMPTY predecessor sets;
-+    /// they merged, and the merged-away copies NOPed their rdi/rcx/ymm0
-+    /// setup straight into the store loop → SIGSEGV. Boundary transparency
-+    /// (is_inert_directive) records the fall-through edge through the
-+    /// `.p2align`, so the preheaders' predecessor sets differ ({.LBB1} vs
-+    /// {.LBB5}) and no merge may happen.
-+    #[test]
-+    fn identical_blocks_p2align_between_blocks_preserves_fallthrough() {
-+        let out = run(concat!(
-+            "main:\n",
-+            ".cfi_startproc\n",
-+            "    xorl %r15d, %r15d\n",
-+            ".LBB1:\n",
-+            "    cmpq $2, %rdi\n",
-+            "    jae .LBB5\n",
-+            "    .p2align 4\n",
-+            ".LBB2:\n",
-+            "    movq %rbx, %rdi\n",
-+            "    movl $0xa5a5a5a5, %eax\n",
-+            "    vmovd %eax, %xmm0\n",
-+            "    vpbroadcastd %xmm0, %ymm0\n",
-+            "    movq $32, %rcx\n",
-+            ".Lmset_loop_0:\n",
-+            "    vmovdqu %ymm0, (%rdi)\n",
-+            "    addq $64, %rdi\n",
-+            "    decq %rcx\n",
-+            "    jne .Lmset_loop_0\n",
-+            "    ret\n",
-+            ".LBB5:\n",
-+            "    cmpq $3, %rsi\n",
-+            "    jae .LBB9\n",
-+            "    .p2align 4\n",
-+            ".LBB6:\n",
-+            "    movq %rbx, %rdi\n",
-+            "    movl $0xa5a5a5a5, %eax\n",
-+            "    vmovd %eax, %xmm0\n",
-+            "    vpbroadcastd %xmm0, %ymm0\n",
-+            "    movq $32, %rcx\n",
-+            ".Lmset_loop_1:\n",
-+            "    vmovdqu %ymm0, (%rdi)\n",
-+            "    addq $64, %rdi\n",
-+            "    decq %rcx\n",
-+            "    jne .Lmset_loop_1\n",
-+            "    ret\n",
-+            ".LBB9:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        // Both preheader blocks must survive with their setup intact.
-+        assert_eq!(
-+            out.matches("vpbroadcastd %xmm0, %ymm0").count(),
-+            2,
-+            "a memset preheader was merged away through the .p2align gap:\n{out}"
-+        );
-+        assert_eq!(out.matches("movl $0xa5a5a5a5, %eax").count(), 2, "{out}");
-+        // The trip-count setup may be narrowed (movq→movl) by other passes;
-+        // only its survival matters here.
-+        assert!(
-+            out.matches("movl $32, %ecx").count() + out.matches("movq $32, %rcx").count() == 2,
-+            "{out}"
-+        );
-+    }
- }
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 5da24fd..9e98b9b 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -10,7 +10,7 @@
- //! ignored (matching GCC's behavior for unrecognized `-f` and `-m` flags),
- //! which is critical for build system compatibility.
+     src.push_str("    ret\n");
  
--use super::pipeline::{CliDefine, CompileMode, Driver};
-+use super::pipeline::{AlignLoopsFlag, CliDefine, CompileMode, Driver};
- use crate::backend::Target;
- use crate::common::error::ColorMode;
- use crate::common::fp_contract::FpContract;
-@@ -1586,6 +1586,39 @@ impl Driver {
-                 }
-                 "-fomit-frame-pointer" => self.omit_frame_pointer = true,
-                 "-fno-omit-frame-pointer" => self.omit_frame_pointer = false,
-+                // -falign-loops[=N[:max]] / -fno-align-loops: hot-loop header
-+                // alignment (bounded .p2align chains, see backend::loop_align).
-+                // GCC-compatible subset: N is a byte boundary (power of two),
-+                // optionally capped by a max-skip. Bare -falign-loops uses the
-+                // compiler's default tiered policy; the explicit form forces
-+                // one uniform chain.
-+                "-falign-loops" => self.align_loops = AlignLoopsFlag::Default,
-+                "-fno-align-loops" => self.align_loops = AlignLoopsFlag::Off,
-+                s if s.starts_with("-falign-loops=") => {
-+                    // N is a byte boundary (GCC semantics: -falign-loops=16
-+                    // means 16 bytes), optionally capped by :max padding
-+                    // bytes. Convert to log2 for the policy layer.
-+                    let spec = &s["-falign-loops=".len()..];
-+                    let mut parts = spec.split(':');
-+                    let bytes: Option<u32> = parts
-+                        .next()
-+                        .and_then(|n| n.parse::<u32>().ok())
-+                        .filter(|n| n.is_power_of_two() && *n <= 4096);
-+                    match bytes {
-+                        Some(bytes) => {
-+                            let log2 = bytes.trailing_zeros() as u8;
-+                            let max_skip = parts
-+                                .next()
-+                                .map(|m| m.trim())
-+                                .filter(|m| !m.is_empty())
-+                                .and_then(|m| m.parse::<u32>().ok());
-+                            self.align_loops = AlignLoopsFlag::Chain(log2, max_skip);
-+                        }
-+                        None => {
-+                            return Err(format!("invalid argument to {}", s));
-+                        }
-+                    }
-+                }
-                 "-fno-asynchronous-unwind-tables" | "-fno-unwind-tables" => {
-                     self.no_unwind_tables = true
-                 }
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index 35340f4..ee16230 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -363,6 +363,10 @@ pub struct Driver {
-     pub(super) preferred_stack_bytes: u8,
-     /// Whether to omit the frame pointer (-fomit-frame-pointer).
-     pub(super) omit_frame_pointer: bool,
-+    /// Loop-header alignment request from -falign-loops[=N[:max]] /
-+    /// -fno-align-loops. Distinct from "not given" so -fno-align-loops wins
-+    /// over the -O2/-O3 default-on policy.
-+    pub(super) align_loops: AlignLoopsFlag,
-     /// Whether to suppress .eh_frame unwind table generation
-     /// (-fno-asynchronous-unwind-tables / -fno-unwind-tables).
-     pub(super) no_unwind_tables: bool,
-@@ -383,6 +387,20 @@ pub struct Driver {
-     pub(super) pgo_update: Option<String>,
- }
+-    let dir = std::env::temp_dir().join(format!("lccc-machinst-{}", std::process::id()));
++    let dir = probe_dir("machinst");
+     let _ = std::fs::create_dir_all(&dir);
+     let s_path = dir.join("probe.s");
+     let o_path = dir.join("probe.o");
+@@ -1456,7 +1479,7 @@ _machinst_fuzz:
+         "expected a substantial corpus, got {kept} lines"
+     );
  
-+/// `-falign-loops` request state (see `Driver::align_loops`).
-+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-+pub(super) enum AlignLoopsFlag {
-+    /// Flag not given: use the -O2/-O3 default tiered policy.
-+    #[default]
-+    Unset,
-+    /// Bare `-falign-loops`: same as Unset, but marks an explicit request.
-+    Default,
-+    /// `-fno-align-loops`: disable loop alignment entirely.
-+    Off,
-+    /// `-falign-loops=N[:max]`: one uniform bounded chain for every loop.
-+    Chain(u8, Option<u32>),
-+}
-+
- impl Driver {
-     pub fn new() -> Self {
-         Self {
-@@ -527,6 +545,7 @@ impl Driver {
-             regparm: 0,
-             preferred_stack_bytes: 16,
-             omit_frame_pointer: false,
-+            align_loops: AlignLoopsFlag::Unset,
-             no_unwind_tables: false,
-             raw_args: Vec::new(),
-             pthread: false,
-@@ -2141,6 +2160,32 @@ impl Driver {
-             } else {
-                 0
-             },
-+            // Hot-loop alignment: default-on at -O2/-O3 (matching GCC/Clang/
-+            // ICX/ICC), off at -O0/-O1 and in size-optimized builds. An
-+            // explicit -falign-loops=N[:max] overrides the tiered default
-+            // with one uniform chain; -fno-align-loops forces it off.
-+            // x86-family targets only: this is where the oracle evidence and
-+            // the assembler's bounded-.p2align support both live.
-+            align_loops: if matches!(
-+                self.target,
-+                crate::backend::Target::X86_64 | crate::backend::Target::I686
-+            ) && self.opt_level >= 2
-+                && self.opt_level <= 3
-+                && !self.optimize_size
-+            {
-+                match self.align_loops {
-+                    AlignLoopsFlag::Off => None,
-+                    AlignLoopsFlag::Chain(log2, max_skip) => Some(
-+                        crate::backend::loop_align::LoopAlignPolicy::uniform(log2, max_skip),
-+                    ),
-+                    // Unset or explicit bare -falign-loops: tiered default.
-+                    AlignLoopsFlag::Unset | AlignLoopsFlag::Default => {
-+                        Some(crate::backend::loop_align::LoopAlignPolicy::default_x86())
-+                    }
-+                }
-+            } else {
-+                None
-+            },
-             skip_rax_setup: self.skip_rax_setup,
-             no_sse: self.no_sse,
-             general_regs_only: self.general_regs_only,
+-    let dir = std::env::temp_dir().join(format!("lccc-machinst-fuzz-{}", std::process::id()));
++    let dir = probe_dir("machinst-fuzz");
+     let _ = std::fs::create_dir_all(&dir);
+     let s_path = dir.join("fuzz.s");
+     let o_path = dir.join("fuzz.o");
+@@ -1562,11 +1585,7 @@ fn run_emitted(body: &str, inputs: &[(i64, i64)]) -> Option<Vec<i64>> {
+         return None;
+     }
+ 
+-    let dir = std::env::temp_dir().join(format!(
+-        "lccc-machinst-exec-{}-{}",
+-        std::process::id(),
+-        body.len()
+-    ));
++    let dir = probe_dir("machinst-exec");
+     let _ = std::fs::create_dir_all(&dir);
+     let s_path = dir.join("f.s");
+     let c_path = dir.join("m.c");
+@@ -1791,7 +1810,7 @@ fn a_symbol_address_is_the_real_address_when_executed() {
+     {
+         return;
+     }
+-    let dir = std::env::temp_dir().join(format!("lccc-leasym-{}", std::process::id()));
++    let dir = probe_dir("leasym");
+     let _ = std::fs::create_dir_all(&dir);
+     let (s_path, c_path, o_path, bin) = (
+         dir.join("f.s"),
+@@ -4020,7 +4039,7 @@ mod float_const_stores {
+             eprintln!("skipping: no assembler available");
+             return;
+         };
+-        let dir = std::env::temp_dir().join(format!("machinst_fconst_{}", std::process::id()));
++        let dir = probe_dir("machinst-fconst");
+         let _ = std::fs::create_dir_all(&dir);
+         let s_path = dir.join("fconst.s");
+         let o_path = dir.join("fconst.o");
 diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
-index 60b3eef..a06db2f 100644
+index da03a0c5..614755ea 100644
 --- a/src/ir/intrinsics.rs
 +++ b/src/ir/intrinsics.rs
 @@ -393,6 +393,31 @@ pub enum IntrinsicOp {
@@ -2217,7 +1268,7 @@ index 60b3eef..a06db2f 100644
              | IntrinsicOp::VecHorizontalMaxI32x8
          ) ||
          // The modern vectorizer's value-producing families (splats, zeros,
-@@ -1417,6 +1450,7 @@ impl IntrinsicOp {
+@@ -1440,6 +1473,7 @@ impl IntrinsicOp {
                  | IntrinsicOp::VecAddF64x2
                  | IntrinsicOp::VecAddI32x8
                  | IntrinsicOp::VecMaxI32x8
@@ -2225,7 +1276,7 @@ index 60b3eef..a06db2f 100644
                  | IntrinsicOp::VecAddI32x4
                  | IntrinsicOp::VecSubI32x8
                  | IntrinsicOp::VecSubI32x4
-@@ -1491,6 +1525,10 @@ impl IntrinsicOp {
+@@ -1514,6 +1548,10 @@ impl IntrinsicOp {
                  | IntrinsicOp::VecBlendvF32x4
                  | IntrinsicOp::VecBlendvF64x4
                  | IntrinsicOp::VecBlendvF64x2
@@ -2236,7 +1287,7 @@ index 60b3eef..a06db2f 100644
          )
      }
  }
-@@ -1644,6 +1682,8 @@ mod vector_result_width_tests {
+@@ -1667,6 +1705,8 @@ mod vector_result_width_tests {
              "VecBlendvF32x4" => IntrinsicOp::VecBlendvF32x4,
              "VecBlendvF32x8" => IntrinsicOp::VecBlendvF32x8,
              "VecBlendvF64x2" => IntrinsicOp::VecBlendvF64x2,
@@ -2245,7 +1296,7 @@ index 60b3eef..a06db2f 100644
              "VecBlendvF64x4" => IntrinsicOp::VecBlendvF64x4,
              "VecBroadcastF32x4" => IntrinsicOp::VecBroadcastF32x4,
              "VecBroadcastF32x8" => IntrinsicOp::VecBroadcastF32x8,
-@@ -1654,6 +1694,8 @@ mod vector_result_width_tests {
+@@ -1677,6 +1717,8 @@ mod vector_result_width_tests {
              "VecBroadcastI64x2" => IntrinsicOp::VecBroadcastI64x2,
              "VecCmpF32x4" => IntrinsicOp::VecCmpF32x4,
              "VecCmpF32x8" => IntrinsicOp::VecCmpF32x8,
@@ -2254,7 +1305,7 @@ index 60b3eef..a06db2f 100644
              "VecCmpF64x2" => IntrinsicOp::VecCmpF64x2,
              "VecCmpF64x4" => IntrinsicOp::VecCmpF64x4,
              "VecDivF32x4" => IntrinsicOp::VecDivF32x4,
-@@ -1689,6 +1731,7 @@ mod vector_result_width_tests {
+@@ -1712,6 +1754,7 @@ mod vector_result_width_tests {
              "VecMaxF64x2" => IntrinsicOp::VecMaxF64x2,
              "VecMaxF64x4" => IntrinsicOp::VecMaxF64x4,
              "VecMaxI32x8" => IntrinsicOp::VecMaxI32x8,
@@ -2262,17 +1313,161 @@ index 60b3eef..a06db2f 100644
              "VecMinF32x4" => IntrinsicOp::VecMinF32x4,
              "VecMinF32x8" => IntrinsicOp::VecMinF32x8,
              "VecMinF64x2" => IntrinsicOp::VecMinF64x2,
+diff --git a/src/passes/loop_align.rs b/src/passes/loop_align.rs
+index e0d7a194..641cb294 100644
+--- a/src/passes/loop_align.rs
++++ b/src/passes/loop_align.rs
+@@ -17,7 +17,10 @@
+ //!   unconditionally (`.p2align 5` / `.p2align 4` / `.p2align 3` cascade —
+ //!   a plain 32-byte alignment), *even under `-fno-align-loops`*: the
+ //!   vectorizer owns that alignment. Clang aligns loop headers to 16; ICX
+-//!   uses `.p2align 4, 0x90`.
++//!   uses `.p2align 4, 0x90`. lccc takes the 32-byte intent bounded at 15
++//!   padding bytes with a 16-byte fallback (see `vector_loop_cascade`):
++//!   the DSB win whenever the offset is within reach, at most half of
++//!   GCC's worst-case padding.
+ //! * GCC 16.2 aligns scalar loop headers with a bounded cascade:
+ //!   `.p2align 4,,10` followed by `.p2align 3` — 16 bytes when at most 10
+ //!   padding bytes are needed, otherwise at least 8 bytes. This is the
+@@ -121,14 +124,32 @@ impl LoopAlignConfig {
+         ]
+     }
+ 
+-    /// The vector-loop directive: 32 bytes, no skip clause — GCC 16.2 emits
+-    /// exactly this (as a 5/4/3 cascade that gas reduces to plain 32) for
+-    /// every vectorized loop header.
+-    fn vector_loop() -> AlignDirective {
+-        AlignDirective {
+-            log2: 5,
+-            max_skip: None,
+-        }
++    /// The vector-loop cascade: try 32 bytes when at most 15 padding bytes
++    /// are needed, otherwise 16 bytes unbounded (at most 15 more).
++    ///
++    /// GCC 16.2 pads every vectorized loop header to 32 bytes with no skip
++    /// clause at all — worst case 31 bytes of one-shot NOP padding. ICX and
++    /// Clang 23.1 both stop at 16 bytes. The bounded cascade takes GCC's
++    /// 32-byte intent whenever the natural offset is within one 16-byte
++    /// quantum of it (the common case after ordinary layout), and degrades
++    /// to exactly the ICX/Clang 16-byte alignment otherwise, capping the
++    /// code-size cost at 15 bytes instead of 31. On the DSB (32-byte uop
++    /// windows inside 64-byte lines) the 32-byte tier gives a loop head a
++    /// fresh window; the 16-byte fallback never shares a decoder fetch
++    /// window with the preheader's tail.
++    fn vector_loop_cascade() -> [AlignDirective; 2] {
++        [
++            AlignDirective {
++                log2: 5,
++                max_skip: Some(15),
++            },
++            // Padding to a 16-byte boundary never exceeds 15 bytes, so a
++            // max-skip clause here could never fire; emit the plain form.
++            AlignDirective {
++                log2: 4,
++                max_skip: None,
++            },
++        ]
+     }
+ }
+ 
+@@ -264,6 +285,21 @@ fn align_function(
+             if cfg.pgo_active && !pgo_map.contains(&header_label) {
+                 continue;
+             }
++            // Constant tiny-trip loops stay unaligned (GCC and Clang both
++            // leave `for (i = 0; i < 3; i++)` alone): padding executes once
++            // but the loop body runs at most `bound` times, so the fetch
++            // savings cannot pay back the padding. Only a *visible* constant
++            // bound disqualifies — a loop with a dynamic bound is aligned
++            // even when its runtime trip count happens to be small. A custom
++            // `-falign-loops=N` is an explicit user contract and overrides
++            // the exclusion.
++            if !matches!(cfg.loops, AlignControl::Custom { .. }) {
++                if let Some(bound) = header_constant_trip_bound(func, lp.header) {
++                    if bound <= 4 {
++                        continue;
++                    }
++                }
++            }
+             let directives = match cfg.loops {
+                 AlignControl::Custom { align, max_skip } => custom_directives(align, max_skip),
+                 _ => {
+@@ -273,7 +309,7 @@ fn align_function(
+                             .is_some_and(|b| block_has_vector_insn(b))
+                     });
+                     if vector_body {
+-                        vec![LoopAlignConfig::vector_loop()]
++                        LoopAlignConfig::vector_loop_cascade().to_vec()
+                     } else {
+                         LoopAlignConfig::scalar_loop_cascade().to_vec()
+                     }
+@@ -356,3 +392,55 @@ fn block_has_vector_insn(block: &BasicBlock) -> bool {
+         .iter()
+         .any(|inst| matches!(inst, Instruction::Intrinsic { op, .. } if op.is_vector_op()))
+ }
++
++/// Visible constant trip bound of a counted loop from its *header exit*
++/// comparison: `Some(n)` when the compare feeding the header's conditional
++/// branch is `iv < Const(n)` (or the mirrored `Const(n) > iv` form).
++///
++/// Comparisons that do not feed the header terminator are ignored — a stray
++/// constant compare inside the header must not disqualify alignment. The
++/// bound measured here is the *runtime* iteration count of THIS loop: a
++/// vectorized main loop whose bound was scaled by the vector width keeps
++/// the scaled bound, and a remainder loop divided down keeps its own, which
++/// is exactly what alignment payback depends on.
++fn header_constant_trip_bound(func: &IrFunction, header_idx: usize) -> Option<i64> {
++    use crate::ir::ops::IrCmpOp;
++    use crate::ir::reexports::Operand;
++
++    let header = func.blocks.get(header_idx)?;
++    let exit_cond = match &header.terminator {
++        Terminator::CondBranch { cond, .. } => match cond {
++            Operand::Value(v) => Some(*v),
++            _ => None,
++        },
++        _ => None,
++    }?;
++    for inst in &header.instructions {
++        if let Instruction::Cmp {
++            dest, op, lhs, rhs, ..
++        } = inst
++        {
++            if *dest != exit_cond {
++                continue;
++            }
++            let (limit, flipped) = match rhs {
++                Operand::Const(c) => (c, false),
++                // The mirrored form `Const(n) > iv` bounds the trip too.
++                Operand::Value(_) => match lhs {
++                    Operand::Const(c) => (c, true),
++                    _ => continue,
++                },
++            };
++            let limit = limit.to_i64()?;
++            let is_lt = match op {
++                IrCmpOp::Slt | IrCmpOp::Ult => !flipped,
++                IrCmpOp::Sgt | IrCmpOp::Ugt => flipped,
++                _ => continue,
++            };
++            if is_lt {
++                return Some(limit);
++            }
++        }
++    }
++    None
++}
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index c310b00..bc687ff 100644
+index c310b00d..214184ce 100644
 --- a/src/passes/vectorize.rs
 +++ b/src/passes/vectorize.rs
 @@ -4443,6 +4443,90 @@ fn parse_map_expr(
                  allow_ext_fp_ops,
              )?)))
          }
-+        Instruction::UnaryOp {
-+            op, src, ty, ..
-+        } if !ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops => {
++        Instruction::UnaryOp { op, src, ty, .. }
++            if !ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops =>
++        {
 +            // Integer unary maps: Neg is exactly Sub(0, x) in two's
 +            // complement (vpsubd), BitNot is exactly Xor(x, -1) (vpxor
 +            // against an all-ones broadcast). Dword lanes only, like the
@@ -2357,14 +1552,12 @@ index c310b00..bc687ff 100644
          Instruction::Cmp {
              op, lhs, rhs, ty, ..
          } if ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops => {
-@@ -4504,7 +4588,13 @@ fn parse_map_expr(
+@@ -4504,7 +4588,11 @@ fn parse_map_expr(
              else {
                  return None;
              };
 -            if !(ty.is_float() && *ty == *elem_ty) {
-+            if !(*ty == *elem_ty
-+                && (ty.is_float() || matches!(ty, IrType::I32 | IrType::U32)))
-+            {
++            if !(*ty == *elem_ty && (ty.is_float() || matches!(ty, IrType::I32 | IrType::U32))) {
 +                // FP conditions: packed compare emitters. I32/U32
 +                // conditions: the integer conditional-map path
 +                // (VecCmpI32x8/x4 + VecBlendvI32x8/x4). Anything else
@@ -2372,11 +1565,66 @@ index c310b00..bc687ff 100644
                  return None;
              }
              let t = parse_map_operand(
-@@ -4553,7 +4643,14 @@ fn parse_map_expr(
+@@ -4553,116 +4641,124 @@ fn parse_map_expr(
              // Non-strict `<=`/`>=` forms differ from MIN/MAX on +0/-0 (and
              // `<= ? r : l` also on NaN) and keep the exact compare+blend
              // lowering.
 -            let fold = match op {
+-                IrCmpOp::Slt => {
+-                    let l = parse_map_operand(
+-                        func,
+-                        loop_blocks,
+-                        load_dests,
+-                        iv_derived,
+-                        is_invariant,
+-                        elem_ty,
+-                        lhs,
+-                        depth + 1,
+-                        allow_ext_fp_ops,
+-                    )?;
+-                    let r = parse_map_operand(
+-                        func,
+-                        loop_blocks,
+-                        load_dests,
+-                        iv_derived,
+-                        is_invariant,
+-                        elem_ty,
+-                        rhs,
+-                        depth + 1,
+-                        allow_ext_fp_ops,
+-                    )?;
+-                    if t == l && f == r {
+-                        // `l < r ? l : r` == min(l, r): MINPS returns the
+-                        // second source (r) on unordered and both-zero
+-                        // lanes, matching the ternary lane for lane.
+-                        Some(MapExpr::MinMax {
+-                            is_max: false,
+-                            l: Box::new(l),
+-                            r: Box::new(r),
+-                        })
+-                    } else if t == r && f == l {
+-                        // `l < r ? r : l` == max(r, l) exactly, with the
+-                        // ARMS SWAPPED relative to the compare operands
+-                        // (mirror of the `l > r ? r : l` -> min(r, l) fold
+-                        // below).  `l < r` is `r > l`, so this is
+-                        // `(r > l) ? r : l` = MAX(src1 = r, src2 = l):
+-                        //   NaN            -> ternary takes F = l; MAX
+-                        //                     returns src2 = l          ok
+-                        //   +-0 both zero  -> `l < r` is false so the
+-                        //                     ternary takes F = l; MAX
+-                        //                     returns src2 = l          ok
+-                        //   equal non-zero -> F = l == src2             ok
+-                        // This is the canonical clamp HEAD `a < 0 ? 0 : a`
+-                        // (one vmaxps instead of cmp+blendv), and it is what
+-                        // lets a full clamp `a < lo ? lo : (a > hi ? hi : a)`
+-                        // lower to vmaxps+vminps the way GCC/Clang/ICX do.
+-                        Some(MapExpr::MinMax {
+-                            is_max: true,
+-                            l: Box::new(r),
+-                            r: Box::new(l),
+-                        })
+-                    } else {
+-                        None
 +            // The packed MIN/MAX fold is FP-only: the op table has no
 +            // integer minmax (the SSE2 baseline lacks dword pminsd/pmaxsd),
 +            // and integers need no fold — cmp+blendv IS their exact
@@ -2385,18 +1633,171 @@ index c310b00..bc687ff 100644
 +                None
 +            } else {
 +                match op {
-                 IrCmpOp::Slt => {
-                     let l = parse_map_operand(
-                         func,
-@@ -4663,6 +4760,7 @@ fn parse_map_expr(
++                    IrCmpOp::Slt => {
++                        let l = parse_map_operand(
++                            func,
++                            loop_blocks,
++                            load_dests,
++                            iv_derived,
++                            is_invariant,
++                            elem_ty,
++                            lhs,
++                            depth + 1,
++                            allow_ext_fp_ops,
++                        )?;
++                        let r = parse_map_operand(
++                            func,
++                            loop_blocks,
++                            load_dests,
++                            iv_derived,
++                            is_invariant,
++                            elem_ty,
++                            rhs,
++                            depth + 1,
++                            allow_ext_fp_ops,
++                        )?;
++                        if t == l && f == r {
++                            // `l < r ? l : r` == min(l, r): MINPS returns the
++                            // second source (r) on unordered and both-zero
++                            // lanes, matching the ternary lane for lane.
++                            Some(MapExpr::MinMax {
++                                is_max: false,
++                                l: Box::new(l),
++                                r: Box::new(r),
++                            })
++                        } else if t == r && f == l {
++                            // `l < r ? r : l` == max(r, l) exactly, with the
++                            // ARMS SWAPPED relative to the compare operands
++                            // (mirror of the `l > r ? r : l` -> min(r, l) fold
++                            // below).  `l < r` is `r > l`, so this is
++                            // `(r > l) ? r : l` = MAX(src1 = r, src2 = l):
++                            //   NaN            -> ternary takes F = l; MAX
++                            //                     returns src2 = l          ok
++                            //   +-0 both zero  -> `l < r` is false so the
++                            //                     ternary takes F = l; MAX
++                            //                     returns src2 = l          ok
++                            //   equal non-zero -> F = l == src2             ok
++                            // This is the canonical clamp HEAD `a < 0 ? 0 : a`
++                            // (one vmaxps instead of cmp+blendv), and it is what
++                            // lets a full clamp `a < lo ? lo : (a > hi ? hi : a)`
++                            // lower to vmaxps+vminps the way GCC/Clang/ICX do.
++                            Some(MapExpr::MinMax {
++                                is_max: true,
++                                l: Box::new(r),
++                                r: Box::new(l),
++                            })
++                        } else {
++                            None
++                        }
                      }
+-                }
+-                IrCmpOp::Sgt => {
+-                    let l = parse_map_operand(
+-                        func,
+-                        loop_blocks,
+-                        load_dests,
+-                        iv_derived,
+-                        is_invariant,
+-                        elem_ty,
+-                        lhs,
+-                        depth + 1,
+-                        allow_ext_fp_ops,
+-                    )?;
+-                    let r = parse_map_operand(
+-                        func,
+-                        loop_blocks,
+-                        load_dests,
+-                        iv_derived,
+-                        is_invariant,
+-                        elem_ty,
+-                        rhs,
+-                        depth + 1,
+-                        allow_ext_fp_ops,
+-                    )?;
+-                    if t == l && f == r {
+-                        // `l > r ? l : r` == max(l, r) exactly: MAXPS returns
+-                        // the second source (r) on unordered and both-zero
+-                        // lanes, matching the ternary lane for lane.
+-                        Some(MapExpr::MinMax {
+-                            is_max: true,
+-                            l: Box::new(l),
+-                            r: Box::new(r),
+-                        })
+-                    } else if t == r && f == l {
+-                        // `l > r ? r : l` == min(r, l) exactly, with the
+-                        // ARMS SWAPPED relative to the compare operands:
+-                        //   NaN  -> false arm l;  MINPS(x=r, y=l) -> y=l   ok
+-                        //   +-0  -> both-zero lanes return y = l, and the
+-                        //           ternary returns T=r on `l>r` (impossible
+-                        //           for equal-magnitude zeros) else F=l   ok
+-                        //   equal non-zero -> false arm l == second source
+-                        // The canonical clamp tail `a > 1 ? 1 : a` hits this
+-                        // fold (min(1, a)) — the exact GCC lowering.
+-                        Some(MapExpr::MinMax {
+-                            is_max: false,
+-                            l: Box::new(r),
+-                            r: Box::new(l),
+-                        })
+-                    } else {
+-                        None
++                    IrCmpOp::Sgt => {
++                        let l = parse_map_operand(
++                            func,
++                            loop_blocks,
++                            load_dests,
++                            iv_derived,
++                            is_invariant,
++                            elem_ty,
++                            lhs,
++                            depth + 1,
++                            allow_ext_fp_ops,
++                        )?;
++                        let r = parse_map_operand(
++                            func,
++                            loop_blocks,
++                            load_dests,
++                            iv_derived,
++                            is_invariant,
++                            elem_ty,
++                            rhs,
++                            depth + 1,
++                            allow_ext_fp_ops,
++                        )?;
++                        if t == l && f == r {
++                            // `l > r ? l : r` == max(l, r) exactly: MAXPS returns
++                            // the second source (r) on unordered and both-zero
++                            // lanes, matching the ternary lane for lane.
++                            Some(MapExpr::MinMax {
++                                is_max: true,
++                                l: Box::new(l),
++                                r: Box::new(r),
++                            })
++                        } else if t == r && f == l {
++                            // `l > r ? r : l` == min(r, l) exactly, with the
++                            // ARMS SWAPPED relative to the compare operands:
++                            //   NaN  -> false arm l;  MINPS(x=r, y=l) -> y=l   ok
++                            //   +-0  -> both-zero lanes return y = l, and the
++                            //           ternary returns T=r on `l>r` (impossible
++                            //           for equal-magnitude zeros) else F=l   ok
++                            //   equal non-zero -> false arm l == second source
++                            // The canonical clamp tail `a > 1 ? 1 : a` hits this
++                            // fold (min(1, a)) — the exact GCC lowering.
++                            Some(MapExpr::MinMax {
++                                is_max: false,
++                                l: Box::new(r),
++                                r: Box::new(l),
++                            })
++                        } else {
++                            None
++                        }
+                     }
++                    _ => None,
                  }
-                 _ => None,
-+                }
+-                _ => None,
              };
              if let Some(folded) = fold {
                  return Some(folded);
-@@ -13062,6 +13160,98 @@ fn transform_reduction_sse2(
+@@ -13062,6 +13158,98 @@ fn transform_reduction_sse2(
      changes
  }
  
@@ -2495,10 +1896,13 @@ index c310b00..bc687ff 100644
  /// Transform a legal one-source store loop to packed 128/256-bit form.  The
  /// optional scale and offset operations stay optional: copies become exactly
  /// load/store, while scale/add/affine maps emit only their source operations.
-@@ -13136,8 +13326,24 @@ fn transform_map_vector(
+@@ -13136,9 +13324,30 @@ fn transform_map_vector(
      // redirected) only after the packed body is in place.  (Redirecting the
      // exit edge first and bailing later left a dangling branch into the
      // next function's labels.)
+-    let Some(remainder) =
+-        build_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label)
+-    else {
 +    // Integer exact min/max (AVX2 vpminsd/vpmaxsd): on signed dword lanes
 +    // every strict AND non-strict ternary shape folds exactly — integers
 +    // have none of the NaN/+0/-0 special cases that constrain the FP fold
@@ -2515,13 +1919,18 @@ index c310b00..bc687ff 100644
 +        pattern.expr.clone()
 +    };
 +
-     let Some(remainder) =
--        build_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label)
-+        build_map_remainder_loop(func, pattern, &expr, vec_width, &mut next_val_id, &mut next_label)
-     else {
++    let Some(remainder) = build_map_remainder_loop(
++        func,
++        pattern,
++        &expr,
++        vec_width,
++        &mut next_val_id,
++        &mut next_label,
++    ) else {
          if debug {
              eprintln!("[VEC-MAP]   Scalar remainder mirror unavailable; bailing");
-@@ -13396,13 +13602,20 @@ fn transform_map_vector(
+         }
+@@ -13396,13 +13605,20 @@ fn transform_map_vector(
              (IrType::F64, false) => IntrinsicOp::VecCmpF64x2,
              (IrType::F32, true) => IntrinsicOp::VecCmpF32x8,
              (IrType::F32, false) => IntrinsicOp::VecCmpF32x4,
@@ -2546,7 +1955,7 @@ index c310b00..bc687ff 100644
              _ => return None,
          };
          Some((vec_op, imm))
-@@ -13412,10 +13625,19 @@ fn transform_map_vector(
+@@ -13412,10 +13628,19 @@ fn transform_map_vector(
          (IrType::F64, false) => Some(IntrinsicOp::VecBlendvF64x2),
          (IrType::F32, true) => Some(IntrinsicOp::VecBlendvF32x8),
          (IrType::F32, false) => Some(IntrinsicOp::VecBlendvF32x4),
@@ -2566,16 +1975,23 @@ index c310b00..bc687ff 100644
              (IrType::F64, true, false) => Some(IntrinsicOp::VecMinF64x4),
              (IrType::F64, false, false) => Some(IntrinsicOp::VecMinF64x2),
              (IrType::F32, true, false) => Some(IntrinsicOp::VecMinF32x8),
-@@ -13433,7 +13655,7 @@ fn transform_map_vector(
+@@ -13432,14 +13657,7 @@ fn transform_map_vector(
+     // have a lowering. A mid-transform bail after the preheader/byte-IV
      // rewrite would leave `func.next_value_id` stale and corrupt every
      // later pass (bit_idioms indexed out of bounds on exactly this).
-     if !map_tree_ops_available(
+-    if !map_tree_ops_available(
 -        &pattern.expr,
-+        &expr,
-         &bin_op,
-         sqrt_op,
-         &cmp_op,
-@@ -13466,7 +13688,7 @@ fn transform_map_vector(
+-        &bin_op,
+-        sqrt_op,
+-        &cmp_op,
+-        &minmax_op,
+-        blendv_op,
+-    ) {
++    if !map_tree_ops_available(&expr, &bin_op, sqrt_op, &cmp_op, &minmax_op, blendv_op) {
+         if debug {
+             eprintln!("[VEC-MAP]   Tree requires an op with no vector lowering");
+         }
+@@ -13466,7 +13684,7 @@ fn transform_map_vector(
              next_val_id,
              changes: &mut changes,
          };
@@ -2584,7 +2000,7 @@ index c310b00..bc687ff 100644
              if debug {
                  eprintln!("[VEC-MAP]   Tree emission failed");
              }
-@@ -13816,6 +14038,7 @@ fn add_phi_incoming(
+@@ -13816,6 +14034,7 @@ fn add_phi_incoming(
  fn build_map_remainder_loop(
      func: &IrFunction,
      pattern: &MapPattern,
@@ -2592,7 +2008,7 @@ index c310b00..bc687ff 100644
      vec_width: u64,
      next_val_id: &mut u32,
      next_label: &mut u32,
-@@ -13940,7 +14163,7 @@ fn build_map_remainder_loop(
+@@ -13940,7 +14159,7 @@ fn build_map_remainder_loop(
      // the identical scalar operation — lane-exact by construction.
      let mut next_val_local = *next_val_id;
      let scalar_result = emit_map_scalar_tree(
@@ -2602,7 +2018,7 @@ index c310b00..bc687ff 100644
          pattern,
          Operand::Value(offset_v),
 diff --git a/tests/correctness/run_correctness.py b/tests/correctness/run_correctness.py
-index e50abf5..f6c9a45 100644
+index e50abf56..f6c9a457 100644
 --- a/tests/correctness/run_correctness.py
 +++ b/tests/correctness/run_correctness.py
 @@ -826,6 +826,89 @@ int main(void) {
