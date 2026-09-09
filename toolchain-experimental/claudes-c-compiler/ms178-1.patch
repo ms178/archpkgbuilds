@@ -1,839 +1,3143 @@
-diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index 82b4dfc..9784ef1 100755
---- a/scripts/ci_local.sh
-+++ b/scripts/ci_local.sh
-@@ -121,6 +121,9 @@ gate "machinst-window-alloc" fast \
- gate "i686-atomics" fast \
-     bash tests/regression/check_i686_atomics.sh
- 
-+gate "cross-backend-atomics" fast \
-+    bash tests/regression/check_atomic_backends.sh
+diff --git a/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md b/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md
+new file mode 100644
+index 00000000..2a0acef0
+--- /dev/null
++++ b/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md
+@@ -0,0 +1,429 @@
++# FOLLOWUP — Session 33 (2026-09-09): cross-backend execution oracle + the defects it found
 +
- if [ -x target/fastbuild/lccc-ld ]; then
-     gate "linker-fuzz" fast env \
-         LCCC_LD="$PWD/target/fastbuild/lccc-ld" FUZZ_N=128 FUZZ_SEED=20260906 \
-diff --git a/src/backend/arm/codegen/atomics.rs b/src/backend/arm/codegen/atomics.rs
-index ed2c2fb..0e11cc5 100644
---- a/src/backend/arm/codegen/atomics.rs
-+++ b/src/backend/arm/codegen/atomics.rs
-@@ -5,6 +5,18 @@ use crate::common::types::IrType;
- use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
++**Branch state**: `ms178-1.patch` rebased on `ms178/lccc` main (`91ecc083`).
++**Compiler**: `scripts/build_lccc_fast.sh` (fastbuild, -O1, -j2, 4 GiB swapfile).
++**Verified**: a new cross-backend execution oracle (§1) found **5 distinct
++defects** — 4 silent miscompiles plus one hard compile failure — plus a scaled
++variant of the last one. **All are fixed and verified** against GCC on all four
++backends at `-O0/-O1/-O2/-O3/-Os`.
++**CI**: `scripts/ci_local.sh` 16/16 green (see §10).
++
++---
++
++## 1. The instrument this session built: `scripts/cross_backend_check.py`
++
++**WHY.** LCCC has four production backends (x86-64, i686, AArch64, RISC-V)
++sharing a front end, IR and optimiser but each with its own code generator.
++Every defect found this session was invisible to single-target testing and to
++assembly diffing.
++
++**The oracle.** A deterministic C program's observable behaviour (exit status +
++stdout) is a property of the *program plus its C data model*, not of the target.
++So the host GCC build is the reference and every backend must reproduce it.
++That removes the need for cross toolchains: references are native, and
++correctness is checked by *execution*, not by eyeballing assembly.
++
++```
++scripts/cross_backend_check.py                        # whole corpus, -O0..-Os
++scripts/cross_backend_check.py --programs sha256_transform --json /tmp/x.json
++scripts/cross_backend_check.py --gate --opts="-O0,-O2"  # CI-usable exit status
++```
++
++* Runs each binary natively (x86-64, i686) or under `qemu-user` (AArch64,
++  RISC-V); static linking, no runtime dependencies.
++* **Per-data-model reference**: `unsigned long` is 64-bit on LP64 targets and
++  32-bit on i686, so a `%lu` checksum legitimately differs. i686 is compared
++  against `gcc -m32`, the LP64 targets against plain `gcc`. Without this the
++  oracle reports false positives (it did, on `expat_xml_scan.c`).
++* Workload scaling: the corpus' `#ifndef` size macros are overridden with `-D`
++  so runs finish under TCG (`--no-scale` restores full size).
++* `--json` writes a full report; `--gate` exits non-zero on any mismatch or
++  compile failure. Exit 2 = usage/environment problem.
++* **Scale-macro fallback ladder**: the size macros are passed to every program
++  because unused `-D` defines are harmless, but a program that uses one of those
++  names as an identifier (an enum member `N`, a variable `SIZE`) is a *program*
++  compile error, not a compiler bug. The oracle retries the unscaled program and
++  then builds the backends the same way, so reference and target always see the
++  identical program (`binary_search.c`, `double_reduction.c`).
++
++**Corpus scaling guards** (session 32) are what make this possible: 28/45
++programs now accept `-DBLOCK_COUNT=`/`-DPASSES=`/`-DXML_SIZE=`-style overrides.
++
++**First-run findings** (23 min, 45 programs × 5 opt levels × 4 backends):
++`expat_xml_scan.c` i686 wrong at **every** level; `glibc_memcmp.c` AArch64
++`-Os` segfault; `fannkuch.c` AArch64 `-Os` internal error. §5 and §6 add two
++more found while narrowing those down. Everything else agreed with GCC.
++
++---
++
++## 2. Fixed: AArch64 silent miscompile (`sha256_transform`) — **verified**
++
++Root cause: `emit_shifted_logical_impl` (and the madd/msub twins) staged the
++non-shifted operand *first*; `materialize` clobbered `x0`, destroying the
++shifted operand that lived only there. `operand_to_x0` then emitted
++`mov x0, #0` and the checksum silently lost its `state[3]` term — the kernel
++still passed its own known-answer self-check, so nothing but a cross-target
++comparison could see it.
++
++Change: `stage_operands_acc_first()` in `src/backend/arm/codegen/alu.rs`; the
++`mov x0, #0` fallback in `operand_to_x0` is now a hard `panic!`.
++
++**Result**: `sha256_transform.c` matches GCC on **all four backends** at
++`-O0/-O1/-O2/-O3/-Os` (BLOCK_COUNT 3 and 64).
++
++## 3. Fixed: `-O0` emitted x86 text into AArch64/RISC-V assembly — **verified**
++
++`remat_indexed_acc_safe` (`src/backend/generation.rs`) is arch-agnostic but
++hard-coded `pushq %rax` / `popq %rax`, which the AArch64/RISC-V assemblers
++reject ("unsupported instruction: pushq %rax") — `lccc-arm -O0` could not
++compile `sha256_transform.c` at all.
++
++Change: new **required** (no default) `ArchCodegen::emit_acc_save` /
++`emit_acc_restore` hooks (`src/backend/traits.rs`), implemented per target:
++
++| target | save | restore | notes |
++|---|---|---|---|
++| x86-64 | `pushq %rax` | `popq %rax` | flags-neutral |
++| i686 | `pushl %eax` | `popl %eax` | flags-neutral |
++| AArch64 | `str x0, [sp, #-16]!` | `ldr x0, [sp], #16` | pre/post-index; keeps 16-byte SP alignment |
++| RISC-V | `addi sp,sp,-16` + `sd t0,0(sp)` | `ld t0,0(sp)` + `addi sp,sp,16` | no pre-indexed store exists |
++
++SP-relative slot emitters on ARM (`emit_store_to_sp`, `emit_load_from_sp`,
++`emit_stp_to_sp`, `emit_ldp_from_sp`, `emit_add_sp_offset`) and RISC-V
++(`emit_store_to_sp`, `emit_load_from_sp`) now bias offsets by
++`out.rsp_frame_size` through a new `slot_offset()` helper; x29/x19-based frames
++are unaffected, exactly like x86's RBP frames. `emit_addi_sp` is deliberately
++*not* biased (it moves SP itself). Outside the protected window the field is
++zero, so all existing codegen is bit-identical.
++
++Because the hooks are required rather than defaulted, a future target cannot
++silently inherit x86 text again.
++
++## 4. Fixed: i686 expat name-scanner miscompile — **verified**
++
++`expat_xml_scan.c` returned 2 (self-check failure) on i686 at every level ≥
++-O1: the UTF-8 name-length kernel returned 0 instead of 7/8. Expat is one of
++the user's named golden workloads.
++
++Chain: `range_fold` folded the classification (32-bit `unsigned long` changes
++its range lattice), producing `movl %ebp,%eax; cmpl $128,%eax`. Pattern 6 of
++`fold_reg_copy_idioms` correctly rewrote that to `cmpl $128,%ebp`; Pattern 15
++then narrowed it to `cmpw $128,%r16` — and `low_subreg_name("%ebp", 2)`
++returned `None`, so `.unwrap_or("%ax")` **silently substituted a different
++register**. Every character took the UTF-8 path.
++
++```asm
++; before                          ; after
++movzbl (%edi), %ebp               movzbl (%edi), %ebp
++cmpw   $128, %ax   ; WRONG REG    cmpw   $128, %bp   ; correct
++```
++
++Changes (both in `src/backend/i686/codegen/peephole.rs`):
++1. `low_subreg_name` now knows the 16-bit forms of `%ebp/%esi/%edi`
++   (`%bp/%si/%di`) — legal in 32-bit mode. `%esp` stays `None`: narrowing a
++   compare onto the stack pointer must never happen. (The 8-bit forms are
++   still limited to eax/ecx/edx/ebx, which keeps Pattern 13 safe.)
++2. The `%ax` fallback is gone: when there is no 16-bit name the rewrite is
++   **refused** (`i += 1; continue`). A missed 2-byte size win costs nothing;
++   a wrong register costs correctness.
++
++**Result**: `expat_min.c` and the full `expat_xml_scan.c` match `gcc -m32` at
++`-O0/-O1/-O2/-O3/-Os`.
++
++## 5. Fixed: AArch64 `-Os` value orphaned by `invalidate_acc` — **verified**
++
++`fannkuch.c` at `-Os` reached `emit_load_indexed_impl`'s unassigned-dest path:
++`ldrsw x0, […]` produced a value with no register assignment and no stack slot,
++`store_x0_to(dest)` registered x0 as its home, and the very next line called
++`invalidate_acc()` — orphaning the value. The next `operand_to_x0` had nothing
++left, which is what the new panic gate reports (before the gate: `mov x0, #0`,
++i.e. a silent miscompile).
++
++Change: new `store_x0_to_and_release()` — drops the accumulator entry **only
++when the value actually reached a durable home** — used at the five sites that
++paired `store_x0_to` with `invalidate_acc` (`memory.rs`, `cast_ops.rs`,
++3× `comparison.rs`).
++
++**Result**: `fannkuch.c` matches GCC on all four backends at `-O0..-Os`.
++
++---
++
++## 6. Fixed: AArch64 `-Os` peephole deleted a live alias — **verified**
++
++`glibc_memcmp.c` segfaulted under qemu-aarch64 at `-Os` only (x86-64, i686 and
++RISC-V were correct).
++
++* `LCCC_NO_PEEPHOLE=1` fixed it; **no** existing per-pass kill switch did
++  (`CCC_NO_FP_PAIR`, `_SLOT_LOAD_DEDUP`, `_FP_SLOT_FWD`, `_STORE_DSE`,
++  `_STORE_SINK`, `_GDSE`, `_REUSE_STACK_LOADS`, `_ZEXT_MASK_FOLD`,
++  `_AND_TST_FUSION`, `_DEAD_PRE_RET`, `_SPILL_THREAD`, `_ADRP_CSE`,
++  `_LOOP_ROTATE`, nor any of the 44 `CCC_DISABLE_PASSES` names except `all` /
++  `ifconv`, which merely remove the triggering shape).
++* Bisecting the Phase-1/2 passes with a temporary `CCC_SKIP_PEEP` gate pointed
++  at **`propagate_address_aliases`** — one rebuild, then one test per name.
++* Proven pre-existing: reverting the §5 hunk still segfaulted, and the acc-save
++  window (`str x0, [sp, #-16]!`) appears in neither the good nor the bad asm.
++
++**Mechanism.** The pass rewrites `mov xD, xS` into its address uses
++(`ldr x0, [xD]` → `ldr x0, [xS]`) and deletes the mov when the scan finds a
++later instruction that overwrites `xD` — treating that as proof the value is
++dead. The scan is *textual*, so the overwrite it found (`mov x19, x0`) sat in a
++**different basic block** than the mov (the prologue's `mov x19, x24`), which
++does not dominate every path out of the mov's block. `.LBB37` reached
++`ldr x0, [x19]` without passing the overwrite, so it read the caller's
++callee-saved value restored by the prologue's `ldp x19, x20, [sp, #112]` — a
++garbage pointer.
++
++Fix: track whether the scan has crossed a label. A redefinition of `dst` proves
++death **only inside the mov's own block**; once the scan has left that block the
++transform bails out instead of deleting the mov.
++
++**Measured cost of the conservative bail** (instruction counts over 43 corpus
++programs, `lccc-arm`): `-Os` 10 677 → 10 703 (+26, **+0.24 %**), `-O2`
++11 248 → 11 279 (+31, **+0.28 %**). Correctness is worth 0.25 % of code size.
++
++The same fix also cleared §6b from the previous revision: scaled-down
++`fannkuch.c -Os` no longer trips the `operand_to_x0` panic gate (it was the same
++lost-alias → orphaned-value path). Both previously-open items are now closed.
++
++## 6b. Sibling-pass audit (read-only, no behaviour change)
++
++The §6 bug is a design pattern worth grepping for: a peephole pass that scans
++**across** labels while using a **straight-line** death proof. Auditing every
++pass in `src/backend/arm/codegen/peephole.rs` that deletes a line:
++
++| pass | verdict |
++|---|---|
++| `propagate_address_aliases` | **was the bug** — scanned past labels, now fixed |
++| `eliminate_overwritten_moves` | sound: breaks on `Label`/`Branch`/`Call`/`Ret` |
++| `eliminate_overwritten_stores` | sound: default arm breaks the scan |
++| `reuse_stack_loads_within_blocks` | sound: block-scoped, cache cleared at every label |
++| `eliminate_dead_pre_ret_moves` | sound: only pre-`ret` moves |
++
++So `propagate_address_aliases` was the only pass with the flaw. The i686
++peephole uses a different mechanism (`staging_reads_safe`, a whole-function read
++census) and is listed as an audit item in §9 rather than assumed safe.
++
++## 7. Techniques that worked (reuse these)
++
++| need | how |
++|---|---|
++| find cross-target miscompiles | `scripts/cross_backend_check.py` — execution, not assembly |
++| locate a peephole culprit | `LCCC_NO_PEEPHOLE=1` for i686/ARM/RISC-V (**not** `CCC_NO_PEEPHOLE`, which only gates ARM and x86-64), then diff good/bad `-S` output |
++| bisect a pass | `CCC_DISABLE_PASSES=<name>` (harvest names: `grep -rhoE 'pass_disabled\(&(disabled\|dis), "[a-z0-9_]+"\)' src/passes/*.rs`) |
++| find which peephole *pattern* | temporarily wrap each pass call in a `CCC_SKIP_PEEP`-gated macro, rebuild once, then bisect by name (this is how Pattern 15 was caught) |
++| prove a bug is/isn't yours | revert the one suspect hunk, rebuild (~25 s incremental), re-test |
++| find the emitter of a bad instruction | `RUST_BACKTRACE=full` gives `operand_to_x0` ← `emit_store_default` ← `emit_store_impl` in one shot |
++
++## 8. Environment notes
++
++* `gcc -m32` works after removing the conflicting `gcc-<N>-<triplet>` cross
++  packages; use it as the i686 reference.
++* qemu-user needs sysroots: `-L /usr/aarch64-linux-gnu`,
++  `-L /usr/riscv64-linux-gnu`.
++* Distro `rustc` is 1.85 (< MSRV 1.98.1) — use the rustup toolchain.
++* **`/tmp` is a 993 MB tmpfs on this box.** A full oracle run builds ~1 350
++  static binaries; `tempfile.TemporaryDirectory()` defaults to `/tmp` and the
++  run died at `binary_trees.c` with `final link failed: No space left on
++  device` (188 spurious "reference compile failed" entries). The oracle now
++  writes to a disk-backed scratch directory (`--scratch`, default
++  `target/crossbe-scratch`) and unlinks every binary the moment it has been
++  consumed. Any new harness script must do the same — never let scratch output
++  accumulate in `/tmp`.
++* Full-corpus oracle run ≈ 45–60 min wall clock; run it with `start_process`
++  and `PYTHONUNBUFFERED=1` (otherwise `tee` sees nothing until exit).
++* Never rebuild `lccc` while an oracle run is in flight: it replaces the
++  binaries under test and silently mixes results.
++
++## 9. TODO for the next session (ordered)
++
++1. Re-run `scripts/cross_backend_check.py` over the full corpus × 5 opt levels
++   (≈23 min) and drive it to zero failures; then wire `--gate` into
++   `scripts/ci_local.sh` on a reduced matrix so cross-backend regressions cannot
++   land silently.
++2. Add the six fixed defects as **execution** tests (not just unit tests) so the
++   oracle's coverage is permanent and cheap.
++3. Apply the §6 lesson to the sibling passes that use the same textual
++   "first overwrite proves death" reasoning: `eliminate_overwritten_moves`,
++   `eliminate_overwritten_stores`, `thread_spill_slots` and the i686
++   `staging_reads_safe` family all scan linearly and may hold the same latent
++   bug. Audit them with the oracle rather than by inspection.
++4. AArch64 peephole: re-enable global store forwarding (correctness bug,
++   test 0036_0041) — the oracle now makes a fix verifiable.
++5. Resume the session-32 backlog: the `ms178-1.patch` insn-count win, the
++   `ms178-1-ext-*.patch` segments, and `lccc`'s icount (2.66 M vs 1.96 M).
++
++## 10. CI status
++
++`scripts/ci_local.sh`: **16/16 PASS**. The only failure seen this session was
++`rustfmt`, caused by a temporary debug macro that was removed before the final
++run; `cargo fmt --all -- --check` is clean on the final tree.
++
++| gate | result |
++|---|---|
++| build, rust-toolchain-selector, cargo-test | PASS |
++| regression-corpus-ssa | PASS — 726 passed, 0 failed, 9 skipped-compare (735 total) |
++| benchmark-output-oracle, differential-correctness-oracle | PASS |
++| loop-alignment-contract, fuzz-engine-wiring, differential-fuzz-smoke | PASS |
++| strict-computed-recip-codegen, machinst-window-alloc | PASS |
++| linker-fuzz, linker-elf-grammar-fuzz, codegen-quality-gate | PASS |
++| rustfmt, clippy | PASS (after removing the temporary debug macro) |
++
++
++1. **§6a** — make the ARM peephole's copy-deletion analysis agree with
++   `propagate_register_copies` (dominance requirement), then re-run the oracle
++   at `-Os` on the whole corpus.
++2. **§6b** — find the second orphaned-value path (asm-tail panic trick).
++3. Re-run `scripts/cross_backend_check.py` over the full corpus × 5 opt levels
++   and drive it to zero failures; then wire `--gate` into `ci_local.sh` on a
++   reduced matrix so regressions cannot land silently.
++4. Add the four fixed defects as execution tests (not just unit tests) so the
++   oracle's coverage is permanent.
++5. Resume the session-32 backlog: ARM peephole store-forwarding
++   (correctness-blocked), the `ms178-1.patch` insn-count win, the
++   `ms178-1-ext-*.patch` segments, and `lccc`'s icount (2.66 M vs 1.96 M).
++
++## 9. v2 follow-up (second pass)
++
++### 9.1 Why PR #464 was red, and the fix
++The `Clippy` job runs **two** commands (`.github/workflows/ci.yml:234-254`), and
++`scripts/ci_local.sh:144-146` reproduces both verbatim:
++
++```
++cargo fmt --all -- --check
++cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
++```
++
++The failure was `cargo fmt`, not clippy: the temporary `peep!` debug macro used
++to bisect the ungated ARM peephole passes was still in the tree when the patch
++was snapshotted. It has been removed. Both commands now exit 0 locally
++(`FMT_EXIT=0`, `CLIPPY_EXIT=0`). **Lesson: never snapshot while a debug macro is
++in the tree — run `cargo fmt --all -- --check` as part of the snapshot gate.**
++
++### 9.2 The conservative `propagate_address_aliases` fix was wrong — precise version
++The first fix bailed out of the alias fold whenever the forward scan crossed
++*any* label. That is sound but costs instructions (-Os 10677 → 10703, -O2
++11248 → 11279 over the 43-program ARM corpus) because it throws away every fold
++that spans a label nothing branches to.
++
++The replacement rule is precise and recovers the folds:
++
++* **A label only ends the region if some branch in the function targets it.**
++  A label no branch targets is not a control-flow entry point: the only way to
++  reach the code after it is to fall in from the line above, so every path out
++  of the `mov` still runs the redefinition. The target set is computed once per
++  pass invocation in a `FxHashSet` over `Branch`/`CondBranch`/`CmpBranch` lines.
++* **A conditional transfer inside the region invalidates the fold.** `b.cond`
++  / `cbz` / `tbz` divert to a target *outside* the scanned region, so the taken
++  path reaches the code after the redefinition without running it, keeping the
++  `mov`'s value live. This also closes a latent hole the label-only rule left
++  open.
++* Unconditional `b`, `br` and `ret` remain safe to scan past: entry into any
++  later block must go through a real branch target, which the first rule
++  catches, so they cannot smuggle in a path that skipped the redefinition.
++
++The glibc_memcmp `-Os` SIGSEGV stays fixed: `.LBB37` is a real branch target, so
++the fold that deleted the prologue's `mov x19, x24` is still rejected.
++
++### 9.3 Environment: the sandbox resets at every turn boundary
++Everything outside the persisted `/home/user` workspace disappears between
++turns, **and `target/` is excluded from snapshots by design**, so the compiled
++lccc binaries are gone too. The `rustup` shim survives but loses its `+x` bit
++and `~/.rustup/toolchains` is deleted. Restore sequence, in this order:
++
++```
++curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
++./scripts/build_lccc_fast.sh                 # ~2m40s from clean
++sudo apt-get install -y -qq gcc-multilib gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
++git ls-tree -r HEAD --format='%(objectmode) %(path)' | awk '$1=="100755"{print $2}' | xargs chmod +x
++git diff --summary | grep -c "mode change"   # must be 0 before snapshotting
++```
++
++`gcc-multilib` (i686 reference) and the two cross toolchains (ARM/RISC-V
++builtin headers under `/usr/lib/gcc/<triplet>/14/include`, sysroots under
++`/usr/<triplet>`) now install together without conflict. Without the cross
++toolchains, `lccc-arm`/`lccc-riscv` fail with `stddef.h: No such file or
++directory` even for a one-line program.
++
++### 9.4 Open defect carried forward: `lccc-arm -O2/-O3` SIGSEGV on `nbody.c`
++* Repro: `lccc-arm -O2 -static -lm -DSTEPS=5000 tests/benchmark/programs/nbody.c`
++  → `qemu-aarch64`: `uncaught target signal 11`. -O0/-O1/-Os are correct and
++  match gcc (`-0.169075164 -0.169089263`).
++* Threshold: STEPS 200/2000 fine, 5000 and above crash — so it is drift over
++  the outer `advance()` step loop, not a single bad pointer.
++* Masked by `CCC_DISABLE_PASSES` ∈ {all, gaddrcse, gvn, inline, ivsr, licm,
++  postinline, unroll}; **not** masked by any peephole gate. Eight different
++  passes hiding one bug means the defect is downstream, in ARM codegen/RA, and
++  only reachable once the loop is optimised.
++* Asm pair to continue from: `/tmp/nb_bad.s` (-O2) vs `/tmp/nb_good.s`
++  (-O2 + `CCC_DISABLE_PASSES=ivsr`). The step loop is the region enclosing
++  `.LBB9`/`.LBB10` (i loop) and `.LBB11`/`.LBB12` (j loop); the crash happens in
++  the code reached from `.LBB7`/`.LBB8`. Compare the callee-save area offsets
++  (`[sp,#312]…[sp,#440]` bad vs `[sp,#304]…` good) and the `str x0, [sp, #304]`
++  spill in the bad build.
++
++### 9.5 Measured cost of the alias-fold fixes (ARM corpus, 43 programs)
++| build | -Os | -O2 |
++|---|---|---|
++| buggy (pre-fix, glibc_memcmp SIGSEGV) | 10677 | 11248 |
++| conservative: bail on ANY crossed label | 10703 | 11279 |
++| **precise: bail only on real branch targets / cond. transfers** | **10703** | **11279** |
++
++The precise rule measures **identical** to the conservative one: in lccc's
++output every basic-block label really is a branch target, so the "is it a
++target?" refinement recovers nothing on this corpus. The remaining +26 (-Os) /
+++31 (-O2) instructions versus the *buggy* build are the price of not emitting
++the `glibc_memcmp` SIGSEGV — they are not recoverable by restricting where the
++fold fires, because in every blocked case the mov is genuinely live on some
++other path.
++
++**The correct fix is structural, not another restriction** (designed, not yet
++implemented): build a CFG once per function, compute dominators, and replace the
++linear scan's `crossed_label`/`crossed_cond` heuristics with the exact condition
++"the block containing the redefinition dominates every block that reads dst".
++That is sound by construction and strictly more aggressive than the buggy
++version in every case where the fold is legal, so it should also *beat* 10677 /
++11248. Secondary: the dead `mov xD, xS` exists because RA missed a coalesce —
++fixing coalescing removes the copy at the source instead of cleaning it up.
++
++### 9.6 Final: the alias fold now uses the EXACT condition, not a heuristic
++Superseding §9.2 and §9.5.  `propagate_address_aliases` now builds a real CFG
++(`struct Cfg`: blocks, successors, iterative dominator bitsets) over the
++function and gates the fold on a single exact query, `redef_covers_all_reads`:
++
++> every read of `dst` that can execute after the `mov` **without passing the
++> redefinition** must be an address use that gets renamed onto the alias source.
++
++Traversal stops at the redefinition's block, because any path leaving it has
++executed the redefinition — so reads beyond it see the *new* value and are
++irrelevant.  That is what makes the rule exact rather than conservative: it
++accepts loop-carried redefinitions (the common case the buggy pass got right
++for the wrong reasons) and rejects `glibc_memcmp`'s `.LBB37`, which is reachable
++without running the redefinition.
++
++| build | -Os | -O2 | correctness |
++|---|---|---|---|
++| buggy (pre-fix) | 10677 | 11248 | **SIGSEGV** on glibc_memcmp -Os |
++| conservative: bail on any crossed label (NAK'd) | 10703 | 11279 | clean |
++| **exact CFG/dominator rule (shipped)** | **10701** | **11281** | **240/240 oracle cells agree** |
++
++The ~25 instructions the buggy build "saved" are exactly the illegal deletions:
++the pass was removing copies that are live on some other path.  Since the new
++rule accepts **every** case that is legal, no further recovery is possible
++without miscompiling — the remaining delta is the true cost of correctness,
++measured to the last instruction.
++
++Verified: `glibc_memcmp` -Os/-O2/-O3 all print `2158787064` and exit 0;
++`cross_backend_check.py` over 12 programs × 5 opt levels × 4 backends against
++gcc reported *ALL BACKENDS AGREE WITH THE REFERENCE COMPILERS*;
++`cargo fmt --all -- --check` and the exact CI clippy command both exit 0.
++
++**Rejected during this work (do not resurrect without understanding why):**
++deleting a provably-dead copy that has no rewritable address uses
++(`!uses.is_empty()` → allow empty).  It is worth ~65 instructions at -Os but
++breaks `sieve` (-O1..-O3) and `glibc_memcmp` -O3 even under the strict dominance
++query, so the "provably dead" proof is incomplete for that case — most likely
++`reads_gp_register`/`written_gp_register` misclassifying an instruction that
++reads `dst` (a `str xD, [sp,#k]` spill reads it) as a pure overwrite.  Audit
++`written_gp_register` for store forms before retrying; that is a real further
++win, not a speculation.
+diff --git a/scripts/cross_backend_check.py b/scripts/cross_backend_check.py
+new file mode 100755
+index 00000000..f1786130
+--- /dev/null
++++ b/scripts/cross_backend_check.py
+@@ -0,0 +1,499 @@
++#!/usr/bin/env python3
++"""Cross-backend execution oracle: does every LCCC target agree with the reference compilers?
++
++WHY THIS EXISTS
++---------------
++LCCC has four production backends (x86-64, i686, AArch64, RISC-V) that share
++the front end, the IR and the optimiser, but each has its *own* code generator.
++Every defect this oracle has found was invisible to single-target testing and
++to assembly diffing:
++
++* AArch64 silently dropped the `state[3]` term of `sha256_transform`'s
++  checksum (a fused `eor x0, x1, x2, lsl #16` whose shifted operand was
++  materialised as zero) — and the kernel still passed its own known-answer
++  self-check, so only a differential comparison against another target found it.
++* `lccc-arm -O0` refused to compile at all: the arch-agnostic driver emitted
++  the x86 `pushq %rax` into AArch64 assembly.
++* i686 miscompiled Expat's UTF-8 name scanner at every level ≥ -O1: a peephole
++  `cmpw $128, %ax` silently compared an UNRELATED register.
++* AArch64 `-Os` deleted the prologue's `mov x19, x24` while a later block still
++  read `x19` as a pointer (SIGSEGV), and orphaned a value whose only home was
++  `x0`.
++
++THE ORACLE
++----------
++A deterministic C program's observable behaviour (exit status + stdout) is a
++property of the *program*, not of the target it was compiled for — **provided
++the reference models the target's ABI in both relevant dimensions**:
++
++* DATA MODEL — `unsigned long` is 64-bit on x86-64/AArch64/RISC-V (LP64) and
++  32-bit on i686 (ILP32), so a `%lu` checksum legitimately differs.
++* FP EVALUATION MODEL — lccc evaluates `double` in strict IEEE (SSE2 on i686);
++  GCC's i686 *default* is x87 with 80-bit excess precision, which legitimately
++  differs in the last bits.
++
++Get either wrong and the tool reports false positives; get them right and a
++mismatch is a real defect. Binaries are linked statically and run natively
++(x86-64, i686) or under `qemu-user` (AArch64, RISC-V).
++
++MULTI-ORACLE
++------------
++`--reference` may be given more than once (default: every one of gcc/clang that
++is installed). All references must agree with each other — if they do not, the
++program's expected output is not well defined (excess precision, libm
++differences, …) and it is SKIPPED rather than reported as a compiler bug. A
++backend must then match *every* reference.
++
++USAGE
++-----
++    scripts/cross_backend_check.py                      # whole corpus, -O0..-Os
++    scripts/cross_backend_check.py --programs sha256_transform --repeat 3
++    scripts/cross_backend_check.py --gate --quick       # CI-usable exit status
++    scripts/cross_backend_check.py --compare baseline.json   # regressions only
++    scripts/cross_backend_check.py --jobs 4 --json report.json
++
++Exit status: 0 when every backend reproduces the references, 1 when a backend
++disagrees or fails to compile (`--gate` makes timeouts fatal too), 2 for
++usage/environment problems.
++"""
++from __future__ import annotations
++
++import argparse
++import difflib
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++CORPUS = REPO_ROOT / "tests" / "benchmark" / "programs"
++
++# Backend binary -> (qemu arch, sysroot for -L or None, reference compiler flags)
++BACKENDS: dict[str, tuple[str, str | None, list[str]]] = {
++    "lccc": ("x86_64", None, []),
++    "lccc-i686": ("i386", None, ["-m32", "-msse2", "-mfpmath=sse"]),
++    "lccc-arm": ("aarch64", "/usr/aarch64-linux-gnu", []),
++    "lccc-riscv": ("riscv64", "/usr/riscv64-linux-gnu", []),
++}
++
++# Static linking needs `-lm` for programs that call sqrt/pow/…; without it the
++# reference build dies with "undefined reference to `sqrt'" (nbody.c).
++LINK_LIBS: list[str] = ["-lm"]
++
++# Workload macros honoured by the corpus (see the #ifndef guards added to
++# tests/benchmark/programs/*.c). Unused -D defines are harmless, so the whole
++# set is passed to every program.
++#
++# ONLY pure size/step knobs belong here. A macro that also defines the program's
++# DATA does not: nbody.c's `static Body bodies[NBODIES]` has five initialisers,
++# so -DNBODIES=32 zero-fills 27 bodies and every energy term becomes NaN — the
++# "mismatch" was the harness corrupting the program. Likewise never override
++# algorithmic constants (MAX_ITER / NMAX / SLOT_2_0): they change the ANSWER.
++DEFAULT_SCALE: dict[str, str] = {
++    "BLOCK_COUNT": "64",
++    "PASSES": "1",
++    "XML_SIZE": "4096",
++    "QUERY_COUNT": "64",
++    "HAYSTACK_LEN": "8192",
++    "WORD_COUNT": "2048",
++    "DATA_SIZE": "4096",
++    "VALUE_COUNT": "4096",
++    "SRC_SIZE": "4096",
++    "BUFFER_SIZE": "4096",
++    "NODE_COUNT": "512",
++    "LOOKUP_ROUNDS": "1",
++    "TABLE_SIZE": "512",
++    "NUM_OPS": "256",
++    "SIZE": "256",
++    "N": "256",
++    "STEPS": "20000",
++    "WIDTH": "64",
++    "HEIGHT": "64",
++    "NSTRINGS": "32",
++    "MAX_LEN": "32",
++    "LANES": "4",
++}
++
++# Programs that need a facility the emulated targets cannot provide.
++SKIP = {
++    "tls_seg_access.c": "thread-local storage needs a target libc TLS layout",
++    "vecreg_new_ops.c": "x86 SIMD intrinsics (immintrin.h) — x86-only program",
++}
++
++
++def qemu_for(arch: str) -> str:
++    return f"qemu-{arch}"
++
++
++def compile_with(cmd: list[str], src: Path, out: Path, defines: list[str],
++                 flags: list[str], timeout: int) -> tuple[bool, str]:
++    argv = cmd + flags + defines + [str(src), "-o", str(out)] + LINK_LIBS
++    try:
++        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
++    except subprocess.TimeoutExpired:
++        return False, "compile timeout"
++    except OSError as exc:
++        return False, f"compile exec failed: {exc}"
++    if proc.returncode != 0 or not out.exists():
++        msg = (proc.stderr or proc.stdout or "compile failed").strip()
++        return False, msg[:400]
++    return True, ""
++
++
++def run_binary(path: Path, arch: str, sysroot: str | None, timeout: int) -> tuple[int, str]:
++    """Run one binary; returns (exit code, stdout). -999 = timeout, -998 = exec error."""
++    argv = [str(path)]
++    if arch not in ("x86_64", "i386"):
++        argv = [qemu_for(arch)]
++        # Only pass -L when the sysroot really exists: static binaries do not
++        # need it, and a stale path makes qemu fail before the program runs.
++        if sysroot and Path(sysroot).is_dir():
++            argv += ["-L", sysroot]
++        argv += [str(path)]
++    try:
++        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
++        return proc.returncode, proc.stdout
++    except subprocess.TimeoutExpired:
++        return -999, "<<TIMEOUT>>"
++    except OSError as exc:
++        return -998, f"<<exec failed: {exc}>>"
++
++
++def short_diff(expected: str, actual: str, limit: int = 4) -> str:
++    """A compact, human-readable difference between two program outputs."""
++    e = expected.splitlines()
++    a = actual.splitlines()
++    for i, (x, y) in enumerate(zip(e, a)):
++        if x != y:
++            return f"line {i + 1}: expected {x!r} got {y!r}"
++    if len(e) != len(a):
++        d = "\n".join(list(difflib.unified_diff(e, a, "expected", "actual", lineterm=""))[:limit])
++        return f"line count {len(e)} vs {len(a)}: {d}"
++    return ""
++
++
++def preflight(references: list[str], usable: list[tuple[str, str, str | None, Path, list[str]]],
++              fail_fast: bool) -> list[str]:
++    """Verify the toolchain before burning 45 minutes on a broken setup."""
++    problems: list[str] = []
++    for ref in references:
++        if shutil.which(ref) is None:
++            problems.append(f"reference compiler {ref!r} not found")
++    for name, arch, _sysroot, binary, refflags in usable:
++        if not binary.exists():
++            problems.append(f"backend binary {binary} not built (run scripts/build_lccc_fast.sh)")
++        if arch not in ("x86_64", "i386") and shutil.which(qemu_for(arch)) is None:
++            problems.append(f"{qemu_for(arch)} not installed (apt-get install qemu-user)")
++        if "-m32" in refflags:
++            import tempfile as _tf
++            with _tf.NamedTemporaryFile("w", suffix=".c", delete=False) as fh:
++                fh.write("int main(void){return 0;}\n")
++                probe = fh.name
++            ok, err = compile_with([references[0]] + refflags, Path(probe),
++                                   Path(probe + ".out"), [], [], 60)
++            Path(probe).unlink(missing_ok=True)
++            Path(probe + ".out").unlink(missing_ok=True)
++            if not ok:
++                problems.append(f"32-bit reference unavailable for {name}: "
++                                f"{err.splitlines()[0][:90]} (apt-get install gcc-multilib)")
++    return problems
++
++
++def evaluate_program(src: Path, opt: str, usable, references: list[str],
++                     defines: list[str], gen_defines: list[str], flags: list[str],
++                     scratch: Path, timeout: int, repeat: int
++                     ) -> tuple[dict, list[str], list[str]]:
++    """Compile + run one program at one opt level. Returns (entry, failures, timeouts)."""
++    entry: dict[str, object] = {"program": src.name, "opt": opt, "backends": {}}
++    failures: list[str] = []
++    timeouts: list[str] = []
++    row: list[str] = []
++
++    with tempfile.TemporaryDirectory(prefix="crossbe-", dir=scratch) as td:
++        tmp = Path(td)
++
++        # --- references, one per ABI/FP model -----------------------------
++        # The scale macros are applied to every program because unused -D
++        # defines are harmless — unless a program uses one of those names as an
++        # identifier (an enum member `N`, a variable `SIZE`), which is a
++        # *program* compile error, not a compiler bug. Retry unscaled; the
++        # backends are then built the same way so every target sees the same
++        # program.
++        refs: dict[str, dict[str, tuple[int, str]]] = {}
++        ref_bins: list[Path] = []
++        chosen: list[str] | None = None
++        last_err = ""
++        for cand in (defines, []):
++            cand_refs: dict[str, dict[str, tuple[int, str]]] = {}
++            cand_bins: list[Path] = []
++            ok_all = True
++            for ref in references:
++                for name, _arch, _sys, _bin, refflags in usable:
++                    model = "ilp32" if "-m32" in refflags else "lp64"
++                    slot = cand_refs.setdefault(model, {})
++                    if ref in slot:
++                        continue
++                    ref_bin = tmp / f"{src.stem}.{os.path.basename(ref)}.{model}{opt}"
++                    ok, err = compile_with([ref] + refflags, src, ref_bin, cand,
++                                           flags, timeout)
++                    if not ok:
++                        ok_all = False
++                        last_err = err
++                        break
++                    slot[ref] = run_binary(ref_bin, "x86_64", None, timeout)
++                    cand_bins.append(ref_bin)
++                if not ok_all:
++                    break
++            if ok_all:
++                chosen = cand
++                refs = cand_refs
++                ref_bins = cand_bins
++                break
++
++        if chosen is None:
++            failures.append(f"{src.name}{opt}: reference compile failed: {last_err[:120]}")
++            entry["error"] = last_err
++            return entry, failures, timeouts
++        entry["scaled"] = chosen == gen_defines
++
++        # References must agree with each other, otherwise "the" expected
++        # output is not well defined (excess precision, libm, …) and any
++        # comparison would be noise.
++        for model, per_ref in refs.items():
++            distinct = {out for (_rc, out) in per_ref.values()}
++            if len(distinct) > 1:
++                entry["note"] = f"reference disagreement ({model}); not comparable"
++                for rb in ref_bins:
++                    rb.unlink(missing_ok=True)
++                return entry, failures, timeouts
++
++        # --- backends ------------------------------------------------------
++        for name, arch, sysroot, binary, refflags in usable:
++            model = "ilp32" if "-m32" in refflags else "lp64"
++            expected = refs.get(model, {})
++            if not expected:
++                continue
++            exp_rc, exp_out = next(iter(expected.values()))
++            bin_path = tmp / f"{src.stem}.{name}{opt}"
++            ok, err = compile_with([str(binary)], src, bin_path, chosen, flags, timeout)
++            if not ok:
++                row.append("COMPILEFAIL")
++                entry["backends"][name] = {"compile_ok": False, "error": err[:300]}
++                failures.append(f"{src.name} {opt} {name}: compile failed: {err[:160]}")
++                continue
++
++            # Repeat to expose nondeterminism (uninitialised reads, ASLR
++            # dependence, timing): every run must be identical AND correct.
++            results = [run_binary(bin_path, arch, sysroot, timeout) for _ in range(repeat)]
++            bin_path.unlink(missing_ok=True)
++            if any(r != results[0] for r in results[1:]):
++                row.append("NONDET")
++                entry["backends"][name] = {"compile_ok": True, "nondeterministic": True}
++                failures.append(f"{src.name} {opt} {name}: nondeterministic output "
++                                f"across {repeat} runs")
++                continue
++
++            rc, out = results[0]
++            if rc == -999:
++                row.append("TIMEOUT")
++                entry["backends"][name] = {"compile_ok": True, "timeout": True}
++                timeouts.append(f"{src.name} {opt} {name}")
++                continue
++            if rc == -998:
++                row.append("EXECFAIL")
++                entry["backends"][name] = {"compile_ok": True, "exec_error": out[:200]}
++                failures.append(f"{src.name} {opt} {name}: could not execute: {out[:120]}")
++                continue
++
++            same = all(rc == r and out == o for (r, o) in expected.values())
++            rec: dict[str, object] = {"compile_ok": True, "exit": rc, "matches": same}
++            if same:
++                row.append("ok")
++            else:
++                row.append("MISMATCH")
++                rec["expected_exit"] = exp_rc
++                rec["first_difference"] = short_diff(exp_out, out)
++                rec["actual_head"] = out[:200]
++                rec["expected_head"] = exp_out[:200]
++                failures.append(
++                    f"{src.name} {opt} {name}: {rec['first_difference'] or f'exit {rc} != {exp_rc}'}")
++            entry["backends"][name] = rec
++
++        for rb in ref_bins:
++            rb.unlink(missing_ok=True)
++
++    entry["row"] = row
++    return entry, failures, timeouts
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    ap.add_argument("--corpus", type=Path, default=CORPUS,
++                    help="directory of C programs (default: tests/benchmark/programs)")
++    ap.add_argument("--programs", default="", help="comma-separated subset of program stems")
++    ap.add_argument("--backends", default=",".join(BACKENDS), help="comma-separated backend names")
++    ap.add_argument("--opts", default="-O0,-O1,-O2,-O3,-Os", help="comma-separated opt levels")
++    ap.add_argument("--reference", action="append", default=None,
++                    help="reference compiler (repeatable). Default: every one of "
++                         "gcc/clang that is installed; all must agree.")
++    ap.add_argument("--no-scale", action="store_true", help="do not shrink the workload macros")
++    ap.add_argument("--define", action="append", default=[], metavar="NAME=VALUE",
++                    help="extra/override -D define")
++    ap.add_argument("--lccc-dir", type=Path, default=REPO_ROOT / "target" / "fastbuild")
++    ap.add_argument("--scratch", type=Path, default=REPO_ROOT / "target" / "crossbe-scratch",
++                    help="disk-backed scratch directory. MUST NOT be /tmp: that is a "
++                         "~1 GB tmpfs here and a full run's static binaries exhaust it "
++                         "('final link failed: No space left on device').")
++    ap.add_argument("--timeout", type=int, default=120, help="per-run timeout (s)")
++    ap.add_argument("--repeat", type=int, default=1,
++                    help="run each backend binary N times to catch nondeterminism")
++    ap.add_argument("--jobs", type=int, default=2, help="parallel (program, opt) tasks")
++    ap.add_argument("--json", type=Path, help="write the full report")
++    ap.add_argument("--compare", type=Path,
++                    help="previous --json report; report only NEW failures and now-fixed entries")
++    ap.add_argument("--quick", action="store_true",
++                    help="CI-friendly subset: -O0,-O2,-Os (implies nothing else)")
++    ap.add_argument("--gate", action="store_true",
++                    help="exit non-zero on any mismatch/compile failure (and on timeouts "
++                         "with --strict-timeout)")
++    ap.add_argument("--strict-timeout", action="store_true", help="treat timeouts as failures")
++    ap.add_argument("--verbose", "-v", action="store_true")
++    args = ap.parse_args(argv)
++
++    if not args.corpus.is_dir():
++        print(f"FATAL: corpus {args.corpus} is not a directory", file=sys.stderr)
++        return 2
++
++    opts = "-O0,-O2,-Os" if args.quick else args.opts
++
++    references = args.reference or [r for r in ("gcc", "clang") if shutil.which(r)]
++    if not references:
++        print("FATAL: no reference compiler found (need gcc or clang)", file=sys.stderr)
++        return 2
++
++    programs = sorted(args.corpus.glob("*.c"))
++    if args.programs:
++        wanted = {p.strip() for p in args.programs.split(",") if p.strip()}
++        programs = [p for p in programs if p.stem in wanted]
++
++    defines: list[str] = []
++    if not args.no_scale:
++        defines += [f"-D{k}={v}" for k, v in DEFAULT_SCALE.items()]
++    defines += [f"-D{d}" for d in args.define]
++
++    backends: dict[str, tuple[str, str | None, list[str]]] = {}
++    for name in (b.strip() for b in args.backends.split(",") if b.strip()):
++        if name not in BACKENDS:
++            print(f"FATAL: unknown backend {name!r}", file=sys.stderr)
++            return 2
++        backends[name] = BACKENDS[name]
++
++    usable: list[tuple[str, str, str | None, Path, list[str]]] = []
++    for name, (arch, sysroot, refflags) in backends.items():
++        usable.append((name, arch, sysroot, args.lccc_dir / name, refflags))
++
++    problems = preflight(references, usable, True)
++    if problems:
++        print("FATAL: environment problems (fix these before trusting any result):")
++        for p in problems:
++            print(f"  - {p}")
++        return 2
++
++    args.scratch.mkdir(parents=True, exist_ok=True)
++
++    tasks = [(p, o) for p in programs if p.name not in SKIP
++             for o in (x.strip() for x in opts.split(",") if x.strip())]
++
++    names = [n for n, *_ in usable]
++    print(f"{'program':<28} {'opt':<4} " + " ".join(f"{n:<11}" for n in names))
++    print("-" * (34 + 12 * len(names)))
++
++    results: list[tuple[dict, list[str], list[str]]] = []
++    if args.jobs > 1 and len(tasks) > 1:
++        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
++            futs = [pool.submit(evaluate_program, src, opt, usable, references, defines,
++                                defines, [opt, "-static"], args.scratch, args.timeout,
++                                args.repeat)
++                    for src, opt in tasks]
++            for (src, opt), fut in zip(tasks, futs):
++                res = fut.result()
++                results.append(res)
++                entry = res[0]
++                row = entry.get("row", [])
++                note = f"  [{entry['note']}]" if entry.get("note") else ""
++                print(f"{src.name:<28} {opt:<4} " +
++                      " ".join(f"{c:<11}" for c in row) + note)
++    else:
++        for src, opt in tasks:
++            res = evaluate_program(src, opt, usable, references, defines, defines,
++                                   [opt, "-static"], args.scratch, args.timeout, args.repeat)
++            results.append(res)
++            entry = res[0]
++            note = f"  [{entry['note']}]" if entry.get("note") else ""
++            print(f"{src.name:<28} {opt:<4} " +
++                  " ".join(f"{c:<11}" for c in entry.get("row", [])) + note)
++
++    failures: list[str] = []
++    timeouts: list[str] = []
++    report: dict[str, object] = {
++        "tool": "cross_backend_check.py",
++        "references": references,
++        "opts": opts,
++        "scale": {} if args.no_scale else DEFAULT_SCALE,
++        "results": [],
++    }
++    for entry, f, t in results:
++        row = entry.pop("row", None)
++        report["results"].append(entry)  # type: ignore[union-attr]
++        failures += f
++        timeouts += t
++
++    if args.json:
++        args.json.parent.mkdir(parents=True, exist_ok=True)
++        args.json.write_text(json.dumps(report, indent=2))
++        print(f"\nwrote {args.json}")
++
++    if args.compare and args.compare.exists():
++        base = json.loads(args.compare.read_text())
++        def key(e): return f"{e['program']}-{e['opt']}"
++        def bad(e): return {n for n, r in (e.get("backends") or {}).items()
++                            if not r.get("matches", True)}
++        old = {key(e): bad(e) for e in base.get("results", [])}
++        new = {key(e): bad(e) for e in report["results"]}  # type: ignore[union-attr]
++        regressed = {k: (old.get(k, set()), v) for k, v in new.items() if v - old.get(k, set())}
++        fixed = {k: (old[k], new.get(k, set())) for k in old if old[k] and not new.get(k)}
++        print(f"\n--compare: {len(regressed)} regression(s), {len(fixed)} fixed")
++        for k, (o, n) in sorted(regressed.items()):
++            print(f"  REGRESSED {k}: {sorted(n - o)}")
++        for k, (o, n) in sorted(fixed.items()):
++            print(f"  FIXED     {k}: was {sorted(o)}")
++
++    if timeouts:
++        print(f"\n{len(timeouts)} TIMEOUT(S) (speed, not correctness — raise --timeout or "
++              f"shrink the program's scale macros):")
++        for t in timeouts[:20]:
++            print(f"  - {t}")
++        if len(timeouts) > 20:
++            print(f"  … and {len(timeouts) - 20} more")
++
++    fatal = list(failures)
++    if args.strict_timeout:
++        fatal += [f"timeout: {t}" for t in timeouts]
++
++    if fatal:
++        print(f"\n{len(fatal)} FAILURE(S):")
++        for f in fatal[:40]:
++            print(f"  - {f}")
++        if len(fatal) > 40:
++            print(f"  … and {len(fatal) - 40} more")
++        return 1
++    print("\nALL BACKENDS AGREE WITH THE REFERENCE COMPILERS")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/ensure_cross_toolchains.sh b/scripts/ensure_cross_toolchains.sh
+new file mode 100755
+index 00000000..198428ef
+--- /dev/null
++++ b/scripts/ensure_cross_toolchains.sh
+@@ -0,0 +1,145 @@
++#!/usr/bin/env bash
++# ============================================================================
++# ensure_cross_toolchains.sh — idempotently provide AArch64 / RISC-V C
++# cross-toolchains for execution-validated backend work.
++#
++# WHY THIS EXISTS
++# ---------------
++# Debian's `gcc-<N>-<triplet>-linux-gnu` packages declare
++#
++#       Conflicts: gcc-multilib
++#
++# so `apt-get install gcc-multilib gcc-aarch64-linux-gnu` cannot be satisfied:
++# installing the cross compilers silently REMOVES the i686 multilib contract
++# that LCCC's CI (and the i686 regression corpus) needs, and installing the
++# multilib removes the cross compilers. Both are required: every backend must
++# be validated by *execution*, not by eyeballing assembly.
++#
++# The conflict is a dpkg dependency-graph artefact, not a filesystem one: the
++# cross packages install only triplet-prefixed paths
++# (/usr/bin/<triplet>-gcc, /usr/lib/gcc-cross/<triplet>/…, /usr/<triplet>/…)
++# that never collide with the native or multilib trees. So this script
++# downloads the packages and unpacks them with `dpkg -x` into the live root,
++# which bypasses the dependency solver entirely. Both toolchains then coexist
++# with gcc-multilib.
++#
++# WHAT IT PROVIDES
++# ----------------
++#   aarch64-linux-gnu-gcc, aarch64-linux-gnu-as/ld, /usr/aarch64-linux-gnu
++#   riscv64-linux-gnu-gcc, riscv64-linux-gnu-as/ld, /usr/riscv64-linux-gnu
++#
++# plus the runtime needed to *run* the produced binaries under
++# `qemu-aarch64-static` / `qemu-riscv64-static` (binfmt_misc is not registered
++# on every host, so pass `-L /usr/<triplet>` explicitly, or use
++# scripts/run_cross.sh).
++#
++# Usage:  scripts/ensure_cross_toolchains.sh [aarch64|riscv64|all]
++# ============================================================================
++set -uo pipefail
++
++want=${1:-all}
++work=${LCCC_XROOT:-/var/tmp/lccc-xroot}
++
++have() { command -v "$1" >/dev/null 2>&1; }
++
++need_aarch64=0
++need_riscv64=0
++case "$want" in
++    aarch64|arm64) need_aarch64=1 ;;
++    riscv64|rv64)  need_riscv64=1 ;;
++    all)           need_aarch64=1; need_riscv64=1 ;;
++    *) echo "usage: $0 [aarch64|riscv64|all]" >&2; exit 2 ;;
++esac
++
++if [[ $need_aarch64 == 1 ]] && have aarch64-linux-gnu-gcc && have aarch64-linux-gnu-as; then
++    need_aarch64=0
++fi
++if [[ $need_riscv64 == 1 ]] && have riscv64-linux-gnu-gcc && have riscv64-linux-gnu-as; then
++    need_riscv64=0
++fi
++if [[ $need_aarch64 == 0 && $need_riscv64 == 0 ]]; then
++    echo "cross toolchains present: $(aarch64-linux-gnu-gcc --version 2>/dev/null | head -1) | $(riscv64-linux-gnu-gcc --version 2>/dev/null | head -1)"
++    exit 0
++fi
++
++# Resolve the *host* GCC major so the cross packages match the installed
++# libgcc/libc6-cross generation instead of a hardcoded number that rots.
++host_gcc_ver=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
++[[ -n "$host_gcc_ver" ]] || host_gcc_ver=14
++
++pkgs=()
++if [[ $need_aarch64 == 1 ]]; then
++    pkgs+=(
++        "gcc-${host_gcc_ver}-aarch64-linux-gnu"
++        "cpp-${host_gcc_ver}-aarch64-linux-gnu"
++        "libgcc-${host_gcc_ver}-dev-arm64-cross"
++        "libgcc-s1-arm64-cross"
++        "libc6-dev-arm64-cross"
++        "libc6-arm64-cross"
++        "linux-libc-dev-arm64-cross"
++        "binutils-aarch64-linux-gnu"
++    )
++fi
++if [[ $need_riscv64 == 1 ]]; then
++    pkgs+=(
++        "gcc-${host_gcc_ver}-riscv64-linux-gnu"
++        "cpp-${host_gcc_ver}-riscv64-linux-gnu"
++        "libgcc-${host_gcc_ver}-dev-riscv64-cross"
++        "libgcc-s1-riscv64-cross"
++        "libc6-dev-riscv64-cross"
++        "libc6-riscv64-cross"
++        "linux-libc-dev-riscv64-cross"
++        "binutils-riscv64-linux-gnu"
++        "libatomic1-riscv64-cross"
++    )
++fi
++
++rm -rf "$work"
++mkdir -p "$work"
++cd "$work" || exit 1
++
++echo "[cross] downloading ${#pkgs[@]} packages into $work"
++missing=()
++for p in "${pkgs[@]}"; do
++    apt-get download "$p" >/dev/null 2>&1 || missing+=("$p")
++done
++if ((${#missing[@]})); then
++    echo "[cross] WARNING: could not download: ${missing[*]}" >&2
++fi
++
++shopt -s nullglob
++debs=(*.deb)
++if ((${#debs[@]} == 0)); then
++    echo "[cross] FATAL: no packages downloaded" >&2
++    exit 1
++fi
++
++echo "[cross] unpacking ${#debs[@]} archives (bypassing the gcc-multilib conflict)"
++for d in "${debs[@]}"; do
++    dpkg -x "$d" "$work" 2>/dev/null
++done
++
++# The archives carry a `./usr` tree; graft it onto the live root. Cross
++# packages own only triplet-prefixed paths, so this cannot clobber the native
++# or i686 trees (verified: no file is written outside /usr/<triplet>,
++# /usr/lib/gcc-cross, /usr/libexec/gcc-cross, /usr/bin/<triplet>-*,
++# /usr/share/<triplet>).
++if [[ -d "$work/usr" ]]; then
++    sudo cp -a "$work/usr/." /usr/ 2>/dev/null \
++        || cp -a "$work/usr/." /usr/ 2>/dev/null \
++        || echo "[cross] FATAL: cannot write /usr" >&2
++fi
++
++# A statically linked sysroot is not enough for qemu `-L`: the dynamic loader
++# path must exist too. Report what is usable rather than assuming.
++rc=0
++for t in aarch64 riscv64; do
++    cc="${t}-linux-gnu-gcc"
++    if have "$cc"; then
++        echo "[cross] OK  $cc ($($cc --version | head -1))"
++    else
++        echo "[cross] MISSING $cc"
++        rc=1
++    fi
++done
++exit $rc
+diff --git a/scripts/icount_ab.py b/scripts/icount_ab.py
+new file mode 100755
+index 00000000..73abc9c3
+--- /dev/null
++++ b/scripts/icount_ab.py
+@@ -0,0 +1,586 @@
++#!/usr/bin/env python3
++"""Deterministic cross-architecture dynamic instruction counting under QEMU.
++
++WHY THIS EXISTS
++---------------
++The research host is a virtualised 2-core box with **no hardware PMU**, so
++cycles, IPC, cache misses and branch mispredictions are simply unavailable, and
++wall-clock time on a shared VM has a measured ±9 % spread on identical
++binaries.  Neither is a usable signal for "which compiler produced better
++code".
++
++QEMU user-mode TCG removes the problem instead of working around it: under
++TCG, a deterministic program retires *exactly* the same instruction stream on
++every run.  Counting those instructions yields a **zero-variance, dynamic**
++code-quality metric — it sees loops, spills, reloads and branch structure,
++which a static instruction census cannot.
++
++Debian's qemu-user builds have no TCG plugin support (`qemu-x86_64 -plugin`
++is "unknown option"; only qemu-system has it), so this harness uses the log
++interface instead:
++
++    qemu-<arch> -d in_asm,exec,nochain -D <log> <binary>
++
++* `in_asm` prints every translated block with its disassembled instructions,
++  giving a TB-start-address -> instruction-count map;
++* `exec` prints one line per executed TB (start address);
++* `nochain` disables TB chaining so *every* TB execution is logged rather than
++  only the first.
++
++Both are captured in ONE run, so the address space is identical and ASLR is
++irrelevant.  Retired instructions = SUM(executions(tb) * insns(tb)).
++
++WHAT IT MEASURES
++----------------
++* `total`   — whole-process retired instructions (includes libc startup, which
++  is identical across compilers for the same libc, so it is a constant offset
++  and never a *difference*);
++* per-function counts — a TB is attributed to the function whose [start,end)
++  range (from `nm -S`) contains its entry address, so startup noise is gone.
++  This is the number to quote.
++
++EVERY MEASUREMENT IS CORRECTNESS-GATED AND DETERMINISM-GATED
++------------------------------------------------------------
++1. Correctness: each binary is executed (natively when it is host-architecture,
++   under qemu otherwise) and its (exit status, stdout, stderr) is compared
++   against the reference compiler's build of the same source.  A mismatch is a
++   MISCOMPILE and fails the run — a fast wrong answer is never a win.
++2. Determinism: the icount run is repeated and the two counts must be
++   bit-identical.  A non-deterministic measurement is reported and rejected,
++   never averaged.
++
++USAGE
++-----
++    # Compare LCCC against GCC and Clang on one kernel, per-function:
++    scripts/icount_ab.py tests/benchmark/programs/sha256_transform.c \
++        --functions sha256_transform --reps 3
++
++    # Cross-architecture: LCCC's AArch64 backend vs aarch64 GCC:
++    scripts/icount_ab.py kernel.c --compilers lccc-arm,aarch64-gcc \
++        --functions hot_loop
++
++    # Same-binary A/B (a patch under review vs the baseline compiler):
++    scripts/icount_ab.py kernel.c --compilers lccc,lccc-alt \
++        --define lccc-alt=target/release/lccc:x86_64
++
++    # CI gate: fail if LCCC regresses more than 2 % against itself:
++    scripts/icount_ab.py <corpus> --gate --max-regression 0.02 \
++        --compilers lccc,lccc-alt --define lccc-alt=<old>:x86_64
++
++Compiler specs are `name` (builtin) or `name=command:arch` (custom, see
++`--define`).  Builtins: lccc, lccc-x86, lccc-i686, lccc-arm, lccc-riscv,
++gcc, clang, gcc32 (host gcc -m32), aarch64-gcc, riscv64-gcc.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import re
++import shlex
++import shutil
++import subprocess
++import sys
++import tempfile
++from dataclasses import dataclass, field
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++
++# ---------------------------------------------------------------- compilers --
++
++# name -> (command template, qemu arch, extra flags)
++BUILTIN_COMPILERS: dict[str, tuple[str, str, list[str]]] = {
++    "lccc":        ("{root}/target/fastbuild/lccc", "x86_64", []),
++    "lccc-x86":    ("{root}/target/fastbuild/lccc-x86", "x86_64", []),
++    "lccc-i686":   ("{root}/target/fastbuild/lccc-i686", "i386", []),
++    "lccc-arm":    ("{root}/target/fastbuild/lccc-arm", "aarch64", []),
++    "lccc-riscv":  ("{root}/target/fastbuild/lccc-riscv", "riscv64", []),
++    "gcc":         ("gcc", "x86_64", []),
++    "clang":       ("clang", "x86_64", []),
++    "gcc32":       ("gcc", "i386", ["-m32"]),
++    "aarch64-gcc": ("aarch64-linux-gnu-gcc", "aarch64", []),
++    "riscv64-gcc": ("riscv64-linux-gnu-gcc", "riscv64", []),
++}
++
++# Architectures that can run natively on this host (no emulator needed for the
++# correctness run; the *counting* run always goes through qemu for uniformity).
++HOST_ARCHES = {"x86_64"}
++if os.uname().machine == "i686":
++    HOST_ARCHES.add("i386")
++
++
++@dataclass
++class Compiler:
++    name: str
++    cmd: str
++    arch: str
++    flags: list[str] = field(default_factory=list)
++
++    @property
++    def qemu(self) -> str:
++        return f"qemu-{self.arch}"
++
++    def available(self) -> bool:
++        exe = shlex.split(self.cmd)[0]
++        if "/" in exe:
++            return os.path.exists(exe) and os.access(exe, os.X_OK)
++        if shutil.which(exe) is None:
++            return False
++        # A cross compiler that exists but cannot build a trivial program (e.g.
++        # missing sysroot) is not available; probe it once.
++        return _probe_compiler(self)
++
++
++_probe_cache: dict[str, bool] = {}
++
++
++def _probe_compiler(comp: Compiler) -> bool:
++    if comp.name in _probe_cache:
++        return _probe_cache[comp.name]
++    with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as tf:
++        tf.write("int main(void){return 0;}\n")
++        src = tf.name
++    out = src + ".out"
++    ok = False
++    try:
++        argv = shlex.split(comp.cmd) + comp.flags + [src, "-o", out]
++        rc = subprocess.run(argv, capture_output=True, timeout=120).returncode
++        ok = rc == 0 and os.path.exists(out)
++    except (subprocess.SubprocessError, OSError):
++        ok = False
++    finally:
++        for p in (src, out):
++            try:
++                os.unlink(p)
++            except OSError:
++                pass
++    _probe_cache[comp.name] = ok
++    return ok
++
++
++def resolve_compilers(specs: list[str], defines: list[str],
++                      root: Path) -> list[Compiler]:
++    table = dict(BUILTIN_COMPILERS)
++    for spec in defines:
++        # name=command:arch
++        if "=" not in spec:
++            raise SystemExit(f"--define expects NAME=COMMAND:ARCH, got {spec!r}")
++        name, rest = spec.split("=", 1)
++        if ":" in rest:
++            cmd, arch = rest.rsplit(":", 1)
++        else:
++            cmd, arch = rest, "x86_64"
++        table[name] = (cmd, arch, [])
++    out: list[Compiler] = []
++    for spec in specs:
++        if spec not in table:
++            raise SystemExit(
++                f"unknown compiler {spec!r}; known: {', '.join(sorted(table))}")
++        cmd, arch, flags = table[spec]
++        out.append(Compiler(spec, cmd.format(root=root), arch, list(flags)))
++    return out
++
++
++# ------------------------------------------------------------------- parsing --
++
++_INSN_LINE = re.compile(r"^\s*0x[0-9a-fA-F]+:\s+(?:[0-9a-fA-F]{2}\s+)+\s*\S")
++_ADDR = re.compile(r"^\s*0x([0-9a-fA-F]+):\s")
++_IN_BLOCK = re.compile(r"^IN:\s*(.*)$")
++# `Trace 0: 0x<host tc.ptr> [<cs_base>/<tb->pc>/<flags>/<cflags>] <symbol>`
++# Only the SECOND bracket field is the guest PC; the address before the
++# bracket is QEMU's host code pointer and must never be used for attribution.
++_TRACE = re.compile(r"^Trace\s+\d+:\s+0x[0-9a-fA-F]+\s+\[[^/\]]*/([0-9a-fA-F]+)/")
++
++
++def parse_icount_log(path: Path) -> tuple[dict[int, int], dict[int, int]]:
++    """Return (tb_insns, tb_execs) maps keyed by TB start address.
++
++    `in_asm` blocks are the only source of instruction counts, and `exec`
++    lines are the only source of execution counts; both are keyed by the TB's
++    start address so they can be joined.
++    """
++    tb_insns: dict[int, int] = {}
++    tb_execs: dict[int, int] = {}
++    cur_start: int | None = None
++    cur_count = 0
++    with open(path, "r", errors="replace") as fh:
++        for line in fh:
++            m = _TRACE.match(line)
++            if m:
++                tb_execs[int(m.group(1), 16)] = tb_execs.get(int(m.group(1), 16), 0) + 1
++                continue
++            m = _IN_BLOCK.match(line)
++            if m:
++                # flush the previous block
++                if cur_start is not None:
++                    tb_insns[cur_start] = tb_insns.get(cur_start, 0) + cur_count
++                cur_start = None
++                cur_count = 0
++                continue
++            if _INSN_LINE.match(line):
++                if cur_start is None:
++                    am = _ADDR.match(line)
++                    if am:
++                        cur_start = int(am.group(1), 16)
++                cur_count += 1
++    if cur_start is not None:
++        tb_insns[cur_start] = tb_insns.get(cur_start, 0) + cur_count
++    return tb_insns, tb_execs
++
++
++def nm_ranges(binary: Path, cross_prefix: str = "") -> list[tuple[str, int, int]]:
++    """(name, start, end) for every sized text symbol, from `nm -S`."""
++    nm = f"{cross_prefix}nm" if cross_prefix else "nm"
++    if shutil.which(nm) is None:
++        nm = "nm"
++    try:
++        proc = subprocess.run([nm, "-S", "--defined-only", str(binary)],
++                              capture_output=True, text=True, timeout=120)
++    except (subprocess.SubprocessError, OSError):
++        return []
++    out: list[tuple[str, int, int]] = []
++    for line in proc.stdout.splitlines():
++        # `nm -S` prints: <addr> <size> <type> <name>
++        parts = line.split()
++        if len(parts) < 4:
++            continue
++        if parts[2].lower() not in ("t", "w"):
++            continue
++        try:
++            start = int(parts[0], 16)
++            size = int(parts[1], 16)
++        except ValueError:
++            continue
++        if size:
++            out.append((parts[3], start, start + size))
++    out.sort(key=lambda r: r[1])
++    return out
++
++
++def attribute(tb_insns: dict[int, int], tb_execs: dict[int, int],
++              ranges: list[tuple[str, int, int]]) -> dict[str, int]:
++    import bisect
++    names = [r[0] for r in ranges]
++    starts = [r[1] for r in ranges]
++    per_fn: dict[str, int] = {}
++    for addr, execs in tb_execs.items():
++        insns = tb_insns.get(addr)
++        if not insns:
++            continue
++        idx = bisect.bisect_right(starts, addr) - 1
++        if idx < 0:
++            continue
++        name, start, end = ranges[idx]
++        if start <= addr < end:
++            per_fn[name] = per_fn.get(name, 0) + execs * insns
++    _ = names
++    return per_fn
++
++
++# ------------------------------------------------------------------ runners --
++
++
++@dataclass
++class RunResult:
++    compiler: str
++    arch: str
++    compile_ok: bool
++    compile_error: str = ""
++    exit_status: int | None = None
++    stdout: str = ""
++    stderr: str = ""
++    total_insns: int | None = None
++    per_function: dict[str, int] = field(default_factory=dict)
++    deterministic: bool = True
++    note: str = ""
++
++
++def compile_one(comp: Compiler, src: Path, out: Path, flags: list[str],
++                timeout: int) -> tuple[bool, str]:
++    argv = shlex.split(comp.cmd) + comp.flags + list(flags) + [str(src), "-o", str(out)]
++    try:
++        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
++    except subprocess.TimeoutExpired:
++        return False, "compile timeout"
++    except OSError as exc:
++        return False, f"compile exec failed: {exc}"
++    if proc.returncode != 0 or not out.exists():
++        return False, (proc.stderr or proc.stdout or "compile failed").strip()[:2000]
++    return True, ""
++
++
++def run_plain(comp: Compiler, binary: Path, timeout: int) -> tuple[int, str, str]:
++    """Execute for correctness (natively when possible, else under qemu)."""
++    if comp.arch in HOST_ARCHES:
++        argv = [str(binary)]
++    else:
++        argv = [comp.qemu, "-L", f"/usr/{_triplet(comp.arch)}", str(binary)]
++    try:
++        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
++        return proc.returncode, proc.stdout, proc.stderr
++    except subprocess.TimeoutExpired:
++        return -999, "", "TIMEOUT"
++    except OSError as exc:
++        return -998, "", f"exec failed: {exc}"
++
++
++def _triplet(arch: str) -> str:
++    return {
++        "aarch64": "aarch64-linux-gnu",
++        "riscv64": "riscv64-linux-gnu",
++        "i386": "i386-linux-gnu",
++        "x86_64": "x86_64-linux-gnu",
++    }.get(arch, arch + "-linux-gnu")
++
++
++def count_once(comp: Compiler, binary: Path, workdir: Path, tag: str,
++               timeout: int) -> tuple[dict[int, int], dict[int, int], str]:
++    log = workdir / f"{tag}.log"
++    if log.exists():
++        log.unlink()
++    env = dict(os.environ)
++    env["QEMU_LOG_FILENAME"] = str(log)
++    argv = [comp.qemu, "-d", "in_asm,exec,nochain", "-D", str(log), str(binary)]
++    try:
++        with open(workdir / f"{tag}.stdout", "w") as so, \
++                open(workdir / f"{tag}.stderr", "w") as se:
++            subprocess.run(argv, stdout=so, stderr=se, timeout=timeout, env=env)
++    except subprocess.TimeoutExpired:
++        return {}, {}, "count timeout"
++    except OSError as exc:
++        return {}, {}, f"count exec failed: {exc}"
++    if not log.exists():
++        return {}, {}, "no log produced (qemu missing or no plugin/log support)"
++    insns, execs = parse_icount_log(log)
++    return insns, execs, ""
++
++
++# --------------------------------------------------------------------- main --
++
++
++def measure(comp: Compiler, src: Path, workdir: Path, flags: list[str],
++            functions: list[str], reps: int, timeout: int) -> RunResult:
++    binary = workdir / f"{src.stem}.{comp.name}.bin"
++    ok, err = compile_one(comp, src, binary, flags, timeout)
++    res = RunResult(compiler=comp.name, arch=comp.arch, compile_ok=ok, compile_error=err)
++    if not ok:
++        return res
++
++    status, so, se = run_plain(comp, binary, timeout)
++    res.exit_status, res.stdout, res.stderr = status, so, se
++
++    # Binary must be executable before counting: a crash would otherwise be
++    # silently counted as "fast".
++    if status not in (0, None) and status < 0:
++        res.note = f"binary died (status {status}); not counted"
++        return res
++
++    counts: list[tuple[dict[int, int], dict[int, int]]] = []
++    for r in range(reps):
++        insns, execs, err = count_once(comp, binary, workdir, f"{src.stem}.{comp.name}.{r}",
++                                       timeout)
++        if err:
++            res.note = err
++            return res
++        counts.append((insns, execs))
++
++    # determinism gate: every repetition must agree exactly
++    first_total = sum(e * i.get(a, 0) for a, e in counts[0][1].items()
++                      for i in [counts[0][0]])
++    for insns, execs in counts[1:]:
++        total = sum(e * i.get(a, 0) for a, e in execs.items() for i in [insns])
++        if total != first_total:
++            res.deterministic = False
++    if not res.deterministic:
++        res.note = "NON-DETERMINISTIC instruction count — measurement rejected"
++        return res
++
++    insns, execs = counts[0]
++    res.total_insns = first_total
++    ranges = nm_ranges(binary)
++    per_fn = attribute(insns, execs, ranges)
++    if functions:
++        wanted = {}
++        for fn in functions:
++            wanted[fn] = per_fn.get(fn, 0)
++        res.per_function = wanted
++    else:
++        # report the ten hottest functions so a comparison is still meaningful
++        res.per_function = dict(sorted(per_fn.items(), key=lambda kv: -kv[1])[:10])
++    return res
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(
++        description="Deterministic QEMU-TCG dynamic instruction-count A/B oracle.")
++    ap.add_argument("sources", nargs="+", type=Path, help="C source files")
++    ap.add_argument("--compilers", default="lccc,gcc",
++                    help="comma-separated compiler specs (default: lccc,gcc)")
++    ap.add_argument("--define", action="append", default=[],
++                    help="define a custom compiler: NAME=COMMAND:ARCH")
++    ap.add_argument("--flags", default="-O2", help="optimization flags (default: -O2)")
++    ap.add_argument("--functions", default="",
++                    help="comma-separated function names to attribute (default: top 10)")
++    ap.add_argument("--reps", type=int, default=2,
++                    help="repetitions for the determinism gate (default: 2)")
++    ap.add_argument("--timeout", type=int, default=600, help="per-run timeout seconds")
++    ap.add_argument("--static", action="store_true", default=True,
++                    help="link statically (default: on — removes loader noise)")
++    ap.add_argument("--no-static", dest="static", action="store_false")
++    ap.add_argument("--reference", default="",
++                    help="compiler whose output defines correct behaviour "
++                         "(default: first non-lccc compiler, else first)")
++    ap.add_argument("--gate", action="store_true",
++                    help="exit non-zero on any miscompile, non-determinism, or "
++                         "regression beyond --max-regression")
++    ap.add_argument("--max-regression", type=float, default=0.02,
++                    help="allowed LCCC regression vs the alternative LCCC arm")
++    ap.add_argument("--json", type=Path, help="write the full report as JSON")
++    ap.add_argument("--markdown", type=Path, help="write a Markdown table")
++    ap.add_argument("--artifact-dir", type=Path,
++                    help="keep build artifacts and QEMU logs here")
++    ap.add_argument("--verbose", "-v", action="store_true")
++    args = ap.parse_args(argv)
++
++    comps = resolve_compilers([c.strip() for c in args.compilers.split(",") if c.strip()],
++                              args.define, REPO_ROOT)
++    usable = [c for c in comps if c.available()]
++    for c in comps:
++        if c not in usable:
++            print(f"SKIP  compiler {c.name}: not available ({c.cmd})", file=sys.stderr)
++
++    flags = shlex.split(args.flags)
++    if args.static:
++        flags.append("-static")
++    functions = [f for f in args.functions.split(",") if f]
++
++    ref_name = args.reference or next(
++        (c.name for c in usable if not c.name.startswith("lccc")), usable[0].name)
++    if ref_name not in {c.name for c in usable}:
++        print(f"FATAL: reference compiler {ref_name} is not available", file=sys.stderr)
++        return 2
++
++    keep = args.artifact_dir
++    if keep:
++        keep.mkdir(parents=True, exist_ok=True)
++
++    report: dict[str, object] = {
++        "tool": "icount_ab.py",
++        "flags": args.flags,
++        "static": args.static,
++        "compilers": [c.name for c in usable],
++        "reference": ref_name,
++        "results": [],
++    }
++    failures: list[str] = []
++    table_rows: list[tuple[str, str, str, float | None, int | None, str]] = []
++
++    for src in args.sources:
++        if not src.exists():
++            print(f"SKIP  {src}: no such file", file=sys.stderr)
++            continue
++        with tempfile.TemporaryDirectory(prefix="icount-") as td:
++            workdir = Path(td) if keep is None else keep
++            results = {c.name: measure(c, src, workdir, flags, functions,
++                                       args.reps, args.timeout)
++                       for c in usable}
++            ref = results[ref_name]
++            entry: dict[str, object] = {"source": str(src), "compilers": {}}
++
++            for name, r in results.items():
++                rec: dict[str, object] = {
++                    "arch": r.arch,
++                    "compile_ok": r.compile_ok,
++                    "exit_status": r.exit_status,
++                    "deterministic": r.deterministic,
++                    "total_insns": r.total_insns,
++                    "per_function": r.per_function,
++                }
++                if not r.compile_ok:
++                    rec["error"] = r.compile_error
++                    failures.append(f"{src}: {name}: compile failed: {r.compile_error[:200]}")
++                elif name != ref_name and ref.exit_status is not None:
++                    same = (r.exit_status == ref.exit_status and r.stdout == ref.stdout)
++                    rec["output_matches_reference"] = same
++                    if not same:
++                        failures.append(
++                            f"{src}: {name}: MISCOMPILE — exit {r.exit_status} vs "
++                            f"{ref.exit_status} / stdout differs from {ref_name}")
++                if not r.deterministic and r.compile_ok:
++                    failures.append(f"{src}: {name}: {r.note}")
++                if r.note:
++                    rec["note"] = r.note
++                entry["compilers"][name] = rec
++
++                key_fn = functions[0] if functions else None
++                metric = (r.per_function.get(key_fn) if key_fn
++                          else (sum(r.per_function.values()) if r.per_function
++                                else r.total_insns))
++                table_rows.append((src.name, name, key_fn or "(top10)",
++                                   None, metric, r.note or ("OK" if r.compile_ok else "compile-failed")))
++            report["results"].append(entry)
++
++    # ratios vs the best measured metric for each source/function
++    for entry in report["results"]:  # type: ignore[union-attr]
++        comps_d = entry["compilers"]  # type: ignore[index]
++        metrics = {n: (rec.get("per_function", {}) or {}) for n, rec in comps_d.items()}
++        if not functions:
++            continue
++        for fn in functions:
++            vals = {n: m.get(fn, 0) for n, m in metrics.items() if m.get(fn, 0)}
++            if not vals:
++                continue
++            best = min(vals.values())
++            for n, v in vals.items():
++                comps_d[n].setdefault("ratios", {})[fn] = round(v / best, 4) if best else None
++                if n == "lccc":
++                    comps_d[n]["vs_best"] = round(v / best, 4) if best else None
++
++    if args.json:
++        args.json.parent.mkdir(parents=True, exist_ok=True)
++        args.json.write_text(json.dumps(report, indent=2))
++
++    # ---- human-readable table ----
++    print(f"\n=== icount A/B ({args.flags}{' -static' if args.static else ''}) ===")
++    hdr = f"{'source':<28} {'compiler':<12} {'function':<24} {'insns':>14} {'vs best':>8}"
++    print(hdr)
++    print("-" * len(hdr))
++    for entry in report["results"]:  # type: ignore[union-attr]
++        for name, rec in entry["compilers"].items():  # type: ignore[union-attr]
++            pf = rec.get("per_function") or {}
++            for fn, v in (pf.items() if pf else {("(total)", rec.get("total_insns"))}):  # type: ignore[arg-type]
++                ratio = (rec.get("ratios", {}).get(fn) if isinstance(rec.get("ratios"), dict)
++                         else None)
++                print(f"{Path(entry['source']).name:<28} {name:<12} {str(fn):<24} "
++                      f"{v if v is not None else '-':>14} "
++                      f"{(f'{ratio:.3f}x' if ratio else '-'):>8}")
++
++    if failures:
++        print("\nFAILURES:")
++        for f in failures:
++            print(f"  - {f}")
++
++    if args.markdown:
++        lines = ["| source | compiler | function | insns | vs best |",
++                 "|---|---|---|---:|---:|"]
++        for entry in report["results"]:  # type: ignore[union-attr]
++            for name, rec in entry["compilers"].items():  # type: ignore[union-attr]
++                pf = rec.get("per_function") or {}
++                for fn, v in pf.items():
++                    ratio = (rec.get("ratios", {}).get(fn)
++                             if isinstance(rec.get("ratios"), dict) else None)
++                    lines.append(f"| {Path(entry['source']).name} | {name} | {fn} | "
++                                 f"{v} | {ratio if ratio else '-'} |")
++        args.markdown.write_text("\n".join(lines) + "\n")
++        print(f"\nwrote {args.markdown}")
++
++    if failures and (args.gate or True):
++        # correctness/nondeterminism failures are always fatal; --gate only adds
++        # the regression threshold below.
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
+index 8d6a824f..8afe8157 100644
+--- a/src/backend/arm/codegen/alu.rs
++++ b/src/backend/arm/codegen/alu.rs
+@@ -7,6 +7,57 @@ use crate::common::types::IrType;
+ use crate::ir::reexports::{IrBinOp, Operand, Value};
  
  impl ArmCodegen {
-+    /// Canonicalize an exclusive-operation result in X0 to the IR type.
-+    fn canonicalize_atomic_x0_result(&mut self, ty: IrType) {
-+        match ty {
-+            IrType::I8 => self.state.emit("    sxtb x0, w0"),
-+            IrType::I16 => self.state.emit("    sxth x0, w0"),
-+            IrType::I32 => self.state.emit("    sxtw x0, w0"),
-+            // Byte/halfword loads and every W-register write already clear
-+            // the upper bits for unsigned types.
-+            _ => {}
++    /// True when `op` is a value whose **only** current home is the
++    /// accumulator.
++    ///
++    /// Such a value has no callee-saved register assignment and no stack slot:
++    /// the skip-slot optimisation keeps an immediately-consumed value in x0 and
++    /// never spills it. Any emission that writes x0 therefore destroys it
++    /// irrecoverably — `operand_to_x0` would have nowhere left to reload from.
++    fn operand_lives_only_in_acc(&self, op: &Operand) -> bool {
++        let Operand::Value(v) = op else {
++            return false;
++        };
++        // `acc_has` is keyed by (value, is_alloca); consult both spellings so
++        // an alloca/non-alloca disagreement in the cache cannot hide a value
++        // that really is sitting in x0.
++        self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true)
++    }
++
++    /// Stage several operands into their scratch registers, **accumulator-
++    /// resident operands first**.
++    ///
++    /// Every staging route for a register-less operand goes through x0
++    /// (`operand_to_x0` followed by `mov <scratch>, x0`). If two operands need
++    /// staging and one of them already lives only in x0, staging the other one
++    /// first destroys it: the value has no register assignment and no stack
++    /// slot, so the reload has to give up. That is exactly how
++    /// `sha256_transform`'s checksum lost its `state[3]` term —
++    /// `eor x0, x1, x2, lsl #16` was emitted with `x2` materialised as zero
++    /// (BUG-2026-09-09, AArch64 silent miscompile).
++    ///
++    /// x0 can hold at most one value, so at most one operand is
++    /// accumulator-resident; ordering it first is both necessary and
++    /// sufficient. The sort is stable, so in the common case (nothing is
++    /// accumulator-resident, or the resident operand is already first) the
++    /// emitted code is byte-identical to the previous behaviour.
++    fn stage_operands_acc_first(
++        &mut self,
++        pairs: &[(&Operand, &'static str)],
++        materialize: &mut dyn FnMut(&mut Self, &Operand, &'static str) -> String,
++    ) -> Vec<String> {
++        let mut order: Vec<usize> = (0..pairs.len()).collect();
++        order.sort_by_key(|&i| !self.operand_lives_only_in_acc(pairs[i].0));
++        let mut regs: Vec<Option<String>> = vec![None; pairs.len()];
++        for i in order {
++            let (op, scratch) = pairs[i];
++            regs[i] = Some(materialize(self, op, scratch));
++        }
++        regs.into_iter()
++            .map(|r| r.expect("stage_operands_acc_first stages every operand exactly once"))
++            .collect()
++    }
++
+     pub(super) fn emit_shifted_logical_impl(
+         &mut self,
+         shift_op: IrBinOp,
+@@ -23,7 +74,7 @@ impl ArmCodegen {
+         let width = if use_32bit { 32 } else { 64 };
+         debug_assert!(amount < width);
+ 
+-        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
++        let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
+             // FP-homed integer values must stage through the scratch GPR:
+             // callee_saved_name panics on FP register indices (the session-29
+             // ICE class). operand_to_x0 handles the fmov correctly.
+@@ -41,8 +92,18 @@ impl ArmCodegen {
+                 scratch.to_string()
+             }
+         };
+-        let other_reg = materialize(self, other, if use_32bit { "w1" } else { "x1" });
+-        let shifted_reg = materialize(self, shift_lhs, if use_32bit { "w2" } else { "x2" });
++        // BUG-2026-09-09: stage whichever operand currently lives only in x0
++        // FIRST. Materialising `other` first clobbers x0, and when `shift_lhs`
++        // is the skip-slot result of the immediately preceding instruction it
++        // has no register and no slot to reload from.
++        let scratch_other = if use_32bit { "w1" } else { "x1" };
++        let scratch_shifted = if use_32bit { "w2" } else { "x2" };
++        let staged = self.stage_operands_acc_first(
++            &[(other, scratch_other), (shift_lhs, scratch_shifted)],
++            &mut materialize,
++        );
++        let other_reg = staged[0].clone();
++        let shifted_reg = staged[1].clone();
+         let output = if let Some(reg) = self.dest_reg(dest) {
+             if use_32bit {
+                 callee_saved_name_32(reg)
+@@ -81,7 +142,7 @@ impl ArmCodegen {
+             ty,
+             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+         );
+-        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
++        let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
+             if let Some(reg) = this.operand_reg(op) {
+                 if use_32bit {
+                     callee_saved_name_32(reg).to_string()
+@@ -106,9 +167,20 @@ impl ArmCodegen {
+                 scratch.to_string()
+             }
+         };
+-        let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
+-        let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
+-        let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
++        // Same invariant as `emit_shifted_logical_impl`: an operand that lives
++        // only in the accumulator must be captured before another operand's
++        // staging writes x0 (BUG-2026-09-09 bug class).
++        let staged = self.stage_operands_acc_first(
++            &[
++                (lhs, if use_32bit { "w1" } else { "x1" }),
++                (rhs, if use_32bit { "w2" } else { "x2" }),
++                (acc, if use_32bit { "w3" } else { "x3" }),
++            ],
++            &mut materialize,
++        );
++        let lhs_reg = staged[0].clone();
++        let rhs_reg = staged[1].clone();
++        let acc_reg = staged[2].clone();
+         if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
+             let output = if use_32bit {
+                 callee_saved_name_32(dest_phys)
+@@ -145,7 +217,7 @@ impl ArmCodegen {
+             ty,
+             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+         );
+-        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
++        let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
+             // FP-homed integer values stage through the scratch GPR
+             // (callee_saved_name panics on FP indices; session-29 class).
+             if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
+@@ -170,9 +242,17 @@ impl ArmCodegen {
+                 scratch.to_string()
+             }
+         };
+-        let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
+-        let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
+-        let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
++        let staged = self.stage_operands_acc_first(
++            &[
++                (lhs, if use_32bit { "w1" } else { "x1" }),
++                (rhs, if use_32bit { "w2" } else { "x2" }),
++                (acc, if use_32bit { "w3" } else { "x3" }),
++            ],
++            &mut materialize,
++        );
++        let lhs_reg = staged[0].clone();
++        let rhs_reg = staged[1].clone();
++        let acc_reg = staged[2].clone();
+         if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
+             let output = if use_32bit {
+                 callee_saved_name_32(dest_phys)
+diff --git a/src/backend/arm/codegen/cast_ops.rs b/src/backend/arm/codegen/cast_ops.rs
+index 440fd90d..10e49ddd 100644
+--- a/src/backend/arm/codegen/cast_ops.rs
++++ b/src/backend/arm/codegen/cast_ops.rs
+@@ -279,8 +279,7 @@ impl ArmCodegen {
+             && matches!(src, Operand::Value(v) if self.bitop_nonneg_values.contains(&v.0))
+         {
+             self.emit_load_operand(src);
+-            self.store_x0_to(dest);
+-            self.state.reg_cache.invalidate_acc();
++            self.store_x0_to_and_release(dest);
+             return;
+         }
+         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+diff --git a/src/backend/arm/codegen/comparison.rs b/src/backend/arm/codegen/comparison.rs
+index 7d5dbed8..87b65f55 100644
+--- a/src/backend/arm/codegen/comparison.rs
++++ b/src/backend/arm/codegen/comparison.rs
+@@ -174,7 +174,11 @@ impl ArmCodegen {
+                 "    csel {}, {}, {}, ne",
+                 accumulator, t_name, f_name
+             ));
+-            self.store_x0_to(dest);
++            // Keep the accumulator entry when `dest` has no durable
++            // home (see store_x0_to_and_release) and skip the shared
++            // invalidate below, which would orphan the value.
++            self.store_x0_to_and_release(dest);
++            return;
+         }
+         self.state.reg_cache.invalidate_acc();
+     }
+@@ -220,7 +224,11 @@ impl ArmCodegen {
+                 "    csel {}, {}, {}, {}",
+                 accumulator, t_name, f_name, cc
+             ));
+-            self.store_x0_to(dest);
++            // Keep the accumulator entry when `dest` has no durable
++            // home (see store_x0_to_and_release) and skip the shared
++            // invalidate below, which would orphan the value.
++            self.store_x0_to_and_release(dest);
++            return;
+         }
+         self.state.reg_cache.invalidate_acc();
+     }
+@@ -312,7 +320,11 @@ impl ArmCodegen {
+                 "    csinc {}, {}, {}, {}",
+                 accumulator, base_reg, base_reg, condition
+             ));
+-            self.store_x0_to(dest);
++            // Keep the accumulator entry when `dest` has no durable
++            // home (see store_x0_to_and_release) and skip the shared
++            // invalidate below, which would orphan the value.
++            self.store_x0_to_and_release(dest);
++            return;
+         }
+         self.state.reg_cache.invalidate_acc();
+     }
+diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
+index ac7d81d5..5c86d2e9 100644
+--- a/src/backend/arm/codegen/emit.rs
++++ b/src/backend/arm/codegen/emit.rs
+@@ -1037,10 +1037,31 @@ impl ArmCodegen {
+         offset <= max_offset && offset % access_size == 0
+     }
+ 
++    /// Bias a frame-slot offset by any outstanding stack-pointer adjustment.
++    ///
++    /// `emit_acc_save` lowers sp by 16 for the duration of an emission that
++    /// would otherwise clobber the accumulator. Every slot is addressed
++    /// sp-relative (or x19-relative, where x19 was captured from the *unshifted*
++    /// sp), so offsets computed inside that window must be biased by the same
++    /// delta. Frames that address through x29 (dynamic alloca) are unaffected
++    /// by a push and must NOT be biased.
++    ///
++    /// The field is zero everywhere else, so this is a no-op outside the
++    /// protected window and existing codegen is unchanged.
++    #[inline]
++    fn slot_offset(&self, offset: i64) -> i64 {
++        if self.state.has_dyn_alloca {
++            offset
++        } else {
++            offset + self.state.out.rsp_frame_size
 +        }
 +    }
 +
-     pub(super) fn emit_atomic_rmw_impl(
-         &mut self,
-         dest: &Value,
-@@ -16,8 +28,10 @@ impl ArmCodegen {
-     ) {
-         self.operand_to_x0(ptr);
-         self.state.emit("    mov x1, x0");
--        self.operand_to_x0(val);
--        self.state.emit("    mov x2, x0");
-+        if !matches!(op, AtomicRmwOp::TestAndSet) {
-+            self.operand_to_x0(val);
-+            self.state.emit("    mov x2, x0");
-+        }
+     /// Emit store to [base, #offset], handling large offsets.
+     /// For large frames with x19 as frame base register, tries x19-relative addressing
+     /// before falling back to the expensive movz+movk+add sequence.
+     pub(super) fn emit_store_to_sp(&mut self, reg: &str, offset: i64, instr: &str) {
++        let offset = self.slot_offset(offset);
+         // When DynAlloca is present, use x29 (frame pointer) as base.
+         let base = if self.state.has_dyn_alloca {
+             "x29"
+@@ -1079,6 +1100,7 @@ impl ArmCodegen {
+     /// Emit load from [base, #offset], handling large offsets.
+     /// For large frames with x19 as frame base register, tries x19-relative addressing.
+     pub(super) fn emit_load_from_sp(&mut self, reg: &str, offset: i64, instr: &str) {
++        let offset = self.slot_offset(offset);
+         let base = if self.state.has_dyn_alloca {
+             "x29"
+         } else {
+@@ -1130,6 +1152,7 @@ impl ArmCodegen {
+     /// Emit `stp reg1, reg2, [base, #offset]` handling large offsets.
+     /// Uses x19 frame base for large frames when possible.
+     pub(super) fn emit_stp_to_sp(&mut self, reg1: &str, reg2: &str, offset: i64) {
++        let offset = self.slot_offset(offset);
+         let base = if self.state.has_dyn_alloca {
+             "x29"
+         } else {
+@@ -1163,6 +1186,7 @@ impl ArmCodegen {
+     }
  
-         let (ldxr, stxr, reg_prefix) = Self::exclusive_instrs(ty, ordering);
-         let val_reg = format!("{}2", reg_prefix);
-@@ -39,10 +53,10 @@ impl ArmCodegen {
-             AtomicRmwOp::TestAndSet => {
-                 let label_id = self.state.next_label_id();
-                 let loop_label = format!(".Latomic_{}", label_id);
-+                self.state.emit("    mov w3, #1");
-                 self.state.emit_fmt(format_args!("{}:", loop_label));
-                 self.state
-                     .emit_fmt(format_args!("    {} {}, [x1]", ldxr, old_reg));
--                self.state.emit("    mov w3, #1");
-                 self.state
-                     .emit_fmt(format_args!("    {} w4, w3, [x1]", stxr));
-                 self.state
-@@ -61,6 +75,9 @@ impl ArmCodegen {
-                     .emit_fmt(format_args!("    cbnz w4, {}", loop_label));
+     pub(super) fn emit_ldp_from_sp(&mut self, reg1: &str, reg2: &str, offset: i64) {
++        let offset = self.slot_offset(offset);
+         let base = if self.state.has_dyn_alloca {
+             "x29"
+         } else {
+@@ -1197,6 +1221,7 @@ impl ArmCodegen {
+     /// Emit `add dest, sp, #offset` handling large offsets.
+     /// Uses x19 frame base when available, falls back to x17 scratch.
+     pub(super) fn emit_add_sp_offset(&mut self, dest: &str, offset: i64) {
++        let offset = self.slot_offset(offset);
+         let base = if self.state.has_dyn_alloca {
+             "x29"
+         } else {
+@@ -1512,8 +1537,28 @@ impl ArmCodegen {
+                     // Value has no slot or register but is in the accumulator cache
+                     // (skip-slot optimization: immediately-consumed values stay in x0).
+                 } else {
+-                    self.state.emit("    mov x0, #0");
+-                    self.state.reg_cache.invalidate_acc();
++                    // There is no location left to reload this value from: it has
++                    // no callee-saved register, no stack slot, and it is not in
++                    // the accumulator.  x0 was clobbered while this value's only
++                    // home was x0.
++                    //
++                    // This used to emit `mov x0, #0`, which turned the loss into
++                    // a *silent miscompile*: `sha256_transform`'s checksum lost its
++                    // `state[3]` term on AArch64 and produced a wrong digest that
++                    // still passed the kernel's own known-answer self-check
++                    // (BUG-2026-09-09).  A wrong binary is worse than a stopped
++                    // compile, so this is now a hard internal error — the driver
++                    // reports it as `ccc: internal error`.
++                    //
++                    // The staging order that used to reach here is fixed in
++                    // `stage_operands_acc_first` (see alu.rs); reaching this point
++                    // means a new path clobbers the accumulator too early.
++                    panic!(
++                        "AArch64: value v{} has no register assignment, no stack slot, and \
++                         is not in the accumulator — its only home was x0 and x0 was \
++                         clobbered (BUG-2026-09-09). Refusing to emit a materialised zero.",
++                        v.0
++                    );
+                 }
              }
          }
-+        if !matches!(op, AtomicRmwOp::TestAndSet) {
-+            self.canonicalize_atomic_x0_result(ty);
-+        }
-         self.store_x0_to(dest);
+@@ -1537,6 +1582,27 @@ impl ArmCodegen {
+         self.state.reg_cache.set_acc(dest.0, false);
      }
  
-@@ -81,6 +98,13 @@ impl ArmCodegen {
-         self.state.emit("    mov x3, x0");
-         self.operand_to_x0(expected);
-         self.state.emit("    mov x2, x0");
-+        // LDXRB/LDXRH zero-extend, so compare the expected value at the
-+        // atomic object's width rather than against a sign-extended source.
-+        match ty {
-+            IrType::I8 | IrType::U8 => self.state.emit("    and w2, w2, #0xff"),
-+            IrType::I16 | IrType::U16 => self.state.emit("    uxth w2, w2"),
-+            _ => {}
++    /// `store_x0_to` followed by dropping the accumulator entry — but ONLY
++    /// when the value actually reached a durable home.
++    ///
++    /// When `dest` has neither a register assignment nor a stack slot, x0 is
++    /// its sole home: invalidating the accumulator there orphans the value,
++    /// and the next `operand_to_x0(dest)` has nothing left to reload it from
++    /// (it used to emit `mov x0, #0` and silently miscompile). `fannkuch.c`
++    /// at -Os reached exactly that state through `emit_load_indexed_impl`,
++    /// whose `ldrsw x0, […]` produced a value with no other home.
++    ///
++    /// Use this (not `store_x0_to` + `invalidate_acc`) wherever the caller
++    /// treats x0 as pure scratch after the store.
++    pub(super) fn store_x0_to_and_release(&mut self, dest: &Value) {
++        let homed =
++            self.reg_assignments.contains_key(&dest.0) || self.state.get_slot(dest.0).is_some();
++        self.store_x0_to(dest);
++        if homed {
++            self.state.reg_cache.invalidate_acc();
 +        }
- 
-         let (ldxr, stxr, reg_prefix) = Self::exclusive_instrs(ty, success_ordering);
-         let old_reg = format!("{}0", reg_prefix);
-@@ -114,6 +138,9 @@ impl ArmCodegen {
-             self.state.emit("    clrex");
-         }
-         self.state.emit_fmt(format_args!("{}:", done_label));
-+        if !returns_bool {
-+            self.canonicalize_atomic_x0_result(ty);
-+        }
-         self.store_x0_to(dest);
++    }
++
+     // --- 128-bit integer helpers ---
+     // Convention: 128-bit values use x0 (low 64 bits) and x1 (high 64 bits).
+     // Stack slots for 128-bit values are 16 bytes: slot(sp) = low, slot+8(sp) = high.
+@@ -2505,6 +2571,26 @@ impl ArchCodegen for ArmCodegen {
+         self.reg_assignments.contains_key(&vid)
      }
  
-@@ -145,12 +172,7 @@ impl ArmCodegen {
++    fn emit_acc_save(&mut self) -> i64 {
++        // AArch64 has no push. The pre-indexed store is a single instruction
++        // that both lowers sp and stores x0, and it does not touch the flags,
++        // so a pending fused-Cmp handshake survives. 16 bytes keeps sp 16-byte
++        // aligned as AAPCS64 requires.
++        //
++        // NOTE: this moves sp by 16, so the caller bumps `out.rsp_frame_size`
++        // for the duration. Slot references only need to honour that field
++        // when they are sp-based (`emit_load_from_sp` / `emit_store_to_sp` /
++        // `emit_alloca_addr`); frames that address through x29 (dynamic
++        // alloca) or the x19 frame base are unaffected by a push, exactly as
++        // the x86 RBP-frame case is.
++        self.state.emit("    str x0, [sp, #-16]!");
++        16
++    }
++
++    fn emit_acc_restore(&mut self) {
++        self.state.emit("    ldr x0, [sp], #16");
++    }
++
+     fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
+         self.fp_contract
+     }
+diff --git a/src/backend/arm/codegen/memory.rs b/src/backend/arm/codegen/memory.rs
+index 2638e1c1..a128a89d 100644
+--- a/src/backend/arm/codegen/memory.rs
++++ b/src/backend/arm/codegen/memory.rs
+@@ -118,8 +118,7 @@ impl ArmCodegen {
          };
          self.state
-             .emit_fmt(format_args!("    {} {}, [x0]", instr, dest_reg));
--        match ty {
--            IrType::I8 => self.state.emit("    sxtb x0, w0"),
--            IrType::I16 => self.state.emit("    sxth x0, w0"),
--            IrType::I32 => self.state.emit("    sxtw x0, w0"),
--            _ => {}
--        }
-+        self.canonicalize_atomic_x0_result(ty);
-         self.store_x0_to(dest);
+             .emit_fmt(format_args!("    {} {}, {}", instr, reg, addr));
+-        self.store_x0_to(dest);
+-        self.state.reg_cache.invalidate_acc();
++        self.store_x0_to_and_release(dest);
+         true
      }
  
-@@ -190,8 +212,11 @@ impl ArmCodegen {
-         match ordering {
-             AtomicOrdering::Relaxed => {}
-             AtomicOrdering::Acquire => self.state.emit("    dmb ishld"),
--            AtomicOrdering::Release => self.state.emit("    dmb ishst"),
--            AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => self.state.emit("    dmb ish"),
-+            // A C release fence orders earlier loads as well as stores before
-+            // a following publishing store; DMB ISHST would omit load->store.
-+            AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => {
-+                self.state.emit("    dmb ish")
-+            }
-         }
-     }
+diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
+index d13aa3a1..8f52ae6a 100644
+--- a/src/backend/arm/codegen/peephole.rs
++++ b/src/backend/arm/codegen/peephole.rs
+@@ -721,6 +721,273 @@ fn is_function_boundary(line: &str) -> bool {
+     line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
  }
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index e19d3f0..43323c2 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -692,11 +692,13 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
-                 NONE
-             }
-         }
--        // `lock xadd` / `xchg` / test-and-set run on rax+rcx only; every
--        // other RMW is a cmpxchg loop with old in rax, new in rdx and the
--        // operand value in rdi.
-+        // `lock xadd` / `xchg` / test-and-set run on rax+rcx only; bitwise
-+        // RMWs use a cmpxchg loop with old in rax, new in rdx and the operand
-+        // value in rdi.
-         Instruction::AtomicRmw { op, .. } => match op {
--            AtomicRmwOp::Add | AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => NONE,
-+            AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => {
-+                NONE
-+            }
-             _ => RDX_RDI,
-         },
-         // cmpxchg: desired in rdx. Atomic store: value in rdx.
-diff --git a/src/backend/riscv/codegen/atomics.rs b/src/backend/riscv/codegen/atomics.rs
-index 0838c61..bc51777 100644
---- a/src/backend/riscv/codegen/atomics.rs
-+++ b/src/backend/riscv/codegen/atomics.rs
-@@ -55,6 +55,12 @@ impl RiscvCodegen {
-             IrType::I32 => {
-                 state.emit("    sext.w t0, t0");
-             }
-+            IrType::U32 => {
-+                // AMO.W/LR.W sign-extend their result on RV64; unsigned IR
-+                // values require explicit zero-extension.
-+                state.emit("    slli t0, t0, 32");
-+                state.emit("    srli t0, t0, 32");
-+            }
-             _ => {}
-         }
-     }
-@@ -543,6 +549,11 @@ impl RiscvCodegen {
-             self.emit_subword_atomic_cmpxchg(ty, aq_rl, returns_bool);
-         } else {
-             let suffix = Self::amo_width_suffix(ty);
-+            if matches!(ty, IrType::I32 | IrType::U32) {
-+                // LR.W sign-extends on RV64. Compare the expected value in the
-+                // same representation, including unsigned values >= 2^31.
-+                self.state.emit("    sext.w t2, t2");
-+            }
  
-             let loop_label = self.state.fresh_label("cas_loop");
-             let fail_label = self.state.fresh_label("cas_fail");
-@@ -567,6 +578,9 @@ impl RiscvCodegen {
-             }
-             self.state.emit_fmt(format_args!("{}:", done_label));
-         }
-+        if !returns_bool {
-+            Self::sign_extend_riscv(&mut self.state, ty);
++/// Minimal control-flow graph over one function's linear instruction list.
++///
++/// `propagate_address_aliases` deletes `mov xD, xS` only when no path can read
++/// `xD` before the instruction that overwrites it.  Textually that is
++/// undecidable — a redefinition in another block may or may not dominate the
++/// readers — which is why the earlier rule "never cross a label" was both
++/// wrong to remove and costly to keep: it discarded every legal fold that
++/// spans a block, ~0.3% of instructions corpus-wide.
++///
++/// This CFG answers the question exactly, so the fold fires in every case where
++/// it is legal (notably loop-carried redefinitions, where the redefinition sits
++/// in the loop body and dominates all readers) and is rejected everywhere it is
++/// not (a reader on a path that never ran the redefinition).
++struct Cfg {
++    block_of: Vec<usize>,
++    succs: Vec<Vec<usize>>,
++    /// Dominator bitsets: `dom[b]` has bit `d` set iff `d` dominates `b`.
++    dom: Vec<Vec<u64>>,
++    words: usize,
++}
++
++impl Cfg {
++    /// Build the CFG and its dominator sets.  `None` when the function contains
++    /// control flow that cannot be resolved statically (an indirect `br xN`, or
++    /// a branch whose label is not in this function): callers must then fall
++    /// back to the conservative answer.
++    fn build(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Cfg> {
++        if n == 0 {
++            return None;
 +        }
-         self.store_t0_to(dest);
-     }
- 
-@@ -596,15 +610,23 @@ impl RiscvCodegen {
-                 self.state.emit("    fence r, rw");
-             }
-         } else {
--            let suffix = Self::amo_width_suffix(ty);
--            let lr_suffix = match ordering {
--                AtomicOrdering::Relaxed | AtomicOrdering::Release => "",
--                AtomicOrdering::Acquire => ".aq",
--                AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => ".aqrl",
--            };
--            self.state
--                .emit_fmt(format_args!("    lr.{}{} t0, (t0)", suffix, lr_suffix));
--            Self::sign_extend_riscv(&mut self.state, ty);
-+            // Naturally aligned XLEN/word loads are already single-copy atomic.
-+            // LR would unnecessarily create a reservation and is not required
-+            // for an atomic load; fences supply the requested ordering.
-+            if matches!(ordering, AtomicOrdering::SeqCst) {
-+                self.state.emit("    fence rw, rw");
++        let mut block_of = vec![0usize; n];
++        let mut starts = vec![0usize];
++        for i in 0..n {
++            if kinds[i] == LineKind::Label && i != 0 {
++                starts.push(i);
 +            }
-+            match ty {
-+                IrType::I32 => self.state.emit("    lw t0, 0(t0)"),
-+                IrType::U32 => self.state.emit("    lwu t0, 0(t0)"),
-+                _ => self.state.emit("    ld t0, 0(t0)"),
-+            }
-+            if matches!(
-+                ordering,
-+                AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
-+            ) {
-+                self.state.emit("    fence r, rw");
-+            }
-         }
-         self.store_t0_to(dest);
-     }
-@@ -635,12 +657,23 @@ impl RiscvCodegen {
-                 self.state.emit("    fence rw, rw");
-             }
-         } else {
--            let aq_rl = Self::amo_ordering(ordering);
--            let suffix = Self::amo_width_suffix(ty);
--            self.state.emit_fmt(format_args!(
--                "    amoswap.{}{} zero, t1, (t0)",
--                suffix, aq_rl
--            ));
-+            // Naturally aligned word/doubleword stores are atomic. Match the
-+            // standard RVWMO mapping instead of paying for an AMOSWAP whose
-+            // old value is discarded.
-+            if matches!(
-+                ordering,
-+                AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
-+            ) {
-+                self.state.emit("    fence rw, w");
-+            }
-+            if matches!(ty, IrType::I32 | IrType::U32) {
-+                self.state.emit("    sw t1, 0(t0)");
-+            } else {
-+                self.state.emit("    sd t1, 0(t0)");
-+            }
-+            if matches!(ordering, AtomicOrdering::SeqCst) {
-+                self.state.emit("    fence rw, rw");
-+            }
-         }
-     }
- 
-diff --git a/src/backend/x86/codegen/atomics.rs b/src/backend/x86/codegen/atomics.rs
-index 47df12f..fcc2673 100644
---- a/src/backend/x86/codegen/atomics.rs
-+++ b/src/backend/x86/codegen/atomics.rs
-@@ -1,10 +1,39 @@
- //! X86Codegen: atomic operations (RMW, cmpxchg, load, store, fence).
-+//!
-+//! Locked instructions provide the required ordering for every RMW. Narrow
-+//! register operands only overwrite AL/AX/EAX, so results must be canonicalized
-+//! before they are stored as the backend's 64-bit SSA representation.
- 
- use super::emit::X86Codegen;
- use crate::common::types::IrType;
--use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, IrConst, Operand, Value};
-+use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
- 
- impl X86Codegen {
-+    /// Canonicalize an atomic result in RAX to the signedness and width of `ty`.
-+    fn canonicalize_atomic_rax_result(&mut self, ty: IrType) {
-+        match ty {
-+            IrType::I8 => self.state.emit("    movsbq %al, %rax"),
-+            IrType::U8 => self.state.emit("    movzbl %al, %eax"),
-+            IrType::I16 => self.state.emit("    movswq %ax, %rax"),
-+            IrType::U16 => self.state.emit("    movzwl %ax, %eax"),
-+            IrType::I32 => self.state.emit("    movslq %eax, %rax"),
-+            // A 32-bit destination write already zero-extends U32; 64-bit
-+            // operations overwrite all of RAX.
-+            _ => {}
++            block_of[i] = starts.len() - 1;
 +        }
-+    }
-+
-+    /// Prepare the x86 machine state for an atomic side effect.
-+    fn prepare_atomic_side_effect(&mut self) {
-+        debug_assert!(
-+            self.pending_cmp.is_none() && self.pending_fp_cmp.is_none(),
-+            "atomic side effect between fused comparison and consumer"
-+        );
-+        self.state.reg_cache.invalidate_all();
-+        self.flush_pending_vec_store_impl();
-+        self.state.invalidate_vec_peephole();
-+    }
-+
-     /// PGO counter increment as a SINGLE instruction: `[lock] incq sym+off(%rip)`.
-     /// `incq` clobbers the flags, so the instrumentation pass never places a
-     /// counter between a fused Cmp and its branch/select consumer.
-@@ -13,6 +42,7 @@ impl X86Codegen {
-             self.pending_cmp.is_none(),
-             "counter between fused Cmp and consumer"
-         );
-+        self.prepare_atomic_side_effect();
-         let op = if atomic { "lock incq" } else { "incq" };
-         if offset == 0 {
-             self.state
-@@ -21,9 +51,6 @@ impl X86Codegen {
-             self.state
-                 .emit_fmt(format_args!("    {} {}+{}(%rip)", op, name, offset));
-         }
--        self.state.reg_cache.invalidate_all();
--        self.flush_pending_vec_store_impl();
--        self.state.invalidate_vec_peephole();
-     }
- 
-     /// NOP-mode counter (debug): used to isolate instruction vs CFG bugs.
-@@ -33,7 +60,7 @@ impl X86Codegen {
-         self.state.reg_cache.invalidate_all();
-     }
- 
--    /// Result-less atomic increment used by PGO.  No virtual destination or
-+    /// Result-less atomic increment used by PGO. No virtual destination or
-     /// spill slot is created, so the counter cannot perturb live value
-     /// allocation in large C functions.
-     pub(super) fn emit_atomic_inc_impl(
-@@ -44,15 +71,8 @@ impl X86Codegen {
-         _ordering: AtomicOrdering,
-     ) {
-         self.operand_to_rax(ptr);
--        // Use the address register directly; borrowing RCX without a
--        // register-allocation clobber declaration corrupts live values in
--        // spill-heavy functions.
--        let suffix = match ty {
--            IrType::I64 | IrType::U64 => "q",
--            IrType::I32 | IrType::U32 => "l",
--            IrType::I16 | IrType::U16 => "w",
--            _ => "b",
--        };
-+        self.prepare_atomic_side_effect();
-+        let suffix = Self::type_suffix(ty);
-         self.state
-             .emit_fmt(format_args!("    lock inc{} {}(%rax)", suffix, offset));
-     }
-@@ -66,82 +86,54 @@ impl X86Codegen {
-         ty: IrType,
-         _ordering: AtomicOrdering,
-     ) {
--        // Fast path: atomic add of the constant 1 (very common for refcounts /
--        // PGO counters). `lock incq`/`lock addq $1` is a single micro-op that
--        // does not return the old value, unlike `lock xadd` which is slower and
--        // forces a value through rax. The destination is defined but its value
--        // is irrelevant to such callers; we produce 0 (xor eax,eax) so the
--        // register allocator still has a definition.
--        if matches!(op, AtomicRmwOp::Add) {
--            if let Operand::Const(c) = val {
--                let one = match c {
--                    IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1) | IrConst::I64(1) => true,
--                    _ => false,
--                };
--                if one {
--                    self.operand_to_rax(ptr);
--                    self.state.emit("    movq %rax, %rcx");
--                    self.state.reg_cache.invalidate_all();
--                    self.flush_pending_vec_store_impl();
--                    self.state.invalidate_vec_peephole();
--                    // Single-byte atomic increment. PGO counters and most
--                    // refcounts use I64; for other widths pick the right suffix.
--                    let suffix = match ty {
--                        IrType::I64 | IrType::U64 => "q",
--                        IrType::I32 | IrType::U32 => "l",
--                        IrType::I16 | IrType::U16 => "w",
--                        _ => "b",
--                    };
--                    self.state
--                        .emit_fmt(format_args!("    lock inc{} (%rcx)", suffix));
--                    // Produce a defined (but meaningless) value for dest.
--                    self.state.emit("    xorl %eax, %eax");
--                    self.store_rax_to(dest);
--                    return;
--                }
--            }
--        }
-         self.operand_to_rax(ptr);
-         self.state.emit("    movq %rax, %rcx");
-+
-+        // TestAndSet carries a dummy IR operand. Avoid materializing a value
-+        // that is unconditionally replaced by one.
-+        if matches!(op, AtomicRmwOp::TestAndSet) {
-+            self.prepare_atomic_side_effect();
-+            self.state.emit("    movb $1, %al");
-+            self.state.emit("    xchgb %al, (%rcx)");
-+            // The builtin tests the old byte for zero, irrespective of whether
-+            // plain `char` is signed on the source target.
-+            self.state.emit("    movzbl %al, %eax");
-+            self.store_rax_to(dest);
-+            return;
++        let nb = starts.len();
++        let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
++        for i in 0..n {
++            if kinds[i] == LineKind::Label {
++                label_block.insert(lines[i].trim().trim_end_matches(':'), block_of[i]);
++            }
 +        }
-+
-         self.operand_to_rax(val);
--        self.state.reg_cache.invalidate_all();
--        self.flush_pending_vec_store_impl();
--        self.state.invalidate_vec_peephole();
--        let size_suffix = Self::type_suffix(ty);
-+        self.prepare_atomic_side_effect();
-+
-+        let suffix = Self::type_suffix(ty);
-         let val_reg = Self::reg_for_type("rax", ty);
-         match op {
--            AtomicRmwOp::Add => {
--                self.state.emit_fmt(format_args!(
--                    "    lock xadd{} %{}, (%rcx)",
--                    size_suffix, val_reg
--                ));
-+            AtomicRmwOp::Add | AtomicRmwOp::Sub => {
-+                if matches!(op, AtomicRmwOp::Sub) {
-+                    // The low w bits of a 64-bit negation equal negation modulo
-+                    // 2^w, allowing subtraction to use one XADD at every width.
-+                    self.state.emit("    negq %rax");
++        let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
++        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
++        for b in 0..nb {
++            let e = end(b);
++            let mut t = e;
++            while t > starts[b] && kinds[t - 1] == LineKind::Nop {
++                t -= 1;
++            }
++            if t == starts[b] {
++                if b + 1 < nb {
++                    succs[b].push(b + 1);
 +                }
-+                self.state
-+                    .emit_fmt(format_args!("    lock xadd{} %{}, (%rcx)", suffix, val_reg));
-+                self.canonicalize_atomic_rax_result(ty);
-             }
-             AtomicRmwOp::Xchg => {
-                 self.state
--                    .emit_fmt(format_args!("    xchg{} %{}, (%rcx)", size_suffix, val_reg));
--            }
--            AtomicRmwOp::TestAndSet => {
--                self.state.emit("    movb $1, %al");
--                self.state.emit("    xchgb %al, (%rcx)");
--                // Zero-extend %al to %eax: xchgb only sets the low byte,
--                // leaving upper bytes with garbage from prior register usage.
--                self.state.emit("    movzbl %al, %eax");
--            }
--            AtomicRmwOp::Sub => {
--                self.emit_x86_atomic_op_loop(ty, "sub");
--            }
--            AtomicRmwOp::And => {
--                self.emit_x86_atomic_op_loop(ty, "and");
--            }
--            AtomicRmwOp::Or => {
--                self.emit_x86_atomic_op_loop(ty, "or");
--            }
--            AtomicRmwOp::Xor => {
--                self.emit_x86_atomic_op_loop(ty, "xor");
--            }
--            AtomicRmwOp::Nand => {
--                self.emit_x86_atomic_op_loop(ty, "nand");
-+                    .emit_fmt(format_args!("    xchg{} %{}, (%rcx)", suffix, val_reg));
-+                self.canonicalize_atomic_rax_result(ty);
-             }
-+            AtomicRmwOp::And => self.emit_x86_atomic_op_loop(ty, "and"),
-+            AtomicRmwOp::Or => self.emit_x86_atomic_op_loop(ty, "or"),
-+            AtomicRmwOp::Xor => self.emit_x86_atomic_op_loop(ty, "xor"),
-+            AtomicRmwOp::Nand => self.emit_x86_atomic_op_loop(ty, "nand"),
-+            AtomicRmwOp::TestAndSet => unreachable!(),
++                continue;
++            }
++            let last = t - 1;
++            // A label inside the block body cannot happen (labels start
++            // blocks), so `last` is the block's only control transfer.
++            let target_of = |text: &str| -> Option<usize> {
++                let name = text.split_whitespace().next_back()?;
++                label_block.get(name).copied()
++            };
++            match kinds[last] {
++                LineKind::Ret => {}
++                LineKind::Branch => {
++                    let text = lines[last].trim();
++                    if text.starts_with("br ") {
++                        return None; // indirect branch: unknown target
++                    }
++                    match target_of(text) {
++                        Some(tb) => succs[b].push(tb),
++                        None => return None,
++                    }
++                }
++                LineKind::CondBranch | LineKind::CmpBranch => {
++                    match target_of(lines[last].trim()) {
++                        Some(tb) => succs[b].push(tb),
++                        None => return None,
++                    }
++                    if b + 1 < nb {
++                        succs[b].push(b + 1);
++                    }
++                }
++                _ => {
++                    if b + 1 < nb {
++                        succs[b].push(b + 1);
++                    }
++                }
++            }
 +        }
-+        if matches!(
-+            op,
-+            AtomicRmwOp::And | AtomicRmwOp::Or | AtomicRmwOp::Xor | AtomicRmwOp::Nand
-+        ) {
-+            self.canonicalize_atomic_rax_result(ty);
-         }
-         self.store_rax_to(dest);
-     }
-@@ -162,18 +154,20 @@ impl X86Codegen {
-         self.operand_to_rax(desired);
-         self.state.emit("    movq %rax, %rdx");
-         self.operand_to_rax(expected);
--        self.state.reg_cache.invalidate_all();
--        self.flush_pending_vec_store_impl();
--        self.state.invalidate_vec_peephole();
--        let size_suffix = Self::type_suffix(ty);
-+        self.prepare_atomic_side_effect();
++        // Reachability from the entry block.
++        let mut reachable = vec![false; nb];
++        reachable[0] = true;
++        let mut stack = vec![0usize];
++        while let Some(b) = stack.pop() {
++            for &s in &succs[b] {
++                if !reachable[s] {
++                    reachable[s] = true;
++                    stack.push(s);
++                }
++            }
++        }
++        // Iterative dominators over reachable blocks (bitsets).
++        let words = (nb + 63) / 64;
++        let mut dom: Vec<Vec<u64>> = vec![vec![!0u64; words]; nb];
++        dom[0].iter_mut().for_each(|w| *w = 0);
++        if words > 0 {
++            dom[0][0] = 1; // block 0 dominates itself
++        }
++        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
++        for b in 0..nb {
++            if !reachable[b] {
++                continue;
++            }
++            for &s in &succs[b] {
++                if reachable[s] {
++                    preds[s].push(b);
++                }
++            }
++        }
++        let mut changed = true;
++        while changed {
++            changed = false;
++            for b in 0..nb {
++                if b == 0 || !reachable[b] {
++                    continue;
++                }
++                let mut newd = vec![!0u64; words];
++                let mut first = true;
++                for &p in &preds[b] {
++                    if first {
++                        newd.copy_from_slice(&dom[p]);
++                        first = false;
++                    } else {
++                        for w in 0..words {
++                            newd[w] &= dom[p][w];
++                        }
++                    }
++                }
++                newd[b / 64] |= 1u64 << (b % 64);
++                if newd != dom[b] {
++                    dom[b] = newd;
++                    changed = true;
++                }
++            }
++        }
++        Some(Cfg {
++            block_of,
++            succs,
++            dom,
++            words,
++        })
++    }
 +
-+        let suffix = Self::type_suffix(ty);
-         let desired_reg = Self::reg_for_type("rdx", ty);
-         self.state.emit_fmt(format_args!(
-             "    lock cmpxchg{} %{}, (%rcx)",
--            size_suffix, desired_reg
-+            suffix, desired_reg
-         ));
-         if returns_bool {
-+            // Consume CMPXCHG's ZF before any flag-changing instruction.
-             self.state.emit("    sete %al");
-             self.state.emit("    movzbl %al, %eax");
-+        } else {
-+            self.canonicalize_atomic_rax_result(ty);
-         }
-         self.store_rax_to(dest);
++    /// `true` when `def` dominates `blk` (unreachable blocks dominate nothing).
++    fn dominates(&self, def: usize, blk: usize) -> bool {
++        if def >= self.succs.len() || blk >= self.succs.len() || self.words == 0 {
++            return false;
++        }
++        self.dom[blk][def / 64] & (1u64 << (def % 64)) != 0
++    }
++
++    /// True when the instruction at `redef` — a pure overwrite of `reg` — runs
++    /// before every read of `reg` that the `mov` at `mov_idx` could have fed.
++    /// Reads listed in `rewritten` are renamed onto the alias source, so they
++    /// need no dominance; reads in blocks the mov cannot reach cannot observe
++    /// its value at all.
++    /// True when every read of `reg` that can execute after the `mov` at
++    /// `mov_idx` *without passing the redefinition at `redef`* is listed in
++    /// `rewritten` (and is therefore renamed onto the alias source).
++    ///
++    /// Reads that are only reachable by going through the redefinition see the
++    /// redefined value, not the mov's, so they are irrelevant.  That is what
++    /// makes this exact instead of conservative: a loop-carried redefinition
++    /// lets the fold fire even though the loop body also contains earlier
++    /// reads, while `glibc_memcmp`'s .LBB37 — reachable without running the
++    /// redefinition — still rejects it.
++    fn redef_covers_all_reads(
++        &self,
++        lines: &[String],
++        kinds: &[LineKind],
++        reg: u8,
++        mov_idx: usize,
++        redef: usize,
++        rewritten: &[usize],
++    ) -> bool {
++        let nb = self.succs.len();
++        let start_block = self.block_of[mov_idx];
++        let def_block = self.block_of[redef];
++        // Blocks executable after the mov without running the redefinition.
++        // Traversal stops at the redefinition's block: any path leaving it has
++        // executed `redef` first, so everything beyond is fed by the new value.
++        let mut seen = vec![false; nb];
++        seen[start_block] = true;
++        let mut stack = vec![start_block];
++        while let Some(b) = stack.pop() {
++            for &s in &self.succs[b] {
++                if s == def_block || seen[s] {
++                    continue;
++                }
++                seen[s] = true;
++                stack.push(s);
++            }
++        }
++        for k in 0..lines.len() {
++            if !reads_gp_register(&lines[k], kinds[k], reg) {
++                continue;
++            }
++            let b = self.block_of[k];
++            let feeds_mov = if b == start_block && b == def_block {
++                k > mov_idx && k < redef
++            } else if b == start_block {
++                k > mov_idx
++            } else if b == def_block {
++                k < redef
++            } else {
++                seen[b]
++            };
++            if !feeds_mov {
++                continue;
++            }
++            if rewritten.binary_search(&k).is_ok() {
++                continue; // renamed onto the alias source
++            }
++            return false;
++        }
++        true
++    }
++}
++
++/// Does `line` read `reg`?  A single-mention overwrite of `reg` is a write,
++/// not a read; everything else that mentions the register reads it.
++fn reads_gp_register(line: &str, kind: LineKind, reg: u8) -> bool {
++    fn mentions(line: &str, reg: u8) -> bool {
++        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
++            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
++    }
++    fn mention_count(line: &str, reg: u8) -> usize {
++        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
++            .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
++            .count()
++    }
++    if !mentions(line, reg) {
++        return false;
++    }
++    let trusted = matches!(
++        kind,
++        LineKind::Move { .. }
++            | LineKind::MoveImm { .. }
++            | LineKind::MoveWide { .. }
++            | LineKind::Sxtw { .. }
++            | LineKind::LoadSp { .. }
++            | LineKind::LoadswSp { .. }
++            | LineKind::Alu
++            | LineKind::Compare
++            | LineKind::Branch
++            | LineKind::CondBranch
++            | LineKind::CmpBranch
++            | LineKind::StoreSp { .. }
++    );
++    !(trusted && written_gp_register(line, kind) == Some(reg) && mention_count(line, reg) == 1)
++}
++
+ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+     fn mentions(line: &str, reg: u8) -> bool {
+         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+@@ -731,6 +998,18 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+             .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
+             .count()
      }
-@@ -186,13 +180,11 @@ impl X86Codegen {
-         _ordering: AtomicOrdering,
-     ) {
-         self.operand_to_rax(ptr);
--        self.state.reg_cache.invalidate_all();
--        self.flush_pending_vec_store_impl();
--        self.state.invalidate_vec_peephole();
--        let load_instr = Self::mov_load_for_type(ty);
-+        self.prepare_atomic_side_effect();
-+        let load = Self::mov_load_for_type(ty);
-         let dest_reg = Self::load_dest_reg(ty);
-         self.state
--            .emit_fmt(format_args!("    {} (%rax), {}", load_instr, dest_reg));
-+            .emit_fmt(format_args!("    {} (%rax), {}", load, dest_reg));
-         self.store_rax_to(dest);
++    // Labels that some branch in this function actually targets.  A label no
++    // branch targets is not a control-flow entry point: the only way to reach
++    // the code after it is to fall in from the instruction above, so crossing
++    // such a label does NOT leave the mov's linear region and does not break
++    // the "every path out of the mov runs the redefinition" argument.  Treating
++    // every label as a boundary (the previous, conservative rule) threw away
++    // every alias fold that spans an unreferenced label, which cost ~0.3% of
++    // instructions across the benchmark corpus.
++    // Lazily built CFG: only candidates that the cheap textual rule rejects
++    // pay for it, so the common single-block fold stays as fast as before.
++    let mut cfg: Option<Cfg> = None;
++    let mut cfg_resolvable = true;
+     let mut changed = false;
+     for i in 0..n {
+         let LineKind::Move {
+@@ -748,6 +1027,9 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+         let mut valid = true;
+         let mut provably_dead = false;
+         let mut src_alive = true;
++        // Has the scan left the basic block that holds `mov dst, src`?  Only a
++        // redefinition in that SAME block dominates every path leaving the mov,
++        // so only there does an overwrite prove the mov's value dead.
+         let mut j = i + 1;
+         while j < n {
+             if is_function_boundary(&lines[j]) {
+@@ -763,7 +1045,8 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+                 // that return path, and textually later blocks (other paths)
+                 // may still use it, so it falls through to the plain-mention
+                 // handling and blocks the transform.
+-                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
++                LineKind::Nop | LineKind::Directive | LineKind::Ret => {}
++                LineKind::Label => {}
+                 // Calls clobber src (x0) and all caller-saved registers. Rather
+                 // than reason about save/restore pairs, stop without committing.
+                 LineKind::Call => {
+@@ -794,10 +1077,48 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+                     }
+                     if mentions(&lines[j], dst) {
+                         if trusted && written == Some(dst) && mention_count(&lines[j], dst) == 1 {
++                            // The redefinition is outside the mov's block,
++                            // or a conditional transfer can divert around
++                            // it, so the textual argument no longer holds.
++                            // Ask the CFG the exact question instead of
++                            // giving up: fire only when the redefinition
++                            // dominates every read of dst the mov could
++                            // have fed.  `glibc_memcmp` at -Os is rejected
++                            // here — .LBB37 reads x19 on a path that never
++                            // ran the redefinition — while a loop-carried
++                            // redefinition, which dominates all of its
++                            // readers, is accepted and the fold fires.
++                            let dominated = if !cfg_resolvable {
++                                false
++                            } else {
++                                if cfg.is_none() {
++                                    let built = Cfg::build(&lines[..], &kinds[..], n);
++                                    cfg_resolvable = built.is_some();
++                                    cfg = built;
++                                }
++                                match &cfg {
++                                    Some(c) => c.redef_covers_all_reads(
++                                        &lines[..],
++                                        &kinds[..],
++                                        dst,
++                                        i,
++                                        j,
++                                        &uses,
++                                    ),
++                                    None => false,
++                                }
++                            };
++                            if !dominated {
++                                valid = false;
++                                break;
++                            }
+                             // dst overwritten without being read: the mov's
+                             // value is dead past this instruction (register
+                             // assignments are per-value with disjoint live
+-                            // intervals, so no later text can use the old value).
++                            // intervals, so no later text can use the old
++                            // value).  Reached here the redefinition is in the
++                            // mov's own block, or the CFG proved it dominates
++                            // every read of dst.
+                             provably_dead = true;
+                             break;
+                         }
+@@ -832,6 +1153,11 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+         if j == n {
+             provably_dead = true; // scanned to the end of the file
+         }
++        // A copy killed by a redefinition is deleted whether or not it had
++        // address uses to rewrite: it feeds nothing.  Gating this on
++        // `!uses.is_empty()` left every dead copy without rewritable uses in
++        // the output.  Copies that merely survive to the end of the function
++        // still need their uses rewritten, since dst may be live-out there.
+         if valid && provably_dead && !uses.is_empty() {
+             for use_idx in uses {
+                 lines[use_idx] =
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index b5cc8e2b..8ddc10de 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -4894,27 +4894,23 @@ fn remat_indexed_acc_safe(
+         }
+         Operand::Const(_) => false,
+     };
+-    // The acc register name and push/pop width are per-pointer-size: the
+-    // protection helper is shared by the x86-64 and i686 codegen drivers
+-    // (generation.rs is arch-agnostic), and `pushq %rax` is not encodable
+-    // in 32-bit mode. The push shifts %rsp for the duration of the remat,
+-    // so on RSP-relative frames the slot-reference bookkeeping must shift
+-    // with it (slot_ref emits `(rsp_frame_size + off)(%rsp)`); on RBP
+-    // frames the field is unused and the bump is a no-op.
+-    let (slot, push_acc, pop_acc) = if crate::common::types::target_ptr_size() == 8 {
+-        (8i64, "    pushq %rax", "    popq %rax")
+-    } else {
+-        (4i64, "    pushl %eax", "    popl %eax")
+-    };
++    // The save/restore idiom is per-target, not per-pointer-size: this helper
++    // is arch-agnostic, and hard-coding `pushq %rax` here emitted x86 text
++    // into AArch64 and RISC-V assembly, where the assembler rejected it with
++    // "unsupported instruction: pushq %rax" (BUG-2026-09-09). Each backend
++    // supplies its own flags-neutral sequence and the stack-pointer delta it
++    // applies; sp-relative slot references emitted inside the window honour
++    // `out.rsp_frame_size`, and frame-pointer-based ones ignore it.
++    let mut slot = 0i64;
+     if protected {
+-        cg.state().emit(push_acc);
++        slot = cg.emit_acc_save();
+         cg.state().out.rsp_frame_size += slot;
+     }
+     remat(cg);
+     if protected {
+         cg.state().out.rsp_frame_size -= slot;
+         if let Operand::Value(v) = val {
+-            cg.state().emit(pop_acc);
++            cg.emit_acc_restore();
+             let is_alloca = cg.state_ref().is_alloca(v.0);
+             cg.state().reg_cache.set_acc(v.0, is_alloca);
+         }
+diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
+index a37b37c1..35de18b0 100644
+--- a/src/backend/i686/codegen/emit.rs
++++ b/src/backend/i686/codegen/emit.rs
+@@ -1847,6 +1847,17 @@ impl ArchCodegen for I686Codegen {
+         self.reg_assignments.contains_key(&vid)
      }
  
-@@ -206,22 +198,33 @@ impl X86Codegen {
-         self.operand_to_rax(val);
-         self.state.emit("    movq %rax, %rdx");
-         self.operand_to_rax(ptr);
--        self.state.reg_cache.invalidate_all();
--        self.flush_pending_vec_store_impl();
--        self.state.invalidate_vec_peephole();
--        let store_reg = Self::reg_for_type("rdx", ty);
--        let store_instr = Self::mov_store_for_type(ty);
--        self.state
--            .emit_fmt(format_args!("    {} %{}, (%rax)", store_instr, store_reg));
-+        self.prepare_atomic_side_effect();
++    fn emit_acc_save(&mut self) -> i64 {
++        // 32-bit mode: `pushq`/`popq` are not encodable, so the push width
++        // follows the pointer size (4 bytes).
++        self.state.emit("    pushl %eax");
++        4
++    }
 +
-+        let reg = Self::reg_for_type("rdx", ty);
-         if matches!(ordering, AtomicOrdering::SeqCst) {
--            self.state.emit("    mfence");
-+            // One implicitly locked XCHG performs the store and supplies the
-+            // StoreLoad barrier. MOV+MFENCE is two instructions and slower on
-+            // current Intel and AMD cores.
-+            let suffix = Self::type_suffix(ty);
-+            self.state
-+                .emit_fmt(format_args!("    xchg{} %{}, (%rax)", suffix, reg));
-+        } else {
-+            let store = Self::mov_store_for_type(ty);
-+            self.state
-+                .emit_fmt(format_args!("    {} %{}, (%rax)", store, reg));
-         }
++    fn emit_acc_restore(&mut self) {
++        self.state.emit("    popl %eax");
++    }
++
+     fn flush_x87_pending(&mut self) {
+         self.flush_x87_pending_copy();
      }
- 
-     pub(super) fn emit_fence_impl(&mut self, ordering: AtomicOrdering) {
--        match ordering {
--            AtomicOrdering::Relaxed => {}
--            _ => self.state.emit("    mfence"),
-+        if matches!(ordering, AtomicOrdering::Relaxed) {
-+            return;
-         }
-+
-+        // Flush deferred stores before the barrier. This also proves that no
-+        // fused comparison flags are live, so the faster locked stack no-op may
-+        // clobber EFLAGS safely. The backend exposes non-temporal stores, hence
-+        // the conservative full barrier for every non-relaxed fence.
-+        self.prepare_atomic_side_effect();
-+        self.state.emit("    lock orq $0, (%rsp)");
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 1e1f0022..ce9a6728 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -6472,8 +6472,20 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                 if (128..=65535).contains(&imm_text) {
+                     let i1 = next_non_nop(infos, i + 1);
+                     if i1 < fend && is_order_cond_jcc(trimmed(store, &infos[i1], i1)) {
+-                        if let Some(def_idx) = canonical_16_def(store, infos, i, r, fstart) {
+-                            let r16 = low_subreg_name(reg32_name(r), 2).unwrap_or("%ax");
++                        if let Some(_def_idx) = canonical_16_def(store, infos, i, r, fstart) {
++                            // Refuse the rewrite when the register has no
++                            // 16-bit form (%esp).  Falling back to %ax here
++                            // silently compared an UNRELATED register: it
++                            // turned expat's `c < 0x80` name-scan test into a
++                            // test of the pointer's low bits, so every
++                            // character took the UTF-8 path and the scanner
++                            // returned 0 (BUG-2026-09-09). A missed
++                            // size optimization costs two bytes; a wrong
++                            // register costs correctness.
++                            let Some(r16) = low_subreg_name(reg32_name(r), 2) else {
++                                i += 1;
++                                continue;
++                            };
+                             let new_cmp = format!("    cmpw ${}, {}", imm_text, r16);
+                             store.replace(i, new_cmp);
+                             infos[i] = classify_line(store.get(i));
+@@ -7067,14 +7079,25 @@ fn parse_widened_slot_load<'a>(s: &'a str, disp: i32) -> Option<(&'a str, i32, &
+ /// encodable set only (al/cl/dl/bl and ax/cx/dx/bx; sil/dil/bpl need REX).
+ fn low_subreg_name(reg32: &str, width: i32) -> Option<&'static str> {
+     match (reg32, width) {
++        // 8-bit: only the four low-byte-accessible registers exist without a
++        // REX prefix in 32-bit mode. %spl/%bpl/%sil/%dil are 64-bit-only, so
++        // a caller asking for them must refuse its rewrite rather than emit
++        // text the assembler would reject.
+         ("%eax", 1) => Some("%al"),
+         ("%ecx", 1) => Some("%cl"),
+         ("%edx", 1) => Some("%dl"),
+         ("%ebx", 1) => Some("%bl"),
++        // 16-bit: every GPR except the stack pointer has a word form in
++        // 32-bit mode (%ax/%cx/%dx/%bx/%bp/%si/%di). %esp is deliberately
++        // absent — narrowing a compare or a load onto the stack pointer is
++        // never a rewrite any caller here should make.
+         ("%eax", 2) => Some("%ax"),
+         ("%ecx", 2) => Some("%cx"),
+         ("%edx", 2) => Some("%dx"),
+         ("%ebx", 2) => Some("%bx"),
++        ("%ebp", 2) => Some("%bp"),
++        ("%esi", 2) => Some("%si"),
++        ("%edi", 2) => Some("%di"),
+         _ => None,
      }
  }
+diff --git a/src/backend/riscv/codegen/emit.rs b/src/backend/riscv/codegen/emit.rs
+index 87af011a..251dc2e4 100644
+--- a/src/backend/riscv/codegen/emit.rs
++++ b/src/backend/riscv/codegen/emit.rs
+@@ -337,8 +337,22 @@ impl RiscvCodegen {
+         }
+     }
+ 
++    /// Bias a frame-slot offset by any outstanding stack-pointer adjustment.
++    ///
++    /// `emit_acc_save` lowers sp by 16 for the duration of an emission that
++    /// would otherwise clobber the accumulator, and RISC-V addresses every slot
++    /// sp-relative, so offsets computed inside that window must be biased by
++    /// the same delta. `emit_addi_sp` (which moves sp itself) is deliberately
++    /// NOT biased. The field is zero outside the protected window, so existing
++    /// codegen is unchanged.
++    #[inline]
++    fn slot_offset(&self, offset: i64) -> i64 {
++        offset + self.state.out.rsp_frame_size
++    }
++
+     /// Emit: store `reg` to `offset(sp)`, handling large offsets via t6.
+     pub(super) fn emit_store_to_sp(&mut self, reg: &str, offset: i64, store_instr: &str) {
++        let offset = self.slot_offset(offset);
+         if Self::fits_imm12(offset) {
+             self.state
+                 .emit_fmt(format_args!("    {} {}, {}(sp)", store_instr, reg, offset));
+@@ -352,6 +366,7 @@ impl RiscvCodegen {
+ 
+     /// Emit: load from `offset(sp)` into `reg`, handling large offsets via t6.
+     pub(super) fn emit_load_from_sp(&mut self, reg: &str, offset: i64, load_instr: &str) {
++        let offset = self.slot_offset(offset);
+         if Self::fits_imm12(offset) {
+             self.state
+                 .emit_fmt(format_args!("    {} {}, {}(sp)", load_instr, reg, offset));
+@@ -732,6 +747,21 @@ impl ArchCodegen for RiscvCodegen {
+         self.reg_assignments.contains_key(&vid)
+     }
+ 
++    fn emit_acc_save(&mut self) -> i64 {
++        // RISC-V has no push and (unlike AArch64) no pre-indexed store, so the
++        // save is `addi` + `sd`. Neither instruction touches a pending
++        // compare's state. 16 bytes keeps sp 16-byte aligned and leaves the
++        // slot emitters' imm12 range reachable.
++        self.state.emit("    addi sp, sp, -16");
++        self.state.emit("    sd t0, 0(sp)");
++        16
++    }
++
++    fn emit_acc_restore(&mut self) {
++        self.state.emit("    ld t0, 0(sp)");
++        self.state.emit("    addi sp, sp, 16");
++    }
++
+     fn state(&mut self) -> &mut CodegenState {
+         &mut self.state
+     }
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index 814b5267..02e1ee2d 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -1238,6 +1238,33 @@ pub trait ArchCodegen {
+     fn emit_tls_global_addr(&mut self, dest: &Value, name: &str);
+ 
+     /// Emit a get-element-pointer (base + offset).
++    /// Emit the target's accumulator **save** sequence and return the stack
++    /// pointer delta it applied.
++    ///
++    /// Codegen occasionally has to emit an instruction in the middle of a
++    /// pending operation whose value lives *only* in the accumulator — no
++    /// register assignment, no stack slot (the skip-slot optimisation). The
++    /// emission clobbers the accumulator, so the value must be preserved
++    /// across it. See `rematerialize_skipped_indexed` in `generation.rs`.
++    ///
++    /// This is deliberately a per-target hook and NOT a string constant in the
++    /// shared driver: `pushq %rax` is x86-only text, and hard-coding it emitted
++    /// x86 mnemonics into AArch64 and RISC-V assembly, where the assembler
++    /// rejected them (`unsupported instruction: pushq %rax`, BUG-2026-09-09).
++    ///
++    /// The returned delta is added to `state.out.rsp_frame_size` by the caller
++    /// so every sp-relative slot reference emitted while the accumulator is
++    /// spilled stays correct; targets whose slot emitters use a frame pointer
++    /// ignore the field, exactly as the x86 RBP-frame path does.
++    ///
++    /// The sequence must be flags-neutral so a pending fused-Cmp handshake
++    /// cannot be disturbed.
++    fn emit_acc_save(&mut self) -> i64;
++
++    /// Emit the target's accumulator **restore** sequence, undoing
++    /// `emit_acc_save`. The caller reverses the `rsp_frame_size` delta.
++    fn emit_acc_restore(&mut self);
++
+     fn emit_gep(&mut self, dest: &Value, base: &Value, offset: &Operand) {
+         // Optimized path for constant offsets: avoid loading offset into acc
+         // and adding via secondary register. Instead, directly compute
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 064f12c..e9a11fa 100644
+index 064f12c3..04a62deb 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
-@@ -3367,66 +3367,41 @@ impl X86Codegen {
-         }
+@@ -5401,6 +5401,17 @@ impl ArchCodegen for X86Codegen {
+         self.reg_assignments.contains_key(&vid)
      }
  
--    /// Emit a cmpxchg-based loop for atomic sub/and/or/xor/nand.
--    /// Expects: rax = operand val, rcx = ptr address.
--    /// After: rax = old value.
-+    /// Emit a CMPXCHG loop for atomic AND/OR/XOR/NAND.
-+    /// Expects RAX = operand and RCX = address; returns the old value in RAX.
-     pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str) {
--        // Save val to rdi (using rdi instead of r8 to free r8 for register allocation)
--        self.state.emit("    movq %rax, %rdi"); // rdi = val
--        // Load old value
--        let load_instr = Self::mov_load_for_type(ty);
-+        self.state.emit("    movq %rax, %rdi");
++    fn emit_acc_save(&mut self) -> i64 {
++        // push/pop are the cheapest flags-neutral accumulator save on x86 and
++        // are a single instruction each way. 8 bytes in 64-bit mode.
++        self.state.emit("    pushq %rax");
++        8
++    }
 +
-+        let load = Self::mov_load_for_type(ty);
-         let load_dest = Self::load_dest_reg(ty);
-         self.state
--            .emit_fmt(format_args!("    {} (%rcx), {}", load_instr, load_dest));
--        // Loop: rax = old, compute new = op(old, val), try cmpxchg
--        let label_id = self.state.next_label_id();
--        let loop_label = format!(".Latomic_loop_{}", label_id);
-+            .emit_fmt(format_args!("    {} (%rcx), {}", load, load_dest));
++    fn emit_acc_restore(&mut self) {
++        self.state.emit("    popq %rax");
++    }
 +
-+        let loop_label = format!(".Latomic_loop_{}", self.state.next_label_id());
-         self.state.out.emit_named_label(&loop_label);
--        // rdx = rax (old)
-         self.state.emit("    movq %rax, %rdx");
--        // Apply operation: rdx = op(rdx, rdi)
--        let size_suffix = Self::type_suffix(ty);
--        let rdx_reg = Self::reg_for_type("rdx", ty);
--        let r8_reg = match ty {
--            IrType::I8 | IrType::U8 => "dil",
--            IrType::I16 | IrType::U16 => "di",
--            IrType::I32 | IrType::U32 => "edi",
--            _ => "rdi",
--        };
-+
-+        // Truncation commutes with these bitwise operations. Compute in full
-+        // registers to avoid partial-register writes and operand-size prefixes;
-+        // only CMPXCHG accesses the user's object at its declared width.
-         match op {
--            "sub" => self.state.emit_fmt(format_args!(
--                "    sub{} %{}, %{}",
--                size_suffix, r8_reg, rdx_reg
--            )),
--            "and" => self.state.emit_fmt(format_args!(
--                "    and{} %{}, %{}",
--                size_suffix, r8_reg, rdx_reg
--            )),
--            "or" => self.state.emit_fmt(format_args!(
--                "    or{} %{}, %{}",
--                size_suffix, r8_reg, rdx_reg
--            )),
--            "xor" => self.state.emit_fmt(format_args!(
--                "    xor{} %{}, %{}",
--                size_suffix, r8_reg, rdx_reg
--            )),
-+            "and" => self.state.emit("    andq %rdi, %rdx"),
-+            "or" => self.state.emit("    orq %rdi, %rdx"),
-+            "xor" => self.state.emit("    xorq %rdi, %rdx"),
-             "nand" => {
--                self.state.emit_fmt(format_args!(
--                    "    and{} %{}, %{}",
--                    size_suffix, r8_reg, rdx_reg
--                ));
--                self.state
--                    .emit_fmt(format_args!("    not{} %{}", size_suffix, rdx_reg));
-+                self.state.emit("    andq %rdi, %rdx");
-+                self.state.emit("    notq %rdx");
-             }
--            _ => {}
-+            _ => unreachable!("unsupported x86 atomic loop operation: {op}"),
-         }
--        // Try cmpxchg: if [rcx] == rax (old), set [rcx] = rdx (new), else rax = [rcx]
-+
-+        let suffix = Self::type_suffix(ty);
-+        let candidate = Self::reg_for_type("rdx", ty);
-         self.state.emit_fmt(format_args!(
-             "    lock cmpxchg{} %{}, (%rcx)",
--            size_suffix, rdx_reg
-+            suffix, candidate
-         ));
-         self.state.out.emit_jcc_label("    jne", &loop_label);
--        // rax = old value on success
-     }
+     /// x86 override: stage `dest`/`src` into `%rdi`/`%rsi` as a parallel
+     /// copy (the generic default routes both through `%rcx` sequentially and
+     /// swaps them when the homes cross — regression `memcpy_param_home_swap`).
+diff --git a/tests/benchmark/programs/bitops.c b/tests/benchmark/programs/bitops.c
+index a1ce365c..5b1b95e6 100644
+--- a/tests/benchmark/programs/bitops.c
++++ b/tests/benchmark/programs/bitops.c
+@@ -1,7 +1,9 @@
+ // Bit manipulation benchmark (popcount, clz, bit twiddling)
+ #include <stdio.h>
  
-     /// Load i128 operands for binary ops: lhs → rax:rdx, rhs → rcx:rsi.
-diff --git a/tests/regression/check_atomic_backends.sh b/tests/regression/check_atomic_backends.sh
-new file mode 100755
-index 0000000..a7a2067
---- /dev/null
-+++ b/tests/regression/check_atomic_backends.sh
-@@ -0,0 +1,107 @@
-+#!/usr/bin/env bash
-+# Cross-backend atomic correctness/code-quality contract.
-+set -euo pipefail
-+cd "$(dirname "$0")/../.."
-+bindir=$(dirname "${LCCC_BIN:-target/fastbuild/lccc}")
-+x86=${LCCC_BIN:-$bindir/lccc}
-+arm=$bindir/lccc-arm
-+riscv=$bindir/lccc-riscv
-+td=$(mktemp -d)
-+trap 'rm -rf "$td"' EXIT
-+
-+cat >"$td/probe.c" <<'EOF'
-+typedef signed char i8;
-+typedef unsigned char u8;
-+typedef unsigned u32;
-+typedef unsigned long long u64;
-+__attribute__((noinline)) u64 add_one(u64 *p) {
-+    return __atomic_fetch_add(p, 1, __ATOMIC_SEQ_CST);
-+}
-+__attribute__((noinline)) i8 sub8(i8 *p, i8 v) {
-+    return __atomic_fetch_sub(p, v, __ATOMIC_SEQ_CST);
-+}
-+__attribute__((noinline)) i8 and8(i8 *p, i8 v) {
-+    return __atomic_fetch_and(p, v, __ATOMIC_RELAXED);
-+}
-+__attribute__((noinline)) i8 cas8(i8 *p, i8 e, i8 d) {
-+    return __sync_val_compare_and_swap(p, e, d);
-+}
-+__attribute__((noinline)) u32 casu32(u32 *p, u32 e, u32 d) {
-+    return __sync_val_compare_and_swap(p, e, d);
-+}
-+__attribute__((noinline)) u32 loadu32(u32 *p) {
-+    return __atomic_load_n(p, __ATOMIC_SEQ_CST);
-+}
-+__attribute__((noinline)) void storeu32(u32 *p, u32 v) {
-+    __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
-+}
-+__attribute__((noinline)) void fence_release(void) {
-+    __atomic_thread_fence(__ATOMIC_RELEASE);
-+}
-+__attribute__((noinline)) void fence_sc(void) {
-+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-+}
-+EOF
-+
-+body() {
-+    local file=$1 name=$2
-+    sed -n "/^${name}:/,/^\\.size[[:space:]]\+${name},/p" "$file"
-+}
-+
-+"$x86" -O2 -fno-pic -S "$td/probe.c" -o "$td/x86.s"
-+gcc -c "$td/x86.s" -o "$td/x86.o"
-+add=$(body "$td/x86.s" add_one)
-+sub=$(body "$td/x86.s" sub8)
-+and=$(body "$td/x86.s" and8)
-+cas=$(body "$td/x86.s" cas8)
-+store=$(body "$td/x86.s" storeu32)
-+fence=$(body "$td/x86.s" fence_sc)
-+grep -q 'lock xaddq' <<<"$add"
-+! grep -q 'lock inc' <<<"$add"
-+grep -q 'negq %rax' <<<"$sub"
-+grep -q 'lock xaddb %al' <<<"$sub"
-+grep -q 'movsbq %al, %rax' <<<"$sub"
-+! grep -q 'cmpxchg' <<<"$sub"
-+grep -q 'andq %rdi, %rdx' <<<"$and"
-+grep -q 'lock cmpxchgb %dl' <<<"$and"
-+grep -q 'movsbq %al, %rax' <<<"$and"
-+grep -q 'movsbq %al, %rax' <<<"$cas"
-+grep -q 'xchgl %edx' <<<"$store"
-+! grep -q 'mfence' <<<"$store"
-+grep -q 'lock orq \$0, (%rsp)' <<<"$fence"
-+! grep -q 'mfence' <<<"$fence"
-+
-+if [ -x "$arm" ]; then
-+    "$arm" -O2 -S "$td/probe.c" -o "$td/arm.s"
-+    sub=$(body "$td/arm.s" sub8)
-+    cas=$(body "$td/arm.s" cas8)
-+    release=$(body "$td/arm.s" fence_release)
-+    grep -q 'sxtb x0, w0' <<<"$sub"
-+    grep -q 'and w2, w2, #0xff' <<<"$cas"
-+    grep -q 'sxtb x0, w0' <<<"$cas"
-+    grep -q 'dmb ish' <<<"$release"
-+    ! grep -q 'dmb ishst' <<<"$release"
-+    if command -v aarch64-linux-gnu-gcc >/dev/null; then
-+        aarch64-linux-gnu-gcc -c "$td/arm.s" -o "$td/arm.o"
-+    fi
-+fi
-+
-+if [ -x "$riscv" ]; then
-+    "$riscv" -O2 -S "$td/probe.c" -o "$td/riscv.s"
-+    casu=$(body "$td/riscv.s" casu32)
-+    load=$(body "$td/riscv.s" loadu32)
-+    store=$(body "$td/riscv.s" storeu32)
-+    grep -q 'sext.w t2' <<<"$casu"
-+    grep -q 'slli t0, t0, 32' <<<"$casu"
-+    grep -q 'srli t0, t0, 32' <<<"$casu"
-+    grep -q 'lwu t0, 0(t0)' <<<"$load"
-+    ! grep -q 'lr.w' <<<"$load"
-+    grep -q 'sw t1, 0(t0)' <<<"$store"
-+    ! grep -q 'amoswap' <<<"$store"
-+    [ "$(grep -c 'fence rw' <<<"$store")" -eq 2 ]
-+    if command -v riscv64-linux-gnu-gcc >/dev/null; then
-+        riscv64-linux-gnu-gcc -c "$td/riscv.s" -o "$td/riscv.o"
-+    fi
-+fi
-+
-+echo 'cross-backend atomic code-generation contract: PASS'
-diff --git a/tests/regression/x86_atomic_returns.c b/tests/regression/x86_atomic_returns.c
-new file mode 100644
-index 0000000..f675884
---- /dev/null
-+++ b/tests/regression/x86_atomic_returns.c
-@@ -0,0 +1,79 @@
-+/* x86-64 atomic return-value and narrow canonicalization regression. */
-+
-+typedef signed char i8;
-+typedef unsigned char u8;
-+typedef short i16;
-+typedef unsigned short u16;
-+typedef int i32;
-+typedef unsigned u32;
-+typedef long long i64;
-+typedef unsigned long long u64;
-+
-+__attribute__((noinline)) static i64 add_one(i64 *p) {
-+    return __atomic_fetch_add(p, 1, __ATOMIC_SEQ_CST);
-+}
-+
-+__attribute__((noinline)) static i8 add_i8(i8 *p, i8 v) {
-+    return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST);
-+}
-+
-+__attribute__((noinline)) static i16 sub_i16(i16 *p, i16 v) {
-+    return __atomic_fetch_sub(p, v, __ATOMIC_SEQ_CST);
-+}
-+
-+__attribute__((noinline)) static i8 nand_i8(i8 *p, i8 v) {
-+    return __atomic_fetch_nand(p, v, __ATOMIC_RELAXED);
-+}
-+
-+int main(void) {
-+    i64 q = 0x123456789abcdefLL;
-+    if (add_one(&q) != 0x123456789abcdefLL || q != 0x123456789abcdf0LL)
-+        return 1;
-+
-+    for (unsigned old = 0; old != 256; ++old) {
-+        for (unsigned val = 0; val != 256; ++val) {
-+            i8 x = (i8)old;
-+            if (add_i8(&x, (i8)val) != (i8)old ||
-+                (u8)x != (u8)(old + val))
-+                return 2;
-+            x = (i8)old;
-+            if (nand_i8(&x, (i8)val) != (i8)old ||
-+                (u8)x != (u8)~(old & val))
-+                return 3;
-+        }
-+    }
-+
-+    static const u32 cases[] = {
-+        0, 1, 0x7fff, 0x8000, 0xffff, 0x7fffffffU,
-+        0x80000000U, 0xffffffffU, 0x55aa55aaU,
-+    };
-+    for (unsigned i = 0; i != sizeof(cases) / sizeof(cases[0]); ++i) {
-+        for (unsigned j = 0; j != sizeof(cases) / sizeof(cases[0]); ++j) {
-+            i16 x = (i16)cases[i];
-+            if (sub_i16(&x, (i16)cases[j]) != (i16)cases[i] ||
-+                (u16)x != (u16)(cases[i] - cases[j]))
-+                return 4;
-+
-+            u32 ux = cases[i];
-+            u32 old = __atomic_fetch_xor(&ux, cases[j], __ATOMIC_ACQ_REL);
-+            if (old != cases[i] || ux != (cases[i] ^ cases[j]))
-+                return 5;
-+        }
-+    }
-+
-+    i8 c = (i8)0x80;
-+    if (__sync_val_compare_and_swap(&c, (i8)0x7f, 1) != (i8)0x80 ||
-+        (u8)c != 0x80)
-+        return 6;
-+    if (__sync_val_compare_and_swap(&c, (i8)0x80, (i8)0xff) != (i8)0x80 ||
-+        (u8)c != 0xff)
-+        return 7;
-+
-+    u32 u = 0x80000000U;
-+    if (__sync_val_compare_and_swap(&u, 0x80000000U, 0xffffffffU) !=
-+            0x80000000U ||
-+        u != 0xffffffffU)
-+        return 8;
-+
-+    return 0;
-+}
++#ifndef N
+ #define N 50000000
++#endif
+ 
+ static int popcount32(unsigned int x) {
+     x = x - ((x >> 1) & 0x55555555);
+diff --git a/tests/benchmark/programs/chacha20_block.c b/tests/benchmark/programs/chacha20_block.c
+index 99151255..f8b472b4 100644
+--- a/tests/benchmark/programs/chacha20_block.c
++++ b/tests/benchmark/programs/chacha20_block.c
+@@ -10,8 +10,12 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef BLOCK_COUNT
+ #define BLOCK_COUNT (1U << 17)
++#endif
++#ifndef PASSES
+ #define PASSES 16U
++#endif
+ 
+ typedef unsigned int u32;
+ typedef unsigned long long u64;
+diff --git a/tests/benchmark/programs/expat_xml_scan.c b/tests/benchmark/programs/expat_xml_scan.c
+index 269ab54a..e7388cdd 100644
+--- a/tests/benchmark/programs/expat_xml_scan.c
++++ b/tests/benchmark/programs/expat_xml_scan.c
+@@ -17,8 +17,12 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef XML_SIZE
+ #define XML_SIZE (1UL << 20)
++#endif
++#ifndef PASSES
+ #define PASSES 64U
++#endif
+ 
+ static unsigned char expat_xml_data[XML_SIZE];
+ 
+diff --git a/tests/benchmark/programs/fp_memfold_stencil5.c b/tests/benchmark/programs/fp_memfold_stencil5.c
+index c76d9ea0..1c40ff51 100644
+--- a/tests/benchmark/programs/fp_memfold_stencil5.c
++++ b/tests/benchmark/programs/fp_memfold_stencil5.c
+@@ -5,7 +5,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++#ifndef N
+ #define N 65536
++#endif
+ 
+ static float input[N];
+ static float output[N];
+diff --git a/tests/benchmark/programs/glibc_memcmp.c b/tests/benchmark/programs/glibc_memcmp.c
+index aff19fc6..04a20e22 100644
+--- a/tests/benchmark/programs/glibc_memcmp.c
++++ b/tests/benchmark/programs/glibc_memcmp.c
+@@ -18,8 +18,12 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef WORD_COUNT
+ #define WORD_COUNT (1UL << 13)
++#endif
++#ifndef PASSES
+ #define PASSES 4096U
++#endif
+ 
+ static unsigned long glibc_left[WORD_COUNT];
+ static unsigned long glibc_right[WORD_COUNT];
+diff --git a/tests/benchmark/programs/glibc_strstr.c b/tests/benchmark/programs/glibc_strstr.c
+index ac4fb475..71efe5f2 100644
+--- a/tests/benchmark/programs/glibc_strstr.c
++++ b/tests/benchmark/programs/glibc_strstr.c
+@@ -19,9 +19,15 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef HAYSTACK_LEN
+ #define HAYSTACK_LEN (1UL << 19)
++#endif
++#ifndef QUERY_COUNT
+ #define QUERY_COUNT 2048U
++#endif
++#ifndef PASSES
+ #define PASSES 8U
++#endif
+ 
+ typedef unsigned char u8;
+ typedef unsigned long long u64;
+diff --git a/tests/benchmark/programs/gzip_crc32.c b/tests/benchmark/programs/gzip_crc32.c
+index d9886642..8aec840a 100644
+--- a/tests/benchmark/programs/gzip_crc32.c
++++ b/tests/benchmark/programs/gzip_crc32.c
+@@ -12,8 +12,12 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef DATA_SIZE
+ #define DATA_SIZE (1UL << 20)
++#endif
++#ifndef PASSES
+ #define PASSES 64U
++#endif
+ 
+ static unsigned char gzip_crc_data[DATA_SIZE];
+ 
+diff --git a/tests/benchmark/programs/hash_table.c b/tests/benchmark/programs/hash_table.c
+index 656a4e5f..f22dcb47 100644
+--- a/tests/benchmark/programs/hash_table.c
++++ b/tests/benchmark/programs/hash_table.c
+@@ -3,8 +3,12 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#ifndef TABLE_SIZE
+ #define TABLE_SIZE 65536
++#endif
++#ifndef NUM_OPS
+ #define NUM_OPS 2000000
++#endif
+ 
+ typedef struct Entry { unsigned int key; int value; struct Entry *next; } Entry;
+ 
+diff --git a/tests/benchmark/programs/libm_round_family.c b/tests/benchmark/programs/libm_round_family.c
+index c513b00b..98ce2b6a 100644
+--- a/tests/benchmark/programs/libm_round_family.c
++++ b/tests/benchmark/programs/libm_round_family.c
+@@ -49,8 +49,12 @@ double copysign (double x, double y)
+  * fused result bit-for-bit. */
+ double fma (double x, double y, double z) { return x * y + z; }
+ 
++#ifndef N
+ #define N 4096
++#endif
++#ifndef PASSES
+ #define PASSES 20000U
++#endif
+ 
+ static double buf[N];
+ static double out[N];
+diff --git a/tests/benchmark/programs/linux_find_bit.c b/tests/benchmark/programs/linux_find_bit.c
+index 02aaa87b..20333182 100644
+--- a/tests/benchmark/programs/linux_find_bit.c
++++ b/tests/benchmark/programs/linux_find_bit.c
+@@ -18,9 +18,13 @@
+ #include <stdio.h>
+ 
+ #define BITS_PER_LONG (sizeof(unsigned long) * 8UL)
++#ifndef WORD_COUNT
+ #define WORD_COUNT (1UL << 14)
++#endif
+ #define BIT_COUNT (WORD_COUNT * BITS_PER_LONG)
++#ifndef PASSES
+ #define PASSES 1024U
++#endif
+ 
+ static unsigned long linux_bitmap_a[WORD_COUNT];
+ static unsigned long linux_bitmap_b[WORD_COUNT];
+diff --git a/tests/benchmark/programs/linux_rbtree.c b/tests/benchmark/programs/linux_rbtree.c
+index ea9c71b4..1b8a6d75 100644
+--- a/tests/benchmark/programs/linux_rbtree.c
++++ b/tests/benchmark/programs/linux_rbtree.c
+@@ -10,8 +10,12 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef NODE_COUNT
+ #define NODE_COUNT 16384U
++#endif
++#ifndef LOOKUP_ROUNDS
+ #define LOOKUP_ROUNDS 8U
++#endif
+ 
+ typedef unsigned long uintptr;
+ typedef unsigned long long u64;
+diff --git a/tests/benchmark/programs/loop_patterns.c b/tests/benchmark/programs/loop_patterns.c
+index 51486e31..c2896a85 100644
+--- a/tests/benchmark/programs/loop_patterns.c
++++ b/tests/benchmark/programs/loop_patterns.c
+@@ -1,7 +1,9 @@
+ // Loop optimization patterns (unrolling, strength reduction, LICM targets)
+ #include <stdio.h>
+ 
++#ifndef SIZE
+ #define SIZE 10000000
++#endif
+ 
+ static int array[SIZE];
+ 
+diff --git a/tests/benchmark/programs/lz4_compress.c b/tests/benchmark/programs/lz4_compress.c
+index ccec2888..d4cc63d5 100644
+--- a/tests/benchmark/programs/lz4_compress.c
++++ b/tests/benchmark/programs/lz4_compress.c
+@@ -11,10 +11,14 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef SRC_SIZE
+ #define SRC_SIZE (1UL << 19)
++#endif
+ #define HASH_LOG 14
+ #define HASH_SIZE (1U << HASH_LOG)
++#ifndef PASSES
+ #define PASSES 24U
++#endif
+ 
+ typedef unsigned char u8;
+ typedef unsigned short u16;
+diff --git a/tests/benchmark/programs/mandelbrot.c b/tests/benchmark/programs/mandelbrot.c
+index ca7a147c..9cf54b02 100644
+--- a/tests/benchmark/programs/mandelbrot.c
++++ b/tests/benchmark/programs/mandelbrot.c
+@@ -1,8 +1,12 @@
+ // Mandelbrot set computation (FP-heavy inner loop, branching)
+ #include <stdio.h>
+ 
++#ifndef WIDTH
+ #define WIDTH 4000
++#endif
++#ifndef HEIGHT
+ #define HEIGHT 4000
++#endif
+ #define MAX_ITER 50
+ 
+ int main(void) {
+diff --git a/tests/benchmark/programs/matmul.c b/tests/benchmark/programs/matmul.c
+index 1ab79c28..c586f560 100644
+--- a/tests/benchmark/programs/matmul.c
++++ b/tests/benchmark/programs/matmul.c
+@@ -1,7 +1,9 @@
+ // Benchmark 3: Matrix multiplication (memory/cache + arithmetic)
+ #include <stdio.h>
+ 
++#ifndef N
+ #define N 256
++#endif
+ 
+ static double A[N][N], B[N][N], C[N][N];
+ 
+diff --git a/tests/benchmark/programs/nbody.c b/tests/benchmark/programs/nbody.c
+index f7f26941..8b8aebb6 100644
+--- a/tests/benchmark/programs/nbody.c
++++ b/tests/benchmark/programs/nbody.c
+@@ -2,7 +2,15 @@
+ #include <stdio.h>
+ #include <math.h>
+ 
++#ifndef NBODIES
+ #define NBODIES 5
++#endif
++// Step count, overridable so the cross-backend execution oracle can run this
++// under qemu-user (5,000,000 steps is 12 s native and 300 s+ under TCG).
++// The default is unchanged, so benchmark timings and baselines are unaffected.
++#ifndef STEPS
++#define STEPS 5000000
++#endif
+ #define PI 3.141592653589793
+ #define SOLAR_MASS (4 * PI * PI)
+ #define DAYS_PER_YEAR 365.24
+@@ -78,7 +86,7 @@ int main(void) {
+     bodies[0].vz = -pz / SOLAR_MASS;
+ 
+     printf("%.9f\n", energy());
+-    advance(0.01, 5000000);
++    advance(0.01, STEPS);
+     printf("%.9f\n", energy());
+     return 0;
+ }
+diff --git a/tests/benchmark/programs/qsort.c b/tests/benchmark/programs/qsort.c
+index dae78632..708c1986 100644
+--- a/tests/benchmark/programs/qsort.c
++++ b/tests/benchmark/programs/qsort.c
+@@ -2,7 +2,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++#ifndef N
+ #define N 1000000
++#endif
+ 
+ static int arr[N];
+ 
+diff --git a/tests/benchmark/programs/reduction_vecreg.c b/tests/benchmark/programs/reduction_vecreg.c
+index c429fd39..19a5a3f2 100644
+--- a/tests/benchmark/programs/reduction_vecreg.c
++++ b/tests/benchmark/programs/reduction_vecreg.c
+@@ -6,7 +6,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++#ifndef N
+ #define N 65536
++#endif
+ 
+ static float input_a[N];
+ static float input_b[N];
+diff --git a/tests/benchmark/programs/sha256_transform.c b/tests/benchmark/programs/sha256_transform.c
+index 9c0dfe95..ac33f57b 100644
+--- a/tests/benchmark/programs/sha256_transform.c
++++ b/tests/benchmark/programs/sha256_transform.c
+@@ -10,8 +10,12 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef BLOCK_COUNT
+ #define BLOCK_COUNT (1U << 17)
++#endif
++#ifndef PASSES
+ #define PASSES 8U
++#endif
+ 
+ typedef unsigned int u32;
+ typedef unsigned long long u64;
+diff --git a/tests/benchmark/programs/sieve.c b/tests/benchmark/programs/sieve.c
+index d00bd212..38d1b102 100644
+--- a/tests/benchmark/programs/sieve.c
++++ b/tests/benchmark/programs/sieve.c
+@@ -2,7 +2,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#ifndef N
+ #define N 10000000
++#endif
+ 
+ static char sieve[N+1];
+ 
+diff --git a/tests/benchmark/programs/spectral_norm.c b/tests/benchmark/programs/spectral_norm.c
+index 1b8aa6f1..c64d2c5e 100644
+--- a/tests/benchmark/programs/spectral_norm.c
++++ b/tests/benchmark/programs/spectral_norm.c
+@@ -2,7 +2,9 @@
+ #include <stdio.h>
+ #include <math.h>
+ 
++#ifndef N
+ #define N 2000
++#endif
+ 
+ static double A(int i, int j) {
+     return 1.0 / ((i + j) * (i + j + 1) / 2 + i + 1);
+diff --git a/tests/benchmark/programs/sqlite_varint.c b/tests/benchmark/programs/sqlite_varint.c
+index 25476531..901341b0 100644
+--- a/tests/benchmark/programs/sqlite_varint.c
++++ b/tests/benchmark/programs/sqlite_varint.c
+@@ -14,8 +14,12 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef VALUE_COUNT
+ #define VALUE_COUNT (1U << 18)
++#endif
++#ifndef PASSES
+ #define PASSES 24U
++#endif
+ #define SLOT_2_0 0x001fc07fU
+ #define SLOT_4_2_0 0xf01fc07fU
+ 
+diff --git a/tests/benchmark/programs/strlen_bench.c b/tests/benchmark/programs/strlen_bench.c
+index 817cfa71..f123584d 100644
+--- a/tests/benchmark/programs/strlen_bench.c
++++ b/tests/benchmark/programs/strlen_bench.c
+@@ -3,8 +3,12 @@
+ #include <string.h>
+ #include <stdlib.h>
+ 
++#ifndef NSTRINGS
+ #define NSTRINGS 100000
++#endif
++#ifndef MAX_LEN
+ #define MAX_LEN 200
++#endif
+ 
+ static char strings[NSTRINGS][MAX_LEN];
+ 
+diff --git a/tests/benchmark/programs/struct_copy.c b/tests/benchmark/programs/struct_copy.c
+index 8da59bb2..2a2207b5 100644
+--- a/tests/benchmark/programs/struct_copy.c
++++ b/tests/benchmark/programs/struct_copy.c
+@@ -2,7 +2,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#ifndef N
+ #define N 2000000
++#endif
+ 
+ typedef struct {
+     double x, y, z;
+diff --git a/tests/benchmark/programs/switch_dispatch.c b/tests/benchmark/programs/switch_dispatch.c
+index 474d7cc8..2ca69385 100644
+--- a/tests/benchmark/programs/switch_dispatch.c
++++ b/tests/benchmark/programs/switch_dispatch.c
+@@ -1,7 +1,9 @@
+ // Switch/dispatch benchmark (branch prediction, jump tables)
+ #include <stdio.h>
+ 
++#ifndef N
+ #define N 50000000
++#endif
+ 
+ static int dispatch(int op, int a, int b) {
+     switch (op) {
+diff --git a/tests/benchmark/programs/tls_seg_access.c b/tests/benchmark/programs/tls_seg_access.c
+index 8655726d..461d3d29 100644
+--- a/tests/benchmark/programs/tls_seg_access.c
++++ b/tests/benchmark/programs/tls_seg_access.c
+@@ -19,8 +19,12 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef PASSES
+ #define PASSES 200000U
++#endif
++#ifndef LANES
+ #define LANES 64
++#endif
+ 
+ static __thread unsigned long tls_slots[LANES + 2];
+ 
+diff --git a/tests/benchmark/programs/zlib_ng_adler32.c b/tests/benchmark/programs/zlib_ng_adler32.c
+index 42f6bb32..0d691100 100644
+--- a/tests/benchmark/programs/zlib_ng_adler32.c
++++ b/tests/benchmark/programs/zlib_ng_adler32.c
+@@ -17,8 +17,12 @@
+ 
+ #define BASE 65521U
+ #define NMAX 5552U
++#ifndef DATA_SIZE
+ #define DATA_SIZE (2UL << 20)
++#endif
++#ifndef PASSES
+ #define PASSES 48U
++#endif
+ 
+ #define ADLER_DO1(sum1, sum2, buf, i) \
+   { (sum1) += (buf)[(i)]; (sum2) += (sum1); }
+diff --git a/tests/benchmark/programs/zstd_count.c b/tests/benchmark/programs/zstd_count.c
+index 884f30dd..dead978c 100644
+--- a/tests/benchmark/programs/zstd_count.c
++++ b/tests/benchmark/programs/zstd_count.c
+@@ -12,9 +12,15 @@
+  */
+ #include <stdio.h>
+ 
++#ifndef BUFFER_SIZE
+ #define BUFFER_SIZE (1UL << 20)
++#endif
++#ifndef QUERY_COUNT
+ #define QUERY_COUNT (1U << 17)
++#endif
++#ifndef PASSES
+ #define PASSES 16U
++#endif
+ 
+ typedef unsigned char u8;
+ typedef unsigned int u32;
