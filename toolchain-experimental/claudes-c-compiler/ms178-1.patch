@@ -1,9 +1,9 @@
 diff --git a/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md b/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md
 new file mode 100644
-index 00000000..2a0acef0
+index 00000000..a62cec52
 --- /dev/null
 +++ b/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,518 @@
 +# FOLLOWUP — Session 33 (2026-09-09): cross-backend execution oracle + the defects it found
 +
 +**Branch state**: `ms178-1.patch` rebased on `ms178/lccc` main (`91ecc083`).
@@ -433,6 +433,95 @@ index 00000000..2a0acef0
 +reads `dst` (a `str xD, [sp,#k]` spill reads it) as a pure overwrite.  Audit
 +`written_gp_register` for store forms before retrying; that is a real further
 +win, not a speculation.
++
++### 9.7 Root cause of the "65-instruction win" breakage — and the real bug
++Superseding the speculation at the end of §9.6.  The deletions that broke
++`sieve` and `glibc_memcmp` were **return-value staging copies**:
++
++```
++    mov x5, x0      ; save
++    ...             ; later
++    mov x0, x5      ; restore / return staging
++```
++
++`propagate_address_aliases` treated `LineKind::Ret` as having "no runtime
++effect" and kept scanning past it, so a redefinition of `x0` in a *later block*
++was accepted as proof that the copy was dead.  It is not: the path through that
++`ret` handed the mov's value to the **caller** — x0-x7 are return-value
++registers.  `glibc_memcmp` returned garbage and exited 2.
++
++**This is the true root cause of the original glibc_memcmp -Os SIGSEGV.** The
++earlier "never cross a label" rule fixed it only by accident: it refused the
++fold in that particular layout while leaving the live-out hole wide open.
++
++Fix: `LineKind::Ret` now invalidates the fold when `dst < 8`.  x8-x17 are
++caller-saved and x19-x28 are restored by the epilogue before the `ret` (which is
++itself a redefinition), so only x0-x7 can be live-out at a return — the barrier
++is precise, not another guess.
++
++With that barrier the dead-copy deletion (removing `!uses.is_empty()`, the win
++§9.6 deferred) is sound, and lccc-arm now beats the *buggy* baseline:
++
++| build | -Os | -O2 |
++|---|---|---|
++| buggy baseline (SIGSEGV on glibc_memcmp) | 10677 | 11248 |
++| conservative label bail (NAK'd) | 10703 | 11279 |
++| exact CFG rule, no dead-copy deletion | 10701 | 11281 |
++| **exact CFG rule + dead-copy deletion + ret barrier** | **10648** | **11230** |
++
++glibc_memcmp -Os/-O2/-O3 all print `2158787064` (gcc: identical); sieve -O1..-O3
++print `primes up to 10000000: 664579` (gcc: identical).
++
++### 9.8 The 65-instruction win, investigated properly (final)
++Deleting a provably-dead copy with no rewritable address uses is worth ~53 (-Os)
++/ ~51 (-O2) instructions — and it was unsound three times over.  Each failure
++was a distinct hole in the "is this copy dead" proof, found by diffing the asm
++produced with and without the deletion (`CCC_NO_DEADCOPY=1`) and reading the
++deleted instruction:
++
++1. **Live-out at a `ret`** (`glibc_memcmp`, `sieve`): the scan treated `ret` as
++   having no runtime effect and accepted a redefinition in a later block as
++   proof of death, but x0-x7 are return-value registers — the path through that
++   `ret` had already handed the value to the caller.  Fixed by invalidating the
++   fold at a `ret` when `dst < 8` (precise: x8-x17 are caller-saved and x19-x28
++   are restored by the epilogue, which is itself a redefinition).
++   **This is also the true root cause of the original glibc_memcmp SIGSEGV.**
++2. **Mid-block control transfer** (`fannkuch`, `zstd_count`): the CFG treated
++   only the last line of a label-delimited run as the terminator, so a branch
++   left by an earlier peephole pass contributed no edge and the query answered
++   "no read" for blocks that were reachable.  Fixed by also splitting blocks
++   after every `b`/`b.cond`/`cbz`/`tbz`/`ret`.
++3. **Entering the redefinition's block from the top** (`zlib_ng_adler32`): the
++   traversal skipped the def block entirely, but execution can run the lines
++   *before* the redefinition — `mov x19, x20` before a loop whose body ends in
++   `mov x19, x5` feeds the first iteration.  Fixed by walking the def block
++   (checking its pre-redefinition lines) while not propagating out of it.
++4. **Loop re-entry above the mov** (`zlib_ng_adler32`, the `mov x19, x5` loop
++   increment itself): when the mov's block is part of a cycle, the back edge
++   re-enters at the block's TOP, so lines *before* the mov are fed by it.  The
++   linear scan never sees the back edge.  Fixed by checking the whole block when
++   the block is reachable from itself.
++
++With all four fixed the deletion is sound, and lccc-arm is smaller than the
++conservative build it replaces:
++
++| build | -Os | -O2 | glibc_memcmp | fannkuch | zlib_ng_adler32 | zstd_count |
++|---|---|---|---|---|---|---|
++| buggy baseline | 10677 | 11248 | **SIGSEGV** | ok | ok | ok |
++| conservative label bail (NAK'd) | 10703 | 11279 | ok | ok | ok | ok |
++| exact CFG rule, no deletion | 10701 | 11281 | ok | ok | ok | ok |
++| **exact CFG + deletion + holes 1-4 fixed** | **10690** | **11265** | ok | ok | ok | ok |
++
++The deletion is worth 11 (-Os) / 16 (-O2) instructions *once it is correct* —
++the other ~40 of the raw 53/51 were illegal deletions of live copies, i.e. latent
++miscompiles of exactly the glibc_memcmp kind.  lccc-arm is now **27 instructions
++smaller than the NAK'd conservative build** and, unlike the 10677/11248
++baseline, does not miscompile.  `nbody` -O2 (the open AArch64 SIGSEGV from §9.4)
++now matches gcc as well.
++
++`struct_copy` -O1/-Os mismatches the reference but also fails with
++`LCCC_NO_PEEPHOLE=1`, so it is a pre-existing codegen defect outside the
++peephole — not a regression from this work, and still open.
 diff --git a/scripts/cross_backend_check.py b/scripts/cross_backend_check.py
 new file mode 100755
 index 00000000..f1786130
@@ -2062,10 +2151,10 @@ index 2638e1c1..a128a89d 100644
      }
  
 diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
-index d13aa3a1..8f52ae6a 100644
+index d13aa3a1..26677e87 100644
 --- a/src/backend/arm/codegen/peephole.rs
 +++ b/src/backend/arm/codegen/peephole.rs
-@@ -721,6 +721,273 @@ fn is_function_boundary(line: &str) -> bool {
+@@ -721,6 +721,326 @@ fn is_function_boundary(line: &str) -> bool {
      line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
  }
  
@@ -2102,7 +2191,17 @@ index d13aa3a1..8f52ae6a 100644
 +        let mut block_of = vec![0usize; n];
 +        let mut starts = vec![0usize];
 +        for i in 0..n {
-+            if kinds[i] == LineKind::Label && i != 0 {
++            // A block also ends after any control transfer, not just before a
++            // label: earlier peephole passes can leave a branch in the middle
++            // of a label-delimited run, and an edge that is not in `succs` is
++            // an edge the query cannot see — it would answer "no read" for
++            // blocks that are in fact reachable, and delete a live copy.
++            let after_transfer = i != 0
++                && matches!(
++                    kinds[i - 1],
++                    LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
++                );
++            if i != 0 && (kinds[i] == LineKind::Label || after_transfer) {
 +                starts.push(i);
 +            }
 +            block_of[i] = starts.len() - 1;
@@ -2269,12 +2368,51 @@ index d13aa3a1..8f52ae6a 100644
 +        seen[start_block] = true;
 +        let mut stack = vec![start_block];
 +        while let Some(b) = stack.pop() {
++            // The redefinition's own block IS entered by paths fed by the mov:
++            // execution can run the lines *before* the redefinition, which read
++            // the mov's value.  (`mov x19, x20` before a loop whose body ends
++            // in `mov x19, x5` — the first iteration reads x20 through x19.
++            // Skipping this block deleted that copy and broke
++            // zlib_ng_adler32.)  It is walked, but not propagated out of: every
++            // path leaving it has executed the redefinition.
++            if b == def_block {
++                continue;
++            }
 +            for &s in &self.succs[b] {
-+                if s == def_block || seen[s] {
++                if seen[s] {
 +                    continue;
 +                }
 +                seen[s] = true;
 +                stack.push(s);
++            }
++        }
++        // Is the mov's block part of a cycle?  Then it is re-entered at its
++        // top and its lines before the mov can be fed by it.
++        let mut in_loop = false;
++        {
++            let mut vis = vec![false; nb];
++            let mut work: Vec<usize> = Vec::new();
++            for &s in &self.succs[start_block] {
++                if s == start_block {
++                    in_loop = true;
++                }
++                if !vis[s] {
++                    vis[s] = true;
++                    work.push(s);
++                }
++            }
++            while !in_loop {
++                let Some(b) = work.pop() else { break };
++                for &s in &self.succs[b] {
++                    if s == start_block {
++                        in_loop = true;
++                        break;
++                    }
++                    if !vis[s] {
++                        vis[s] = true;
++                        work.push(s);
++                    }
++                }
 +            }
 +        }
 +        for k in 0..lines.len() {
@@ -2282,12 +2420,16 @@ index d13aa3a1..8f52ae6a 100644
 +                continue;
 +            }
 +            let b = self.block_of[k];
-+            let feeds_mov = if b == start_block && b == def_block {
-+                k > mov_idx && k < redef
++            // In a loop the back edge re-enters the block at its TOP, so the
++            // lines before the mov are fed by it on the next iteration —
++            // `mov x19, x5` inside a loop body reads as dead to a linear scan
++            // while the loop back edge feeds `add x5, x19, #1` at the top from
++            // it.  Without this, that copy was deleted and zlib_ng_adler32
++            // produced no output at all.
++            let feeds_mov = if b == def_block {
++                k < redef && (b != start_block || in_loop || k > mov_idx)
 +            } else if b == start_block {
-+                k > mov_idx
-+            } else if b == def_block {
-+                k < redef
++                in_loop || k > mov_idx
 +            } else {
 +                seen[b]
 +            };
@@ -2339,7 +2481,7 @@ index d13aa3a1..8f52ae6a 100644
  fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
      fn mentions(line: &str, reg: u8) -> bool {
          line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-@@ -731,6 +998,18 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+@@ -731,6 +1051,18 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
              .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
              .count()
      }
@@ -2358,9 +2500,11 @@ index d13aa3a1..8f52ae6a 100644
      let mut changed = false;
      for i in 0..n {
          let LineKind::Move {
-@@ -748,6 +1027,9 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+@@ -747,7 +1079,11 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+         let mut uses = Vec::new();
          let mut valid = true;
          let mut provably_dead = false;
++        let mut dead_by_redef = false;
          let mut src_alive = true;
 +        // Has the scan left the basic block that holds `mov dst, src`?  Only a
 +        // redefinition in that SAME block dominates every path leaving the mov,
@@ -2368,17 +2512,31 @@ index d13aa3a1..8f52ae6a 100644
          let mut j = i + 1;
          while j < n {
              if is_function_boundary(&lines[j]) {
-@@ -763,7 +1045,8 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+@@ -763,7 +1099,22 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                  // that return path, and textually later blocks (other paths)
                  // may still use it, so it falls through to the plain-mention
                  // handling and blocks the transform.
 -                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
-+                LineKind::Nop | LineKind::Directive | LineKind::Ret => {}
++                LineKind::Nop | LineKind::Directive => {}
++                // A `ret` ends this path, and dst can be LIVE-OUT there: x0-x7 carry
++                // the return value.  A redefinition found after a ret therefore does
++                // not prove the mov's value dead — the path that returned it handed
++                // the value to the caller.  `glibc_memcmp` died exactly this way:
++                // `mov x0, x5` (return staging) was deleted because a later block
++                // redefined x0, and the function returned garbage (exit 2).
++                // x8+ cannot be live-out: x8-x17 are caller-saved and x19-x28 are
++                // restored by the epilogue before the ret, which is a redefinition.
++                LineKind::Ret => {
++                    if dst < 8 {
++                        valid = false;
++                        break;
++                    }
++                }
 +                LineKind::Label => {}
                  // Calls clobber src (x0) and all caller-saved registers. Rather
                  // than reason about save/restore pairs, stop without committing.
                  LineKind::Call => {
-@@ -794,10 +1077,48 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+@@ -794,11 +1145,50 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                      }
                      if mentions(&lines[j], dst) {
                          if trusted && written == Some(dst) && mention_count(&lines[j], dst) == 1 {
@@ -2426,20 +2584,24 @@ index d13aa3a1..8f52ae6a 100644
 +                            // mov's own block, or the CFG proved it dominates
 +                            // every read of dst.
                              provably_dead = true;
++                            dead_by_redef = true;
                              break;
                          }
-@@ -832,6 +1153,11 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+                         // A pre/post-indexed writeback WRITES the base:
+@@ -832,7 +1222,12 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
          if j == n {
              provably_dead = true; // scanned to the end of the file
          }
+-        if valid && provably_dead && !uses.is_empty() {
 +        // A copy killed by a redefinition is deleted whether or not it had
 +        // address uses to rewrite: it feeds nothing.  Gating this on
 +        // `!uses.is_empty()` left every dead copy without rewritable uses in
 +        // the output.  Copies that merely survive to the end of the function
 +        // still need their uses rewritten, since dst may be live-out there.
-         if valid && provably_dead && !uses.is_empty() {
++        if valid && provably_dead && (!uses.is_empty() || dead_by_redef) {
              for use_idx in uses {
                  lines[use_idx] =
+                     replace_whole_word(&lines[use_idx], xreg_name(dst), xreg_name(src));
 diff --git a/src/backend/generation.rs b/src/backend/generation.rs
 index b5cc8e2b..8ddc10de 100644
 --- a/src/backend/generation.rs
