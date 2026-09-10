@@ -1,2105 +1,654 @@
-diff --git a/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md b/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md
-index 4f08c3078..ff89c7671 100644
---- a/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md
-+++ b/FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md
-@@ -1,562 +1,409 @@
--# FOLLOWUP — Session 33 (2026-09-09): cross-backend execution oracle + the defects it found
-+# Cross-backend oracle, miscompile fixes and cross-pollination
- 
--**Branch state**: `ms178-1.patch` rebased on `ms178/lccc` main (`91ecc083`).
--**Compiler**: `scripts/build_lccc_fast.sh` (fastbuild, -O1, -j2, 4 GiB swapfile).
--**Verified**: a new cross-backend execution oracle (§1) found **5 distinct
--defects** — 4 silent miscompiles plus one hard compile failure — plus a scaled
--variant of the last one. **All are fixed and verified** against GCC on all four
--backends at `-O0/-O1/-O2/-O3/-Os`.
--**CI**: `scripts/ci_local.sh` 16/16 green (see §10).
-+State of the work as of the ARM/RISC-V copy-coalescing ports. This document
-+describes **what is true now**; superseded analyses are not kept as history.
- 
- ---
- 
--## 1. The instrument this session built: `scripts/cross_backend_check.py`
-+## 0. Environment: the sandbox resets at every turn boundary
- 
--**WHY.** LCCC has four production backends (x86-64, i686, AArch64, RISC-V)
--sharing a front end, IR and optimiser but each with its own code generator.
--Every defect found this session was invisible to single-target testing and to
--assembly diffing.
--
--**The oracle.** A deterministic C program's observable behaviour (exit status +
--stdout) is a property of the *program plus its C data model*, not of the target.
--So the host GCC build is the reference and every backend must reproduce it.
--That removes the need for cross toolchains: references are native, and
--correctness is checked by *execution*, not by eyeballing assembly.
-+Everything outside the persisted `/home/user` workspace disappears between
-+turns, and `target/` is excluded from snapshots by design, so the compiled
-+compiler is gone too. Restore in this order (one command):
- 
- ```
--scripts/cross_backend_check.py                        # whole corpus, -O0..-Os
--scripts/cross_backend_check.py --programs sha256_transform --json /tmp/x.json
--scripts/cross_backend_check.py --gate --opts="-O0,-O2"  # CI-usable exit status
-+scripts/arena_session_restore.sh      # swap, toolchain, apt deps, exec bits
-+cargo build --profile fastbuild -j 2  # ~2m30s from clean
- ```
- 
--* Runs each binary natively (x86-64, i686) or under `qemu-user` (AArch64,
--  RISC-V); static linking, no runtime dependencies.
--* **Per-data-model reference**: `unsigned long` is 64-bit on LP64 targets and
--  32-bit on i686, so a `%lu` checksum legitimately differs. i686 is compared
--  against `gcc -m32`, the LP64 targets against plain `gcc`. Without this the
--  oracle reports false positives (it did, on `expat_xml_scan.c`).
--* Workload scaling: the corpus' `#ifndef` size macros are overridden with `-D`
--  so runs finish under TCG (`--no-scale` restores full size).
--* `--json` writes a full report; `--gate` exits non-zero on any mismatch or
--  compile failure. Exit 2 = usage/environment problem.
--* **Scale-macro fallback ladder**: the size macros are passed to every program
--  because unused `-D` defines are harmless, but a program that uses one of those
--  names as an identifier (an enum member `N`, a variable `SIZE`) is a *program*
--  compile error, not a compiler bug. The oracle retries the unscaled program and
--  then builds the backends the same way, so reference and target always see the
--  identical program (`binary_search.c`, `double_reduction.c`).
--
--**Corpus scaling guards** (session 32) are what make this possible: 28/45
--programs now accept `-DBLOCK_COUNT=`/`-DPASSES=`/`-DXML_SIZE=`-style overrides.
--
--**First-run findings** (23 min, 45 programs × 5 opt levels × 4 backends):
--`expat_xml_scan.c` i686 wrong at **every** level; `glibc_memcmp.c` AArch64
--`-Os` segfault; `fannkuch.c` AArch64 `-Os` internal error. §5 and §6 add two
--more found while narrowing those down. Everything else agreed with GCC.
-+`arena_session_restore.sh` is idempotent and covers everything: 8 GB swapfile
-+(`/sbin/swapon`, not on PATH), the rustup toolchain under `/home/user/.cargo`
-++ `/home/user/.rustup`, `gcc-multilib` + `gcc-aarch64-linux-gnu` +
-+`gcc-riscv64-linux-gnu` + `qemu-user`, the `origin` remote, and the `+x` bits
-+(86 scripts lose them on every restore).
-+
-+Two traps that cost real time:
-+
-+- **Without the cross toolchains, `lccc-arm`/`lccc-riscv` fail with
-+  `stddef.h: No such file or directory`** — they read GCC's builtin include
-+  directory for the target (`/usr/lib/gcc/<triplet>/14/include`). A one-line
-+  `hello.c` fails; it looks like a compiler bug and is not.
-+- **`git diff` shows ~86 spurious mode changes** after a restore. Run
-+  `git ls-tree -r HEAD --format='%(objectmode) %(path)' | awk '$1=="100755"{print $2}' | xargs chmod +x`
-+  and verify `git diff --summary | grep -c 'mode change'` is **0** before
-+  snapshotting, or the patch carries all of them.
- 
- ---
- 
--## 2. Fixed: AArch64 silent miscompile (`sha256_transform`) — **verified**
-+## 1. The instrument: `scripts/cross_backend_check.py`
- 
--Root cause: `emit_shifted_logical_impl` (and the madd/msub twins) staged the
--non-shifted operand *first*; `materialize` clobbered `x0`, destroying the
--shifted operand that lived only there. `operand_to_x0` then emitted
--`mov x0, #0` and the checksum silently lost its `state[3]` term — the kernel
--still passed its own known-answer self-check, so nothing but a cross-target
--comparison could see it.
-+Compiles each corpus program with `lccc`, `lccc-i686`, `lccc-arm`,
-+`lccc-riscv` and one or more reference compilers, runs every binary under
-+qemu, and diffs exit status + stdout.
- 
--Change: `stage_operands_acc_first()` in `src/backend/arm/codegen/alu.rs`; the
--`mov x0, #0` fallback in `operand_to_x0` is now a hard `panic!`.
-+```
-+python3 scripts/cross_backend_check.py [--programs a,b] [--opts=-O0,-O2,-Os]
-+        [--reference gcc [--reference clang]] [--repeat N] [--jobs N]
-+        [--json P --compare OLD] [--quick] [--gate] [--strict-timeout]
-+```
- 
--**Result**: `sha256_transform.c` matches GCC on **all four backends** at
--`-O0/-O1/-O2/-O3/-Os` (BLOCK_COUNT 3 and 64).
-+Design points that matter (each one was a false bug report before it was
-+fixed):
-+
-+- **All references must agree**, or the program is skipped as unusable.
-+- **`preflight()`** checks every compiler, qemu and the 32-bit libs *before*
-+  the run and exits 2 — never 45 minutes into it.
-+- **Per-cell verdicts** distinguish `ok` / `MISMATCH` / `COMPILEFAIL` /
-+  `TIMEOUT` / `EXECFAIL` / `NONDET`. A qemu timeout under `--jobs` load is a
-+  speed artefact, not a miscompile; `--repeat N` separates nondeterminism from
-+  a real mismatch.
-+- **A program's output is a function of its data model *and* its FP model.**
-+  The i686 reference must be `-m32 -msse2 -mfpmath=sse`: plain `-m32` uses x87
-+  excess precision and fakes a `libm_round_family` mismatch at every opt level.
-+- **`LINK_LIBS = ["-lm"]`** is appended to every link (nbody needs `sqrt`).
-+- **Never put a data-defining macro in `DEFAULT_SCALE`.** `-DNBODIES=32` on
-+  `nbody.c` zero-fills 27 of the 32 static bodies, so every backend prints NaN
-+  and "mismatches" identically. Only pure size/step macros belong there.
-+- Scratch is disk-backed (default `target/crossbe-scratch`): `/tmp` is a
-+  993 MB tmpfs and ~1350 static binaries exhaust it, which surfaces as
-+  `final link failed: No space left on device` reported as a reference failure.
-+
-+Run it with `PYTHONUNBUFFERED=1` under `tee`, and never rebuild lccc while a
-+run is in flight.
- 
--## 3. Fixed: `-O0` emitted x86 text into AArch64/RISC-V assembly — **verified**
-+---
- 
--`remat_indexed_acc_safe` (`src/backend/generation.rs`) is arch-agnostic but
--hard-coded `pushq %rax` / `popq %rax`, which the AArch64/RISC-V assemblers
--reject ("unsupported instruction: pushq %rax") — `lccc-arm -O0` could not
--compile `sha256_transform.c` at all.
-+## 2. Miscompiles found and fixed (all verified against reference compilers)
- 
--Change: new **required** (no default) `ArchCodegen::emit_acc_save` /
--`emit_acc_restore` hooks (`src/backend/traits.rs`), implemented per target:
-+| # | Bug | Status |
-+|---|---|---|
-+| 1 | AArch64 silent miscompile in `sha256_transform` | fixed |
-+| 2 | `-O0` emitted x86 text into AArch64/RISC-V assembly | fixed |
-+| 3 | i686 expat name-scanner miscompile | fixed |
-+| 4 | AArch64 `-Os`: value orphaned by `invalidate_acc` | fixed |
-+| 5 | AArch64 `-Os`: peephole deleted a live alias (`glibc_memcmp` SIGSEGV) | fixed |
-+
-+Bug 5's **root cause is not what the first fix assumed**. The scan treated
-+`ret` as having no runtime effect, so a redefinition of `x0` in a *later block*
-+was accepted as proof that a copy was dead — but x0-x7 are return-value
-+registers, and the path through that `ret` had already handed the value to the
-+caller. The first fix ("never cross a label") suppressed that one layout and
-+left the hole open. The real fix is a `ret` barrier for `dst < 8`
-+(`LineKind::Ret` invalidates the fold); x8-x17 are caller-saved and x19-x28 are
-+restored by the epilogue, which is itself a redefinition, so the barrier is
-+precise rather than another guess.
-+
-+The `nbody` `-O2`/`-O3` AArch64 SIGSEGV that used to be listed here as an open
-+defect is **fixed** — it was the same class of bug (a copy deleted while still
-+live on the loop path) and now matches gcc at every opt level.
- 
--| target | save | restore | notes |
--|---|---|---|---|
--| x86-64 | `pushq %rax` | `popq %rax` | flags-neutral |
--| i686 | `pushl %eax` | `popl %eax` | flags-neutral |
--| AArch64 | `str x0, [sp, #-16]!` | `ldr x0, [sp], #16` | pre/post-index; keeps 16-byte SP alignment |
--| RISC-V | `addi sp,sp,-16` + `sd t0,0(sp)` | `ld t0,0(sp)` + `addi sp,sp,16` | no pre-indexed store exists |
--
--SP-relative slot emitters on ARM (`emit_store_to_sp`, `emit_load_from_sp`,
--`emit_stp_to_sp`, `emit_ldp_from_sp`, `emit_add_sp_offset`) and RISC-V
--(`emit_store_to_sp`, `emit_load_from_sp`) now bias offsets by
--`out.rsp_frame_size` through a new `slot_offset()` helper; x29/x19-based frames
--are unaffected, exactly like x86's RBP frames. `emit_addi_sp` is deliberately
--*not* biased (it moves SP itself). Outside the protected window the field is
--zero, so all existing codegen is bit-identical.
--
--Because the hooks are required rather than defaulted, a future target cannot
--silently inherit x86 text again.
--
--## 4. Fixed: i686 expat name-scanner miscompile — **verified**
--
--`expat_xml_scan.c` returned 2 (self-check failure) on i686 at every level ≥
---O1: the UTF-8 name-length kernel returned 0 instead of 7/8. Expat is one of
--the user's named golden workloads.
--
--Chain: `range_fold` folded the classification (32-bit `unsigned long` changes
--its range lattice), producing `movl %ebp,%eax; cmpl $128,%eax`. Pattern 6 of
--`fold_reg_copy_idioms` correctly rewrote that to `cmpl $128,%ebp`; Pattern 15
--then narrowed it to `cmpw $128,%r16` — and `low_subreg_name("%ebp", 2)`
--returned `None`, so `.unwrap_or("%ax")` **silently substituted a different
--register**. Every character took the UTF-8 path.
--
--```asm
--; before                          ; after
--movzbl (%edi), %ebp               movzbl (%edi), %ebp
--cmpw   $128, %ax   ; WRONG REG    cmpw   $128, %bp   ; correct
--```
-+---
-+
-+## 3. ARM alias folding: from heuristic to exact CFG query
- 
--Changes (both in `src/backend/i686/codegen/peephole.rs`):
--1. `low_subreg_name` now knows the 16-bit forms of `%ebp/%esi/%edi`
--   (`%bp/%si/%di`) — legal in 32-bit mode. `%esp` stays `None`: narrowing a
--   compare onto the stack pointer must never happen. (The 8-bit forms are
--   still limited to eax/ecx/edx/ebx, which keeps Pattern 13 safe.)
--2. The `%ax` fallback is gone: when there is no 16-bit name the rewrite is
--   **refused** (`i += 1; continue`). A missed 2-byte size win costs nothing;
--   a wrong register costs correctness.
-+`propagate_address_aliases` deletes `mov xD, xS` when dst is only ever used as
-+an address base, rewriting those uses onto `xS`. Proving the copy dead needs to
-+know whether the redefinition of dst *dominates* every read of it, which text
-+cannot answer.
- 
--**Result**: `expat_min.c` and the full `expat_xml_scan.c` match `gcc -m32` at
--`-O0/-O1/-O2/-O3/-Os`.
-+The pass now builds a real CFG (`struct Cfg`: blocks, successors, iterative
-+dominator bitsets) and gates the fold on one exact query,
-+`redef_covers_all_reads`:
- 
--## 5. Fixed: AArch64 `-Os` value orphaned by `invalidate_acc` — **verified**
-+> every read of `dst` that can execute after the `mov` **without passing the
-+> redefinition** must be an address use that gets renamed onto the source.
- 
--`fannkuch.c` at `-Os` reached `emit_load_indexed_impl`'s unassigned-dest path:
--`ldrsw x0, […]` produced a value with no register assignment and no stack slot,
--`store_x0_to(dest)` registered x0 as its home, and the very next line called
--`invalidate_acc()` — orphaning the value. The next `operand_to_x0` had nothing
--left, which is what the new panic gate reports (before the gate: `mov x0, #0`,
--i.e. a silent miscompile).
-+Details that make it exact rather than conservative:
- 
--Change: new `store_x0_to_and_release()` — drops the accumulator entry **only
--when the value actually reached a durable home** — used at the five sites that
--paired `store_x0_to` with `invalidate_acc` (`memory.rs`, `cast_ops.rs`,
--3× `comparison.rs`).
-+- Blocks split after **every** control transfer, not only at labels. Earlier
-+  passes can leave a branch mid-block; an edge missing from `succs` is an edge
-+  the query cannot see.
-+- The redefinition's own block **is** walked (execution can run the lines
-+  before the redefinition) but is not propagated out of (every path leaving it
-+  has executed the redefinition).
-+- When the mov's block is in a cycle, the back edge re-enters at the block's
-+  **top**, so lines *before* the mov are fed by it and are checked too.
-+- `LineKind::Ret` invalidates the fold for `dst < 8` (§2).
- 
--**Result**: `fannkuch.c` matches GCC on all four backends at `-O0..-Os`.
-+With that in place the dead-copy deletion — removing a copy with no rewritable
-+address uses — is sound. It is worth 11 (-Os) / 16 (-O2) instructions; the
-+other ~40 of the raw 53/51 that the unsound version removed were illegal
-+deletions of live copies, i.e. latent miscompiles of the glibc_memcmp kind.
- 
- ---
- 
--## 6. Fixed: AArch64 `-Os` peephole deleted a live alias — **verified**
--
--`glibc_memcmp.c` segfaulted under qemu-aarch64 at `-Os` only (x86-64, i686 and
--RISC-V were correct).
--
--* `LCCC_NO_PEEPHOLE=1` fixed it; **no** existing per-pass kill switch did
--  (`CCC_NO_FP_PAIR`, `_SLOT_LOAD_DEDUP`, `_FP_SLOT_FWD`, `_STORE_DSE`,
--  `_STORE_SINK`, `_GDSE`, `_REUSE_STACK_LOADS`, `_ZEXT_MASK_FOLD`,
--  `_AND_TST_FUSION`, `_DEAD_PRE_RET`, `_SPILL_THREAD`, `_ADRP_CSE`,
--  `_LOOP_ROTATE`, nor any of the 44 `CCC_DISABLE_PASSES` names except `all` /
--  `ifconv`, which merely remove the triggering shape).
--* Bisecting the Phase-1/2 passes with a temporary `CCC_SKIP_PEEP` gate pointed
--  at **`propagate_address_aliases`** — one rebuild, then one test per name.
--* Proven pre-existing: reverting the §5 hunk still segfaulted, and the acc-save
--  window (`str x0, [sp, #-16]!`) appears in neither the good nor the bad asm.
--
--**Mechanism.** The pass rewrites `mov xD, xS` into its address uses
--(`ldr x0, [xD]` → `ldr x0, [xS]`) and deletes the mov when the scan finds a
--later instruction that overwrites `xD` — treating that as proof the value is
--dead. The scan is *textual*, so the overwrite it found (`mov x19, x0`) sat in a
--**different basic block** than the mov (the prologue's `mov x19, x24`), which
--does not dominate every path out of the mov's block. `.LBB37` reached
--`ldr x0, [x19]` without passing the overwrite, so it read the caller's
--callee-saved value restored by the prologue's `ldp x19, x20, [sp, #112]` — a
--garbage pointer.
--
--Fix: track whether the scan has crossed a label. A redefinition of `dst` proves
--death **only inside the mov's own block**; once the scan has left that block the
--transform bails out instead of deleting the mov.
--
--**Measured cost of the conservative bail** (instruction counts over 43 corpus
--programs, `lccc-arm`): `-Os` 10 677 → 10 703 (+26, **+0.24 %**), `-O2`
--11 248 → 11 279 (+31, **+0.28 %**). Correctness is worth 0.25 % of code size.
--
--The same fix also cleared §6b from the previous revision: scaled-down
--`fannkuch.c -Os` no longer trips the `operand_to_x0` panic gate (it was the same
--lost-alias → orphaned-value path). Both previously-open items are now closed.
--
--## 6b. Sibling-pass audit (read-only, no behaviour change)
--
--The §6 bug is a design pattern worth grepping for: a peephole pass that scans
--**across** labels while using a **straight-line** death proof. Auditing every
--pass in `src/backend/arm/codegen/peephole.rs` that deletes a line:
--
--| pass | verdict |
--|---|---|
--| `propagate_address_aliases` | **was the bug** — scanned past labels, now fixed |
--| `eliminate_overwritten_moves` | sound: breaks on `Label`/`Branch`/`Call`/`Ret` |
--| `eliminate_overwritten_stores` | sound: default arm breaks the scan |
--| `reuse_stack_loads_within_blocks` | sound: block-scoped, cache cleared at every label |
--| `eliminate_dead_pre_ret_moves` | sound: only pre-`ret` moves |
--
--So `propagate_address_aliases` was the only pass with the flaw. The i686
--peephole uses a different mechanism (`staging_reads_safe`, a whole-function read
--census) and is listed as an audit item in §9 rather than assumed safe.
--
--## 7. Techniques that worked (reuse these)
--
--| need | how |
--|---|---|
--| find cross-target miscompiles | `scripts/cross_backend_check.py` — execution, not assembly |
--| locate a peephole culprit | `LCCC_NO_PEEPHOLE=1` for i686/ARM/RISC-V (**not** `CCC_NO_PEEPHOLE`, which only gates ARM and x86-64), then diff good/bad `-S` output |
--| bisect a pass | `CCC_DISABLE_PASSES=<name>` (harvest names: `grep -rhoE 'pass_disabled\(&(disabled\|dis), "[a-z0-9_]+"\)' src/passes/*.rs`) |
--| find which peephole *pattern* | temporarily wrap each pass call in a `CCC_SKIP_PEEP`-gated macro, rebuild once, then bisect by name (this is how Pattern 15 was caught) |
--| prove a bug is/isn't yours | revert the one suspect hunk, rebuild (~25 s incremental), re-test |
--| find the emitter of a bad instruction | `RUST_BACKTRACE=full` gives `operand_to_x0` ← `emit_store_default` ← `emit_store_impl` in one shot |
--
--## 8. Environment notes
--
--* `gcc -m32` works after removing the conflicting `gcc-<N>-<triplet>` cross
--  packages; use it as the i686 reference.
--* qemu-user needs sysroots: `-L /usr/aarch64-linux-gnu`,
--  `-L /usr/riscv64-linux-gnu`.
--* Distro `rustc` is 1.85 (< MSRV 1.98.1) — use the rustup toolchain.
--* **`/tmp` is a 993 MB tmpfs on this box.** A full oracle run builds ~1 350
--  static binaries; `tempfile.TemporaryDirectory()` defaults to `/tmp` and the
--  run died at `binary_trees.c` with `final link failed: No space left on
--  device` (188 spurious "reference compile failed" entries). The oracle now
--  writes to a disk-backed scratch directory (`--scratch`, default
--  `target/crossbe-scratch`) and unlinks every binary the moment it has been
--  consumed. Any new harness script must do the same — never let scratch output
--  accumulate in `/tmp`.
--* Full-corpus oracle run ≈ 45–60 min wall clock; run it with `start_process`
--  and `PYTHONUNBUFFERED=1` (otherwise `tee` sees nothing until exit).
--* Never rebuild `lccc` while an oracle run is in flight: it replaces the
--  binaries under test and silently mixes results.
--
--## 9. TODO for the next session (ordered)
--
--1. Re-run `scripts/cross_backend_check.py` over the full corpus × 5 opt levels
--   (≈23 min) and drive it to zero failures; then wire `--gate` into
--   `scripts/ci_local.sh` on a reduced matrix so cross-backend regressions cannot
--   land silently.
--2. Add the six fixed defects as **execution** tests (not just unit tests) so the
--   oracle's coverage is permanent and cheap.
--3. Apply the §6 lesson to the sibling passes that use the same textual
--   "first overwrite proves death" reasoning: `eliminate_overwritten_moves`,
--   `eliminate_overwritten_stores`, `thread_spill_slots` and the i686
--   `staging_reads_safe` family all scan linearly and may hold the same latent
--   bug. Audit them with the oracle rather than by inspection.
--4. AArch64 peephole: re-enable global store forwarding (correctness bug,
--   test 0036_0041) — the oracle now makes a fix verifiable.
--5. Resume the session-32 backlog: the `ms178-1.patch` insn-count win, the
--   `ms178-1-ext-*.patch` segments, and `lccc`'s icount (2.66 M vs 1.96 M).
--
--## 10. CI status
--
--`scripts/ci_local.sh`: **16/16 PASS**. The only failure seen this session was
--`rustfmt`, caused by a temporary debug macro that was removed before the final
--run; `cargo fmt --all -- --check` is clean on the final tree.
--
--| gate | result |
--|---|---|
--| build, rust-toolchain-selector, cargo-test | PASS |
--| regression-corpus-ssa | PASS — 726 passed, 0 failed, 9 skipped-compare (735 total) |
--| benchmark-output-oracle, differential-correctness-oracle | PASS |
--| loop-alignment-contract, fuzz-engine-wiring, differential-fuzz-smoke | PASS |
--| strict-computed-recip-codegen, machinst-window-alloc | PASS |
--| linker-fuzz, linker-elf-grammar-fuzz, codegen-quality-gate | PASS |
--| rustfmt, clippy | PASS (after removing the temporary debug macro) |
--
--
--1. **§6a** — make the ARM peephole's copy-deletion analysis agree with
--   `propagate_register_copies` (dominance requirement), then re-run the oracle
--   at `-Os` on the whole corpus.
--2. **§6b** — find the second orphaned-value path (asm-tail panic trick).
--3. Re-run `scripts/cross_backend_check.py` over the full corpus × 5 opt levels
--   and drive it to zero failures; then wire `--gate` into `ci_local.sh` on a
--   reduced matrix so regressions cannot land silently.
--4. Add the four fixed defects as execution tests (not just unit tests) so the
--   oracle's coverage is permanent.
--5. Resume the session-32 backlog: ARM peephole store-forwarding
--   (correctness-blocked), the `ms178-1.patch` insn-count win, the
--   `ms178-1-ext-*.patch` segments, and `lccc`'s icount (2.66 M vs 1.96 M).
--
--## 9. v2 follow-up (second pass)
--
--### 9.1 Why PR #464 was red, and the fix
--The `Clippy` job runs **two** commands (`.github/workflows/ci.yml:234-254`), and
--`scripts/ci_local.sh:144-146` reproduces both verbatim:
-+## 4. Cross-pollination: register-copy coalescing, x86 -> ARM -> RISC-V
- 
--```
--cargo fmt --all -- --check
--cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
--```
-+x86 had whole-function register-copy coalescing
-+(`x86/codegen/peephole/passes/copy_coalesce.rs`). **ARM and RISC-V had
-+nothing**, so their functions paid an entry shuffle x86 deletes: the register
-+allocator hands parameters homes that do not match the ABI registers they
-+arrive in, and the resulting `mov`/`mv` has a destination that is live for the
-+whole function — no local pass can remove it. Coalescing renames the
-+destination family onto the source everywhere after the copy and drops the
-+copy.
-+
-+Ported as `coalesce_entry_copies` in both backends, with per-architecture
-+legality rules:
-+
-+1. The copy sits in the **straight-line entry run** (no label/branch/call/ret
-+   before it), so every earlier line runs once and cannot be re-entered by a
-+   back edge.
-+2. **`src` is mentioned nowhere else in the function** — no later write
-+   clobbers the coalesced value, no other live range is disturbed. A
-+   parameter's arrival in `src` is implicit, not a mention.
-+3. After the copy, `dst` has **no unrenamable reader or writer**: no implicit
-+   operand (`classify_implicit_operands_a64` / `_rv`), no `ret` while `dst` is
-+   a return-value register (ARM x0-x7, RISC-V a0-a7), and no call while the
-+   value lives in a caller-saved register **and is still used afterwards**.
-+4. Frame pointer, return address and stack pointer are never renamed
-+   (ARM x29/x30/sp; RISC-V s0/ra/sp). A far RISC-V `jump` uses t6 as scratch,
-+   so t6 is not renamed across one.
-+
-+**Measured (43-program corpus, instruction count):**
-+
-+| backend | -Os | -O2 | win vs. no coalescer |
-+|---|---|---|---|
-+| ARM | 10675 | 11253 | -15 / -12 |
-+| RISC-V | 20942 | 21998 | -9 / -2 |
-+
-+The ARM win is real because 75 of its 567 entry-run copies have a source that
-+appears nowhere else. **RISC-V has 775 entry-run copies but only 1 with a
-+unique source** — its allocator reuses argument registers after moving them to
-+their homes, so rule 2 rejects nearly everything. That is the single biggest
-+remaining optimisation in this area: x86's pass uses **liveness**
-+(`live_after(i, src) == false`) instead of the syntactic rule 2, and porting
-+that liveness to ARM and RISC-V is what would unlock the other ~490 (ARM) and
-+~774 (RISC-V) copies. It is the first item in §10.
- 
--The failure was `cargo fmt`, not clippy: the temporary `peep!` debug macro used
--to bisect the ungated ARM peephole passes was still in the tree when the patch
--was snapshotted. It has been removed. Both commands now exit 0 locally
--(`FMT_EXIT=0`, `CLIPPY_EXIT=0`). **Lesson: never snapshot while a debug macro is
--in the tree — run `cargo fmt --all -- --check` as part of the snapshot gate.**
--
--### 9.2 The conservative `propagate_address_aliases` fix was wrong — precise version
--The first fix bailed out of the alias fold whenever the forward scan crossed
--*any* label. That is sound but costs instructions (-Os 10677 → 10703, -O2
--11248 → 11279 over the 43-program ARM corpus) because it throws away every fold
--that spans a label nothing branches to.
--
--The replacement rule is precise and recovers the folds:
--
--* **A label only ends the region if some branch in the function targets it.**
--  A label no branch targets is not a control-flow entry point: the only way to
--  reach the code after it is to fall in from the line above, so every path out
--  of the `mov` still runs the redefinition. The target set is computed once per
--  pass invocation in a `FxHashSet` over `Branch`/`CondBranch`/`CmpBranch` lines.
--* **A conditional transfer inside the region invalidates the fold.** `b.cond`
--  / `cbz` / `tbz` divert to a target *outside* the scanned region, so the taken
--  path reaches the code after the redefinition without running it, keeping the
--  `mov`'s value live. This also closes a latent hole the label-only rule left
--  open.
--* Unconditional `b`, `br` and `ret` remain safe to scan past: entry into any
--  later block must go through a real branch target, which the first rule
--  catches, so they cannot smuggle in a path that skipped the redefinition.
--
--The glibc_memcmp `-Os` SIGSEGV stays fixed: `.LBB37` is a real branch target, so
--the fold that deleted the prologue's `mov x19, x24` is still rejected.
--
--### 9.3 Environment: the sandbox resets at every turn boundary
--Everything outside the persisted `/home/user` workspace disappears between
--turns, **and `target/` is excluded from snapshots by design**, so the compiled
--lccc binaries are gone too. The `rustup` shim survives but loses its `+x` bit
--and `~/.rustup/toolchains` is deleted. Restore sequence, in this order:
-+---
- 
--```
--curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
--./scripts/build_lccc_fast.sh                 # ~2m40s from clean
--sudo apt-get install -y -qq gcc-multilib gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
--git ls-tree -r HEAD --format='%(objectmode) %(path)' | awk '$1=="100755"{print $2}' | xargs chmod +x
--git diff --summary | grep -c "mode change"   # must be 0 before snapshotting
--```
-+## 5. Measured results
-+
-+ARM, 43 programs, instruction count:
- 
--`gcc-multilib` (i686 reference) and the two cross toolchains (ARM/RISC-V
--builtin headers under `/usr/lib/gcc/<triplet>/14/include`, sysroots under
--`/usr/<triplet>`) now install together without conflict. Without the cross
--toolchains, `lccc-arm`/`lccc-riscv` fail with `stddef.h: No such file or
--directory` even for a one-line program.
--
--### 9.4 Open defect carried forward: `lccc-arm -O2/-O3` SIGSEGV on `nbody.c`
--* Repro: `lccc-arm -O2 -static -lm -DSTEPS=5000 tests/benchmark/programs/nbody.c`
--  → `qemu-aarch64`: `uncaught target signal 11`. -O0/-O1/-Os are correct and
--  match gcc (`-0.169075164 -0.169089263`).
--* Threshold: STEPS 200/2000 fine, 5000 and above crash — so it is drift over
--  the outer `advance()` step loop, not a single bad pointer.
--* Masked by `CCC_DISABLE_PASSES` ∈ {all, gaddrcse, gvn, inline, ivsr, licm,
--  postinline, unroll}; **not** masked by any peephole gate. Eight different
--  passes hiding one bug means the defect is downstream, in ARM codegen/RA, and
--  only reachable once the loop is optimised.
--* Asm pair to continue from: `/tmp/nb_bad.s` (-O2) vs `/tmp/nb_good.s`
--  (-O2 + `CCC_DISABLE_PASSES=ivsr`). The step loop is the region enclosing
--  `.LBB9`/`.LBB10` (i loop) and `.LBB11`/`.LBB12` (j loop); the crash happens in
--  the code reached from `.LBB7`/`.LBB8`. Compare the callee-save area offsets
--  (`[sp,#312]…[sp,#440]` bad vs `[sp,#304]…` good) and the `str x0, [sp, #304]`
--  spill in the bad build.
--
--### 9.5 Measured cost of the alias-fold fixes (ARM corpus, 43 programs)
- | build | -Os | -O2 |
- |---|---|---|
--| buggy (pre-fix, glibc_memcmp SIGSEGV) | 10677 | 11248 |
--| conservative: bail on ANY crossed label | 10703 | 11279 |
--| **precise: bail only on real branch targets / cond. transfers** | **10703** | **11279** |
--
--The precise rule measures **identical** to the conservative one: in lccc's
--output every basic-block label really is a branch target, so the "is it a
--target?" refinement recovers nothing on this corpus. The remaining +26 (-Os) /
--+31 (-O2) instructions versus the *buggy* build are the price of not emitting
--the `glibc_memcmp` SIGSEGV — they are not recoverable by restricting where the
--fold fires, because in every blocked case the mov is genuinely live on some
--other path.
--
--**The correct fix is structural, not another restriction** (designed, not yet
--implemented): build a CFG once per function, compute dominators, and replace the
--linear scan's `crossed_label`/`crossed_cond` heuristics with the exact condition
--"the block containing the redefinition dominates every block that reads dst".
--That is sound by construction and strictly more aggressive than the buggy
--version in every case where the fold is legal, so it should also *beat* 10677 /
--11248. Secondary: the dead `mov xD, xS` exists because RA missed a coalesce —
--fixing coalescing removes the copy at the source instead of cleaning it up.
--
--### 9.6 Final: the alias fold now uses the EXACT condition, not a heuristic
--Superseding §9.2 and §9.5.  `propagate_address_aliases` now builds a real CFG
--(`struct Cfg`: blocks, successors, iterative dominator bitsets) over the
--function and gates the fold on a single exact query, `redef_covers_all_reads`:
-+| baseline before this work (miscompiles: glibc_memcmp SIGSEGV) | 10677 | 11248 |
-+| conservative label bail | 10703 | 11279 |
-+| + exact CFG query | 10701 | 11281 |
-+| + sound dead-copy deletion | 10690 | 11265 |
-+| + copy coalescing | 10675 | 11253 |
-+| **+ identical-block merging (current)** | **10630** | **11223** |
- 
--> every read of `dst` that can execute after the `mov` **without passing the
--> redefinition** must be an address use that gets renamed onto the alias source.
-+RISC-V, same 43 programs:
-+
-+| build | -Os | -O2 |
-+|---|---|---|
-+| baseline | 20951 | 22000 |
-+| + copy coalescing | 20942 | 21998 |
-+| **+ identical-block merging (current)** | **20891** | **21953** |
- 
--Traversal stops at the redefinition's block, because any path leaving it has
--executed the redefinition — so reads beyond it see the *new* value and are
--irrelevant.  That is what makes the rule exact rather than conservative: it
--accepts loop-carried redefinitions (the common case the buggy pass got right
--for the wrong reasons) and rejects `glibc_memcmp`'s `.LBB37`, which is reachable
--without running the redefinition.
-+The correctness fixes are paid for by two new optimisations rather than by
-+surrendering one: the current ARM build is **47 (-Os) / 25 (-O2) instructions
-+smaller than the miscompiling baseline it replaces**, and the RISC-V build is
-+**60 / 47** smaller than the pre-work baseline.
- 
--| build | -Os | -O2 | correctness |
--|---|---|---|---|
--| buggy (pre-fix) | 10677 | 11248 | **SIGSEGV** on glibc_memcmp -Os |
--| conservative: bail on any crossed label (NAK'd) | 10703 | 11279 | clean |
--| **exact CFG/dominator rule (shipped)** | **10701** | **11281** | **240/240 oracle cells agree** |
--
--The ~25 instructions the buggy build "saved" are exactly the illegal deletions:
--the pass was removing copies that are live on some other path.  Since the new
--rule accepts **every** case that is legal, no further recovery is possible
--without miscompiling — the remaining delta is the true cost of correctness,
--measured to the last instruction.
--
--Verified: `glibc_memcmp` -Os/-O2/-O3 all print `2158787064` and exit 0;
--`cross_backend_check.py` over 12 programs × 5 opt levels × 4 backends against
--gcc reported *ALL BACKENDS AGREE WITH THE REFERENCE COMPILERS*;
--`cargo fmt --all -- --check` and the exact CI clippy command both exit 0.
--
--**Rejected during this work (do not resurrect without understanding why):**
--deleting a provably-dead copy that has no rewritable address uses
--(`!uses.is_empty()` → allow empty).  It is worth ~65 instructions at -Os but
--breaks `sieve` (-O1..-O3) and `glibc_memcmp` -O3 even under the strict dominance
--query, so the "provably dead" proof is incomplete for that case — most likely
--`reads_gp_register`/`written_gp_register` misclassifying an instruction that
--reads `dst` (a `str xD, [sp,#k]` spill reads it) as a pure overwrite.  Audit
--`written_gp_register` for store forms before retrying; that is a real further
--win, not a speculation.
--
--### 9.7 Root cause of the "65-instruction win" breakage — and the real bug
--Superseding the speculation at the end of §9.6.  The deletions that broke
--`sieve` and `glibc_memcmp` were **return-value staging copies**:
-+
-+---
-+
-+## 5b. Cross-pollination from x86: identical basic-block merging
-+
-+The x86 backend is the most polished of the four: 22 peephole pass modules
-+behind ~70 `sk("...")` gates, where ARM and RISC-V carry their passes inline.
-+A census of what x86 has that the others do not singled out three passes:
-+`identical_blocks`, `epilogue_merge` and `frame_compact` — none of which
-+existed in ARM, RISC-V or i686.
-+
-+`identical_blocks` was ported first. Its soundness contract, carried over
-+verbatim in spirit, is:
-+
-+1. the two blocks must have the same instruction text;
-+2. the deleted block must be entered only by **explicit branches** — a
-+   fall-through edge cannot be retargeted by renaming a label, and after
-+   deletion the preceding block would fall into whatever now follows it;
-+3. a **function's entry block is never deleted** (its label is the symbol);
-+4. blocks reached from an unresolvable edge (an indirect `br xN` jump table,
-+   a `jalr`) are excluded — and, unlike `Cfg::build`, they do **not** poison
-+   the whole file. The merge pass therefore builds its own tolerant block
-+   model: a function containing a switch's jump table still gets merged
-+   everywhere else.
-+
-+On entry state, x86 requires *equal predecessor sets* plus *not flag-dependent
-+at entry*. AArch64 and RISC-V have no EFLAGS, so the second condition
-+disappears — and the first turned out to be far too weak on its own:
-+
-+> **Measured.** A census of the ARM corpus found 19 duplicate-text groups (33
-+> candidate pairs). **All 33 were rejected by the predecessor-set rule** —
-+> the x86 pattern it was written for (phi trampolines sharing their
-+> predecessors) simply does not occur in this corpus. Porting the rule as
-+> written would have shipped a pass that never fires.
-+
-+The fix was to add a second, *stronger* admission test that does not need the
-+predecessor sets at all: a block is **live-in independent** when every register
-+it reads is defined inside the block before the read (implicit operands
-+included; blocks containing a call or `ret` are excluded, since a call reads
-+the argument registers implicitly and `ret` reads the return-value registers).
-+Two identical live-in-independent blocks are interchangeable whatever their
-+predecessors are, because the live-in state is irrelevant to both. With that
-+test added the pass fires for real: **-45 / -30 instructions on ARM, -51 / -45
-+on RISC-V.**
-+
-+Both backends were verified at 48/48 against `aarch64-linux-gnu-gcc` and
-+`riscv64-linux-gnu-gcc` under qemu at `-O1/-O2/-Os/-O3` (12 programs x 4
-+levels), on top of the corpus-wide instruction-count measurements.
-+
-+Still unported: `epilogue_merge` and `frame_compact` (x86-only), and the
-+register-copy coalescers still use the *syntactic* "source appears nowhere
-+else" rule on ARM/RISC-V rather than x86's *liveness* rule
-+(`live_after(i, src) == false`). The census for that is in section 4: ~490
-+further copies on ARM and ~774 on RISC-V are in reach once the liveness rule
-+is ported — the largest remaining single item.
-+
-+---
-+
-+## 6. Golden workloads: zstd added
-+
-+`.github/scripts/ci-codegen-gate.py` now gates `zstd_count.c` alongside
-+gzip_crc32, zlib_ng_adler32, expat_xml_scan, sqlite_varint, glibc_memcmp and
-+hash_table, with a baseline entry (`insns 131, moves 34, pushes 7,
-+stackmem 0`). It earned the place twice: it caught the loop-carried copy bug
-+(§3), and zstd is what the x86 boot path decompresses with, so the golden set
-+now covers the decoder the boot path actually runs.
-+
-+---
-+
-+## 7. Known open defects
-+
-+- **`struct_copy` -O1/-Os (AArch64) mismatches the reference.** It also fails
-+  with `LCCC_NO_PEEPHOLE=1`, so it is **not** a peephole bug — it is a
-+  pre-existing codegen defect elsewhere (struct copy / aggregate ABI) and is
-+  still open.
-+- **ARM global store forwarding remains disabled** (test `0036_0041`): the
-+  same-register NOP elimination has an unidentified correctness bug in complex
-+  float-array code. RISC-V *has* a working `global_store_forwarding`, so that
-+  implementation is the reference for fixing ARM's.
-+- **The i686 `staging_reads_safe` census** (whole-function read census in the
-+  i686 peephole) is still unaudited.
-+- **IR loop rotation is still opt-in** (`CCC_LOOP_ROTATE=1`,
-+  `engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md`); the ARM peephole's
-+  `rotate_simple_loops` is default-on independently.
-+
-+---
-+
-+## 8. Kernel boot: blocked, and how to unblock
-+
-+`scripts/build_kernel_boot.sh` cannot run: the workspace wipe removed
-+`/home/user/kernel-work/linux-6.18.47` **and**
-+`/home/user/archpkgbuilds/packages/linux-cachymod-6.18`, which
-+`prepare_kernel_tree.sh` requires for the 26 CachyMod patches and the package
-+config (`PKGDIR` check line 44, patches line 158, config line 172).
-+
-+The AUR `linux-cachyos` clone is **not** a substitute: it is version **7.2**
-+and carries **0 patch files**.
- 
- ```
--    mov x5, x0      ; save
--    ...             ; later
--    mov x0, x5      ; restore / return staging
-+# restore the PKGBUILD tree (26 patches + config, CachyOS source order), then:
-+KERNEL_DIR=/home/user/kernel-work/linux-6.18.47 bash scripts/prepare_kernel_tree.sh
-+KERNEL_DIR=... LCCC=.../lccc bash scripts/build_kernel_boot.sh
- ```
- 
--`propagate_address_aliases` treated `LineKind::Ret` as having "no runtime
--effect" and kept scanning past it, so a redefinition of `x0` in a *later block*
--was accepted as proof that the copy was dead.  It is not: the path through that
--`ret` handed the mov's value to the **caller** — x0-x7 are return-value
--registers.  `glibc_memcmp` returned garbage and exited 2.
--
--**This is the true root cause of the original glibc_memcmp -Os SIGSEGV.** The
--earlier "never cross a label" rule fixed it only by accident: it refused the
--fold in that particular layout while leaving the live-out hole wide open.
-+Fallback if the patch set is unrecoverable: a **vanilla 6.18.47** tree. The
-+tarball download is already in the script (kernel.org), and `arch/x86/boot` is
-+largely patch-independent, so a defconfig build is a valid boot-code test.
-+`scripts/qemu_qmp_probe.py` probes `decompress_kernel -> zstd_decompress_dctx`.
- 
--Fix: `LineKind::Ret` now invalidates the fold when `dst < 8`.  x8-x17 are
--caller-saved and x19-x28 are restored by the epilogue before the `ret` (which is
--itself a redefinition), so only x0-x7 can be live-out at a return — the barrier
--is precise, not another guess.
-+---
- 
--With that barrier the dead-copy deletion (removing `!uses.is_empty()`, the win
--§9.6 deferred) is sound, and lccc-arm now beats the *buggy* baseline:
-+## 9. CI status
-+
-+- `cargo fmt --all -- --check` and
-+  `cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings`
-+  — the two commands of the `Clippy` job (`.github/workflows/ci.yml:234-254`,
-+  reproduced verbatim by `scripts/ci_local.sh:144-146`) — both **exit 0**.
-+- The previous red was `cargo fmt`: a temporary `peep!` debug macro was still in
-+  the tree when the patch was snapshotted. Never snapshot with debug code in
-+  the tree; `cargo fmt --all -- --check` is part of the snapshot gate.
-+- **The full `ci_local.sh` has not been run end to end.** Run
-+  `scripts/ci_local.sh --fast` per the standing instruction; the full run
-+  (regression corpus + benchmark oracle, ~26 min) is still owed.
-+
-+### 9a. PR #471 was red: a flaky test, not a codegen regression
-+
-+The `Test Suite` job failed at the `Run tests` step with exit 101. It is a
-+**flaky test**, and reproducing it took more than running the suite once:
-+
-+> `passes::loop_invert::tests::the_duplicated_test_reads_the_updated_induction_variable`
-+> panicked with `index out of bounds: the len is 1 but the index is 1` — the
-+> latch never received the duplicated header block. It failed in **1 run out of
-+> 12**; run in isolation it passed 30/30, which is the signature of
-+> cross-thread interference rather than a logic bug in the pass.
-+
-+**Root cause.** `invert_loops` read its kill switch from the process
-+environment (`std::env::var("CCC_NO_LOOP_INVERT")`), and a neighbouring test,
-+`the_pass_can_be_disabled`, exercised that switch with
-+`std::env::set_var`. The environment is process-global and `cargo test` runs
-+its tests on parallel threads, so the ten other tests in the module could call
-+`invert_loops` while the variable was set, observe `enabled == false`, skip the
-+rotation and then index an instruction that was never created. `set_var` is
-+`unsafe` in a multithreaded process for exactly this reason.
-+
-+**Fix.** The kill switch is now an explicit parameter. `LoopInvertConfig`
-+carries `enabled`/`debug`; `invert_loops` (the driver's entry point, called
-+from `src/driver/pipeline.rs:1846`) resolves it from the environment **once
-+per compilation** and delegates to `invert_loops_with(func, cfg)`. The tests
-+call `invert_loops_with(&mut f, LoopInvertConfig::testing()|disabled())` and
-+touch no global state, so `set_var` is gone from the module entirely. The
-+documented `CCC_NO_LOOP_INVERT` / `CCC_DEBUG_LOOP_INVERT` escape hatches behave
-+exactly as before.
-+
-+Verified: **30 consecutive full-suite runs, 0 failures** (previously ~1 in 10).
-+
-+Two sibling passes — `vec_interleave` and `vec_load_sink` — still use the same
-+`set_var` idiom, defended by a module-local `ENV_LOCK`. That lock only
-+serialises callers that remember to take it, so the pattern is fragile even
-+though it is not currently racing; both should get the same explicit-config
-+treatment.
-+
-+### 9b. `scripts/ci_local.sh` now runs the tests GitHub runs
-+
-+The `--fast` gate set was green while the PR was red because the `cargo-test`
-+gate was tagged `slow` and therefore skipped. It is now:
-+
-+- **in the fast set** — it is the step the required check runs, so `--fast`
-+  has to cover it;
-+- **run with the same `RUSTFLAGS` the build resolved** — `build_lccc_fast.sh`
-+  publishes them to `target/lccc-rustflags`. `RUSTFLAGS` is part of cargo's
-+  fingerprint, so passing a different value would rebuild the whole tree;
-+- **repeatable** via `LCCC_TEST_REPEATS=N`, which is how the flake above was
-+  found and how its fix was proven. A single run cannot see a
-+  process-global-state race; three repeats cost seconds once the test binaries
-+  are built.
-+
-+`ci_local.sh --fast` with `LCCC_TEST_REPEATS=3`: **15 passed, 0 failed,
-+3 skipped — ALL GATES GREEN**.
- 
--| build | -Os | -O2 |
--|---|---|---|
--| buggy baseline (SIGSEGV on glibc_memcmp) | 10677 | 11248 |
--| conservative label bail (NAK'd) | 10703 | 11279 |
--| exact CFG rule, no dead-copy deletion | 10701 | 11281 |
--| **exact CFG rule + dead-copy deletion + ret barrier** | **10648** | **11230** |
--
--glibc_memcmp -Os/-O2/-O3 all print `2158787064` (gcc: identical); sieve -O1..-O3
--print `primes up to 10000000: 664579` (gcc: identical).
--
--### 9.8 The 65-instruction win, investigated properly (final)
--Deleting a provably-dead copy with no rewritable address uses is worth ~53 (-Os)
--/ ~51 (-O2) instructions — and it was unsound three times over.  Each failure
--was a distinct hole in the "is this copy dead" proof, found by diffing the asm
--produced with and without the deletion (`CCC_NO_DEADCOPY=1`) and reading the
--deleted instruction:
--
--1. **Live-out at a `ret`** (`glibc_memcmp`, `sieve`): the scan treated `ret` as
--   having no runtime effect and accepted a redefinition in a later block as
--   proof of death, but x0-x7 are return-value registers — the path through that
--   `ret` had already handed the value to the caller.  Fixed by invalidating the
--   fold at a `ret` when `dst < 8` (precise: x8-x17 are caller-saved and x19-x28
--   are restored by the epilogue, which is itself a redefinition).
--   **This is also the true root cause of the original glibc_memcmp SIGSEGV.**
--2. **Mid-block control transfer** (`fannkuch`, `zstd_count`): the CFG treated
--   only the last line of a label-delimited run as the terminator, so a branch
--   left by an earlier peephole pass contributed no edge and the query answered
--   "no read" for blocks that were reachable.  Fixed by also splitting blocks
--   after every `b`/`b.cond`/`cbz`/`tbz`/`ret`.
--3. **Entering the redefinition's block from the top** (`zlib_ng_adler32`): the
--   traversal skipped the def block entirely, but execution can run the lines
--   *before* the redefinition — `mov x19, x20` before a loop whose body ends in
--   `mov x19, x5` feeds the first iteration.  Fixed by walking the def block
--   (checking its pre-redefinition lines) while not propagating out of it.
--4. **Loop re-entry above the mov** (`zlib_ng_adler32`, the `mov x19, x5` loop
--   increment itself): when the mov's block is part of a cycle, the back edge
--   re-enters at the block's TOP, so lines *before* the mov are fed by it.  The
--   linear scan never sees the back edge.  Fixed by checking the whole block when
--   the block is reachable from itself.
--
--With all four fixed the deletion is sound, and lccc-arm is smaller than the
--conservative build it replaces:
--
--| build | -Os | -O2 | glibc_memcmp | fannkuch | zlib_ng_adler32 | zstd_count |
--|---|---|---|---|---|---|---|
--| buggy baseline | 10677 | 11248 | **SIGSEGV** | ok | ok | ok |
--| conservative label bail (NAK'd) | 10703 | 11279 | ok | ok | ok | ok |
--| exact CFG rule, no deletion | 10701 | 11281 | ok | ok | ok | ok |
--| **exact CFG + deletion + holes 1-4 fixed** | **10690** | **11265** | ok | ok | ok | ok |
--
--The deletion is worth 11 (-Os) / 16 (-O2) instructions *once it is correct* —
--the other ~40 of the raw 53/51 were illegal deletions of live copies, i.e. latent
--miscompiles of exactly the glibc_memcmp kind.  lccc-arm is now **27 instructions
--smaller than the NAK'd conservative build** and, unlike the 10677/11248
--baseline, does not miscompile.  `nbody` -O2 (the open AArch64 SIGSEGV from §9.4)
--now matches gcc as well.
--
--`struct_copy` -O1/-Os mismatches the reference but also fails with
--`LCCC_NO_PEEPHOLE=1`, so it is a pre-existing codegen defect outside the
--peephole — not a regression from this work, and still open.
--
--### 9.9 Cross-pollination: x86's copy coalescer ported to ARM (the real win)
--x86 had whole-function register-copy coalescing
--(`x86/codegen/peephole/passes/copy_coalesce.rs`); **ARM and RISC-V had
--nothing** — ARM functions paid for an entry shuffle the x86 backend deletes.
--Measurement first (`/tmp/count_shuffle.py`): **567** entry-run `mov xD, xS`
--copies across the corpus, 75 of them with a source that appears nowhere else.
--
--Ported as `coalesce_entry_copies` in the ARM peephole, with AArch64 legality
--rules (x86's are x86-specific):
--
--1. The copy sits in the straight-line entry run (no label/branch/call/ret before
--   it), so earlier lines run once and cannot be re-entered by a back edge.
--2. `src` is mentioned nowhere else in the function — no later clobber, no other
--   live range disturbed. A parameter's arrival in `src` is implicit, not a
--   mention.
--3. After the copy, `dst` has no unrenamable reader/writer: no implicit operand
--   (`classify_implicit_operands_a64`), no `ret` when `dst < 8` (x0-x7 carry the
--   return value), and no call while the value lives in a caller-saved register
--   **and is still used afterwards** (refined from a blanket "no call": a call
--   with no mention of `dst` after it is harmless).
--4. No `Other` (unmodelled mnemonic). `MemOther` is allowed: it names every
--   register it touches, pre/post-indexed writeback included.
-+---
- 
--| build | -Os | -O2 |
--|---|---|---|
--| buggy baseline (miscompiles) | 10677 | 11248 |
--| conservative label bail (NAK'd) | 10703 | 11279 |
--| + exact CFG rule + dead-copy deletion | 10690 | 11265 |
--| **+ ARM copy coalescing (shipped)** | **10675** | **11253** |
--
--lccc-arm is now **28 (-Os) / 26 (-O2) instructions smaller than the NAK'd
--conservative build** — 54 total — and within +2/+5 of the miscompiling
--baseline, i.e. the entire "regression" is now paid for by a *new* optimisation
--rather than by giving one up. Spot-checked against aarch64 gcc at -O2/-Os:
--glibc_memcmp, zlib_ng_adler32, zstd_count, fannkuch, sieve, gzip_crc32,
--expat_xml_scan all match.
--
--### 9.10 zstd added to the golden workloads
--`zstd_count.c` is now a golden workload in
--`.github/scripts/ci-codegen-gate.py` with a baseline entry
--(`insns 131, moves 34, pushes 7, stackmem 0`). It earned its place: it is the
--workload that caught the loop-carried copy bug (§9.8 hole 4), and the x86 boot
--path decompresses with zstd, so it ties the golden set to the kernel work.
-+## 10. TODO for the next session (ordered)
-+
-+1. **Liveness-based copy coalescing for ARM and RISC-V.** Replace rule 2
-+   ("`src` mentioned nowhere else") with x86's dataflow rule
-+   (`live_after(i, src) == false`, plus "no write to `src` while `dst` is still
-+   live"). Measured upside: ~490 more copies on ARM, ~774 on RISC-V. This is
-+   by far the largest single win available in the backend.
-+2. **Close the RISC-V pass gap.** Its peephole has 27 passes against ARM's 78
-+   and i686's 117; candidates for porting, cheapest first:
-+   `eliminate_move_chains`, `eliminate_overwritten_moves`,
-+   `eliminate_overwritten_stores`, `reuse_stack_loads_within_blocks`,
-+   `thread_spill_slots`, `hoist_loop_invariant_remats`,
-+   `sink_loop_carried_stores`, `fold_zero_stores`.
-+3. **Fix ARM global store forwarding** using RISC-V's working
-+   `global_store_forwarding` as the reference (test `0036_0041`).
-+4. **`struct_copy` AArch64 defect** — bisect outside the peephole (it fails
-+   with the peephole disabled).
-+5. **Audit i686 `staging_reads_safe`.**
-+6. **Kernel boot** once the tree is restored (§8): build the 23 setup objects
-+   with lccc + lccc-ld, pass the `_end <= 0x8000` ASSERT, then fix whatever
-+   miscompiles the boot exposes.
-+7. **Full `ci_local.sh`** end to end.
-diff --git a/docs/optimization-passes.md b/docs/optimization-passes.md
-index 307685390..27ca18aa2 100644
---- a/docs/optimization-passes.md
-+++ b/docs/optimization-passes.md
-@@ -24,14 +24,15 @@ Older text that claimed “all `-O` levels run the same pipeline” is **obsolet
- 
- The `-O` flags still set `__OPTIMIZE__` / `__OPTIMIZE_SIZE__` for kernel-style `#ifdef`s.
- 
--## Passes added since this page was written (August 2026)
-+## Recently added passes
- 
--This page predates several production passes; `src/passes/README.md` and
--`src/passes/mod.rs` are authoritative. Landed since:
-+`src/passes/README.md` and `src/passes/mod.rs` are authoritative for the IR
-+passes; the backend peepholes are documented per backend
-+(`src/backend/<arch>/codegen/`). Landed since this page was written:
- 
- - **DSE** (`dse.rs`) — same-block dead-store elimination with closed-alloca
-   escape analysis and byte-range kills (`CCC_NO_DSE`).
--- **Backedge PRE** — integer recurrences default-on (1.14× measured);
-+- **Backedge PRE** — integer recurrences default-on (1.14x measured);
-   FP variants gated (`CCC_BEPRE_FP=1` research).
- - **GlobalAddr CSE** (`global_addr_cse.rs`) — oracle-derived placement:
-   cold singletons branch-local, loop addresses to the innermost preheader,
-@@ -39,14 +40,48 @@ This page predates several production passes; `src/passes/README.md` and
- - **Stencil vectorizer** — constant-tap affine loops, bit-exact vs scalar
-   (`CCC_NO_STENCIL_VEC`).
- - **Map expression trees** — elementwise FP/int map loops (`CCC_NO_MAP_VEC`).
--- **Widening + masked conditional-sum reductions** — I32→I64 `paddq`
--  pipelines, VEX-only bodies (9× AVX-SSE transition penalty avoided).
--- **Loop rotation** (`loop_rotate.rs`) — opt-in (`CCC_LOOP_ROTATE=1`),
--  runs after vectorize; default-enable pending hardening.
-+- **Widening + masked conditional-sum reductions** — I32->I64 `paddq`
-+  pipelines, VEX-only bodies (9x AVX-SSE transition penalty avoided).
-+- **Loop rotation** (`loop_rotate.rs`, IR) — **opt-in** at the IR level
-+  (`CCC_LOOP_ROTATE=1`), runs after vectorize; default-enable pending
-+  hardening (see `engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md`).
-+  Independently, the **ARM backend peephole rotates simple loops by default**
-+  (`rotate_simple_loops`, off only under `CCC_NO_LOOP_ROTATE`).
- - **General complete unrolling** — nested/multi-block constant-trip loops
-   with FP-aware expansion budget.
- - **Tri-state FP contraction** — `FpContract { Off, OnExpr, Fast }`,
-   default Off (GCC `gnu*` parity); FMA emission requires the FMA3 feature.
-+- **Identical basic-block merging** (`merge_identical_blocks`, ARM + RISC-V
-+  backend peepholes) — collapses duplicate blocks that a switch's phi
-+  trampolines, repeated guard sequences and cloned epilogue stubs leave behind.
-+  Ported from the x86 backend's `identical_blocks` pass.  Measured on the
-+  43-program corpus: **-45 / -30 instructions (ARM `-Os` / `-O2`)** and
-+  **-51 / -45 (RISC-V)**.
-+
-+### Backend peepholes worth knowing about
-+
-+- **Register-copy coalescing** — whole-function: renames a copy's destination
-+  onto its source everywhere and deletes the copy. Installed in **x86**
-+  (`passes/copy_coalesce.rs`), **ARM** and **RISC-V**
-+  (`coalesce_entry_copies`); i686 has its own equivalents. It is the only way
-+  to remove an entry-shuffle copy, whose destination is live to the end of the
-+  function, so no local pass can touch it.
-+- **Alias folding** (ARM `propagate_address_aliases`) — deletes `mov xD, xS`
-+  when dst is only ever used as an address base. Gated on an exact CFG query
-+  (`Cfg::redef_covers_all_reads`): every read of dst reachable *without passing
-+  the redefinition* must be a rewritable address use. A `ret` invalidates it
-+  for x0-x7, which carry the return value.
-+
-+- **Identical basic-block merging** (`merge_identical_blocks`) — a block is
-+  deleted and its predecessors retargeted when its instruction text matches
-+  another block's and either (a) both have the **same non-empty predecessor
-+  set**, so the live-in state is identical, or (b) both are **live-in
-+  independent** — every register they read is defined inside the block — so
-+  the live-in state is irrelevant.  Additionally the deleted block must be
-+  entered only by explicit branches (a fall-through edge cannot be retargeted
-+  by renaming a label), must not be a function's entry block, and blocks whose
-+  predecessors are unknown (an indirect `br xN` jump table, or a `jalr`) are
-+  excluded rather than poisoning the whole function.
- 
- ## Pass Order
- 
-diff --git a/engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md b/engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md
-index a4730894a..548d3cb89 100644
---- a/engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md
-+++ b/engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md
-@@ -95,10 +95,20 @@ Root causes (distinct; all three FAILs MATCH gcc with rotation OFF):
-    nested inside another (tighter "cond uses outer-header phi" is not
-    enough — copy-prop hides the phi dest). Test: `simd_crc_adler`.
- 
--Still open before default-ON: full corpus, 9-worst, nbody bit-identical,
--kernel 15/15, fuzz. Guard E is a correctness fence; nested inner loops
--no longer rotate (perf left on the table — a sound nested-rotate rewrite
--is future work).
-+Still open before default-ON: full corpus, 9-worst, kernel 15/15, fuzz.
-+Guard E is a correctness fence; nested inner loops no longer rotate (perf
-+left on the table — a sound nested-rotate rewrite is future work).
-+
-+Update 2026-09-10 — `nbody` is bit-identical at every opt level, so it is no
-+longer a blocker. The AArch64 `-O2`/`-O3` SIGSEGV it stood for was a register
-+copy deleted while still live on the loop path; it is fixed by the exact-CFG
-+alias fold described in
-+`FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md` §2-§3.
-+
-+Scope note: this task is about the **IR** pass `loop_rotate.rs`. Independently,
-+the ARM backend peephole rotates simple loops **by default**
-+(`rotate_simple_loops`, off only under `CCC_NO_LOOP_ROTATE`) — that is not what
-+this task gates.
- 
- ## Session 2026-09-01 — post-merge audit (`453cbea`, PRs #325–#328)
- 
-diff --git a/scripts/build_lccc_fast.sh b/scripts/build_lccc_fast.sh
-index a46b3a982..26499e272 100755
---- a/scripts/build_lccc_fast.sh
-+++ b/scripts/build_lccc_fast.sh
-@@ -84,6 +84,11 @@ printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
- if [ "${LCCC_ALLOW_WARNINGS:-0}" != "1" ]; then
-     rustflags="${rustflags:+$rustflags }-D warnings"
- fi
-+# Publish the resolved flags. RUSTFLAGS is part of cargo's fingerprint, so a
-+# later `cargo test` that passed a different value would rebuild the entire
-+# tree; `scripts/ci_local.sh` reads this file to reuse the build's cache.
-+mkdir -p target && printf '%s\n' "$rustflags" > target/lccc-rustflags
-+
- # Export unconditionally: RUSTFLAGS outranks every config file, so it is the
- # single authoritative source of rustc flags in all three link modes. (Only the
- # host target is built here; the i686 `-m32` link arg in .cargo/config.toml
-diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index 9784ef176..507b84421 100755
---- a/scripts/ci_local.sh
-+++ b/scripts/ci_local.sh
-@@ -20,6 +20,10 @@
- #   ./scripts/ci_local.sh --fast       # skip the two slowest oracles
- #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
+diff --git a/scripts/ensure_cross_toolchains.sh b/scripts/ensure_cross_toolchains.sh
+index 198428e..3f6b32d 100755
+--- a/scripts/ensure_cross_toolchains.sh
++++ b/scripts/ensure_cross_toolchains.sh
+@@ -28,10 +28,9 @@
+ #   aarch64-linux-gnu-gcc, aarch64-linux-gnu-as/ld, /usr/aarch64-linux-gnu
+ #   riscv64-linux-gnu-gcc, riscv64-linux-gnu-as/ld, /usr/riscv64-linux-gnu
  #
-+# Environment:
-+#   LCCC_TEST_REPEATS=N   run the unit-test suite N times (default 1). N > 1
-+#                         surfaces tests that depend on process-global state.
-+#
- # Exit status is non-zero if ANY gate fails, and every failure is repeated in
- # the summary at the end so a long log cannot hide one.
- set -u -o pipefail
-@@ -86,8 +90,30 @@ fi
- gate "rust-toolchain-selector" fast \
-     bash tests/regression/check_rust_toolchain_selector.sh
+-# plus the runtime needed to *run* the produced binaries under
+-# `qemu-aarch64-static` / `qemu-riscv64-static` (binfmt_misc is not registered
+-# on every host, so pass `-L /usr/<triplet>` explicitly, or use
+-# scripts/run_cross.sh).
++# plus the runtime needed to *run* the produced binaries under `qemu-aarch64`
++# / `qemu-riscv64` (binfmt_misc is not registered on every host, so pass
++# `-L /usr/<triplet>` explicitly, or use scripts/run_cross.sh).
+ #
+ # Usage:  scripts/ensure_cross_toolchains.sh [aarch64|riscv64|all]
+ # ============================================================================
+@@ -50,15 +49,33 @@ case "$want" in
+     all)           need_aarch64=1; need_riscv64=1 ;;
+     *) echo "usage: $0 [aarch64|riscv64|all]" >&2; exit 2 ;;
+ esac
++# Keep the requested set separate: the need_* flags below are cleared for
++# already-installed tools, but final verification must still check exactly the
++# targets requested by this invocation (not always both, and not neither).
++check_aarch64=$need_aarch64
++check_riscv64=$need_riscv64
  
--gate "cargo-test" slow \
--    cargo test --profile fastbuild --all-targets --locked -j 2
-+# The unit-test gate is what GitHub's required check runs on every PR, so it
-+# belongs in the fast set: a red PR has to be reproducible with --fast.
-+#
-+# The suite runs its tests on parallel threads, so a test that touches
-+# process-global state -- the environment, a static -- passes or fails
-+# depending on what its neighbours are doing. A single run hides that class of
-+# bug: PR #471 was red with a ~1-in-10 failure while every local single-shot
-+# run was green. Repeating the suite is the only way to see it, and it is
-+# cheap once the test binaries are built. Set LCCC_TEST_REPEATS to raise the
-+# count (CI itself runs it once).
-+cargo_test_repeated() {
-+    local flags="" n i
-+    # Reuse the flags the build gate resolved, or cargo rebuilds everything.
-+    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-+    n="${LCCC_TEST_REPEATS:-1}"
-+    for ((i = 1; i <= n; i++)); do
-+        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j 2; then
-+            printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
-+            return 1
+-if [[ $need_aarch64 == 1 ]] && have aarch64-linux-gnu-gcc && have aarch64-linux-gnu-as; then
++if [[ $need_aarch64 == 1 ]] \
++    && have aarch64-linux-gnu-gcc \
++    && have aarch64-linux-gnu-as \
++    && [[ -e /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 ]]; then
+     need_aarch64=0
+ fi
+-if [[ $need_riscv64 == 1 ]] && have riscv64-linux-gnu-gcc && have riscv64-linux-gnu-as; then
++if [[ $need_riscv64 == 1 ]] \
++    && have riscv64-linux-gnu-gcc \
++    && have riscv64-linux-gnu-as \
++    && [[ -e /usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1 ]]; then
+     need_riscv64=0
+ fi
+-if [[ $need_aarch64 == 0 && $need_riscv64 == 0 ]]; then
+-    echo "cross toolchains present: $(aarch64-linux-gnu-gcc --version 2>/dev/null | head -1) | $(riscv64-linux-gnu-gcc --version 2>/dev/null | head -1)"
++need_qemu=0
++if [[ $check_aarch64 == 1 ]] && ! have qemu-aarch64; then
++    need_qemu=1
++fi
++if [[ $check_riscv64 == 1 ]] && ! have qemu-riscv64; then
++    need_qemu=1
++fi
++if [[ $need_aarch64 == 0 && $need_riscv64 == 0 && $need_qemu == 0 ]]; then
++    echo "requested cross toolchain(s) already present"
+     exit 0
+ fi
+ 
+@@ -68,6 +85,12 @@ host_gcc_ver=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
+ [[ -n "$host_gcc_ver" ]] || host_gcc_ver=14
+ 
+ pkgs=()
++if [[ $need_qemu == 1 ]]; then
++    # qemu-user carries qemu-aarch64 and qemu-riscv64. It has no multilib
++    # conflict, but extracting it here keeps this bootstrap non-destructive and
++    # usable without mutating dpkg's package database.
++    pkgs+=("qemu-user")
++fi
+ if [[ $need_aarch64 == 1 ]]; then
+     pkgs+=(
+         "gcc-${host_gcc_ver}-aarch64-linux-gnu"
+@@ -130,15 +153,46 @@ if [[ -d "$work/usr" ]]; then
+         || echo "[cross] FATAL: cannot write /usr" >&2
+ fi
+ 
+-# A statically linked sysroot is not enough for qemu `-L`: the dynamic loader
+-# path must exist too. Report what is usable rather than assuming.
++# Versioned compiler packages intentionally omit the unversioned driver
++# symlinks supplied by the conflicting gcc-<triplet>-linux-gnu meta packages.
++# Recreate only missing links, pointing at the matching host-major tools.
++for t in aarch64 riscv64; do
++    if [[ $t == aarch64 && $check_aarch64 == 0 ]] \
++        || [[ $t == riscv64 && $check_riscv64 == 0 ]]; then
++        continue
++    fi
++    for tool in gcc gcc-ar gcc-nm gcc-ranlib; do
++        dst="/usr/bin/${t}-linux-gnu-${tool}"
++        src="${dst}-${host_gcc_ver}"
++        if [[ ! -e "$dst" && -x "$src" ]]; then
++            sudo ln -s "$(basename "$src")" "$dst" 2>/dev/null \
++                || ln -s "$(basename "$src")" "$dst" 2>/dev/null \
++                || true
 +        fi
 +    done
-+}
++done
 +
-+gate "cargo-test" fast cargo_test_repeated
- 
- # CCC_VALIDATE_SSA is what CI sets; without it the corpus does not verify SSA
- # form after every pass and a malformed-IR bug can hide behind a correct
++# A sysroot is not enough for qemu `-L`: both the emulator and dynamic loader
++# path must exist. Verify exactly the targets requested by this invocation.
+ rc=0
+ for t in aarch64 riscv64; do
++    if [[ $t == aarch64 && $check_aarch64 == 0 ]] \
++        || [[ $t == riscv64 && $check_riscv64 == 0 ]]; then
++        continue
++    fi
+     cc="${t}-linux-gnu-gcc"
+-    if have "$cc"; then
+-        echo "[cross] OK  $cc ($($cc --version | head -1))"
++    qemu="qemu-${t}"
++    if [[ $t == aarch64 ]]; then
++        loader=/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1
++    else
++        loader=/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1
++    fi
++    if have "$cc" && have "$qemu" && [[ -e $loader ]]; then
++        echo "[cross] OK  $cc ($($cc --version | head -1)); $qemu; $loader"
+     else
+-        echo "[cross] MISSING $cc"
++        have "$cc" || echo "[cross] MISSING $cc"
++        have "$qemu" || echo "[cross] MISSING $qemu"
++        [[ -e $loader ]] || echo "[cross] MISSING $loader"
+         rc=1
+     fi
+ done
 diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
-index 5d764d3c5..af78b5a98 100644
+index af78b5a..0153c4c 100644
 --- a/src/backend/arm/codegen/peephole.rs
 +++ b/src/backend/arm/codegen/peephole.rs
-@@ -617,6 +617,7 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -601,6 +601,8 @@ pub fn peephole_optimize(asm: String) -> String {
+ 
+     // Phase 1: Iterative local passes (up to 8 rounds)
+     let rotate = std::env::var("CCC_NO_LOOP_ROTATE").is_err();
++    let merge_blocks = std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
++    let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
+     let mut changed = true;
+     let mut rounds = 0;
+     while changed && rounds < 8 {
+@@ -617,7 +619,9 @@ pub fn peephole_optimize(asm: String) -> String {
          changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
          changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
          changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
-+        changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
+-        changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
++        if merge_blocks {
++            changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
++        }
          changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
          changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
          changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
-@@ -673,6 +674,7 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -674,8 +678,12 @@ pub fn peephole_optimize(asm: String) -> String {
              changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
              changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
              changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
-+            changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
-             changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+-            changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
+-            changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
++            if merge_blocks {
++                changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
++            }
++            if coalesce_entry {
++                changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
++            }
              changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
              changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
-@@ -737,6 +739,10 @@ fn is_function_boundary(line: &str) -> bool {
- /// not (a reader on a path that never ran the redefinition).
- struct Cfg {
-     block_of: Vec<usize>,
-+    /// First line index of every block.
-+    starts: Vec<usize>,
-+    /// Label introducing a block; empty when the block starts without one.
-+    labels: Vec<String>,
-     succs: Vec<Vec<usize>>,
-     /// Dominator bitsets: `dom[b]` has bit `d` set iff `d` dominates `b`.
-     dom: Vec<Vec<u64>>,
-@@ -771,10 +777,13 @@ impl Cfg {
-             block_of[i] = starts.len() - 1;
+             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
+@@ -1330,6 +1338,7 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
          }
-         let nb = starts.len();
-+        let mut labels: Vec<String> = vec![String::new(); nb];
-         let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
-         for i in 0..n {
-             if kinds[i] == LineKind::Label {
--                label_block.insert(lines[i].trim().trim_end_matches(':'), block_of[i]);
-+                let name = lines[i].trim().trim_end_matches(':');
-+                label_block.insert(name, block_of[i]);
-+                labels[block_of[i]] = (*name).to_string();
+     }
+     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
++    let mut falls_through = vec![false; nb];
+     let mut unknown_out = vec![false; nb];
+     for b in 0..nb {
+         let e = end(b);
+@@ -1340,6 +1349,7 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
+         if t == starts[b] {
+             if b + 1 < nb {
+                 succs[b].push(b + 1);
++                falls_through[b] = true;
+             }
+             continue;
+         }
+@@ -1362,11 +1372,13 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
+                 }
+                 if b + 1 < nb {
+                     succs[b].push(b + 1);
++                    falls_through[b] = true;
+                 }
+             }
+             _ => {
+                 if b + 1 < nb {
+                     succs[b].push(b + 1);
++                    falls_through[b] = true;
+                 }
              }
          }
-         let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
-@@ -884,6 +893,8 @@ impl Cfg {
-         }
-         Some(Cfg {
-             block_of,
-+            starts: starts.clone(),
-+            labels,
-             succs,
-             dom,
-             words,
-@@ -1190,6 +1201,309 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
-     changed
- }
+@@ -1442,6 +1454,16 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
+                 if is_function_boundary(&lines[starts[dup]]) {
+                     continue;
+                 }
++                // Equal instruction text is not enough when execution falls
++                // through: the label following each body is part of that
++                // block's behaviour.  Redirecting `.Ldup` to `.Lkeep` would
++                // otherwise execute keep's successor (the expat O0 failure
++                // merged two identical `ptr++` blocks whose continuations
++                // were different).  Explicitly terminated equal bodies name
++                // their successor in the body text and need no extra check.
++                if (falls_through[keep] || falls_through[dup]) && succs[keep] != succs[dup] {
++                    continue;
++                }
+                 let same_preds = {
+                     let mut a = preds[keep].clone();
+                     let mut b = preds[dup].clone();
+@@ -5059,11 +5081,26 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
+     let mut edits: Vec<(usize, String, usize, usize)> = Vec::new();
  
-+/// Merge identical basic blocks.
-+///
-+/// Ported from the x86 backend's `identical_blocks` pass — the most polished of
-+/// the four.  Two blocks with the same instruction text and the same set of
-+/// predecessor blocks are interchangeable: the predecessors are single basic
-+/// blocks, so their register state on every outgoing edge is identical, and
-+/// equal predecessor sets therefore imply equal live-in state.  Keeping one
-+/// copy and retargeting the rest is then semantics-preserving.
-+///
-+/// AArch64 needs less than x86 here: there are no EFLAGS, so the x86 pass's
-+/// "not flag-dependent at entry" condition has no counterpart.  What remains
-+/// is enforced:
-+///   * the deleted block must be entered **only by explicit branches** — a
-+///     fall-through edge cannot be retargeted by renaming a label, and after
-+///     deletion the preceding block would fall into whatever now follows it;
-+///   * a function's entry block is never deleted (its label is the symbol);
-+///   * both blocks must be in the same function.
-+///
-+/// The x86 pass also records the trap that empty predecessor sets must not be
-+/// treated as equal: a block can look orphaned only because its fall-through
-+/// edge was missed, and merging two such "orphans" deleted a live block.  Here
-+/// the predecessor sets come from the CFG that already models fall-through, and
-+/// empty sets are rejected outright.
-+///
-+/// One merge per call: rewriting the text invalidates the CFG, so the pass
-+/// returns and the driver's fixpoint loop re-runs it.
-+/// True when a block defines every register it reads before the read, so its
-+/// result cannot depend on the state it is entered with.  Two identical blocks
-+/// that are both live-in independent are interchangeable **regardless of their
-+/// predecessors** — the predecessor-set equality that `merge_identical_blocks`
-+/// otherwise requires exists only to guarantee equal live-in state, which is
-+/// vacuous here.  Blocks containing a call or a return are excluded: a call
-+/// reads the argument registers implicitly and a return reads x0-x7, and
-+/// neither can be proven defined at the block's entry.
-+fn block_is_live_in_independent(
-+    lines: &[String],
-+    kinds: &[LineKind],
-+    start: usize,
-+    end: usize,
-+) -> bool {
-+    let mut defined: u64 = 0;
-+    for k in start..end {
-+        match kinds[k] {
-+            LineKind::Nop | LineKind::Directive | LineKind::Label => {}
-+            LineKind::Call | LineKind::Ret => return false,
-+            _ => {}
-+        }
-+        let line = &lines[k];
-+        let (ireads, iwrites) = classify_implicit_operands_a64(line);
-+        if ireads & !defined != 0 {
-+            return false;
-+        }
-+        let out = written_gp_register(line, kinds[k]);
-+        let mentions_dst_once = match out {
-+            Some(r) => {
-+                let xn = xreg_name(r);
-+                let wn = wreg_name(r);
-+                line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+                    .filter(|t| *t == xn || *t == wn)
-+                    .count()
-+                    == 1
-+            }
-+            None => false,
-+        };
-+        for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-+            let reg = if let Some(rest) = tok.strip_prefix('x') {
-+                rest.parse::<u8>().ok()
-+            } else if let Some(rest) = tok.strip_prefix('w') {
-+                rest.parse::<u8>().ok()
-+            } else {
-+                None
-+            };
-+            let Some(r) = reg else { continue };
-+            if r > 30 {
-+                continue;
-+            }
-+            if mentions_dst_once && out == Some(r) {
-+                continue; // sole mention is the definition
-+            }
-+            if defined & (1u64 << r) == 0 {
-+                return false;
-+            }
-+        }
-+        if let Some(r) = out {
-+            defined |= 1u64 << r;
-+        }
-+        defined |= iwrites;
-+    }
-+    true
-+}
-+
-+fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    // A block model that never fails.  `Cfg::build` bails out for the whole
-+    // file on an indirect `br xN` — which is exactly what a switch's jump table
-+    // is — and merging must still work in the rest of such a function.  Blocks
-+    // with an unresolvable out-edge (and everything they reach) are simply
-+    // marked unusable instead of poisoning the file.
-+    let mut starts: Vec<usize> = vec![0];
-+    for i in 0..n {
-+        let after_transfer = i != 0
-+            && matches!(
-+                kinds[i - 1],
-+                LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
-+            );
-+        if i != 0 && (kinds[i] == LineKind::Label || after_transfer) {
-+            starts.push(i);
-+        }
-+    }
-+    let nb = starts.len();
-+    if nb < 2 {
-+        return false;
-+    }
-+    let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
-+    let mut block_of = vec![0usize; n];
-+    for b in 0..nb {
-+        for k in starts[b]..end(b) {
-+            block_of[k] = b;
-+        }
-+    }
-+    let mut labels: Vec<String> = vec![String::new(); nb];
-+    let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
-+    for i in 0..n {
-+        if kinds[i] == LineKind::Label {
-+            let name = lines[i].trim().trim_end_matches(':');
-+            label_block.insert(name, block_of[i]);
-+            labels[block_of[i]] = (*name).to_string();
-+        }
-+    }
-+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
-+    let mut unknown_out = vec![false; nb];
-+    for b in 0..nb {
-+        let e = end(b);
-+        let mut t = e;
-+        while t > starts[b] && kinds[t - 1] == LineKind::Nop {
-+            t -= 1;
-+        }
-+        if t == starts[b] {
-+            if b + 1 < nb {
-+                succs[b].push(b + 1);
-+            }
+     for &(h, j) in &regions {
+-        // Region-level hazards: calls, returns, or branches to unknown labels.
++        // Region-level hazards: calls, returns, branches to unknown labels, or
++        // an escaped/materialised stack address.  The latter can read a slot
++        // through a derived base (`add x10, sp, #280; ldp ..., [x10]`), which
++        // is invisible to an exact `[sp,#280]` textual census.  Sinking the
++        // stores that initialise such an object past the loop made struct_copy
++        // consume stale zeros.  A precise region alias graph is possible, but
++        // until then any sp-derived pointer makes store sinking ineligible.
+         let mut region_bad = false;
+         for p in h..=j {
+             let t = &v[p].2;
+-            if t.starts_with("bl ") || t.starts_with("blr ") || t == "ret" {
++            let materializes_sp = t
++                .strip_prefix("mov ")
++                .and_then(|ops| ops.split_once(", "))
++                .is_some_and(|(_, src)| src.trim() == "sp")
++                || t.strip_prefix("add ")
++                    .or_else(|| t.strip_prefix("sub "))
++                    .and_then(|ops| ops.split_once(", "))
++                    .and_then(|(_, rest)| rest.split_once(", "))
++                    .is_some_and(|(base, _)| base.trim() == "sp");
++            if materializes_sp || t.starts_with("bl ") || t.starts_with("blr ") || t == "ret" {
+                 region_bad = true;
+                 break;
+             }
+@@ -5946,12 +5983,40 @@ fn hoist_loop_invariant_remats(
+             }
+         };
+         let target = target.as_str();
++        // Process the last backedge to this header.  Treating an earlier
++        // backedge as the loop end misses later entries that jump straight to
++        // the label and therefore bypass the copy inserted immediately before
++        // it (nbody -O2 hoisted an sp-slot base for the first of two
++        // backedges, leaving the second entry with a stale x1).
++        if ((i + 1)..n).any(|m| branch_targets(&lines[m], kinds[m], target)) {
++            i += 1;
 +            continue;
 +        }
-+        let last = t - 1;
-+        match kinds[last] {
-+            LineKind::Ret => {}
-+            LineKind::Branch => {
-+                let text = lines[last].trim();
-+                let tgt = text.split_whitespace().next_back();
-+                match tgt.and_then(|t| label_block.get(t).copied()) {
-+                    Some(tb) => succs[b].push(tb),
-+                    None => unknown_out[b] = true, // `br xN`: jump table
-+                }
-+            }
-+            LineKind::CondBranch | LineKind::CmpBranch => {
-+                let tgt = lines[last].trim().split_whitespace().next_back();
-+                match tgt.and_then(|t| label_block.get(t).copied()) {
-+                    Some(tb) => succs[b].push(tb),
-+                    None => unknown_out[b] = true,
-+                }
-+                if b + 1 < nb {
-+                    succs[b].push(b + 1);
-+                }
-+            }
-+            _ => {
-+                if b + 1 < nb {
-+                    succs[b].push(b + 1);
-+                }
-+            }
-+        }
-+    }
-+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
-+    for b in 0..nb {
-+        for &s in &succs[b] {
-+            preds[s].push(b);
-+        }
-+    }
-+    // A block reached from an unresolvable edge has an incomplete predecessor
-+    // set, so it must not take part in a merge.
-+    let mut unusable = vec![false; nb];
-+    for b in 0..nb {
-+        if unknown_out[b] {
-+            unusable[b] = true;
-+        }
-+    }
-+    for b in 0..nb {
-+        if preds[b].iter().any(|&p| unknown_out[p]) {
-+            unusable[b] = true;
-+        }
-+    }
-+    // Body text: instructions only, so labels, directives and alignment are
-+    // transparent (an alignment directive must not make two blocks differ).
-+    let mut body: Vec<String> = Vec::with_capacity(nb);
-+    for b in 0..nb {
-+        let mut t = String::new();
-+        for k in starts[b]..end(b) {
-+            if matches!(
-+                kinds[k],
+         let Some(top) = (0..i).rev().find(|&k| {
+             kinds[k] == LineKind::Label && lines[k].trim().trim_end_matches(':') == target
+         }) else {
+             i += 1;
+             continue;
+         };
++        // There must be a provable first entry that executes code immediately
++        // before the header (fall-through) or an earlier branch we can seed.
++        // A header preceded by an unconditional branch can be reached for the
++        // first time from a side entry later in the textual region; placing a
++        // copy before its label is then dead code (nbody's `.LBB14`).
++        let prev_real = (0..top).rev().find(|&m| {
++            !matches!(
++                kinds[m],
 +                LineKind::Nop | LineKind::Directive | LineKind::Label
-+            ) {
-+                continue;
-+            }
-+            t.push_str(lines[k].trim());
-+            t.push('\n');
-+        }
-+        body.push(t);
-+    }
-+    let mut func_of = vec![0usize; nb];
-+    {
-+        let mut f = 0usize;
-+        for b in 0..nb {
-+            let st = starts[b];
-+            if kinds[st] == LineKind::Label && is_function_boundary(&lines[st]) {
-+                f += 1;
-+            }
-+            func_of[b] = f;
-+        }
-+    }
-+    let mut groups: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
-+    for b in 0..nb {
-+        if unusable[b] || body[b].trim().is_empty() {
++            )
++        });
++        let has_fallthrough_entry =
++            prev_real.is_some_and(|m| !matches!(kinds[m], LineKind::Branch | LineKind::Ret));
++        let has_earlier_entry_branch =
++            (0..top).any(|m| branch_targets(&lines[m], kinds[m], target));
++        if !has_fallthrough_entry && !has_earlier_entry_branch {
++            i += 1;
 +            continue;
 +        }
-+        groups.entry(body[b].as_str()).or_default().push(b);
+ 
+         // ── loop validity ──
+         // Entry edges into the loop top are the fallthrough and branches
+@@ -6137,6 +6202,16 @@ fn hoist_loop_invariant_remats(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn identical_blocks_with_different_fallthroughs_do_not_merge() {
++        let asm = "f:\n    cbz x0, .Ldup\n.Lkeep:\n    mov x2, #1\n.Lkeep_next:\n    mov x3, #11\n    ret\n.Ldup:\n    mov x2, #1\n.Ldup_next:\n    mov x3, #22\n    ret\n";
++        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
++        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
++        let n = lines.len();
++        assert!(!merge_identical_blocks(&mut lines, &mut kinds, n));
++        assert_eq!(kinds[7], LineKind::Label, "duplicate block was deleted");
 +    }
-+    for members in groups.values() {
-+        if members.len() < 2 {
-+            continue;
-+        }
-+        for (i, &keep) in members.iter().enumerate() {
-+            for &dup in members.iter().skip(i + 1) {
-+                let from = labels[dup].clone();
-+                let to = labels[keep].clone();
-+                if from.is_empty() || to.is_empty() || keep == dup {
-+                    continue;
-+                }
-+                if func_of[keep] != func_of[dup] {
-+                    continue;
-+                }
-+                if is_function_boundary(&lines[starts[dup]]) {
-+                    continue;
-+                }
-+                let same_preds = {
-+                    let mut a = preds[keep].clone();
-+                    let mut b = preds[dup].clone();
-+                    a.sort_unstable();
-+                    a.dedup();
-+                    b.sort_unstable();
-+                    b.dedup();
-+                    !a.is_empty() && a == b // never trust two empty sets
-+                };
-+                if !same_preds
-+                    && !(block_is_live_in_independent(lines, kinds, starts[keep], end(keep))
-+                        && block_is_live_in_independent(lines, kinds, starts[dup], end(dup)))
-+                {
-+                    continue;
-+                }
-+                // `dup` must not be entered by fall-through: that edge cannot
-+                // be retargeted by renaming a label.
-+                let mut fallthrough_in = false;
-+                for &p in &preds[dup] {
-+                    let e = end(p);
-+                    let mut t = e;
-+                    while t > starts[p] && kinds[t - 1] == LineKind::Nop {
-+                        t -= 1;
-+                    }
-+                    let term = if t > starts[p] {
-+                        kinds[t - 1]
-+                    } else {
-+                        LineKind::Nop
-+                    };
-+                    if !matches!(term, LineKind::Branch | LineKind::Ret) && p + 1 == dup {
-+                        fallthrough_in = true;
-+                        break;
-+                    }
-+                }
-+                if fallthrough_in {
-+                    continue;
-+                }
-+                for k in 0..n {
-+                    if !matches!(
-+                        kinds[k],
-+                        LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
-+                    ) {
-+                        continue;
-+                    }
-+                    let mut parts: Vec<&str> = lines[k].split_whitespace().collect();
-+                    let last = parts.len() - 1;
-+                    if parts[last] == from {
-+                        parts[last] = to.as_str();
-+                        lines[k] = parts.join(" ");
-+                        kinds[k] = classify_line(&lines[k]);
-+                    }
-+                }
-+                for k in starts[dup]..end(dup) {
-+                    kinds[k] = LineKind::Nop;
-+                }
-+                return true;
-+            }
-+        }
-+    }
-+    false
-+}
 +
- fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-     fn mentions(line: &str, reg: u8) -> bool {
-         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+     #[test]
+     fn test_classify_store() {
+         assert!(matches!(
+@@ -6377,6 +6452,28 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_invar_hoist_waits_for_last_backedge() {
++        let input = concat!(
++            "main:\n",
++            ".Ltop:\n",
++            "    ldr x1, [sp, #32]\n",
++            "    add x2, x1, x3\n",
++            "    cmp x20, #5\n",
++            "    b.lt .Ltop\n",
++            "    mov x1, x4\n",
++            "    cmp x21, #5\n",
++            "    b.lt .Ltop\n",
++            "    ret\n",
++        );
++        let result = peephole_optimize(input.to_string());
++        let body = result.split(".Ltop:\n").nth(1).unwrap_or("");
++        assert!(
++            body.starts_with("    ldr x1, [sp, #32]"),
++            "earlier backedge caused a bypassable hoist:\n{result}"
++        );
++    }
++
+     #[test]
+     fn test_invar_hoist_blocked_by_in_loop_store() {
+         // The loop stores into the slot: the load must stay.
+@@ -7491,6 +7588,26 @@ f:
+         assert!(st > be, "store after backedge:\n{}", result);
+     }
+ 
++    #[test]
++    fn test_sink_blocked_by_sp_derived_alias() {
++        let input = "\
++f:
++.Lbody:
++    fmul d16, d16, d1
++    str d16, [sp, #280]
++    add x10, sp, #280
++    ldr d0, [x10]
++    cmp w20, w21
++    b.le .Lbody
++    ret
++";
++        let mut lines: Vec<String> = input.lines().map(String::from).collect();
++        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
++        let n = lines.len();
++        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
++        assert!(matches!(kinds[3], LineKind::MemOther));
++    }
++
+     #[test]
+     fn test_sink_blocked_when_slot_read_in_loop() {
+         let input = "\
 diff --git a/src/backend/riscv/codegen/peephole.rs b/src/backend/riscv/codegen/peephole.rs
-index 3b853131c..66e47821a 100644
+index 66e4782..7bef7be 100644
 --- a/src/backend/riscv/codegen/peephole.rs
 +++ b/src/backend/riscv/codegen/peephole.rs
-@@ -513,6 +513,8 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -41,6 +41,10 @@
+ //!
+ //! 8. **Global dead store elimination**: Removes stores to stack slots that
+ //!    are never loaded anywhere in the function.
++//!
++//! 9. **Range-safe branch-over-jump fusion**: Inverts a conditional branch
++//!    over an unconditional jump when the new B-type target is conservatively
++//!    proven to fit its ±4 KiB range.
+ 
+ // ── Line classification types ────────────────────────────────────────────────
+ 
+@@ -473,6 +477,30 @@ fn label_name(line: &str) -> Option<&str> {
+     trimmed.strip_suffix(':')
+ }
+ 
++/// Invert a RISC-V conditional branch mnemonic.
++fn invert_branch_mnemonic(op: &str) -> Option<&'static str> {
++    match op {
++        "beq" => Some("bne"),
++        "bne" => Some("beq"),
++        "blt" => Some("bge"),
++        "bge" => Some("blt"),
++        "bltu" => Some("bgeu"),
++        "bgeu" => Some("bltu"),
++        "beqz" => Some("bnez"),
++        "bnez" => Some("beqz"),
++        _ => None,
++    }
++}
++
++/// Parse a conditional branch into (mnemonic, operands before target, target).
++fn branch_parts(line: &str) -> Option<(&str, &str, &str)> {
++    let trimmed = line.trim();
++    let (op, args) = trimmed.split_once(' ')?;
++    invert_branch_mnemonic(op)?;
++    let comma = args.rfind(',')?;
++    Some((op, args[..comma].trim_end(), args[comma + 1..].trim()))
++}
++
+ /// Parse the destination register from an ALU-style instruction.
+ /// RISC-V ALU instructions have the form: `mnemonic rd, rs1, rs2/imm`
+ /// The destination is the first operand.
+@@ -502,6 +530,9 @@ pub fn peephole_optimize(asm: String) -> String {
+         return asm;
+     }
+ 
++    let merge_blocks = std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
++    let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
++
+     // Phase 1: Iterative local passes (up to 8 rounds)
+     let mut changed = true;
+     let mut rounds = 0;
+@@ -510,20 +541,22 @@ pub fn peephole_optimize(asm: String) -> String {
+         changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
+         changed |= eliminate_redundant_jumps(&lines, &mut kinds, n);
+         changed |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
++        changed |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
          changed |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
          changed |= eliminate_self_moves(&mut kinds, n);
          changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
-+        changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
-+        changed |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+-        changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
+-        changed |= coalesce_entry_copies(&mut lines, &mut kinds, n);
++        if merge_blocks {
++            changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
++        }
++        if coalesce_entry {
++            changed |= coalesce_entry_copies(&mut lines, &mut kinds, n);
++        }
          changed |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
          rounds += 1;
      }
-@@ -542,6 +544,8 @@ pub fn peephole_optimize(asm: String) -> String {
+ 
+-    // NOTE: Branch-over-branch optimization is not safe on RISC-V because
+-    // B-type branches have ±4KB range while the `jump label, t6` instruction
+-    // (auipc+jalr) has unlimited range. Inverting a branch to directly target
+-    // a far label would cause R_RISCV_JAL relocation truncation errors in
+-    // large functions. The codegen already uses the near/far pattern correctly.
++    // Branch-over-jump fusion above is deliberately range-gated: B-type
++    // branches reach only ±4 KiB, unlike the far `jump` pseudo.
+ 
+     // Phase 2: Global passes (run once)
+     let mut global_changed = false;
+@@ -541,11 +574,16 @@ pub fn peephole_optimize(asm: String) -> String {
+             changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
+             changed2 |= eliminate_redundant_jumps(&lines, &mut kinds, n);
+             changed2 |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
++            changed2 |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
              changed2 |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
              changed2 |= eliminate_self_moves(&mut kinds, n);
              changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
-+            changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
-+            changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+-            changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
+-            changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
++            if merge_blocks {
++                changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
++            }
++            if coalesce_entry {
++                changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
++            }
              changed2 |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
              changed2 |= eliminate_dead_reg_moves(&lines, &mut kinds, n);
              rounds2 += 1;
-@@ -891,6 +895,435 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
- // register, we can redirect to `mv C, B` and eliminate the first mv if A
- // is not used elsewhere.
+@@ -686,6 +724,97 @@ fn rewrite_far_jumps_to_near(lines: &mut [String], kinds: &mut [LineKind], n: us
+     changed
+ }
  
-+/// Instructions whose effects are not fully described by their textual
-+/// operands: system, atomic and memory-ordering traffic.  A register rename
-+/// cannot reach into any of them, so a candidate crossing one is rejected.
-+fn has_unmodelled_effects(line: &str) -> bool {
-+    let m = line.trim().split_whitespace().next().unwrap_or("");
-+    matches!(
-+        m,
-+        "ecall"
-+            | "ebreak"
-+            | "fence"
-+            | "fence.i"
-+            | "sfence.vma"
-+            | "wfi"
-+            | "mret"
-+            | "sret"
-+            | "uret"
-+            | "csrr"
-+            | "csrw"
-+            | "csrs"
-+            | "csrc"
-+            | "csrrw"
-+            | "csrrs"
-+            | "csrrc"
-+            | "csrrwi"
-+            | "csrrsi"
-+            | "csrrci"
-+    ) || m.starts_with("lr.")
-+        || m.starts_with("sc.")
-+        || m.starts_with("amo")
-+}
-+
-+/// Whole-function register-copy coalescing for the entry shuffle.
-+///
-+/// Ported from the ARM backend, which ports the x86 pass
-+/// (`x86/codegen/peephole/passes/copy_coalesce.rs`).  RISC-V had no coalescing
-+/// at all, so its functions paid for an entry shuffle both other backends
-+/// delete: the register allocator hands parameters homes that do not match the
-+/// a0-a7 registers they arrive in, so functions open with `mv rD, rS` copies
-+/// whose destination really is live for the rest of the function — no local
-+/// pass can delete those.  Coalescing renames the destination onto the source
-+/// everywhere after the copy and drops the copy.
-+///
-+/// Legality, all required:
-+///  1. The copy sits in the straight-line entry run (no label, jump, branch,
-+///     call or return before it), so every earlier line runs exactly once and
-+///     cannot be re-entered through a back edge.
-+///  2. `src` is mentioned nowhere else in the function — no later write
-+///     clobbers the coalesced value and no other live range is disturbed.  A
-+///     parameter's arrival in `src` is implicit, not a mention.
-+///  3. After the copy, `dst` has no unrenamable reader or writer: no implicit
-+///     operand, no `ret` with `dst` in a0-a7 (the return-value registers), no
-+///     call while the value lives in a caller-saved register *and is still used
-+///     afterwards*, and no unmodelled instruction.  A far `jump` uses t6 as its
-+///     scratch, so t6 is never renamed across one.
-+///  4. s0 (frame pointer), ra and sp are never renamed.
-+fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    fn mentions(line: &str, reg: u8) -> bool {
-+        let name = reg_name(reg);
-+        !name.is_empty()
-+            && line
-+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+                .any(|tok| tok == name)
-+    }
-+    /// Caller-saved: clobbered by `call`.  t0-t6, the unnamed temporaries,
-+    /// and a0-a7.
-+    fn caller_saved(reg: u8) -> bool {
-+        reg <= 9 || (REG_A0..=REG_A7).contains(&reg)
-+    }
-+    fn renamable(reg: u8) -> bool {
-+        (reg as usize) < NUM_REGS && reg != REG_S0 && reg != REG_RA && reg != REG_SP
-+    }
-+    if n == 0 {
++// ── Branch-over-jump fusion ──────────────────────────────────────────────────
++//
++//     b<cond> rs..., .Lskip       b<!cond> rs..., .Ltarget
++//     j/jump .Ltarget       ->
++// .Lskip:                    .Lskip:
++//
++// This is the RV counterpart of ARM's branch-over-branch pass, but RV B-type
++// branches have only a ±4 KiB reach.  Count every intervening source
++// instruction as 32 bytes (the worst expansion of the pseudos emitted here)
++// and retain a generous 1 KiB linker/relaxation margin.  The deliberately
++// conservative bound trades a few missed folds for relocation-proof output.
++fn fuse_branch_over_jump(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
++    if std::env::var("CCC_NO_BRANCH_OVER_JUMP").is_ok() {
 +        return false;
 +    }
-+    let mut starts: Vec<usize> = (0..n)
-+        .filter(|&i| {
-+            lines[i].ends_with(':')
-+                && !lines[i].starts_with('.')
-+                && !lines[i].starts_with(char::is_whitespace)
-+        })
-+        .collect();
-+    if starts.is_empty() {
-+        return false;
-+    }
-+    starts.push(n);
 +    let mut changed = false;
-+    for w in 0..starts.len() - 1 {
-+        let (fstart, fend) = (starts[w], starts[w + 1]);
-+        let mut eend = fend;
-+        for k in fstart + 1..fend {
-+            if matches!(
-+                kinds[k],
-+                LineKind::Label
-+                    | LineKind::Jump
-+                    | LineKind::Branch
-+                    | LineKind::Call
-+                    | LineKind::Ret
-+            ) {
-+                eend = k;
++    for i in 0..n {
++        if kinds[i] != LineKind::Branch {
++            continue;
++        }
++        let mut j = i + 1;
++        while j < n && kinds[j] == LineKind::Nop {
++            j += 1;
++        }
++        if j >= n || kinds[j] != LineKind::Jump {
++            continue;
++        }
++        let mut k = j + 1;
++        while k < n && kinds[k] == LineKind::Nop {
++            k += 1;
++        }
++        if k >= n || kinds[k] != LineKind::Label {
++            continue;
++        }
++        let Some((op, operands, skip)) = branch_parts(&lines[i]) else {
++            continue;
++        };
++        if label_name(&lines[k]) != Some(skip) {
++            continue;
++        }
++        let Some(target) = jump_target(&lines[j]) else {
++            continue;
++        };
++        // Only local labels in this function are candidates.  Find the unique
++        // target without crossing a global symbol (a function boundary).
++        let mut target_pos = None;
++        let (lo, hi) = if target.starts_with(".L") {
++            (0, n)
++        } else {
++            continue;
++        };
++        for m in lo..hi {
++            if m != i && kinds[m] == LineKind::Label && label_name(&lines[m]) == Some(target) {
++                target_pos = Some(m);
 +                break;
 +            }
 +        }
-+        let mut i = fstart + 1;
-+        while i < eend {
-+            i += 1;
-+            let LineKind::Move { dst, src } = kinds[i - 1] else {
-+                continue;
-+            };
-+            let i = i - 1;
-+            if dst == src || !renamable(dst) || !renamable(src) {
-+                continue;
-+            }
-+            let mut ok = true;
-+            for k in fstart..fend {
-+                if k == i || kinds[k] == LineKind::Nop {
-+                    continue;
-+                }
-+                if mentions(&lines[k], src) {
-+                    ok = false;
-+                    break;
-+                }
-+            }
-+            if ok {
-+                for k in i + 1..fend {
-+                    match kinds[k] {
-+                        LineKind::Nop | LineKind::Directive | LineKind::Label => {}
-+                        LineKind::Ret => {
-+                            if (REG_A0..=REG_A7).contains(&dst) {
-+                                ok = false;
-+                                break;
-+                            }
-+                        }
-+                        LineKind::Jump => {
-+                            if dst == REG_T6 {
-+                                ok = false;
-+                                break;
-+                            }
-+                        }
-+                        LineKind::Call => {
-+                            if caller_saved(src)
-+                                && (k + 1..fend)
-+                                    .any(|m| kinds[m] != LineKind::Nop && mentions(&lines[m], dst))
-+                            {
-+                                ok = false;
-+                                break;
-+                            }
-+                        }
-+                        _ => {}
-+                    }
-+                    if !ok || has_unmodelled_effects(&lines[k]) {
-+                        ok = false;
-+                        break;
-+                    }
-+                    let (ireads, iwrites) = classify_implicit_operands_rv(&lines[k]);
-+                    if (ireads | iwrites) & (1u64 << dst) != 0 {
-+                        ok = false;
-+                        break;
-+                    }
-+                }
-+            }
-+            if !ok {
-+                continue;
-+            }
-+            let d = reg_name(dst).to_string();
-+            let s = reg_name(src).to_string();
-+            for k in i + 1..fend {
-+                if kinds[k] == LineKind::Nop {
-+                    continue;
-+                }
-+                let new = crate::backend::peephole_common::replace_whole_word(&lines[k], &d, &s);
-+                if new != lines[k] {
-+                    lines[k] = new;
-+                    kinds[k] = classify_line(&lines[k]);
-+                }
-+            }
-+            kinds[i] = LineKind::Nop;
-+            changed = true;
-+            break; // the rename changes the picture: re-scan this function
++        let Some(tp) = target_pos else { continue };
++        let a = i.min(tp);
++        let b = i.max(tp);
++        if (a + 1..b).any(|m| {
++            (kinds[m] == LineKind::Label
++                && !label_name(&lines[m]).unwrap_or("").starts_with('.'))
++                // `.space`, `.rept`, inline `.insn`, and large alignments can
++                // contribute an unbounded number of bytes that a line census
++                // cannot estimate. Fail closed rather than risk B-range
++                // relocation overflow.
++                || kinds[m] == LineKind::Directive
++        }) {
++            continue;
 +        }
++        let insns = (a..=b)
++            .filter(|&m| {
++                !matches!(
++                    kinds[m],
++                    LineKind::Nop | LineKind::Label | LineKind::Directive
++                )
++            })
++            .count();
++        if insns.saturating_mul(32) > 3_000 {
++            continue;
++        }
++        let inv = invert_branch_mnemonic(op).unwrap();
++        lines[i] = format!("    {} {}, {}", inv, operands, target);
++        kinds[i] = LineKind::Branch;
++        kinds[j] = LineKind::Nop;
++        changed = true;
 +    }
 +    changed
 +}
 +
-+/// True when a block defines every register it reads before the read, so its
-+/// result cannot depend on the state it is entered with.  Two identical blocks
-+/// that are both live-in independent are interchangeable regardless of their
-+/// predecessors.  Calls and returns are excluded: a call reads the argument
-+/// registers implicitly and a `ret` reads a0-a7.
-+fn block_is_live_in_independent(
-+    lines: &[String],
-+    kinds: &[LineKind],
-+    start: usize,
-+    end: usize,
-+) -> bool {
-+    let mut defined: u64 = 0;
-+    for k in start..end {
-+        match kinds[k] {
-+            LineKind::Nop | LineKind::Directive | LineKind::Label => continue,
-+            LineKind::Call | LineKind::Ret => return false,
-+            _ => {}
-+        }
-+        let line = &lines[k];
-+        let (ireads, iwrites) = classify_implicit_operands_rv(line);
-+        if ireads & !defined != 0 {
-+            return false;
-+        }
-+        let out = sext_producing_def(line, kinds[k]).map(|(d, _)| d);
-+        let mentions_dst_once = match out {
-+            Some(r) => {
-+                let name = reg_name(r);
-+                !name.is_empty()
-+                    && line
-+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+                        .filter(|t| *t == name)
-+                        .count()
-+                        == 1
-+            }
-+            None => false,
-+        };
-+        for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-+            let r = parse_reg(tok);
-+            if r == REG_NONE || (r as usize) >= NUM_REGS {
-+                continue;
-+            }
-+            if mentions_dst_once && out == Some(r) {
-+                continue; // sole mention is the definition
-+            }
-+            if defined & (1u64 << r) == 0 {
-+                return false;
-+            }
-+        }
-+        if let Some(r) = out {
-+            defined |= 1u64 << r;
-+        }
-+        defined |= iwrites;
-+    }
-+    true
-+}
-+
-+/// Merge identical basic blocks.
-+///
-+/// Ported from the ARM backend, which ports it from x86's `identical_blocks`.
-+/// Two blocks with the same instruction text are interchangeable when either
-+/// their predecessor sets are equal (so the live-in state is identical) or both
-+/// are live-in independent (so the live-in state is irrelevant).  The deleted
-+/// block must be entered only by explicit jumps — a fall-through edge cannot be
-+/// retargeted by renaming a label — and a function's entry block is never
-+/// deleted.  Empty predecessor sets are never treated as equal: a block can
-+/// look orphaned only because an edge was missed.
-+fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    let mut starts: Vec<usize> = vec![0];
-+    for i in 0..n {
-+        let after_transfer = i != 0
-+            && matches!(
-+                kinds[i - 1],
-+                LineKind::Jump | LineKind::Branch | LineKind::Ret
-+            );
-+        if i != 0 && (kinds[i] == LineKind::Label || after_transfer) {
-+            starts.push(i);
-+        }
-+    }
-+    let nb = starts.len();
-+    if nb < 2 {
-+        return false;
-+    }
-+    let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
-+    let mut block_of = vec![0usize; n];
-+    for b in 0..nb {
-+        for k in starts[b]..end(b) {
-+            block_of[k] = b;
-+        }
-+    }
-+    let mut labels: Vec<String> = vec![String::new(); nb];
-+    let mut label_block: std::collections::HashMap<&str, usize> =
-+        std::collections::HashMap::default();
-+    for i in 0..n {
-+        if kinds[i] == LineKind::Label {
-+            let name = lines[i].trim().trim_end_matches(':');
-+            label_block.insert(name, block_of[i]);
-+            labels[block_of[i]] = (*name).to_string();
-+        }
-+    }
-+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
-+    let mut unknown_out = vec![false; nb];
-+    for b in 0..nb {
-+        let e = end(b);
-+        let mut t = e;
-+        while t > starts[b] && kinds[t - 1] == LineKind::Nop {
-+            t -= 1;
-+        }
-+        if t == starts[b] {
-+            if b + 1 < nb {
-+                succs[b].push(b + 1);
-+            }
-+            continue;
-+        }
-+        let last = t - 1;
-+        match kinds[last] {
-+            LineKind::Ret => {}
-+            // `jump L, t6` names its scratch register last, so the label is
-+            // the first argument — `jump_target` knows both spellings.
-+            LineKind::Jump => {
-+                match jump_target(&lines[last]).and_then(|t| label_block.get(t).copied()) {
-+                    Some(tb) => succs[b].push(tb),
-+                    None => unknown_out[b] = true,
-+                }
-+            }
-+            LineKind::Branch => {
-+                let tgt = lines[last].trim().split_whitespace().next_back();
-+                match tgt.and_then(|t| label_block.get(t).copied()) {
-+                    Some(tb) => succs[b].push(tb),
-+                    None => unknown_out[b] = true,
-+                }
-+                if b + 1 < nb {
-+                    succs[b].push(b + 1);
-+                }
-+            }
-+            _ => {
-+                if b + 1 < nb {
-+                    succs[b].push(b + 1);
-+                }
-+            }
-+        }
-+    }
-+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
-+    for b in 0..nb {
-+        for &s in &succs[b] {
-+            preds[s].push(b);
-+        }
-+    }
-+    let unusable: Vec<bool> = (0..nb)
-+        .map(|b| unknown_out[b] || preds[b].iter().any(|&p| unknown_out[p]))
-+        .collect();
-+    let body: Vec<String> = (0..nb)
-+        .map(|b| {
-+            let mut t = String::new();
-+            for k in starts[b]..end(b) {
-+                if matches!(
-+                    kinds[k],
-+                    LineKind::Nop | LineKind::Directive | LineKind::Label
-+                ) {
-+                    continue;
-+                }
-+                t.push_str(lines[k].trim());
-+                t.push('\n');
-+            }
-+            t
-+        })
-+        .collect();
-+    let mut groups: std::collections::HashMap<&str, Vec<usize>> =
-+        std::collections::HashMap::default();
-+    for b in 0..nb {
-+        if unusable[b] || body[b].trim().is_empty() {
-+            continue;
-+        }
-+        groups.entry(body[b].as_str()).or_default().push(b);
-+    }
-+    for members in groups.values() {
-+        if members.len() < 2 {
-+            continue;
-+        }
-+        for (i, &keep) in members.iter().enumerate() {
-+            for &dup in members.iter().skip(i + 1) {
-+                let from = labels[dup].clone();
-+                let to = labels[keep].clone();
-+                if keep == dup || from.is_empty() || to.is_empty() {
-+                    continue;
-+                }
-+                // A function's entry block is the symbol itself.
-+                if lines[starts[dup]].ends_with(':') && !lines[starts[dup]].starts_with('.') {
-+                    continue;
-+                }
-+                let same_preds = {
-+                    let mut a = preds[keep].clone();
-+                    let mut b = preds[dup].clone();
-+                    a.sort_unstable();
-+                    a.dedup();
-+                    b.sort_unstable();
-+                    b.dedup();
-+                    !a.is_empty() && a == b
-+                };
-+                if !same_preds
-+                    && !(block_is_live_in_independent(lines, kinds, starts[keep], end(keep))
-+                        && block_is_live_in_independent(lines, kinds, starts[dup], end(dup)))
-+                {
-+                    continue;
-+                }
-+                // `dup` must not be entered by fall-through.
-+                let mut fallthrough_in = false;
-+                for &p in &preds[dup] {
-+                    let e = end(p);
-+                    let mut t = e;
-+                    while t > starts[p] && kinds[t - 1] == LineKind::Nop {
-+                        t -= 1;
-+                    }
-+                    let term = if t > starts[p] {
-+                        kinds[t - 1]
-+                    } else {
-+                        LineKind::Nop
-+                    };
-+                    if !matches!(term, LineKind::Jump | LineKind::Ret) && p + 1 == dup {
-+                        fallthrough_in = true;
-+                        break;
-+                    }
-+                }
-+                if fallthrough_in {
-+                    continue;
-+                }
-+                for k in 0..n {
-+                    if !matches!(kinds[k], LineKind::Jump | LineKind::Branch) {
-+                        continue;
-+                    }
-+                    let new =
-+                        crate::backend::peephole_common::replace_whole_word(&lines[k], &from, &to);
-+                    if new != lines[k] {
-+                        lines[k] = new;
-+                        kinds[k] = classify_line(&lines[k]);
-+                    }
-+                }
-+                for k in starts[dup]..end(dup) {
-+                    kinds[k] = LineKind::Nop;
-+                }
-+                return true;
-+            }
-+        }
-+    }
-+    false
-+}
-+
- fn eliminate_redundant_mv_chain(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-     let mut changed = false;
-     let mut i = 0;
-diff --git a/src/passes/loop_invert.rs b/src/passes/loop_invert.rs
-index fb99c19d4..8b9682170 100644
---- a/src/passes/loop_invert.rs
-+++ b/src/passes/loop_invert.rs
-@@ -90,15 +90,64 @@ fn is_duplicable(inst: &Instruction) -> bool {
-     )
- }
- 
-+/// Whether loop inversion runs at all.
-+///
-+/// The kill switch is resolved **once**, by the driver, and then passed down
-+/// explicitly. It used to be read out of the process environment deep inside
-+/// the pass; because `std::env::set_var` is process-global, a test that
-+/// toggled it raced with every test running in parallel on the other threads
-+/// of the test binary, and those tests observed the wrong value (the symptom
-+/// was a ~1-in-10 flake in this module). Configuration a caller can supply
-+/// belongs in a parameter, not in ambient global state.
-+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-+pub(crate) struct LoopInvertConfig {
-+    pub enabled: bool,
-+    pub debug: bool,
-+}
-+
-+impl LoopInvertConfig {
-+    /// The driver's configuration: the documented `CCC_NO_LOOP_INVERT` /
-+    /// `CCC_DEBUG_LOOP_INVERT` escape hatches, read at most once per run.
-+    pub fn from_env() -> Self {
-+        Self {
-+            enabled: std::env::var("CCC_NO_LOOP_INVERT").is_err(),
-+            debug: std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok(),
-+        }
-+    }
-+
-+    /// Configuration used by the unit tests: no environment access at all.
-+    #[cfg(test)]
-+    const fn testing() -> Self {
-+        Self {
-+            enabled: true,
-+            debug: false,
-+        }
-+    }
-+
-+    #[cfg(test)]
-+    const fn disabled() -> Self {
-+        Self {
-+            enabled: false,
-+            debug: false,
-+        }
-+    }
-+}
-+
- /// Invert every eligible top-test loop in `func`. Returns the number rotated.
- pub(crate) fn invert_loops(func: &mut IrFunction) -> usize {
-+    let cfg = LoopInvertConfig::from_env();
-+    invert_loops_with(func, cfg)
-+}
-+
-+/// The pass itself, parameterised by [`LoopInvertConfig`].
-+pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) -> usize {
-+    let debug = cfg.debug;
-     if func.blocks.len() < 3 {
-         return 0;
-     }
--    if std::env::var("CCC_NO_LOOP_INVERT").is_ok() {
-+    if !cfg.enabled {
-         return 0;
-     }
--    let debug = std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok();
- 
-     // Phis must already be gone; this pass's whole safety argument rests on it.
-     debug_assert!(
-@@ -442,7 +491,7 @@ mod tests {
-     #[test]
-     fn a_top_test_counted_loop_is_bottom_tested() {
-         let mut f = counted_loop();
--        assert_eq!(invert_loops(&mut f), 1);
-+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
- 
-         // The header keeps its test and becomes the guard, executed once.
-         assert!(matches!(
-@@ -479,7 +528,7 @@ mod tests {
-         // duplicated compare that follows it must read the NEW value -- that
-         // is the whole point of a bottom test.
-         let mut f = counted_loop();
--        invert_loops(&mut f);
-+        invert_loops_with(&mut f, LoopInvertConfig::testing());
-         let latch = &f.blocks[3];
-         let Instruction::Cmp { lhs, .. } = &latch.instructions[1] else {
-             panic!("expected the duplicated Cmp second");
-@@ -493,7 +542,7 @@ mod tests {
-     #[test]
-     fn value_ids_stay_unique_after_inversion() {
-         let mut f = counted_loop();
--        invert_loops(&mut f);
-+        invert_loops_with(&mut f, LoopInvertConfig::testing());
-         let mut seen = FxHashSet::default();
-         for b in &f.blocks {
-             for i in &b.instructions {
-@@ -531,7 +580,7 @@ mod tests {
-         // the collision is purely an ID-allocation hazard across the function.
-         let mut f = counted_loop();
-         f.blocks[4].instructions.insert(0, asm);
--        assert_eq!(invert_loops(&mut f), 1);
-+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
- 
-         let mut seen = FxHashSet::default();
-         for b in &f.blocks {
-@@ -576,7 +625,7 @@ mod tests {
-                 volatile: false,
-             },
-         );
--        assert_eq!(invert_loops(&mut f), 0);
-+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
-     }
- 
-     #[test]
-@@ -585,7 +634,7 @@ mod tests {
-         // execution instead of this iteration's.
-         let mut f = counted_loop();
-         f.blocks[2].instructions.push(add1(31, 10));
--        assert_eq!(invert_loops(&mut f), 0);
-+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
-     }
- 
-     #[test]
-@@ -596,7 +645,7 @@ mod tests {
-             blk(1, vec![cmp(10, 20), add1(20, 20)], cond(10, 1, 2)),
-             blk(2, vec![], ret()),
-         ]);
--        assert_eq!(invert_loops(&mut f), 0);
-+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
-     }
- 
-     #[test]
-@@ -610,7 +659,7 @@ mod tests {
-             blk(4, vec![add1(21, 20)], br(1)),
-             blk(5, vec![], ret()),
-         ]);
--        assert_eq!(invert_loops(&mut f), 0);
-+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
-     }
- 
-     #[test]
-@@ -625,7 +674,7 @@ mod tests {
-             blk(4, vec![cmp(11, 20), add1(20, 20)], cond(11, 1, 5)),
-             blk(5, vec![], ret()),
-         ]);
--        assert_eq!(invert_loops(&mut f), 0);
-+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
-     }
- 
-     #[test]
-@@ -635,23 +684,16 @@ mod tests {
-             f.blocks[1].instructions.insert(0, add1(40 + k, 20));
+ // ── Pass 7: redundant sext.w elimination ────────────────────────────────────
+ //
+ // `sext.w rD, rS` re-sign-extends the low 32 bits. It is a no-op when rS
+@@ -1178,6 +1307,7 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
          }
-         // Those values are used nowhere, so only the size guard can stop it.
--        assert_eq!(invert_loops(&mut f), 0);
-+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
      }
+     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
++    let mut falls_through = vec![false; nb];
+     let mut unknown_out = vec![false; nb];
+     for b in 0..nb {
+         let e = end(b);
+@@ -1188,6 +1318,7 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
+         if t == starts[b] {
+             if b + 1 < nb {
+                 succs[b].push(b + 1);
++                falls_through[b] = true;
+             }
+             continue;
+         }
+@@ -1210,11 +1341,13 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
+                 }
+                 if b + 1 < nb {
+                     succs[b].push(b + 1);
++                    falls_through[b] = true;
+                 }
+             }
+             _ => {
+                 if b + 1 < nb {
+                     succs[b].push(b + 1);
++                    falls_through[b] = true;
+                 }
+             }
+         }
+@@ -1267,6 +1400,13 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
+                 if lines[starts[dup]].ends_with(':') && !lines[starts[dup]].starts_with('.') {
+                     continue;
+                 }
++                // A fall-through successor is semantically part of a block
++                // even though it is absent from the textual body.  Identical
++                // instruction sequences with different following blocks are
++                // therefore not interchangeable.
++                if (falls_through[keep] || falls_through[dup]) && succs[keep] != succs[dup] {
++                    continue;
++                }
+                 let same_preds = {
+                     let mut a = preds[keep].clone();
+                     let mut b = preds[dup].clone();
+@@ -1928,6 +2068,36 @@ fn extract_s0_offset_from_line(line: &str) -> Option<i32> {
+ mod tests {
+     use super::*;
  
++    #[test]
++    fn identical_blocks_with_different_fallthroughs_do_not_merge() {
++        let asm = "f:\n    beq a0, zero, .Ldup\n.Lkeep:\n    li t0, 1\n.Lkeep_next:\n    li t1, 11\n    ret\n.Ldup:\n    li t0, 1\n.Ldup_next:\n    li t1, 22\n    ret\n";
++        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
++        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
++        let n = lines.len();
++        assert!(!merge_identical_blocks(&mut lines, &mut kinds, n));
++        assert_eq!(kinds[7], LineKind::Label, "duplicate block was deleted");
++    }
++
++    #[test]
++    fn branch_over_jump_fuses_only_to_in_range_target() {
++        let input = "f:\n    beq t0, t1, .Lskip\n    jump .Ltarget, t6\n.Lskip:\n    li t2, 3\n.Ltarget:\n    ret\n";
++        let out = peephole_optimize(input.to_string());
++        assert!(out.contains("bne t0, t1, .Ltarget"), "{out}");
++        assert!(!out.contains("jump .Ltarget"), "{out}");
++    }
++
++    #[test]
++    fn branch_over_jump_keeps_out_of_range_target() {
++        let mut input =
++            String::from("f:\n    beq t0, t1, .Lskip\n    jump .Ltarget, t6\n.Lskip:\n");
++        for _ in 0..100 {
++            input.push_str("    add t2, t2, t3\n");
++        }
++        input.push_str(".Ltarget:\n    ret\n");
++        let out = peephole_optimize(input);
++        assert!(out.contains("beq t0, t1, .Lskip"), "{out}");
++    }
++
      #[test]
-     fn the_pass_can_be_disabled() {
--        // Escape hatch for bisecting a codegen regression.
--        temp_env_set("CCC_NO_LOOP_INVERT", "1");
-+        // Escape hatch for bisecting a codegen regression. Exercised through
-+        // the config parameter: setting the environment variable here would be
-+        // process-global and would race with the tests running in parallel.
-         let mut f = counted_loop();
--        let n = invert_loops(&mut f);
--        temp_env_unset("CCC_NO_LOOP_INVERT");
-+        let n = invert_loops_with(&mut f, LoopInvertConfig::disabled());
-         assert_eq!(n, 0);
-     }
--
--    fn temp_env_set(k: &str, v: &str) {
--        unsafe { std::env::set_var(k, v) };
--    }
--    fn temp_env_unset(k: &str) {
--        unsafe { std::env::remove_var(k) };
--    }
- }
+     fn test_classify_store() {
+         assert!(matches!(
+diff --git a/tests/benchmark/programs/strlen_bench.c b/tests/benchmark/programs/strlen_bench.c
+index f123584..7b90b25 100644
+--- a/tests/benchmark/programs/strlen_bench.c
++++ b/tests/benchmark/programs/strlen_bench.c
+@@ -49,8 +49,13 @@ int main(void) {
+ 
+     // Benchmark: strcmp pairs
+     long cmp_sum = 0;
+-    for (int i = 0; i < NSTRINGS - 1; i++)
+-        cmp_sum += strcmp(strings[i], strings[i + 1]);
++    for (int i = 0; i < NSTRINGS - 1; i++) {
++        // ISO C specifies only the sign of a nonzero strcmp result, not its
++        // magnitude.  Normalise it so this execution oracle compares compiler
++        // behaviour rather than x86 and AArch64 libc implementation details.
++        int cmp = strcmp(strings[i], strings[i + 1]);
++        cmp_sum += (cmp > 0) - (cmp < 0);
++    }
+ 
+     // Benchmark: strstr search
+     long found = 0;
