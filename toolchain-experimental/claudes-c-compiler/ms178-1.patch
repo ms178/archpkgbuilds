@@ -1,3032 +1,454 @@
-diff --git a/FOLLOWUP-2026-09-10-i686-prologue-fastcall-regparm-audit.md b/FOLLOWUP-2026-09-10-i686-prologue-fastcall-regparm-audit.md
-new file mode 100644
-index 00000000..752c243b
---- /dev/null
-+++ b/FOLLOWUP-2026-09-10-i686-prologue-fastcall-regparm-audit.md
-@@ -0,0 +1,135 @@
-+# FOLLOWUP-2026-09-10-i686-prologue-fastcall-regparm-audit.md
-+
-+Red-team audit of `src/backend/i686/codegen/prologue.rs` (12 findings) plus the
-+follow-up review of the merged casts work (PR #480). All findings below were
-+reproduced or refuted empirically against GCC 14.2 (`-m32`) as the ABI oracle
-+and against the x86-64 backend for the cross-backend classes.
-+
-+## Base
-+
-+- Anchor: origin/main e6c08ab0 (Merge PR #481). The casts audit (PR #480,
-+  68d57a3a) is merged upstream and is byte-identical to this tree's casts.rs.
-+- Every change is validated by: fastbuild, `cargo test --lib` (2301 pass),
-+  the i686 battery (battery1.c), the 4-way callee/caller interop matrix
-+  (gcc/lccc × gcc/lccc), dedicated PC-matrix / sret / variadic harnesses,
-+  and `scripts/ci_local.sh --fast`.
-+
-+## Adjudicated findings
-+
-+### Confirmed and fixed
-+
-+**F128 -> U64 depended on the x87 precision control (follow-up review #1).**
-+Reproduced: `(unsigned long long)18446744073709551615.0L` under 24- and
-+53-bit precision control produced 0 (the subtraction-based high path rounded
-+2^64-1 to 2^63, outside signed range, -> integer-indefinite). GCC 14.2
-+miscompiles identically on i686 AND x86-64. Fix (both backends): the high
-+path stores the native extended representation with `fstpt` (stores are
-+exact, no arithmetic) and reads the 64-bit significand directly when the
-+sign/exponent word is 0x403e; NaN/inf/>=2^64 fall through to `fisttpq`
-+(GCC-compatible indefinite). The low path keeps a direct `fisttpq`. No
-+arithmetic on either path => independent of PC at every setting. lccc now
-+passes the full matrix at PC24/PC53/PC64 where GCC fails 3 cases.
-+- i686: `casts.rs cast_x87_to_u64`; x86-64: `f128.rs
-+  emit_f128_st0_to_int` + `emit_f128_to_u64_cast`.
-+- Runtime regression: `tests/regression/casts_roundtrip.c` gained a
-+  PC-matrix section (`fnstcw`/`fldcw`, boundary + NaN cases). The GCC
-+  oracle binary fails those checks, so `casts_roundtrip.c.env` sets
-+  `LCCC_NO_COMPARE=1` (established pattern for defective oracles).
-+- Unit tests: integer-arithmetic precision model
-+  (`round_integer_to_binary_precision`) proving the counterexample, plus
-+  ties-to-even and native-payload boundary tests in casts.rs.
-+
-+**F128 direct-copy ECX clobber (follow-up review #2).** Audited the
-+allocator model: `collect_i686_scratch_hazard_points`'s catch-all already
-+marked Cast points as ECX/EDX hazards, and `eliminate_dead_reg_moves`'
-+census fallback consulted only *textual* reads. That census deleted
-+`movl %eax, %ecx` right before a fastcall call (the call never names %ecx
-+yet reads it) — reproduced with a fastcall struct-return: the sret pointer
-+stayed in EAX while the callee read ECX (SIGSEGV). Fixes:
-+- `census_reg_reads` now counts `Call` as a read of EAX/ECX/EDX and
-+  `JmpIndirect` as a read of every GPR (matches the GprLiveness oracle's
-+  Call model already documented in the file).
-+- An explicit, documented Cast arm in the hazard collector pins the
-+  F128-cast scratch contract (same-value casts stay clean).
-+- The fast copy path itself is unchanged (6 movs, no stack engine); the
-+  allocator contract is now provable, not incidental.
-+
-+**Fastcall caller marshalling was broken for every non-trivial shape.**
-+One authoritative layout (`fastcall_layout`) now drives caller, callee
-+capture, ParamRef and `ret $N`. The caller-side rewrite fixed: constant
-+F128/D128/i128 arguments silently NOT written to the outgoing area
-+(reproduced: fastcall(long double, int) read garbage); aggregates
-+truncated to one word; variadic fastcall now all-stack with caller
-+cleanup (GCC rule); sret now marshalled ECX=sret, EDX=arg0, stack=rest
-+with `ret $4` interop-verified both directions; float/_Decimal scalars
-+skip-not-break (D32/D64/D128 verified against the GCC oracle battery).
-+
-+**Parallel capture (Finding 1).** Incoming-register captures are a real
-+parallel move (`resolve_incoming_reg_moves`): ready moves first, 2-cycles
-+via xchgl, longer cycles via a stack scratch. Register-sharing params
-+(Finding 2) get 4-byte conflict slots allocated past the packed slot
-+region; ParamRef reloads from them.
-+
-+**Fastcall overwrite order / narrow upper bits (Findings 3-5).** Register
-+captures run before any stack copy; sub-int params are normalized
-+(sign/zero-extended) into their slots at capture; ParamRef uses the exact
-+layout offsets instead of a blanket `reg_count * 4` subtraction.
-+
-+**D64 (Findings 6-7).** Callee-pop accounting and the 8-byte copy paths
-+now include D64 (BID container copies — no x87 round trip).
-+
-+**CFI (Finding 8).** Callee-save pushes now emit `.cfi_offset` (and, in
-+no-frame-pointer mode, the ESP-tracking `.cfi_def_cfa_offset` chain); the
-+frame subtraction advances the CFA. Frame-pointer mode keeps CFA=%ebp+8
-+with only offset growth, as the DWARF spec requires.
-+
-+**`__attribute__((regparm(N)))`.** Implemented end to end (parser with
-+GCC-diagnostic parity — bare `regparm` is an error, N>3 warns and clamps,
-+`fastcall`+`regparm` is rejected; decl-side and def-side collection; per-
-+call `CallInfo.regparm`; per-function effective regparm in the prologue;
-+caller staging via the per-call effective value — the global-only gate in
-+`emit_call_reg_args_impl` was the last gap). Precedence: the attribute
-+overrides the global `-mregparm` flag; fastcall overrides both (verified
-+against GCC: `-mregparm=3` + fastcall attribute keeps ECX/EDX). The 4-way
-+matrix (37 cases incl. 11 regparm signatures) is green in all four
-+callee/caller combinations.
-+
-+**x86-64 cross-backend (follow-up review #1 applied).** x86-64 had the
-+same subtraction-based F128->U64 defect (long double is 80-bit there
-+too). Fixed identically; ARM/RISC-V route F128<->U64 through
-+`__fixunstfdi` softfloat (IEEE binary128) and are immune by construction.
-+
-+### Verified non-issues (current code)
-+
-+- F9 alignment bias: bias 12 (no FP) / 8 (FP) is the correct CFA-derived
-+  offset for 16-byte local alignment.
-+- F10 GOT allowlist: deliberately conservative, documented; correctness
-+  over one saved register.
-+- F12 fold sets: rebuilt fresh per function (`build_foldable_global_addr_set_for`
-+  + `build_folded_value_set`); no cross-function residue.
-+- `fstpt`/`fldt` copies (F11): replaced with bit-exact 12-byte movl copies
-+  in all param-capture and ParamRef paths; caller-side F128 args copy the
-+  slot bit-exactly (no x87 round trip that re-canonicalizes exceptional
-+  encodings).
-+- Performance claims in casts.rs: replaced with mechanism statements
-+  (the "measured ~15%" claim had no retained artifact).
-+
-+### Known gaps (documented, not silently claimed)
-+
-+- **Over-aligned parameter allocas**: the frontend drops type-level
-+  `aligned(N)` on parameter types (`param.struct_align` only covers
-+  structs), so `&x` for an `aligned(32)` parameter is misaligned vs GCC
-+  (which dynamically realigns). Repro: ovalign3.c (scratch). Fix plan:
-+  propagate the parameter type's alignment into the IR param alloca, and
-+  make the ParamRef read the effective (aligned) address — the capture
-+  side already targets the effective address.
-+- `emit_f128_to_u64_cast`'s rax-loading head on x86-64 is legacy-shaped;
-+  the live st0 path is fixed and tested.
-+
-+## Test inventory added
-+
-+- `tests/regression/casts_roundtrip.c`: x87 PC matrix (24/53/64) over
-+  F128->U64 boundaries + indefinite fallback; fastcall/regparm F128 copy
-+  pressure test; `casts_roundtrip.c.env` marks the GCC oracle defective.
-+- casts.rs unit tests: precision model, counterexample, payload
-+  boundaries, ties-to-even.
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 8ddc10de..2546fba4 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -5246,6 +5246,7 @@ pub(super) fn generate_instruction(
-                 &info.struct_arg_is_f128_sse,
-                 info.is_sret,
-                 info.is_fastcall,
-+                info.regparm,
-                 &info.ret_eightbyte_classes,
-                 info.ret_is_f128_sse,
-             );
-@@ -5268,6 +5269,7 @@ pub(super) fn generate_instruction(
-                 &info.struct_arg_is_f128_sse,
-                 info.is_sret,
-                 info.is_fastcall,
-+                info.regparm,
-                 &info.ret_eightbyte_classes,
-                 info.ret_is_f128_sse,
-             );
-diff --git a/src/backend/i686/codegen/README.md b/src/backend/i686/codegen/README.md
-index 90f99cf9..b0afaa03 100644
---- a/src/backend/i686/codegen/README.md
-+++ b/src/backend/i686/codegen/README.md
-@@ -145,13 +145,27 @@ reverse order to avoid clobbering `%eax` (the accumulator) prematurely.
+diff --git a/src/backend/riscv/codegen/peephole.rs b/src/backend/riscv/codegen/peephole.rs
+index 71b4810..47683aa 100644
+--- a/src/backend/riscv/codegen/peephole.rs
++++ b/src/backend/riscv/codegen/peephole.rs
+@@ -46,9 +46,10 @@
+ //!    over an unconditional jump when the new B-type target is conservatively
+ //!    proven to fit its ±4 KiB range.
+ //!
+-//! 10. **Redundant byte zero-extension elimination**: Tracks values produced
+-//!     by `lbu`, byte-sized constants, and register copies, removing a later
+-//!     `andi r, r, 0xff` when the upper bits are already known zero.
++//! 10. **Narrow-value lattice / redundant zero extensions**: Cross-pollinates
++//!     AArch64 extension folding and x86 upper-bit knowledge across unsigned
++//!     loads, constants, copies, comparisons, masks, logic and shifts; removes
++//!     both redundant byte masks and RV64 `slli 32; srli 32` zext.w pairs.
  
- Passes the first two DWORD-or-smaller integer/pointer arguments in `%ecx` and
- `%edx`.  The callee pops the *stack* arguments on return (callee-cleanup) via
--`ret $N`.  Implemented via `is_fastcall`, `fastcall_reg_param_count`, and
--`fastcall_stack_cleanup` fields on the codegen struct.
--
--The prologue handles fastcall parameter storage by storing from `%ecx`/`%edx`
--to the appropriate stack slots, with sub-integer types (I8, U8, I16, U16)
--properly sign/zero-extended before storing.  The epilogue emits `ret $N`
--where N accounts for the stack bytes the callee must clean up.
-+`ret $N`.  Implemented via `is_fastcall`, `fastcall_slots` (per-parameter
-+`I686FastcallSlot` layout from `fastcall_layout`) and `fastcall_stack_cleanup`
-+fields on the codegen struct.
-+
-+The layout follows the GCC i386 fastcall rules exactly: float and `_Decimal`
-+scalars are *skipped* (they neither consume a register nor end the chain),
-+aggregates and 64/128-bit integers *break* the chain, and variadic fastcall
-+passes everything on the stack with a plain `ret`.  One layout drives the
-+prologue capture, `emit_param_ref` and the epilogue `ret $N`, replacing the
-+previous three independently-derived assignments whose positional counting
-+diverged from GCC for every float-interleaved signature.
-+
-+The prologue captures `%ecx`/`%edx` parameters before any stack-parameter
-+copy can clobber them, with sub-integer types (I8, U8, I16, U16) sign/zero-
-+extended before storing.  Register-target captures are resolved as a
-+parallel move (`resolve_incoming_reg_moves`): moves emit while a target is
-+not a pending source, 2-cycles become one `xchgl`, longer cycles rotate
-+through a scratch slot, and params whose destinations share one physical
-+register (disjoint IR live ranges, entry-time capture) go through 4-byte
-+conflict slots in the frame.  The epilogue emits `ret $N` where N accounts
-+for the stack bytes the callee must clean up.
+ // ── Line classification types ────────────────────────────────────────────────
  
- ### ABI Configuration
+@@ -971,81 +972,169 @@ fn eliminate_redundant_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize
+     changed
+ }
  
-diff --git a/src/backend/i686/codegen/calls.rs b/src/backend/i686/codegen/calls.rs
-index a51a907f..858bd391 100644
---- a/src/backend/i686/codegen/calls.rs
-+++ b/src/backend/i686/codegen/calls.rs
-@@ -185,7 +185,7 @@ impl I686Codegen {
-         _stack_arg_space: usize,
-         _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
-     ) {
--        if self.regparm == 0 {
-+        if self.current_call_regparm == 0 {
-             return; // cdecl: no register args
-         }
-         // regparm register order: EAX (reg_idx 0), EDX (reg_idx 1), ECX (reg_idx 2).
-@@ -315,7 +315,7 @@ impl I686Codegen {
+-// ── Redundant byte zero-extension elimination ────────────────────────────────
++// ── Narrow-value lattice and redundant zero-extension elimination ────────────
+ //
+-// RV64 `lbu` already produces an XLEN-wide zero-extended value.  The generic
+-// lowering nevertheless often emits a later `andi r, r, 0xff`, usually with
+-// register-copy staging in between.  This is the RISC-V adaptation of ARM's
+-// redundant-zext pass: maintain a conservative per-basic-block proof that a
+-// register is in [0,255], propagate it through `mv`, and delete only a self
+-// mask whose input is proven.  Cross-register masks become moves because they
+-// still define their destination.
++// This is the RV64 adaptation of AArch64's repeated-extension elimination and
++// x86's upper-bit knowledge: track the maximum number of potentially nonzero
++// low bits in each register.  The lattice recognises ten target constructs:
++// lbu/lhu/lwu, nonnegative li, mv, seqz/snez/slt*, positive andi masks,
++// logical and/or/xor, srli, slli, and the canonical slli+srli zext.w pair.
++// Unknown instructions and CFG joins fail closed.  Calls retain only the
++// callee-saved s-register facts.
+ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+-    if std::env::var("CCC_NO_ZEXT_BYTE_ELIM").is_ok() {
++    if std::env::var("CCC_NO_ZEXT_BYTE_ELIM").is_ok()
++        || std::env::var("CCC_NO_NARROW_VALUE_ELIM").is_ok()
++    {
+         return false;
+     }
+-    let mut known: u64 = 0;
++    fn bits_for_nonnegative(v: i64) -> u8 {
++        if v <= 0 {
++            1
++        } else {
++            (64 - (v as u64).leading_zeros()) as u8
++        }
++    }
++    fn set_width(widths: &mut [u8; NUM_REGS], reg: u8, width: u8) {
++        if (reg as usize) < NUM_REGS {
++            widths[reg as usize] = if width == 0 || width >= 64 { 0 } else { width };
++        }
++    }
++
++    let mut widths = [0u8; NUM_REGS]; // 0 = unknown/full 64-bit
+     let mut changed = false;
+-    for i in 0..n {
++    let mut i = 0;
++    while i < n {
+         match kinds[i] {
+             LineKind::Label | LineKind::Branch | LineKind::Jump | LineKind::Ret => {
+-                known = 0;
++                widths.fill(0);
++                i += 1;
+                 continue;
              }
-         } else if indirect {
-             if let Some(fptr) = func_ptr {
--                if self.regparm > 0 {
-+                if self.current_call_regparm > 0 {
-                     // Under regparm, %eax/%edx/%ecx carry arguments — staging
-                     // the target in %eax would destroy arg 0. Call through
-                     // the value's home directly (register or stack slot);
-diff --git a/src/backend/i686/codegen/casts.rs b/src/backend/i686/codegen/casts.rs
-index 966c4900..98453939 100644
---- a/src/backend/i686/codegen/casts.rs
-+++ b/src/backend/i686/codegen/casts.rs
-@@ -185,18 +185,20 @@ impl I686Codegen {
- 
-         // --- Scalar float<->integer casts that fit the single-register
-         // interface (the SSE fast paths for the common sizes) ---
--        if matches!(kind, CastKind::SignedToFloat { to_f64: false, .. }) && from_ty != IrType::I64
--            || matches!(kind, CastKind::UnsignedToFloat { to_f64: false, .. })
--                && from_ty != IrType::U64
--            || matches!(kind, CastKind::FloatToSigned { from_f64: false }) && to_ty != IrType::I64
--            || matches!(
--                kind,
--                CastKind::FloatToUnsigned {
--                    from_f64: false,
--                    to_u64: false
--                }
--            )
--        {
-+        //
-+        // The width restriction is stated directly in the types: only
-+        // F32<->subword/integer32 conversions use the eax interface. F64
-+        // and F128 (and every wide pair) take the x87 path below; the
-+        // previous classifier-boolean form derived the same set through
-+        // `to_f64`/`from_f64` encodings, which did not locally prove the
-+        // width.
-+        let integer_to_f32 =
-+            to_ty == IrType::F32 && cast_is_integer(from_ty) && !cast_is_integer_pair(from_ty);
-+
-+        let f32_to_integer =
-+            from_ty == IrType::F32 && cast_is_integer(to_ty) && !cast_is_integer_pair(to_ty);
-+
-+        if integer_to_f32 || f32_to_integer {
-             self.operand_to_eax(src);
-             self.emit_cast_instrs_impl(from_ty, to_ty);
-             self.store_eax_to(dest);
-@@ -295,8 +297,12 @@ impl I686Codegen {
+             LineKind::Call => {
+-                // Preserve only callee-saved s0-s11 knowledge.
+-                for r in 0..=6u8 {
+-                    known &= !(1u64 << r);
++                for r in 0..=6usize {
++                    widths[r] = 0;
+                 }
+-                for r in 30..=37u8 {
+-                    known &= !(1u64 << r);
++                for r in 30..=37usize {
++                    widths[r] = 0;
+                 }
++                widths[REG_RA as usize] = 0;
++                i += 1;
++                continue;
++            }
++            LineKind::Nop | LineKind::Directive => {
++                i += 1;
+                 continue;
+             }
+-            LineKind::Nop | LineKind::Directive => continue,
+             _ => {}
          }
-     }
  
-+    /// Normalize a subword integer in EAX.
-+    ///
-+    /// EAX may no longer contain the previously cached representation.
-     fn cast_normalize_eax(&mut self, ty: IrType) {
-         if let Some(instruction) = cast_normalization_instruction(ty) {
-+            self.state.reg_cache.invalidate_acc();
-             self.state.emit(instruction);
-         }
-     }
-@@ -306,8 +312,14 @@ impl I686Codegen {
-     /// The full 12-byte ABI object is copied (3 dwords), so NaN payloads
-     /// and padding survive verbatim. All source words are read before any
-     /// destination word is written, so overlapping source and destination
--    /// slots cannot corrupt the copy. Measured ~15% faster than the
--    /// push/pop form and free of the stack engine.
-+    /// slots cannot corrupt the copy. No x87 round trip, no stack-engine
-+    /// traffic, no precision-control interaction.
-+    ///
-+    /// %eax/%ecx/%edx scratch contract: the i686 register allocator's
-+    /// scratch-hazard model (regalloc.rs collect_i686_scratch_hazard_points)
-+    /// marks every Cast instruction as an ECX/EDX hazard point, so no value
-+    /// homed in a caller-saved register can be live across this sequence —
-+    /// the scratch use here is allocator-modelled, not cache-hidden.
-     fn cast_copy_direct_f128(&mut self, dest: &Value, src: &Operand) -> bool {
-         let source = match src {
-             Operand::Value(source) => source,
-@@ -349,8 +361,9 @@ impl I686Codegen {
- 
-     /// Load one supported numeric operand into st(0).
-     ///
--    /// Leaves `%eax`/`%edx` untouched on every path (push/pop round trips
--    /// preserve them), so accumulator-cache entries stay valid.
-+    /// Operand materialization may modify EAX/EDX. Integer-pair loads
-+    /// invalidate cached register contents here; subword normalization
-+    /// invalidates the accumulator cache when it emits an instruction.
-     fn cast_load_x87(&mut self, src: &Operand, from_ty: IrType) {
-         match from_ty {
-             IrType::F32 => {
-@@ -425,7 +438,6 @@ impl I686Codegen {
-         self.state.emit("    subl $12, %esp");
-         self.state.emit("    movl %eax, (%esp)");
-         self.state.emit("    movl %edx, 4(%esp)");
--        emit!(self.state, "    movw ${}, 8(%esp)", U64_HIGH_X87_EXPONENT);
- 
-         self.state.emit("    testl %edx, %edx");
-         self.state.out.emit_jcc_label("    js", &high);
-@@ -434,6 +446,9 @@ impl I686Codegen {
-         self.state.out.emit_jmp_label(&done);
- 
-         self.state.out.emit_named_label(&high);
-+        // The exponent word is needed only on this path: the common
-+        // low-range conversion executes one fewer store.
-+        emit!(self.state, "    movw ${}, 8(%esp)", U64_HIGH_X87_EXPONENT);
-         self.state.emit("    fldt (%esp)");
- 
-         self.state.out.emit_named_label(&done);
-@@ -524,43 +539,76 @@ impl I686Codegen {
- 
-     /// Pop st(0), returning U64 in edx:eax.
-     ///
--    /// The 2^63 threshold decides between the two exact conversions:
-+    /// The threshold compare selects between two EXACT conversions, and
-+    /// neither path performs any x87 arithmetic, so the result does not
-+    /// depend on the ambient precision-control setting:
-     ///
-     /// ```text
--    /// x <  2^63: fisttpq(x) is in range
--    /// x >= 2^63: y = x - 2^63 is exact (Sterbenz) and in [0, 2^63);
--    ///            result = y | 2^63
-+    /// x <  2^63: fisttpq(x) directly — truncation, in signed range.
-+    /// x >= 2^63: the native extended encoding is stored with fstpt.
-+    ///            Every finite extended value in [2^63, 2^64) is an
-+    ///            integer whose sign/exponent word is 0x403e and whose
-+    ///            64-bit significand IS the unsigned result — read the
-+    ///            payload directly, no subtraction.
-     /// ```
-     ///
--    /// Measured at parity with the plain (signed-only) `fisttpq` sequence
--    /// on the validation host; the branch is perfectly predicted on
--    /// uniform data. The threshold constant is 2^63 exactly as an F32
--    /// (`0x5f000000`), so the compare needs no double-width load.
-+    /// The previous high path computed `fisttpq(x - 2^63)` and XORed the
-+    /// high bit back in. That subtraction rounds at the ambient x87
-+    /// precision: under a 24- or 53-bit precision control, 2^64 - 1
-+    /// (exactly representable in extended precision, e.g. loaded with
-+    /// fldt from memory or produced by fild-based integer arithmetic)
-+    /// rounds to 2^63, which lies outside the signed 64-bit range and
-+    /// converts to the integer-indefinite value — 0 after the XOR
-+    /// instead of UINT64_MAX (verified against GCC 14.2 -m32, which
-+    /// miscompiles identically; we exceed it).
-+    ///
-+    /// NaNs, infinities and values >= 2^64 fall through to fisttpq,
-+    /// yielding the same integer-indefinite value GCC produces.
-+    /// The threshold constant is 2^63 exactly as an F32 (`0x5f000000`),
-+    /// so the compare needs no double-width load; FUCOMIP pops the
-+    /// threshold and keeps x, and the unordered (NaN) case sets CF=ZF=1
-+    /// so `jbe` routes it to the high-path fallback.
-     fn cast_x87_to_u64(&mut self) {
-         let high = self.state.fresh_label("cast_fp_u64_high");
-+        let not_range = self.state.fresh_label("cast_fp_u64_notrange");
-         let done = self.state.fresh_label("cast_fp_u64_done");
- 
--        self.state.emit("    subl $8, %esp");
-+        self.state.emit("    subl $12, %esp");
-         self.state.emit("    movl $0x5f000000, (%esp)");
-         self.state.emit("    flds (%esp)");
--        // FUCOMIP pops the threshold and compares 2^63 with x; the x87
--        // unordered case (NaN input) falls to the low path, whose
--        // indefinite result is outside the defined conversion domain.
-         self.state.emit("    fucomip %st(1), %st");
-         self.state.out.emit_jcc_label("    jbe", &high);
- 
-+        // Low path: defined inputs truncate into signed i64. FISTTP
-+        // truncates toward zero independently of the ambient rounding
-+        // direction and performs no arithmetic subject to precision
-+        // control. Fractional inputs may still raise FE_INEXACT.
-         self.state.emit("    fisttpq (%esp)");
-+        self.state.emit("    movl (%esp), %eax");
-+        self.state.emit("    movl 4(%esp), %edx");
-         self.state.out.emit_jmp_label(&done);
- 
-         self.state.out.emit_named_label(&high);
--        self.state.emit("    fsubs (%esp)");
--        self.state.emit("    fisttpq (%esp)");
--        self.state.emit("    xorl $0x80000000, 4(%esp)");
-+        // High path: store the native extended representation (stores are
-+        // exact) and inspect the sign/exponent word without reloading.
-+        self.state.emit("    fstpt (%esp)");
-+        emit!(self.state, "    cmpw ${}, 8(%esp)", U64_HIGH_X87_EXPONENT);
-+        self.state.out.emit_jcc_label("    jne", &not_range);
- 
--        self.state.out.emit_named_label(&done);
-+        // Finite [2^63, 2^64): the significand is the result.
-+        self.state.emit("    movl (%esp), %eax");
-+        self.state.emit("    movl 4(%esp), %edx");
-+        self.state.out.emit_jmp_label(&done);
+-        let t = lines[i].trim();
+-        let (mnem, operands) = match t.split_once(' ') {
++        // Own the current text because successful folds rewrite `lines[i]`
++        // while mnemonic/operand slices remain live for lattice bookkeeping.
++        let text = lines[i].trim().to_owned();
++        let (mnem, operands) = match text.split_once(' ') {
+             Some(parts) => parts,
+             None => {
+-                known = 0;
++                widths.fill(0);
++                i += 1;
+                 continue;
+             }
+         };
++        let ops: Vec<&str> = operands.split(',').map(str::trim).collect();
 +
-+        // NaN / infinity / >= 2^64 (or negative): integer-indefinite.
-+        self.state.out.emit_named_label(&not_range);
-+        self.state.emit("    fldt (%esp)");
-+        self.state.emit("    fisttpq (%esp)");
-         self.state.emit("    movl (%esp), %eax");
-         self.state.emit("    movl 4(%esp), %edx");
--        self.state.emit("    addl $8, %esp");
-+
-+        self.state.out.emit_named_label(&done);
-+        self.state.emit("    addl $12, %esp");
-         self.state.reg_cache.invalidate_acc();
-         self.state.reg_cache.invalidate_sec();
-     }
-@@ -678,8 +726,9 @@ impl I686Codegen {
- 
-                     // Never the signed 32-bit cvttss2si: for [2^31, 2^32)
-                     // it returns the indefinite 0x80000000 and raises
--                    // FE_INVALID. The 64-bit fisttpq stays in range for
--                    // every defined input and raises nothing. The F32
-+                    // FE_INVALID. The signed 64-bit conversion accommodates
-+                    // every defined U32 result, including [2^31, 2^32).
-+                    // Fractional inputs may still raise FE_INEXACT. The F32
-                     // bits are consumed by flds before the conversion
-                     // overwrites the scratch.
-                     self.state.emit("    subl $8, %esp");
-@@ -843,17 +892,77 @@ mod tests {
-         }
-     }
- 
-+    /// Integer-arithmetic model of rounding a positive integer to a
-+    /// binary precision using round-to-nearest, ties-to-even.
-+    ///
-+    /// This models the x87 precision-control rounding applied to the
-+    /// superseded subtraction-based U64 conversion's FSUB result. It does
-+    /// not execute x87.
-+    fn round_integer_to_binary_precision(value: u128, precision: u32) -> u128 {
-+        assert!((1..=64).contains(&precision));
-+
-+        if value == 0 {
-+            return 0;
-+        }
-+
-+        let width = u128::BITS - value.leading_zeros();
-+        if width <= precision {
-+            return value;
-+        }
-+
-+        let shift = width - precision;
-+        let retained = value >> shift;
-+        let discarded = value & ((1_u128 << shift) - 1);
-+        let halfway = 1_u128 << (shift - 1);
-+
-+        let increment = discarded > halfway || (discarded == halfway && retained & 1 != 0);
-+
-+        (retained + u128::from(increment)) << shift
-+    }
-+
-+    /// The superseded high path computed fisttpq(x - 2^63). Under a 24- or
-+    /// 53-bit precision control the subtraction of an exactly representable
-+    /// extended input rounds to 2^63 — outside the signed range — and the
-+    /// conversion yields the integer-indefinite value. The native-payload
-+    /// path performs no arithmetic and is immune.
-     #[test]
--    fn high_unsigned_representation_deterministic_samples() {
--        let mut state = 0x6a09_e667_f3bc_c909u64;
-+    fn subtraction_based_u64_conversion_has_precision_counterexample() {
-+        let exact_difference = (1_u128 << 63) - 1;
- 
--        for _ in 0..100_000 {
--            let value = next_u64(&mut state) | (1u64 << 63);
--            assert_eq!(
--                decode_positive_integer(encode_high_u64(value)),
--                u128::from(value)
--            );
-+        for precision in [24, 53] {
-+            let rounded = round_integer_to_binary_precision(exact_difference, precision);
-+
-+            assert_eq!(rounded, 1_u128 << 63);
-+            assert!(rounded > i64::MAX as u128);
-         }
-+
-+        assert_eq!(
-+            round_integer_to_binary_precision(exact_difference, 64),
-+            exact_difference
-+        );
-+    }
-+
-+    #[test]
-+    fn precision_model_implements_ties_to_even() {
-+        assert_eq!(round_integer_to_binary_precision(17, 4), 16);
-+        assert_eq!(round_integer_to_binary_precision(19, 4), 20);
-+        assert_eq!(round_integer_to_binary_precision(21, 4), 20);
-+        assert_eq!(round_integer_to_binary_precision(23, 4), 24);
-+    }
-+
-+    #[test]
-+    fn native_high_u64_payload_avoids_the_subtraction_counterexample() {
-+        let encoded = encode_high_u64(u64::MAX);
-+
-+        assert_eq!(
-+            u16::from_le_bytes([encoded[8], encoded[9]]),
-+            U64_HIGH_X87_EXPONENT
-+        );
-+
-+        let mut payload = [0_u8; 8];
-+        payload.copy_from_slice(&encoded[..8]);
-+
-+        assert_eq!(u64::from_le_bytes(payload), u64::MAX);
-     }
- 
-     #[test]
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index 0075998a..3fc7ca10 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -27,6 +27,17 @@ use std::sync::Arc;
- 
- use super::i128_ops::MulAccPlan;
- 
-+/// One i686 fastcall parameter slot from [`I686Codegen::fastcall_layout`].
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub(super) enum I686FastcallSlot {
-+    /// Passed in %ecx (0) or %edx (1).
-+    Reg(u8),
-+    /// Passed on the stack at `offset` bytes into the fastcall argument
-+    /// area (callee reference: 8(%ebp) / entry ESP+4), occupying `size`
-+    /// bytes.
-+    Stack { offset: i64, size: usize },
-+}
-+
- /// i686 code generator. Implements the ArchCodegen trait for the shared framework.
- /// Uses cdecl calling convention with no register allocation (accumulator-based).
- pub struct I686Codegen {
-@@ -57,8 +68,18 @@ pub struct I686Codegen {
-     pub(super) is_fastcall: bool,
-     /// For fastcall functions, the number of bytes of stack args the callee must pop on return.
-     pub(super) fastcall_stack_cleanup: usize,
--    /// For fastcall functions, how many leading params are passed in registers (0, 1, or 2).
--    pub(super) fastcall_reg_param_count: usize,
-+    /// Per-parameter fastcall slots from `fastcall_layout` (empty for cdecl).
-+    /// The single source of truth for capture, ParamRef and the return
-+    /// instruction; replaces the previous `fastcall_reg_param_count` counter
-+    /// whose positional counting diverged from the GCC i386 fastcall rules.
-+    pub(super) fastcall_slots: Vec<I686FastcallSlot>,
-+    /// Incoming register parameters whose ParamRef dests share one physical
-+    /// register. Their IR live ranges are disjoint, so RA may reuse the
-+    /// register — but every capture happens at function entry, so capturing
-+    /// both into the shared register would clobber the first. These params
-+    /// are captured into 4-byte frame slots instead (allocated in
-+    /// `calculate_stack_space_impl`) and the ParamRef reloads from there.
-+    pub(super) conflict_param_slots: FxHashMap<usize, StackSlot>,
-     /// Whether %ebx holds the PIC GOT base for the function being emitted.
-     ///
-     /// Set per function by `function_needs_got`. When false the GOT setup is
-@@ -69,7 +90,15 @@ pub struct I686Codegen {
-     pub(super) needs_pc_thunk_bx: bool,
-     /// Number of integer arguments to pass in registers (-mregparm=N).
-     /// 0 = standard cdecl, 1-3 = pass first N int args in EAX, EDX, ECX.
-+    /// This is the EFFECTIVE per-function value; `base_regparm` holds the
-+    /// global flag and is re-applied per function (a function-level
-+    /// `__attribute__((regparm(N)))` overrides it).
-     pub(super) regparm: u8,
-+    /// The global -mregparm=N flag value (0..=3).
-+    pub(super) base_regparm: u8,
-+    /// Effective regparm for the call currently being emitted (per-callee
-+    /// __attribute__((regparm(N))) override of `base_regparm`; 0 = cdecl).
-+    pub(super) current_call_regparm: u8,
-     /// Stack boundary in bytes for frame rounding (4, 8, or 16).
-     /// From -mpreferred-stack-boundary; the kernel realmode code uses 4.
-     pub(super) stack_boundary: i64,
-@@ -325,10 +354,13 @@ impl I686Codegen {
-             asm_xmm_scratch_idx: 0,
-             is_fastcall: false,
-             fastcall_stack_cleanup: 0,
--            fastcall_reg_param_count: 0,
-+            fastcall_slots: Vec::new(),
-+            conflict_param_slots: FxHashMap::default(),
-             pic_got_live: false,
-             needs_pc_thunk_bx: false,
-             regparm: 0,
-+            base_regparm: 0,
-+            current_call_regparm: 0,
-             stack_boundary: 16,
-             omit_frame_pointer: false,
-             frame_base_offset: 0,
-@@ -354,6 +386,7 @@ impl I686Codegen {
-         self.state.pie_mode = opts.pie;
-         self.set_no_jump_tables(opts.no_jump_tables);
-         self.state.mcount = opts.mcount;
-+        self.base_regparm = opts.regparm;
-         self.regparm = opts.regparm;
-         self.omit_frame_pointer = opts.omit_frame_pointer;
-         self.state.emit_cfi = opts.emit_cfi;
-@@ -815,6 +848,171 @@ impl I686Codegen {
-         count
-     }
- 
-+    /// GCC-exact i386 fastcall parameter layout, verified against the
-+    /// GCC 14.2 -m32 oracle (caller and callee, -O0 and -O2):
-+    ///
-+    /// - The first two eligible integer/pointer arguments take %ecx, %edx
-+    ///   in parameter order.
-+    /// - Float and `_Decimal` scalars (F32/F64/F128, D32/D64/D128) are
-+    ///   SKIPPED: they neither consume a register slot nor end the chain
-+    ///   (`f(double,int)`: the int still arrives in %ecx — GCC oracle
-+    ///   `fldl 16(%esp) … addl %ecx,%eax; ret $8`).
-+    /// - Aggregates and 64/128-bit integers BREAK the chain: they and every
-+    ///   following parameter go on the stack (`f(int,S2,int)`: the trailing
-+    ///   int is a stack argument — GCC oracle `ret $12` with %ecx only).
-+    /// - The sret hidden pointer is an explicit leading `Ptr` parameter, so
-+    ///   it takes %ecx and the first eligible argument shifts to %edx (the
-+    ///   GCC -O2 protocol, which is what optimized callers emit).
-+    /// - Variadic fastcall passes everything on the stack; the callee does
-+    ///   not pop (plain `ret`).
-+    ///
-+    /// Returns the per-parameter slots and the total stack bytes (the
-+    /// callee's `ret $N` operand / the caller's pop count).  The layout is
-+    /// the single source of truth shared by parameter capture, ParamRef and
-+    /// the return instruction; the previous implementation re-derived
-+    /// register assignment, offsets and cleanup sizes in three places with
-+    /// incompatible rules.
-+    pub(super) fn fastcall_layout(
-+        &self,
-+        param_tys: &[IrType],
-+        struct_sizes: &[Option<usize>],
-+        is_variadic: bool,
-+    ) -> (Vec<I686FastcallSlot>, usize) {
-+        let mut slots = Vec::with_capacity(param_tys.len());
-+        let mut regs_free = [true, true];
-+        let mut chain_broken = is_variadic;
-+        let mut cursor: i64 = 0;
-+
-+        for (i, ty) in param_tys.iter().enumerate() {
-+            let aggregate = struct_sizes
-+                .get(i)
-+                .copied()
-+                .flatten()
-+                .map(|size| (size + 3) & !3);
-+            let size = aggregate.unwrap_or_else(|| match ty {
-+                IrType::F32 | IrType::D32 => 4,
-+                IrType::I64 | IrType::U64 | IrType::F64 | IrType::D64 => 8,
-+                IrType::F128 => 12,
-+                _ if is_i128_type(*ty) => 16,
-+                _ => 4,
-+            });
-+
-+            if !chain_broken && aggregate.is_none() && self.is_fastcall_reg_eligible(*ty) {
-+                if let Some(idx) = regs_free.iter().position(|&free| free) {
-+                    regs_free[idx] = false;
-+                    slots.push(I686FastcallSlot::Reg(idx as u8));
++        // Canonical RV64 zero-extension: slli d,s,32; srli d,d,32.  If s is
++        // already u32-or-narrower, preserve the destination definition with a
++        // move (or delete both for the self form).
++        if mnem == "slli" && ops.len() == 3 && parse_asm_i64(ops[2]) == Some(32) {
++            let dst = parse_reg(ops[0]);
++            let src = parse_reg(ops[1]);
++            let mut j = i + 1;
++            while j < n && kinds[j] == LineKind::Nop {
++                j += 1;
++            }
++            if dst != REG_NONE
++                && src != REG_NONE
++                && widths[src as usize] != 0
++                && widths[src as usize] <= 32
++                && j < n
++            {
++                let jt = lines[j].trim();
++                let jops: Vec<&str> = jt
++                    .strip_prefix("srli ")
++                    .map(|s| s.split(',').map(str::trim).collect())
++                    .unwrap_or_default();
++                if jops.len() == 3
++                    && parse_reg(jops[0]) == dst
++                    && parse_reg(jops[1]) == dst
++                    && parse_asm_i64(jops[2]) == Some(32)
++                {
++                    if dst == src {
++                        kinds[i] = LineKind::Nop;
++                    } else {
++                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
++                        kinds[i] = LineKind::Move { dst, src };
++                    }
++                    kinds[j] = LineKind::Nop;
++                    let src_width = widths[src as usize];
++                    set_width(&mut widths, dst, src_width);
++                    changed = true;
++                    i = j + 1;
 +                    continue;
 +                }
 +            }
-+
-+            // Aggregates and wide integers end the register chain.
-+            if aggregate.is_some() || matches!(ty, IrType::I64 | IrType::U64) || is_i128_type(*ty) {
-+                chain_broken = true;
-+            }
-+
-+            slots.push(I686FastcallSlot::Stack {
-+                offset: cursor,
-+                size,
-+            });
-+            cursor += size as i64;
 +        }
-+
-+        (slots, cursor as usize)
-+    }
-+
-+    /// Move an incoming ABI register into a target register, normalizing
-+    /// narrow integer types. The i386 regparm/fastcall ABIs guarantee only
-+    /// the low 8/16 bits of a sub-int argument, so a bare `movl` would
-+    /// leave the register home's upper bits caller-garbage. Every
-+    /// accumulator read re-extends by type, but the capture itself should
-+    /// not rely on that invariant: normalizing at the capture costs exactly
-+    /// the instruction the first use would pay anyway.
-+    pub(super) fn emit_incoming_reg_move(
-+        &mut self,
-+        src_full: &'static str,
-+        dst_name: &'static str,
-+        ty: IrType,
-+    ) {
-+        debug_assert_eq!(src_full.len(), 4, "expected %eax/%ecx/%edx");
-+        let byte_name = format!("%{}l", &src_full[2..3]);
-+        let word_name = format!("%{}x", &src_full[2..3]);
-+        match ty {
-+            IrType::I8 => {
-+                emit!(self.state, "    movsbl {}, %{}", byte_name, dst_name);
-+            }
-+            IrType::U8 => {
-+                emit!(self.state, "    movzbl {}, %{}", byte_name, dst_name);
-+            }
-+            IrType::I16 => {
-+                emit!(self.state, "    movswl {}, %{}", word_name, dst_name);
-+            }
-+            IrType::U16 => {
-+                emit!(self.state, "    movzwl {}, %{}", word_name, dst_name);
-+            }
-+            _ => {
-+                emit!(self.state, "    movl {}, %{}", src_full, dst_name);
-+            }
-+        }
-+    }
-+
-+    /// Resolve incoming-register captures whose targets are registers as a
-+    /// parallel move. A target register can itself be another move's
-+    /// still-unread source (incoming registers %eax/%ecx/%edx are all
-+    /// allocatable), so moves are emitted only while a move exists whose
-+    /// target is not a pending source. A stuck state is a cycle:
-+    ///
-+    /// - 2-cycles are resolved with a single `xchgl` (both values land in
-+    ///   their targets), and
-+    /// - longer cycles (only possible when %eax participates) are rotated
-+    ///   through a scratch stack slot: `pushl` the first source, move every
-+    ///   successor in reverse, `popl` into the first target. The push/pop
-+    ///   pair is stack-neutral, so no esp_adjust bookkeeping is needed.
-+    ///
-+    /// The previous implementation hardcoded `xchgl %ecx, %edx` for every
-+    /// stuck state, which miscompiles any cycle that involves %eax.
-+    pub(super) fn resolve_incoming_reg_moves(
-+        &mut self,
-+        moves: &mut Vec<(usize, &'static str, PhysReg, IrType)>,
-+    ) {
-+        while !moves.is_empty() {
-+            let pending_srcs: Vec<&str> = moves.iter().map(|m| m.1).collect();
-+            if let Some(pos) = moves.iter().position(|&(_, src, dst, _)| {
-+                let dst_name = format!("%{}", phys_reg_name(dst));
-+                dst_name == src || !pending_srcs.contains(&dst_name.as_str())
-+            }) {
-+                let (i, src, dst, ty) = moves.remove(pos);
-+                let dst_name = phys_reg_name(dst);
-+                if format!("%{}", dst_name) != src {
-+                    self.emit_incoming_reg_move(src, dst_name, ty);
-+                }
-+                self.state.param_pre_stored.insert(i);
-+            } else if moves.len() == 2 {
-+                // Pure 2-cycle: xchg places both values in their targets.
-+                let (s0, s1) = (moves[0].1, moves[1].1);
-+                emit!(self.state, "    xchgl {}, {}", s0, s1);
-+                for m in moves.drain(..) {
-+                    self.state.param_pre_stored.insert(m.0);
-+                }
+ 
+-        // `lbu rd, address` establishes the proof regardless of addressing
+-        // mode. Other unclassified instructions remain fail-closed below.
+-        if mnem == "lbu" {
+-            let dst = parse_reg(operands.split(',').next().unwrap_or("").trim());
++        // Unsigned loads establish width regardless of their addressing mode.
++        if let Some(width) = match mnem {
++            "lbu" => Some(8),
++            "lhu" => Some(16),
++            "lwu" | "zext.w" => Some(32),
++            _ => None,
++        } {
++            let dst = parse_reg(ops.first().copied().unwrap_or(""));
++            if dst == REG_NONE {
++                widths.fill(0);
 +            } else {
-+                // Longer cycle: rotate through a scratch stack slot.
-+                let first = moves[0];
-+                let n = moves.len();
-+                emit!(self.state, "    pushl {}", first.1);
-+                for k in (1..n).rev() {
-+                    let (i, src, dst, ty) = moves[k];
-+                    let dst_name = phys_reg_name(dst);
-+                    self.emit_incoming_reg_move(src, dst_name, ty);
-+                    self.state.param_pre_stored.insert(i);
-+                }
-+                let (i0, _, dst0, _) = first;
-+                let dst0_name = phys_reg_name(dst0);
-+                emit!(self.state, "    popl %{}", dst0_name);
-+                self.state.param_pre_stored.insert(i0);
++                set_width(&mut widths, dst, width);
 +            }
++            i += 1;
++            continue;
 +        }
-+        self.state.reg_cache.invalidate_acc();
-+    }
-+
-     /// Check if an operand is a constant that fits in an i32 immediate.
-     pub(super) fn const_as_imm32(op: &Operand) -> Option<i64> {
-         match op {
-@@ -1228,49 +1426,29 @@ impl I686Codegen {
-     }
- 
-     /// Emit a fastcall function call on i686.
--    /// First two DWORD (int/ptr) args go in ECX, EDX.
--    /// Remaining args go on the stack (right-to-left push order).
--    /// The callee pops stack args, so caller does NOT adjust ESP after call.
-+    /// Register and stack assignment follows `fastcall_layout` (the GCC
-+    /// i386 fastcall rules): the first two eligible integer/pointer args
-+    /// take %ecx/%edx, float/decimal scalars are skipped, aggregates and
-+    /// wide integers break the chain, and variadic callees receive every
-+    /// argument on the stack and pop nothing.
-     pub(super) fn emit_fastcall(
-         &mut self,
-         args: &[Operand],
-         arg_types: &[IrType],
-+        struct_arg_sizes: &[Option<usize>],
-         direct_name: Option<&str>,
-         func_ptr: Option<&Operand>,
-         dest: Option<Value>,
-         return_type: IrType,
-+        is_variadic: bool,
-     ) {
-         let indirect = func_ptr.is_some() && direct_name.is_none();
- 
--        // Determine which args go in registers vs stack.
--        let mut reg_count = 0usize;
--        for ty in arg_types.iter() {
--            if reg_count >= 2 {
--                break;
--            }
--            if self.is_fastcall_reg_eligible(*ty) {
--                reg_count += 1;
--            } else {
--                break;
--            }
--        }
-+        // One authoritative layout, identical to the callee-side prologue.
-+        let (slots, stack_bytes) = self.fastcall_layout(arg_types, struct_arg_sizes, is_variadic);
- 
--        // Compute stack space for overflow args (args beyond the register ones).
--        let mut stack_bytes = 0usize;
--        for i in reg_count..args.len() {
--            let ty = if i < arg_types.len() {
--                arg_types[i]
--            } else {
--                IrType::I32
--            };
--            match ty {
--                IrType::F64 | IrType::I64 | IrType::U64 => stack_bytes += 8,
--                IrType::F128 => stack_bytes += 12,
--                _ if is_i128_type(ty) => stack_bytes += 16,
--                _ => stack_bytes += 4,
--            }
--        }
--        // Align to 16 bytes
-+        // Align the outgoing argument area to 16 bytes. The callee pops
-+        // exactly `stack_bytes`; the alignment padding is caller-owned.
-         let stack_arg_space = (stack_bytes + 15) & !15;
- 
-         // Spill indirect function pointer before stack manipulation.
-@@ -1278,66 +1456,63 @@ impl I686Codegen {
-             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
-         }
- 
--        // Phase 1: Allocate stack space and write stack args.
-+        // Phase 1: Allocate stack space and write stack args at their
-+        // layout offsets.
-         if stack_arg_space > 0 {
-             emit!(self.state, "    subl ${}, %esp", stack_arg_space);
-             self.esp_adjust += stack_arg_space as i64;
-         }
- 
--        // Write stack args (skipping register args).
--        let mut offset = 0i64;
--        for i in reg_count..args.len() {
--            let ty = if i < arg_types.len() {
--                arg_types[i]
--            } else {
--                IrType::I32
-+        for (i, slot) in slots.iter().enumerate() {
-+            let I686FastcallSlot::Stack { offset, size } = *slot else {
-+                continue;
-             };
-             let arg = &args[i];
-+            let ty = arg_types[i];
-+
-+            // The shared cdecl stack-argument helpers handle every operand
-+            // kind (values, slots, F128/D128/i128 constants). The previous
-+            // hand-rolled arms only handled slot-backed values: constant
-+            // long double / i128 arguments were silently NOT written to the
-+            // outgoing area, and aggregate arguments were truncated to one
-+            // word — the callee then read garbage.
-+            if struct_arg_sizes.get(i).copied().flatten().is_some() {
-+                self.emit_call_struct_stack_arg(arg, offset as usize, size);
-+                continue;
-+            }
- 
-             match ty {
-                 IrType::I64 | IrType::U64 | IrType::F64 => {
-                     self.emit_load_acc_pair(arg);
-                     emit!(self.state, "    movl %eax, {}(%esp)", offset);
-                     emit!(self.state, "    movl %edx, {}(%esp)", offset + 4);
--                    offset += 8;
-                 }
-                 IrType::F128 => {
--                    // Load F128 value to x87 and store to stack
--                    self.emit_f128_load_to_x87(arg);
--                    emit!(self.state, "    fstpt {}(%esp)", offset);
--                    offset += 12;
-+                    self.emit_call_f128_stack_arg(arg, offset as usize);
-                 }
-                 _ if is_i128_type(ty) => {
--                    // Copy 16 bytes
--                    if let Operand::Value(v) = arg {
--                        if let Some(slot) = self.state.get_slot(v.0) {
--                            for j in (0..16).step_by(4) {
--                                let sr = self.slot_ref_offset(slot, j as i64);
--                                emit!(self.state, "    movl {}, %eax", sr);
--                                emit!(self.state, "    movl %eax, {}(%esp)", offset + j as i64);
--                            }
--                        }
--                    }
--                    offset += 16;
-+                    self.emit_call_i128_stack_arg(arg, offset as usize);
-                 }
-                 _ => {
-                     self.emit_load_operand(arg);
-                     emit!(self.state, "    movl %eax, {}(%esp)", offset);
--                    offset += 4;
-                 }
++        // Signed/full-width loads kill only their destination proof; ordinary
++        // stores define no GP register on RISC-V.  Keeping unrelated facts
++        // across these fully modelled instructions is safe and materially
++        // improves AND-with-a-narrow-operand cases.
++        if matches!(mnem, "lb" | "lh" | "lw" | "ld") {
++            let dst = parse_reg(ops.first().copied().unwrap_or(""));
+             if dst == REG_NONE {
+-                known = 0;
++                widths.fill(0);
+             } else {
+-                known |= 1u64 << dst;
++                set_width(&mut widths, dst, 0);
              }
-         }
- 
--        // Phase 2: Load register args into ECX and EDX.
--        // Load EDX first (arg 1) then ECX (arg 0), because loading arg 0
--        // may clobber EDX if it involves function calls.
--        if reg_count >= 2 {
--            self.emit_load_operand(&args[1]);
--            self.state.emit("    movl %eax, %edx");
--        }
--        if reg_count >= 1 {
--            self.emit_load_operand(&args[0]);
--            self.state.emit("    movl %eax, %ecx");
-+        // Phase 2: Load register args. Load the %edx argument before the
-+        // %ecx argument: materializing the first argument may clobber %edx
-+        // (its home can itself be a caller-saved register).
-+        for reg_idx in [1u8, 0u8] {
-+            if let Some((i, _)) = slots
-+                .iter()
-+                .enumerate()
-+                .find(|(_, slot)| matches!(slot, I686FastcallSlot::Reg(r) if *r == reg_idx))
-+            {
-+                let reg = ["%ecx", "%edx"][reg_idx as usize];
-+                self.emit_load_operand(&args[i]);
-+                emit!(self.state, "    movl %eax, {}", reg);
-+            }
-         }
- 
-         // Phase 3: Emit the call.
-@@ -1347,14 +1522,28 @@ impl I686Codegen {
-             emit!(self.state, "    movl {}(%esp), %eax", fptr_offset);
-             self.state.emit("    call *%eax");
-         } else if let Some(name) = direct_name {
--            emit!(self.state, "    call {}", name);
-+            // PIC: external fastcall callees must go through the PLT
-+            // exactly like cdecl calls (calls.rs); a bare `call name`
-+            // to an external symbol would create a text relocation or
-+            // resolve to the wrong address in a PIE.
-+            if self.state.needs_plt(name) {
-+                emit!(self.state, "    call {}@PLT", name);
-+            } else {
-+                emit!(self.state, "    call {}", name);
-+            }
-         }
- 
--        // Phase 4: For indirect calls, pop the spilled function pointer.
--        // Note: callee already cleaned up the stack args, so we only need
--        // to handle the fptr spill and alignment padding.
--        // After call: callee popped stack_bytes, so esp_adjust drops by that amount.
--        self.esp_adjust -= stack_bytes as i64;
-+        // Phase 4: Stack cleanup. Non-variadic fastcall callees pop the
-+        // stack args themselves (`ret $N`); variadic callees pop nothing.
-+        if is_variadic {
-+            if stack_bytes != 0 {
-+                emit!(self.state, "    addl ${}, %esp", stack_bytes);
-+                self.esp_adjust -= stack_bytes as i64;
-+            }
-+        } else {
-+            // Callee popped stack_bytes, so esp_adjust drops by that amount.
-+            self.esp_adjust -= stack_bytes as i64;
++            i += 1;
++            continue;
 +        }
-         if indirect {
-             self.state.emit("    addl $4, %esp"); // pop fptr spill
-             self.esp_adjust -= 4;
-@@ -1606,10 +1795,13 @@ impl I686Codegen {
-         match arg {
-             Operand::Value(v) => {
-                 if self.state.f128_direct_slots.contains(&v.0) {
-+                    // Bit-exact 12-byte copy of the slot (10 payload + 2
-+                    // pad). The x87 round trip the old code used
-+                    // re-canonicalizes exceptional encodings, rewrites the
-+                    // padding and costs a store-forwarding stall; three
-+                    // movl are exact and cheaper.
-                     if let Some(slot) = self.state.get_slot(v.0) {
--                        let sr = self.slot_ref(slot);
--                        emit!(self.state, "    fldt {}", sr);
--                        emit!(self.state, "    fstpt {}(%esp)", stack_offset);
-+                        self.emit_copy_slot_to_stack(slot, stack_offset, 12);
-                     }
-                 } else if let Some(slot) = self.state.get_slot(v.0) {
-                     self.emit_copy_slot_to_stack(slot, stack_offset, 12);
-@@ -2249,15 +2441,32 @@ impl ArchCodegen for I686Codegen {
-         struct_arg_is_f128_sse: &[bool],
-         is_sret: bool,
-         is_fastcall: bool,
-+        is_regparm: Option<u8>,
-         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
-         _ret_is_f128_sse: bool,
-     ) {
-         if is_fastcall {
--            self.emit_fastcall(args, arg_types, direct_name, func_ptr, dest, return_type);
-+            self.emit_fastcall(
-+                args,
-+                arg_types,
-+                struct_arg_sizes,
-+                direct_name,
-+                func_ptr,
-+                dest,
-+                return_type,
-+                is_variadic,
-+            );
-             return;
-         }
-         use crate::backend::call_abi::*;
--        let config = self.call_abi_config();
-+        // Per-callee `__attribute__((regparm(N)))` overrides the global
-+        // -mregparm flag for this call only (GCC semantics: the attribute
-+        // wins over the command-line flag).
-+        self.current_call_regparm = is_regparm.unwrap_or(self.base_regparm).min(3);
-+        let mut config = self.call_abi_config();
-+        if self.current_call_regparm > 0 {
-+            config.max_int_regs = self.current_call_regparm as usize;
-+        }
-         let arg_classes_vec = classify_call_args(
-             args,
-             arg_types,
-@@ -2407,9 +2616,14 @@ impl ArchCodegen for I686Codegen {
-     }
- 
-     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
--        // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
--        // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
--        if is_sret && self.regparm == 0 { 4 } else { 0 }
-+        // Under regparm>=1 (global or per-callee attribute) the sret pointer
-+        // is passed in %eax, not pushed, so the callee's plain `ret` pops
-+        // nothing (mirrors emit_epilogue).
-+        if is_sret && self.current_call_regparm == 0 {
-+            4
-+        } else {
-+            0
-+        }
-     }
- 
-     // ---- Control flow ----
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index ce9a6728..46051d07 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -6099,6 +6099,26 @@ fn census_reg_reads(
-             k += 1;
++        if matches!(mnem, "sb" | "sh" | "sw" | "sd") {
++            i += 1;
              continue;
          }
-+        // A direct call semantically READS the incoming argument registers:
-+        // regparm callees consume %eax/%edx/%ecx and fastcall callees
-+        // %ecx/%edx, without the call line ever naming them. Deleting the
-+        // move that staged such an argument made the callee read caller
-+        // garbage (fastcall struct return: `leal 20(%esp),%eax;
-+        // movl %eax,%ecx; call mk` lost the %ecx move). This matches the
-+        // GprLiveness oracle's Call model exactly.
-+        if infos[k].kind == LineKind::Call {
-+            if reg == REG_EAX || reg == REG_ECX || reg == REG_EDX {
-+                n += 1;
-+            }
-+            k += 1;
-+            continue;
-+        }
-+        // Computed branches may select any GPR (jump-table dispatch).
-+        if infos[k].kind == LineKind::JmpIndirect && reg <= REG_GP_MAX {
-+            n += 1;
-+            k += 1;
-+            continue;
-+        }
-         let line = trimmed(store, &infos[k], k);
-         // A read is: an explicit textual mention that is not a pure write
-         // of the family, or an architectural implicit READ (the oracle's
-diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index 756bcceb..e3673286 100644
---- a/src/backend/i686/codegen/prologue.rs
-+++ b/src/backend/i686/codegen/prologue.rs
-@@ -2,7 +2,7 @@
  
- use super::emit::{
-     I686_CALLEE_SAVED, I686_CALLEE_SAVED_WITH_EBP, I686_CALLER_SAVED, I686Codegen,
--    i686_clobber_to_phys, i686_constraint_to_phys, phys_reg_name,
-+    I686FastcallSlot, i686_clobber_to_phys, i686_constraint_to_phys, phys_reg_name,
- };
- use crate::backend::call_abi::{ParamClass, classify_params};
- use crate::backend::generation::{
-@@ -10,6 +10,7 @@ use crate::backend::generation::{
-     run_regalloc_and_merge_clobbers,
- };
- use crate::backend::regalloc::PhysReg;
-+use crate::backend::state::StackSlot;
- use crate::backend::traits::ArchCodegen;
- use crate::common::types::IrType;
- use crate::emit;
-@@ -92,6 +93,36 @@ impl I686Codegen {
-         self.is_fastcall = func.is_fastcall;
-         self.current_return_type = func.return_type;
- 
-+        // Effective regparm for this function: a function-level
-+        // `__attribute__((regparm(N)))` overrides the global -mregparm
-+        // flag; fastcall wins over both (GCC passes ECX/EDX and the two
-+        // attributes together are rejected at parse time). The
-+        // classification itself ignores regparm for variadic functions
-+        // (GCC function_arg_32: all-stack).
-+        self.regparm = if func.is_fastcall {
-+            0
-+        } else {
-+            func.regparm.unwrap_or(self.base_regparm).min(3)
-+        };
-+
-+        // Fastcall layout: the single source of truth shared by parameter
-+        // capture, ParamRef and the return instruction. Computed here (not
-+        // in emit_store_params) because the conflict analysis below needs
-+        // it after register allocation.
-+        self.fastcall_slots.clear();
-+        self.conflict_param_slots.clear();
-+        if self.is_fastcall {
-+            let param_tys: Vec<IrType> = func.params.iter().map(|p| p.ty).collect();
-+            let struct_sizes: Vec<Option<usize>> =
-+                func.params.iter().map(|p| p.struct_size).collect();
-+            let (slots, stack_bytes) =
-+                self.fastcall_layout(&param_tys, &struct_sizes, func.is_variadic);
-+            self.fastcall_slots = slots;
-+            self.fastcall_stack_cleanup = stack_bytes;
-+        } else {
-+            self.fastcall_stack_cleanup = 0;
-+        }
-+
-         // Same-block div/rem pair fusion table (one divl serves a
-         // URem+UDiv couple with identical operands). Constant-RHS pairs
-         // fuse as well: the head runs ONE magic-number sequence producing
-@@ -365,6 +396,11 @@ impl I686Codegen {
-             self.used_callee_saved.insert(0, PhysReg(0));
-         }
- 
-+        // Incoming register parameters whose destinations share one
-+        // physical register get 4-byte conflict slots (allocated below)
-+        // instead of an entry-time register capture.
-+        let conflict_params = self.compute_conflict_params(func);
-+
-         let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
- 
-         // The bias ensures that slots requiring >= 16-byte alignment land on
-@@ -413,11 +449,78 @@ impl I686Codegen {
-         // fusibility depends on the final register homes and stack slots
-         // (see compute_i686_mulacc_chains / resolve_mulacc_plans).
-         self.resolve_mulacc_plans(func);
--        space
-+
-+        // Conflict slots: appended past the packed slot region, so they
-+        // cannot collide with any allocator-assigned slot. The extra space
-+        // becomes part of the frame.
-+        for (k, &param_idx) in conflict_params.iter().enumerate() {
-+            let offset = -(space + 4 + (k as i64) * 4);
-+            self.conflict_param_slots
-+                .insert(param_idx, StackSlot(offset));
-+        }
-+        space + conflict_params.len() as i64 * 4
-     }
- 
-     // ---- aligned_frame_size ----
- 
-+    /// Incoming register parameters (fastcall %ecx/%edx slots, or regparm
-+    /// %eax/%edx/%ecx classes) whose ParamRef destinations share one
-+    /// physical register. Their IR live ranges are disjoint, so RA may
-+    /// legally reuse the register — but every capture happens at function
-+    /// entry, so capturing both into the shared register would clobber the
-+    /// first. These parameters are captured into 4-byte conflict slots
-+    /// instead (see `conflict_param_slots`).
-+    fn compute_conflict_params(&self, func: &IrFunction) -> Vec<usize> {
-+        let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                if let Instruction::ParamRef {
-+                    dest, param_idx, ..
-+                } = inst
-+                {
-+                    if *param_idx < paramref_dests.len() {
-+                        paramref_dests[*param_idx] = Some(*dest);
-+                    }
-+                }
-+            }
-+        }
-+
-+        let mut candidates: Vec<usize> = Vec::new();
-+        if self.is_fastcall {
-+            for (i, slot) in self.fastcall_slots.iter().enumerate() {
-+                if matches!(slot, I686FastcallSlot::Reg(_)) {
-+                    candidates.push(i);
-+                }
-+            }
-+        } else if self.regparm > 0 {
-+            let config = self.call_abi_config();
-+            let classes = classify_params(func, &config);
-+            for (i, class) in classes.iter().enumerate() {
-+                if matches!(class, ParamClass::IntReg { .. }) {
-+                    candidates.push(i);
-+                }
-+            }
-+        }
-+
-+        let mut by_reg: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> =
-+            crate::common::fx_hash::FxHashMap::default();
-+        for i in candidates {
-+            if let Some(dest) = paramref_dests[i] {
-+                if let Some(&phys) = self.reg_assignments.get(&dest.0) {
-+                    by_reg.entry(phys.0).or_default().push(i);
-+                }
-+            }
-+        }
-+        let mut conflicts: Vec<usize> = Vec::new();
-+        for (_, params) in by_reg {
-+            if params.len() > 1 {
-+                conflicts.extend(params);
-+            }
-+        }
-+        conflicts.sort_unstable();
-+        conflicts
-+    }
-+
-     pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
-         let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
-         let raw_locals = raw_space - callee_saved_bytes;
-@@ -444,21 +547,28 @@ impl I686Codegen {
-         if matches!(func.return_type, IrType::I64 | IrType::U64) || is_i128_type(func.return_type) {
-             self.state.emit("# lccc-i686-return-uses-edx");
-         }
-+        // CFA tracking for unwind tables: with a frame pointer the CFA is
-+        // %ebp+8 once `pushl %ebp` ran and switches register with
-+        // cfi_def_cfa_register; the callee-save pushes and the frame
-+        // subtraction then move the CFA by known, emitted amounts. Without a
-+        // frame pointer the CFA stays %esp-relative and every push/sub
-+        // advances it (the previous code emitted none of these, so
-+        // unwinders saw the entry CFA and restored garbage into
-+        // %ebx/%esi/%edi at every interior PC).
-+        let mut cfa_offset: i64 = 4; // entry CFA: %esp+4
-+        let frame_ptr_mode = !self.omit_frame_pointer;
-         if self.omit_frame_pointer {
-             // No frame pointer setup; use ESP-relative addressing.
--            // frame_base_offset and esp_adjust will be set after callee-saved pushes.
--            // TODO: Emit ESP-relative CFI directives (.cfi_def_cfa_offset after each
--            // push/sub) for proper unwinding when frame pointer is omitted. Currently
--            // the default .cfi_startproc CFA (ESP+4) is used, which is only valid at
--            // function entry. This is acceptable for now since -fomit-frame-pointer on
--            // i686 is primarily used by the Linux kernel boot code, which disables
--            // unwind tables via -fno-asynchronous-unwind-tables.
-+            // frame_base_offset and esp_adjust are set after the
-+            // callee-saved pushes; the CFA stays %esp-based and is
-+            // tracked through every push/sub below.
-         } else {
-             self.state.emit("    pushl %ebp");
-             if self.state.emit_cfi {
-                 self.state.emit("    .cfi_def_cfa_offset 8");
-                 self.state.emit("    .cfi_offset %ebp, -8");
-             }
-+            cfa_offset = 8;
-             self.state.emit("    movl %esp, %ebp");
-             if self.state.emit_cfi {
-                 self.state.emit("    .cfi_def_cfa_register %ebp");
-@@ -468,6 +578,19 @@ impl I686Codegen {
-         for &reg in self.used_callee_saved.iter() {
-             let name = phys_reg_name(reg);
-             emit!(self.state, "    pushl %{}", name);
-+            if self.state.emit_cfi {
-+                cfa_offset += 4;
-+                // Frame-pointer mode: the CFA is %ebp+8 and does NOT move
-+                // when %esp changes; only the saved-register offset grows.
-+                // No-FP mode: the CFA tracks %esp, so both directives
-+                // advance (the pushed register sits at CFA-cfa_offset).
-+                if frame_ptr_mode {
-+                    emit!(self.state, "    .cfi_offset %{}, -{}", name, cfa_offset);
-+                } else {
-+                    emit!(self.state, "    .cfi_def_cfa_offset {}", cfa_offset);
-+                    emit!(self.state, "    .cfi_offset %{}, -{}", name, cfa_offset);
-+                }
-+            }
-         }
- 
-         if self.pic_got_live {
-@@ -482,6 +605,10 @@ impl I686Codegen {
- 
-         if frame_size > 0 {
-             emit!(self.state, "    subl ${}, %esp", frame_size);
-+            if self.state.emit_cfi && !frame_ptr_mode {
-+                cfa_offset += frame_size;
-+                emit!(self.state, "    .cfi_def_cfa_offset {}", cfa_offset);
-+            }
-         }
- 
-         // Post-prologue %esp baseline (ebp-relative), valid in both frame
-@@ -540,32 +667,9 @@ impl I686Codegen {
-             })
-             .collect();
- 
--        let fastcall_reg_count = if self.is_fastcall {
--            self.count_fastcall_reg_params(func)
--        } else {
--            0
--        };
--        self.fastcall_reg_param_count = fastcall_reg_count;
--
--        if self.is_fastcall {
--            let mut total_stack_bytes: usize = 0;
--            for (i, _p) in func.params.iter().enumerate() {
--                if i < fastcall_reg_count {
--                    continue;
--                }
--                let ty = func.params[i].ty;
--                let size = match ty {
--                    IrType::I64 | IrType::U64 | IrType::F64 => 8,
--                    IrType::F128 => 12,
--                    _ if is_i128_type(ty) => 16,
--                    _ => 4,
--                };
--                total_stack_bytes += size;
--            }
--            self.fastcall_stack_cleanup = total_stack_bytes;
--        } else {
--            self.fastcall_stack_cleanup = 0;
--        }
-+        // The fastcall layout (self.fastcall_slots /
-+        // self.fastcall_stack_cleanup) was computed in
-+        // calculate_stack_space_impl, before register allocation.
- 
-         // Build a map of param_idx -> ParamRef dest Value for fast lookup.
-         // Used to handle the case where param alloca was eliminated by mem2reg
-@@ -587,7 +691,6 @@ impl I686Codegen {
-         }
- 
-         let stack_base: i64 = 8;
--        let mut fastcall_reg_idx = 0usize;
- 
-         // ── regparm callee-side capture ─────────────────────────────────────
-         // Register parameters (%eax/%edx/%ecx) are caller-saved: the ONLY safe
-@@ -611,8 +714,12 @@ impl I686Codegen {
-             // MUST cover register params with live allocas too: the main
-             // loop's stack-param copies stage through %eax (and wide copies
-             // through %edx), which would destroy unsaved register args.
--            let mut reg_moves: Vec<(usize, &'static str, crate::backend::regalloc::PhysReg)> =
--                Vec::new(); // (param_idx, src, dst)
-+            let mut reg_moves: Vec<(
-+                usize,
-+                &'static str,
-+                crate::backend::regalloc::PhysReg,
-+                IrType,
-+            )> = Vec::new(); // (param_idx, src, dst, ty)
-             for (i, class) in param_classes.iter().enumerate() {
-                 let alloca_slot = find_param_alloca(func, i)
-                     .and_then(|(dest, _)| self.state.get_slot(dest.0).map(|s| (dest, s)));
-@@ -671,10 +778,34 @@ impl I686Codegen {
-                             }
-                         } else if let Some(dest) = paramref_dests[i] {
-                             if let Some(&phys) = self.reg_assignments.get(&dest.0) {
--                                reg_moves.push((i, src_full, phys));
-+                                if let Some(&conflict_slot) = self.conflict_param_slots.get(&i) {
-+                                    // Shared register home with another
-+                                    // parameter: capture into the conflict
-+                                    // slot (the ParamRef reloads from there);
-+                                    // capturing into the register would
-+                                    // clobber the other param's value.
-+                                    let cr = self.slot_ref(conflict_slot);
-+                                    emit!(self.state, "    movl {}, {}", src_full, cr);
-+                                } else {
-+                                    reg_moves.push((i, src_full, phys, func.params[i].ty));
-+                                }
-                             } else if let Some(slot) = self.state.get_slot(dest.0) {
--                                let sr = self.slot_ref(slot);
--                                emit!(self.state, "    movl {}, {}", src_full, sr);
-+                                // Normalize sub-int types into the spill
-+                                // slot: one extension here is never more
-+                                // expensive than extending at every later
-+                                // use, and the slot then carries a full
-+                                // 32-bit value.
-+                                let slot_ref = self.slot_ref(slot);
-+                                let ty = func.params[i].ty;
-+                                match ty {
-+                                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => {
-+                                        self.emit_incoming_reg_move(src_full, "eax", ty);
-+                                        emit!(self.state, "    movl %eax, {}", slot_ref);
-+                                    }
-+                                    _ => {
-+                                        emit!(self.state, "    movl {}, {}", src_full, slot_ref);
-+                                    }
-+                                }
-                                 self.state.param_pre_stored.insert(i);
-                             }
-                             // Neither register nor slot: value is dead.
-@@ -728,47 +859,83 @@ impl I686Codegen {
-                     _ => {}
-                 }
-             }
--            // Phase 2: register-target captures form a parallel move: a target
--            // (%ecx/%edx — and since Phase 2e also %eax — are allocatable on
--            // i686) can be another move's still-unread source. Standard
--            // resolution: repeatedly emit a move whose target is not a pending
--            // source; a stuck state is a swap cycle, broken with xchg. (In
--            // practice a param never lands an %eax home — any real use spans
--            // an eax hazard — so cycles stay within {%ecx, %edx}.)
--            while !reg_moves.is_empty() {
--                let pending_srcs: Vec<&str> = reg_moves.iter().map(|m| m.1).collect();
--                if let Some(pos) = reg_moves.iter().position(|&(_, src, dst)| {
--                    let dst_name = format!("%{}", phys_reg_name(dst));
--                    dst_name == src || !pending_srcs.contains(&dst_name.as_str())
--                }) {
--                    let (i, src, dst) = reg_moves.remove(pos);
--                    let dst_name = phys_reg_name(dst);
--                    if format!("%{}", dst_name) != src {
--                        emit!(self.state, "    movl {}, %{}", src, dst_name);
--                    }
--                    self.state.param_pre_stored.insert(i);
--                } else {
--                    // Pure swap cycle: only possible between %ecx and %edx.
--                    self.state.emit("    xchgl %ecx, %edx");
--                    for m in reg_moves.drain(..) {
--                        // After the swap both values sit in their targets.
--                        self.state.param_pre_stored.insert(m.0);
--                    }
--                }
--            }
--            self.state.reg_cache.invalidate_acc();
-+            // Phase 2: register-target captures form a parallel move: a
-+            // target (%eax/%ecx/%edx are all allocatable on i686) can be
-+            // another move's still-unread source. The shared resolver
-+            // (emit.rs) emits moves only while a move exists whose target
-+            // is not a pending source, breaks 2-cycles with xchg and
-+            // rotates longer cycles (which require %eax participation)
-+            // through a scratch stack slot. The previous hardcoded
-+            // `xchgl %ecx, %edx` fallback miscompiled every %eax cycle.
-+            self.resolve_incoming_reg_moves(&mut reg_moves);
-         }
- 
--        // Build a map from physical register -> list of param indices that use it,
--        // so we can detect when two params share the same callee-saved register.
--        let mut reg_to_params: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> =
--            crate::common::fx_hash::FxHashMap::default();
-+        // ── fastcall register capture ──────────────────────────────────────
-+        // Fastcall register arguments (%ecx/%edx) are captured in parameter
-+        // order before the main copy loop runs. All stack copies stage
-+        // through %eax only (the over-aligned aggregate path saves/restores
-+        // %ecx), so the sources stay intact — but register-target captures
-+        // are collected and resolved as one parallel move AFTER the loop, so
-+        // a swap between two register params cannot corrupt a source.
-+        let mut fc_reg_moves: Vec<(
-+            usize,
-+            &'static str,
-+            crate::backend::regalloc::PhysReg,
-+            IrType,
-+        )> = Vec::new();
-         if self.is_fastcall {
--            for (i, _) in func.params.iter().enumerate() {
--                if let Some(paramref_dest) = paramref_dests[i] {
--                    if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
--                        reg_to_params.entry(phys_reg.0).or_default().push(i);
-+            for i in 0..func.params.len() {
-+                let I686FastcallSlot::Reg(reg_idx) = self.fastcall_slots[i] else {
-+                    continue;
-+                };
-+                let src_full: &'static str = ["%ecx", "%edx"][reg_idx as usize];
-+                let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
-+                let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
-+                let ty = func.params[i].ty;
-+                let has_alloca_slot = find_param_alloca(func, i)
-+                    .and_then(|(dest, _)| self.state.get_slot(dest.0))
-+                    .is_some();
-+                if has_alloca_slot {
-+                    // Handled by the alloca capture in the main loop below
-+                    // (which normalizes sub-int types into the slot).
-+                    continue;
-+                }
-+                let Some(paramref_dest) = paramref_dests[i] else {
-+                    continue;
-+                };
-+                if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
-+                    if let Some(&conflict_slot) = self.conflict_param_slots.get(&i) {
-+                        // Shared register home: capture into the conflict
-+                        // slot; the ParamRef reloads from there.
-+                        let cr = self.slot_ref(conflict_slot);
-+                        emit!(self.state, "    movl {}, {}", src_full, cr);
-+                    } else {
-+                        fc_reg_moves.push((i, src_full, phys_reg, ty));
-+                    }
-+                } else if let Some(slot) = self.state.get_slot(paramref_dest.0) {
-+                    let slot_ref = self.slot_ref(slot);
-+                    match ty {
-+                        IrType::I8 => {
-+                            emit!(self.state, "    movsbl {}, %eax", src_byte);
-+                            emit!(self.state, "    movl %eax, {}", slot_ref);
-+                        }
-+                        IrType::U8 => {
-+                            emit!(self.state, "    movzbl {}, %eax", src_byte);
-+                            emit!(self.state, "    movl %eax, {}", slot_ref);
-+                        }
-+                        IrType::I16 => {
-+                            emit!(self.state, "    movswl {}, %eax", src_word);
-+                            emit!(self.state, "    movl %eax, {}", slot_ref);
-+                        }
-+                        IrType::U16 => {
-+                            emit!(self.state, "    movzwl {}, %eax", src_word);
-+                            emit!(self.state, "    movl %eax, {}", slot_ref);
-+                        }
-+                        _ => {
-+                            emit!(self.state, "    movl {}, {}", src_full, slot_ref);
-+                        }
-                     }
-+                    self.state.param_pre_stored.insert(i);
-                 }
-             }
-         }
-@@ -793,6 +960,11 @@ impl I686Codegen {
-                 if self.state.param_pre_stored.contains(&i) {
-                     continue;
-                 }
-+                // Conflict-slot capture: the value sits in a frame slot,
-+                // not the destination — nothing to re-capture here.
-+                if self.conflict_param_slots.contains_key(&i) {
-+                    continue;
-+                }
-                 let has_alloca_slot = find_param_alloca(func, i)
-                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
-                     .is_some();
-@@ -837,129 +1009,95 @@ impl I686Codegen {
-                 }
-             }
- 
--            // Pre-store optimization for fastcall register params: when the param's
--            // alloca was eliminated (by mem2reg) but the ParamRef dest is register-
--            // allocated to a callee-saved register, store the fastcall ABI register
--            // (%ecx/%edx) directly to the assigned physical register. This is critical
--            // because:
--            // 1. Dead alloca means no stack slot exists for this param
--            // 2. %ecx/%edx are caller-saved and will be clobbered
--            // 3. We must save the value NOW, before any other code runs
--            // 4. emit_param_ref will see param_pre_stored and skip code generation
--            if self.is_fastcall && fastcall_reg_idx < fastcall_reg_count {
--                let param_ty = func.params[i].ty;
--                if self.is_fastcall_reg_eligible(param_ty) {
--                    let has_alloca_slot = find_param_alloca(func, i)
--                        .and_then(|(dest, _)| self.state.get_slot(dest.0))
--                        .is_some();
--                    if !has_alloca_slot {
--                        let src_reg = if fastcall_reg_idx == 0 {
--                            "%ecx"
+-        if mnem == "andi" {
+-            let ops: Vec<&str> = operands.split(',').map(str::trim).collect();
+-            if ops.len() == 3 {
+-                let dst = parse_reg(ops[0]);
+-                let src = parse_reg(ops[1]);
+-                let imm = parse_asm_i64(ops[2]);
+-                if dst != REG_NONE && src != REG_NONE && imm == Some(255) {
+-                    if known & (1u64 << src) != 0 {
+-                        if dst == src {
+-                            kinds[i] = LineKind::Nop;
 -                        } else {
--                            "%edx"
--                        };
--                        if let Some(paramref_dest) = paramref_dests[i] {
--                            if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
--                                // Safety check: if another param's dest is also assigned
--                                // to this register, skip pre-store to avoid conflicts.
--                                let shared = reg_to_params
--                                    .get(&phys_reg.0)
--                                    .is_some_and(|users| users.len() > 1);
--                                if !shared {
--                                    // Store directly to the callee-saved register
--                                    let dest_reg = phys_reg_name(phys_reg);
--                                    emit!(self.state, "    movl {}, %{}", src_reg, dest_reg);
--                                    self.state.param_pre_stored.insert(i);
--                                }
--                            } else if let Some(slot) = self.state.get_slot(paramref_dest.0) {
--                                // Value was spilled to a stack slot - no register conflict
--                                let slot_ref = self.slot_ref(slot);
--                                emit!(self.state, "    movl {}, {}", src_reg, slot_ref);
--                                self.state.param_pre_stored.insert(i);
--                            }
+-                            lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
+-                            kinds[i] = LineKind::Move { dst, src };
 -                        }
--                        fastcall_reg_idx += 1;
--                        continue;
--                    }
--                }
--            }
--
-             let (slot, ty, dest_id) = if let Some((dest, ty)) = find_param_alloca(func, i) {
-                 if let Some(slot) = self.state.get_slot(dest.0) {
-                     (slot, ty, dest.0)
-                 } else {
--                    if self.is_fastcall
--                        && fastcall_reg_idx < fastcall_reg_count
--                        && i < func.params.len()
--                        && self.is_fastcall_reg_eligible(ty)
--                    {
--                        fastcall_reg_idx += 1;
--                    }
+-                        changed = true;
++        if mnem == "andi" && ops.len() == 3 {
++            let dst = parse_reg(ops[0]);
++            let src = parse_reg(ops[1]);
++            let imm = parse_asm_i64(ops[2]);
++            if dst != REG_NONE && src != REG_NONE {
++                if imm == Some(255) && widths[src as usize] != 0 && widths[src as usize] <= 8 {
++                    if dst == src {
++                        kinds[i] = LineKind::Nop;
++                    } else {
++                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
++                        kinds[i] = LineKind::Move { dst, src };
+                     }
+-                    // Masking with 255 establishes the invariant even when it
+-                    // could not itself be removed.
+-                    known |= 1u64 << dst;
++                    changed = true;
++                }
++                if let Some(v) = imm.filter(|v| *v >= 0) {
++                    set_width(&mut widths, dst, bits_for_nonnegative(v));
++                    i += 1;
                      continue;
                  }
-             } else {
--                if self.is_fastcall
--                    && fastcall_reg_idx < fastcall_reg_count
--                    && i < func.params.len()
--                {
--                    let param_ty = func.params[i].ty;
--                    if self.is_fastcall_reg_eligible(param_ty) {
--                        fastcall_reg_idx += 1;
--                    }
--                }
-                 continue;
-             };
+             }
+@@ -1053,34 +1142,88 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
  
--            if self.is_fastcall
--                && fastcall_reg_idx < fastcall_reg_count
--                && self.is_fastcall_reg_eligible(ty)
--            {
--                let src_reg_full = if fastcall_reg_idx == 0 {
--                    "%ecx"
--                } else {
--                    "%edx"
--                };
--                let slot_ref = self.slot_ref(slot);
--                // For sub-int types, sign/zero-extend to full 32-bit before
--                // storing to the 4-byte SSA slot (avoids partial-write issues).
--                match ty {
--                    IrType::I8 => {
--                        let src_byte = if fastcall_reg_idx == 0 { "%cl" } else { "%dl" };
--                        emit!(self.state, "    movsbl {}, {}", src_byte, src_reg_full);
--                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
--                    }
--                    IrType::U8 => {
--                        let src_byte = if fastcall_reg_idx == 0 { "%cl" } else { "%dl" };
--                        emit!(self.state, "    movzbl {}, {}", src_byte, src_reg_full);
--                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
--                    }
--                    IrType::I16 => {
--                        let src_word = if fastcall_reg_idx == 0 { "%cx" } else { "%dx" };
--                        emit!(self.state, "    movswl {}, {}", src_word, src_reg_full);
--                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
--                    }
--                    IrType::U16 => {
--                        let src_word = if fastcall_reg_idx == 0 { "%cx" } else { "%dx" };
--                        emit!(self.state, "    movzwl {}, {}", src_word, src_reg_full);
--                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
--                    }
--                    _ => {
--                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-+            // Fastcall register parameters whose alloca survived: capture
-+            // %ecx/%edx into the alloca slot (normalizing sub-int types).
-+            // The fc_reg_moves pass above skipped them precisely so this
-+            // arm (which knows the slot) handles the capture.
-+            if self.is_fastcall {
-+                if let I686FastcallSlot::Reg(reg_idx) = self.fastcall_slots[i] {
-+                    let src_reg_full: &'static str = ["%ecx", "%edx"][reg_idx as usize];
-+                    let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
-+                    let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
-+                    let slot_ref = self.slot_ref(slot);
-+                    // For sub-int types, sign/zero-extend to full 32-bit before
-+                    // storing to the 4-byte SSA slot (avoids partial-write issues).
-+                    match ty {
-+                        IrType::I8 => {
-+                            emit!(self.state, "    movsbl {}, {}", src_byte, src_reg_full);
-+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-+                        }
-+                        IrType::U8 => {
-+                            emit!(self.state, "    movzbl {}, {}", src_byte, src_reg_full);
-+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-+                        }
-+                        IrType::I16 => {
-+                            emit!(self.state, "    movswl {}, {}", src_word, src_reg_full);
-+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-+                        }
-+                        IrType::U16 => {
-+                            emit!(self.state, "    movzwl {}, {}", src_word, src_reg_full);
-+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-+                        }
-+                        _ => {
-+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-+                        }
-                     }
-+                    continue;
-                 }
--                fastcall_reg_idx += 1;
+         match kinds[i] {
+             LineKind::Move { dst, src } => {
+-                if known & (1u64 << src) != 0 {
+-                    known |= 1u64 << dst;
++                let src_width = widths[src as usize];
++                set_width(&mut widths, dst, src_width);
 +            }
-+
-+            // Register-class parameters (IntReg with a surviving alloca,
-+            // I64RegPair, StructByValReg) were captured into their alloca
-+            // slots by the regparm phases above, before any stack copy
-+            // could clobber the incoming registers. The main loop copies
-+            // stack-class parameters only.
-+            if matches!(
-+                class,
-+                ParamClass::IntReg { .. }
-+                    | ParamClass::I64RegPair { .. }
-+                    | ParamClass::StructByValReg { .. }
-+            ) {
-                 continue;
-             }
- 
--            let stack_offset_adjust = if self.is_fastcall {
--                fastcall_reg_count as i64 * 4
-+            // Stack-parameter source offset. For fastcall functions the
-+            // layout gives each stack parameter its exact offset in the
-+            // compacted argument area (GCC rule: register args removed
-+            // wherever they occur, floats skipped without removal, so a
-+            // blanket `reg_count * 4` subtraction is NOT generally valid).
-+            let src_offset = if self.is_fastcall {
-+                match self.fastcall_slots[i] {
-+                    I686FastcallSlot::Stack { offset, .. } => stack_base + offset,
-+                    I686FastcallSlot::Reg(_) => unreachable!("handled above"),
-+                }
-             } else {
--                0
-+                match class {
-+                    ParamClass::StackScalar { offset }
-+                    | ParamClass::StructStack { offset, .. }
-+                    | ParamClass::LargeStructStack { offset, .. }
-+                    | ParamClass::F128AlwaysStack { offset }
-+                    | ParamClass::I128Stack { offset }
-+                    | ParamClass::F128Stack { offset }
-+                    | ParamClass::LargeStructByRefStack { offset, .. } => stack_base + offset,
-+                    _ => {
-+                        // Register classes: captured by the regparm phases.
-+                        unreachable!("register parameter without capture: {:?}", class)
-+                    }
-+                }
-             };
- 
-             match class {
--                ParamClass::StackScalar { offset } => {
--                    let src_offset = stack_base + offset - stack_offset_adjust;
-+                ParamClass::StackScalar { offset: _ } => {
-                     // D64: BID bit container — integer pair copy, no x87.
-                     if ty == IrType::F64
-                         || ty == IrType::I64
-@@ -987,9 +1125,8 @@ impl I686Codegen {
-                         emit!(self.state, "    movl %eax, {}", dst_ref);
-                     }
-                 }
--                ParamClass::StructStack { offset, size }
--                | ParamClass::LargeStructStack { offset, size } => {
--                    let src = stack_base + offset - stack_offset_adjust;
-+                ParamClass::StructStack { offset: _, size }
-+                | ParamClass::LargeStructStack { offset: _, size } => {
-                     // Over-aligned (>16) parameter allocas: the slot is
-                     // oversized by (align-1) and the EFFECTIVE address is
-                     // align_up(slot, align) — every alloca-address user
-@@ -1021,13 +1158,13 @@ impl I686Codegen {
-                         }
-                         let mut copied = 0usize;
-                         while copied + 4 <= size {
--                            let src_ref = self.param_ref(src + copied as i64);
-+                            let src_ref = self.param_ref(src_offset + copied as i64);
-                             emit!(self.state, "    movl {}, %eax", src_ref);
-                             emit!(self.state, "    movl %eax, {}(%ecx)", copied);
-                             copied += 4;
-                         }
-                         while copied < size {
--                            let src_ref = self.param_ref(src + copied as i64);
-+                            let src_ref = self.param_ref(src_offset + copied as i64);
-                             emit!(self.state, "    movb {}, %al", src_ref);
-                             emit!(self.state, "    movb %al, {}(%ecx)", copied);
-                             copied += 1;
-@@ -1039,14 +1176,14 @@ impl I686Codegen {
-                     } else {
-                         let mut copied = 0usize;
-                         while copied + 4 <= size {
--                            let src_ref = self.param_ref(src + copied as i64);
-+                            let src_ref = self.param_ref(src_offset + copied as i64);
-                             let dst_ref = self.slot_ref_offset(slot, copied as i64);
-                             emit!(self.state, "    movl {}, %eax", src_ref);
-                             emit!(self.state, "    movl %eax, {}", dst_ref);
-                             copied += 4;
-                         }
-                         while copied < size {
--                            let src_ref = self.param_ref(src + copied as i64);
-+                            let src_ref = self.param_ref(src_offset + copied as i64);
-                             let dst_ref = self.slot_ref_offset(slot, copied as i64);
-                             emit!(self.state, "    movb {}, %al", src_ref);
-                             emit!(self.state, "    movb %al, {}", dst_ref);
-@@ -1054,29 +1191,36 @@ impl I686Codegen {
-                         }
-                     }
-                 }
--                ParamClass::F128AlwaysStack { offset } => {
--                    let src = stack_base + offset - stack_offset_adjust;
--                    let src_ref = self.param_ref(src);
--                    let dst_ref = self.slot_ref(slot);
--                    emit!(self.state, "    fldt {}", src_ref);
--                    emit!(self.state, "    fstpt {}", dst_ref);
-+                ParamClass::F128AlwaysStack { offset: _ } => {
-+                    // Bit-exact 12-byte copy of the incoming argument (the
-+                    // caller's 10 payload bytes + 2 pad). An x87 round trip
-+                    // would re-canonicalize exceptional encodings and
-+                    // rewrite the padding; the slot keeps the native 80-bit
-+                    // representation, so f128_direct_slots still applies.
-+                    for j in (0..12).step_by(4) {
-+                        let src_ref = self.param_ref(src_offset + j as i64);
-+                        let dst_ref = self.slot_ref_offset(slot, j as i64);
-+                        emit!(self.state, "    movl {}, %eax", src_ref);
-+                        emit!(self.state, "    movl %eax, {}", dst_ref);
-+                    }
-                     self.state.f128_direct_slots.insert(dest_id);
-                 }
--                ParamClass::I128Stack { offset } => {
--                    let src = stack_base + offset - stack_offset_adjust;
-+                ParamClass::I128Stack { offset: _ } => {
-                     for j in (0..16).step_by(4) {
--                        let src_ref = self.param_ref(src + j as i64);
-+                        let src_ref = self.param_ref(src_offset + j as i64);
-                         let dst_ref = self.slot_ref_offset(slot, j as i64);
-                         emit!(self.state, "    movl {}, %eax", src_ref);
-                         emit!(self.state, "    movl %eax, {}", dst_ref);
-                     }
-                 }
--                ParamClass::F128Stack { offset } => {
--                    let src = stack_base + offset - stack_offset_adjust;
--                    let src_ref = self.param_ref(src);
--                    let dst_ref = self.slot_ref(slot);
--                    emit!(self.state, "    fldt {}", src_ref);
--                    emit!(self.state, "    fstpt {}", dst_ref);
-+                ParamClass::F128Stack { offset: _ } => {
-+                    // Bit-exact 12-byte copy (see F128AlwaysStack above).
-+                    for j in (0..12).step_by(4) {
-+                        let src_ref = self.param_ref(src_offset + j as i64);
-+                        let dst_ref = self.slot_ref_offset(slot, j as i64);
-+                        emit!(self.state, "    movl {}, %eax", src_ref);
-+                        emit!(self.state, "    movl %eax, {}", dst_ref);
-+                    }
-                     self.state.f128_direct_slots.insert(dest_id);
-                 }
-                 ParamClass::IntReg { .. }
-@@ -1091,6 +1235,14 @@ impl I686Codegen {
-                 }
-             }
-         }
-+
-+        // Fastcall register-target captures: resolved LAST, after every
-+        // stack copy and every alloca-slot capture has read its source
-+        // register (stack copies stage through %eax only; the over-aligned
-+        // path preserves %ecx). Resolving earlier would let a cycle's
-+        // scratch moves overwrite %ecx/%edx before an alloca-slot capture
-+        // further down the parameter list read them.
-+        self.resolve_incoming_reg_moves(&mut fc_reg_moves);
-     }
- 
-     // ---- emit_param_ref ----
-@@ -1105,6 +1257,17 @@ impl I686Codegen {
-             return;
-         }
- 
-+        // Shared register home: the prologue captured this param into a
-+        // conflict slot instead of the destination register (a second
-+        // capture would have clobbered another param's value). Reload.
-+        if let Some(&conflict_slot) = self.conflict_param_slots.get(&param_idx) {
-+            let load_instr = self.mov_load_for_type(ty);
-+            let src_ref = self.slot_ref(conflict_slot);
-+            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
-+            self.store_eax_to(dest);
-+            return;
-+        }
-+
-         if param_idx < self.state.param_alloca_slots.len() {
-             if let Some((alloca_slot, _alloca_ty)) = self.state.param_alloca_slots[param_idx] {
-                 if let Some(dest_slot) = self.state.get_slot(dest.0) {
-@@ -1123,6 +1286,12 @@ impl I686Codegen {
-                             emit!(self.state, "    movl %eax, %{}", reg);
-                             self.state.reg_cache.invalidate_acc();
-                         }
-+                        // The shared slot holds the native F128 encoding
-+                        // (emit_store_params captured it bit-exactly), so a
-+                        // later identity cast may use the direct copy path.
-+                        if ty == IrType::F128 {
-+                            self.state.f128_direct_slots.insert(dest.0);
-+                        }
-                         return;
-                     }
-                 }
-@@ -1152,12 +1321,21 @@ impl I686Codegen {
-                             emit!(self.state, "    movl %eax, {}", dst_ref);
-                         }
-                     } else if ty == IrType::F128 {
--                        let src_ref = self.slot_ref(alloca_slot);
--                        let dst_ref = self.slot_ref(dest_slot);
--                        emit!(self.state, "    fldt {}", src_ref);
--                        emit!(self.state, "    fstpt {}", dst_ref);
-+                        // Bit-exact 12-byte copy (see the F128 capture
-+                        // arms above); the destination keeps the native
-+                        // 80-bit representation.
-+                        for j in (0..12).step_by(4) {
-+                            let src_ref = self.slot_ref_offset(alloca_slot, j as i64);
-+                            let dst_ref = self.slot_ref_offset(dest_slot, j as i64);
-+                            emit!(self.state, "    movl {}, %eax", src_ref);
-+                            emit!(self.state, "    movl %eax, {}", dst_ref);
-+                        }
-                         self.state.f128_direct_slots.insert(dest.0);
--                    } else if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 {
-+                    } else if ty == IrType::F64
-+                        || ty == IrType::I64
-+                        || ty == IrType::U64
-+                        || ty == IrType::D64
-+                    {
-                         let src_ref = self.slot_ref(alloca_slot);
-                         let dst_ref = self.slot_ref(dest_slot);
-                         emit!(self.state, "    movl {}, %eax", src_ref);
-@@ -1177,23 +1355,29 @@ impl I686Codegen {
-             }
-         }
- 
--        if self.is_fastcall && param_idx < self.fastcall_reg_param_count {
--            if let Some(Some((slot, _slot_ty))) = self.state.param_alloca_slots.get(param_idx) {
--                let load_instr = self.mov_load_for_type(ty);
--                let slot_ref = self.slot_ref(*slot);
--                emit!(self.state, "    {} {}, %eax", load_instr, slot_ref);
--                self.store_eax_to(dest);
-+        // Fastcall register parameter: captured in the prologue into its
-+        // home (param_pre_stored, or its alloca slot). It has no stack
-+        // location to read.
-+        if self.is_fastcall {
-+            if let I686FastcallSlot::Reg(_) = self.fastcall_slots[param_idx] {
-+                if let Some(Some((slot, _slot_ty))) = self.state.param_alloca_slots.get(param_idx) {
-+                    let load_instr = self.mov_load_for_type(ty);
-+                    let slot_ref = self.slot_ref(*slot);
-+                    emit!(self.state, "    {} {}, %eax", load_instr, slot_ref);
-+                    self.store_eax_to(dest);
-+                }
-+                return;
-             }
--            return;
-         }
- 
-         let stack_base: i64 = 8;
--        let stack_offset_adjust = if self.is_fastcall {
--            self.fastcall_reg_param_count as i64 * 4
--        } else {
--            0
--        };
--        let param_offset = if param_idx < self.state.param_classes.len() {
-+        let param_offset = if self.is_fastcall {
-+            // Exact compacted offset from the authoritative layout.
-+            match self.fastcall_slots[param_idx] {
-+                I686FastcallSlot::Stack { offset, .. } => stack_base + offset,
-+                I686FastcallSlot::Reg(_) => unreachable!("handled above"),
++            LineKind::LoadImm { dst } => {
++                let width = ops
++                    .get(1)
++                    .and_then(|imm| parse_asm_i64(imm))
++                    .filter(|v| *v >= 0)
++                    .map(bits_for_nonnegative)
++                    .unwrap_or(0);
++                set_width(&mut widths, dst, width);
 +            }
-+        } else if param_idx < self.state.param_classes.len() {
-             match self.state.param_classes[param_idx] {
-                 ParamClass::StackScalar { offset }
-                 | ParamClass::StructStack { offset, .. }
-@@ -1201,9 +1385,7 @@ impl I686Codegen {
-                 | ParamClass::F128AlwaysStack { offset }
-                 | ParamClass::I128Stack { offset }
-                 | ParamClass::F128Stack { offset }
--                | ParamClass::LargeStructByRefStack { offset, .. } => {
--                    stack_base + offset - stack_offset_adjust
--                }
-+                | ParamClass::LargeStructByRefStack { offset, .. } => stack_base + offset,
-                 ParamClass::IntReg { .. }
-                 | ParamClass::I64RegPair { .. }
-                 | ParamClass::StructByValReg { .. } => {
-@@ -1235,13 +1417,17 @@ impl I686Codegen {
-             }
-         } else if ty == IrType::F128 {
-             if let Some(dest_slot) = self.state.get_slot(dest.0) {
--                let src_ref = self.param_ref(param_offset);
--                let dst_ref = self.slot_ref(dest_slot);
--                emit!(self.state, "    fldt {}", src_ref);
--                emit!(self.state, "    fstpt {}", dst_ref);
-+                // Bit-exact 12-byte copy; destination keeps the native
-+                // 80-bit representation.
-+                for j in (0..12).step_by(4) {
-+                    let src_ref = self.param_ref(param_offset + j as i64);
-+                    let dst_ref = self.slot_ref_offset(dest_slot, j as i64);
-+                    emit!(self.state, "    movl {}, %eax", src_ref);
-+                    emit!(self.state, "    movl %eax, {}", dst_ref);
-+                }
-                 self.state.f128_direct_slots.insert(dest.0);
-             }
--        } else if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 {
-+        } else if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 || ty == IrType::D64 {
-             if let Some(slot) = self.state.get_slot(dest.0) {
-                 let src_ref = self.param_ref(param_offset);
-                 let dst_ref = self.slot_ref(slot);
-@@ -1269,7 +1455,9 @@ impl I686Codegen {
-             // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
-             // function_value semantics) — nothing is on the stack to pop.
-             self.state.emit("    ret $4");
--        } else if self.is_fastcall && self.fastcall_stack_cleanup > 0 {
-+        } else if self.is_fastcall && !self.is_variadic && self.fastcall_stack_cleanup > 0 {
-+            // Variadic fastcall callees receive everything on the stack and
-+            // pop nothing (plain `ret`); the caller owns the cleanup.
-             emit!(self.state, "    ret ${}", self.fastcall_stack_cleanup);
-         } else {
-             self.state.emit("    ret");
-diff --git a/src/backend/liveness.rs b/src/backend/liveness.rs
-index 0d25ec8c..770ee789 100644
---- a/src/backend/liveness.rs
-+++ b/src/backend/liveness.rs
-@@ -2201,6 +2201,7 @@ mod tests {
-             ret_is_f128_sse: false,
-             is_sret: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_pure: false,
-             is_const: false,
-             ret_eightbyte_classes: Vec::new(),
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 43323c20..72739351 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -8065,6 +8065,35 @@ fn collect_i686_scratch_hazard_points_refined(
-                 {
-                     (true, true)
++            LineKind::Alu
++                if matches!(mnem, "seqz" | "snez" | "slt" | "sltu" | "slti" | "sltiu") =>
++            {
++                if let Some(dst) = parse_alu_dest(&lines[i]) {
++                    set_width(&mut widths, dst, 1);
+                 } else {
+-                    known &= !(1u64 << dst);
++                    widths.fill(0);
                  }
-+                // F128 identity casts expand to either the direct copy
-+                // (six movl staging through %eax/%ecx/%edx —
-+                // casts.rs cast_copy_direct_f128, which fires when the
-+                // source slot holds the native encoding) or the x87
-+                // fallback (fldt/fstpt, no GPR scratch). The RA cannot
-+                // see slot membership, so mark BOTH registers dirty:
-+                // this point may clobber them. (F128<->scalar casts
-+                // also fall here via the catch-all; the emitter reads
-+                // results from the stack scratch and stages through
-+                // %eax, but %edx receives the pair result of
-+                // F128->U64, and conservatism at a rare instruction
-+                // costs nothing.)
-+                Instruction::Cast {
-+                    from_ty,
-+                    to_ty,
-+                    src,
-+                    dest,
-+                    ..
-+                } if matches!(from_ty, IrType::F128) || matches!(to_ty, IrType::F128) => {
-+                    // A same-value F128->F128 cast emits nothing
-+                    // (cast_same_value early-return in casts.rs).
-+                    let same_value =
-+                        matches!(src, Operand::Value(v) if v.0 == dest.0) && from_ty == to_ty;
-+                    if same_value {
-+                        (true, true)
+             }
+-            LineKind::LoadImm { dst } => {
+-                let value = operands
+-                    .split_once(',')
+-                    .and_then(|(_, imm)| parse_asm_i64(imm));
+-                if value.is_some_and(|v| (0..=255).contains(&v)) {
+-                    known |= 1u64 << dst;
++            LineKind::Alu if matches!(mnem, "and" | "or" | "xor") && ops.len() == 3 => {
++                let dst = parse_reg(ops[0]);
++                let a = parse_reg(ops[1]);
++                let b = parse_reg(ops[2]);
++                if dst == REG_NONE || a == REG_NONE || b == REG_NONE {
++                    widths.fill(0);
+                 } else {
+-                    known &= !(1u64 << dst);
++                    let (wa, wb) = (widths[a as usize], widths[b as usize]);
++                    let w = if mnem == "and" {
++                        match (wa, wb) {
++                            (0, 0) => 0,
++                            (0, x) | (x, 0) => x,
++                            (x, y) => x.min(y),
++                        }
++                    } else if wa != 0 && wb != 0 {
++                        wa.max(wb)
 +                    } else {
-+                        (false, false)
-+                    }
-+                }
-                 Instruction::Copy { dest, src } => match src {
-                     Operand::Value(v) => {
-                         let c = !wide.contains(&v.0) && !wide.contains(&dest.0);
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 02e1ee2d..f8a84c9f 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -905,6 +905,8 @@ pub trait ArchCodegen {
-         struct_arg_is_f128_sse: &[bool],
-         is_sret: bool,
-         _is_fastcall: bool,
-+        // i686: per-callee `__attribute__((regparm(N)))` override.
-+        _is_regparm: Option<u8>,
-         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
-         ret_is_f128_sse: bool,
-     ) {
-diff --git a/src/backend/x86/codegen/f128.rs b/src/backend/x86/codegen/f128.rs
-index 227bcf3d..08e8c372 100644
---- a/src/backend/x86/codegen/f128.rs
-+++ b/src/backend/x86/codegen/f128.rs
-@@ -287,33 +287,48 @@ impl X86Codegen {
++                        0
++                    };
++                    set_width(&mut widths, dst, w);
                  }
              }
-         } else if to_ty == IrType::U64 {
--            // Unsigned 64-bit: handle values >= 2^63
-+            // Unsigned 64-bit: the threshold compare selects between two
-+            // EXACT conversions and NEITHER performs x87 arithmetic, so the
-+            // result is independent of the ambient precision control. The
-+            // previous high path computed `fisttpq(x - 2^63)` and added
-+            // 2^63 back: the subtraction rounds at the current x87
-+            // precision, so under 24/53-bit precision control an exactly
-+            // representable input like 2^64 - 1 rounds to 2^63 — outside
-+            // the signed range — and converts to the integer-indefinite
-+            // value (verified: GCC 14.2 miscompiles identically).
-             let big_label = self.state.fresh_label("ld2u_big");
-+            let not_range_label = self.state.fresh_label("ld2u_notrange");
-             let done_label = self.state.fresh_label("ld2u_done");
-             // Load 2^63 as x87 extended precision for comparison
--            self.state.emit("    subq $8, %rsp");
-+            self.state.emit("    subq $16, %rsp");
-             self.state.emit("    movabsq $4890909195324358656, %rcx"); // 2^63 as f64 bits
-             self.state.emit("    movq %rcx, (%rsp)");
-             self.state.emit("    fldl (%rsp)"); // ST0 = 2^63 (f64), ST1 = value (80-bit)
-             self.state.emit("    fcomip %st(1), %st"); // compare and pop 2^63
-             self.state.out.emit_jcc_label("    jbe", &big_label);
--            // Small case: value < 2^63
-+            // Small case: value < 2^63 — FISTTP truncates exactly; no
-+            // arithmetic subject to precision control. Fractional inputs
-+            // may still raise FE_INEXACT.
-             self.state.emit("    fisttpq (%rsp)");
-             self.state.emit("    movq (%rsp), %rax");
--            self.state.emit("    addq $8, %rsp");
-             self.state.out.emit_jmp_label(&done_label);
--            // Big case: value >= 2^63
-+            // Big case: value >= 2^63. Store the native extended
-+            // representation (stores are exact) and inspect the
-+            // sign/exponent word without reloading.
-             self.state.out.emit_named_label(&big_label);
--            self.state.emit("    movabsq $4890909195324358656, %rcx");
--            self.state.emit("    movq %rcx, (%rsp)");
--            self.state.emit("    fldl (%rsp)"); // ST0 = 2^63, ST1 = value
--            self.state.emit("    fsubrp %st, %st(1)"); // ST0 = value - 2^63
-+            self.state.emit("    fstpt (%rsp)");
-+            self.state.emit("    cmpw $16446, 8(%rsp)"); // 0x403e: bias + 63
-+            self.state.out.emit_jcc_label("    jne", &not_range_label);
-+            // Finite [2^63, 2^64): the 64-bit significand is the result.
-+            self.state.emit("    movq (%rsp), %rax");
-+            self.state.out.emit_jmp_label(&done_label);
-+            // NaN / infinity / >= 2^64 / negative: integer-indefinite.
-+            self.state.out.emit_named_label(&not_range_label);
-+            self.state.emit("    fldt (%rsp)");
-             self.state.emit("    fisttpq (%rsp)");
-             self.state.emit("    movq (%rsp), %rax");
--            self.state.emit("    addq $8, %rsp");
--            self.state.emit("    movabsq $9223372036854775808, %rcx");
--            self.state.emit("    addq %rcx, %rax");
-             self.state.out.emit_named_label(&done_label);
-+            self.state.emit("    addq $16, %rsp");
-         } else {
-             // Smaller unsigned types: fisttpq then truncate
-             self.state.emit("    subq $8, %rsp");
-@@ -407,8 +422,9 @@ impl X86Codegen {
- 
-     fn emit_f128_to_u64_cast(&mut self) {
-         let big_label = self.state.fresh_label("ld2u_big");
-+        let not_range_label = self.state.fresh_label("ld2u_notrange");
-         let done_label = self.state.fresh_label("ld2u_done");
--        self.state.emit("    subq $8, %rsp");
-+        self.state.emit("    subq $16, %rsp");
-         self.state.emit("    movq %rax, (%rsp)");
-         self.state.emit("    fldl (%rsp)");
-         self.state.emit("    movabsq $4890909195324358656, %rcx"); // 2^63 as f64 bits
-@@ -419,20 +435,23 @@ impl X86Codegen {
-         // Small case: value < 2^63
-         self.state.emit("    fisttpq (%rsp)");
-         self.state.emit("    movq (%rsp), %rax");
--        self.state.emit("    addq $8, %rsp");
-         self.state.out.emit_jmp_label(&done_label);
--        // Big case: value >= 2^63
-+        // Big case: value >= 2^63 — native extended payload, no
-+        // arithmetic (precision-control independent; see
-+        // emit_f128_st0_to_int above).
-         self.state.out.emit_named_label(&big_label);
--        self.state.emit("    movabsq $4890909195324358656, %rcx");
--        self.state.emit("    movq %rcx, (%rsp)");
--        self.state.emit("    fldl (%rsp)");
--        self.state.emit("    fsubrp %st, %st(1)"); // ST0 = value - 2^63
-+        self.state.emit("    fstpt (%rsp)");
-+        self.state.emit("    cmpw $16446, 8(%rsp)"); // 0x403e
-+        self.state.out.emit_jcc_label("    jne", &not_range_label);
-+        self.state.emit("    movq (%rsp), %rax");
-+        self.state.out.emit_jmp_label(&done_label);
-+        // NaN / infinity / >= 2^64 / negative: integer-indefinite.
-+        self.state.out.emit_named_label(&not_range_label);
-+        self.state.emit("    fldt (%rsp)");
-         self.state.emit("    fisttpq (%rsp)");
-         self.state.emit("    movq (%rsp), %rax");
--        self.state.emit("    addq $8, %rsp");
--        self.state.emit("    movabsq $9223372036854775808, %rcx");
--        self.state.emit("    addq %rcx, %rax");
-         self.state.out.emit_named_label(&done_label);
-+        self.state.emit("    addq $16, %rsp");
-     }
- 
-     fn emit_f128_to_f32_cast(&mut self) {
-diff --git a/src/backend/x86/codegen/machinst_tests.rs b/src/backend/x86/codegen/machinst_tests.rs
-index c9bdd58f..1128d248 100644
---- a/src/backend/x86/codegen/machinst_tests.rs
-+++ b/src/backend/x86/codegen/machinst_tests.rs
-@@ -4431,6 +4431,7 @@ mod typed_indirect_calls {
-                 ret_is_f128_sse: false,
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: vec![],
-diff --git a/src/frontend/parser/ast.rs b/src/frontend/parser/ast.rs
-index 026c1c65..f45d57ca 100644
---- a/src/frontend/parser/ast.rs
-+++ b/src/frontend/parser/ast.rs
-@@ -34,6 +34,11 @@ pub struct FunctionAttributes {
-     pub visibility: Option<String>,
-     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
-     pub symver: Option<String>,
-+    /// __attribute__((regparm(N))) - pass N integer args in EAX/EDX/ECX.
-+    /// None = attribute absent; Some(N) with N in 0..=3 (GCC semantics:
-+    /// bare `regparm` means N = 3; the global -mregparm flag applies only
-+    /// when the attribute is absent).
-+    pub regparm: Option<u8>,
- }
- 
- /// Bit masks for boolean flags in `FunctionAttributes::flags`.
-@@ -249,6 +254,7 @@ impl std::fmt::Debug for FunctionAttributes {
-             .field("is_weak", &self.is_weak())
-             .field("is_used", &self.is_used())
-             .field("is_fastcall", &self.is_fastcall())
-+            .field("regparm", &self.regparm)
-             .field("is_naked", &self.is_naked())
-             .field("is_noreturn", &self.is_noreturn())
-             .field("is_cold", &self.is_cold())
-@@ -581,6 +587,8 @@ pub struct DeclAttributes {
-     pub cleanup_fn: Option<String>,
-     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
-     pub symver: Option<String>,
-+    /// __attribute__((regparm(N))) on a function declaration.
-+    pub regparm: Option<u8>,
- }
- 
- /// Bit masks for boolean flags in `DeclAttributes::flags`.
-@@ -735,6 +743,7 @@ impl std::fmt::Debug for DeclAttributes {
-             .field("is_noreturn", &self.is_noreturn())
-             .field("is_used", &self.is_used())
-             .field("alias_target", &self.alias_target)
-+            .field("regparm", &self.regparm)
-             .field("visibility", &self.visibility)
-             .field("section", &self.section)
-             .field("asm_register", &self.asm_register)
-diff --git a/src/frontend/parser/declarations.rs b/src/frontend/parser/declarations.rs
-index eb6ede52..44cb30e6 100644
---- a/src/frontend/parser/declarations.rs
-+++ b/src/frontend/parser/declarations.rs
-@@ -182,6 +182,7 @@ impl Parser {
-         let symver = self.attrs.parsing_symver.take();
-         let is_used = self.attrs.parsing_used();
-         let is_fastcall = self.attrs.parsing_fastcall();
-+        let regparm = self.attrs.parsing_regparm;
-         let is_naked = self.attrs.parsing_naked();
-         let no_instrument = self.attrs.parsing_no_instrument();
-         let is_pure = self.attrs.parsing_pure();
-@@ -197,6 +198,7 @@ impl Parser {
-         decl_attrs.set_noreturn(is_noreturn);
-         decl_attrs.set_used(is_used);
-         decl_attrs.set_fastcall(is_fastcall);
-+        decl_attrs.regparm = regparm;
-         decl_attrs.set_naked(is_naked);
-         decl_attrs.set_no_instrument(no_instrument);
-         decl_attrs.set_pure(is_pure);
-@@ -326,6 +328,7 @@ impl Parser {
-                 attrs.set_weak(decl_attrs.is_weak());
-                 attrs.set_used(decl_attrs.is_used());
-                 attrs.set_fastcall(decl_attrs.is_fastcall());
-+                attrs.regparm = decl_attrs.regparm;
-                 attrs.set_naked(decl_attrs.is_naked());
-                 attrs.set_no_instrument(no_instrument_merged);
-                 attrs.set_noreturn(decl_attrs.is_noreturn());
-@@ -636,6 +639,9 @@ impl Parser {
-         if self.attrs.parsing_fastcall() {
-             last_decl.attrs.set_fastcall(true);
-         }
-+        if let Some(n) = self.attrs.parsing_regparm {
-+            last_decl.attrs.regparm = Some(n);
-+        }
-         if self.attrs.parsing_naked() {
-             last_decl.attrs.set_naked(true);
-         }
-@@ -666,6 +672,7 @@ impl Parser {
-         self.attrs.parsing_cleanup_fn = None;
-         self.attrs.set_used(false);
-         self.attrs.set_fastcall(false);
-+        self.attrs.parsing_regparm = None;
-         self.attrs.set_naked(false);
-         self.attrs.set_no_instrument(false);
-         ctx.is_common = ctx.is_common || extra_common;
-@@ -713,6 +720,7 @@ impl Parser {
-                 None
-             };
-             let d_fastcall = self.attrs.parsing_fastcall();
-+            let d_regparm = self.attrs.parsing_regparm;
-             declarators.push(InitDeclarator {
-                 name: dname.unwrap_or_default(),
-                 derived: dderived,
-@@ -728,6 +736,7 @@ impl Parser {
-                     da.set_const_attr(d_const_attr);
-                     da.set_used(d_used);
-                     da.set_fastcall(d_fastcall);
-+                    da.regparm = d_regparm;
-                     da.alias_target = d_alias;
-                     da.visibility = d_vis;
-                     da.section = d_section;
-@@ -875,6 +884,7 @@ impl Parser {
-                     da.set_destructor(self.attrs.parsing_destructor());
-                     da.set_weak(self.attrs.parsing_weak());
-                     da.set_fastcall(self.attrs.parsing_fastcall());
-+                    da.regparm = self.attrs.parsing_regparm;
-                     da.set_naked(self.attrs.parsing_naked());
-                     da.set_no_instrument(self.attrs.parsing_no_instrument());
-                     da.set_error_attr(self.attrs.parsing_error_attr());
-diff --git a/src/frontend/parser/parse.rs b/src/frontend/parser/parse.rs
-index b9bf9166..b4d63769 100644
---- a/src/frontend/parser/parse.rs
-+++ b/src/frontend/parser/parse.rs
-@@ -180,6 +180,8 @@ pub(super) struct ParsedDeclAttrs {
-     pub parsing_cleanup_fn: Option<String>,
-     /// `__attribute__((symver("name@@VERSION")))` symbol version string.
-     pub parsing_symver: Option<String>,
-+    /// `__attribute__((regparm(N)))` register-argument count.
-+    pub parsing_regparm: Option<u8>,
-     /// `__attribute__((vector_size(N)))` total vector size in bytes.
-     pub parsing_vector_size: Option<usize>,
-     /// `__attribute__((vector_size(EXPR)))` whose EXPR was not parse-time
-@@ -447,6 +449,7 @@ impl std::fmt::Debug for ParsedDeclAttrs {
-                 &self.parsing_transparent_union(),
-             )
-             .field("parsing_fastcall", &self.parsing_fastcall())
-+            .field("parsing_regparm", &self.parsing_regparm)
-             .field("parsing_cold", &self.parsing_cold())
-             .field("parsing_alias_target", &self.parsing_alias_target)
-             .field("parsing_visibility", &self.parsing_visibility)
-@@ -1317,8 +1320,37 @@ impl Parser {
-                 self.advance();
-             }
-             "fastcall" | "__fastcall__" => {
-+                let span = self.peek_span();
-                 self.attrs.set_fastcall(true);
-                 self.advance();
-+                // GCC: "fastcall and regparm attributes are not compatible"
-+                if self.attrs.parsing_regparm.is_some() {
-+                    self.emit_error("fastcall and regparm attributes are not compatible", span);
+-            LineKind::Alu if mnem == "seqz" || mnem == "snez" => {
+-                if let Some(dst) = parse_alu_dest(&lines[i]) {
+-                    known |= 1u64 << dst;
++            LineKind::Alu if mnem == "srli" && ops.len() == 3 => {
++                let dst = parse_reg(ops[0]);
++                let src = parse_reg(ops[1]);
++                let sh = parse_asm_i64(ops[2]).filter(|v| (0..64).contains(v));
++                if dst == REG_NONE || src == REG_NONE || sh.is_none() {
++                    widths.fill(0);
++                } else {
++                    let sh = sh.unwrap() as u8;
++                    let sw = widths[src as usize];
++                    let w = if sw == 0 {
++                        64 - sh
++                    } else {
++                        sw.saturating_sub(sh).max(1)
++                    };
++                    set_width(&mut widths, dst, w);
 +                }
 +            }
-+            "regparm" | "__regparm__" => {
-+                // GCC i386 `__attribute__((regparm(N)))`: pass the first N
-+                // integer arguments in EAX, EDX, ECX. The argument is
-+                // required (bare `regparm` is an error in GCC); values above
-+                // 3 warn and clamp to 3.
-+                let span = self.peek_span();
-+                self.advance();
-+                if !matches!(self.peek(), TokenKind::LParen) {
-+                    self.emit_error(
-+                        "wrong number of arguments specified for 'regparm' attribute",
-+                        span,
-+                    );
-+                } else if let Some(v) = self.parse_alignment_expr() {
-+                    let n = v.min(3) as u8;
-+                    if v > 3 {
-+                        self.diagnostics
-+                            .warning("argument to 'regparm' attribute larger than 3", span);
-+                    }
-+                    self.attrs.parsing_regparm = Some(n);
-+                    if self.attrs.parsing_fastcall() {
-+                        self.emit_error("fastcall and regparm attributes are not compatible", span);
-+                    }
-+                }
-             }
-             "naked" | "__naked__" => {
-                 self.attrs.set_naked(true);
-diff --git a/src/ir/instruction.rs b/src/ir/instruction.rs
-index 2092bc7a..2cae752b 100644
---- a/src/ir/instruction.rs
-+++ b/src/ir/instruction.rs
-@@ -101,6 +101,9 @@ pub struct CallInfo {
-     pub is_sret: bool,
-     /// True if the callee uses the fastcall calling convention.
-     pub is_fastcall: bool,
-+    /// i686: `__attribute__((regparm(N)))` on the callee — per-function
-+    /// override of the global -mregparm flag. None = attribute absent.
-+    pub regparm: Option<u8>,
-     /// True if the callee is marked pure (no memory writes outside local allocas, no side effects).
-     pub is_pure: bool,
-     /// True if the callee is marked const (no memory reads or writes outside local allocas, no side effects).
-diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
-index 8dbca66e..b0947d5b 100644
---- a/src/ir/lowering/expr_builtins.rs
-+++ b/src/ir/lowering/expr_builtins.rs
-@@ -450,6 +450,7 @@ impl Lowerer {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: Vec::new(),
-@@ -1001,6 +1002,7 @@ impl Lowerer {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: Vec::new(),
-@@ -1271,6 +1273,7 @@ impl Lowerer {
-                 struct_arg_is_f128_sse: Vec::new(),
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: Vec::new(),
-diff --git a/src/ir/lowering/expr_builtins_fpclass.rs b/src/ir/lowering/expr_builtins_fpclass.rs
-index 1aca39d7..9d965475 100644
---- a/src/ir/lowering/expr_builtins_fpclass.rs
-+++ b/src/ir/lowering/expr_builtins_fpclass.rs
-@@ -41,6 +41,7 @@ impl Lowerer {
-                 struct_arg_is_f128_sse: Vec::new(),
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: Vec::new(),
-diff --git a/src/ir/lowering/expr_calls.rs b/src/ir/lowering/expr_calls.rs
-index 6f3ff71c..748fa2e0 100644
---- a/src/ir/lowering/expr_calls.rs
-+++ b/src/ir/lowering/expr_calls.rs
-@@ -1234,6 +1234,7 @@ impl Lowerer {
-                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                             is_sret: sret_size.is_some(),
-                             is_fastcall: false,
-+                            regparm: None,
-                             is_pure: false,
-                             is_const: false,
-                             ret_eightbyte_classes: call_ret_classes,
-@@ -1265,6 +1266,10 @@ impl Lowerer {
-                         }
-                     }
-                     let callee_is_fastcall = self.fastcall_functions.contains(name.as_str());
-+                    let mut callee_regparm = self.regparm_functions.get(name.as_str()).copied();
-+                    if callee_is_fastcall {
-+                        callee_regparm = None;
-+                    }
-                     let is_pure = self.pure_functions.contains(name.as_str());
-                     let is_const = self.const_functions.contains(name.as_str());
-                     let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
-@@ -1284,6 +1289,7 @@ impl Lowerer {
-                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                             is_sret: sret_size.is_some(),
-                             is_fastcall: callee_is_fastcall,
-+                            regparm: callee_regparm,
-                             is_pure,
-                             is_const,
-                             ret_eightbyte_classes: call_ret_classes,
-@@ -1344,6 +1350,7 @@ impl Lowerer {
-                         struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                         is_sret: sret_size.is_some(),
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: call_ret_classes,
-@@ -1403,6 +1410,11 @@ impl Lowerer {
-                         }
-                     }
-                     let callee_is_fastcall = self.fastcall_functions.contains(call_name.as_str());
-+                    let mut callee_regparm =
-+                        self.regparm_functions.get(call_name.as_str()).copied();
-+                    if callee_is_fastcall {
-+                        callee_regparm = None;
-+                    }
-                     let is_pure = self.pure_functions.contains(call_name.as_str());
-                     let is_const = self.const_functions.contains(call_name.as_str());
-                     let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
-@@ -1422,6 +1434,7 @@ impl Lowerer {
-                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                             is_sret: sret_size.is_some(),
-                             is_fastcall: callee_is_fastcall,
-+                            regparm: callee_regparm,
-                             is_pure,
-                             is_const,
-                             ret_eightbyte_classes: call_ret_classes,
-@@ -1446,6 +1459,7 @@ impl Lowerer {
-                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                             is_sret: sret_size.is_some(),
-                             is_fastcall: false,
-+                            regparm: None,
-                             is_pure: false,
-                             is_const: false,
-                             ret_eightbyte_classes: call_ret_classes,
-diff --git a/src/ir/lowering/func_lowering.rs b/src/ir/lowering/func_lowering.rs
-index 731dd3ef..748b9f9d 100644
---- a/src/ir/lowering/func_lowering.rs
-+++ b/src/ir/lowering/func_lowering.rs
-@@ -987,6 +987,7 @@ impl Lowerer {
-             param_alloca_values: param_alloca_vals,
-             uses_sret,
-             is_fastcall: func.attrs.is_fastcall(),
-+            regparm: func.attrs.regparm,
-             is_naked: func.attrs.is_naked(),
-             no_instrument: func.attrs.is_no_instrument(),
-             global_init_label_blocks: global_init_labels,
-diff --git a/src/ir/lowering/lower.rs b/src/ir/lowering/lower.rs
-index e6d9a75f..453e556b 100644
---- a/src/ir/lowering/lower.rs
-+++ b/src/ir/lowering/lower.rs
-@@ -63,6 +63,9 @@ pub struct Lowerer {
-     /// Set of function names declared with __attribute__((fastcall)).
-     /// On i386, these use ecx/edx for the first two integer/pointer args.
-     pub(super) fastcall_functions: FxHashSet<String>,
-+    /// __attribute__((regparm(N))) per function name (definitions and
-+    /// declarations). Consulted at call sites like fastcall_functions.
-+    pub(super) regparm_functions: FxHashMap<String, u8>,
-     /// Set of function names declared with __attribute__((pure)).
-     pub pure_functions: FxHashSet<String>,
-     /// Set of function names declared with __attribute__((const)).
-@@ -220,6 +223,7 @@ impl Lowerer {
-             error_functions: FxHashSet::default(),
-             noreturn_functions: FxHashSet::default(),
-             fastcall_functions: FxHashSet::default(),
-+            regparm_functions: FxHashMap::default(),
-             pure_functions: FxHashSet::default(),
-             const_functions: FxHashSet::default(),
-             discard_expr_result: false,
-@@ -427,6 +431,7 @@ impl Lowerer {
-                     struct_arg_is_f128_sse: Vec::new(),
-                     is_sret: false,
-                     is_fastcall: false,
-+                    regparm: None,
-                     is_pure: false,
-                     is_const: false,
-                     ret_eightbyte_classes: Vec::new(),
-@@ -782,6 +787,9 @@ impl Lowerer {
-                     if func.attrs.is_fastcall() {
-                         self.fastcall_functions.insert(func.name.clone());
-                     }
-+                    if let Some(n) = func.attrs.regparm {
-+                        self.regparm_functions.insert(func.name.clone(), n);
-+                    }
++            LineKind::Alu if mnem == "slli" && ops.len() == 3 => {
++                let dst = parse_reg(ops[0]);
++                let src = parse_reg(ops[1]);
++                let sh = parse_asm_i64(ops[2]).filter(|v| (0..64).contains(v));
++                if dst == REG_NONE || src == REG_NONE || sh.is_none() {
++                    widths.fill(0);
+                 } else {
+-                    known = 0;
++                    let sw = widths[src as usize];
++                    let w = if sw != 0 {
++                        sw.saturating_add(sh.unwrap() as u8)
++                    } else {
++                        0
++                    };
++                    set_width(&mut widths, dst, w);
                  }
-                 ExternalDecl::Declaration(decl) => {
-                     for declarator in &decl.declarators {
-@@ -836,6 +844,12 @@ impl Lowerer {
-                         if declarator.attrs.is_fastcall() && !declarator.name.is_empty() {
-                             self.fastcall_functions.insert(declarator.name.clone());
-                         }
-+                        // Collect __attribute__((regparm(N)))
-+                        if let Some(n) = declarator.attrs.regparm {
-+                            if !declarator.name.is_empty() {
-+                                self.regparm_functions.insert(declarator.name.clone(), n);
-+                            }
-+                        }
-                         // Collect __attribute__((pure))
-                         if declarator.attrs.is_pure() && !declarator.name.is_empty() {
-                             self.pure_functions.insert(declarator.name.clone());
-@@ -1969,6 +1983,7 @@ impl Lowerer {
-                     struct_arg_is_f128_sse: full_f128,
-                     is_sret: true,
-                     is_fastcall: false,
-+                    regparm: None,
-                     ret_eightbyte_classes: Vec::new(),
-                     ret_is_f128_sse: false,
-                     is_const: false,
-@@ -2020,6 +2035,7 @@ impl Lowerer {
-                 struct_arg_is_f128_sse: arg_is_f128,
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: ret_classes,
-@@ -2361,6 +2377,7 @@ impl Lowerer {
-                 struct_arg_is_f128_sse: vec![false, false, false],
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: Vec::new(),
-@@ -2399,6 +2416,7 @@ impl Lowerer {
-                 struct_arg_is_f128_sse: vec![false, false, false],
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: Vec::new(),
-diff --git a/src/ir/lowering/nested_functions.rs b/src/ir/lowering/nested_functions.rs
-index 0bc01275..497b13be 100644
---- a/src/ir/lowering/nested_functions.rs
-+++ b/src/ir/lowering/nested_functions.rs
-@@ -1178,6 +1178,7 @@ impl Lowerer {
-             is_used: true,
-             has_inlined_calls: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             param_alloca_values: param_alloca_vals,
-diff --git a/src/ir/mem2reg/promote.rs b/src/ir/mem2reg/promote.rs
-index d2ebe8e8..37c64ca0 100644
---- a/src/ir/mem2reg/promote.rs
-+++ b/src/ir/mem2reg/promote.rs
-@@ -1238,6 +1238,7 @@ mod tests {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: Vec::new(),
-diff --git a/src/ir/module.rs b/src/ir/module.rs
-index 4e69d65e..7ddef413 100644
---- a/src/ir/module.rs
-+++ b/src/ir/module.rs
-@@ -216,6 +216,9 @@ pub struct IrFunction {
-     /// __attribute__((fastcall)) - i386 fastcall calling convention.
-     /// First two integer/pointer args passed in ecx/edx instead of stack.
-     pub is_fastcall: bool,
-+    /// i686: `__attribute__((regparm(N)))` on the function definition —
-+    /// per-function override of the global -mregparm flag.
-+    pub regparm: Option<u8>,
-     /// __attribute__((naked)) - emit no prologue/epilogue; function body is pure asm.
-     pub is_naked: bool,
-     /// __attribute__((no_instrument_function)) - skip mcount/__fentry__ entry
-@@ -353,6 +356,7 @@ impl IrFunction {
-             param_alloca_values: Vec::new(),
-             uses_sret: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             global_init_label_blocks: Vec::new(),
-diff --git a/src/passes/fortify_fold.rs b/src/passes/fortify_fold.rs
-index d01888e2..9fc30d34 100644
---- a/src/passes/fortify_fold.rs
-+++ b/src/passes/fortify_fold.rs
-@@ -227,6 +227,7 @@ fn mk_call(name: &str, args: Vec<Operand>, arg_types: Vec<IrType>) -> Instructio
-             ret_is_f128_sse: false,
-             is_sret: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_pure: false,
-             is_const: false,
-             ret_eightbyte_classes: Vec::new(),
-@@ -756,6 +757,7 @@ mod tests {
-                 ret_is_f128_sse: false,
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: Vec::new(),
-diff --git a/src/passes/global_addr_cse.rs b/src/passes/global_addr_cse.rs
-index 2a330e0d..7c5e60b6 100644
---- a/src/passes/global_addr_cse.rs
-+++ b/src/passes/global_addr_cse.rs
-@@ -878,6 +878,7 @@ mod tests {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: vec![],
-@@ -927,6 +928,7 @@ mod tests {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: vec![],
-@@ -1426,6 +1428,7 @@ mod tests {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: vec![],
-diff --git a/src/passes/gvn.rs b/src/passes/gvn.rs
-index b2e37f7c..be6926d1 100644
---- a/src/passes/gvn.rs
-+++ b/src/passes/gvn.rs
-@@ -1714,6 +1714,7 @@ mod tests {
-             blocks: vec![block],
-             is_variadic: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             is_static: false,
-@@ -1801,6 +1802,7 @@ mod tests {
-             }],
-             is_variadic: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             is_static: false,
-@@ -1876,6 +1878,7 @@ mod tests {
-             }],
-             is_variadic: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             is_static: false,
-@@ -1957,6 +1960,7 @@ mod tests {
-             }],
-             is_variadic: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             is_static: false,
-@@ -2042,6 +2046,7 @@ mod tests {
-             }],
-             is_variadic: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             is_static: false,
-@@ -2127,6 +2132,7 @@ mod tests {
-             ],
-             is_variadic: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             is_static: false,
-@@ -2237,6 +2243,7 @@ mod tests {
-             ],
-             is_variadic: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             is_static: false,
-@@ -2308,6 +2315,7 @@ mod tests {
-             blocks,
-             is_variadic: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             fp_expr_tags: Default::default(),
-@@ -2469,6 +2477,7 @@ mod tests {
-                             struct_arg_is_f128_sse: Vec::new(),
-                             is_sret: false,
-                             is_fastcall: false,
-+                            regparm: None,
-                             is_pure: false,
-                             is_const: false,
-                             ret_eightbyte_classes: Vec::new(),
-@@ -2732,6 +2741,7 @@ mod tests {
-                             struct_arg_is_f128_sse: Vec::new(),
-                             is_sret: false,
-                             is_fastcall: false,
-+                            regparm: None,
-                             is_pure: false,
-                             is_const: false,
-                             ret_eightbyte_classes: Vec::new(),
-@@ -2929,6 +2939,7 @@ mod tests {
-                             struct_arg_is_f128_sse: Vec::new(),
-                             is_sret: false,
-                             is_fastcall: false,
-+                            regparm: None,
-                             is_pure: false,
-                             is_const: false,
-                             ret_eightbyte_classes: vec![],
-diff --git a/src/passes/inline.rs b/src/passes/inline.rs
-index a2a49b07..2fc9bb96 100644
---- a/src/passes/inline.rs
-+++ b/src/passes/inline.rs
-@@ -857,6 +857,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
-                                         param_alloca_values: vec![],
-                                         uses_sret: false,
-                                         is_fastcall: false,
-+                                        regparm: None,
-                                         is_naked: false,
-                                         no_instrument: false,
-                                         global_init_label_blocks: vec![],
-@@ -1126,6 +1127,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
-                                         param_alloca_values: vec![],
-                                         uses_sret: false,
-                                         is_fastcall: false,
-+                                        regparm: None,
-                                         is_naked: false,
-                                         no_instrument: false,
-                                         global_init_label_blocks: vec![],
-@@ -3671,6 +3673,7 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
-         struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
-         is_sret: info.is_sret,
-         is_fastcall: info.is_fastcall,
-+        regparm: None,
-         is_pure: info.is_pure,
-         is_const: info.is_const,
-         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
-@@ -4540,6 +4543,7 @@ mod value_reference_tests {
-             param_alloca_values: vec![],
-             uses_sret: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             global_init_label_blocks: vec![],
-diff --git a/src/passes/instrument.rs b/src/passes/instrument.rs
-index e1bf4d5e..23bde84c 100644
---- a/src/passes/instrument.rs
-+++ b/src/passes/instrument.rs
-@@ -147,6 +147,7 @@ fn hook_call(vfn: Value, vsite: Value) -> CallInfo {
-         ret_is_f128_sse: false,
-         is_sret: false,
-         is_fastcall: false,
-+        regparm: None,
-         // The hooks observe and mutate profiler state: never pure, never
-         // const, never removable. (Explicit for clarity; these are the
-         // defaults an extern call gets anyway.)
-diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
-index 7eea6380..894f87d8 100644
---- a/src/passes/loop_unroll.rs
-+++ b/src/passes/loop_unroll.rs
-@@ -4223,6 +4223,7 @@ mod tests {
-                 struct_arg_is_f128_sse: Vec::new(),
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: vec![],
-diff --git a/src/passes/outline_switch.rs b/src/passes/outline_switch.rs
-index c1c48d79..0ef35cb0 100644
---- a/src/passes/outline_switch.rs
-+++ b/src/passes/outline_switch.rs
-@@ -894,6 +894,7 @@ fn build_outlined_function(
-         is_weak: false,
-         is_used: false,
-         is_fastcall: false,
-+        regparm: None,
-         is_naked: false,
-         no_instrument: false,
-         has_inlined_calls: false,
-@@ -1311,6 +1312,7 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
-         struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
-         is_sret: info.is_sret,
-         is_fastcall: info.is_fastcall,
-+        regparm: None,
-         is_pure: info.is_pure,
-         is_const: info.is_const,
-         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
-@@ -1454,6 +1456,7 @@ fn replace_case_with_call(
-                 struct_arg_is_f128_sse: Vec::new(),
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: Vec::new(),
-@@ -1497,6 +1500,7 @@ fn replace_case_with_call(
-                 struct_arg_is_f128_sse: Vec::new(),
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: Vec::new(),
-diff --git a/src/passes/recursion_to_iter.rs b/src/passes/recursion_to_iter.rs
-index 9e13b42a..12a1b95d 100644
---- a/src/passes/recursion_to_iter.rs
-+++ b/src/passes/recursion_to_iter.rs
-@@ -629,6 +629,7 @@ mod tests {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: Vec::new(),
-@@ -664,6 +665,7 @@ mod tests {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: Vec::new(),
-@@ -813,6 +815,7 @@ mod tests {
-                     struct_arg_is_f128_sse: Vec::new(),
-                     is_sret: false,
-                     is_fastcall: false,
-+                    regparm: None,
-                     is_pure: false,
-                     is_const: false,
-                     ret_eightbyte_classes: Vec::new(),
-diff --git a/src/passes/redundant_loads.rs b/src/passes/redundant_loads.rs
-index 50f08fc0..026149c5 100644
---- a/src/passes/redundant_loads.rs
-+++ b/src/passes/redundant_loads.rs
-@@ -287,6 +287,7 @@ mod tests {
-             param_alloca_values: vec![],
-             uses_sret: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             global_init_label_blocks: vec![],
-diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index a08622e7..d76e86f4 100644
---- a/src/passes/simplify.rs
-+++ b/src/passes/simplify.rs
-@@ -3043,6 +3043,7 @@ mod tests {
-                 struct_arg_is_f128_sse: Vec::new(),
-                 is_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_pure: false,
-                 is_const: false,
-                 ret_eightbyte_classes: Vec::new(),
-diff --git a/src/passes/tail_call_elim.rs b/src/passes/tail_call_elim.rs
-index 68a340a1..a8a0550c 100644
---- a/src/passes/tail_call_elim.rs
-+++ b/src/passes/tail_call_elim.rs
-@@ -1006,6 +1006,7 @@ mod tests {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: vec![],
-@@ -1237,6 +1238,7 @@ mod tests {
-                         struct_arg_is_f128_sse: Vec::new(),
-                         is_sret: false,
-                         is_fastcall: false,
-+                        regparm: None,
-                         is_pure: false,
-                         is_const: false,
-                         ret_eightbyte_classes: vec![],
-diff --git a/src/pgo/instrument.rs b/src/pgo/instrument.rs
-index 70b1e376..40aef6b3 100644
---- a/src/pgo/instrument.rs
-+++ b/src/pgo/instrument.rs
-@@ -1486,6 +1486,7 @@ fn dump_helper(
-         param_alloca_values: vec![],
-         uses_sret: false,
-         is_fastcall: false,
-+        regparm: None,
-         is_naked: false,
-         no_instrument: false,
-         global_init_label_blocks: vec![],
-@@ -1527,6 +1528,7 @@ fn dump_helper(
-                 param_alloca_values: vec![],
-                 uses_sret: false,
-                 is_fastcall: false,
-+                regparm: None,
-                 is_naked: false,
-                 no_instrument: false,
-                 global_init_label_blocks: vec![],
-@@ -1554,6 +1556,7 @@ fn ci(d: Option<Value>, a: Vec<Operand>, t: Vec<IrType>, r: IrType, var: bool) -
-         struct_arg_is_f128_sse: Vec::new(),
-         is_sret: false,
-         is_fastcall: false,
-+        regparm: None,
-         is_pure: false,
-         is_const: false,
-         ret_eightbyte_classes: vec![],
-@@ -1813,6 +1816,7 @@ fn push_helper_fn(
-         param_alloca_values: param_allocas,
-         uses_sret: false,
-         is_fastcall: false,
-+        regparm: None,
-         is_naked: false,
-         no_instrument: false,
-         global_init_label_blocks: vec![],
-diff --git a/src/pgo/profile.rs b/src/pgo/profile.rs
-index 4116a6f1..6099b690 100644
---- a/src/pgo/profile.rs
-+++ b/src/pgo/profile.rs
-@@ -715,6 +715,7 @@ mod tests {
-             param_alloca_values: vec![],
-             uses_sret: false,
-             is_fastcall: false,
-+            regparm: None,
-             is_naked: false,
-             no_instrument: false,
-             global_init_label_blocks: vec![],
-diff --git a/tests/regression/casts_roundtrip.c b/tests/regression/casts_roundtrip.c
-index d55d0d2f..4166e69a 100644
---- a/tests/regression/casts_roundtrip.c
-+++ b/tests/regression/casts_roundtrip.c
-@@ -93,5 +93,73 @@ int main(void) {
-         CHECK(ident_f128(q) == q);
+             }
+             _ => match sext_producing_def(&lines[i], kinds[i]) {
+-                Some((dst, _)) => known &= !(1u64 << dst),
+-                None => known = 0,
++                Some((dst, _)) => set_width(&mut widths, dst, 0),
++                None => widths.fill(0),
+             },
+         }
++        i += 1;
+     }
+     changed
+ }
+@@ -2544,6 +2687,115 @@ mod jump_near_tests {
+         assert!(out.contains("jump some_function, t6"), "\n{}", out);
      }
  
-+#if defined(__i386__) || defined(__x86_64__)
-+    /* F128 -> U64 must not depend on the x87 precision control.
-+     * The superseded subtraction-based high path rounded 2^64 - 1 to
-+     * 2^63 under 24/53-bit precision control (verified against GCC 14.2
-+     * -m32, which miscompiles identically) and returned 0 instead of
-+     * UINT64_MAX. The native-payload path performs no arithmetic.
-+     */
-+    {
-+        static __inline__ void set_pc(unsigned short pc) {
-+            unsigned short cw;
-+            __asm__ volatile("fnstcw %0" : "=m"(cw));
-+            cw = (unsigned short)((cw & ~0x0300u) | pc);
-+            __asm__ volatile("fldcw %0" : : "m"(cw));
-+        }
-+        static __inline__ unsigned short get_pc(void) {
-+            unsigned short cw;
-+            __asm__ volatile("fnstcw %0" : "=m"(cw));
-+            return cw;
-+        }
-+        unsigned short save_pc = get_pc();
-+        static const unsigned short pcs[3] = { 0x0000, 0x0200, 0x0300 };
-+
-+        /* 2^64 - 1 is exactly representable in extended precision, so
-+         * loading it via a volatile long double must reach the converter
-+         * unrounded at every precision-control setting. */
-+        volatile f128 hi = 18446744073709551615.0L;
-+        volatile f128 hi2 = 18446744073709549568.0L; /* 2^64 - 2048 */
-+        for (int c = 0; c < 3; c++) {
-+            set_pc(pcs[c]);
-+            CHECK((u64)hi == 18446744073709551615ULL);
-+            CHECK((u64)hi2 == 18446744073709549568ULL);
-+            CHECK((u64)(f128)9223372036854775808.0L == 9223372036854775808ULL);
-+            CHECK((u64)(f128)9223372036854775807.0L == 9223372036854775807ULL);
-+            /* low-range values stay exact at every precision */
-+            CHECK((u64)(f128)12345.75L == 12345);
-+        }
-+        /* the not-in-range fallback keeps the GCC-compatible indefinite */
-+        set_pc(0x0300);
-+        {
-+            volatile f128 inf = 1.0L / 0.0L;
-+            CHECK((u64)inf == 0x8000000000000000ULL);
-+        }
-+        set_pc(save_pc);
++    #[test]
++    fn word_zext_pair_removed_after_lwu_and_copy() {
++        let input = concat!(
++            "f:\n",
++            "    lwu t0, 0(t2)\n",
++            "    mv a0, t0\n",
++            "    slli a0, a0, 32\n",
++            "    srli a0, a0, 32\n",
++            "    ret\n",
++        );
++        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
++        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
++        let n = lines.len();
++        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
++        assert_eq!(kinds[3], LineKind::Nop);
++        assert_eq!(kinds[4], LineKind::Nop);
 +    }
 +
-+    /* F128 identity copy must not clobber a caller-saved register home:
-+     * under regparm register pressure the allocator may keep a parameter
-+     * in ECX/EDX (the hazard model marks Cast points so it never spans
-+     * one, but a value used AFTER the cast must still read its true
-+     * home). This exercises the direct 3-register copy path. */
-+#if defined(__i386__)
-+    {
-+        extern long long f128_copy_pressure(int a, int b, int c, long double x);
-+        long long r = f128_copy_pressure(7, 11, 13, 100.0L);
-+        CHECK(r == 131); /* 7 + 11 + 13 + (int)100.5 */
++    #[test]
++    fn word_zext_cross_register_pair_becomes_move() {
++        let input = "f:\n    lhu t0, 0(t2)\n    slli a0, t0, 32\n    srli a0, a0, 32\n    add a1, a0, t3\n    ret\n";
++        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
++        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
++        let n = lines.len();
++        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
++        assert_eq!(lines[2].trim(), "mv a0, t0");
++        assert_eq!(kinds[3], LineKind::Nop);
 +    }
-+#endif
-+#endif
 +
-     return fails;
- }
++    #[test]
++    fn narrow_logic_and_shift_producers_feed_word_zext() {
++        let input = concat!(
++            "f:\n",
++            "    lbu t0, 0(t2)\n",
++            "    li t1, 255\n",
++            "    xor t0, t0, t1\n",
++            "    srli t0, t0, 1\n",
++            "    slli t0, t0, 32\n",
++            "    srli t0, t0, 32\n",
++            "    ret\n",
++        );
++        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
++        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
++        let n = lines.len();
++        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
++        assert_eq!(kinds[5], LineKind::Nop);
++        assert_eq!(kinds[6], LineKind::Nop);
++    }
 +
-+#if defined(__i386__)
-+__attribute__((regparm(3), noinline))
-+long long f128_copy_pressure(int a, int b, int c, long double x) {
-+    long double y = x;                  /* identity cast: direct copy path */
-+    volatile long double z = y + 0.5L;  /* keep a/b/c live across the cast */
-+    return a + b + c + (int)z;
-+}
-+#endif
-diff --git a/tests/regression/casts_roundtrip.c.env b/tests/regression/casts_roundtrip.c.env
-new file mode 100644
-index 00000000..63a672f8
---- /dev/null
-+++ b/tests/regression/casts_roundtrip.c.env
-@@ -0,0 +1,6 @@
-+# The F128 -> U64 precision-control matrix is deliberately STRICTER than
-+# GCC: GCC 14.2 -m32 miscompiles 2^64 - 1 under 24/53-bit x87 precision
-+# control (its subtraction-based conversion returns 0), while lccc's
-+# native-payload path is exact at every precision-control setting. A
-+# GCC-compiled oracle binary therefore fails the same checks lccc passes.
-+LCCC_NO_COMPARE=1
++    #[test]
++    fn narrow_producer_lattice_covers_comparisons_masks_and_logic() {
++        let cases = [
++            "    seqz t0, t1\n",
++            "    sltu t0, t1, t2\n",
++            "    andi t0, t1, 1023\n",
++            "    lhu t0, 0(t2)\n    ld t1, 8(t2)\n    and t0, t0, t1\n",
++            "    lbu t0, 0(t2)\n    li t1, 3\n    or t0, t0, t1\n",
++            "    lbu t0, 0(t2)\n    slli t0, t0, 4\n",
++        ];
++        for producer in cases {
++            let input =
++                format!("f:\n{producer}    slli t0, t0, 32\n    srli t0, t0, 32\n    ret\n");
++            let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
++            let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
++            let n = lines.len();
++            assert!(
++                eliminate_redundant_zext_byte(&mut lines, &mut kinds, n),
++                "producer did not establish a narrow value:\n{input}"
++            );
++            assert!(
++                !lines
++                    .iter()
++                    .zip(&kinds)
++                    .any(|(line, kind)| *kind != LineKind::Nop && line.trim() == "slli t0, t0, 32"),
++                "zext pair survived:\n{input}"
++            );
++        }
++    }
++
++    #[test]
++    fn wide_or_operand_prevents_false_narrow_proof() {
++        let input = concat!(
++            "f:\n",
++            "    lbu t0, 0(t2)\n",
++            "    ld t1, 8(t2)\n",
++            "    or t0, t0, t1\n",
++            "    slli t0, t0, 32\n",
++            "    srli t0, t0, 32\n",
++            "    ret\n",
++        );
++        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
++        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
++        let n = lines.len();
++        assert!(!eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
++        assert_eq!(kinds[4], LineKind::Alu);
++        assert_eq!(kinds[5], LineKind::Alu);
++    }
++
++    #[test]
++    fn word_zext_pair_kept_without_upper_bit_proof() {
++        let input = "f:\n    ld t0, 0(t2)\n    slli t0, t0, 32\n    srli t0, t0, 32\n    ret\n";
++        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
++        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
++        let n = lines.len();
++        assert!(!eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
++        assert_eq!(kinds[2], LineKind::Alu);
++        assert_eq!(kinds[3], LineKind::Alu);
++    }
++
+     #[test]
+     fn byte_zext_tracks_lbu_through_moves() {
+         let input = "f:\n    lbu t0, 0(t2)\n    mv a0, t0\n    andi t0, t0, 0xff\n    ret\n";
