@@ -1,454 +1,2158 @@
-diff --git a/src/backend/riscv/codegen/peephole.rs b/src/backend/riscv/codegen/peephole.rs
-index 71b4810..47683aa 100644
---- a/src/backend/riscv/codegen/peephole.rs
-+++ b/src/backend/riscv/codegen/peephole.rs
-@@ -46,9 +46,10 @@
- //!    over an unconditional jump when the new B-type target is conservatively
- //!    proven to fit its ±4 KiB range.
- //!
--//! 10. **Redundant byte zero-extension elimination**: Tracks values produced
--//!     by `lbu`, byte-sized constants, and register copies, removing a later
--//!     `andi r, r, 0xff` when the upper bits are already known zero.
-+//! 10. **Narrow-value lattice / redundant zero extensions**: Cross-pollinates
-+//!     AArch64 extension folding and x86 upper-bit knowledge across unsigned
-+//!     loads, constants, copies, comparisons, masks, logic and shifts; removes
-+//!     both redundant byte masks and RV64 `slli 32; srli 32` zext.w pairs.
+diff --git a/FOLLOWUP-2026-09-10-param-alignment-and-f128-u64-rail.md b/FOLLOWUP-2026-09-10-param-alignment-and-f128-u64-rail.md
+new file mode 100644
+index 00000000..e9241aaf
+--- /dev/null
++++ b/FOLLOWUP-2026-09-10-param-alignment-and-f128-u64-rail.md
+@@ -0,0 +1,166 @@
++# FOLLOWUP-2026-09-10-param-alignment-and-f128-u64-rail.md
++
++Closes the two outstanding defects from the i686 prologue audit
++(`FOLLOWUP-2026-09-10-i686-prologue-fastcall-regparm-audit.md`): **Gap 1**
++(over-aligned parameter allocas) and **Gap 2** (x86-64 legacy `%rax` head in
++the F128 -> U64 cast). One additional pre-existing defect found and fixed on
++the way (i686 peephole `ret $N` misclassification). All changes re-based onto
++origin/main **28379879** (Merge PR #483), which re-integrates the S07 merge
++(PR #482) plus PRs #477-#479.
++
++Every claim below was reproduced or refuted empirically. Oracles:
++GCC 14.2.0-19, Clang 23.1.2 (apt.llvm.org), ICX 2023.2.4 and classic ICC
++2021.10.0 (Intel oneAPI apt repo). GCC 16.2 could not be installed: Debian
++trixie/experimental has no `gcc-16` package yet (documented in the installer
++log); GCC 14.2.0-19 is the newest stable GCC on this host.
++
++## Gap 1 — over-aligned parameter allocas
++
++**Defect.** `typedef int A32 __attribute__((aligned(32))); int f(A32 x){ &x }`
++must observe `&x` 32-aligned (the parameter OBJECT carries the declared
++alignment; C11 6.2.8p3 / GCC semantics: the callee homes the incoming value
++at the declared alignment, dynamically realigning `%esp` when > 16). lccc
++instead stored and reloaded the parameter from a 4-aligned slot, so `&x`
++violated the declared alignment — silent UB for any user relying on it.
++
++**Reproduction.** `ovalign3.c/ovalign3_sink.c/ovalign3_drv.c` (cross-TU
++escape), `ovalign4.c` (+sink/drv, checks `&x % 32 == 0`), `ovalign5.c`
++(in-TU `void *volatile` escape): GCC -m32 prints `78`/rc 0; the pre-fix
++lccc printed -1/rc 1. Escape is essential: without it the alloca is folded
++away (`ovalign2_l.s`).
++
++**Design.** Two regimes, mirroring GCC's split:
++
++* `align <= 16` — static homing at the ABI-inherited alignment (frame
++  already satisfies it; GCC-identical, zero cost).
++* `align > 16` — the alloca slot is padded by `align - 1` and everything
++  routes through the *effective* aligned address (`lea base(%ebp),%ecx;
++  add $31; and $-32`):
++
++  * the prologue capture stores the incoming argument **directly at the
++    effective address** — the capture IS the homing store;
++  * `&x` and every alloca load/store use the effective address
++    (`alloca_over_align` / `emit_alloca_aligned_addr_impl` in all four
++    backends);
++  * the ParamRef materialization loads from the effective address;
++  * the separate `store %p, %a` homing store and the ParamRef copy are
++    **elided** when the ParamRef dest's only use is that store
++    (Phase 7.5 census in `stack_layout/mod.rs`; `param_homing_stores` /
++    `dead_param_ref_dests` in `state.rs`; checks in `emit_store_impl` and
++    `emit_param_ref_impl`, i686 + x86-64).
++
++Result: capture-as-single-home. Disassembly of
++`h(A32 x){ void *volatile p=&x; sink_ptr_rw(p); return x; }` is ONE aligned
++store plus reads straight from the effective address — strictly fewer memory
++ops than GCC, which captures to a temporary and copies into a realigned home.
++
++**Frontend.** `ParamDecl` gained `alignment` / `alignas_type`
++(`ast.rs`); `parse_param_list` now captures pre-name GCC attributes, parses
++POST-name attributes (`int x __attribute__((aligned(32)))` — previously
++silently skipped), and merges `_Alignas` via `.take()` (no cross-parameter
++leakage). `build_ir_params` folds the declared alignment into `param_align`
++(scalars), `struct_align` (struct/union/vector params), and the `_Float128`
++carrier branch (previously hardcoded `struct_align: Some(16)`, silently
++dropping `aligned(32)` on `_Float128` params). lccc ACCEPTS direct
++`aligned`/`_Alignas` parameter spellings that GCC and Clang reject
++("alignment may not be specified for 'x'"), so honoring them is mandatory —
++accepting-but-ignoring would be silent UB.
++
++**Guards added.** `slot_assignment.rs`: the ParamRef-dest/alloca slot share
++is now refused for over-aligned allocas (the dest's accesses would use the
++raw base while the alloca's use the padded effective address). x86-64
++`emit_param_ref_impl` loads over-aligned param allocas via the effective
++address (was raw `slot_ref`); i686 already did via
++`emit_param_slot_load`.
++
++**Validation.** `pa1_matrix.c` (24 cases: alignment x type x ABI-shape,
++mutation/escape, register interaction), `pa2_direct.c` (9 direct-spelling
++cases), `pa3_conv.c` (fastcall/regparm(1..3)/stdcall x over-aligned
++scalars and structs): all PASS on lccc-i686 and lccc-x86-64, 20-run
++determinism (1 unique summary). Oracle standings for over-aligned
++parameters (ovalign6g + pa1): GCC 14.2 PASS, Clang 23.1.2 PASS, ICX
++2023.2.4 PASS, **classic ICC FAILS at -O0, -O2 and -O2 -align-all**
++(`&x` misaligned for every typedef-aligned parameter — ICC drops parameter
++alignment entirely), lccc PASS. lccc is strictly stronger than ICC here.
++
++## Gap 2 — x86-64 legacy `%rax` head in F128 -> U64
++
++`emit_f128_to_u64_cast` opened with `subq $16; movq %rax,(%rsp);
++fldl (%rsp)` — a legacy rail that treats the low 8 bytes of an F128 as an
++f64 and was only reachable from `emit_f128_to_int_cast`, which itself is
++only called when `emit_f128_to_int` (cast_ops.rs) fails to intercept a cast.
++A 16-byte F128 can never ride the `%rax` accumulator, so the rail was
++structurally wrong — a latent miscompile for any shape that reached it.
++
++**Empirical rail proof.** An emission marker was inserted at the head and
++the compiler was run over a 400-file corpus (repo tests + scratch harnesses)
++on BOTH x86-64 and i686: **0 hits in 800 compilations** (plus the S07
++battery: f128u64.c, x64f128.c, battery1.c).
++
++**Fix.** The legacy functions (`emit_f128_to_u64_cast`,
++`emit_f128_to_int_cast`, `emit_fisttp_from_f64_via_stack`) are deleted; the
++call site in `emit_cast_instrs_x86` now **fails closed** with a descriptive
++panic instead of silently emitting the wrong sequence. Every real
++F128 -> int conversion flows through `emit_f128_to_int`'s dispatch
++(memory / f128-source / constant) into the canonical x87 ST0 path
++(`emit_f128_st0_to_int`, the S07 0x403e threshold implementation).
++
++**Validation.** `fc_matrix.c` (bit-exact truncations, boundary values,
++precision-control invariance at PC 24/53/64, exact F128 -> F64/F32 narrows,
++U64 -> F128 -> U64 round trip): **all eight toolchain/mode combinations
++PASS** (lccc-i686, lccc-x86-64, GCC -m32/-m64, Clang -m32/-m64, ICX,
++ICC). The long-double PC matrix remains the discriminator: f128u64.c
++(lccc-i686 ALL OK; **GCC -m32 FAILS PC53 case 8**, got 0 want 2^64-1) and
++x64f128.c (lccc-x86-64 ALL OK; **GCC x86-64 FAILS pc=1 case=2**) — lccc is
++strictly stronger than GCC where precision control meets exact payloads.
++
++Matrix note: `(_Float128)N.N` casts are NOT valid test vectors — the
++unsuffixed literal is parsed as double and ROUNDS first
++(`(_Float128)9223372036854775807.0` is 2^63, not 2^63-1; GCC, Clang, ICX,
++ICC and lccc all agree on this). The matrix therefore uses exact `f128`
++(GCC/lccc) / `q` (Clang/ICX/ICC) literal suffixes.
++
++## New defect found and fixed — i686 peephole `ret $N`
++
++`pa3_conv.c` fastcall case f2 returned garbage (a value left in `%ecx` at
++`ret $8`). Root cause: `classify_line` recognized only the bare `ret` as
++`LineKind::Ret`; `ret $N` (fastcall/stdcall/sret callee-pop) fell through as
++a generic non-barrier line, so `eliminate_dead_reg_moves` scanned PAST the
++`ret $8`, saw no read of `%eax`, and **deleted the return-value move**
++(`movl %ecx, %eax`) immediately before the return. Reproduced in isolation:
++`peephole_optimize("movl %ecx,%eax\nret $8")` returns just `ret $8`.
++
++Fix: new `LineKind::RetN` classification for `ret $N`, wired into all 11
++consumers (is_barrier, slot invalidation, CFG liveness in/out, edx
++return-value liveness, dead-reg-move Ret arm, ret-observes census,
++guarded-label scan, block-terminator scan). Tail-call conversion is
++deliberately NOT given RetN (its suppression "falls out naturally" and
++remains intact). Regression test added in the peephole test module.
++
++## Test assets
++
++`/home/user/scratch/paramalign/` — pa1_matrix.c (+pa_sink.c), pa2_direct.c,
++pa3_conv.c, fc_matrix.c (self-checking, unique negative failure codes,
++PASS/FAIL summary, 20-run determinism verified). `/home/user/scratch/prologue/`
++— ovalign3-6 chains incl. the GCC-clean typedef oracle ovalign6g.c.
++
++## Validation summary (all on the re-based tree)
++
++* fastbuild, `-D warnings`: clean (2m38s).
++* `cargo test --lib`: 2307 passed, 0 failed.
++* `scripts/ci_local.sh --fast`: 16/16 gates green.
++* `cargo fmt --all`: clean.
++* Matrices: pa1/pa2/pa3/fc + ovalign chains: all green on lccc-i686 and
++  lccc-x86-64; oracle tables above.
++
++## Follow-ups
++
++* ARM/RISC-V ParamRef routing for over-aligned param allocas still uses
++  the placeholder `_alloca_id` (no over-aligned effective-address load yet);
++  same fix shape as x86-64 once ARM/RISC-V runtime oracles are available
++  (qemu-user installed with the oracle toolchain).
++* ICC classic: no 32-bit runtime (ia32_lin not shipped in the 2023.2.4
++  oneAPI package), so ICC -m32 evidence is limited to compile-only; ICC
++  additionally fails the over-aligned-parameter semantics outright.
++* GCC 16.2: unavailable on Debian trixie (no gcc-16 package in stable or
++  experimental); re-run the oracle tables when it lands.
+diff --git a/src/backend/arm/codegen/prologue.rs b/src/backend/arm/codegen/prologue.rs
+index e0692a2c..b9245657 100644
+--- a/src/backend/arm/codegen/prologue.rs
++++ b/src/backend/arm/codegen/prologue.rs
+@@ -513,8 +513,9 @@ impl ArmCodegen {
  
- // ── Line classification types ────────────────────────────────────────────────
+         self.state.param_alloca_slots = (0..func.params.len())
+             .map(|i| {
+-                find_param_alloca(func, i)
+-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
++                find_param_alloca(func, i).and_then(|(dest, ty)| {
++                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
++                })
+             })
+             .collect();
  
-@@ -971,81 +972,169 @@ fn eliminate_redundant_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize
-     changed
- }
+@@ -643,7 +644,7 @@ impl ArmCodegen {
+         }
  
--// ── Redundant byte zero-extension elimination ────────────────────────────────
-+// ── Narrow-value lattice and redundant zero-extension elimination ────────────
- //
--// RV64 `lbu` already produces an XLEN-wide zero-extended value.  The generic
--// lowering nevertheless often emits a later `andi r, r, 0xff`, usually with
--// register-copy staging in between.  This is the RISC-V adaptation of ARM's
--// redundant-zext pass: maintain a conservative per-basic-block proof that a
--// register is in [0,255], propagate it through `mv`, and delete only a self
--// mask whose input is proven.  Cross-register masks become moves because they
--// still define their destination.
-+// This is the RV64 adaptation of AArch64's repeated-extension elimination and
-+// x86's upper-bit knowledge: track the maximum number of potentially nonzero
-+// low bits in each register.  The lattice recognises ten target constructs:
-+// lbu/lhu/lwu, nonnegative li, mv, seqz/snez/slt*, positive andi masks,
-+// logical and/or/xor, srli, slli, and the canonical slli+srli zext.w pair.
-+// Unknown instructions and CFG joins fail closed.  Calls retain only the
-+// callee-saved s-register facts.
- fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
--    if std::env::var("CCC_NO_ZEXT_BYTE_ELIM").is_ok() {
-+    if std::env::var("CCC_NO_ZEXT_BYTE_ELIM").is_ok()
-+        || std::env::var("CCC_NO_NARROW_VALUE_ELIM").is_ok()
-+    {
-         return false;
+         if param_idx < self.state.param_alloca_slots.len() {
+-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
++            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
+                 let ldr_instr = self.load_instr_for_type_impl(alloca_ty);
+                 let (actual_instr, reg) = Self::arm_parse_load(ldr_instr);
+                 self.emit_load_from_sp(reg, slot.0, actual_instr);
+diff --git a/src/backend/i686/codegen/memory.rs b/src/backend/i686/codegen/memory.rs
+index 6111dbbb..0670bfcd 100644
+--- a/src/backend/i686/codegen/memory.rs
++++ b/src/backend/i686/codegen/memory.rs
+@@ -188,6 +188,17 @@ impl I686Codegen {
+     // ---- Store/Load overrides ----
+ 
+     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
++        // Over-aligned-param homing-store elision: `store %p, %a` where %a is
++        // an over-aligned param alloca. The prologue capture already wrote the
++        // incoming value to the alloca's EFFECTIVE aligned address, so this
++        // store is a redundant rewrite (and, pre-elision, the destructive
++        // garbage-copy source: it re-loaded %p from a slot the capture never
++        // wrote). Elide: zero instructions instead of load+store.
++        if let Operand::Value(v) = val {
++            if self.state.param_homing_stores.contains(&(v.0, ptr.0)) {
++                return;
++            }
++        }
+         // 128-bit integer container stores (IrType::I128/U128: the _Float128
+         // gp-view, _Decimal128, vector pack results).  The historical
+         // "i128 == 64-bit eax:edx pair" model truncated these to 8 bytes,
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 46051d07..19b29b9c 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -67,6 +67,11 @@ enum LineKind {
+     CondJmp,
+     Call,
+     Ret,
++    /// `ret $N` — callee-pops conventions (fastcall/stdcall/sret cleanup).
++    /// Semantically a return exactly like `Ret` (observes %eax/%edx/%esp,
++    /// terminates the block), but kept distinct so passes that only handle
++    /// the plain form (tail-call conversion) never see it.
++    RetN,
+     Push {
+         reg: RegId,
+     },
+@@ -139,7 +144,8 @@ impl LineInfo {
+         matches!(
+             self.kind,
+             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
+-            LineKind::CondJmp | LineKind::Ret | LineKind::Directive | LineKind::InlineAsm |
++            LineKind::CondJmp | LineKind::Ret | LineKind::RetN | LineKind::Directive
++                | LineKind::InlineAsm |
+             // ESP changes renumber every (%esp) slot: push/pop and explicit
+             // %esp arithmetic fence all slot windows now that ESP-relative
+             // slots participate in the peepholes. Pushes/pops only appear
+@@ -829,6 +835,13 @@ fn classify_line(raw: &str) -> LineInfo {
+     if first == b'r' && s == "ret" {
+         return line_info(LineKind::Ret, ts);
      }
--    let mut known: u64 = 0;
-+    fn bits_for_nonnegative(v: i64) -> u8 {
-+        if v <= 0 {
-+            1
-+        } else {
-+            (64 - (v as u64).leading_zeros()) as u8
-+        }
++    // `ret $N` (callee-pops return): a return in every respect, but
++    // classified distinctly so tail-call conversion (which requires the
++    // plain form) and the dead-move elimination (which MUST treat it as
++    // observing %eax/%edx) can both be correct.
++    if first == b'r' && s.starts_with("ret ") {
++        return line_info(LineKind::RetN, ts);
 +    }
-+    fn set_width(widths: &mut [u8; NUM_REGS], reg: u8, width: u8) {
-+        if (reg as usize) < NUM_REGS {
-+            widths[reg as usize] = if width == 0 || width >= 64 { 0 } else { width };
-+        }
-+    }
-+
-+    let mut widths = [0u8; NUM_REGS]; // 0 = unknown/full 64-bit
-     let mut changed = false;
--    for i in 0..n {
-+    let mut i = 0;
-+    while i < n {
-         match kinds[i] {
-             LineKind::Label | LineKind::Branch | LineKind::Jump | LineKind::Ret => {
--                known = 0;
-+                widths.fill(0);
-+                i += 1;
-                 continue;
-             }
-             LineKind::Call => {
--                // Preserve only callee-saved s0-s11 knowledge.
--                for r in 0..=6u8 {
--                    known &= !(1u64 << r);
-+                for r in 0..=6usize {
-+                    widths[r] = 0;
-                 }
--                for r in 30..=37u8 {
--                    known &= !(1u64 << r);
-+                for r in 30..=37usize {
-+                    widths[r] = 0;
-                 }
-+                widths[REG_RA as usize] = 0;
-+                i += 1;
-+                continue;
-+            }
-+            LineKind::Nop | LineKind::Directive => {
-+                i += 1;
-                 continue;
-             }
--            LineKind::Nop | LineKind::Directive => continue,
-             _ => {}
-         }
  
--        let t = lines[i].trim();
--        let (mnem, operands) = match t.split_once(' ') {
-+        // Own the current text because successful folds rewrite `lines[i]`
-+        // while mnemonic/operand slices remain live for lattice bookkeeping.
-+        let text = lines[i].trim().to_owned();
-+        let (mnem, operands) = match text.split_once(' ') {
-             Some(parts) => parts,
-             None => {
--                known = 0;
-+                widths.fill(0);
-+                i += 1;
-                 continue;
-             }
-         };
-+        let ops: Vec<&str> = operands.split(',').map(str::trim).collect();
-+
-+        // Canonical RV64 zero-extension: slli d,s,32; srli d,d,32.  If s is
-+        // already u32-or-narrower, preserve the destination definition with a
-+        // move (or delete both for the self form).
-+        if mnem == "slli" && ops.len() == 3 && parse_asm_i64(ops[2]) == Some(32) {
-+            let dst = parse_reg(ops[0]);
-+            let src = parse_reg(ops[1]);
-+            let mut j = i + 1;
-+            while j < n && kinds[j] == LineKind::Nop {
-+                j += 1;
-+            }
-+            if dst != REG_NONE
-+                && src != REG_NONE
-+                && widths[src as usize] != 0
-+                && widths[src as usize] <= 32
-+                && j < n
-+            {
-+                let jt = lines[j].trim();
-+                let jops: Vec<&str> = jt
-+                    .strip_prefix("srli ")
-+                    .map(|s| s.split(',').map(str::trim).collect())
-+                    .unwrap_or_default();
-+                if jops.len() == 3
-+                    && parse_reg(jops[0]) == dst
-+                    && parse_reg(jops[1]) == dst
-+                    && parse_asm_i64(jops[2]) == Some(32)
-+                {
-+                    if dst == src {
-+                        kinds[i] = LineKind::Nop;
-+                    } else {
-+                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
-+                        kinds[i] = LineKind::Move { dst, src };
-+                    }
-+                    kinds[j] = LineKind::Nop;
-+                    let src_width = widths[src as usize];
-+                    set_width(&mut widths, dst, src_width);
-+                    changed = true;
-+                    i = j + 1;
-+                    continue;
-+                }
-+            }
-+        }
- 
--        // `lbu rd, address` establishes the proof regardless of addressing
--        // mode. Other unclassified instructions remain fail-closed below.
--        if mnem == "lbu" {
--            let dst = parse_reg(operands.split(',').next().unwrap_or("").trim());
-+        // Unsigned loads establish width regardless of their addressing mode.
-+        if let Some(width) = match mnem {
-+            "lbu" => Some(8),
-+            "lhu" => Some(16),
-+            "lwu" | "zext.w" => Some(32),
-+            _ => None,
-+        } {
-+            let dst = parse_reg(ops.first().copied().unwrap_or(""));
-+            if dst == REG_NONE {
-+                widths.fill(0);
-+            } else {
-+                set_width(&mut widths, dst, width);
-+            }
-+            i += 1;
-+            continue;
-+        }
-+        // Signed/full-width loads kill only their destination proof; ordinary
-+        // stores define no GP register on RISC-V.  Keeping unrelated facts
-+        // across these fully modelled instructions is safe and materially
-+        // improves AND-with-a-narrow-operand cases.
-+        if matches!(mnem, "lb" | "lh" | "lw" | "ld") {
-+            let dst = parse_reg(ops.first().copied().unwrap_or(""));
-             if dst == REG_NONE {
--                known = 0;
-+                widths.fill(0);
-             } else {
--                known |= 1u64 << dst;
-+                set_width(&mut widths, dst, 0);
-             }
-+            i += 1;
-+            continue;
-+        }
-+        if matches!(mnem, "sb" | "sh" | "sw" | "sd") {
-+            i += 1;
-             continue;
-         }
- 
--        if mnem == "andi" {
--            let ops: Vec<&str> = operands.split(',').map(str::trim).collect();
--            if ops.len() == 3 {
--                let dst = parse_reg(ops[0]);
--                let src = parse_reg(ops[1]);
--                let imm = parse_asm_i64(ops[2]);
--                if dst != REG_NONE && src != REG_NONE && imm == Some(255) {
--                    if known & (1u64 << src) != 0 {
--                        if dst == src {
--                            kinds[i] = LineKind::Nop;
--                        } else {
--                            lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
--                            kinds[i] = LineKind::Move { dst, src };
--                        }
--                        changed = true;
-+        if mnem == "andi" && ops.len() == 3 {
-+            let dst = parse_reg(ops[0]);
-+            let src = parse_reg(ops[1]);
-+            let imm = parse_asm_i64(ops[2]);
-+            if dst != REG_NONE && src != REG_NONE {
-+                if imm == Some(255) && widths[src as usize] != 0 && widths[src as usize] <= 8 {
-+                    if dst == src {
-+                        kinds[i] = LineKind::Nop;
-+                    } else {
-+                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
-+                        kinds[i] = LineKind::Move { dst, src };
+     // test instructions
+     if first == b't' && bytes.len() >= 5 && bytes[1] == b'e' && bytes[2] == b's' && bytes[3] == b't'
+@@ -2127,7 +2140,7 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
                      }
--                    // Masking with 255 establishes the invariant even when it
--                    // could not itself be removed.
--                    known |= 1u64 << dst;
-+                    changed = true;
-+                }
-+                if let Some(v) = imm.filter(|v| *v >= 0) {
-+                    set_width(&mut widths, dst, bits_for_nonnegative(v));
-+                    i += 1;
-                     continue;
                  }
              }
-@@ -1053,34 +1142,88 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
- 
-         match kinds[i] {
-             LineKind::Move { dst, src } => {
--                if known & (1u64 << src) != 0 {
--                    known |= 1u64 << dst;
-+                let src_width = widths[src as usize];
-+                set_width(&mut widths, dst, src_width);
-+            }
-+            LineKind::LoadImm { dst } => {
-+                let width = ops
-+                    .get(1)
-+                    .and_then(|imm| parse_asm_i64(imm))
-+                    .filter(|v| *v >= 0)
-+                    .map(bits_for_nonnegative)
-+                    .unwrap_or(0);
-+                set_width(&mut widths, dst, width);
-+            }
-+            LineKind::Alu
-+                if matches!(mnem, "seqz" | "snez" | "slt" | "sltu" | "slti" | "sltiu") =>
-+            {
-+                if let Some(dst) = parse_alu_dest(&lines[i]) {
-+                    set_width(&mut widths, dst, 1);
-                 } else {
--                    known &= !(1u64 << dst);
-+                    widths.fill(0);
-                 }
+-            LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret => {
++            LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret | LineKind::RetN => {
+                 // Control flow change - invalidate all
+                 slots = [(REG_NONE, MoveSize::L); SLOT_COUNT];
              }
--            LineKind::LoadImm { dst } => {
--                let value = operands
--                    .split_once(',')
--                    .and_then(|(_, imm)| parse_asm_i64(imm));
--                if value.is_some_and(|v| (0..=255).contains(&v)) {
--                    known |= 1u64 << dst;
-+            LineKind::Alu if matches!(mnem, "and" | "or" | "xor") && ops.len() == 3 => {
-+                let dst = parse_reg(ops[0]);
-+                let a = parse_reg(ops[1]);
-+                let b = parse_reg(ops[2]);
-+                if dst == REG_NONE || a == REG_NONE || b == REG_NONE {
-+                    widths.fill(0);
-                 } else {
--                    known &= !(1u64 << dst);
-+                    let (wa, wb) = (widths[a as usize], widths[b as usize]);
-+                    let w = if mnem == "and" {
-+                        match (wa, wb) {
-+                            (0, 0) => 0,
-+                            (0, x) | (x, 0) => x,
-+                            (x, y) => x.min(y),
-+                        }
-+                    } else if wa != 0 && wb != 0 {
-+                        wa.max(wb)
-+                    } else {
-+                        0
-+                    };
-+                    set_width(&mut widths, dst, w);
-                 }
-             }
--            LineKind::Alu if mnem == "seqz" || mnem == "snez" => {
--                if let Some(dst) = parse_alu_dest(&lines[i]) {
--                    known |= 1u64 << dst;
-+            LineKind::Alu if mnem == "srli" && ops.len() == 3 => {
-+                let dst = parse_reg(ops[0]);
-+                let src = parse_reg(ops[1]);
-+                let sh = parse_asm_i64(ops[2]).filter(|v| (0..64).contains(v));
-+                if dst == REG_NONE || src == REG_NONE || sh.is_none() {
-+                    widths.fill(0);
-+                } else {
-+                    let sh = sh.unwrap() as u8;
-+                    let sw = widths[src as usize];
-+                    let w = if sw == 0 {
-+                        64 - sh
-+                    } else {
-+                        sw.saturating_sub(sh).max(1)
-+                    };
-+                    set_width(&mut widths, dst, w);
-+                }
-+            }
-+            LineKind::Alu if mnem == "slli" && ops.len() == 3 => {
-+                let dst = parse_reg(ops[0]);
-+                let src = parse_reg(ops[1]);
-+                let sh = parse_asm_i64(ops[2]).filter(|v| (0..64).contains(v));
-+                if dst == REG_NONE || src == REG_NONE || sh.is_none() {
-+                    widths.fill(0);
-                 } else {
--                    known = 0;
-+                    let sw = widths[src as usize];
-+                    let w = if sw != 0 {
-+                        sw.saturating_add(sh.unwrap() as u8)
-+                    } else {
-+                        0
-+                    };
-+                    set_width(&mut widths, dst, w);
-                 }
-             }
-             _ => match sext_producing_def(&lines[i], kinds[i]) {
--                Some((dst, _)) => known &= !(1u64 << dst),
--                None => known = 0,
-+                Some((dst, _)) => set_width(&mut widths, dst, 0),
-+                None => widths.fill(0),
-             },
+@@ -3284,7 +3297,7 @@ fn line_reg_use_def(store: &LineStore, infos: &[LineInfo], idx: usize) -> (u16,
+             uses |= caller;
+             defs = caller;
          }
-+        i += 1;
-     }
-     changed
- }
-@@ -2544,6 +2687,115 @@ mod jump_near_tests {
-         assert!(out.contains("jump some_function, t6"), "\n{}", out);
-     }
+-        LineKind::Ret => {
++        LineKind::Ret | LineKind::RetN => {
+             // EAX is every scalar return.  EDX liveness for wide integer
+             // returns is added from the private function metadata by the CFG
+             // driver below.
+@@ -3542,7 +3555,7 @@ fn compute_gpr_live_out(
+                 .and_then(|name| labels.get(name).copied());
+             let mut out = 0u16;
+             match infos[i].kind {
+-                LineKind::Ret => {}
++                LineKind::Ret | LineKind::RetN => {}
+                 LineKind::JmpIndirect => {
+                     // See above: jump tables / tail calls — stay conservative.
+                     out = GprLiveness::ALL;
+@@ -3573,7 +3586,7 @@ fn compute_gpr_live_out(
+                 }
+             }
+             let (mut uses, defs) = line_reg_use_def(store, infos, i);
+-            if return_uses_edx && infos[i].kind == LineKind::Ret {
++            if return_uses_edx && matches!(infos[i].kind, LineKind::Ret | LineKind::RetN) {
+                 uses |= 1u16 << REG_EDX;
+             }
+             let input = uses | (out & !defs);
+@@ -3995,7 +4008,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+             // %eax/%edx carry the return value, so they must stay live to the
+             // `ret`; the pops between here and it are handled by the Pop arm
+             // below, which sees the register being redefined.
+-            if matches!(infos[j].kind, LineKind::Ret) {
++            if matches!(infos[j].kind, LineKind::Ret | LineKind::RetN) {
+                 if is_callee_saved_reg(dst_reg) {
+                     infos[i].kind = LineKind::Nop;
+                     changed = true;
+@@ -4118,7 +4131,10 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+                 // can see.  Refuse the fallback for the return registers
+                 // unless the function has no `ret` at all (noreturn tail).
+                 let ret_observes = matches!(dst_reg, REG_EAX | REG_EDX)
+-                    && (fs..fe).any(|k| infos[k].kind == LineKind::Ret && !infos[k].is_nop());
++                    && (fs..fe).any(|k| {
++                        matches!(infos[k].kind, LineKind::Ret | LineKind::RetN)
++                            && !infos[k].is_nop()
++                    });
+                 if !ret_observes && census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) == 0 {
+                     infos[i].kind = LineKind::Nop;
+                     changed = true;
+@@ -6345,7 +6361,7 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
+                 }
+                 match infos[b].kind {
+                     LineKind::Directive | LineKind::Empty => continue,
+-                    LineKind::Ret | LineKind::Jmp | LineKind::JmpIndirect => {
++                    LineKind::Ret | LineKind::RetN | LineKind::Jmp | LineKind::JmpIndirect => {
+                         guarded = true;
+                     }
+                     _ => {}
+@@ -6924,6 +6940,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                         LineKind::Jmp
+                         | LineKind::CondJmp
+                         | LineKind::Ret
++                        | LineKind::RetN
+                         | LineKind::JmpIndirect => break,
+                         _ => {}
+                     }
+@@ -9819,6 +9836,40 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
+ mod tests {
+     use super::*;
  
 +    #[test]
-+    fn word_zext_pair_removed_after_lwu_and_copy() {
-+        let input = concat!(
-+            "f:\n",
-+            "    lwu t0, 0(t2)\n",
-+            "    mv a0, t0\n",
-+            "    slli a0, a0, 32\n",
-+            "    srli a0, a0, 32\n",
-+            "    ret\n",
++    fn ret_n_observes_return_register() {
++        // `ret $N` (fastcall/stdcall/sret callee-pop) must classify as a
++        // return: the return-value move right before it is LIVE and must
++        // never be deleted by eliminate_dead_reg_moves. Before the RetN
++        // classification, the scan crossed the `ret $8` (a non-barrier
++        // line), saw no read of %eax and dropped the move -- fastcall
++        // callees returned garbage in a non-%eax home.
++        let asm = concat!(
++            "    movl %ecx, %eax\n",
++            "    movl %ebp, %esp\n",
++            "    popl %ebp\n",
++            "    ret $8\n",
 +        );
-+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
-+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
-+        let n = lines.len();
-+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
-+        assert_eq!(kinds[3], LineKind::Nop);
-+        assert_eq!(kinds[4], LineKind::Nop);
-+    }
-+
-+    #[test]
-+    fn word_zext_cross_register_pair_becomes_move() {
-+        let input = "f:\n    lhu t0, 0(t2)\n    slli a0, t0, 32\n    srli a0, a0, 32\n    add a1, a0, t3\n    ret\n";
-+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
-+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
-+        let n = lines.len();
-+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
-+        assert_eq!(lines[2].trim(), "mv a0, t0");
-+        assert_eq!(kinds[3], LineKind::Nop);
-+    }
-+
-+    #[test]
-+    fn narrow_logic_and_shift_producers_feed_word_zext() {
-+        let input = concat!(
-+            "f:\n",
-+            "    lbu t0, 0(t2)\n",
-+            "    li t1, 255\n",
-+            "    xor t0, t0, t1\n",
-+            "    srli t0, t0, 1\n",
-+            "    slli t0, t0, 32\n",
-+            "    srli t0, t0, 32\n",
-+            "    ret\n",
++        let result = peephole_optimize(asm.to_string());
++        assert!(
++            result.contains("movl %ecx, %eax"),
++            "return-value move deleted before ret $8:\n{result}"
 +        );
-+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
-+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
-+        let n = lines.len();
-+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
-+        assert_eq!(kinds[5], LineKind::Nop);
-+        assert_eq!(kinds[6], LineKind::Nop);
-+    }
-+
-+    #[test]
-+    fn narrow_producer_lattice_covers_comparisons_masks_and_logic() {
-+        let cases = [
-+            "    seqz t0, t1\n",
-+            "    sltu t0, t1, t2\n",
-+            "    andi t0, t1, 1023\n",
-+            "    lhu t0, 0(t2)\n    ld t1, 8(t2)\n    and t0, t0, t1\n",
-+            "    lbu t0, 0(t2)\n    li t1, 3\n    or t0, t0, t1\n",
-+            "    lbu t0, 0(t2)\n    slli t0, t0, 4\n",
-+        ];
-+        for producer in cases {
-+            let input =
-+                format!("f:\n{producer}    slli t0, t0, 32\n    srli t0, t0, 32\n    ret\n");
-+            let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
-+            let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
-+            let n = lines.len();
-+            assert!(
-+                eliminate_redundant_zext_byte(&mut lines, &mut kinds, n),
-+                "producer did not establish a narrow value:\n{input}"
-+            );
-+            assert!(
-+                !lines
-+                    .iter()
-+                    .zip(&kinds)
-+                    .any(|(line, kind)| *kind != LineKind::Nop && line.trim() == "slli t0, t0, 32"),
-+                "zext pair survived:\n{input}"
-+            );
-+        }
-+    }
-+
-+    #[test]
-+    fn wide_or_operand_prevents_false_narrow_proof() {
-+        let input = concat!(
-+            "f:\n",
-+            "    lbu t0, 0(t2)\n",
-+            "    ld t1, 8(t2)\n",
-+            "    or t0, t0, t1\n",
-+            "    slli t0, t0, 32\n",
-+            "    srli t0, t0, 32\n",
-+            "    ret\n",
++        // The callee-saved variant: a dead write to %esi before ret $8 is
++        // still dead and must still be removed.
++        let asm2 = concat!(
++            "    movl %eax, %esi\n",
++            "    movl %ebp, %esp\n",
++            "    popl %ebp\n",
++            "    ret $8\n",
 +        );
-+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
-+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
-+        let n = lines.len();
-+        assert!(!eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
-+        assert_eq!(kinds[4], LineKind::Alu);
-+        assert_eq!(kinds[5], LineKind::Alu);
-+    }
-+
-+    #[test]
-+    fn word_zext_pair_kept_without_upper_bit_proof() {
-+        let input = "f:\n    ld t0, 0(t2)\n    slli t0, t0, 32\n    srli t0, t0, 32\n    ret\n";
-+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
-+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
-+        let n = lines.len();
-+        assert!(!eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
-+        assert_eq!(kinds[2], LineKind::Alu);
-+        assert_eq!(kinds[3], LineKind::Alu);
++        let result2 = peephole_optimize(asm2.to_string());
++        assert!(
++            !result2.contains("movl %eax, %esi"),
++            "dead callee-saved write must still be removed before ret $8:\n{result2}"
++        );
 +    }
 +
      #[test]
-     fn byte_zext_tracks_lbu_through_moves() {
-         let input = "f:\n    lbu t0, 0(t2)\n    mv a0, t0\n    andi t0, t0, 0xff\n    ret\n";
+     fn unary_rmw_breaks_copy_alias() {
+         // `movl %edi,%eax; negl %eax; movl %eax,(%esi)` must NOT become
+diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
+index e3673286..1d8f3270 100644
+--- a/src/backend/i686/codegen/prologue.rs
++++ b/src/backend/i686/codegen/prologue.rs
+@@ -651,6 +651,106 @@ impl I686Codegen {
+         }
+     }
+ 
++    // ---- Over-aligned parameter alloca support ----
++
++    /// Store 4-byte words into a parameter alloca slot, honoring over-aligned
++    /// (>16) parameter allocas: the slot is oversized by (align-1) and the
++    /// EFFECTIVE address is align_up(slot, align) — every alloca-address user
++    /// (emit_alloca_addr_to, memcpy paths, ParamRef loads) resolves that same
++    /// aligned address, so a capture written to the raw slot would desync
++    /// from every later read by the alignment pad (mirrors the struct-capture
++    /// arm's handling and the x86-64 prologue's _Alignas fix).
++    ///
++    /// Returns true when the stores were emitted through the effective
++    /// address; false means the slot is not over-aligned and the caller must
++    /// emit the normal raw-slot stores (keeps the common path identical).
++    ///
++    /// %ecx holds the aligned base for the stores. While register parameters
++    /// could still be live (regparm/fastcall), %ecx is saved/restored around
++    /// the copy and a %ecx source is read from its pushed copy; capture sites
++    /// run in parameter order, so staging sources through %eax cannot
++    /// clobber an uncaptured incoming register (%eax is param 0's regparm
++    /// source — captured before any later parameter's copy — and is never a
++    /// fastcall source). `esp_adjust` stays in sync so esp-relative refs
++    /// below the push stay exact.
++    pub(super) fn emit_over_aligned_param_stores<'a>(
++        &mut self,
++        dest_id: u32,
++        slot: StackSlot,
++        words: impl IntoIterator<Item = (&'a str, i64)>,
++    ) -> bool {
++        if self.state.alloca_over_align(dest_id).is_none() {
++            return false;
++        }
++        let ecx_free = self.regparm == 0 && !self.is_fastcall;
++        if !ecx_free {
++            self.state.emit("    pushl %ecx");
++            self.esp_adjust += 4;
++        }
++        self.emit_alloca_addr_to("ecx", dest_id, slot);
++        for (src, off) in words {
++            match src {
++                "%eax" => {}
++                "%ecx" if !ecx_free => {
++                    // The incoming source was saved below the base
++                    // computation; reload it from the pushed copy.
++                    self.state.emit("    movl 0(%esp), %eax");
++                }
++                _ => emit!(self.state, "    movl {}, %eax", src),
++            }
++            emit!(self.state, "    movl %eax, {}(%ecx)", off);
++        }
++        if !ecx_free {
++            self.state.emit("    popl %ecx");
++            self.esp_adjust -= 4;
++        }
++        true
++    }
++
++    /// Load `ty` from a (possibly over-aligned) parameter alloca slot into
++    /// %eax. Over-aligned slots load through the effective address (%ecx,
++    /// which is free scratch at any ParamRef in the body: the prologue has
++    /// long captured the incoming registers); plain slots keep the exact
++    /// previous raw-slot-ref load.
++    pub(super) fn emit_param_slot_load(&mut self, dest_id: u32, slot: StackSlot, ty: IrType) {
++        let load_instr = self.mov_load_for_type(ty);
++        if self.state.alloca_over_align(dest_id).is_some() {
++            self.emit_alloca_addr_to("ecx", dest_id, slot);
++            emit!(self.state, "    {} 0(%ecx), %eax", load_instr);
++        } else {
++            let src_ref = self.slot_ref(slot);
++            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
++        }
++    }
++
++    /// Copy 4-byte words from a (possibly over-aligned) parameter alloca
++    /// slot to a destination slot. Over-aligned sources read through the
++    /// effective address (%ecx); plain slots keep the exact previous
++    /// raw-slot-ref loads.
++    pub(super) fn emit_param_slot_word_copies(
++        &mut self,
++        dest_id: u32,
++        src_slot: StackSlot,
++        dst_slot: StackSlot,
++        offs: &[i64],
++    ) {
++        if self.state.alloca_over_align(dest_id).is_some() {
++            self.emit_alloca_addr_to("ecx", dest_id, src_slot);
++            for &j in offs {
++                emit!(self.state, "    movl {}(%ecx), %eax", j);
++                let dst_ref = self.slot_ref_offset(dst_slot, j);
++                emit!(self.state, "    movl %eax, {}", dst_ref);
++            }
++        } else {
++            for &j in offs {
++                let src_ref = self.slot_ref_offset(src_slot, j);
++                let dst_ref = self.slot_ref_offset(dst_slot, j);
++                emit!(self.state, "    movl {}, %eax", src_ref);
++                emit!(self.state, "    movl %eax, {}", dst_ref);
++            }
++        }
++    }
++
+     // ---- emit_store_params ----
+ 
+     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+@@ -662,8 +762,9 @@ impl I686Codegen {
+ 
+         self.state.param_alloca_slots = (0..func.params.len())
+             .map(|i| {
+-                find_param_alloca(func, i)
+-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
++                find_param_alloca(func, i).and_then(|(dest, ty)| {
++                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
++                })
+             })
+             .collect();
+ 
+@@ -675,21 +776,26 @@ impl I686Codegen {
+         // Used to handle the case where param alloca was eliminated by mem2reg
+         // but the register allocator assigned a callee-saved register.
+         let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
+-        if self.is_fastcall || self.regparm > 0 {
+-            for block in &func.blocks {
+-                for inst in &block.instructions {
+-                    if let Instruction::ParamRef {
+-                        dest, param_idx, ..
+-                    } = inst
+-                    {
+-                        if *param_idx < paramref_dests.len() {
+-                            paramref_dests[*param_idx] = Some(*dest);
+-                        }
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let Instruction::ParamRef {
++                    dest, param_idx, ..
++                } = inst
++                {
++                    if *param_idx < paramref_dests.len() {
++                        paramref_dests[*param_idx] = Some(*dest);
+                     }
+                 }
+             }
+         }
+ 
++        // NOTE: ParamRef dest values never share an over-aligned (>16)
++        // parameter alloca's slot — resolve_copy_aliases refuses the share
++        // (the padded slot's effective address differs from its raw base,
++        // so a plain value sharing it would desync from every aligned
++        // access). The dest keeps its own plain slot; ParamRef copies
++        // from the alloca through the aligned address.
++
+         let stack_base: i64 = 8;
+ 
+         // ── regparm callee-side capture ─────────────────────────────────────
+@@ -726,7 +832,7 @@ impl I686Codegen {
+                 match *class {
+                     ParamClass::IntReg { reg_idx } => {
+                         let src_full = regparm_srcs[reg_idx];
+-                        if let Some((_, slot)) = alloca_slot {
++                        if let Some((dest, slot)) = alloca_slot {
+                             // Typed capture into the alloca slot. Sub-int
+                             // types are extended in-register first (the
+                             // extension clobbers only this param's own
+@@ -734,7 +840,6 @@ impl I686Codegen {
+                             let ty = func.params[i].ty;
+                             let regparm_regs_byte = ["%al", "%dl", "%cl"];
+                             let regparm_regs_word = ["%ax", "%dx", "%cx"];
+-                            let slot_ref = self.slot_ref(slot);
+                             match ty {
+                                 IrType::I8 => {
+                                     emit!(
+@@ -743,7 +848,6 @@ impl I686Codegen {
+                                         regparm_regs_byte[reg_idx],
+                                         src_full
+                                     );
+-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                 }
+                                 IrType::U8 => {
+                                     emit!(
+@@ -752,7 +856,6 @@ impl I686Codegen {
+                                         regparm_regs_byte[reg_idx],
+                                         src_full
+                                     );
+-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                 }
+                                 IrType::I16 => {
+                                     emit!(
+@@ -761,7 +864,6 @@ impl I686Codegen {
+                                         regparm_regs_word[reg_idx],
+                                         src_full
+                                     );
+-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                 }
+                                 IrType::U16 => {
+                                     emit!(
+@@ -770,11 +872,13 @@ impl I686Codegen {
+                                         regparm_regs_word[reg_idx],
+                                         src_full
+                                     );
+-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+-                                }
+-                                _ => {
+-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                 }
++                                _ => {}
++                            }
++                            let words = [(src_full, 0i64)];
++                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
++                                let slot_ref = self.slot_ref(slot);
++                                emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                             }
+                         } else if let Some(dest) = paramref_dests[i] {
+                             if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+@@ -813,10 +917,30 @@ impl I686Codegen {
+                     }
+                     ParamClass::I64RegPair { base_reg_idx } => {
+                         // Wide values always live in 8-byte slots on i686.
+-                        let slot = alloca_slot
+-                            .map(|(_, s)| s)
+-                            .or_else(|| paramref_dests[i].and_then(|d| self.state.get_slot(d.0)));
+-                        if let Some(slot) = slot {
++                        if let Some((dest, slot)) = alloca_slot {
++                            let words = [
++                                (regparm_srcs[base_reg_idx], 0i64),
++                                (regparm_srcs[base_reg_idx + 1], 4i64),
++                            ];
++                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
++                                let sr0 = self.slot_ref(slot);
++                                let sr4 = self.slot_ref_offset(slot, 4);
++                                emit!(
++                                    self.state,
++                                    "    movl {}, {}",
++                                    regparm_srcs[base_reg_idx],
++                                    sr0
++                                );
++                                emit!(
++                                    self.state,
++                                    "    movl {}, {}",
++                                    regparm_srcs[base_reg_idx + 1],
++                                    sr4
++                                );
++                            }
++                        } else if let Some(slot) =
++                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
++                        {
+                             let sr0 = self.slot_ref(slot);
+                             let sr4 = self.slot_ref_offset(slot, 4);
+                             emit!(
+@@ -831,18 +955,30 @@ impl I686Codegen {
+                                 regparm_srcs[base_reg_idx + 1],
+                                 sr4
+                             );
+-                            if alloca_slot.is_none() {
+-                                self.state.param_pre_stored.insert(i);
+-                            }
++                            self.state.param_pre_stored.insert(i);
+                         }
+                     }
+                     ParamClass::StructByValReg { base_reg_idx, size } => {
+-                        let slot = alloca_slot
+-                            .map(|(_, s)| s)
+-                            .or_else(|| paramref_dests[i].and_then(|d| self.state.get_slot(d.0)));
+-                        if let Some(slot) = slot {
+-                            let words = size.div_ceil(4);
+-                            for k in 0..words {
++                        let nwords = size.div_ceil(4);
++                        if let Some((dest, slot)) = alloca_slot {
++                            let words: Vec<(&str, i64)> = (0..nwords)
++                                .map(|k| (regparm_srcs[base_reg_idx + k], (k * 4) as i64))
++                                .collect();
++                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
++                                for k in 0..nwords {
++                                    let sr = self.slot_ref_offset(slot, (k * 4) as i64);
++                                    emit!(
++                                        self.state,
++                                        "    movl {}, {}",
++                                        regparm_srcs[base_reg_idx + k],
++                                        sr
++                                    );
++                                }
++                            }
++                        } else if let Some(slot) =
++                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
++                        {
++                            for k in 0..nwords {
+                                 let sr = self.slot_ref_offset(slot, (k * 4) as i64);
+                                 emit!(
+                                     self.state,
+@@ -851,9 +987,7 @@ impl I686Codegen {
+                                     sr
+                                 );
+                             }
+-                            if alloca_slot.is_none() {
+-                                self.state.param_pre_stored.insert(i);
+-                            }
++                            self.state.param_pre_stored.insert(i);
+                         }
+                     }
+                     _ => {}
+@@ -1028,29 +1162,27 @@ impl I686Codegen {
+                     let src_reg_full: &'static str = ["%ecx", "%edx"][reg_idx as usize];
+                     let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
+                     let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
+-                    let slot_ref = self.slot_ref(slot);
+                     // For sub-int types, sign/zero-extend to full 32-bit before
+                     // storing to the 4-byte SSA slot (avoids partial-write issues).
+                     match ty {
+                         IrType::I8 => {
+                             emit!(self.state, "    movsbl {}, {}", src_byte, src_reg_full);
+-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                         }
+                         IrType::U8 => {
+                             emit!(self.state, "    movzbl {}, {}", src_byte, src_reg_full);
+-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                         }
+                         IrType::I16 => {
+                             emit!(self.state, "    movswl {}, {}", src_word, src_reg_full);
+-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                         }
+                         IrType::U16 => {
+                             emit!(self.state, "    movzwl {}, {}", src_word, src_reg_full);
+-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+-                        }
+-                        _ => {
+-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                         }
++                        _ => {}
++                    }
++                    let words = [(src_reg_full, 0i64)];
++                    if !self.emit_over_aligned_param_stores(dest_id, slot, words) {
++                        let slot_ref = self.slot_ref(slot);
++                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                     }
+                     continue;
+                 }
+@@ -1105,24 +1237,36 @@ impl I686Codegen {
+                         || ty == IrType::D64
+                     {
+                         let src_ref = self.param_ref(src_offset);
+-                        let dst_ref = self.slot_ref(slot);
+-                        emit!(self.state, "    movl {}, %eax", src_ref);
+-                        emit!(self.state, "    movl %eax, {}", dst_ref);
+                         let src_ref_hi = self.param_ref(src_offset + 4);
+-                        let dst_ref_hi = self.slot_ref_offset(slot, 4);
+-                        emit!(self.state, "    movl {}, %eax", src_ref_hi);
+-                        emit!(self.state, "    movl %eax, {}", dst_ref_hi);
++                        let words = [(&*src_ref, 0i64), (&*src_ref_hi, 4i64)];
++                        if !self.emit_over_aligned_param_stores(dest_id, slot, words) {
++                            let dst_ref = self.slot_ref(slot);
++                            emit!(self.state, "    movl {}, %eax", src_ref);
++                            emit!(self.state, "    movl %eax, {}", dst_ref);
++                            let dst_ref_hi = self.slot_ref_offset(slot, 4);
++                            emit!(self.state, "    movl {}, %eax", src_ref_hi);
++                            emit!(self.state, "    movl %eax, {}", dst_ref_hi);
++                        }
+                     } else {
+                         let load_instr = self.mov_load_for_type(ty);
+                         let src_ref = self.param_ref(src_offset);
+-                        let dst_ref = self.slot_ref(slot);
+-                        emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+-                        // Always store full 32-bit value to SSA slot. The load
+-                        // instruction above already sign/zero-extended sub-int
+-                        // types into the full eax register. Using movb/movw here
+-                        // would leave garbage in the upper bytes of the 4-byte
+-                        // slot, which gets read back later by movl.
+-                        emit!(self.state, "    movl %eax, {}", dst_ref);
++                        if self.state.alloca_over_align(dest_id).is_some() {
++                            // Load + sign/zero-extend into %eax first (the
++                            // helper stages memory sources with a plain
++                            // movl), then store through the aligned base.
++                            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
++                            let words = [("%eax", 0i64)];
++                            self.emit_over_aligned_param_stores(dest_id, slot, words);
++                        } else {
++                            let dst_ref = self.slot_ref(slot);
++                            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
++                            // Always store full 32-bit value to SSA slot. The load
++                            // instruction above already sign/zero-extended sub-int
++                            // types into the full eax register. Using movb/movw here
++                            // would leave garbage in the upper bytes of the 4-byte
++                            // slot, which gets read back later by movl.
++                            emit!(self.state, "    movl %eax, {}", dst_ref);
++                        }
+                     }
+                 }
+                 ParamClass::StructStack { offset: _, size }
+@@ -1197,29 +1341,50 @@ impl I686Codegen {
+                     // would re-canonicalize exceptional encodings and
+                     // rewrite the padding; the slot keeps the native 80-bit
+                     // representation, so f128_direct_slots still applies.
+-                    for j in (0..12).step_by(4) {
+-                        let src_ref = self.param_ref(src_offset + j as i64);
+-                        let dst_ref = self.slot_ref_offset(slot, j as i64);
+-                        emit!(self.state, "    movl {}, %eax", src_ref);
+-                        emit!(self.state, "    movl %eax, {}", dst_ref);
++                    let words: Vec<(String, i64)> = (0..12)
++                        .step_by(4)
++                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
++                        .collect();
++                    let refs: Vec<(&str, i64)> =
++                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
++                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
++                        for (src_ref, j) in words {
++                            let dst_ref = self.slot_ref_offset(slot, j);
++                            emit!(self.state, "    movl {}, %eax", src_ref);
++                            emit!(self.state, "    movl %eax, {}", dst_ref);
++                        }
+                     }
+                     self.state.f128_direct_slots.insert(dest_id);
+                 }
+                 ParamClass::I128Stack { offset: _ } => {
+-                    for j in (0..16).step_by(4) {
+-                        let src_ref = self.param_ref(src_offset + j as i64);
+-                        let dst_ref = self.slot_ref_offset(slot, j as i64);
+-                        emit!(self.state, "    movl {}, %eax", src_ref);
+-                        emit!(self.state, "    movl %eax, {}", dst_ref);
++                    let words: Vec<(String, i64)> = (0..16)
++                        .step_by(4)
++                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
++                        .collect();
++                    let refs: Vec<(&str, i64)> =
++                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
++                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
++                        for (src_ref, j) in words {
++                            let dst_ref = self.slot_ref_offset(slot, j);
++                            emit!(self.state, "    movl {}, %eax", src_ref);
++                            emit!(self.state, "    movl %eax, {}", dst_ref);
++                        }
+                     }
+                 }
+                 ParamClass::F128Stack { offset: _ } => {
+                     // Bit-exact 12-byte copy (see F128AlwaysStack above).
+-                    for j in (0..12).step_by(4) {
+-                        let src_ref = self.param_ref(src_offset + j as i64);
+-                        let dst_ref = self.slot_ref_offset(slot, j as i64);
+-                        emit!(self.state, "    movl {}, %eax", src_ref);
+-                        emit!(self.state, "    movl %eax, {}", dst_ref);
++                    let words: Vec<(String, i64)> = (0..12)
++                        .step_by(4)
++                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
++                        .collect();
++                    let refs: Vec<(&str, i64)> =
++                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
++                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
++                        for (src_ref, j) in words {
++                            let dst_ref = self.slot_ref_offset(slot, j);
++                            emit!(self.state, "    movl {}, %eax", src_ref);
++                            emit!(self.state, "    movl %eax, {}", dst_ref);
++                        }
+                     }
+                     self.state.f128_direct_slots.insert(dest_id);
+                 }
+@@ -1250,6 +1415,14 @@ impl I686Codegen {
+     pub(super) fn emit_param_ref_impl(&mut self, dest: &Value, param_idx: usize, ty: IrType) {
+         use crate::backend::call_abi::ParamClass;
+ 
++        // Over-aligned-param homing elision: this dest's only use was the
++        // elided homing store. The prologue capture is the single
++        // authoritative home of the alloca; the dest itself is dead. Emit
++        // nothing (its slot, if any, is never read).
++        if self.state.dead_param_ref_dests.contains(&dest.0) {
++            return;
++        }
++
+         // If this param was pre-stored in the prologue (fastcall register param
+         // with eliminated alloca), the value is already in the correct physical
+         // register or stack slot. No code generation needed.
+@@ -1269,7 +1442,9 @@ impl I686Codegen {
+         }
+ 
+         if param_idx < self.state.param_alloca_slots.len() {
+-            if let Some((alloca_slot, _alloca_ty)) = self.state.param_alloca_slots[param_idx] {
++            if let Some((alloca_slot, _alloca_ty, alloca_id)) =
++                self.state.param_alloca_slots[param_idx]
++            {
+                 if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                     if dest_slot.0 == alloca_slot.0 {
+                         // The param value is already in the alloca slot (stored by
+@@ -1280,9 +1455,7 @@ impl I686Codegen {
+                         // (uninitialized) instead of the slot.
+                         if let Some(phys) = self.dest_reg(dest) {
+                             let reg = phys_reg_name(phys);
+-                            let load_instr = self.mov_load_for_type(ty);
+-                            let src_ref = self.slot_ref(alloca_slot);
+-                            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
++                            self.emit_param_slot_load(alloca_id, alloca_slot, ty);
+                             emit!(self.state, "    movl %eax, %{}", reg);
+                             self.state.reg_cache.invalidate_acc();
+                         }
+@@ -1304,9 +1477,7 @@ impl I686Codegen {
+                     // params (they have no stack home).
+                     if let Some(phys) = self.dest_reg(dest) {
+                         let reg = phys_reg_name(phys);
+-                        let load_instr = self.mov_load_for_type(ty);
+-                        let src_ref = self.slot_ref(alloca_slot);
+-                        emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
++                        self.emit_param_slot_load(alloca_id, alloca_slot, ty);
+                         emit!(self.state, "    movl %eax, %{}", reg);
+                         self.state.reg_cache.invalidate_acc();
+                     }
+@@ -1314,40 +1485,36 @@ impl I686Codegen {
+                 }
+                 if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                     if is_i128_type(ty) {
+-                        for i in (0..16).step_by(4) {
+-                            let src_ref = self.slot_ref_offset(alloca_slot, i as i64);
+-                            let dst_ref = self.slot_ref_offset(dest_slot, i as i64);
+-                            emit!(self.state, "    movl {}, %eax", src_ref);
+-                            emit!(self.state, "    movl %eax, {}", dst_ref);
+-                        }
++                        self.emit_param_slot_word_copies(
++                            alloca_id,
++                            alloca_slot,
++                            dest_slot,
++                            &[0, 4, 8, 12],
++                        );
+                     } else if ty == IrType::F128 {
+                         // Bit-exact 12-byte copy (see the F128 capture
+                         // arms above); the destination keeps the native
+                         // 80-bit representation.
+-                        for j in (0..12).step_by(4) {
+-                            let src_ref = self.slot_ref_offset(alloca_slot, j as i64);
+-                            let dst_ref = self.slot_ref_offset(dest_slot, j as i64);
+-                            emit!(self.state, "    movl {}, %eax", src_ref);
+-                            emit!(self.state, "    movl %eax, {}", dst_ref);
+-                        }
++                        self.emit_param_slot_word_copies(
++                            alloca_id,
++                            alloca_slot,
++                            dest_slot,
++                            &[0, 4, 8],
++                        );
+                         self.state.f128_direct_slots.insert(dest.0);
+                     } else if ty == IrType::F64
+                         || ty == IrType::I64
+                         || ty == IrType::U64
+                         || ty == IrType::D64
+                     {
+-                        let src_ref = self.slot_ref(alloca_slot);
+-                        let dst_ref = self.slot_ref(dest_slot);
+-                        emit!(self.state, "    movl {}, %eax", src_ref);
+-                        emit!(self.state, "    movl %eax, {}", dst_ref);
+-                        let src_ref_hi = self.slot_ref_offset(alloca_slot, 4);
+-                        let dst_ref_hi = self.slot_ref_offset(dest_slot, 4);
+-                        emit!(self.state, "    movl {}, %eax", src_ref_hi);
+-                        emit!(self.state, "    movl %eax, {}", dst_ref_hi);
++                        self.emit_param_slot_word_copies(
++                            alloca_id,
++                            alloca_slot,
++                            dest_slot,
++                            &[0, 4],
++                        );
+                     } else {
+-                        let load_instr = self.mov_load_for_type(ty);
+-                        let src_ref = self.slot_ref(alloca_slot);
+-                        emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
++                        self.emit_param_slot_load(alloca_id, alloca_slot, ty);
+                         self.store_eax_to(dest);
+                     }
+                     return;
+@@ -1360,10 +1527,10 @@ impl I686Codegen {
+         // location to read.
+         if self.is_fastcall {
+             if let I686FastcallSlot::Reg(_) = self.fastcall_slots[param_idx] {
+-                if let Some(Some((slot, _slot_ty))) = self.state.param_alloca_slots.get(param_idx) {
+-                    let load_instr = self.mov_load_for_type(ty);
+-                    let slot_ref = self.slot_ref(*slot);
+-                    emit!(self.state, "    {} {}, %eax", load_instr, slot_ref);
++                if let Some(Some((slot, _slot_ty, alloca_id))) =
++                    self.state.param_alloca_slots.get(param_idx)
++                {
++                    self.emit_param_slot_load(*alloca_id, *slot, ty);
+                     self.store_eax_to(dest);
+                 }
+                 return;
+diff --git a/src/backend/riscv/codegen/prologue.rs b/src/backend/riscv/codegen/prologue.rs
+index cb4c84c7..9636d4eb 100644
+--- a/src/backend/riscv/codegen/prologue.rs
++++ b/src/backend/riscv/codegen/prologue.rs
+@@ -350,8 +350,9 @@ impl RiscvCodegen {
+         // Pre-compute param alloca slots for emit_param_ref
+         self.state.param_alloca_slots = (0..func.params.len())
+             .map(|i| {
+-                find_param_alloca(func, i)
+-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
++                find_param_alloca(func, i).and_then(|(dest, ty)| {
++                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
++                })
+             })
+             .collect();
+ 
+@@ -829,7 +830,7 @@ impl RiscvCodegen {
+         // already saved the incoming register value). This avoids issues where
+         // ABI registers get clobbered during emit_store_params' processing.
+         if param_idx < self.state.param_alloca_slots.len() {
+-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
++            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
+                 let load_instr = Self::load_for_type(alloca_ty);
+                 self.emit_load_from_s0("t0", slot.0, load_instr);
+                 self.store_t0_to(dest);
+diff --git a/src/backend/stack_layout/mod.rs b/src/backend/stack_layout/mod.rs
+index 898ae9fa..5cca4d48 100644
+--- a/src/backend/stack_layout/mod.rs
++++ b/src/backend/stack_layout/mod.rs
+@@ -54,7 +54,7 @@ pub use regalloc_helpers::{
+ use super::regalloc::PhysReg;
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::common::types::IrType;
+-use crate::ir::reexports::{Instruction, IrFunction};
++use crate::ir::reexports::{Instruction, IrFunction, Operand};
+ 
+ use alloca_coalescing::CoalescableAllocas;
+ 
+@@ -469,6 +469,80 @@ pub fn calculate_stack_space_common(
+     // Phase 7: Propagate wide-value status through Copy chains (32-bit targets only).
+     slot_assignment::propagate_wide_values(state, func, &ctx.copy_alias);
+ 
++    // Phase 7.5: Over-aligned-param homing-store elision.
++    //
++    // For a parameter whose alloca survived with an over-aligned (>16) slot,
++    // the PROLOGUE CAPTURE already wrote the incoming value to the alloca's
++    // effective aligned address. The IR-level homing store
++    // (`store %p, %a` with %p the ParamRef dest) therefore re-writes the same
++    // value to the same location: emitting it costs a dest-slot load plus an
++    // aligned store per over-aligned parameter, with zero semantic effect.
++    // Record the (dest, alloca) pair for `emit_store_impl` to elide; when the
++    // dest has no other use, record it as dead so `emit_param_ref_impl`
++    // elides the ParamRef too (the capture is the single authoritative home
++    // — this beats GCC's realign+copy by both memory operations).
++    state.param_homing_stores.clear();
++    state.dead_param_ref_dests.clear();
++    {
++        let mut paramref_dests: Vec<Option<u32>> = vec![None; func.param_alloca_values.len()];
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let Instruction::ParamRef {
++                    dest, param_idx, ..
++                } = inst
++                {
++                    if *param_idx < paramref_dests.len() {
++                        paramref_dests[*param_idx] = Some(dest.0);
++                    }
++                }
++            }
++        }
++        let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
++        let mut homing_uses: FxHashMap<u32, u32> = FxHashMap::default();
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let Instruction::Store { val, ptr, .. } = inst {
++                    if let Operand::Value(v) = val {
++                        // Is this store the homing store of v's parameter?
++                        // (ptr is the param alloca of the param v is the
++                        // ParamRef dest of.)
++                        for (i, alloca) in func.param_alloca_values.iter().enumerate() {
++                            if ptr.0 == alloca.0
++                                && paramref_dests.get(i).copied().flatten() == Some(v.0)
++                            {
++                                homing_uses.entry(v.0).and_modify(|c| *c += 1).or_insert(1);
++                                break;
++                            }
++                        }
++                    }
++                }
++                inst.for_each_used_value(|vid| {
++                    use_counts.entry(vid).and_modify(|c| *c += 1).or_insert(1);
++                });
++            }
++        }
++        for (i, alloca) in func.param_alloca_values.iter().enumerate() {
++            let Some(dest_id) = paramref_dests.get(i).copied().flatten() else {
++                continue;
++            };
++            // Only when the alloca is over-aligned AND has a slot: the
++            // capture then wrote the effective address and the homing store
++            // is redundant. (A non-slotted alloca has no capture, so the
++            // store stays.)
++            if !state.alloca_alignments.contains_key(&alloca.0)
++                || !state.value_locations.contains_key(&alloca.0)
++            {
++                continue;
++            }
++            if homing_uses.get(&dest_id).copied().unwrap_or(0) >= 1 {
++                state.param_homing_stores.insert((dest_id, alloca.0));
++                if use_counts.get(&dest_id).copied().unwrap_or(0) == 1 {
++                    state.dead_param_ref_dests.insert(dest_id);
++                }
++            }
++        }
++    }
++
+     // Diagnostic: dump the full value→slot map (and the vector/defer sets) so
+     // slot aliasing miscompiles can be root-caused from the layout alone.
+     // Usage: CCC_DEBUG_SLOTS=1 lccc -O2 -c file.c
+@@ -556,15 +630,17 @@ fn build_layout_context(
+         ra_config,
+     );
+ 
+-    // Authoritative ABI alignment of struct/union parameter allocas (the
+-    // Alloca.align may have been dropped by a pass; IrParam.struct_align is not).
++    // Authoritative ABI alignment of parameter allocas (the Alloca.align may
++    // have been dropped by a pass; IrParam.struct_align / IrParam.param_align
++    // are not). struct_align covers struct/union params; param_align covers
++    // typedef-aligned scalar params (`aligned(32) int` parameter types).
+     // `param_alloca_values` and `params` are index-aligned (both include the
+     // sret pointer at index 0 when present).
+     let param_aligns: FxHashMap<u32, usize> = func
+         .params
+         .iter()
+         .zip(func.param_alloca_values.iter())
+-        .filter_map(|(p, v)| p.struct_align.map(|a| (v.0, a)))
++        .filter_map(|(p, v)| p.param_align.or(p.struct_align).map(|a| (v.0, a)))
+         .collect();
+ 
+     // Alloca coalescability analysis.
+diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
+index dea635bc..ebe8645c 100644
+--- a/src/backend/stack_layout/slot_assignment.rs
++++ b/src/backend/stack_layout/slot_assignment.rs
+@@ -436,9 +436,22 @@ pub(super) fn classify_instructions(
+                 // its address escaping to a call), the ParamRef must have its
+                 // own separate slot. Otherwise the ParamRef would read back the
+                 // modified value instead of the original parameter value.
++                //
++                // Second exception: OVER-ALIGNED (>16) param allocas. Their
++                // slot is padded and every access — including the prologue
++                // capture — targets the EFFECTIVE align_up'd address, not the
++                // raw base. A ParamRef dest sharing that slot would access the
++                // RAW base (its accesses resolve as a plain value), so the
++                // capture (aligned) and the dest (raw) desync by the alignment
++                // pad: the dest reads/writes padding garbage and, worse,
++                // writes it back over the captured value (the garbage-copy
++                // regression with runtime-nondeterministic results). The dest
++                // keeps its own plain slot and emit_param_ref materializes it
++                // FROM the alloca through the aligned address.
+                 if *param_idx < func.param_alloca_values.len() {
+                     let alloca_val = func.param_alloca_values[*param_idx];
+                     if !modified_param_allocas.contains(&alloca_val.0)
++                        && !state.alloca_alignments.contains_key(&alloca_val.0)
+                         && !reg_assigned.contains_key(&dest.0)
+                     {
+                         if let Some(&slot) = state.value_locations.get(&alloca_val.0) {
+@@ -1403,6 +1416,21 @@ pub(super) fn resolve_copy_aliases(
+     }
+ 
+     for (&dest_id, &root_id) in copy_alias {
++        // An over-aligned (>16) alloca's slot is PADDED: the effective
++        // address (align_up) differs from the raw slot base, and every
++        // access routes through the aligned address. A plain SSA value
++        // sharing that slot would read/write the RAW base and desync
++        // from the aligned accesses (the parameter capture writes the
++        // aligned slot; ParamRef copies read it through the same aligned
++        // address). Refuse the share for BOTH endpoints so the aliased
++        // value keeps its own plain slot — its accesses are then correct
++        // by construction, and the copy between the two runs through the
++        // aligned address on the alloca side.
++        if state.alloca_alignments.contains_key(&dest_id)
++            || state.alloca_alignments.contains_key(&root_id)
++        {
++            continue;
++        }
+         // For phi-web coalesced values, force-overwrite the existing slot with
+         // the root's slot. These values were checked for interference during
+         // phi-web analysis and are safe to share. Loop-backedge phi aliases are
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index 7cfccfc8..a17f84b7 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -453,7 +453,21 @@ pub struct CodegenState {
+     /// Populated by `emit_store_params` so that `emit_param_ref` can load the
+     /// parameter value from its alloca slot (where emit_store_params saved it)
+     /// instead of reading from ABI registers that may have been clobbered.
+-    pub param_alloca_slots: Vec<Option<(StackSlot, IrType)>>,
++    /// Over-aligned-param homing-store elision: (store value id = ParamRef
++    /// dest, alloca value id) pairs for `store %p, %a` instructions whose
++    /// effect the prologue capture already performed (it wrote the incoming
++    /// value to the alloca's EFFECTIVE aligned address). Emitting the store
++    /// would re-load the dest slot and re-write the alloca — two memory ops
++    /// per over-aligned parameter. `emit_store_impl` elides them.
++    pub param_homing_stores: FxHashSet<(u32, u32)>,
++    /// ParamRef dests whose ONLY use was the elided homing store: dead after
++    /// the elision. `emit_param_ref_impl` skips them entirely.
++    pub dead_param_ref_dests: FxHashSet<u32>,
++    /// Per-parameter alloca home: (slot, alloca IR type, alloca value id).
++    /// The value id lets ParamRef resolve over-aligned (>16) parameter
++    /// allocas through `alloca_over_align` / `emit_alloca_addr_to`, whose
++    /// effective address differs from the raw slot by the alignment pad.
++    pub param_alloca_slots: Vec<Option<(StackSlot, IrType, u32)>>,
+     /// Set of param indices whose values have been pre-stored directly to a
+     /// callee-saved register during `emit_store_params`. `emit_param_ref` can
+     /// skip the alloca load for these and just emit a no-op (the value is
+@@ -578,6 +592,8 @@ impl CodegenState {
+             num_params: 0,
+             func_is_variadic: false,
+             param_alloca_slots: Vec::new(),
++            param_homing_stores: FxHashSet::default(),
++            dead_param_ref_dests: FxHashSet::default(),
+             param_pre_stored: FxHashSet::default(),
+             uses_sret: false,
+             function_sections: false,
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 20d45bd3..658b8db8 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -5413,7 +5413,7 @@ impl X86Codegen {
+         // Case 1 (text path's first materializing case): the parameter's
+         // alloca slot holds the staged value — one load.
+         if param_idx < self.state.param_alloca_slots.len() {
+-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
++            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
+                 return match dst {
+                     ParamDst::Reg(r) => {
+                         let form = Self::paramref_reg_load_form(alloca_ty)
+diff --git a/src/backend/x86/codegen/f128.rs b/src/backend/x86/codegen/f128.rs
+index 08e8c372..ea055f84 100644
+--- a/src/backend/x86/codegen/f128.rs
++++ b/src/backend/x86/codegen/f128.rs
+@@ -354,8 +354,18 @@ impl X86Codegen {
+             return;
+         }
+         if from_ty == IrType::F128 && !to_ty.is_float() {
+-            self.emit_f128_to_int_cast(to_ty);
+-            return;
++            // Fail closed: a 16-byte F128 cannot ride the %rax accumulator
++            // rail. Every F128->int cast is dispatched earlier by
++            // `emit_f128_to_int` (cast_ops.rs), which knows the operand's
++            // home (memory / f128 source / constant) and converts through
++            // the canonical x87 ST0 path. Reaching this arm would mean the
++            // dispatch missed a shape -- historically this rail emitted a
++            // `fldl` of the low 8 bytes of the F128 (a latent miscompile);
++            // a hard panic is the correct failure mode.
++            panic!(
++                "F128->int cast reached the accumulator rail (from {from_ty:?} to {to_ty:?}); \
++                 must be dispatched via emit_f128_to_int"
++            );
+         }
+         if from_ty == IrType::F128 && to_ty == IrType::F32 {
+             self.emit_f128_to_f32_cast();
+@@ -404,56 +414,6 @@ impl X86Codegen {
+         }
+     }
+ 
+-    /// Emit x87 FISTTP-based F128 -> integer conversion.
+-    fn emit_f128_to_int_cast(&mut self, to_ty: IrType) {
+-        if to_ty.is_signed() || to_ty == IrType::Ptr {
+-            self.emit_fisttp_from_f64_via_stack();
+-            if to_ty.size() < 8 && to_ty != IrType::Ptr {
+-                self.emit_sign_extend_to_rax(to_ty);
+-            }
+-        } else if to_ty == IrType::U64 {
+-            self.emit_f128_to_u64_cast();
+-        } else {
+-            // Smaller unsigned types: FISTTP then truncate
+-            self.emit_fisttp_from_f64_via_stack();
+-            self.emit_zero_extend_to_rax(to_ty);
+-        }
+-    }
+-
+-    fn emit_f128_to_u64_cast(&mut self) {
+-        let big_label = self.state.fresh_label("ld2u_big");
+-        let not_range_label = self.state.fresh_label("ld2u_notrange");
+-        let done_label = self.state.fresh_label("ld2u_done");
+-        self.state.emit("    subq $16, %rsp");
+-        self.state.emit("    movq %rax, (%rsp)");
+-        self.state.emit("    fldl (%rsp)");
+-        self.state.emit("    movabsq $4890909195324358656, %rcx"); // 2^63 as f64 bits
+-        self.state.emit("    movq %rcx, (%rsp)");
+-        self.state.emit("    fldl (%rsp)"); // ST0 = 2^63, ST1 = value
+-        self.state.emit("    fcomip %st(1), %st");
+-        self.state.out.emit_jcc_label("    jbe", &big_label);
+-        // Small case: value < 2^63
+-        self.state.emit("    fisttpq (%rsp)");
+-        self.state.emit("    movq (%rsp), %rax");
+-        self.state.out.emit_jmp_label(&done_label);
+-        // Big case: value >= 2^63 — native extended payload, no
+-        // arithmetic (precision-control independent; see
+-        // emit_f128_st0_to_int above).
+-        self.state.out.emit_named_label(&big_label);
+-        self.state.emit("    fstpt (%rsp)");
+-        self.state.emit("    cmpw $16446, 8(%rsp)"); // 0x403e
+-        self.state.out.emit_jcc_label("    jne", &not_range_label);
+-        self.state.emit("    movq (%rsp), %rax");
+-        self.state.out.emit_jmp_label(&done_label);
+-        // NaN / infinity / >= 2^64 / negative: integer-indefinite.
+-        self.state.out.emit_named_label(&not_range_label);
+-        self.state.emit("    fldt (%rsp)");
+-        self.state.emit("    fisttpq (%rsp)");
+-        self.state.emit("    movq (%rsp), %rax");
+-        self.state.out.emit_named_label(&done_label);
+-        self.state.emit("    addq $16, %rsp");
+-    }
+-
+     fn emit_f128_to_f32_cast(&mut self) {
+         self.state.emit("    subq $8, %rsp");
+         self.state.emit("    movq %rax, (%rsp)");
+@@ -473,16 +433,6 @@ impl X86Codegen {
+         self.state.emit("    addq $8, %rsp");
+     }
+ 
+-    /// Load f64 from rax via stack, FISTTP to i64 — used for F128->int.
+-    fn emit_fisttp_from_f64_via_stack(&mut self) {
+-        self.state.emit("    subq $8, %rsp");
+-        self.state.emit("    movq %rax, (%rsp)");
+-        self.state.emit("    fldl (%rsp)");
+-        self.state.emit("    fisttpq (%rsp)");
+-        self.state.emit("    movq (%rsp), %rax");
+-        self.state.emit("    addq $8, %rsp");
+-    }
+-
+     /// Sign or zero-extend a sub-64-bit type in rax to fill the register.
+     fn emit_extend_to_rax(&mut self, ty: IrType) {
+         if ty.is_unsigned() {
+diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
+index 6ecf4d80..17d873be 100644
+--- a/src/backend/x86/codegen/memory.rs
++++ b/src/backend/x86/codegen/memory.rs
+@@ -615,6 +615,17 @@ impl X86Codegen {
+     // ---- Store/Load overrides ----
+ 
+     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
++        // Over-aligned-param homing-store elision: `store %p, %a` where %a is
++        // an over-aligned param alloca. The prologue capture already wrote the
++        // incoming value to the alloca's EFFECTIVE aligned address, so this
++        // store is a redundant rewrite (and, pre-elision, the destructive
++        // garbage-copy source: it re-loaded %p from a slot the capture never
++        // wrote). Elide: zero instructions instead of load+store.
++        if let Operand::Value(v) = val {
++            if self.state.param_homing_stores.contains(&(v.0, ptr.0)) {
++                return;
++            }
++        }
+         if ty == IrType::F128 {
+             if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = val {
+                 let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index 21637bd3..d1eaf71b 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -79,6 +79,15 @@ fn va_root_is_stable(func: &IrFunction, root: u32) -> bool {
+     false
+ }
+ 
++/// Destination selector for parameter-capture stores: the raw
++/// rbp-relative slot offset, or the effective (over-aligned) base
++/// pre-computed in %r11.
++#[derive(Clone, Copy)]
++enum CaptureDst {
++    Raw(i64),
++    Aligned,
++}
++
+ impl X86Codegen {
+     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+         // ms178 debug: dump IR per function
+@@ -2204,6 +2213,56 @@ impl X86Codegen {
+         let _ = frame_size;
+     }
+ 
++    /// Capture-store a 64-bit GPR into the parameter home slot.
++    fn emit_capture_store_qword(&mut self, dst: CaptureDst, src_reg: &str, off: i64) {
++        match dst {
++            CaptureDst::Raw(b) => {
++                self.state
++                    .out
++                    .emit_instr_reg_rbp("    movq", src_reg, b + off);
++            }
++            CaptureDst::Aligned => self
++                .state
++                .emit_fmt(format_args!("    movq %{}, {}(%r11)", src_reg, off)),
++        }
++    }
++
++    /// Capture-store a 64-bit XMM payload into the parameter home slot.
++    fn emit_capture_store_xmm(&mut self, dst: CaptureDst, src_reg: &str, off: i64) {
++        match dst {
++            CaptureDst::Raw(b) => {
++                self.state
++                    .out
++                    .emit_instr_reg_rbp("    movq", src_reg, b + off);
++            }
++            CaptureDst::Aligned => self
++                .state
++                .emit_fmt(format_args!("    movq %{}, {}(%r11)", src_reg, off)),
++        }
++    }
++
++    /// Capture-store a full 16-byte XMM register (F128SseReg: movdqu).
++    fn emit_capture_store_movdqu(&mut self, dst: CaptureDst, src_reg: &str) {
++        match dst {
++            CaptureDst::Raw(b) => {
++                self.state.out.emit_instr_rbp_reg("    movdqu", b, src_reg);
++            }
++            CaptureDst::Aligned => self
++                .state
++                .emit_fmt(format_args!("    movdqu %{}, (%r11)", src_reg)),
++        }
++    }
++
++    /// Capture-store the x87 ST0 80-bit image (F128AlwaysStack).
++    fn emit_capture_fstpt(&mut self, dst: CaptureDst, off: i64) {
++        match dst {
++            CaptureDst::Raw(b) => {
++                self.state.out.emit_instr_rbp("    fstpt", b + off);
++            }
++            CaptureDst::Aligned => self.state.emit_fmt(format_args!("    fstpt {}(%r11)", off)),
++        }
++    }
++
+     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+         let xmm_regs = [
+             "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+@@ -2216,8 +2275,9 @@ impl X86Codegen {
+ 
+         self.state.param_alloca_slots = (0..func.params.len())
+             .map(|i| {
+-                find_param_alloca(func, i)
+-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
++                find_param_alloca(func, i).and_then(|(dest, ty)| {
++                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
++                })
+             })
+             .collect();
+ 
+@@ -2494,9 +2554,9 @@ impl X86Codegen {
+                 }
+             }
+ 
+-            let (slot, ty) = if let Some((dest, ty)) = find_param_alloca(func, i) {
++            let (slot, ty, dest_id) = if let Some((dest, ty)) = find_param_alloca(func, i) {
+                 if let Some(slot) = self.state.get_slot(dest.0) {
+-                    (slot, ty)
++                    (slot, ty, dest.0)
+                 } else {
+                     continue;
+                 }
+@@ -2504,6 +2564,36 @@ impl X86Codegen {
+                 continue;
+             };
+ 
++            // Over-aligned (>16) parameter allocas: the slot is padded by
++            // (align-1) and every access resolves the EFFECTIVE aligned
++            // address — the capture must target it too, or the aligned
++            // reads desync from the written data (the same class the
++            // StructStack arm fixed for _Alignas(32) structs; extended
++            // here to every capture class, including the capture-only
++            // ones — F128/I128/struct-by-reg — that no IR-level store
++            // re-homes afterwards).
++            //
++            // %r11 is the aligned-base scratch: it has no SysV incoming
++            // role (rdi,rsi,rdx,rcx,r8,r9 are the argument registers and
++            // %r10 carries the nested-function static chain), so it is
++            // dead by construction here and the parallel-copy pass
++            // reserves only %rax.
++            let over_align = self.state.alloca_over_align(dest_id).filter(|&a| a > 16);
++            if let Some(a) = over_align {
++                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "r11");
++                self.state
++                    .out
++                    .emit_instr_imm_reg("    addq", (a - 1) as i64, "r11");
++                self.state
++                    .out
++                    .emit_instr_imm_reg("    andq", -(a as i64), "r11");
++            }
++            let dst = if over_align.is_some() {
++                CaptureDst::Aligned
++            } else {
++                CaptureDst::Raw(slot.0)
++            };
++
+             match class {
+                 // I64RegPair exists only under i686 gcc_regparm_mode; this
+                 // backend never sets that config flag.
+@@ -2516,46 +2606,26 @@ impl X86Codegen {
+                     // uninitialized memory and trigger valgrind errors.
+                     // The typed load in emit_param_ref_impl correctly extracts only the
+                     // meaningful bytes (e.g., movslq for I32).
+-                    self.state
+-                        .out
+-                        .emit_instr_reg_rbp("    movq", X86_ARG_REGS[reg_idx], slot.0);
++                    self.emit_capture_store_qword(dst, X86_ARG_REGS[reg_idx], 0);
+                 }
+                 ParamClass::FloatReg { reg_idx } => {
+                     if ty == IrType::F32 || ty == IrType::D32 {
+                         self.state
+                             .out
+                             .emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");
+-                        self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
++                        self.emit_capture_store_qword(dst, "rax", 0);
+                     } else {
+-                        self.state
+-                            .out
+-                            .emit_instr_reg_rbp("    movq", xmm_regs[reg_idx], slot.0);
++                        self.emit_capture_store_xmm(dst, xmm_regs[reg_idx], 0);
+                     }
+                 }
+                 ParamClass::I128RegPair { base_reg_idx } => {
+-                    self.state.out.emit_instr_reg_rbp(
+-                        "    movq",
+-                        X86_ARG_REGS[base_reg_idx],
+-                        slot.0,
+-                    );
+-                    self.state.out.emit_instr_reg_rbp(
+-                        "    movq",
+-                        X86_ARG_REGS[base_reg_idx + 1],
+-                        slot.0 + 8,
+-                    );
++                    self.emit_capture_store_qword(dst, X86_ARG_REGS[base_reg_idx], 0);
++                    self.emit_capture_store_qword(dst, X86_ARG_REGS[base_reg_idx + 1], 8);
+                 }
+                 ParamClass::StructByValReg { base_reg_idx, size } => {
+-                    self.state.out.emit_instr_reg_rbp(
+-                        "    movq",
+-                        X86_ARG_REGS[base_reg_idx],
+-                        slot.0,
+-                    );
++                    self.emit_capture_store_qword(dst, X86_ARG_REGS[base_reg_idx], 0);
+                     if size > 8 {
+-                        self.state.out.emit_instr_reg_rbp(
+-                            "    movq",
+-                            X86_ARG_REGS[base_reg_idx + 1],
+-                            slot.0 + 8,
+-                        );
++                        self.emit_capture_store_qword(dst, X86_ARG_REGS[base_reg_idx + 1], 8);
+                     }
+                 }
+                 ParamClass::StructSseReg {
+@@ -2563,71 +2633,51 @@ impl X86Codegen {
+                     hi_fp_idx,
+                     ..
+                 } => {
+-                    self.state
+-                        .out
+-                        .emit_instr_reg_rbp("    movq", xmm_regs[lo_fp_idx], slot.0);
++                    self.emit_capture_store_xmm(dst, xmm_regs[lo_fp_idx], 0);
+                     if let Some(hi) = hi_fp_idx {
+-                        self.state
+-                            .out
+-                            .emit_instr_reg_rbp("    movq", xmm_regs[hi], slot.0 + 8);
++                        self.emit_capture_store_xmm(dst, xmm_regs[hi], 8);
+                     }
+                 }
+                 ParamClass::F128SseReg { reg_idx } => {
+                     // _Float128: the full 16 bytes arrive in ONE XMM register.
+-                    self.state
+-                        .out
+-                        .emit_instr_reg_rbp("    movdqu", xmm_regs[reg_idx], slot.0);
++                    self.emit_capture_store_movdqu(dst, xmm_regs[reg_idx]);
+                 }
+                 ParamClass::StructMixedIntSseReg {
+                     int_reg_idx,
+                     fp_reg_idx,
+                     ..
+                 } => {
+-                    self.state.out.emit_instr_reg_rbp(
+-                        "    movq",
+-                        X86_ARG_REGS[int_reg_idx],
+-                        slot.0,
+-                    );
+-                    self.state
+-                        .out
+-                        .emit_instr_reg_rbp("    movq", xmm_regs[fp_reg_idx], slot.0 + 8);
++                    self.emit_capture_store_qword(dst, X86_ARG_REGS[int_reg_idx], 0);
++                    self.emit_capture_store_xmm(dst, xmm_regs[fp_reg_idx], 8);
+                 }
+                 ParamClass::StructMixedSseIntReg {
+                     fp_reg_idx,
+                     int_reg_idx,
+                     ..
+                 } => {
+-                    self.state
+-                        .out
+-                        .emit_instr_reg_rbp("    movq", xmm_regs[fp_reg_idx], slot.0);
+-                    self.state.out.emit_instr_reg_rbp(
+-                        "    movq",
+-                        X86_ARG_REGS[int_reg_idx],
+-                        slot.0 + 8,
+-                    );
++                    self.emit_capture_store_xmm(dst, xmm_regs[fp_reg_idx], 0);
++                    self.emit_capture_store_qword(dst, X86_ARG_REGS[int_reg_idx], 8);
+                 }
+                 ParamClass::F128AlwaysStack { offset } => {
+                     let src = stack_base + offset;
+                     self.state.out.emit_instr_rbp("    fldt", src);
+-                    self.state.out.emit_instr_rbp("    fstpt", slot.0);
++                    self.emit_capture_fstpt(dst, 0);
+                 }
+                 ParamClass::I128Stack { offset } => {
+                     let src = stack_base + offset;
+                     self.state.out.emit_instr_rbp_reg("    movq", src, "rax");
+-                    self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
++                    self.emit_capture_store_qword(dst, "rax", 0);
+                     self.state
+                         .out
+                         .emit_instr_rbp_reg("    movq", src + 8, "rax");
+-                    self.state
+-                        .out
+-                        .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
++                    self.emit_capture_store_qword(dst, "rax", 8);
+                 }
+                 ParamClass::StackScalar { offset } => {
+                     // Load from caller's stack frame and store full 8 bytes to ensure
+                     // the entire slot is initialized (see IntReg comment above).
+                     let src = stack_base + offset;
+                     self.state.out.emit_instr_rbp_reg("    movq", src, "rax");
+-                    self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
++                    self.emit_capture_store_qword(dst, "rax", 0);
+                 }
+                 ParamClass::StructStack { offset, size }
+                 | ParamClass::LargeStructStack { offset, size } => {
+@@ -2636,51 +2686,19 @@ impl X86Codegen {
+                     // Over-aligned (>16) parameter allocas have their slot
+                     // oversized by (align-1); the EFFECTIVE address is
+                     // align_up(slot, align). `&s` (via value_to_reg) resolves
+-                    // that same aligned address, so the copy must target it too
+-                    // — writing the raw slot desyncs the two by the alignment
+-                    // pad (the _Alignas(32) struct param regression).
+-                    let over_align = find_param_alloca(func, i)
+-                        .and_then(|(dest, _)| self.state.alloca_over_align(dest.0))
+-                        .filter(|&a| a > 16);
+-                    if let Some(a) = over_align {
+-                        // The aligned-address scratch MUST NOT be %rcx: with
+-                        // three or more register-class integer parameters the
+-                        // third SysV integer argument LIVES in %rcx at this
+-                        // point (fn4 stress repro: `long a3` arrived in %rcx,
+-                        // the lea/add/and overwrote it with the aligned-home
+-                        // address, and every later read of a3 consumed a
+-                        // stack pointer).  %r11 is the only GP register with
+-                        // no incoming role on SysV — it is not one of the six
+-                        // argument registers (rdi,rsi,rdx,rcx,r8,r9) and it
+-                        // does not carry the nested-function static chain
+-                        // (%r10) — so it is dead by construction here, and
+-                        // the parallel-copy pass below reserves only %rax.
+-                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "r11");
+-                        self.state
+-                            .out
+-                            .emit_instr_imm_reg("    addq", (a - 1) as i64, "r11");
++                    // that same aligned address, so the copy must target it
++                    // too — writing the raw slot desyncs the two by the
++                    // alignment pad (the _Alignas(32) struct param
++                    // regression). The aligned base is pre-computed in %r11
++                    // above (a register with no SysV incoming role — see the
++                    // comment there; %rcx is NOT usable here: it may still
++                    // carry an uncaptured third integer argument).
++                    for qi in 0..n_qwords {
++                        let src_off = src + (qi as i64 * 8);
+                         self.state
+                             .out
+-                            .emit_instr_imm_reg("    andq", -(a as i64), "r11");
+-                        for qi in 0..n_qwords {
+-                            let src_off = src + (qi as i64 * 8);
+-                            self.state
+-                                .out
+-                                .emit_instr_rbp_reg("    movq", src_off, "rax");
+-                            self.state
+-                                .emit_fmt(format_args!("    movq %rax, {}(%r11)", qi * 8));
+-                        }
+-                    } else {
+-                        for qi in 0..n_qwords {
+-                            let src_off = src + (qi as i64 * 8);
+-                            let dst_off = slot.0 + (qi as i64 * 8);
+-                            self.state
+-                                .out
+-                                .emit_instr_rbp_reg("    movq", src_off, "rax");
+-                            self.state
+-                                .out
+-                                .emit_instr_reg_rbp("    movq", "rax", dst_off);
+-                        }
++                            .emit_instr_rbp_reg("    movq", src_off, "rax");
++                        self.emit_capture_store_qword(dst, "rax", qi as i64 * 8);
+                     }
+                 }
+                 ParamClass::F128FpReg { .. }
+@@ -2902,6 +2920,13 @@ impl X86Codegen {
+     }
+ 
+     pub(super) fn emit_param_ref_impl(&mut self, dest: &Value, param_idx: usize, ty: IrType) {
++        // Over-aligned-param homing elision: this dest's only use was the
++        // elided homing store. The prologue capture is the single
++        // authoritative home of the alloca; the dest itself is dead. Emit
++        // nothing (its slot, if any, is never read).
++        if self.state.dead_param_ref_dests.contains(&dest.0) {
++            return;
++        }
+         if param_idx >= self.state.param_classes.len() {
+             return;
+         }
+@@ -2914,12 +2939,23 @@ impl X86Codegen {
+         }
+ 
+         if param_idx < self.state.param_alloca_slots.len() {
+-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
++            if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
+                 let load_instr = Self::mov_load_for_type(alloca_ty);
+                 let reg = Self::load_dest_reg(alloca_ty);
+-                let sr = self.slot_ref(slot.0);
+-                self.state
+-                    .emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
++                if self.state.alloca_over_align(alloca_id).is_some() {
++                    // Over-aligned (>16) param alloca: the capture wrote the
++                    // EFFECTIVE align_up'd address, not the raw slot base.
++                    // Load from the same effective address (via %rcx) or the
++                    // dest receives padding garbage and, through the homing
++                    // store, writes it back over the captured value.
++                    self.emit_alloca_aligned_addr_impl(slot, alloca_id);
++                    self.state
++                        .emit_fmt(format_args!("    {} (%rcx), {}", load_instr, reg));
++                } else {
++                    let sr = self.slot_ref(slot.0);
++                    self.state
++                        .emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
++                }
+                 self.store_rax_to(dest);
+                 return;
+             }
+diff --git a/src/frontend/parser/ast.rs b/src/frontend/parser/ast.rs
+index f45d57ca..2a713d66 100644
+--- a/src/frontend/parser/ast.rs
++++ b/src/frontend/parser/ast.rs
+@@ -283,6 +283,14 @@ pub struct FunctionDef {
+ pub struct ParamDecl {
+     pub type_spec: TypeSpecifier,
+     pub name: Option<String>,
++    /// Direct alignment override written IN the parameter list:
++    /// `int x __attribute__((aligned(32)))` or `_Alignas(32) int x`.
++    /// The typedef spelling rides on `type_spec` (TypedefName); the direct
++    /// spelling lands here — without it the alignment is silently dropped
++    /// while the spelling is accepted (silent misalignment of `&x`).
++    pub alignment: Option<usize>,
++    /// `_Alignas(type-name)` form: resolved by the lowerer via alignof_type.
++    pub alignas_type: Option<TypeSpecifier>,
+     /// For function pointer parameters, the parameter types of the pointed-to function.
+     /// E.g., for `float (*func)(float, float)`, this holds the two float param decls.
+     pub fptr_params: Option<Vec<ParamDecl>>,
+diff --git a/src/frontend/parser/declarators.rs b/src/frontend/parser/declarators.rs
+index 2a42ff05..ed874da2 100644
+--- a/src/frontend/parser/declarators.rs
++++ b/src/frontend/parser/declarators.rs
+@@ -466,7 +466,17 @@ impl Parser {
+             // on a function pointer parameter (e.g. `__attribute__((__noreturn__)) fn_ptr_t`)
+             // doesn't leak to the enclosing function declaration.
+             let saved_noreturn = self.attrs.parsing_noreturn();
+-            self.skip_gcc_extensions();
++            // Parse pre-name GCC attributes (e.g. `__attribute__((aligned(16))) int x`)
++            // instead of skipping them, so a pre-name aligned attribute is
++            // honored exactly like the _Alignas pre-name spelling.
++            let (_, pre_align, _, _, _) = self.parse_gcc_attributes();
++            if let Some(a) = pre_align {
++                self.attrs.parsed_alignas = Some(
++                    self.attrs
++                        .parsed_alignas
++                        .map_or(a, |prev: usize| prev.max(a)),
++                );
++            }
+             // Save and reset parsing_const to detect if this parameter's base type is const.
+             let saved_const = self.attrs.parsing_const();
+             self.attrs.set_const(false);
+@@ -487,6 +497,25 @@ impl Parser {
+                     inner_ptr_depth,
+                     param_is_restrict,
+                 ) = self.parse_param_declarator_full();
++                // Post-name GCC attributes: `int x __attribute__((aligned(32)))`.
++                // The parameter declarator parser does not consume them; parse
++                // them here and merge `aligned` with any pre-name/_Alignas
++                // alignment already captured.
++                let (_, post_align, _, _, _) = self.parse_gcc_attributes();
++                if let Some(a) = post_align {
++                    self.attrs.parsed_alignas = Some(
++                        self.attrs
++                            .parsed_alignas
++                            .map_or(a, |prev: usize| prev.max(a)),
++                    );
++                }
++                // Direct `__attribute__((aligned(N)))` / `_Alignas(...)`
++                // spellings on the parameter: captured during declarator
++                // parsing. `take()` also prevents leakage into the NEXT
++                // parameter (the save/reset pattern above covers const and
++                // noreturn, but parsed_alignas was never reset here).
++                let param_alignment = self.attrs.parsed_alignas.take();
++                let param_alignas_type = self.attrs.parsed_alignas_type.take();
+                 self.skip_gcc_extensions();
+ 
+                 // Apply pointer levels
+@@ -528,6 +557,8 @@ impl Parser {
+                 params.push(ParamDecl {
+                     type_spec,
+                     name,
++                    alignment: param_alignment,
++                    alignas_type: param_alignas_type,
+                     fptr_params: fptr_param_decls,
+                     fptr_variadic,
+                     is_const: param_is_const,
+@@ -560,6 +591,8 @@ impl Parser {
+             params.push(ParamDecl {
+                 type_spec: TypeSpecifier::Int, // K&R default type
+                 name: Some(n),
++                alignment: None,
++                alignas_type: None,
+                 fptr_params: None,
+                 fptr_variadic: false,
+                 is_const: false,
+diff --git a/src/ir/lowering/func_lowering.rs b/src/ir/lowering/func_lowering.rs
+index 748b9f9d..aab1b095 100644
+--- a/src/ir/lowering/func_lowering.rs
++++ b/src/ir/lowering/func_lowering.rs
+@@ -182,6 +182,7 @@ impl Lowerer {
+                     noalias: false,
+                     struct_size: None,
+                     struct_align: None,
++                    param_align: None,
+                     struct_eightbyte_classes: Vec::new(),
+                     riscv_float_class: None,
+                     is_f128_sse: false,
+@@ -221,6 +222,7 @@ impl Lowerer {
+                         noalias: false,
+                         struct_size: None,
+                         struct_align: None,
++                        param_align: None,
+                         struct_eightbyte_classes: Vec::new(),
+                         riscv_float_class: None,
+                         is_f128_sse: false,
+@@ -237,6 +239,7 @@ impl Lowerer {
+                         noalias: false,
+                         struct_size: None,
+                         struct_align: None,
++                        param_align: None,
+                         struct_eightbyte_classes: Vec::new(),
+                         riscv_float_class: None,
+                         is_f128_sse: false,
+@@ -247,6 +250,7 @@ impl Lowerer {
+                         noalias: false,
+                         struct_size: None,
+                         struct_align: None,
++                        param_align: None,
+                         struct_eightbyte_classes: Vec::new(),
+                         riscv_float_class: None,
+                         is_f128_sse: false,
+@@ -292,11 +296,32 @@ impl Lowerer {
+                     } else {
+                         (None, Vec::new(), None)
+                     };
++                // Struct params carry alignment through `struct_align`.
++                // The struct LAYOUT's natural alignment (layout.align) is not
++                // enough: a typedef override (`typedef S7 AS32
++                // __attribute__((aligned(32)))`) or a direct parameter-list
++                // spelling (`struct S {...} s __attribute__((aligned(32)))`)
++                // raises the alignment of the PARAMETER OBJECT itself above
++                // the layout's — and `&s` must observe it (GCC homes the
++                // param at the declared alignment). Fold the declared
++                // alignment in so the alloca is padded and the capture
++                // targets the effective aligned address.
++                let declared_align = self.alignof_type(&param.type_spec);
++                let direct_align = param
++                    .alignment
++                    .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
++                let extra = declared_align.max(direct_align.unwrap_or(0));
++                let struct_align = match struct_align {
++                    Some(a) => Some(a.max(extra)),
++                    None if extra > 0 => Some(extra),
++                    None => None,
++                };
+                 params.push(IrParam {
+                     ty: IrType::Ptr,
+                     noalias: false,
+                     struct_size,
+                     struct_align,
++                    param_align: None,
+                     struct_eightbyte_classes,
+                     riscv_float_class,
+                     is_f128_sse: false,
+@@ -310,11 +335,24 @@ impl Lowerer {
+             // a 16-byte SSE struct so the backend routes it through XMM regs.
+             if matches!(param_ctype, CType::Float128 | CType::Decimal128) {
+                 let ir_idx = params.len();
++                // The carrier is 16 bytes / 16-aligned by ABI, but the
++                // DECLARED alignment may exceed that (typedef override or a
++                // direct parameter-list spelling): `&x` of an
++                // `aligned(32)` _Float128 parameter must be 32-aligned.
++                // Fold it in exactly like the scalar arm.
++                let natural_align = self.ctype_align(&param_ctype);
++                let declared_align = self.alignof_type(&param.type_spec);
++                let direct_align = param
++                    .alignment
++                    .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
++                let declared = declared_align.max(direct_align.unwrap_or(0));
++                let param_align = (declared > natural_align).then_some(declared);
+                 params.push(IrParam {
+                     ty: IrType::U128,
+                     noalias: false,
+                     struct_size: Some(16),
+-                    struct_align: Some(16),
++                    struct_align: Some(16.max(declared)),
++                    param_align,
+                     struct_eightbyte_classes: vec![
+                         crate::common::types::EightbyteClass::Sse,
+                         crate::common::types::EightbyteClass::Sse,
+@@ -337,11 +375,33 @@ impl Lowerer {
+                     other => other,
+                 };
+             }
++            // Declared alignment of the parameter type, honoring typedef
++            // `__attribute__((aligned(N)))` / `_Alignas(N)` overrides. An
++            // override above the type's natural alignment must reach the
++            // backend so the parameter alloca is homed at that alignment
++            // (GCC realigns its frame for over-aligned parameter types, so
++            // `&x` of an `aligned(32)` parameter is 32-aligned there).
++            // Without this, a typedef-aligned scalar parameter is copied to
++            // a naturally-placed slot and `&x` is misaligned.
++            let natural_align = self.ctype_align(&param_ctype);
++            let declared_align = self.alignof_type(&param.type_spec);
++            // Direct spellings written IN the parameter list
++            // (`int x __attribute__((aligned(32)))`, `_Alignas(32) int x`)
++            // ride on ParamDecl, not the type spec. lccc accepts them
++            // (GCC/Clang reject), so they MUST be honored — otherwise the
++            // parameter is homed at natural alignment while the user asked
++            // for more (silent misalignment of `&x`).
++            let direct_align = param
++                .alignment
++                .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
++            let declared_align = declared_align.max(direct_align.unwrap_or(0));
++            let param_align = (declared_align > natural_align).then_some(declared_align);
+             params.push(IrParam {
+                 ty,
+                 noalias: param.is_restrict && ty == IrType::Ptr,
+                 struct_size: None,
+                 struct_align: None,
++                param_align,
+                 struct_eightbyte_classes: Vec::new(),
+                 riscv_float_class: None,
+                 is_f128_sse: false,
+@@ -384,11 +444,14 @@ impl Lowerer {
+                 .ty
+                 .size()
+                 .max(param.struct_size.unwrap_or(param.ty.size()));
+-            // Carry the struct's ABI alignment onto its parameter alloca. Without
++            // Carry the parameter's declared alignment onto its alloca. Without
+             // this, a by-value `_Alignas(16)` struct parameter is copied into an
+             // 8-aligned slot in emit_store_params and `&s` (or an aligned vector
+-            // access on the param) sees a misaligned address.
+-            let align = param.struct_align.unwrap_or(0);
++            // access on the param) sees a misaligned address. `param_align`
++            // extends the same guarantee to typedef-aligned scalar parameters
++            // (`typedef int A32 __attribute__((aligned(32)))`), whose alignment
++            // the frontend would otherwise drop entirely.
++            let align = param.struct_align.or(param.param_align).unwrap_or(0);
+             self.emit(Instruction::Alloca {
+                 dest: alloca,
+                 ty: param.ty,
+diff --git a/src/ir/lowering/types_ctype.rs b/src/ir/lowering/types_ctype.rs
+index 785fd385..e2062b0e 100644
+--- a/src/ir/lowering/types_ctype.rs
++++ b/src/ir/lowering/types_ctype.rs
+@@ -53,6 +53,8 @@ impl Lowerer {
+                         .map(|(cty, name)| ParamDecl {
+                             type_spec: Self::ctype_to_type_spec(cty),
+                             name: name.clone(),
++                            alignment: None,
++                            alignas_type: None,
+                             fptr_params: None,
+                             fptr_variadic: false,
+                             is_const: false,
+@@ -111,6 +113,8 @@ impl Lowerer {
+                     .map(|(cty, name)| ParamDecl {
+                         type_spec: Self::ctype_to_type_spec(cty),
+                         name: name.clone(),
++                        alignment: None,
++                        alignas_type: None,
+                         fptr_params: None,
+                         fptr_variadic: false,
+                         is_const: false,
+diff --git a/src/ir/mem2reg/promote.rs b/src/ir/mem2reg/promote.rs
+index 37c64ca0..27295fef 100644
+--- a/src/ir/mem2reg/promote.rs
++++ b/src/ir/mem2reg/promote.rs
+@@ -1084,6 +1084,7 @@ mod tests {
+                 noalias: false,
+                 struct_size: None,
+                 struct_align: None,
++                param_align: None,
+                 struct_eightbyte_classes: Vec::new(),
+                 riscv_float_class: None,
+                 is_f128_sse: false,
+@@ -1791,6 +1792,7 @@ mod tests {
+                 noalias: false,
+                 struct_size: Some(8),
+                 struct_align: Some(8),
++                param_align: None,
+                 struct_eightbyte_classes: vec![crate::common::types::EightbyteClass::Integer],
+                 riscv_float_class: None,
+                 is_f128_sse: false,
+diff --git a/src/ir/module.rs b/src/ir/module.rs
+index 7ddef413..d1096c88 100644
+--- a/src/ir/module.rs
++++ b/src/ir/module.rs
+@@ -276,6 +276,16 @@ pub struct IrParam {
+     /// Struct alignment in bytes. Used on RISC-V to even-align register pairs for
+     /// 2×XLEN-aligned structs. None for non-struct params.
+     pub struct_align: Option<usize>,
++    /// Declared alignment of a scalar parameter's type when an explicit
++    /// alignment override (`__attribute__((aligned(N)))` / `_Alignas(N)`,
++    /// most often through a typedef) exceeds the type's natural alignment.
++    /// The frontend drops nothing here; the backend must home the parameter
++    /// alloca at this alignment so `&x` (and aligned vector accesses on the
++    /// parameter) see the declared alignment, matching GCC, which realigns
++    /// its frame for over-aligned parameter types. None for struct/union
++    /// params (struct_align already covers those) and for scalars without an
++    /// override.
++    pub param_align: Option<usize>,
+     /// Per-eightbyte SysV ABI classification for struct params (x86-64 only).
+     /// Empty for non-struct params or when classification is not applicable.
+     /// Each entry indicates whether that eightbyte should use SSE or GP registers.
+diff --git a/src/passes/bool_thread.rs b/src/passes/bool_thread.rs
+index 40a71949..85ea87f4 100644
+--- a/src/passes/bool_thread.rs
++++ b/src/passes/bool_thread.rs
+@@ -899,6 +899,7 @@ mod tests {
+                     noalias: false,
+                     struct_size: None,
+                     struct_align: None,
++                    param_align: None,
+                     struct_eightbyte_classes: vec![],
+                     is_f128_sse: false,
+                     riscv_float_class: None,
+@@ -908,6 +909,7 @@ mod tests {
+                     noalias: false,
+                     struct_size: None,
+                     struct_align: None,
++                    param_align: None,
+                     struct_eightbyte_classes: vec![],
+                     is_f128_sse: false,
+                     riscv_float_class: None,
+@@ -917,6 +919,7 @@ mod tests {
+                     noalias: false,
+                     struct_size: None,
+                     struct_align: None,
++                    param_align: None,
+                     struct_eightbyte_classes: vec![],
+                     is_f128_sse: false,
+                     riscv_float_class: None,
+diff --git a/src/passes/dce.rs b/src/passes/dce.rs
+index 6de6966b..e09b43a8 100644
+--- a/src/passes/dce.rs
++++ b/src/passes/dce.rs
+@@ -775,6 +775,7 @@ mod tests {
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: vec![],
+             is_f128_sse: false,
+             riscv_float_class: None,
+diff --git a/src/passes/outline_switch.rs b/src/passes/outline_switch.rs
+index 0ef35cb0..2261b735 100644
+--- a/src/passes/outline_switch.rs
++++ b/src/passes/outline_switch.rs
+@@ -865,6 +865,7 @@ fn build_outlined_function(
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: Vec::new(),
+             riscv_float_class: None,
+             is_f128_sse: false,
+diff --git a/src/passes/recursion_to_iter.rs b/src/passes/recursion_to_iter.rs
+index 12a1b95d..4e478745 100644
+--- a/src/passes/recursion_to_iter.rs
++++ b/src/passes/recursion_to_iter.rs
+@@ -537,6 +537,7 @@ mod tests {
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: Vec::new(),
+             riscv_float_class: None,
+             is_f128_sse: false,
+@@ -759,6 +760,7 @@ mod tests {
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: Vec::new(),
+             riscv_float_class: None,
+             is_f128_sse: false,
+@@ -840,6 +842,7 @@ mod tests {
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: Vec::new(),
+             riscv_float_class: None,
+             is_f128_sse: false,
+@@ -864,6 +867,7 @@ mod tests {
+                 noalias: false,
+                 struct_size: None,
+                 struct_align: None,
++                param_align: None,
+                 struct_eightbyte_classes: Vec::new(),
+                 riscv_float_class: None,
+                 is_f128_sse: false,
+@@ -873,6 +877,7 @@ mod tests {
+                 noalias: false,
+                 struct_size: None,
+                 struct_align: None,
++                param_align: None,
+                 struct_eightbyte_classes: Vec::new(),
+                 riscv_float_class: None,
+                 is_f128_sse: false,
+@@ -901,6 +906,7 @@ mod tests {
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: Vec::new(),
+             riscv_float_class: None,
+             is_f128_sse: false,
+diff --git a/src/passes/tail_call_elim.rs b/src/passes/tail_call_elim.rs
+index a8a0550c..f5b5a29f 100644
+--- a/src/passes/tail_call_elim.rs
++++ b/src/passes/tail_call_elim.rs
+@@ -889,6 +889,7 @@ mod tests {
+                 noalias: false,
+                 struct_size: None,
+                 struct_align: None,
++                param_align: None,
+                 struct_eightbyte_classes: Vec::new(),
+                 riscv_float_class: None,
+                 is_f128_sse: false,
+diff --git a/src/passes/vector_temp_promotion.rs b/src/passes/vector_temp_promotion.rs
+index c07d42c6..6de37551 100644
+--- a/src/passes/vector_temp_promotion.rs
++++ b/src/passes/vector_temp_promotion.rs
+@@ -2419,6 +2419,7 @@ mod tests {
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: Vec::new(),
+             is_f128_sse: false,
+             riscv_float_class: None,
+@@ -3047,6 +3048,7 @@ mod tests {
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: Vec::new(),
+             is_f128_sse: false,
+             riscv_float_class: None,
+@@ -3173,6 +3175,7 @@ mod tests {
+             noalias: true,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: Vec::new(),
+             is_f128_sse: false,
+             riscv_float_class: None,
+diff --git a/src/pgo/instrument.rs b/src/pgo/instrument.rs
+index 40aef6b3..3464b1eb 100644
+--- a/src/pgo/instrument.rs
++++ b/src/pgo/instrument.rs
+@@ -1598,6 +1598,7 @@ fn push_helper_fn(
+             noalias: false,
+             struct_size: None,
+             struct_align: None,
++            param_align: None,
+             struct_eightbyte_classes: vec![],
+             is_f128_sse: false,
+             riscv_float_class: None,
+diff --git a/src/pgo/profile.rs b/src/pgo/profile.rs
+index 6099b690..11e61d86 100644
+--- a/src/pgo/profile.rs
++++ b/src/pgo/profile.rs
+@@ -676,6 +676,7 @@ mod tests {
+                 noalias: false,
+                 struct_size: None,
+                 struct_align: None,
++                param_align: None,
+                 struct_eightbyte_classes: vec![],
+                 is_f128_sse: false,
+                 riscv_float_class: None,
