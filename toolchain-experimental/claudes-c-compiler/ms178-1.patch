@@ -1,17 +1,19 @@
 diff --git a/FOLLOWUP-2026-09-10-param-alignment-and-f128-u64-rail.md b/FOLLOWUP-2026-09-10-param-alignment-and-f128-u64-rail.md
 new file mode 100644
-index 00000000..e9241aaf
+index 0000000..0b69d81
 --- /dev/null
 +++ b/FOLLOWUP-2026-09-10-param-alignment-and-f128-u64-rail.md
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,258 @@
 +# FOLLOWUP-2026-09-10-param-alignment-and-f128-u64-rail.md
 +
 +Closes the two outstanding defects from the i686 prologue audit
 +(`FOLLOWUP-2026-09-10-i686-prologue-fastcall-regparm-audit.md`): **Gap 1**
 +(over-aligned parameter allocas) and **Gap 2** (x86-64 legacy `%rax` head in
-+the F128 -> U64 cast). One additional pre-existing defect found and fixed on
-+the way (i686 peephole `ret $N` misclassification). All changes re-based onto
-+origin/main **28379879** (Merge PR #483), which re-integrates the S07 merge
++the F128 -> U64 cast). Two additional pre-existing defects found and fixed on
++the way (i686 peephole `ret $N` misclassification; see also the CI-red
++section below, which fixes one defect the PR itself introduced plus three
++codegen traps it exposed). All changes re-based onto origin/main
++**28379879** (Merge PR #483), which re-integrates the S07 merge
 +(PR #482) plus PRs #477-#479.
 +
 +Every claim below was reproduced or refuted empirically. Oracles:
@@ -150,28 +152,400 @@ index 00000000..e9241aaf
 +PASS/FAIL summary, 20-run determinism verified). `/home/user/scratch/prologue/`
 +— ovalign3-6 chains incl. the GCC-clean typedef oracle ovalign6g.c.
 +
-+## Validation summary (all on the re-based tree)
++## Validation summary (all on the re-based tree, post-CI-fix)
 +
 +* fastbuild, `-D warnings`: clean (2m38s).
-+* `cargo test --lib`: 2307 passed, 0 failed.
-+* `scripts/ci_local.sh --fast`: 16/16 gates green.
++* `cargo test --lib`: 2308 passed, 0 failed.
++* `scripts/ci_local.sh --fast`: 16/16 gates green (incl. the
++  benchmark-output oracle gate, run explicitly: green).
++* `CCC_VALIDATE_SSA=1 python3 tests/regression/run_regression.py --lccc
++  target/fastbuild/lccc -j 2`: **729 passed, 0 failed** — the exact CI-red
++  step, green (3 consecutive full runs; `fabsf128` and
++  `f128_global_carrier` individually re-verified).
 +* `cargo fmt --all`: clean.
 +* Matrices: pa1/pa2/pa3/fc + ovalign chains: all green on lccc-i686 and
 +  lccc-x86-64; oracle tables above.
++* New: `ovalign4` green at ALL opt levels (default/-O0/-O1/-O2/-O3/-Os/-Oz)
++  on lccc-x86-64 — the shape that exposed the typed-call-arg trap.
++* New: arm (aarch64) + riscv64 under qemu — `ovalign6g` and the LD32
++  capture probe green at ALL opt levels, outputs ≡ cross-GCC. AArch64
++  regression suite: identical pass/fail/skip counts vs the base compiler
++  (514/53/127 — zero regressions).
++* New: over-aligned-param value+alignment probes (`livepref.c`,
++  `livepref2.c`, `one.c`, `cap_o2.c`) green on lccc-x86-64/-i686/-arm/-riscv
++  at every opt level and ≡ GCC; arm/riscv disassembly verified: captures
++  write the effective address (x11/t2 bases), reads resolve it, no pad
++  access.
++* Oracle anomaly recorded: GCC 14.2 at -O1 (and default) FAILS the
++  over-aligned long-double param case of `ovalign6g.c` (prints -1000);
++  lccc is correct at every level. GCC on riscv64/aarch64 does not honor
++  typedef-aligned scalar params at all (alignment checks fail); lccc now
++  honors them on all four backends.
++* Benchmark output oracle gate: 180/180 PASS.
++
++## CI red — root cause and fixes (PR #484)
++
++**Symptom.** GitHub job 103013467965 (PR #484), "Run regression corpus
++with SSA validation" (`CCC_VALIDATE_SSA=1 … run_regression.py -j 2`):
++`FAIL fabsf128`, `f128_global_carrier: 3 check(s) failed`, exit 3. The SSA
++validator itself was innocent: it exercised the FULL corpus at -O2, the
++configuration the local gates skipped, and the failures were plain runtime
++miscompiles.
++
++**Root cause (one line).** `emit_capture_store_movdqu` in
++`src/backend/x86/codegen/prologue.rs` (new in this PR) used the LOAD-form
++emitter `emit_instr_rbp_reg` ("movdqu off(%rbp), %xmmN") in its Raw arm
++instead of the STORE-form `emit_instr_reg_rbp`. The 16-byte `_Float128`
++parameter capture became a garbage load: the incoming register is clobbered
++and the parameter slot is never written. At -O2, mem2reg removes the
++IR-level homing store, making the prologue capture the sole writer of the
++parameter slot — every parameter read returns uninitialized memory. This is
++why the lower-opt matrices (address-taken params, IR homing store still
++present) passed. A/B disassembly against the base compiler pinned the
++delta exactly: base emits `movdqu %xmm0, -16(%rbp)`; the PR emitted two
++loads and no store. Exhaustive audit of every emitter added/rewritten in
++the PR (x86-64/i686 prologue + memory paths, arm/riscv diffs) confirmed
++this was the ONLY polarity error. Fix restores the exact pre-PR
++instruction; zero performance cost. Regression test:
++`tests/regression/f128_param_capture_o2.c` (red on the broken build, green
++after the fix).
++
++**Latent traps exposed by the same audit, fixed in the same PR (all
++x86-64 typed-MachInst admission):**
++
++1. *Typed call arguments for over-aligned allocas* (`arg_src` in emit.rs):
++   `TypedCallSrc::AllocaAddr` resolved to a raw-slot `LeaSlot` while the
++   capture writes the EFFECTIVE align_up'd address — `sinkp32(&x)` received
++   the pad base. Live miscompile, maskable by frame-layout luck (that is
++   why `ovalign4` only failed at -O1/default). Fix: over-aligned allocas
++   fall back to the mature path (the established OverAligned-rejection
++   doctrine), which computes the effective address.
++2. *Typed ParamRef materialization of a dead destination*: the census
++   looked only at `value_use_counts == 0`, not at `dead_param_ref_dests`
++   (the homing-elision set) — a dest whose sole use was the elided homing
++   store still materialized a raw-slot load of the alignment pad. Fix:
++   mirror the text path's early-out.
++3. *Typed ParamRef "Case 1" raw-slot load for over-aligned param allocas*:
++   the `_alloca_id` tuple element existed but was unused; a live ParamRef
++   of an over-aligned param would have loaded the pad. Fix: reject to the
++   text path (effective-address load), same doctrine.
++
++**Cross-backend audit fallout (arm/riscv), fixed in the same PR:**
++
++4. *aarch64 SIGSEGV on over-aligned long-double params*:
++   `f128_softfloat.rs` Path-2 OverAligned arm computed the effective
++   address into x9 but loaded through x17 (the mask scratch) — the
++   `f128_move_aligned_to_addr_reg` bridge (`mov x17, x9`) was missing at
++   one of five sites. Base compiler does not crash; the PR's param
++   over-align plumbing made this path reachable. Fix: add the bridge.
++5. *arm/riscv prologue captures ignored the effective address*: with the
++   PR, over-aligned scalar parameters now get padded slots on all four
++   backends, but the arm/riscv captures still wrote the raw slot while all
++   readers resolve the effective address — deterministic silent value
++   corruption on riscv64 (LD32 probe printed 5 instead of 82) and
++   frame-luck corruption on aarch64. Fix: new `emit_param_home_store_impl`
++   in both backends; the capture loops compute the effective base once per
++   parameter (arm: x11, riscv: t2) and store through it; the arm/riscv
++   `emit_param_ref_impl` alloca-load paths now route over-aligned param
++   allocas through the effective address (the former `_alloca_id`
++   placeholders). All store sites covered (GP/FP/F128/stack/by-ref
++   classes). Verified by qemu runtime + disassembly at all opt levels,
++   outputs ≡ cross-GCC.
 +
 +## Follow-ups
 +
-+* ARM/RISC-V ParamRef routing for over-aligned param allocas still uses
-+  the placeholder `_alloca_id` (no over-aligned effective-address load yet);
-+  same fix shape as x86-64 once ARM/RISC-V runtime oracles are available
-+  (qemu-user installed with the oracle toolchain).
 +* ICC classic: no 32-bit runtime (ia32_lin not shipped in the 2023.2.4
 +  oneAPI package), so ICC -m32 evidence is limited to compile-only; ICC
 +  additionally fails the over-aligned-parameter semantics outright.
 +* GCC 16.2: unavailable on Debian trixie (no gcc-16 package in stable or
 +  experimental); re-run the oracle tables when it lands.
++* GCC -O1 over-aligned long-double param defect (ovalign6g case 5) is an
++  oracle anomaly, not a lccc defect; re-check against a future GCC point
++  release.
+diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
+index 5c86d2e..28883db 100644
+--- a/src/backend/arm/codegen/emit.rs
++++ b/src/backend/arm/codegen/emit.rs
+@@ -2302,6 +2302,39 @@ impl ArmCodegen {
+     }
+ 
+     /// Resolve param alloca to (slot, type) for parameter `i`.
++    /// Store `reg` into a parameter alloca home slot: over-aligned (>16)
++    /// allocas have a padded slot and every reader resolves the EFFECTIVE
++    /// align_up'd address — the capture must target it too or the incoming
++    /// value desyncs from its readers by the alignment pad. `over_aligned`
++    /// reports whether x11 currently holds that effective base (computed
++    /// once per parameter in the capture loops); `instr` is the store
++    /// mnemonic (str/strb/strh, or str qN for the 16-byte F128 form).
++    fn emit_param_home_store_impl(
++        &mut self,
++        over_aligned: bool,
++        instr: &str,
++        reg: &str,
++        slot: StackSlot,
++        off: i64,
++    ) {
++        if over_aligned {
++            if off == 0 {
++                self.state
++                    .emit_fmt(format_args!("    {} {}, [x11]", instr, reg));
++            } else if (0..=4095).contains(&off) {
++                self.state
++                    .emit_fmt(format_args!("    {} {}, [x11, #{}]", instr, reg, off));
++            } else {
++                self.load_large_imm("x17", off);
++                self.state.emit("    add x17, x11, x17");
++                self.state
++                    .emit_fmt(format_args!("    {} {}, [x17]", instr, reg));
++            }
++        } else {
++            self.emit_store_to_sp(reg, slot.0 + off, instr);
++        }
++    }
++
+     fn resolve_param_slot(
+         &self,
+         func: &IrFunction,
+@@ -2341,16 +2374,30 @@ impl ArmCodegen {
+                 continue;
+             }
+ 
+-            let (slot, ty, _) = match self.resolve_param_slot(func, i) {
++            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
+                 Some(v) => v,
+                 None => continue,
+             };
++            // Over-aligned (>16) param allocas: the slot is padded and
++            // every reader resolves the EFFECTIVE align_up'd address; the
++            // capture must target it too or the incoming value desyncs
++            // from its readers by the alignment pad. x11 holds the
++            // effective base for the whole arm (x9/x10 are the per-arm
++            // staging registers, x17 is emit_alloca_addr's scratch).
++            let over_aligned = self
++                .state
++                .alloca_over_align(dest_val.0)
++                .filter(|&a| a > 16)
++                .is_some();
++            if over_aligned {
++                self.emit_alloca_addr("x11", dest_val.0, slot.0);
++            }
+ 
+             match class {
+                 ParamClass::IntReg { reg_idx } => {
+                     if sret_shift > 0 && reg_idx == 0 && i == 0 {
+                         // sret pointer: comes in x8 on AArch64
+-                        self.emit_store_to_sp("x8", slot.0, "str");
++                        self.emit_param_home_store_impl(over_aligned, "str", "x8", slot, 0);
+                     } else {
+                         let actual_idx = if reg_idx >= sret_shift {
+                             reg_idx - sret_shift
+@@ -2359,7 +2406,7 @@ impl ArmCodegen {
+                         };
+                         let store_instr = Self::str_for_type(ty);
+                         let reg = Self::reg_for_type(ARM_ARG_REGS[actual_idx], ty);
+-                        self.emit_store_to_sp(reg, slot.0, store_instr);
++                        self.emit_param_home_store_impl(over_aligned, store_instr, reg, slot, 0);
+                     }
+                 }
+                 ParamClass::I128RegPair { base_reg_idx } => {
+@@ -2368,8 +2415,20 @@ impl ArmCodegen {
+                     } else {
+                         base_reg_idx
+                     };
+-                    self.emit_store_to_sp(ARM_ARG_REGS[actual_idx], slot.0, "str");
+-                    self.emit_store_to_sp(ARM_ARG_REGS[actual_idx + 1], slot.0 + 8, "str");
++                    self.emit_param_home_store_impl(
++                        over_aligned,
++                        "str",
++                        ARM_ARG_REGS[actual_idx],
++                        slot,
++                        0,
++                    );
++                    self.emit_param_home_store_impl(
++                        over_aligned,
++                        "str",
++                        ARM_ARG_REGS[actual_idx + 1],
++                        slot,
++                        8,
++                    );
+                 }
+                 ParamClass::StructByValReg { base_reg_idx, size } => {
+                     let actual_idx = if base_reg_idx >= sret_shift {
+@@ -2377,9 +2436,21 @@ impl ArmCodegen {
+                     } else {
+                         base_reg_idx
+                     };
+-                    self.emit_store_to_sp(ARM_ARG_REGS[actual_idx], slot.0, "str");
++                    self.emit_param_home_store_impl(
++                        over_aligned,
++                        "str",
++                        ARM_ARG_REGS[actual_idx],
++                        slot,
++                        0,
++                    );
+                     if size > 8 {
+-                        self.emit_store_to_sp(ARM_ARG_REGS[actual_idx + 1], slot.0 + 8, "str");
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "str",
++                            ARM_ARG_REGS[actual_idx + 1],
++                            slot,
++                            8,
++                        );
+                     }
+                 }
+                 ParamClass::LargeStructByRefReg { reg_idx, size } => {
+@@ -2393,7 +2464,7 @@ impl ArmCodegen {
+                     for qi in 0..n_dwords {
+                         let src_off = (qi * 8) as i64;
+                         self.emit_load_from_reg("x9", src_reg, src_off, "ldr");
+-                        self.emit_store_to_sp("x9", slot.0 + src_off, "str");
++                        self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, src_off);
+                     }
+                 }
+                 _ => {}
+@@ -2428,10 +2499,18 @@ impl ArmCodegen {
+                 ParamClass::FloatReg { reg_idx } => reg_idx,
+                 _ => continue,
+             };
+-            let (slot, ty, _) = match self.resolve_param_slot(func, i) {
++            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
+                 Some(v) => v,
+                 None => continue,
+             };
++            let over_aligned = self
++                .state
++                .alloca_over_align(dest_val.0)
++                .filter(|&a| a > 16)
++                .is_some();
++            if over_aligned {
++                self.emit_alloca_addr("x11", dest_val.0, slot.0);
++            }
+             let fp_reg_off = (reg_idx * 16) as i64;
+             if ty == IrType::F32 {
+                 self.state
+@@ -2442,7 +2521,7 @@ impl ArmCodegen {
+                     .emit_fmt(format_args!("    ldr d0, [sp, #{}]", fp_reg_off));
+                 self.state.emit("    fmov x9, d0");
+             }
+-            self.emit_store_to_sp("x9", slot.0 + 128, "str");
++            self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 128);
+         }
+ 
+         // Process F128 FP reg params: store full 16-byte f128, then f64 approx.
+@@ -2455,10 +2534,18 @@ impl ArmCodegen {
+                 Some(v) => v,
+                 None => continue,
+             };
++            let over_aligned = self
++                .state
++                .alloca_over_align(dest_val.0)
++                .filter(|&a| a > 16)
++                .is_some();
++            if over_aligned {
++                self.emit_alloca_addr("x11", dest_val.0, slot.0);
++            }
+             let fp_reg_off = (reg_idx * 16) as i64;
+             self.state
+                 .emit_fmt(format_args!("    ldr q0, [sp, #{}]", fp_reg_off));
+-            self.emit_store_to_sp("q0", slot.0 + 128, "str");
++            self.emit_param_home_store_impl(over_aligned, "str", "q0", slot, 128);
+             self.state.track_f128_self(dest_val.0);
+             self.state.emit("    bl __trunctfdf2");
+             self.state.emit("    fmov x0, d0");
+@@ -2477,10 +2564,18 @@ impl ArmCodegen {
+                 ParamClass::FloatReg { reg_idx } => reg_idx,
+                 _ => continue,
+             };
+-            let (slot, ty, _) = match self.resolve_param_slot(func, i) {
++            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
+                 Some(v) => v,
+                 None => continue,
+             };
++            let over_aligned = self
++                .state
++                .alloca_over_align(dest_val.0)
++                .filter(|&a| a > 16)
++                .is_some();
++            if over_aligned {
++                self.emit_alloca_addr("x11", dest_val.0, slot.0);
++            }
+             if ty == IrType::F32 {
+                 self.state
+                     .emit_fmt(format_args!("    fmov w9, s{}", reg_idx));
+@@ -2488,7 +2583,7 @@ impl ArmCodegen {
+                 self.state
+                     .emit_fmt(format_args!("    fmov x9, d{}", reg_idx));
+             }
+-            self.emit_store_to_sp("x9", slot.0, "str");
++            self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 0);
+         }
+     }
+ 
+@@ -2512,6 +2607,14 @@ impl ArmCodegen {
+                 Some(v) => v,
+                 None => continue,
+             };
++            let over_aligned = self
++                .state
++                .alloca_over_align(dest_val.0)
++                .filter(|&a| a > 16)
++                .is_some();
++            if over_aligned {
++                self.emit_alloca_addr("x11", dest_val.0, slot.0);
++            }
+ 
+             match class {
+                 ParamClass::StructStack { offset, size }
+@@ -2520,23 +2623,23 @@ impl ArmCodegen {
+                     for qi in 0..size.div_ceil(8) {
+                         let off = qi as i64 * 8;
+                         self.emit_load_from_sp("x9", caller_offset + off, "ldr");
+-                        self.emit_store_to_sp("x9", slot.0 + off, "str");
++                        self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, off);
+                     }
+                 }
+                 ParamClass::F128Stack { offset } => {
+                     let caller_offset = frame_size + offset;
+                     self.emit_load_from_sp("x9", caller_offset, "ldr");
+-                    self.emit_store_to_sp("x9", slot.0, "str");
++                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 0);
+                     self.emit_load_from_sp("x9", caller_offset + 8, "ldr");
+-                    self.emit_store_to_sp("x9", slot.0 + 8, "str");
++                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 8);
+                     self.state.track_f128_self(dest_val.0);
+                 }
+                 ParamClass::I128Stack { offset } => {
+                     let caller_offset = frame_size + offset;
+                     self.emit_load_from_sp("x9", caller_offset, "ldr");
+-                    self.emit_store_to_sp("x9", slot.0, "str");
++                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 0);
+                     self.emit_load_from_sp("x9", caller_offset + 8, "ldr");
+-                    self.emit_store_to_sp("x9", slot.0 + 8, "str");
++                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 8);
+                 }
+                 ParamClass::StackScalar { offset } => {
+                     let caller_offset = frame_size + offset;
+@@ -2546,7 +2649,7 @@ impl ArmCodegen {
+                     let load_instr = self.load_instr_for_type_impl(ty);
+                     let (arm_load, dest_reg) = Self::arm_parse_load_to_reg(load_instr, "x9", "w9");
+                     self.emit_load_from_sp(dest_reg, caller_offset, arm_load);
+-                    self.emit_store_to_sp("x9", slot.0, "str");
++                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 0);
+                 }
+                 ParamClass::LargeStructByRefStack { offset, size } => {
+                     let caller_offset = frame_size + offset;
+@@ -2554,7 +2657,7 @@ impl ArmCodegen {
+                     for qi in 0..size.div_ceil(8) {
+                         let off = (qi * 8) as i64;
+                         self.emit_load_from_reg("x10", "x9", off, "ldr");
+-                        self.emit_store_to_sp("x10", slot.0 + off, "str");
++                        self.emit_param_home_store_impl(over_aligned, "str", "x10", slot, off);
+                     }
+                 }
+                 _ => {}
 diff --git a/src/backend/arm/codegen/prologue.rs b/src/backend/arm/codegen/prologue.rs
-index e0692a2c..b9245657 100644
+index e0692a2..7ce99a3 100644
 --- a/src/backend/arm/codegen/prologue.rs
 +++ b/src/backend/arm/codegen/prologue.rs
 @@ -513,8 +513,9 @@ impl ArmCodegen {
@@ -186,17 +560,43 @@ index e0692a2c..b9245657 100644
              })
              .collect();
  
-@@ -643,7 +644,7 @@ impl ArmCodegen {
+@@ -643,10 +644,20 @@ impl ArmCodegen {
          }
  
          if param_idx < self.state.param_alloca_slots.len() {
 -            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
-+            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
++            if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
                  let ldr_instr = self.load_instr_for_type_impl(alloca_ty);
                  let (actual_instr, reg) = Self::arm_parse_load(ldr_instr);
-                 self.emit_load_from_sp(reg, slot.0, actual_instr);
+-                self.emit_load_from_sp(reg, slot.0, actual_instr);
++                if self.state.alloca_over_align(alloca_id).is_some() {
++                    // Over-aligned (>16) param alloca: the capture wrote the
++                    // EFFECTIVE align_up'd address (x9 convention of
++                    // emit_alloca_aligned_addr_impl); a raw slot load would
++                    // read the alignment pad.
++                    self.emit_alloca_aligned_addr_impl(slot, alloca_id);
++                    self.state
++                        .emit_fmt(format_args!("    {} {}, [x9]", actual_instr, reg));
++                } else {
++                    self.emit_load_from_sp(reg, slot.0, actual_instr);
++                }
+                 self.store_x0_to(dest);
+                 return;
+             }
+diff --git a/src/backend/f128_softfloat.rs b/src/backend/f128_softfloat.rs
+index 48fa794..e1a663f 100644
+--- a/src/backend/f128_softfloat.rs
++++ b/src/backend/f128_softfloat.rs
+@@ -299,6 +299,7 @@ pub fn f128_operand_to_arg1<T: F128SoftFloat + ?Sized>(cg: &mut T, op: &Operand)
+                         }
+                         SlotAddr::OverAligned(slot, id) => {
+                             cg.f128_alloca_aligned_addr(slot, id);
++                            cg.f128_move_aligned_to_addr_reg();
+                             if offset != 0 {
+                                 cg.f128_add_offset_to_addr_reg(offset);
+                             }
 diff --git a/src/backend/i686/codegen/memory.rs b/src/backend/i686/codegen/memory.rs
-index 6111dbbb..0670bfcd 100644
+index 6111dbb..0670bfc 100644
 --- a/src/backend/i686/codegen/memory.rs
 +++ b/src/backend/i686/codegen/memory.rs
 @@ -188,6 +188,17 @@ impl I686Codegen {
@@ -218,7 +618,7 @@ index 6111dbbb..0670bfcd 100644
          // gp-view, _Decimal128, vector pack results).  The historical
          // "i128 == 64-bit eax:edx pair" model truncated these to 8 bytes,
 diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 46051d07..19b29b9c 100644
+index 46051d0..19b29b9 100644
 --- a/src/backend/i686/codegen/peephole.rs
 +++ b/src/backend/i686/codegen/peephole.rs
 @@ -67,6 +67,11 @@ enum LineKind {
@@ -373,7 +773,7 @@ index 46051d07..19b29b9c 100644
      fn unary_rmw_breaks_copy_alias() {
          // `movl %edi,%eax; negl %eax; movl %eax,(%esi)` must NOT become
 diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index e3673286..1d8f3270 100644
+index e367328..1d8f327 100644
 --- a/src/backend/i686/codegen/prologue.rs
 +++ b/src/backend/i686/codegen/prologue.rs
 @@ -651,6 +651,106 @@ impl I686Codegen {
@@ -954,10 +1354,56 @@ index e3673286..1d8f3270 100644
                  }
                  return;
 diff --git a/src/backend/riscv/codegen/prologue.rs b/src/backend/riscv/codegen/prologue.rs
-index cb4c84c7..9636d4eb 100644
+index cb4c84c..86acafb 100644
 --- a/src/backend/riscv/codegen/prologue.rs
 +++ b/src/backend/riscv/codegen/prologue.rs
-@@ -350,8 +350,9 @@ impl RiscvCodegen {
+@@ -6,6 +6,7 @@ use super::emit::{
+ };
+ use crate::backend::call_abi::{ParamClass, classify_params};
+ use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
++use crate::backend::state::StackSlot;
+ use crate::common::types::IrType;
+ use crate::ir::reexports::IrFunction;
+ 
+@@ -326,6 +327,37 @@ impl RiscvCodegen {
+ 
+     // ---- emit_store_params ----
+ 
++    /// Store `reg` into a parameter alloca home slot: over-aligned (>16)
++    /// allocas have a padded slot and every reader resolves the EFFECTIVE
++    /// align_up'd address — the capture must target it too or the incoming
++    /// value desyncs from its readers by the alignment pad (the silent
++    /// value-corruption class on over-aligned parameters). `over_aligned`
++    /// reports whether t2 currently holds that effective base (computed
++    /// once per parameter in `emit_store_params_impl`); `instr` is the
++    /// store mnemonic (sd/sw/fsd/fsw).
++    fn emit_param_home_store_impl(
++        &mut self,
++        over_aligned: bool,
++        instr: &str,
++        reg: &str,
++        slot: StackSlot,
++        off: i64,
++    ) {
++        if over_aligned {
++            if Self::fits_imm12(off) {
++                self.state
++                    .emit_fmt(format_args!("    {} {}, {}(t2)", instr, reg, off));
++            } else {
++                self.state.emit_fmt(format_args!("    li t6, {}", off));
++                self.state.emit("    add t6, t2, t6");
++                self.state
++                    .emit_fmt(format_args!("    {} {}, 0(t6)", instr, reg));
++            }
++        } else {
++            self.emit_store_to_s0(reg, slot.0 + off, instr);
++        }
++    }
++
+     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
+ 
+@@ -350,8 +382,9 @@ impl RiscvCodegen {
          // Pre-compute param alloca slots for emit_param_ref
          self.state.param_alloca_slots = (0..func.params.len())
              .map(|i| {
@@ -969,17 +1415,441 @@ index cb4c84c7..9636d4eb 100644
              })
              .collect();
  
-@@ -829,7 +830,7 @@ impl RiscvCodegen {
+@@ -381,13 +414,28 @@ impl RiscvCodegen {
+         for (i, _param) in func.params.iter().enumerate() {
+             let class = param_classes[i];
+ 
+-            let (slot, ty) = match find_param_alloca(func, i) {
++            let (slot, ty, dest_id) = match find_param_alloca(func, i) {
+                 Some((dest, ty)) => match self.state.get_slot(dest.0) {
+-                    Some(slot) => (slot, ty),
++                    Some(slot) => (slot, ty, dest.0),
+                     None => continue,
+                 },
+                 None => continue,
+             };
++            // Over-aligned (>16) param allocas: the slot is padded and every
++            // reader resolves the EFFECTIVE align_up'd address; the capture
++            // must target it too or the incoming value desyncs from its
++            // readers by the alignment pad. t2 holds the effective base for
++            // the whole arm (t0 is the per-arm staging scratch, t1 is the
++            // by-ref struct source pointer, t6 is emit_alloca_addr's
++            // scratch).
++            let over_aligned = self
++                .state
++                .alloca_over_align(dest_id)
++                .filter(|&a| a > 16)
++                .is_some();
++            if over_aligned {
++                self.emit_alloca_addr("t2", dest_id, slot.0);
++            }
+ 
+             match class {
+                 // I64RegPair exists only under i686 gcc_regparm_mode; this
+@@ -403,16 +451,16 @@ impl RiscvCodegen {
+                         let load_instr = Self::load_for_type(ty);
+                         self.state
+                             .emit_fmt(format_args!("    {} t0, {}(sp)", load_instr, off));
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                     } else if func.is_variadic {
+                         // For variadic, load from save area with extending load.
+                         let save_off = (reg_idx as i64) * 8;
+                         let load_instr = Self::load_for_type(ty);
+                         self.emit_load_from_s0("t0", save_off, load_instr);
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                     } else {
+                         Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                     }
+                 }
+                 ParamClass::FloatReg { reg_idx } => {
+@@ -435,28 +483,40 @@ impl RiscvCodegen {
+                         self.state
+                             .emit_fmt(format_args!("    fmv.x.d t0, {}", float_arg_regs[reg_idx]));
+                     }
+-                    self.emit_store_to_s0("t0", slot.0, "sd");
++                    self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                 }
+                 ParamClass::I128RegPair { base_reg_idx } => {
+                     if func.is_variadic {
+                         let lo_off = (base_reg_idx as i64) * 8;
+                         let hi_off = ((base_reg_idx + 1) as i64) * 8;
+                         self.emit_load_from_s0("t0", lo_off, "ld");
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                         self.emit_load_from_s0("t0", hi_off, "ld");
+-                        self.emit_store_to_s0("t0", slot.0 + 8, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                     } else if has_f128_reg_params {
+                         let lo_off = f128_save_offset + (base_reg_idx as i64) * 8;
+                         let hi_off = f128_save_offset + ((base_reg_idx + 1) as i64) * 8;
+                         self.state
+                             .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                         self.state
+                             .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
+-                        self.emit_store_to_s0("t0", slot.0 + 8, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                     } else {
+-                        self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx], slot.0, "sd");
+-                        self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx + 1], slot.0 + 8, "sd");
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "sd",
++                            RISCV_ARG_REGS[base_reg_idx],
++                            slot,
++                            0,
++                        );
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "sd",
++                            RISCV_ARG_REGS[base_reg_idx + 1],
++                            slot,
++                            8,
++                        );
+                     }
+                 }
+                 ParamClass::StructByValReg { base_reg_idx, size } => {
+@@ -464,24 +524,30 @@ impl RiscvCodegen {
+                         let lo_off = f128_save_offset + (base_reg_idx as i64) * 8;
+                         self.state
+                             .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                         if size > 8 {
+                             let hi_off = f128_save_offset + ((base_reg_idx + 1) as i64) * 8;
+                             self.state
+                                 .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
+-                            self.emit_store_to_s0("t0", slot.0 + 8, "sd");
++                            self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                         }
+                     } else if func.is_variadic {
+                         let lo_off = (base_reg_idx as i64) * 8;
+                         self.emit_load_from_s0("t0", lo_off, "ld");
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                         if size > 8 {
+                             let hi_off = ((base_reg_idx + 1) as i64) * 8;
+                             self.emit_load_from_s0("t0", hi_off, "ld");
+-                            self.emit_store_to_s0("t0", slot.0 + 8, "sd");
++                            self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                         }
+                     } else {
+-                        self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx], slot.0, "sd");
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "sd",
++                            RISCV_ARG_REGS[base_reg_idx],
++                            slot,
++                            0,
++                        );
+                         if size > 8 {
+                             self.emit_store_to_s0(
+                                 RISCV_ARG_REGS[base_reg_idx + 1],
+@@ -501,35 +567,35 @@ impl RiscvCodegen {
+                         let lo_off = (lo_reg_idx as i64) * 8;
+                         let hi_off = (hi_reg_idx as i64) * 8;
+                         self.emit_load_from_s0("t0", lo_off, "ld");
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                         self.emit_load_from_s0("t0", hi_off, "ld");
+-                        self.emit_store_to_s0("t0", slot.0 + 8, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                     } else {
+                         // Load from F128 save area.
+                         let lo_off = f128_save_offset + (lo_reg_idx as i64) * 8;
+                         let hi_off = f128_save_offset + (hi_reg_idx as i64) * 8;
+                         self.state
+                             .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                         self.state
+                             .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
+-                        self.emit_store_to_s0("t0", slot.0 + 8, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                     }
+                 }
+                 ParamClass::F128Stack { offset } | ParamClass::F128AlwaysStack { offset } => {
+                     // F128 from stack: store full 16-byte f128 directly to alloca.
+                     let src = stack_base + offset;
+                     self.emit_load_from_s0("t0", src, "ld");
+-                    self.emit_store_to_s0("t0", slot.0, "sd");
++                    self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                     self.emit_load_from_s0("t0", src + 8, "ld");
+-                    self.emit_store_to_s0("t0", slot.0 + 8, "sd");
++                    self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                 }
+                 ParamClass::I128Stack { offset } => {
+                     let src = stack_base + offset;
+                     self.emit_load_from_s0("t0", src, "ld");
+-                    self.emit_store_to_s0("t0", slot.0, "sd");
++                    self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                     self.emit_load_from_s0("t0", src + 8, "ld");
+-                    self.emit_store_to_s0("t0", slot.0 + 8, "sd");
++                    self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                 }
+                 ParamClass::StackScalar { offset } => {
+                     // Load with extending load so the full 8-byte dest
+@@ -537,7 +603,7 @@ impl RiscvCodegen {
+                     let src = stack_base + offset;
+                     let load_instr = Self::load_for_type(ty);
+                     self.emit_load_from_s0("t0", src, load_instr);
+-                    self.emit_store_to_s0("t0", slot.0, "sd");
++                    self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                 }
+                 ParamClass::StructStack { offset, size }
+                 | ParamClass::LargeStructStack { offset, size } => {
+@@ -545,9 +611,14 @@ impl RiscvCodegen {
+                     let n_dwords = size.div_ceil(8);
+                     for qi in 0..n_dwords {
+                         let src_off = src + (qi as i64 * 8);
+-                        let dst_off = slot.0 + (qi as i64 * 8);
+                         self.emit_load_from_s0("t0", src_off, "ld");
+-                        self.emit_store_to_s0("t0", dst_off, "sd");
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "sd",
++                            "t0",
++                            slot,
++                            (qi as i64) * 8,
++                        );
+                     }
+                 }
+                 ParamClass::LargeStructByRefReg { reg_idx, size } => {
+@@ -573,9 +644,8 @@ impl RiscvCodegen {
+                     let n_dwords = size.div_ceil(8);
+                     for qi in 0..n_dwords {
+                         let src_off = (qi * 8) as i64;
+-                        let dst_off = slot.0 + src_off;
+                         Self::emit_load_from_reg(&mut self.state, "t0", "t1", src_off, "ld");
+-                        self.emit_store_to_s0("t0", dst_off, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, src_off);
+                     }
+                 }
+                 ParamClass::LargeStructByRefStack { offset, size } => {
+@@ -586,9 +656,8 @@ impl RiscvCodegen {
+                     let n_dwords = size.div_ceil(8);
+                     for qi in 0..n_dwords {
+                         let src_off = (qi * 8) as i64;
+-                        let dst_off = slot.0 + src_off;
+                         Self::emit_load_from_reg(&mut self.state, "t0", "t1", src_off, "ld");
+-                        self.emit_store_to_s0("t0", dst_off, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, src_off);
+                     }
+                 }
+                 ParamClass::StructSplitRegStack {
+@@ -601,13 +670,19 @@ impl RiscvCodegen {
+                         // Variadic: load first half from register save area
+                         let off = (reg_idx as i64) * 8;
+                         self.emit_load_from_s0("t0", off, "ld");
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                     } else if has_f128_reg_params {
+                         let off = f128_save_offset + (reg_idx as i64) * 8;
+                         self.state.emit_fmt(format_args!("    ld t0, {}(sp)", off));
+-                        self.emit_store_to_s0("t0", slot.0, "sd");
++                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                     } else {
+-                        self.emit_store_to_s0(RISCV_ARG_REGS[reg_idx], slot.0, "sd");
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "sd",
++                            RISCV_ARG_REGS[reg_idx],
++                            slot,
++                            0,
++                        );
+                     }
+                     // Second half from the caller's stack
+                     let src = stack_base + stack_offset;
+@@ -615,9 +690,14 @@ impl RiscvCodegen {
+                     let n_dwords = remaining.div_ceil(8);
+                     for qi in 0..n_dwords {
+                         let src_off = src + (qi as i64 * 8);
+-                        let dst_off = slot.0 + 8 + (qi as i64 * 8);
+                         self.emit_load_from_s0("t0", src_off, "ld");
+-                        self.emit_store_to_s0("t0", dst_off, "sd");
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "sd",
++                            "t0",
++                            slot,
++                            8 + (qi as i64) * 8,
++                        );
+                     }
+                 }
+                 // F128 in FP reg doesn't happen on RISC-V.
+@@ -647,31 +727,41 @@ impl RiscvCodegen {
+                     };
+                     // Store first float/double field
+                     if lo_is_double {
+-                        self.state.emit_fmt(format_args!(
+-                            "    fsd {}, {}(s0)",
+-                            float_arg_regs_inner[lo_fp_idx], slot.0
+-                        ));
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "fsd",
++                            float_arg_regs_inner[lo_fp_idx],
++                            slot,
++                            0,
++                        );
+                     } else {
+-                        self.state.emit_fmt(format_args!(
+-                            "    fsw {}, {}(s0)",
+-                            float_arg_regs_inner[lo_fp_idx], slot.0
+-                        ));
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "fsw",
++                            float_arg_regs_inner[lo_fp_idx],
++                            slot,
++                            0,
++                        );
+                     }
+                     // Store second float/double field (if present)
+                     if let Some(hi_idx) = hi_fp_idx {
+                         let hi_offset = if lo_is_double { 8 } else { 4 };
+                         if hi_is_double {
+-                            self.state.emit_fmt(format_args!(
+-                                "    fsd {}, {}(s0)",
++                            self.emit_param_home_store_impl(
++                                over_aligned,
++                                "fsd",
+                                 float_arg_regs_inner[hi_idx],
+-                                slot.0 + hi_offset
+-                            ));
++                                slot,
++                                hi_offset,
++                            );
+                         } else {
+-                            self.state.emit_fmt(format_args!(
+-                                "    fsw {}, {}(s0)",
++                            self.emit_param_home_store_impl(
++                                over_aligned,
++                                "fsw",
+                                 float_arg_regs_inner[hi_idx],
+-                                slot.0 + hi_offset
+-                            ));
++                                slot,
++                                hi_offset,
++                            );
+                         }
+                     }
+                 }
+@@ -695,23 +785,30 @@ impl RiscvCodegen {
+                     };
+                     // Store integer part at beginning of struct
+                     let int_store = if int_size <= 4 { "sw" } else { "sd" };
+-                    self.state.emit_fmt(format_args!(
+-                        "    {} {}, {}(s0)",
+-                        int_store, RISCV_ARG_REGS[int_reg_idx], slot.0
+-                    ));
++                    self.emit_param_home_store_impl(
++                        over_aligned,
++                        int_store,
++                        RISCV_ARG_REGS[int_reg_idx],
++                        slot,
++                        0,
++                    );
+                     // Store float part at its offset
+                     if float_is_double {
+-                        self.state.emit_fmt(format_args!(
+-                            "    fsd {}, {}(s0)",
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "fsd",
+                             float_arg_regs_inner[fp_reg_idx],
+-                            slot.0 + float_offset as i64
+-                        ));
++                            slot,
++                            float_offset as i64,
++                        );
+                     } else {
+-                        self.state.emit_fmt(format_args!(
+-                            "    fsw {}, {}(s0)",
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "fsw",
+                             float_arg_regs_inner[fp_reg_idx],
+-                            slot.0 + float_offset as i64
+-                        ));
++                            slot,
++                            float_offset as i64,
++                        );
+                     }
+                 }
+                 ParamClass::StructMixedSseIntReg {
+@@ -734,24 +831,31 @@ impl RiscvCodegen {
+                     };
+                     // Store float part at beginning of struct
+                     if float_is_double {
+-                        self.state.emit_fmt(format_args!(
+-                            "    fsd {}, {}(s0)",
+-                            float_arg_regs_inner[fp_reg_idx], slot.0
+-                        ));
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "fsd",
++                            float_arg_regs_inner[fp_reg_idx],
++                            slot,
++                            0,
++                        );
+                     } else {
+-                        self.state.emit_fmt(format_args!(
+-                            "    fsw {}, {}(s0)",
+-                            float_arg_regs_inner[fp_reg_idx], slot.0
+-                        ));
++                        self.emit_param_home_store_impl(
++                            over_aligned,
++                            "fsw",
++                            float_arg_regs_inner[fp_reg_idx],
++                            slot,
++                            0,
++                        );
+                     }
+                     // Store integer part at its offset
+                     let int_store = if int_size <= 4 { "sw" } else { "sd" };
+-                    self.state.emit_fmt(format_args!(
+-                        "    {} {}, {}(s0)",
++                    self.emit_param_home_store_impl(
++                        over_aligned,
+                         int_store,
+                         RISCV_ARG_REGS[int_reg_idx],
+-                        slot.0 + int_offset as i64
+-                    ));
++                        slot,
++                        int_offset as i64,
++                    );
+                 }
+             }
+         }
+@@ -829,9 +933,18 @@ impl RiscvCodegen {
          // already saved the incoming register value). This avoids issues where
          // ABI registers get clobbered during emit_store_params' processing.
          if param_idx < self.state.param_alloca_slots.len() {
 -            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
-+            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
++            if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
                  let load_instr = Self::load_for_type(alloca_ty);
-                 self.emit_load_from_s0("t0", slot.0, load_instr);
+-                self.emit_load_from_s0("t0", slot.0, load_instr);
++                if self.state.alloca_over_align(alloca_id).is_some() {
++                    // Over-aligned (>16) param alloca: the capture wrote the
++                    // EFFECTIVE align_up'd address; a raw slot load would
++                    // read the alignment pad.
++                    self.emit_alloca_addr("t2", alloca_id, slot.0);
++                    self.state
++                        .emit_fmt(format_args!("    {} t0, 0(t2)", load_instr));
++                } else {
++                    self.emit_load_from_s0("t0", slot.0, load_instr);
++                }
                  self.store_t0_to(dest);
+                 return;
+             }
 diff --git a/src/backend/stack_layout/mod.rs b/src/backend/stack_layout/mod.rs
-index 898ae9fa..5cca4d48 100644
+index 898ae9f..5cca4d4 100644
 --- a/src/backend/stack_layout/mod.rs
 +++ b/src/backend/stack_layout/mod.rs
 @@ -54,7 +54,7 @@ pub use regalloc_helpers::{
@@ -1094,7 +1964,7 @@ index 898ae9fa..5cca4d48 100644
  
      // Alloca coalescability analysis.
 diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
-index dea635bc..ebe8645c 100644
+index dea635b..ebe8645 100644
 --- a/src/backend/stack_layout/slot_assignment.rs
 +++ b/src/backend/stack_layout/slot_assignment.rs
 @@ -436,9 +436,22 @@ pub(super) fn classify_instructions(
@@ -1143,7 +2013,7 @@ index dea635bc..ebe8645c 100644
          // the root's slot. These values were checked for interference during
          // phi-web analysis and are safe to share. Loop-backedge phi aliases are
 diff --git a/src/backend/state.rs b/src/backend/state.rs
-index 7cfccfc8..a17f84b7 100644
+index 7cfccfc..a17f84b 100644
 --- a/src/backend/state.rs
 +++ b/src/backend/state.rs
 @@ -453,7 +453,21 @@ pub struct CodegenState {
@@ -1179,20 +2049,69 @@ index 7cfccfc8..a17f84b7 100644
              uses_sret: false,
              function_sections: false,
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 20d45bd3..658b8db8 100644
+index 20d45bd..6dcb221 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
-@@ -5413,7 +5413,7 @@ impl X86Codegen {
+@@ -5081,6 +5081,18 @@ impl X86Codegen {
+                     // address into the ABI register before the call. The
+                     // slot must exist for the resolver to render the leaq.
+                     if state.is_alloca(v.0) {
++                        // Over-aligned (>16) allocas: the resolver renders a
++                        // raw-slot LeaSlot, but every consumer of the alloca
++                        // (prologue capture, ParamRef loads, memcpys) targets
++                        // the EFFECTIVE align_up'd address inside the padded
++                        // slot — a raw leaq passes the pad base to the callee
++                        // (the `sinkp32(&x)` regression). Fall back to the
++                        // mature path, which computes the effective address
++                        // (mirrors the OverAligned rejections in the typed
++                        // load/store admission).
++                        if state.alloca_over_align(v.0).is_some() {
++                            return None;
++                        }
+                         return state.get_slot(v.0).map(|_| TypedCallSrc::AllocaAddr(v.0));
+                     }
+                     if is_mi_unsafe_value(v.0, ra, state, value_types) {
+@@ -5380,6 +5392,16 @@ impl X86Codegen {
+         {
+             return Ok(());
+         }
++        // Homing-elision mirror: a dest whose ONLY use was the elided
++        // homing store also gets no code on the text path
++        // (`emit_param_ref_impl` early-outs via `dead_param_ref_dests`).
++        // The store still counts in `value_use_counts` above, so this is a
++        // separate check — and it must come first: for an over-aligned
++        // alloca a materialized load would read the alignment PAD, which
++        // is uninitialized memory, not the captured value.
++        if self.state.dead_param_ref_dests.contains(&dest.0) {
++            return Ok(());
++        }
+         // Pre-stored parameters are already in their destination register;
+         // `emit_store_params` placed them during the prologue. This takes
+         // priority over the alloca slot exactly as on the text path.
+@@ -5413,7 +5435,20 @@ impl X86Codegen {
          // Case 1 (text path's first materializing case): the parameter's
          // alloca slot holds the staged value — one load.
          if param_idx < self.state.param_alloca_slots.len() {
 -            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
-+            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
++            if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
++                // Over-aligned (>16) param allocas: the capture wrote the
++                // EFFECTIVE align_up'd address inside the padded slot, and
++                // the text path loads from that same effective address
++                // (emit_alloca_aligned_addr_impl). A raw StackSlot operand
++                // here would read the alignment pad. Reject to the text
++                // path — the effective-address dance needs a scratch
++                // register and a multi-instruction sequence, which the
++                // typed census deliberately does not own (same doctrine as
++                // the OverAligned rejections in the typed load/store and
++                // call-argument admission).
++                if self.state.alloca_over_align(alloca_id).is_some() {
++                    return Err("ParamRef(over-aligned-alloca)");
++                }
                  return match dst {
                      ParamDst::Reg(r) => {
                          let form = Self::paramref_reg_load_form(alloca_ty)
 diff --git a/src/backend/x86/codegen/f128.rs b/src/backend/x86/codegen/f128.rs
-index 08e8c372..ea055f84 100644
+index 08e8c37..ea055f8 100644
 --- a/src/backend/x86/codegen/f128.rs
 +++ b/src/backend/x86/codegen/f128.rs
 @@ -354,8 +354,18 @@ impl X86Codegen {
@@ -1291,7 +2210,7 @@ index 08e8c372..ea055f84 100644
      fn emit_extend_to_rax(&mut self, ty: IrType) {
          if ty.is_unsigned() {
 diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 6ecf4d80..17d873be 100644
+index 6ecf4d8..17d873b 100644
 --- a/src/backend/x86/codegen/memory.rs
 +++ b/src/backend/x86/codegen/memory.rs
 @@ -615,6 +615,17 @@ impl X86Codegen {
@@ -1313,7 +2232,7 @@ index 6ecf4d80..17d873be 100644
              if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = val {
                  let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
 diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index 21637bd3..d1eaf71b 100644
+index 21637bd..8d67cdf 100644
 --- a/src/backend/x86/codegen/prologue.rs
 +++ b/src/backend/x86/codegen/prologue.rs
 @@ -79,6 +79,15 @@ fn va_root_is_stable(func: &IrFunction, root: u32) -> bool {
@@ -1368,7 +2287,7 @@ index 21637bd3..d1eaf71b 100644
 +    fn emit_capture_store_movdqu(&mut self, dst: CaptureDst, src_reg: &str) {
 +        match dst {
 +            CaptureDst::Raw(b) => {
-+                self.state.out.emit_instr_rbp_reg("    movdqu", b, src_reg);
++                self.state.out.emit_instr_reg_rbp("    movdqu", src_reg, b);
 +            }
 +            CaptureDst::Aligned => self
 +                .state
@@ -1693,7 +2612,7 @@ index 21637bd3..d1eaf71b 100644
                  return;
              }
 diff --git a/src/frontend/parser/ast.rs b/src/frontend/parser/ast.rs
-index f45d57ca..2a713d66 100644
+index f45d57c..2a713d6 100644
 --- a/src/frontend/parser/ast.rs
 +++ b/src/frontend/parser/ast.rs
 @@ -283,6 +283,14 @@ pub struct FunctionDef {
@@ -1712,7 +2631,7 @@ index f45d57ca..2a713d66 100644
      /// E.g., for `float (*func)(float, float)`, this holds the two float param decls.
      pub fptr_params: Option<Vec<ParamDecl>>,
 diff --git a/src/frontend/parser/declarators.rs b/src/frontend/parser/declarators.rs
-index 2a42ff05..ed874da2 100644
+index 2a42ff0..ed874da 100644
 --- a/src/frontend/parser/declarators.rs
 +++ b/src/frontend/parser/declarators.rs
 @@ -466,7 +466,17 @@ impl Parser {
@@ -1779,7 +2698,7 @@ index 2a42ff05..ed874da2 100644
                  fptr_variadic: false,
                  is_const: false,
 diff --git a/src/ir/lowering/func_lowering.rs b/src/ir/lowering/func_lowering.rs
-index 748b9f9d..aab1b095 100644
+index 748b9f9..aab1b09 100644
 --- a/src/ir/lowering/func_lowering.rs
 +++ b/src/ir/lowering/func_lowering.rs
 @@ -182,6 +182,7 @@ impl Lowerer {
@@ -1926,7 +2845,7 @@ index 748b9f9d..aab1b095 100644
                  dest: alloca,
                  ty: param.ty,
 diff --git a/src/ir/lowering/types_ctype.rs b/src/ir/lowering/types_ctype.rs
-index 785fd385..e2062b0e 100644
+index 785fd38..e2062b0 100644
 --- a/src/ir/lowering/types_ctype.rs
 +++ b/src/ir/lowering/types_ctype.rs
 @@ -53,6 +53,8 @@ impl Lowerer {
@@ -1948,7 +2867,7 @@ index 785fd385..e2062b0e 100644
                          fptr_variadic: false,
                          is_const: false,
 diff --git a/src/ir/mem2reg/promote.rs b/src/ir/mem2reg/promote.rs
-index 37c64ca0..27295fef 100644
+index 37c64ca..27295fe 100644
 --- a/src/ir/mem2reg/promote.rs
 +++ b/src/ir/mem2reg/promote.rs
 @@ -1084,6 +1084,7 @@ mod tests {
@@ -1968,7 +2887,7 @@ index 37c64ca0..27295fef 100644
                  riscv_float_class: None,
                  is_f128_sse: false,
 diff --git a/src/ir/module.rs b/src/ir/module.rs
-index 7ddef413..d1096c88 100644
+index 7ddef41..d1096c8 100644
 --- a/src/ir/module.rs
 +++ b/src/ir/module.rs
 @@ -276,6 +276,16 @@ pub struct IrParam {
@@ -1989,7 +2908,7 @@ index 7ddef413..d1096c88 100644
      /// Empty for non-struct params or when classification is not applicable.
      /// Each entry indicates whether that eightbyte should use SSE or GP registers.
 diff --git a/src/passes/bool_thread.rs b/src/passes/bool_thread.rs
-index 40a71949..85ea87f4 100644
+index 40a7194..85ea87f 100644
 --- a/src/passes/bool_thread.rs
 +++ b/src/passes/bool_thread.rs
 @@ -899,6 +899,7 @@ mod tests {
@@ -2017,7 +2936,7 @@ index 40a71949..85ea87f4 100644
                      is_f128_sse: false,
                      riscv_float_class: None,
 diff --git a/src/passes/dce.rs b/src/passes/dce.rs
-index 6de6966b..e09b43a8 100644
+index 6de6966..e09b43a 100644
 --- a/src/passes/dce.rs
 +++ b/src/passes/dce.rs
 @@ -775,6 +775,7 @@ mod tests {
@@ -2029,7 +2948,7 @@ index 6de6966b..e09b43a8 100644
              is_f128_sse: false,
              riscv_float_class: None,
 diff --git a/src/passes/outline_switch.rs b/src/passes/outline_switch.rs
-index 0ef35cb0..2261b735 100644
+index 0ef35cb..2261b73 100644
 --- a/src/passes/outline_switch.rs
 +++ b/src/passes/outline_switch.rs
 @@ -865,6 +865,7 @@ fn build_outlined_function(
@@ -2041,7 +2960,7 @@ index 0ef35cb0..2261b735 100644
              riscv_float_class: None,
              is_f128_sse: false,
 diff --git a/src/passes/recursion_to_iter.rs b/src/passes/recursion_to_iter.rs
-index 12a1b95d..4e478745 100644
+index 12a1b95..4e47874 100644
 --- a/src/passes/recursion_to_iter.rs
 +++ b/src/passes/recursion_to_iter.rs
 @@ -537,6 +537,7 @@ mod tests {
@@ -2093,7 +3012,7 @@ index 12a1b95d..4e478745 100644
              riscv_float_class: None,
              is_f128_sse: false,
 diff --git a/src/passes/tail_call_elim.rs b/src/passes/tail_call_elim.rs
-index a8a0550c..f5b5a29f 100644
+index a8a0550..f5b5a29 100644
 --- a/src/passes/tail_call_elim.rs
 +++ b/src/passes/tail_call_elim.rs
 @@ -889,6 +889,7 @@ mod tests {
@@ -2105,7 +3024,7 @@ index a8a0550c..f5b5a29f 100644
                  riscv_float_class: None,
                  is_f128_sse: false,
 diff --git a/src/passes/vector_temp_promotion.rs b/src/passes/vector_temp_promotion.rs
-index c07d42c6..6de37551 100644
+index c07d42c..6de3755 100644
 --- a/src/passes/vector_temp_promotion.rs
 +++ b/src/passes/vector_temp_promotion.rs
 @@ -2419,6 +2419,7 @@ mod tests {
@@ -2133,7 +3052,7 @@ index c07d42c6..6de37551 100644
              is_f128_sse: false,
              riscv_float_class: None,
 diff --git a/src/pgo/instrument.rs b/src/pgo/instrument.rs
-index 40aef6b3..3464b1eb 100644
+index 40aef6b..3464b1e 100644
 --- a/src/pgo/instrument.rs
 +++ b/src/pgo/instrument.rs
 @@ -1598,6 +1598,7 @@ fn push_helper_fn(
@@ -2145,7 +3064,7 @@ index 40aef6b3..3464b1eb 100644
              is_f128_sse: false,
              riscv_float_class: None,
 diff --git a/src/pgo/profile.rs b/src/pgo/profile.rs
-index 6099b690..11e61d86 100644
+index 6099b69..11e61d8 100644
 --- a/src/pgo/profile.rs
 +++ b/src/pgo/profile.rs
 @@ -676,6 +676,7 @@ mod tests {
@@ -2156,3 +3075,52 @@ index 6099b690..11e61d86 100644
                  struct_eightbyte_classes: vec![],
                  is_f128_sse: false,
                  riscv_float_class: None,
+diff --git a/tests/regression/f128_param_capture_o2.c b/tests/regression/f128_param_capture_o2.c
+new file mode 100644
+index 0000000..4d0511a
+--- /dev/null
++++ b/tests/regression/f128_param_capture_o2.c
+@@ -0,0 +1,43 @@
++// Prologue capture polarity for _Float128 parameters on x86-64 (the
++// `movdqu %xmm0, slot(%rbp)` capture store must be a STORE, not a load):
++// at -O2 mem2reg turns the parameter into a Load-from-alloca, so the
++// prologue capture is the sole writer of the parameter slot. A
++// load-form "capture" never homes the incoming register value and
++// clobbers it with uninitialized memory instead — every read of the
++// parameter then returns garbage.
++//
++// Regression for the CI corpus failure in f128_global_carrier /
++// fabsf128 (PR #484): checks 4/6/7 of f128_global_carrier read a
++// _Float128 parameter that is never address-taken, the exact
++// configuration the earlier matrices (address-taken params, -O0/-O1)
++// did not cover.
++#include <stdio.h>
++
++_Float128 negate(_Float128 x) { return -x; }
++
++_Float128 twice_negate(_Float128 x) { return -(-x); }
++
++_Float128 f128_sub(_Float128 a, _Float128 b) { return a - b; }
++
++static int fails = 0;
++#define CHECK(n, cond)                                                         \
++    do {                                                                       \
++        if (!(cond)) {                                                         \
++            fails++;                                                           \
++            printf("FAIL check %d\n", n);                                      \
++        }                                                                      \
++    } while (0)
++
++int main(void) {
++    /* Direct read of a non-address-taken parameter. */
++    CHECK(1, negate(1.5F128) == -1.5F128);
++    CHECK(2, negate(-42.0F128) == 42.0F128);
++    /* Round trip through two calls: still the parameter home, both times. */
++    CHECK(3, twice_negate(1.5F128) == 1.5F128);
++    /* Second parameter of the same class (xmm1) exercises per-slot capture. */
++    CHECK(4, f128_sub(7.5F128, 2.0F128) == 5.5F128);
++    if (fails != 0) {
++        printf("f128_param_capture_o2: %d check(s) failed\n", fails);
++    }
++    return fails != 0;
++}
