@@ -1,88 +1,950 @@
-From 064bfc5c00b33d7cbdf05b574656ccccf4c32a44 Mon Sep 17 00:00:00 2001
-From: arena-agent <arena-agent@local>
-Date: Fri, 11 Sep 2026 17:37:58 +0000
-Subject: [PATCH] S11 bool-pair-prune-fix: atomic post-RA prune + regression
- pins
-
-The bool-pair post-RA prune un-skipped legs by OPERAND id instead of leg
-Cmp DEST id, leaving both setcc emissions skipped while the And fell back
-to a real andl over never-written boolean homes (half-pruned miscompile:
-hits=1024/0 instead of 256/303 under CCC_NO_FOLDED_INDEX_LIVENESS=1).
-
-Fix: record both leg dests in a CmpBoolPair struct (named fields replace
-the 8-tuple that lost them) and remove dest1/dest2 on prune. Scan,
-emission, tail-jmp, memset/idiom disjointness, i686 gate, and S06/fused/
-fp-select exclusions all re-audited sound.
-
-Tests: check_bool_pair_prune.sh (proven FAIL pre-fix / PASS post-fix in
-both miscompile directions + fusion-disabled control), vecreg_map_liveout
-+ vecreg_stencil_liveout S10 pins (proven i=64/128 pre-S10, i=512 post).
-Full suite: build/clippy/cargo-test/fmt/corpus-739/bench-204/diff-57/
-align/prune/tailjmp all green.
----
- scripts/ci_local.sh                       |   3 +
- src/backend/x86/codegen/comparison.rs     |  89 ++++++++--------
- src/backend/x86/codegen/emit.rs           |  17 +---
- src/backend/x86/codegen/prologue.rs       |  22 ++--
- tests/regression/check_bool_pair_prune.sh | 117 ++++++++++++++++++++++
- tests/regression/vecreg_map_liveout.c     |  20 ++++
- tests/regression/vecreg_stencil_liveout.c |  20 ++++
- 7 files changed, 220 insertions(+), 68 deletions(-)
- create mode 100755 tests/regression/check_bool_pair_prune.sh
- create mode 100644 tests/regression/vecreg_map_liveout.c
- create mode 100644 tests/regression/vecreg_stencil_liveout.c
-
+diff --git a/.github/scripts/ci-codegen-baseline.json b/.github/scripts/ci-codegen-baseline.json
+index 4902bd73..c84533ec 100644
+--- a/.github/scripts/ci-codegen-baseline.json
++++ b/.github/scripts/ci-codegen-baseline.json
+@@ -16,10 +16,10 @@
+   "fma": 0
+  },
+  "expat_xml_scan": {
+-  "insns": 198,
+-  "stackmem": 20,
++  "insns": 200,
++  "stackmem": 14,
+   "pushes": 6,
+-  "moves": 39,
++  "moves": 44,
+   "ymm": 0,
+   "fma": 0
+  },
 diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index 62a5d9e8c..ecf510fe5 100755
+index 62a5d9e8..9a45dde2 100755
 --- a/scripts/ci_local.sh
 +++ b/scripts/ci_local.sh
-@@ -153,6 +153,9 @@ gate "loop-memset-decisions" fast \
+@@ -153,6 +153,12 @@ gate "loop-memset-decisions" fast \
  gate "bool-pair-tail-jmp-contract" fast \
      env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
  
-+gate "bool-pair-prune-atomicity" fast \
-+    env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_prune.sh
++gate "demorgan-branch-split" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_demorgan_branch_split.sh
++
++gate "gvn-xsign-load-cse" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_gvn_xsign_load_cse.sh
 +
  gate "i686-atomics" fast \
      bash tests/regression/check_i686_atomics.sh
  
-diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
-index ab2dcd991..23ea3c803 100644
---- a/src/backend/x86/codegen/comparison.rs
-+++ b/src/backend/x86/codegen/comparison.rs
-@@ -27,6 +27,28 @@ use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
- /// that end up with no home at all (never-materialized values) are
- /// pruned post-RA by the prologue; slot-homed operands never needed the
- /// extension (the slot is written at every definition).
-+/// One recorded AND-of-compares (bool-pair) fusion: both legs' compares
-+/// plus each leg's Cmp DEST. The dests are load-bearing: post-RA pruning
-+/// drops the whole pair atomically — the And entry AND both legs' skip
-+/// memberships — so a pruned pair falls back to two materialized booleans
-+/// plus an ordinary `andl`. (A prune that forgets the leg dests leaves
-+/// both setcc emissions skipped while the And reads their never-written
-+/// boolean homes — a half-pruned miscompile. Named fields, not a tuple:
-+/// positional (op, lhs, rhs, ty) × 2 is exactly how the dests got lost.)
-+#[derive(Clone, Debug)]
-+pub(crate) struct CmpBoolPair {
-+    pub op1: IrCmpOp,
-+    pub lhs1: Operand,
-+    pub rhs1: Operand,
-+    pub ty1: IrType,
-+    pub dest1: u32,
-+    pub op2: IrCmpOp,
-+    pub lhs2: Operand,
-+    pub rhs2: Operand,
-+    pub ty2: IrType,
-+    pub dest2: u32,
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index c20516bb..66b83977 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -245,6 +245,7 @@ fn can_indexed_addr_fold(
+     cg: &dyn ArchCodegen,
+     info: &IndexedGepInfo,
+     global_addr_map: &FxHashMap<u32, String>,
++    gep_dest: u32,
+ ) -> bool {
+     // Backend agreement on the ACCESS profile first: types (and store
+     // staging) the backend's indexed emitter refuses must also refuse the
+@@ -295,7 +296,26 @@ fn can_indexed_addr_fold(
+         return false;
+     }
+     if let Some(sym) = global_addr_map.get(&info.base.0) {
+-        return !rip_rel_blocked(cg, sym);
++        if rip_rel_blocked(cg, sym) {
++            return false;
++        }
++        // PIC cost rule: the symbol form rematerializes the base at EVERY
++        // folded use (leaq sym(%rip),%rcx — RIP+index is unencodable), so a
++        // GEP folded into N accesses pays N leas where one home + N SIB
++        // uses costs a single lea (lz4's hot probe paid 2-3 in-loop leas
++        // for globals the IR had hoisted to block 0). Fold only single-use
++        // GEPs under PIC (one lea, and the base's home is saved); multi-use
++        // GEPs keep their def (RA homes the base once, uses read it via
++        // SIB). Non-PIC absolute sym(,%idx,scale) is free — always fold
++        // there. An empty use table (backend didn't compute it) fails open.
++        let st = cg.state_ref();
++        if st.pic_mode {
++            let counts = &st.value_use_counts;
++            if !counts.is_empty() && counts.get(gep_dest as usize).copied().unwrap_or(0) > 1 {
++                return false;
++            }
++        }
++        return true;
+     }
+     false
+ }
+@@ -3999,7 +4019,7 @@ fn generate_function(
+             if load_cmp_ptrs_func.contains(dest) {
+                 continue; // pointer needed materialised by a cmp-mem fold
+             }
+-            if can_indexed_addr_fold(cg, info, &global_addr_map) {
++            if can_indexed_addr_fold(cg, info, &global_addr_map, *dest) {
+                 foldable_folds.insert(*dest);
+             }
+         }
+@@ -4440,7 +4460,7 @@ fn generate_function(
+                 }
+                 if let Some(info) = indexed_gep_map.get(&dest.0) {
+                     if !load_cmp_ptrs.contains(&dest.0)
+-                        && can_indexed_addr_fold(cg, info, &global_addr_map)
++                        && can_indexed_addr_fold(cg, info, &global_addr_map, dest.0)
+                     {
+                         cg.state().folded_gep_values.insert(dest.0);
+                         cg.state().current_program_point += 1;
+@@ -5611,7 +5631,7 @@ fn generate_load(
+         rematerialize_const_addr(cg, ptr, gep_info);
+     }
+     if let Some(info) = indexed_gep_map.get(&ptr.0) {
+-        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
++        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map, ptr.0) {
+             if cg.emit_load_indexed(dest, &info.base, &info.index, info.shift, info.disp, ty) {
+                 return;
+             }
+@@ -5680,7 +5700,7 @@ fn generate_store(
+         remat_indexed_acc_safe(cg, val, |cg| rematerialize_const_addr(cg, ptr, gep_info));
+     }
+     if let Some(info) = indexed_gep_map.get(&ptr.0) {
+-        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
++        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map, ptr.0) {
+             if cg.emit_store_indexed(val, &info.base, &info.index, info.shift, info.disp, ty) {
+                 return;
+             }
+diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
+index e751956a..843aba17 100644
+--- a/src/backend/live_range.rs
++++ b/src/backend/live_range.rs
+@@ -1475,7 +1475,36 @@ impl LinearScanAllocator {
+             let span_steal_arch =
+                 crate::common::types::target_elf_machine() == crate::backend::elf::EM_386;
+             if mode >= 3 && nxt <= incoming.end && (!incoming.spans_loop || !span_steal_arch) {
+-                continue;
++                // Cost-ratio escape: the next-use gate protects short
++                // chain-links (struct_copy/sha256: evicting hot shorts
++                // for spans measured ~2x), but it is absolute — a span
++                // orders of magnitude hotter than the short still spills
++                // (lz4's src base, prio 700 vs a prio-20 temp: 2 hot
++                // reloads/iter). Escape when the incoming outweighs the
++                // short by more than Kx (default 16: struct_copy's ~7x
++                // stays gated, lz4's 35x escapes). K=0 disables.
++                // The escape requires the victim's next use strictly
++                // inside the incoming's life (nxt > pos): a use AT the
++                // incoming position is a use-before-def hazard (the
++                // incoming would overwrite a value read first).
++                // The victim must also DIE at its next use (no remaining
++                // cost past nxt): the escape then costs exactly one victim
++                // reload and the victim never re-competes. A victim with
++                // future cost reloads at nxt and keeps fighting for its
++                // register, cascading into recoloring churn the local
++                // ratio cannot see (measured: expat victims with vrem
++                // 1-210 cost +5 moves with zero spill win; every winning
++                // escape — rbtree spills 29->14, moving_stats 12->5 —
++                // had vrem=0). Evaluated last: O(log n) suffix lookup,
++                // only reached when the O(1) ratio already passes.
++                let k = self.ra_config.evict_short_k;
++                let escapes = k > 0
++                    && nxt > pos
++                    && (priority as u128) * (k as u128) < (bar as u128)
++                    && interval.range.remaining_cost(nxt) == 0;
++                if !escapes {
++                    continue;
++                }
+             }
+             if mode >= 3 && incoming.spans_loop && span_steal_arch {
+                 if interval.range.span_recurrence {
+@@ -3518,7 +3547,7 @@ mod tests {
+ 
+             next_use: None,
+         });
+-        let incoming = lr(3, 10, 50, vec![10, 50], 100);
++        let incoming = lr(3, 10, 50, vec![10, 50], 10);
+ 
+         let idx3 = a.select_evict_victim(&incoming, 3).expect("legal victim");
+         assert_eq!(
+@@ -3851,7 +3880,7 @@ mod tests {
+         assert_eq!(a.select_evict_victim(&incoming, 6), None);
+ 
+         // (b) A victim needed DURING the incoming's lifetime is refused.
+-        let victim = lr_weighted(3, 0, 200, vec![(1, 100), (80, 1)]);
++        let victim = lr_weighted(3, 0, 200, vec![(1, 100), (80, 200)]);
+         let incoming2 = lr_weighted(4, 50, 120, vec![(60, 1000), (119, 1000)]);
+         assert!(victim.remaining_cost(50) < incoming2.remaining_cost(50));
+         let mut b = LinearScanAllocator::new(vec![], regs);
+@@ -3864,6 +3893,56 @@ mod tests {
+         );
+     }
+ 
++    /// Cost-ratio escape (mode 3, K=CCC_EVICT_SHORT_K default 16): a victim
++    /// whose next use lies inside the incoming's life is normally refused,
++    /// but escapes when the incoming outweighs it by more than Kx (lz4's
++    /// prio-700 span vs a prio-20 short: 35x escapes; struct_copy's ~7x
++    /// stays gated). Demands nxt strictly inside (use-before-def hazard
++    /// at nxt == pos refuses regardless of ratio), the victim dead at nxt
++    /// (no remaining cost past it, else re-competition churn), and K=0
++    /// disables.
++    #[test]
++    fn short_victim_escapes_by_cost_ratio() {
++        let regs = vec![PhysReg(0)];
++        // (a) 35x escapes: hot span takes the short's register.
++        let victim = lr(1, 0, 200, vec![1, 80], 20);
++        let incoming = lr(2, 50, 120, vec![60, 119], 700);
++        let mut a = LinearScanAllocator::new(vec![], regs.clone());
++        a.init_registers();
++        a.allocate_range(victim);
++        assert_eq!(a.select_evict_victim(&incoming, 3), Some(0));
++        // (b) 7x stays gated: the short keeps its register.
++        let victim = lr(3, 0, 200, vec![1, 80], 100);
++        let incoming = lr(4, 50, 120, vec![60, 119], 700);
++        let mut b = LinearScanAllocator::new(vec![], regs.clone());
++        b.init_registers();
++        b.allocate_range(victim);
++        assert_eq!(b.select_evict_victim(&incoming, 3), None);
++        // (c) nxt == pos refuses even at 35x (use-before-def hazard).
++        let victim = lr(5, 0, 200, vec![1, 50], 20);
++        let incoming = lr(6, 50, 120, vec![60, 119], 700);
++        let mut c = LinearScanAllocator::new(vec![], regs.clone());
++        c.init_registers();
++        c.allocate_range(victim);
++        assert_eq!(c.select_evict_victim(&incoming, 3), None);
++        // (d) K=0 disables the escape entirely.
++        let victim = lr(7, 0, 200, vec![1, 80], 20);
++        let incoming = lr(8, 50, 120, vec![60, 119], 700);
++        let mut d = LinearScanAllocator::new(vec![], regs.clone());
++        d.init_registers();
++        d.allocate_range(victim);
++        Arc::get_mut(&mut d.ra_config).unwrap().evict_short_k = 0;
++        assert_eq!(d.select_evict_victim(&incoming, 3), None);
++        // (e) A victim that lives past its next use refuses even at 35x:
++        // it would reload at nxt and keep re-competing (expat churn).
++        let victim = lr(9, 0, 200, vec![1, 80, 150], 20);
++        let incoming = lr(10, 50, 120, vec![60, 119], 700);
++        let mut e = LinearScanAllocator::new(vec![], regs);
++        e.init_registers();
++        e.allocate_range(victim);
++        assert_eq!(e.select_evict_victim(&incoming, 3), None);
++    }
++
+     /// Modes 1-3 must be untouched by the cost model: same victim, same
+     /// refusal, whether or not per-use weights happen to be attached.
+     #[test]
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index c6ff8bbb..d0b096a7 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -101,6 +101,11 @@ pub(crate) struct RaConfig {
+     pub(crate) no_segment_scan: bool,
+     /// `CCC_EVICT_MODE`: eviction mode (default: 3; malformed values use 3).
+     pub(crate) evict_mode: i32,
++    /// `CCC_EVICT_SHORT_K`: cost-ratio escape for the mode>=3 next-use
++    /// gate (default: 16; 0 disables the escape). A short victim whose
++    /// next use dies before the incoming ends is still evicted when the
++    /// incoming outweighs it by more than Kx. Malformed values use 16.
++    pub(crate) evict_short_k: u64,
+     /// `CCC_RA_LOOP_SPAN_RESERVE`: CEILING on the registers the main scan
+     /// reserves for block-local ranges by capping how many registers
+     /// loop-spanning ranges may hold at once (default: 0 = OFF). The
+@@ -295,6 +300,9 @@ impl RaConfig {
+             evict_mode: text("CCC_EVICT_MODE")
+                 .and_then(|value| value.parse::<i32>().ok())
+                 .unwrap_or(3),
++            evict_short_k: text("CCC_EVICT_SHORT_K")
++                .and_then(|value| value.parse::<u64>().ok())
++                .unwrap_or(16),
+             loop_span_reserve: number("CCC_RA_LOOP_SPAN_RESERVE", 0),
+             pgo_weight_max: text("CCC_PGO_WEIGHT_MAX")
+                 .and_then(|value| value.parse::<u64>().ok())
+@@ -9037,6 +9045,336 @@ fn const_address_link_bases(func: &IrFunction) -> FxHashMap<u32, u32> {
+     bases
+ }
+ 
++/// Potential simultaneous-sharing components: a deliberate SUPERSET of every
++/// mechanism that can place two values in one home with overlapping ranges.
++///
++/// Edges (unioned):
++/// * multi-def-dest + single-def-src `Copy D <- S` — every phi-coalesce
++///   candidate edge (multi-def srcs are never candidates);
++/// * phi-transport `Copy D <- S` (`D` feeds a Phi / `S` is a Phi result);
++/// * adjacent `(def(S), Copy D <- S)` — the latch same-value relaxation
++///   mirrored exactly (see below);
++/// * int-class `Cast D <- S` (float/decimal casts never share a GPR home).
++///
++/// General Copy merges and phi-congruence merges are overlap-checked
++/// (time-share only): two values covering one program point cannot
++/// time-share there, so they need no edge. Actual coalesced webs are
++/// subsets of these components, hence values in different components
++/// NEVER share a home — the soundness anchor for exempting hidden
++/// folded reads whose consumer provably lives in another web (lz4: the
++/// v403-rooted copy Loads extend v224/v212 through the v403<-v426<-v404
++/// snapshot chain and veto the {v404,v212,v224} web even though
++/// {v403,v426} provably occupies a different home).
++///
++/// Roots compare with [`web_find`].
++fn coalesce_web_parent(func: &IrFunction) -> FxHashMap<u32, u32> {
++    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut copy_dests: FxHashSet<u32> = FxHashSet::default();
++    let mut phi_dests: FxHashSet<u32> = FxHashSet::default();
++    let mut phi_operands: FxHashSet<u32> = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Some(dest) = inst.dest() {
++                *def_count.entry(dest.0).or_insert(0) += 1;
++            }
++            match inst {
++                Instruction::Copy { dest, .. } => {
++                    copy_dests.insert(dest.0);
++                }
++                Instruction::Phi { dest, incoming, .. } => {
++                    phi_dests.insert(dest.0);
++                    for (op, _) in incoming {
++                        if let Operand::Value(v) = op {
++                            phi_operands.insert(v.0);
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            inst.for_each_used_value(|u| {
++                *use_count.entry(u).or_insert(0) += 1;
++            });
++        }
++        block
++            .terminator
++            .for_each_used_value(|u| *use_count.entry(u).or_insert(0) += 1);
++    }
++    fn union_sets(parent: &mut FxHashMap<u32, u32>, a: u32, b: u32) {
++        if a == b {
++            return;
++        }
++        parent.entry(a).or_insert(a);
++        parent.entry(b).or_insert(b);
++        let ra = web_find(parent, a);
++        let rb = web_find(parent, b);
++        if ra != rb {
++            parent.insert(rb, ra);
++        }
++    }
++    let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
++    let int_class = |t: &IrType| {
++        matches!(
++            t,
++            IrType::I8
++                | IrType::I16
++                | IrType::I32
++                | IrType::I64
++                | IrType::I128
++                | IrType::U8
++                | IrType::U16
++                | IrType::U32
++                | IrType::U64
++                | IrType::U128
++                | IrType::Ptr
++        )
++    };
++    for block in &func.blocks {
++        for w in block.instructions.windows(2) {
++            if let (
++                prev,
++                Instruction::Copy {
++                    dest,
++                    src: Operand::Value(s),
++                },
++            ) = (&w[0], &w[1])
++            {
++                // Mirror latch_same_value in build_coalesce_groups exactly
++                // (keep in sync: loosening there without updating here misses
++                // simultaneous sharings and is unsound; use_count==1 is
++                // load-bearing — the zstd HUF DTable miscompile).
++                if copy_dests.contains(&dest.0)
++                    && def_count.get(&dest.0).copied().unwrap_or(0) > 1
++                    && prev.dest().is_some_and(|pd| pd.0 == s.0)
++                    && use_count.get(&s.0).copied().unwrap_or(0) == 1
++                {
++                    union_sets(&mut parent, dest.0, s.0);
++                }
++            }
++        }
++        for inst in &block.instructions {
++            match inst {
++                Instruction::Copy {
++                    dest,
++                    src: Operand::Value(s),
++                } => {
++                    let (d, s) = (dest.0, s.0);
++                    // Phi-pair arm mirrors the candidate enumeration filter
++                    // (multi-def Copy dest + single-def src; keep in sync —
++                    // admitting multi-def srcs there without updating here is
++                    // unsound). Transport arms stay unfiltered (superset).
++                    let phi_edge = copy_dests.contains(&d)
++                        && def_count.get(&d).copied().unwrap_or(0) > 1
++                        && def_count.get(&s).copied().unwrap_or(0) == 1;
++                    let transport_edge = phi_operands.contains(&d) || phi_dests.contains(&s);
++                    if phi_edge || transport_edge {
++                        union_sets(&mut parent, d, s);
++                    }
++                }
++                Instruction::Cast {
++                    dest,
++                    src: Operand::Value(s),
++                    from_ty,
++                    to_ty,
++                } => {
++                    if int_class(from_ty) && int_class(to_ty) {
++                        union_sets(&mut parent, dest.0, s.0);
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++    parent
 +}
 +
- pub(crate) struct CmpReplayScan {
-     pub replay: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
-     pub operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
-@@ -38,19 +60,7 @@ pub(crate) struct CmpReplayScan {
-     /// CondBranch condition) -> both legs' recorded compares. The branch
-     /// re-emits them as a short-circuit jcc chain; the And itself and both
-     /// legs' boolean materializations are skipped.
++/// Union-find root with path compression. Total: values without an entry
++/// are singleton roots (they never share a home simultaneously — every
++/// simultaneous-sharing mechanism above needs an edge).
++fn web_find(parent: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
++    let mut root = x;
++    loop {
++        match parent.get(&root).copied() {
++            None => break,
++            Some(p) if p == root => break,
++            Some(p) => root = p,
++        }
++    }
++    let mut c = x;
++    while c != root {
++        let next = parent.get(&c).copied().unwrap_or(root);
++        parent.insert(c, root);
++        c = next;
++    }
++    root
++}
++
++/// Every value on a folded consumer's address path: the ptr itself plus
++/// everything reachable by peeling what the backend can fold into the
++/// addressing mode (GEP base+index, Cast, const-operand Add/Sub/Shl/Mul).
++/// A SUPERSET of the backend peel set (no addr-fed filter): peeling too
++/// far only costs exemptions, while stopping early would compare a folded
++/// (homeless) intermediate. Multi-def values, params and unrecognized defs
++/// stop the peel (they hold their own home, which the consumer reads).
++/// `None` on runaway (fail-closed: no exemption).
++fn consumer_address_path(
++    ptr: u32,
++    def_of: &FxHashMap<u32, &Instruction>,
++    def_count: &FxHashMap<u32, u32>,
++) -> Option<Vec<u32>> {
++    let mut path = Vec::new();
++    let mut stack = vec![ptr];
++    let mut seen: FxHashSet<u32> = FxHashSet::default();
++    while let Some(v) = stack.pop() {
++        if !seen.insert(v) {
++            continue;
++        }
++        if seen.len() > 1024 {
++            return None;
++        }
++        path.push(v);
++        if def_count.get(&v).copied().unwrap_or(0) != 1 {
++            continue;
++        }
++        let Some(def) = def_of.get(&v) else {
++            continue;
++        };
++        match *def {
++            Instruction::GetElementPtr { base, offset, .. } => {
++                stack.push(base.0);
++                if let Operand::Value(o) = offset {
++                    stack.push(o.0);
++                }
++            }
++            Instruction::Cast {
++                src: Operand::Value(s),
++                ..
++            } => {
++                stack.push(s.0);
++            }
++            Instruction::BinOp { op, lhs, rhs, .. }
++                if matches!(
++                    op,
++                    IrBinOp::Add | IrBinOp::Sub | IrBinOp::Shl | IrBinOp::Mul
++                ) =>
++            {
++                let mut has_const = false;
++                let mut vals = Vec::new();
++                for opnd in [lhs, rhs] {
++                    match opnd {
++                        Operand::Const(_) => has_const = true,
++                        Operand::Value(w) => vals.push(w.0),
++                    }
++                }
++                if has_const {
++                    stack.extend(vals);
++                }
++            }
++            _ => {}
++        }
++    }
++    Some(path)
++}
++
++/// True when a hidden (folded-chain) read of the candidate source at
++/// `consumer` provably observes a different home: every value on the
++/// consumer's address path lives in a different potential-sharing
++/// component than the source, so the consumer's home cannot be the
++/// candidate's shared home and a dest redef cannot corrupt it.
++/// Fail-closed (`false`) for non-Load/Store consumers and runaway peels.
++fn hidden_read_in_disjoint_web(
++    consumer: &Instruction,
++    src_web: u32,
++    web_parent: &mut FxHashMap<u32, u32>,
++    def_of: &FxHashMap<u32, &Instruction>,
++    def_count: &FxHashMap<u32, u32>,
++) -> bool {
++    let ptr = match consumer {
++        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => ptr.0,
++        _ => return false,
++    };
++    let Some(path) = consumer_address_path(ptr, def_of, def_count) else {
++        return false;
++    };
++    // Read-home distance gate (profitability, not soundness — disjointness
++    // below is the soundness proof): exempt only multi-peel chains (the
++    // lz4 snapshot-chain pathology: copy-Load isolation through 2+ folds,
++    // read-home distance >= 2). Single-peel hidden reads (ptr -> base, the
++    // consumer adjacent to the candidate) stay vetoed (legacy): merging on
++    // weak evidence churns global coloring for one Copy (expat's len-2
++    // {v185,v20} cost 8% with identical spill counts).
++    if path.len() < 3 {
++        return false;
++    }
++    path.iter().all(|&v| web_find(web_parent, v) != src_web)
++}
++
++/// Profitability gate for homeless-merging (one home for the union):
++/// merging saves the segment overlap (two homes -> one over the shared
++/// points) but costs the incremental fat-fill (union points neither
++/// member covers that the merged fat range then occupies). Refuse when
++/// the incremental fill exceeds the overlap — pure-gap merges (a
++/// disjoint init folded into a global web) burn a global home to delete
++/// one cold Copy (expat's {v185,v20} spilled where the base allocator
++/// spilled nothing). Fail-open (merge) when coverage data is missing
++/// (matches legacy behavior; the gate is profitability, not safety).
++fn homeless_merge_profitable(segments: &[LiveInterval], dest: u32, src: u32) -> bool {
++    let mut l_segs: Vec<(u32, u32)> = Vec::new();
++    let mut s_segs: Vec<(u32, u32)> = Vec::new();
++    for iv in segments {
++        if iv.value_id == dest {
++            l_segs.push((iv.start, iv.end));
++        } else if iv.value_id == src {
++            s_segs.push((iv.start, iv.end));
++        }
++    }
++    if l_segs.is_empty() || s_segs.is_empty() {
++        return true;
++    }
++    let seg_len = |segs: &[(u32, u32)]| -> u64 {
++        let mut v = segs.to_vec();
++        v.sort_unstable();
++        let mut len: u64 = 0;
++        let mut cur_s = v[0].0;
++        let mut cur_e = v[0].1;
++        for &(s, e) in &v[1..] {
++            if s <= cur_e {
++                cur_e = cur_e.max(e);
++            } else {
++                len += u64::from(cur_e.saturating_sub(cur_s));
++                cur_s = s;
++                cur_e = e;
++            }
++        }
++        len + u64::from(cur_e.saturating_sub(cur_s))
++    };
++    let fat_span = |segs: &[(u32, u32)]| -> u64 {
++        let lo = segs.iter().map(|&(s, _)| s).min().unwrap_or(0);
++        let hi = segs.iter().map(|&(_, e)| e).max().unwrap_or(0);
++        u64::from(hi.saturating_sub(lo))
++    };
++    let mut overlap: u64 = 0;
++    for &(ls, le) in &l_segs {
++        for &(ss, se) in &s_segs {
++            let lo = ls.max(ss);
++            let hi = le.min(se);
++            if hi > lo {
++                overlap += u64::from(hi - lo);
++            }
++        }
++    }
++    let mut both = l_segs.clone();
++    both.extend_from_slice(&s_segs);
++    let leader_fill = fat_span(&l_segs).saturating_sub(seg_len(&l_segs));
++    let union_fill = fat_span(&both).saturating_sub(seg_len(&both));
++    let incr_fill = union_fill.saturating_sub(leader_fill);
++    overlap >= incr_fill
++}
++
+ fn source_home_survives_dest_redefs(
+     func: &IrFunction,
+     liveness: &LivenessResult,
+@@ -9093,6 +9431,20 @@ fn source_home_survives_dest_redefs(
+         used
+     };
+ 
++    // Potential-sharing components + def maps for the disjoint-web hidden-read
++    // exemption below (a few O(func) passes, negligible next to the CFG walk).
++    let mut web_parent = coalesce_web_parent(func);
++    let mut def_of: FxHashMap<u32, &Instruction> = FxHashMap::default();
++    let mut path_def_count: FxHashMap<u32, u32> = FxHashMap::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Some(dest) = inst.dest() {
++                *path_def_count.entry(dest.0).or_insert(0) += 1;
++                def_of.entry(dest.0).or_insert(inst);
++            }
++        }
++    }
++    let src_web = web_find(&mut web_parent, src);
+     let mut work = vec![(
+         candidate.source_block_idx,
+         candidate.source_def_idx.saturating_add(1),
+@@ -9130,6 +9482,13 @@ fn source_home_survives_dest_redefs(
+             if dirty
+                 && hidden_use_at(point)
+                 && !folded_consumer_reads_dest_home(inst, dest, &fold_base_of)
++                && !hidden_read_in_disjoint_web(
++                    inst,
++                    src_web,
++                    &mut web_parent,
++                    &def_of,
++                    &path_def_count,
++                )
+             {
+                 return false;
+             }
+@@ -10067,6 +10426,7 @@ mod ra_config_tests {
+         assert_eq!(defaults.loop_pin, 2);
+         assert_eq!(defaults.hot_web_steal, 3);
+         assert_eq!(defaults.evict_mode, 3);
++        assert_eq!(defaults.evict_short_k, 16);
+         assert_eq!(defaults.pgo_weight_max, 1);
+         assert_eq!(defaults.loop_span_reserve, 0);
+         assert_eq!(
+@@ -12614,6 +12974,20 @@ mod allocation_kernel_tests {
+         func.blocks = vec![block(
+             0,
+             vec![
++                Instruction::BinOp {
++                    dest: Value(9),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(2)),
++                    rhs: Operand::Value(Value(2)),
++                    ty: IrType::I64,
++                },
++                Instruction::BinOp {
++                    dest: Value(7),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(9)),
++                    rhs: Operand::Const(IrConst::I64(1)),
++                    ty: IrType::I64,
++                },
+                 Instruction::GetElementPtr {
+                     dest: Value(11),
+                     base: Value(2),
+@@ -12658,7 +13032,7 @@ mod allocation_kernel_tests {
+         func.next_value_id = 12;
+         let mut liveness = compute_live_intervals(&func);
+         let base = liveness.block_starts[0];
+-        liveness.folded_read_points.insert(5, vec![base + 3]);
++        liveness.folded_read_points.insert(5, vec![base + 5]);
+         let label_to_idx = analysis::build_label_map(&func);
+         let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+         let cand = PhiCoalesceCandidate {
+@@ -12666,23 +13040,210 @@ mod allocation_kernel_tests {
+             backedge_src: 5,
+             block_idx: 0,
+             source_block_idx: 0,
+-            source_def_idx: 1,
+-            copy_idx: 5,
++            source_def_idx: 3,
++            copy_idx: 7,
+         };
+         assert!(
+             source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+             "dest-rooted folded read must not veto (adler32 buf+=8 shape)"
+         );
+ 
+-        // Control: the same folded read through a root that is NOT dest
+-        // still vetoes — the home may hold dest's value instead of src's.
+-        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[0] else {
++        // Control: the same folded read through a root that IS the source
++        // still vetoes — the consumer reads the shared home itself while it
++        // holds dest's newer value (true dirty-window hazard).
++        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[2] else {
++            panic!("fixture shape changed");
++        };
++        *base = Value(5);
++        assert!(
++            !source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
++            "src-rooted folded read in a dirty window must veto"
++        );
++
++        // Disjoint web: the same folded read through a two-peel chain
++        // (GEP(v7) of folded address math v7 = v9+1 over the opaque root v9;
++        // read-home distance 2) that provably occupies a different home (no
++        // potential-sharing
++        // edge to the candidate web) must NOT veto — the dest redef cannot
++        // corrupt a home the consumer never reads (lz4 snapshot-chain
++        // shape; single-peel reads stay vetoed, see the distance gate).
++        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[2] else {
+             panic!("fixture shape changed");
+         };
+         *base = Value(7);
++        assert!(
++            source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
++            "disjoint-web folded read in a dirty window must not veto"
++        );
++
++        // Distance gate: the same folded read one peel away (GEP over the
++        // opaque root v9 directly; read-home distance 1) stays vetoed even
++        // though v9 provably occupies a different home — single-peel
++        // evidence is too weak to risk global recolor churn (expat len-2
++        // regression guard).
++        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[2] else {
++            panic!("fixture shape changed");
++        };
++        *base = Value(9);
+         assert!(
+             !source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+-            "non-dest-rooted folded read in a dirty window must veto"
++            "single-peel disjoint folded read must veto (distance gate)"
++        );
++    }
++
++    #[test]
++    fn hidden_read_through_deep_address_chain_does_not_veto() {
++        // Miniature lz4 {v404,v224} shape: the consumer address (ptr v11)
++        // folds through a deep address chain (v7 = v6+1, v6 = v9+1, v9
++        // opaque) whose root provably occupies a different home (no
++        // potential-sharing edge to the candidate web {2,5}), so the
++        // dirty-window hidden read of the source must not veto. (Real lz4
++        // paths are len-4 GEP/BinOp/Cast chains; Copies stop the peel, so
++        // snapshot Copies are invisible here by construction.)
++        let mut func = IrFunction::new("snapshot_chain".to_string(), IrType::I64, vec![], false);
++        func.blocks = vec![block(
++            0,
++            vec![
++                Instruction::BinOp {
++                    dest: Value(9),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(2)),
++                    rhs: Operand::Value(Value(2)),
++                    ty: IrType::I64,
++                },
++                Instruction::BinOp {
++                    dest: Value(6),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(9)),
++                    rhs: Operand::Const(IrConst::I64(1)),
++                    ty: IrType::I64,
++                },
++                Instruction::BinOp {
++                    dest: Value(7),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(6)),
++                    rhs: Operand::Const(IrConst::I64(1)),
++                    ty: IrType::I64,
++                },
++                Instruction::GetElementPtr {
++                    dest: Value(11),
++                    base: Value(7),
++                    offset: Operand::Const(IrConst::I64(1)),
++                    ty: IrType::Ptr,
++                },
++                Instruction::BinOp {
++                    dest: Value(5),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(2)),
++                    rhs: Operand::Const(IrConst::I64(8)),
++                    ty: IrType::I64,
++                },
++                Instruction::Copy {
++                    dest: Value(2),
++                    src: Operand::Value(Value(5)),
++                },
++                Instruction::BinOp {
++                    dest: Value(2),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(2)),
++                    rhs: Operand::Const(IrConst::I64(1)),
++                    ty: IrType::I64,
++                },
++                Instruction::Load {
++                    dest: Value(8),
++                    ptr: Value(11),
++                    ty: IrType::U8,
++                    volatile: false,
++                    seg_override: Default::default(),
++                },
++            ],
++            Terminator::Return(None),
++        )];
++        func.next_value_id = 12;
++        let mut liveness = compute_live_intervals(&func);
++        let base = liveness.block_starts[0];
++        liveness.folded_read_points.insert(5, vec![base + 7]);
++        let label_to_idx = analysis::build_label_map(&func);
++        let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
++        let cand = PhiCoalesceCandidate {
++            phi_dest: 2,
++            backedge_src: 5,
++            block_idx: 0,
++            source_block_idx: 0,
++            source_def_idx: 4,
++            copy_idx: 5,
++        };
++        assert!(
++            source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
++            "hidden read through a snapshot chain into a disjoint web must not veto"
++        );
++    }
++
++    #[test]
++    fn homeless_merge_profitability_gate() {
++        // Expat {v185,v20} shape: source covers 2 points disjoint from the
++        // leader's global segments; the merged fat range would occupy ~40
++        // new gap points to delete one cold Copy — refuse.
++        let gap = vec![
++            LiveInterval {
++                value_id: 185,
++                start: 0,
++                end: 10,
++            },
++            LiveInterval {
++                value_id: 185,
++                start: 33,
++                end: 87,
++            },
++            LiveInterval {
++                value_id: 20,
++                start: 127,
++                end: 128,
++            },
++        ];
++        assert!(
++            !homeless_merge_profitable(&gap, 185, 20),
++            "pure-gap merge (overlap 0, fill ~40) must be refused"
++        );
++        // lz4 {v404,v212} shape: full fat overlap — merge.
++        let fat = vec![
++            LiveInterval {
++                value_id: 404,
++                start: 0,
++                end: 265,
++            },
++            LiveInterval {
++                value_id: 212,
++                start: 0,
++                end: 265,
++            },
++        ];
++        assert!(
++            homeless_merge_profitable(&fat, 404, 212),
++            "full-overlap merge (overlap 265, fill 0) must be accepted"
++        );
++        // Inside-disjoint: source sits in a hole of the leader's span —
++        // no new span, shrinking fill — merge.
++        let inside = vec![
++            LiveInterval {
++                value_id: 7,
++                start: 0,
++                end: 30,
++            },
++            LiveInterval {
++                value_id: 7,
++                start: 50,
++                end: 100,
++            },
++            LiveInterval {
++                value_id: 8,
++                start: 40,
++                end: 41,
++            },
++        ];
++        assert!(
++            homeless_merge_profitable(&inside, 7, 8),
++            "inside-disjoint merge (no new span) must be accepted"
+         );
+     }
+ }
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index e4e35d9c..5bf659bc 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -663,20 +663,16 @@ impl X86Codegen {
+         rhs: &Operand,
+         ty: IrType,
+     ) {
+-        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+-        let is_unsigned = ty.is_unsigned();
+-
+-        // BOOL-PAIR (AND-of-compares) branch fusion: this And's single use
+-        // is the block's CondBranch and it is fused into a short-circuit
+-        // two-jcc chain re-emitted by the branch (see
+-        // emit_cond_branch_blocks_impl). Emit nothing here: the two leg
+-        // compares already skipped their setcc materialization, and the
+-        // branch replays both compares from the recorded operands. If
+-        // post-RA pruning dropped the pair, the And dest was removed from
+-        // cmp_bool_pair with it and the ordinary andl path below runs.
+-        if op == IrBinOp::And && self.cmp_bool_pair.contains_key(&dest.0) {
++        // DE MORGAN SPLIT: an And/Or claimed by the branch split emits
++        // NOTHING at its own position — the CondBranch re-emits both
++        // recorded comparisons with a short-circuit jump between them.
++        // (Only And/Or can be claimed; other BinOps never appear in the
++        // skip set, so no opcode check is needed.)
++        if self.demorgan_skip.contains(&dest.0) {
+             return;
+         }
++        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
++        let is_unsigned = ty.is_unsigned();
+ 
+         // Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
+         // X86_64 target). The TAIL of a pair emits nothing — its result was
+diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
+index 7716b017..1a675dda 100644
+--- a/src/backend/x86/codegen/cast_ops.rs
++++ b/src/backend/x86/codegen/cast_ops.rs
+@@ -54,6 +54,16 @@ impl X86Codegen {
+             return;
+         }
+         self.fold_skip_cast = None;
++        // DE MORGAN SPLIT: Cast passthru (`bool c = a&&b; if (c)` — the
++        // materialized boolean is cast to the branch-cond type) — the
++        // branch replays the original comparisons, so the cast result is
++        // never read; emitting it would convert a never-written home. No
++        // widen-flush is needed (unlike the Cmp gate): the skipped Cmp
++        // gates ahead of this instruction already flushed every deferred
++        // narrowing widen, and the replay reads only the Cmp operands.
++        if self.demorgan_skip.contains(&dest.0) {
++            return;
++        }
+         // A cast OF an x87 bit-pattern value (LDFabs/LDCopysign result,
+         // tracked in f128_direct_slots) is a no-op regardless of the source
+         // type in the IR (the value is already the 16-byte x87 format).
+diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
+index ab2dcd99..4afff4b6 100644
+--- a/src/backend/x86/codegen/comparison.rs
++++ b/src/backend/x86/codegen/comparison.rs
+@@ -34,26 +34,54 @@ pub(crate) struct CmpReplayScan {
+     /// single use is a Select; keyed by Cmp dest with the recorded operands
+     /// re-derived as a vcmpsd/vcmpss mask by the select.
+     pub fp_select: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+-    /// BOOL-PAIR (AND-of-compares) branch fusion: And-binop dest (the
+-    /// CondBranch condition) -> both legs' recorded compares. The branch
+-    /// re-emits them as a short-circuit jcc chain; the And itself and both
+-    /// legs' boolean materializations are skipped.
 -    pub bool_pair: crate::common::fx_hash::FxHashMap<
 -        u32,
 -        (
@@ -96,14 +958,79 @@ index ab2dcd991..23ea3c803 100644
 -            IrType,
 -        ),
 -    >,
-+    pub bool_pair: crate::common::fx_hash::FxHashMap<u32, CmpBoolPair>,
-     /// The two Cmp dests of each recorded pair: they skip setcc/movzbl
-     /// materialization (the flags are re-derived by the branch replay).
-     pub bool_pair_cmps: crate::common::fx_hash::FxHashSet<u32>,
-@@ -81,19 +91,8 @@ pub(crate) fn compute_cmp_replay_scan(
-     // reordering them against each other and against the (never-emitted)
-     // And is semantically transparent; the redefinition guard below keeps
-     // each Cmp's operands intact up to the replay position.
+-    /// The two Cmp dests of each recorded pair: they skip setcc/movzbl
+-    /// materialization (the flags are re-derived by the branch replay).
+-    pub bool_pair_cmps: crate::common::fx_hash::FxHashSet<u32>,
++    /// De Morgan branch records: `CondBranch(And/Or(CmpA, CmpB))` where the
++    /// And/Or and both Cmps are single-use and same-block. Keyed by the
++    /// And/Or dest; the branch re-emits both comparisons with a
++    /// short-circuit jump between them (cmpA; jcc; cmpB; jcc) instead of
++    /// materializing two booleans plus the conjunction (cmp; setcc; movzbl;
++    /// cmp; setcc; movzbl; and; test; jcc). The two Cmp dests are recorded
++    /// in [`DemorganRec::cmp_dests`] so emission can skip all three
++    /// instructions. Operand links for both Cmps' operands ride the shared
++    /// `operand_links` map (consumer = the And/Or dest, whose live end is
++    /// the terminator).
++    pub demorgan: crate::common::fx_hash::FxHashMap<u32, DemorganRec>,
++    /// Multi-select replay counts: Cmp dests whose EVERY use is a direct
++    /// same-block Select (2+). Each select re-emits the recorded compare
++    /// (see take_replay_cmp's countdown); entries without a count here
++    /// are legacy single-consumer records, consumed by one take.
++    pub replay_multi: crate::common::fx_hash::FxHashMap<u32, u32>,
++}
++
++/// One De Morgan branch-split candidate. See [`CmpReplayScan::demorgan`].
++#[derive(Clone)]
++pub(crate) struct DemorganRec {
++    /// True for `And` (short-circuit on false), false for `Or`
++    /// (short-circuit on true).
++    pub is_and: bool,
++    /// First comparison (op, lhs, rhs, ty), re-emitted first.
++    pub a: (IrCmpOp, Operand, Operand, IrType),
++    /// Second comparison, re-emitted after the short-circuit jump.
++    pub b: (IrCmpOp, Operand, Operand, IrType),
++    /// The two Cmp dest value ids (emission skips them and the And/Or).
++    pub cmp_dests: [u32; 2],
++    /// Copy/Cast indirection between the And/Or and the branch, if any:
++    /// `bool c = a&&b; if (c)` (or the `|`/`||` Or equivalents) leaves a
++    /// single-use same-block Copy/Cast whose dest is the branch cond and
++    /// whose src is the And/Or. Emission skips it alongside the And/Or
++    /// (the branch replays the original comparisons, so the renamed value
++    /// is never read); `None` when the And/Or feeds the branch directly.
++    /// Always equals the recorded consumer id when present.
++    pub passthru: Option<u32>,
++    /// The And/Or BinOp's own dest id: equals the map key (the branch
++    /// cond) in the direct case, the passthru's src in the indirect case.
++    /// Emission skips it alongside the Cmps and the passthru.
++    pub binop_id: u32,
++}
++
++/// Env-gated trace for the De Morgan branch split: prints scan matches,
++/// prune decisions, and emission fires to stderr. Zero cost when off.
++pub(crate) fn demorgan_debug_enabled() -> bool {
++    std::env::var_os("LCCC_DEBUG_DEMORGAN").is_some()
+ }
+ 
+ pub(crate) fn compute_cmp_replay_scan(
+@@ -66,36 +94,11 @@ pub(crate) fn compute_cmp_replay_scan(
+         crate::common::fx_hash::FxHashMap::default();
+     let mut fp_select: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> =
+         crate::common::fx_hash::FxHashMap::default();
+-    // Kill switch `CCC_NO_BOOL_PAIR` (CI/bisect): disables the fusion scan
+-    // below; compares keep their setcc materialization and the And emits
+-    // normally.
+-    let bool_pair_enabled = !std::env::var_os("CCC_NO_BOOL_PAIR").is_some();
+-    // BOOL-PAIR (AND-of-compares) branch fusion scan (RA-BOOL-PAIR):
+-    //   Cmp c1; Cmp c2; And a = c1 & c2;  CondBranch { cond: a }
+-    // with c1, c2, a all single-use, all in one block, records
+-    // `bool_pair[a] = (c1, c2)` plus `bool_pair_cmps = {c1, c2}`: the two
+-    // Cmps skip their setcc/movzbl materialization, the And emits nothing,
+-    // and the branch re-emits both compares as a short-circuit
+-    // `cmp1; jcc(inv1) cold; cmp2; jcc(inv2) cold` chain — 4 instructions
+-    // instead of cmp+setcc+movzbl ×2 + andl + je (8). Compares are pure, so
+-    // reordering them against each other and against the (never-emitted)
+-    // And is semantically transparent; the redefinition guard below keeps
+-    // each Cmp's operands intact up to the replay position.
 -    let mut bool_pair: crate::common::fx_hash::FxHashMap<
 -        u32,
 -        (
@@ -117,97 +1044,688 @@ index ab2dcd991..23ea3c803 100644
 -            IrType,
 -        ),
 -    > = crate::common::fx_hash::FxHashMap::default();
-+    let mut bool_pair: crate::common::fx_hash::FxHashMap<u32, CmpBoolPair> =
+-    let mut bool_pair_cmps: crate::common::fx_hash::FxHashSet<u32> =
+-        crate::common::fx_hash::FxHashSet::default();
++    let mut demorgan: crate::common::fx_hash::FxHashMap<u32, DemorganRec> =
 +        crate::common::fx_hash::FxHashMap::default();
-     let mut bool_pair_cmps: crate::common::fx_hash::FxHashSet<u32> =
-         crate::common::fx_hash::FxHashSet::default();
++    let mut replay_multi: crate::common::fx_hash::FxHashMap<u32, u32> =
++        crate::common::fx_hash::FxHashMap::default();
++    let demorgan_enabled = std::env::var("CCC_NO_DEMORGAN").is_err();
      for block in &func.blocks {
-@@ -202,7 +201,7 @@ pub(crate) fn compute_cmp_replay_scan(
-                     continue;
+         let insts = &block.instructions;
+         for (ii, inst) in insts.iter().enumerate() {
+@@ -109,7 +112,82 @@ pub(crate) fn compute_cmp_replay_scan(
+                 } => (dest.0, *op, lhs.clone(), rhs.clone(), *ty),
+                 _ => continue,
+             };
+-            if use_counts.get(&cdest).copied().unwrap_or(0) != 1 {
++            let n_uses = use_counts.get(&cdest).copied().unwrap_or(0);
++            if n_uses != 1 {
++                // MULTI-SELECT REPLAY: every use is a direct same-block
++                // Select (2+, the min/max/clamp shape: binary_search's
++                // lo/hi updates share one bounds compare). Each select
++                // re-emits the compare from the recorded operands, so
++                // the Cmp emits nothing — saving setcc+movzbl plus one
++                // test per select over the materialized path. Coverage
++                // must be TOTAL: any non-select use (or a select behind
++                // a Copy) would read the never-materialized boolean.
++                // Integer-only (FP keeps the single-use fp_select path;
++                // wide ints cannot replay, same as the single path).
++                if n_uses >= 2
++                    && !fused.contains_key(&cdest)
++                    && cty.is_integer()
++                    && !crate::backend::generation::is_wide_int_type(cty)
++                {
++                    let mut sel_idxs: Vec<usize> = Vec::new();
++                    for (jj, other) in insts.iter().enumerate() {
++                        if jj == ii {
++                            continue;
++                        }
++                        if let crate::ir::reexports::Instruction::Select {
++                            cond: Operand::Value(v),
++                            ..
++                        } = other
++                        {
++                            if v.0 == cdest {
++                                sel_idxs.push(jj);
++                            }
++                        }
++                    }
++                    // The block-terminator CondBranch may join as the last
++                    // consumer (loop-back on a shared bounds bool): the
++                    // branch re-emits the compare like any select (it
++                    // already consumes replay records on the single-use
++                    // branch path), so select+branch mixes replay fully.
++                    let mut n_consumers = sel_idxs.len();
++                    if let crate::ir::reexports::Terminator::CondBranch {
++                        cond: Operand::Value(v),
++                        ..
++                    } = &block.terminator
++                    {
++                        if v.0 == cdest {
++                            n_consumers += 1;
++                        }
++                    }
++                    if n_consumers == n_uses as usize && !sel_idxs.is_empty() {
++                        // Redefinition guard to the LAST consumer (covers
++                        // every re-emission point — same contract as the
++                        // single-consumer guard below).
++                        let last = if n_consumers > sel_idxs.len() {
++                            insts.len()
++                        } else {
++                            sel_idxs.iter().copied().max().unwrap_or(ii)
++                        };
++                        let operand_ids: [Option<u32>; 2] = [&clhs, &crhs].map(|op| match op {
++                            Operand::Value(v) => Some(v.0),
++                            Operand::Const(_) => None,
++                        });
++                        let redefined = operand_ids.iter().flatten().any(|&vid| {
++                            insts[ii + 1..last]
++                                .iter()
++                                .any(|other| other.dest().is_some_and(|d| d.0 == vid))
++                        });
++                        if !redefined {
++                            for op in [&clhs, &crhs] {
++                                if let Operand::Value(v) = op {
++                                    operand_links.entry(v.0).or_default().push(cdest);
++                                }
++                            }
++                            replay.insert(cdest, (cop, clhs, crhs, cty));
++                            replay_multi.insert(cdest, n_consumers as u32);
++                        }
++                    }
++                }
+                 continue;
+             }
+             // Already handled by the (better) adjacent fusion (integer
+@@ -154,144 +232,6 @@ pub(crate) fn compute_cmp_replay_scan(
+                     }
                  }
-                 // Locate the sibling Cmp (the other leg of the And).
+             }
+-            // BOOL-PAIR: the single use may instead be an `And` binop whose
+-            // own single use is this block's CondBranch condition. Locate it
+-            // and validate the full four-value chain (Cmp, Cmp, And, branch)
+-            // before recording. The And consumer is only tracked when the
+-            // other leg is also a single-use integer Cmp in this block —
+-            // otherwise the And stays on the ordinary materialized path.
+-            let mut and_consumer: Option<u32> = None;
+-            if !used_by_select && !used_by_branch {
+-                for other in insts.iter() {
+-                    if let crate::ir::reexports::Instruction::BinOp {
+-                        dest: adest,
+-                        op: crate::ir::reexports::IrBinOp::And,
+-                        lhs: Operand::Value(lv),
+-                        rhs: Operand::Value(rv),
+-                        ..
+-                    } = other
+-                    {
+-                        if lv.0 == cdest || rv.0 == cdest {
+-                            and_consumer = Some(adest.0);
+-                            break;
+-                        }
+-                    }
+-                }
+-                let Some(adest) = and_consumer else {
+-                    continue;
+-                };
+-                // Exactly-once contracts: each Cmp feeds the And once, the
+-                // And feeds only the branch. (use_counts == 1 is the gate the
+-                // replay scan already trusts for the Select/branch shapes.)
+-                if use_counts.get(&adest).copied().unwrap_or(0) != 1 {
+-                    continue;
+-                }
+-                let consumed_by_branch = matches!(
+-                    &block.terminator,
+-                    crate::ir::reexports::Terminator::CondBranch {
+-                        cond: Operand::Value(v),
+-                        ..
+-                    } if v.0 == adest
+-                );
+-                if !consumed_by_branch {
+-                    continue;
+-                }
+-                // Integer pairs only (see the wide/FP gate below — a pair
+-                // must satisfy it for BOTH legs, so check early here too).
+-                if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
+-                    continue;
+-                }
+-                // Locate the sibling Cmp (the other leg of the And).
 -                let sibling: Option<(usize, IrCmpOp, Operand, Operand, IrType)> =
-+                let sibling: Option<(usize, u32, IrCmpOp, Operand, Operand, IrType)> =
-                     insts.iter().enumerate().find_map(|(jj, other)| {
-                         if let crate::ir::reexports::Instruction::Cmp {
-                             dest: d2,
-@@ -231,13 +230,13 @@ pub(crate) fn compute_cmp_replay_scan(
-                                     )
-                                 });
-                                 if feeds_and {
+-                    insts.iter().enumerate().find_map(|(jj, other)| {
+-                        if let crate::ir::reexports::Instruction::Cmp {
+-                            dest: d2,
+-                            op: o2,
+-                            lhs: l2,
+-                            rhs: r2,
+-                            ty: t2,
+-                        } = other
+-                        {
+-                            if d2.0 != cdest
+-                                && use_counts.get(&d2.0).copied() == Some(1)
+-                                && !fused.contains_key(&d2.0)
+-                                && t2.is_integer()
+-                                && !crate::backend::generation::is_wide_int_type(*t2)
+-                            {
+-                                let feeds_and = insts.iter().any(|a| {
+-                                    matches!(
+-                                        a,
+-                                        crate::ir::reexports::Instruction::BinOp {
+-                                            op: crate::ir::reexports::IrBinOp::And,
+-                                            lhs: Operand::Value(lv),
+-                                            rhs: Operand::Value(rv),
+-                                            ..
+-                                        } if (lv.0 == d2.0 || rv.0 == d2.0)
+-                                            && a.dest().is_some_and(|d| d.0 == adest)
+-                                    )
+-                                });
+-                                if feeds_and {
 -                                    return Some((jj, *o2, l2.clone(), r2.clone(), *t2));
-+                                    return Some((jj, d2.0, *o2, l2.clone(), r2.clone(), *t2));
-                                 }
-                             }
-                         }
-                         None
-                     });
+-                                }
+-                            }
+-                        }
+-                        None
+-                    });
 -                let Some((jj, op2, l2, r2, t2)) = sibling else {
-+                let Some((jj, d2dest, op2, l2, r2, t2)) = sibling else {
-                     continue;
-                 };
-                 // No operand of EITHER leg may be redefined between its Cmp
-@@ -265,19 +264,21 @@ pub(crate) fn compute_cmp_replay_scan(
-                 if bool_pair_enabled {
-                     bool_pair.insert(
-                         adest,
+-                    continue;
+-                };
+-                // No operand of EITHER leg may be redefined between its Cmp
+-                // and the block end: both compares are re-emitted at the
+-                // branch, after every instruction in the block.
+-                let legs = [(ii, &clhs, &crhs), (jj, &l2, &r2)];
+-                let redefined = legs.iter().any(|(pos, lhs, rhs)| {
+-                    let ids: [Option<u32>; 2] = [lhs, rhs].map(|op| match op {
+-                        Operand::Value(v) => Some(v.0),
+-                        Operand::Const(_) => None,
+-                    });
+-                    ids.iter().flatten().any(|&vid| {
+-                        insts[pos + 1..]
+-                            .iter()
+-                            .any(|other| other.dest().is_some_and(|d| d.0 == vid))
+-                    })
+-                });
+-                if redefined {
+-                    continue;
+-                }
+-                // Deterministic single record per And (both legs scan here).
+-                if bool_pair.contains_key(&adest) {
+-                    continue;
+-                }
+-                if bool_pair_enabled {
+-                    bool_pair.insert(
+-                        adest,
 -                        (
 -                            cop,
 -                            clhs.clone(),
 -                            crhs.clone(),
 -                            cty,
-+                        CmpBoolPair {
-+                            op1: cop,
-+                            lhs1: clhs.clone(),
-+                            rhs1: crhs.clone(),
-+                            ty1: cty,
-+                            dest1: cdest,
-                             op2,
+-                            op2,
 -                            l2.clone(),
 -                            r2.clone(),
 -                            t2,
 -                        ),
-+                            lhs2: l2.clone(),
-+                            rhs2: r2.clone(),
-+                            ty2: t2,
-+                            dest2: d2dest,
-+                        },
-                     );
-                     bool_pair_cmps.insert(cdest);
+-                    );
+-                    bool_pair_cmps.insert(cdest);
 -                    bool_pair_cmps.insert(insts[jj].dest().map(|d| d.0).unwrap_or(u32::MAX));
-+                    bool_pair_cmps.insert(d2dest);
-                 }
-                 // Operand homes must survive to the branch: link every leg
-                 // operand to the And value, whose own (single) use is the
-@@ -992,15 +993,15 @@ impl X86Codegen {
-         // layout pass placed next; the only difference between the two
-         // shapes is which side avoids the extra jump.
-         if let Operand::Value(cond_v) = cond {
+-                }
+-                // Operand homes must survive to the branch: link every leg
+-                // operand to the And value, whose own (single) use is the
+-                // block terminator. Over-constraining links are harmless
+-                // (see the replay comment above).
+-                for (lhs, rhs) in [(&clhs, &crhs), (&l2, &r2)] {
+-                    for op in [lhs, rhs] {
+-                        if let Operand::Value(v) = op {
+-                            operand_links.entry(v.0).or_default().push(adest);
+-                        }
+-                    }
+-                }
+-                continue;
+-            }
+             if !used_by_select && !used_by_branch {
+                 continue;
+             }
+@@ -355,14 +295,184 @@ pub(crate) fn compute_cmp_replay_scan(
+             }
+             replay.insert(cdest, (cop, clhs, crhs, cty));
+         }
++        // De Morgan branch split: `CondBranch(And/Or(CmpA, CmpB))` with all
++        // three single-use and same-block. The terminator re-emits cmpA,
++        // short-circuit-jumps, then re-emits cmpB — instead of
++        // materializing two booleans plus the conjunction. Operand links
++        // for both Cmps' operands ride the shared map (consumer = the
++        // And/Or dest, whose live end is the terminator).
++        if demorgan_enabled {
++            if let crate::ir::reexports::Terminator::CondBranch {
++                cond: Operand::Value(cond_v),
++                ..
++            } = &block.terminator
++            {
++                if use_counts.get(&cond_v.0).copied().unwrap_or(0) == 1
++                    && let Some(rec) = check_demorgan_pattern(insts, cond_v.0, use_counts, fused)
++                {
++                    if demorgan_debug_enabled() {
++                        eprintln!(
++                            "[demorgan] scan andor={} is_and={} fuzz=({},{})",
++                            cond_v.0, rec.is_and, rec.cmp_dests[0], rec.cmp_dests[1]
++                        );
++                    }
++                    for op in [&rec.a.1, &rec.a.2, &rec.b.1, &rec.b.2] {
++                        if let Operand::Value(v) = op {
++                            operand_links.entry(v.0).or_default().push(cond_v.0);
++                        }
++                    }
++                    demorgan.insert(cond_v.0, rec);
++                }
++            }
++        }
+     }
+     CmpReplayScan {
+         replay,
+         operand_links,
+         fp_select,
+-        bool_pair,
+-        bool_pair_cmps,
++        demorgan,
++        replay_multi,
++    }
++}
++
++/// Match `And/Or(CmpA, CmpB)` for the De Morgan branch split: the And/Or
++/// producer must be a same-block `BinOp` with `And`/`Or` opcode, both arms
++/// single-use same-block *integer* (non-wide) Cmps, and neither Cmp's
++/// operands redefined between the Cmp and the block end (the replay
++/// re-reads them at the terminator — same contract as the Cmp-replay
++/// redefinition guard above).
++fn check_demorgan_pattern(
++    insts: &[crate::ir::reexports::Instruction],
++    andor_id: u32,
++    use_counts: &crate::common::fx_hash::FxHashMap<u32, u32>,
++    fused: &crate::common::fx_hash::FxHashMap<u32, u32>,
++) -> Option<DemorganRec> {
++    use crate::ir::reexports::{Instruction, IrBinOp};
++    // Resolve the branch cond to its And/Or producer: either directly
++    // (`if (a&&b)`, the cond IS the And/Or) or through one single-use
++    // same-block Copy/Cast (`bool c = a&&b; if (c)` — and the `|`/`||` Or
++    // equivalents, which ONLY arise in this materialized form: the frontend
++    // control-flow-lowers direct `||` and if-conversion never merges the
++    // Or-nest back). The cond must be defined EXACTLY once in this block:
++    // post-phi coalescing webs can carry position-dependent multi-defs
++    // (#490), and the terminator reads the LAST one — recording the first
++    // would replay the wrong arms. The And/Or itself must likewise be
++    // single-use (its only reader is the branch or the passthru — both are
++    // skipped, so nothing else may observe its never-written home).
++    let mut cond_defs: Vec<&Instruction> = Vec::new();
++    for inst in insts {
++        if inst.dest().is_some_and(|d| d.0 == andor_id) {
++            cond_defs.push(inst);
++        }
++    }
++    let [cond_def] = cond_defs.as_slice() else {
++        return None;
++    };
++    let (andor_src_id, passthru) = match cond_def {
++        Instruction::BinOp { .. } => (andor_id, None),
++        Instruction::Copy {
++            src: Operand::Value(s),
++            ..
++        }
++        | Instruction::Cast {
++            src: Operand::Value(s),
++            ..
++        } => {
++            if use_counts.get(&s.0).copied().unwrap_or(0) != 1 {
++                return None;
++            }
++            (s.0, Some(andor_id))
++        }
++        _ => return None,
++    };
++    let mut producer: Option<(bool, Operand, Operand)> = None;
++    for inst in insts {
++        if let Instruction::BinOp {
++            dest, op, lhs, rhs, ..
++        } = inst
++            && dest.0 == andor_src_id
++        {
++            if producer.is_some() {
++                return None;
++            }
++            match op {
++                IrBinOp::And => producer = Some((true, lhs.clone(), rhs.clone())),
++                IrBinOp::Or => producer = Some((false, lhs.clone(), rhs.clone())),
++                _ => return None,
++            }
++        }
+     }
++    let (is_and, a_op, b_op) = producer?;
++    if use_counts.get(&andor_src_id).copied().unwrap_or(0) != 1 {
++        return None;
++    }
++    let mut found: [Option<(IrCmpOp, Operand, Operand, IrType, u32, usize)>; 2] = [None, None];
++    for (slot, arm) in [a_op, b_op].into_iter().enumerate() {
++        let arm_v = match arm {
++            Operand::Value(v) => v.0,
++            Operand::Const(_) => return None,
++        };
++        if use_counts.get(&arm_v).copied().unwrap_or(0) != 1 {
++            return None;
++        }
++        // Flag-fusion owns adjacent Cmp→Select/branch pairs: a fused Cmp's
++        // consumer reads live FLAGS, not a replayed compare. (Unreachable
++        // today — a fused Cmp's consumer is a Select/branch, never the
++        // And/Or — but free insurance against future fusion extensions.)
++        if fused.contains_key(&arm_v) {
++            return None;
++        }
++        // Exactly one same-block definition (same multi-def rationale as
++        // the And/Or guard above).
++        for (ci, inst) in insts.iter().enumerate() {
++            if let Instruction::Cmp {
++                dest,
++                op,
++                lhs,
++                rhs,
++                ty,
++            } = inst
++                && dest.0 == arm_v
++            {
++                if found[slot].is_some() {
++                    return None;
++                }
++                if !ty.is_integer() || crate::backend::generation::is_wide_int_type(*ty) {
++                    return None;
++                }
++                found[slot] = Some((*op, lhs.clone(), rhs.clone(), *ty, arm_v, ci));
++            }
++        }
++        if found[slot].is_none() {
++            return None;
++        }
++    }
++    let [
++        (aop, alhs, arhs, aty, adest, aidx),
++        (bop, blhs, brhs, bty, bdest, bidx),
++    ] = found.map(|f| f.expect("checked above"));
++    // Redefinition guard: each Cmp's value operands must not be redefined
++    // between the Cmp and the terminator (the And/Or itself emits nothing,
++    // so only real defs in between can disturb the replayed reads).
++    for (op_a, op_b, cidx) in [(&alhs, &arhs, aidx), (&blhs, &brhs, bidx)] {
++        for op in [op_a, op_b] {
++            if let Operand::Value(v) = op
++                && insts[cidx + 1..]
++                    .iter()
++                    .any(|other| other.dest().is_some_and(|d| d.0 == v.0))
++            {
++                return None;
++            }
++        }
++    }
++    Some(DemorganRec {
++        is_and,
++        a: (aop, alhs, arhs, aty),
++        b: (bop, blhs, brhs, bty),
++        cmp_dests: [adest, bdest],
++        passthru,
++        binop_id: andor_src_id,
++    })
+ }
+ 
+ impl X86Codegen {
+@@ -608,13 +718,10 @@ impl X86Codegen {
+             self.flush_pending_widen_impl();
+             return;
+         }
+-        // BOOL-PAIR leg: skip the ENTIRE instruction — including the cmp
+-        // itself. The fused branch re-emits both legs from the recorded
+-        // operands (this compare's flags could not survive anyway: the
+-        // sibling leg's compare follows before the branch). If post-RA
+-        // pruning dropped the pair, the dest was removed from
+-        // bool_pair_cmps with it and the ordinary path below runs.
+-        if self.bool_pair_cmps.contains(&dest.0) {
++        // DE MORGAN SPLIT: this Cmp's boolean feeds a skipped And/Or whose
++        // CondBranch re-emits the comparison from the recorded operands —
++        // skip the entire instruction (same contract as compare-replay).
++        if self.demorgan_skip.contains(&dest.0) {
+             self.flush_pending_widen_impl();
+             return;
+         }
+@@ -917,16 +1024,40 @@ impl X86Codegen {
+ 
+     /// If `cond` is the destination of a Cmp eligible for compare-replay,
+     /// consume the replay record (op + operands) so the consumer can re-emit
+-    /// the comparison and use cmovcc/jcc directly.
++    /// the comparison and use cmovcc/jcc directly. Multi-select records
++    /// (see CmpReplayScan::replay_multi) are consumed by countdown: each
++    /// select clones the record and only the last one removes it.
+     fn take_replay_cmp(&mut self, cond: &Operand) -> Option<(IrCmpOp, Operand, Operand, IrType)> {
+         if let Operand::Value(v) = cond {
+-            if let Some(rec) = self.cmp_replay.remove(&v.0) {
++            if let Some(rec) = self.cmp_replay.get(&v.0).cloned() {
++                if let Some(n) = self.cmp_replay_multi.get_mut(&v.0) {
++                    if *n <= 1 {
++                        self.cmp_replay.remove(&v.0);
++                        self.cmp_replay_multi.remove(&v.0);
++                    } else {
++                        *n -= 1;
++                    }
++                } else {
++                    self.cmp_replay.remove(&v.0);
++                }
+                 return Some(rec);
+             }
+         }
+         None
+     }
+ 
++    /// If `cond` is the destination of an And/Or eligible for the De Morgan
++    /// branch split, consume the record so the branch can re-emit both
++    /// comparisons with a short-circuit jump between them.
++    fn take_demorgan(&mut self, cond: &Operand) -> Option<(u32, DemorganRec)> {
++        if let Operand::Value(v) = cond {
++            if let Some(rec) = self.demorgan_branch.remove(&v.0) {
++                return Some((v.0, rec));
++            }
++        }
++        None
++    }
++
+     #[inline]
+     fn invert_jcc(cc: &str) -> &'static str {
+         match cc {
+@@ -971,59 +1102,48 @@ impl X86Codegen {
+         let hot_next = next == Some(hot);
+         let cold_next = next == Some(cold);
+ 
+-        // BOOL-PAIR (AND-of-compares) branch fusion: the condition is an
+-        // And of two single-use integer compares recorded by the replay
+-        // scan. Both compares are pure, so the And never materializes and
+-        // the branch re-emits them as a short-circuit chain:
+-        //
+-        //   And, hot next (fallthrough = true target):
+-        //       cmp1; j<inv1> cold; cmp2; j<inv2> cold;   (fall into hot)
+-        //   And, cold next (fallthrough = false target):
+-        //       cmp1; j<inv1> cold; cmp2; j<cmp2> hot;    (fall into cold)
+-        //   And, neither successor next: the cold-next shape plus an
+-        //       explicit tail `jmp cold` (fall-through is unrelated).
+-        //
+-        // 4 instructions instead of cmp+setcc+movzbl x2 + andl (+test/je)
+-        // and two fewer live booleans. Each leg's own emission already
+-        // happened at its IR position (materialization skipped); replaying
+-        // them here is the same contract the single-Cmp compare-replay
+-        // uses. Soundness note: emit_jcc_block to `cold`/`hot` targets the
+-        // BLOCK LABELS, so control flow is exact regardless of what the
+-        // layout pass placed next; the only difference between the two
+-        // shapes is which side avoids the extra jump.
+-        if let Operand::Value(cond_v) = cond {
 -            if let Some((o1, l1, r1, t1, o2, l2, r2, t2)) = self.cmp_bool_pair.remove(&cond_v.0) {
-+            if let Some(pair) = self.cmp_bool_pair.remove(&cond_v.0) {
-                 self.state.reg_cache.invalidate_acc();
+-                self.state.reg_cache.invalidate_acc();
 -                let jcc1 = Self::cmp_jcc(o1);
 -                let jcc2 = Self::cmp_jcc(o2);
 -                self.emit_int_cmp_replay_insn(&l1, &r1, t1);
-+                let jcc1 = Self::cmp_jcc(pair.op1);
-+                let jcc2 = Self::cmp_jcc(pair.op2);
-+                self.emit_int_cmp_replay_insn(&pair.lhs1, &pair.rhs1, pair.ty1);
++        // DE MORGAN SPLIT: `CondBranch(And/Or(CmpA, CmpB))` with all three
++        // skipped at their own positions. Re-emit cmpA, short-circuit-jump
++        // on the decided outcome (And: !A → false; Or: A → true), re-emit
++        // cmpB, then branch on B with the usual hot/cold layout. Kills two
++        // boolean materializations (setcc+movzbl each) plus the And/Or plus
++        // the test per branch (lz4's match-length checks). The jumps always
++        // emit (even to the next block — a jcc to next skips the rest of
++        // this block, which is exactly the short-circuit semantic).
++        if let Some((andor_id, rec)) = self.take_demorgan(cond) {
++            if demorgan_debug_enabled() {
++                eprintln!("[demorgan] fire andor={} is_and={}", andor_id, rec.is_and);
++            }
++            self.state.reg_cache.invalidate_acc();
++            self.emit_int_cmp_replay_insn(&rec.a.1, &rec.a.2, rec.a.3);
++            if rec.is_and {
                  self.state
                      .out
-                     .emit_jcc_block(Self::invert_jcc(jcc1), cold.0);
+-                    .emit_jcc_block(Self::invert_jcc(jcc1), cold.0);
 -                self.emit_int_cmp_replay_insn(&l2, &r2, t2);
-+                self.emit_int_cmp_replay_insn(&pair.lhs2, &pair.rhs2, pair.ty2);
-                 if hot_next {
-                     self.state
-                         .out
+-                if hot_next {
+-                    self.state
+-                        .out
+-                        .emit_jcc_block(Self::invert_jcc(jcc2), cold.0);
+-                    // Fall-through reaches the hot successor.
+-                } else {
+-                    self.state.out.emit_jcc_block(jcc2, hot.0);
+-                    // Fall-through reaches the cold successor ONLY when the
+-                    // layout placed it next. The fused chain is a
+-                    // two-target branch: when NEITHER successor is the
+-                    // physically next block, an explicit tail jump is
+-                    // mandatory or the both-compares-true path falls into
+-                    // an unrelated block (the missing tail `jmp cold` was a
+-                    // real control-flow corruption — this arm was the only
+-                    // branch emitter without the guard). Mirrors the
+-                    // FP/int flag-fusion and compare-replay arms exactly.
+-                    if !cold_next {
+-                        self.state.out.emit_jmp_block(cold.0);
+-                    }
++                    .emit_jcc_block(Self::invert_jcc(Self::cmp_jcc(rec.a.0)), false_block.0);
++            } else {
++                self.state
++                    .out
++                    .emit_jcc_block(Self::cmp_jcc(rec.a.0), true_block.0);
++            }
++            self.emit_int_cmp_replay_insn(&rec.b.1, &rec.b.2, rec.b.3);
++            let jcc_b = Self::cmp_jcc(rec.b.0);
++            let jcc_hot = if pref_true {
++                jcc_b
++            } else {
++                Self::invert_jcc(jcc_b)
++            };
++            if hot_next {
++                self.state
++                    .out
++                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
++            } else {
++                self.state.out.emit_jcc_block(jcc_hot, hot.0);
++                if !cold_next {
++                    self.state.out.emit_jmp_block(cold.0);
+                 }
+-                self.state.reg_cache.invalidate_all();
+-                return;
+             }
++            self.state.reg_cache.invalidate_all();
++            return;
+         }
+ 
+         // FLAG FUSION (FP): the condition is the direct result of an
+@@ -2014,4 +2134,85 @@ mod tests {
+     fn replays_when_the_redefinition_is_the_compare_itself() {
+         assert!(scan(vec![cp(5, 9), cmp7(5)]).replay.contains_key(&7));
+     }
++
++    fn sel(d: u32) -> Instruction {
++        Instruction::Select {
++            dest: Value(d),
++            cond: Operand::Value(Value(7)),
++            true_val: Operand::Value(Value(20 + d)),
++            false_val: Operand::Value(Value(30 + d)),
++            ty: IrType::I32,
++        }
++    }
++
++    fn scan_n(body: Vec<Instruction>, n_uses: u32, term_branch_on_7: bool) -> CmpReplayScan {
++        let term = if term_branch_on_7 {
++            Terminator::CondBranch {
++                cond: Operand::Value(Value(7)),
++                true_label: BlockId(0),
++                false_label: BlockId(1),
++            }
++        } else {
++            Terminator::Return(None)
++        };
++        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
++        f.blocks = vec![
++            blk(0, body, term),
++            blk(1, Vec::new(), Terminator::Return(None)),
++        ];
++        f.next_value_id = 100;
++        let mut use_counts = FxHashMap::default();
++        use_counts.insert(7u32, n_uses);
++        compute_cmp_replay_scan(&f, &use_counts, &FxHashMap::default())
++    }
++
++    /// The min/max shape: two selects share one bounds compare; each
++    /// re-emits it (binary_search's lo/hi updates).
++    #[test]
++    fn admits_two_selects_sharing_one_compare() {
++        let s = scan_n(vec![cmp7(5), sel(10), sel(11)], 2, false);
++        assert!(s.replay.contains_key(&7));
++        assert_eq!(s.replay_multi.get(&7), Some(&2));
++    }
++
++    /// The loop-back shape: two selects plus the terminator branch share
++    /// the bool; the branch re-emits like any select (linux_find_bit).
++    #[test]
++    fn admits_selects_plus_terminator_branch() {
++        let s = scan_n(vec![cmp7(5), sel(10), sel(11)], 3, true);
++        assert!(s.replay.contains_key(&7));
++        assert_eq!(s.replay_multi.get(&7), Some(&3));
++    }
++
++    /// Partial coverage is unsound: the Copy consumer would read the
++    /// never-materialized boolean, so the whole record is refused.
++    #[test]
++    fn refuses_multi_when_a_use_is_not_a_select() {
++        let s = scan_n(vec![cmp7(5), sel(10), cp(9, 7)], 2, false);
++        assert!(!s.replay.contains_key(&7));
++    }
++
++    /// The redefinition guard spans to the LAST select: an operand
++    /// redefined between the two selects poisons the second re-emission.
++    #[test]
++    fn refuses_multi_when_an_operand_dies_between_selects() {
++        let s = scan_n(vec![cmp7(5), sel(10), cp(5, 9), sel(11)], 2, false);
++        assert!(!s.replay.contains_key(&7));
++    }
++
++    /// Multi-select replay is integer-only; float Cmps keep the
++    /// single-use fp_select path even with several selects.
++    #[test]
++    fn refuses_multi_for_float_compares() {
++        let fcmp = Instruction::Cmp {
++            dest: Value(7),
++            op: IrCmpOp::Slt,
++            lhs: Operand::Value(Value(5)),
++            rhs: Operand::Const(IrConst::F64(0.0)),
++            ty: IrType::F64,
++        };
++        let s = scan_n(vec![fcmp, sel(10), sel(11)], 2, false);
++        assert!(!s.replay.contains_key(&7));
++        assert!(!s.fp_select.contains_key(&7));
++    }
+ }
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 322bbcde1..8afe0cc72 100644
+index 322bbcde..968df204 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
-@@ -671,20 +671,9 @@ pub struct X86Codegen {
-     /// BOOL-PAIR (AND-of-compares) branch fusion: And-binop dest (branch
-     /// condition) -> both legs' compares; the branch re-emits them as a
-     /// short-circuit jcc chain. `bool_pair_cmps` are the leg Cmp dests whose
+@@ -668,24 +668,14 @@ pub struct X86Codegen {
+     /// recorded operands and uses cmovcc/jcc directly instead of testing the
+     /// materialized boolean (setcc/movzbl/testq chain). Keyed by Cmp dest.
+     pub(super) cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+-    /// BOOL-PAIR (AND-of-compares) branch fusion: And-binop dest (branch
+-    /// condition) -> both legs' compares; the branch re-emits them as a
+-    /// short-circuit jcc chain. `bool_pair_cmps` are the leg Cmp dests whose
 -    /// setcc/movzbl materialization is skipped.
 -    pub(super) cmp_bool_pair: FxHashMap<
 -        u32,
@@ -222,31 +1740,181 @@ index 322bbcde1..8afe0cc72 100644
 -            IrType,
 -        ),
 -    >,
-+    /// setcc/movzbl materialization is skipped. The entry carries each
-+    /// leg's Cmp dest so post-RA pruning can un-skip both legs atomically.
-+    pub(super) cmp_bool_pair: FxHashMap<u32, super::comparison::CmpBoolPair>,
-     pub(super) bool_pair_cmps: FxHashSet<u32>,
+-    pub(super) bool_pair_cmps: FxHashSet<u32>,
++    pub(super) cmp_replay_multi: FxHashMap<u32, u32>,
++    /// De Morgan branch records (post-prune): And/Or dest → record. The
++    /// CondBranch consumes the record and re-emits both comparisons with a
++    /// short-circuit jump. Cleared per function; survivors only.
++    pub(super) demorgan_branch: FxHashMap<u32, super::comparison::DemorganRec>,
++    /// And/Or + Cmp dests skipped at their own positions by the De Morgan
++    /// split (machinst claim, alu And/Or gate, Cmp gate). Post-prune only.
++    pub(super) demorgan_skip: FxHashSet<u32>,
      /// CMP-REPLAY operand -> consumer links built with `cmp_replay` (IS-09):
      /// merged into the RA's folded_index_uses so register-homed replay
+     /// operands keep their homes until the consumer re-emits the compare.
+@@ -1083,9 +1073,10 @@ impl X86Codegen {
+             bitop_nonneg_values: FxHashSet::default(),
+             fused_cmp_dests: FxHashMap::default(),
+             fused_forward_dests: FxHashSet::default(),
+-            cmp_bool_pair: FxHashMap::default(),
+-            bool_pair_cmps: FxHashSet::default(),
+             cmp_replay: FxHashMap::default(),
++            cmp_replay_multi: FxHashMap::default(),
++            demorgan_branch: FxHashMap::default(),
++            demorgan_skip: FxHashSet::default(),
+             cmp_replay_operand_links: FxHashMap::default(),
+             fp_select_cmps: FxHashMap::default(),
+             value_use_counts: FxHashMap::default(),
+@@ -6246,6 +6237,34 @@ impl ArchCodegen for X86Codegen {
+         {
+             return false;
+         }
++        // DE MORGAN SPLIT: And/Or + Cmp dests claimed by the branch split
++        // must NOT take the MachInst fast path — the branch re-emits both
++        // comparisons from the recorded operands, and the And/Or emits
++        // nothing at all. Claiming them here would materialize booleans the
++        // split was built to kill (and strand the skip-set: the text-path
++        // gates below would see an already-lowered instruction).
++        if let crate::ir::reexports::Instruction::BinOp { dest, .. } = inst {
++            if self.demorgan_skip.contains(&dest.0) {
++                return false;
++            }
++        }
++        if let crate::ir::reexports::Instruction::Cmp { dest, .. } = inst {
++            if self.demorgan_skip.contains(&dest.0) {
++                return false;
++            }
++        }
++        // Same for the Copy/Cast passthru (`bool c = a&&b; if (c)`): it is
++        // skipped by the text-path gates below, never MachInst-claimed.
++        if let crate::ir::reexports::Instruction::Copy { dest, .. } = inst {
++            if self.demorgan_skip.contains(&dest.0) {
++                return false;
++            }
++        }
++        if let crate::ir::reexports::Instruction::Cast { dest, .. } = inst {
++            if self.demorgan_skip.contains(&dest.0) {
++                return false;
++            }
++        }
+         // TLS symbols must NOT take the MachInst LeaSym fast path: it lowers
+         // GlobalAddr to a plain `leaq sym(%rip)`, which for a __thread symbol
+         // computes the address of the .tdata TEMPLATE, not the calling
+@@ -6390,21 +6409,6 @@ impl ArchCodegen for X86Codegen {
+                 return false;
+             }
+         }
+-        // BOOL-PAIR (AND-of-compares) branch fusion: a fused And emits
+-        // NOTHING (the branch replays both leg compares). Keep it on the
+-        // text path so emit_int_binop_impl's skip is the single point of
+-        // enforcement — the MachInst window lowering would happily emit a
+-        // real `andl` reading the legs' skipped boolean homes.
+-        if let crate::ir::reexports::Instruction::BinOp {
+-            dest,
+-            op: crate::ir::reexports::IrBinOp::And,
+-            ..
+-        } = inst
+-        {
+-            if self.cmp_bool_pair.contains_key(&dest.0) {
+-                return false;
+-            }
+-        }
+         // W2 Load->Cast folding is a two-instruction runtime handshake: the
+         // default Load emitter redirects into the Cast destination and arms
+         // fold_skip_cast; the default Cast emitter consumes that handshake.
+@@ -6502,8 +6506,7 @@ impl ArchCodegen for X86Codegen {
+             }
+             crate::ir::reexports::Instruction::Cmp { dest, .. }
+                 if self.fused_cmp_dests.contains_key(&dest.0)
+-                    || self.cmp_replay.contains_key(&dest.0)
+-                    || self.bool_pair_cmps.contains(&dest.0) =>
++                    || self.cmp_replay.contains_key(&dest.0) =>
+             {
+                 // Fused candidates keep their flags for the adjacent consumer;
+                 // REPLAY candidates are emitted by the mature path's Cmp
+@@ -7494,6 +7497,12 @@ impl ArchCodegen for X86Codegen {
+         if self.fused_forward_dests.contains(&dest.0) {
+             return;
+         }
++        // DE MORGAN SPLIT: Copy passthru (`bool c = a&&b; if (c)`) — the
++        // branch replays the original comparisons, so the renamed boolean
++        // is never read; emitting the mov would copy a never-written home.
++        if self.demorgan_skip.contains(&dest.0) {
++            return;
++        }
+         // Handle vector Copy instructions: %dest_vec = copy %src_vec
+         // Vectors are stored directly in stack slots (not as pointers), so we copy
+         // with ymm/xmm registers instead of scalar movq.
 diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index bc41941e0..c58467d8a 100644
+index bc41941e..b5ed6315 100644
 --- a/src/backend/x86/codegen/prologue.rs
 +++ b/src/backend/x86/codegen/prologue.rs
-@@ -1554,20 +1554,22 @@ impl X86Codegen {
-                     }
-                 };
-                 let mut prune_pairs: Vec<u32> = Vec::new();
+@@ -923,8 +923,7 @@ impl X86Codegen {
+             let replay_scan = super::comparison::compute_cmp_replay_scan(func, &use_counts, &fused);
+             self.cmp_replay_operand_links = replay_scan.operand_links;
+             self.cmp_replay = replay_scan.replay;
+-            self.cmp_bool_pair = replay_scan.bool_pair;
+-            self.bool_pair_cmps = replay_scan.bool_pair_cmps;
++            self.cmp_replay_multi = replay_scan.replay_multi;
+             // FP-SELECT (S05): float Cmps whose boolean feeds only Selects.
+             // The Cmp emitter skips the ucomisd/setcc boolean entirely; every
+             // select re-derives a vcmpsd/vcmpss mask from the recorded
+@@ -933,6 +932,13 @@ impl X86Codegen {
+             // whose operands became unreadable falls back to re-materializing
+             // the boolean (emit_fp_cmp_boolean) and the ordinary cmov path.
+             self.fp_select_cmps = replay_scan.fp_select;
++            // DE MORGAN SPLIT (branch-join): And/Or dests whose branch
++            // re-emits both comparisons. Stored UNPRUNED here; the
++            // post-slot-assignment prune below (after
++            // calculate_stack_space_common) drops entries whose operands
++            // are unreadable at the terminator and builds the skip set.
++            self.demorgan_branch = replay_scan.demorgan;
++            self.demorgan_skip.clear();
+ 
+             self.fused_cmp_dests = fused;
+             self.fused_forward_dests = fused_forward;
+@@ -1522,54 +1528,7 @@ impl X86Codegen {
+             }
+             for d in prune {
+                 self.cmp_replay.remove(&d);
+-            }
+-            // ── BOOL-PAIR post-RA prune ─────────────────────────────────────
+-            // Same readability contract as the replay prune: the branch
+-            // re-reads all four leg operands at the branch position. A pair
+-            // with any unreadable operand is dropped ATOMICALLY — including
+-            // its two bool_pair_cmps members — so both Cmps fall back to
+-            // materializing their booleans at their own positions and the
+-            // And emits the ordinary andl. That fallback must be all-or-
+-            // nothing: a half-pruned pair would skip one leg's setcc and
+-            // read a boolean that was never written.
+-            {
+-                let ext_active = !self.state.ra_config.no_folded_index_liveness;
+-                let acc_no_home: crate::common::fx_hash::FxHashSet<u32> =
+-                    accumulator_assignments.iter().map(|a| a.value_id).collect();
+-                let readable = |op: &Operand| -> bool {
+-                    match op {
+-                        Operand::Const(_) => true,
+-                        Operand::Value(v) => {
+-                            if self.state.get_slot(v.0).is_some() {
+-                                return true;
+-                            }
+-                            if self.reg_assignments.contains_key(&v.0) {
+-                                return ext_active;
+-                            }
+-                            if acc_no_home.contains(&v.0) {
+-                                return false;
+-                            }
+-                            false
+-                        }
+-                    }
+-                };
+-                let mut prune_pairs: Vec<u32> = Vec::new();
 -                for (adest, (_o1, l1, r1, _t1, _o2, l2, r2, _t2)) in self.cmp_bool_pair.iter() {
 -                    if ![l1, r1, l2, r2].iter().all(|op| readable(op)) {
-+                for (adest, pair) in self.cmp_bool_pair.iter() {
-+                    if ![&pair.lhs1, &pair.rhs1, &pair.lhs2, &pair.rhs2]
-+                        .iter()
-+                        .all(|op| readable(op))
-+                    {
-                         prune_pairs.push(*adest);
-                     }
-                 }
-                 for adest in prune_pairs {
+-                        prune_pairs.push(*adest);
+-                    }
+-                }
+-                for adest in prune_pairs {
 -                    if let Some((_o1, l1, r1, _t1, _o2, l2, r2, _t2)) =
 -                        self.cmp_bool_pair.remove(&adest)
 -                    {
@@ -255,191 +1923,841 @@ index bc41941e0..c58467d8a 100644
 -                                self.bool_pair_cmps.remove(&v.0);
 -                            }
 -                        }
-+                    // Un-skip by LEG DEST, not by leg operand: the skip set
-+                    // holds the two Cmps' dests. Removing operand ids here
-+                    // would leave both legs skipped while the And falls
-+                    // back to a real `andl` over never-written homes.
-+                    if let Some(pair) = self.cmp_bool_pair.remove(&adest) {
-+                        self.bool_pair_cmps.remove(&pair.dest1);
-+                        self.bool_pair_cmps.remove(&pair.dest2);
-                     }
-                 }
+-                    }
+-                }
++                self.cmp_replay_multi.remove(&d);
              }
-diff --git a/tests/regression/check_bool_pair_prune.sh b/tests/regression/check_bool_pair_prune.sh
-new file mode 100755
-index 000000000..fcb03762c
+             // ── FP-SELECT post-RA prune (S05) ───────────────────────────────
+             // Same readability contract as the replay prune above: a select
+@@ -1938,6 +1897,100 @@ impl X86Codegen {
+             cached_liveness,
+         );
+ 
++        // ── DE MORGAN post-slot-assignment prune ────────────────────────
++        // Same readability contract as the compare-replay prune above
++        // (Const, slot, register home with the folded-index extension
++        // active; accumulator-only and homeless operands are out), but
++        // positioned AFTER calculate_stack_space_common: the tiered slot
++        // allocator runs there, so a value that WILL be slot-homed reads
++        // as homeless at the earlier prune point (lz4's match-length
++        // And: both Cmp operands are tier-spilled AFTER the replay
++        // prune, and pruning here instead of there is the difference
++        // between cmp;jcc;cmp;jcc and setcc+andl). Survivors populate
++        // the skip set (the And/Or + both Cmp dests emit nothing at
++        // their own positions); pruned entries fall back to the
++        // ordinary materialize-the-booleans path. The operand links
++        // were already consumed by the RA above — the prune only
++        // affects emission, so a retained link for a pruned entry only
++        // over-constrains the allocator, never under-constrains.
++        if !self.demorgan_branch.is_empty() {
++            let ext_active = !self.state.ra_config.no_folded_index_liveness;
++            let acc_no_home: crate::common::fx_hash::FxHashSet<u32> =
++                accumulator_assignments.iter().map(|a| a.value_id).collect();
++            let debug = super::comparison::demorgan_debug_enabled();
++            let mut prune_dm: Vec<u32> = Vec::new();
++            for (andor_id, rec) in self.demorgan_branch.iter() {
++                let readable = |op: &Operand| -> bool {
++                    match op {
++                        Operand::Const(_) => true,
++                        Operand::Value(v) => {
++                            if self.state.get_slot(v.0).is_some() {
++                                return true;
++                            }
++                            if self.reg_assignments.contains_key(&v.0) {
++                                return ext_active;
++                            }
++                            if acc_no_home.contains(&v.0) {
++                                return false;
++                            }
++                            false
++                        }
++                    }
++                };
++                let ops = [&rec.a.1, &rec.a.2, &rec.b.1, &rec.b.2];
++                if debug {
++                    let homes: Vec<String> = ops
++                        .iter()
++                        .map(|op| match op {
++                            Operand::Const(_) => "const".to_string(),
++                            Operand::Value(v) => {
++                                if self.state.get_slot(v.0).is_some() {
++                                    format!("v{}:slot", v.0)
++                                } else if self.reg_assignments.contains_key(&v.0) {
++                                    format!("v{}:reg", v.0)
++                                } else {
++                                    format!("v{}:none", v.0)
++                                }
++                            }
++                        })
++                        .collect();
++                    eprintln!(
++                        "[demorgan] prune-check andor={} homes=[{}]",
++                        andor_id,
++                        homes.join(", ")
++                    );
++                }
++                // NOTE: skipped defs (the And/Or, its passthru, both Cmps)
++                // need NO accumulator-homing refusal. The accumulator
++                // assignment is not an emission path — it only tells slot
++                // assignment the value needs no home (it passes through
++                // %rax between adjacent def/use, set at def emission via
++                // the acc cache). A skipped def never emits, so it never
++                // sets an acc entry; its only reader is skipped (branch
++                // replays, passthru skipped) or is the branch itself.
++                // Only the OPERAND readability above matters (an acc-only
++                // operand has no readable home at the replay distance).
++                if ops.iter().any(|op| !readable(op)) {
++                    if debug {
++                        eprintln!("[demorgan] prune andor={}", andor_id);
++                    }
++                    prune_dm.push(*andor_id);
++                } else if debug {
++                    eprintln!("[demorgan] survive andor={}", andor_id);
++                }
++            }
++            for d in prune_dm {
++                self.demorgan_branch.remove(&d);
++            }
++            self.demorgan_skip.clear();
++            for (andor_id, rec) in self.demorgan_branch.iter() {
++                self.demorgan_skip.insert(*andor_id);
++                self.demorgan_skip.insert(rec.binop_id);
++                self.demorgan_skip.insert(rec.cmp_dests[0]);
++                self.demorgan_skip.insert(rec.cmp_dests[1]);
++            }
++        }
++
+         // Allocate spill slots for Phase 2b caller-saved-spanning registers.
+         self.caller_save_spill_slots.clear();
+         self.caller_save_intervals.clear();
+diff --git a/src/passes/gvn.rs b/src/passes/gvn.rs
+index 6b5a584f..a72b3b30 100644
+--- a/src/passes/gvn.rs
++++ b/src/passes/gvn.rs
+@@ -15,7 +15,8 @@
+ //! - Cast (type-to-type conversions)
+ //! - GetElementPtr (base + offset address computation)
+ //! - Load (redundant load elimination within dominator scope, invalidated
+-//!   by stores, calls, and other memory-clobbering instructions)
++//!   by stores, calls, and other memory-clobbering instructions; integer
++//!   loads also CSE across signedness, see `XLoadUseKind`)
+ 
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::common::types::{AddressSpace, IrType};
+@@ -98,6 +99,40 @@ struct MemoryVersion {
+     base: u64,
+ }
+ 
++/// Load-CSE table entry: the canonical value, the EXACT load type it was
++/// recorded from (the key holds the signedness-normalized type), whether
++/// the canonical is a genuine `Load` instruction (vs a store-forwarded
++/// `Copy`), and the memory version at record time.
++///
++/// Cross-signedness CSE (an I8 canonical feeding a U8 candidate, etc.) is
++/// only sound for genuine-load canonicals: their register home then has a
++/// known extension (movsbl/movzbl), which the candidate-side use rule
++/// relies on. Forwarded entries stay exact-type-only.
++#[derive(Debug, Clone, Copy)]
++struct LoadCseEntry {
++    canon: Value,
++    canon_ty: IrType,
++    canon_is_plain_load: bool,
++    version: MemoryVersion,
++}
++
++/// Sole-use classification for cross-signedness load CSE (see
++/// `find_value_use_info`). Only the first three kinds read at most the
++/// low bits (or re-extend) from a sign-extended home, so only they admit
++/// a sext-home canonical for a zext-typed candidate.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum XLoadUseKind {
++    /// `Cmp` operand (8/16-bit cmps read the low sub-register only).
++    CmpVal,
++    /// `Cast` source with an integer-only target (int widens re-extract).
++    CastIntSrc,
++    /// `Store` value operand (`movb`/`movw` store the low bits only).
++    StoreVal,
++    /// Anything else (binops read full registers, calls/returns/terminators
++    /// have unverified narrow staging, ptr roles need full addresses).
++    Other,
++}
++
+ /// A provably-distinct memory object a pointer may be rooted at.  Load-CSE and
+ /// store-to-load-forwarding entries keyed on such an object only need to be
+ /// invalidated by stores through pointers rooted at the SAME object.
+@@ -193,8 +228,8 @@ struct GvnState {
+     next_vn: u32,
+     /// Pure expression -> canonical value (not memory-dependent).
+     expr_to_value: FxHashMap<ExprKey, Value>,
+-    /// Load expression -> canonical value and memory version.
+-    load_expr_to_value: FxHashMap<ExprKey, (Value, MemoryVersion)>,
++    /// Load expression -> canonical entry (value, exact type, version).
++    load_expr_to_value: FxHashMap<ExprKey, LoadCseEntry>,
+     /// Canonical value numbers for equivalent GEP addresses. The GEP
+     /// instructions themselves are retained, avoiding backend Copy-chain
+     /// hazards while letting memory forwarding recognize equal addresses.
+@@ -241,11 +276,18 @@ struct GvnState {
+     /// against the recorded `sext→v1020` and rewired the second zone
+     /// computation to read the ZONE POINTER — boot page fault).
+     multi_def_values: FxHashSet<u32>,
++    /// Per-value use info for cross-signedness load CSE: value id ->
++    /// (total use count, first-use kind). Computed once per function by
++    /// `find_value_use_info`; candidate counts are stable across the GVN
++    /// walk (rewrites only replace load defs with copies, never add or
++    /// remove uses of a candidate), so a recorded count of 1 plus a safe
++    /// first-use kind is sound at any later lookup.
++    xsign_use_info: FxHashMap<u32, (u32, XLoadUseKind)>,
+     context: GvnContext,
+     /// Rollback log for `expr_to_value`: (key, previous_value).
+     rollback_log: Vec<(ExprKey, Option<Value>)>,
+     /// Rollback log for `load_expr_to_value`: (key, previous_entry).
+-    load_rollback_log: Vec<(ExprKey, Option<(Value, MemoryVersion)>)>,
++    load_rollback_log: Vec<(ExprKey, Option<LoadCseEntry>)>,
+     /// Rollback log for `store_fwd_map`: (key, previous_entry).
+     store_fwd_rollback_log: Vec<(StoreFwdKey, Option<(Operand, MemoryVersion)>)>,
+     /// Rollback log for `value_numbers`: (index, previous_vn).
+@@ -323,6 +365,7 @@ impl GvnState {
+             nonescaping_allocas,
+             noalias_params,
+             multi_def_values,
++            xsign_use_info: FxHashMap::default(),
+             context: context.clone(),
+             rollback_log: Vec::new(),
+             load_rollback_log: Vec::new(),
+@@ -671,8 +714,9 @@ impl GvnState {
+                 },
+                 *dest,
+             )),
+-            // Load CSE: two loads from the same pointer with the same type can be
+-            // CSE'd if no intervening memory modification occurred. The caller
++            // Load CSE: two loads from the same pointer with the same
++            // signedness-normalized integer type can be CSE'd if no intervening
++            // memory modification occurred. The caller
+             // (process_block) handles invalidating Load entries on memory clobbers.
+             //
+             // Excluded from CSE:
+@@ -719,10 +763,14 @@ impl GvnState {
+                 }
+                 let ptr_vn = self.operand_to_vn(&Operand::Value(*ptr));
+                 let ptr_vn = self.canonical_addr_vn(ptr_vn);
++                // Signedness-normalized key: I8/U8 (etc.) loads of the same
++                // address hold the same bits. Exact-type hits keep the
++                // historical same-block rule; cross-signedness hits go
++                // through `cross_type_load_cse_ok`.
+                 Some((
+                     ExprKey::Load {
+                         ptr: ptr_vn,
+-                        ty: *ty,
++                        ty: ty.to_unsigned(),
+                     },
+                     *dest,
+                 ))
+@@ -767,8 +815,19 @@ impl GvnState {
+     /// later loads/stores through an equivalent GEP (possibly over a
+     /// site-local GlobalAddr duplicate) share one memory key.
+     fn record_gep_addr_key(&mut self, base: &Value, offset: &Operand, ty: IrType, vn: u32) {
+-        let Some(cb) = self.canonical_symbol_base_vn(base) else {
+-            return;
++        // Symbol bases canonicalize through the symbol table (so site-local
++        // GlobalAddr duplicates share keys); every other base (params,
++        // allocas, ...) canonicalizes through its own value number. Two GEPs
++        // over the same base value with equal offsets compute the same
++        // address, so unifying their memory keys is sound (loads through
++        // them are still guarded by the memory-version check, and GVN's
++        // single dominator-DFS visit per block cannot span loop backedges).
++        let cb = match self.canonical_symbol_base_vn(base) {
++            Some(cb) => cb,
++            None => match self.operand_to_vn(&Operand::Value(*base)) {
++                VNOperand::ValueNum(v) => v,
++                VNOperand::Const(_) => return,
++            },
+         };
+         let off_vn = self.operand_to_vn(offset);
+         let key = (cb, off_vn, ty);
+@@ -1147,6 +1206,150 @@ pub(crate) fn find_multi_def_values(func: &IrFunction) -> FxHashSet<u32> {
+         .collect()
+ }
+ 
++/// Per-value use info for cross-signedness load CSE: value id -> (total
++/// use count, first-use kind). Instruction uses in `Cmp` operand,
++/// integer-`Cast` source, and `Store` value positions classify to their
++/// safe kinds when (and only when) the value is single-use; every other
++/// use (binops, calls, returns, terminators, pointer roles, copies,
++/// phis, selects, ...) classifies as `XLoadUseKind::Other`.
++fn find_value_use_info(func: &IrFunction) -> FxHashMap<u32, (u32, XLoadUseKind)> {
++    fn is_int_only_cast_target(ty: IrType) -> bool {
++        matches!(
++            ty,
++            IrType::I8
++                | IrType::U8
++                | IrType::I16
++                | IrType::U16
++                | IrType::I32
++                | IrType::U32
++                | IrType::I64
++                | IrType::U64
++        )
++    }
++    let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            inst.for_each_used_value(|v| {
++                *counts.entry(v).or_insert(0) += 1;
++            });
++        }
++        block.terminator.for_each_used_value(|v| {
++            *counts.entry(v).or_insert(0) += 1;
++        });
++    }
++    let mut info: FxHashMap<u32, (u32, XLoadUseKind)> = FxHashMap::default();
++    for (v, c) in &counts {
++        info.insert(*v, (*c, XLoadUseKind::Other));
++    }
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            match inst {
++                Instruction::Cmp { lhs, rhs, .. } => {
++                    for op in [lhs, rhs] {
++                        if let Operand::Value(v) = op {
++                            if let Some(e) = info.get_mut(&v.0) {
++                                if e.0 == 1 {
++                                    e.1 = XLoadUseKind::CmpVal;
++                                }
++                            }
++                        }
++                    }
++                }
++                Instruction::Cast { src, to_ty, .. } if is_int_only_cast_target(*to_ty) => {
++                    if let Operand::Value(v) = src {
++                        if let Some(e) = info.get_mut(&v.0) {
++                            if e.0 == 1 {
++                                e.1 = XLoadUseKind::CastIntSrc;
++                            }
++                        }
++                    }
++                }
++                Instruction::Store { val, .. } => {
++                    if let Operand::Value(v) = val {
++                        if let Some(e) = info.get_mut(&v.0) {
++                            if e.0 == 1 {
++                                e.1 = XLoadUseKind::StoreVal;
++                            }
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++    info
++}
++
++/// Cross-signedness load-CSE legality: candidate `cand` (exact type
++/// `cand_ty`) against canonical `canon` (exact type `canon_ty`), known to
++/// share the signedness-normalized key with `canon_ty != cand_ty`.
++///
++/// Soundness cases:
++/// - 64-bit pairs are bit-identical `movq` loads: unconditional.
++/// - A zext-home canonical (U8/U16/U32) feeding an I8/I16/I32 candidate:
++///   every narrow signed lowering re-extracts from (or reads only) the
++///   low sub-register, so the zero-extended home is always safe.
++/// - A sext-home canonical (I8/I16/I32) feeding a U8/U16/U32 candidate:
++///   sound only when the candidate's single use reads at most the low
++///   bits (`Cmp`, integer `Cast`, `Store` value). Binops read full
++///   registers, float casts/utrunc assume pre-extended homes, and
++///   copies/phis/selects would propagate the sext home to unverified
++///   users — all excluded.
++fn cross_type_load_cse_ok(
++    state: &GvnState,
++    canon_ty: IrType,
++    canon_is_plain_load: bool,
++    cand: Value,
++    cand_ty: IrType,
++) -> bool {
++    // Canonical must be a genuine load (known home extension) ...
++    if !canon_is_plain_load {
++        return false;
++    }
++    // ... and the candidate single-definition (all its uses read this load).
++    // (The canonical's multi-def is already excluded by the caller lookup.)
++    if state.multi_def_values.contains(&cand.0) {
++        return false;
++    }
++    // Defensive: only same-width plain integers (the normalized key match
++    // already implies this; never trust it blindly).
++    fn is_plain_int(ty: IrType) -> bool {
++        matches!(
++            ty,
++            IrType::I8
++                | IrType::U8
++                | IrType::I16
++                | IrType::U16
++                | IrType::I32
++                | IrType::U32
++                | IrType::I64
++                | IrType::U64
++        )
++    }
++    if !is_plain_int(canon_ty) || !is_plain_int(cand_ty) {
++        return false;
++    }
++    if canon_ty.size() != cand_ty.size() {
++        return false;
++    }
++    // 64-bit loads are bit-identical movq: unconditional.
++    if canon_ty.size() == 8 {
++        return true;
++    }
++    // Zext-home canonical (reverse direction): unconditional.
++    if canon_ty.is_unsigned() {
++        return true;
++    }
++    // Sext-home canonical (forward direction): single safe use only.
++    matches!(
++        state.xsign_use_info.get(&cand.0),
++        Some((
++            1,
++            XLoadUseKind::CmpVal | XLoadUseKind::CastIntSrc | XLoadUseKind::StoreVal
++        ))
++    )
++}
++
+ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &GvnContext) -> usize {
+     let num_blocks = func.blocks.len();
+     if num_blocks == 0 || function_uses_128(func) {
+@@ -1170,6 +1373,7 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
+             noalias,
+             multi_def,
+         );
++        state.xsign_use_info = find_value_use_info(func);
+         return process_block(0, func, &mut state);
+     }
+     let cfg = analysis::CfgAnalysis::build(func);
+@@ -1210,6 +1414,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
+             noalias,
+             multi_def,
+         );
++        state.xsign_use_info = find_value_use_info(func);
+         return process_block(0, func, &mut state);
+     }
+     let mut state = GvnState::new(
+@@ -1224,6 +1429,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
+         noalias,
+         multi_def,
+     );
++    state.xsign_use_info = find_value_use_info(func);
+     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
+     state.total_eliminated
+ }
+@@ -1450,13 +1656,19 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
+                 // This catches the pattern: store V -> *P; load *P -> replace with V.
+                 if is_load {
+                     if let ExprKey::Load {
+-                        ptr: ref ptr_vn,
+-                        ty,
++                        ptr: ref ptr_vn, ..
+                     } = expr_key
+                     {
++                        // Store-forward keys use the EXACT load type (stores
++                        // record exact types): the normalized key type would
++                        // break I8-store -> U8-load forwarding.
++                        let exact_ty = match &inst {
++                            Instruction::Load { ty, .. } => *ty,
++                            _ => unreachable!("load expr key from non-load"),
++                        };
+                         let fwd_key = StoreFwdKey {
+                             ptr_vn: ptr_vn.clone(),
+-                            ty,
++                            ty: exact_ty,
+                         };
+                         if let Some((stored_op, version)) = state.store_fwd_map.get(&fwd_key) {
+                             let stored_is_multi_def = matches!(stored_op, Operand::Value(v)
+@@ -1501,8 +1713,15 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
+                                 // same pointer can CSE with this load's dest.
+                                 let version = state.memory_version(ptr_vn);
+                                 let load_key_for_log = expr_key.clone();
+-                                let old_load =
+-                                    state.load_expr_to_value.insert(expr_key, (dest, version));
++                                let old_load = state.load_expr_to_value.insert(
++                                    expr_key,
++                                    LoadCseEntry {
++                                        canon: dest,
++                                        canon_ty: exact_ty,
++                                        canon_is_plain_load: false,
++                                        version,
++                                    },
++                                );
+                                 state.load_rollback_log.push((load_key_for_log, old_load));
+                                 new_instructions.push(Instruction::Copy {
+                                     dest,
+@@ -1517,23 +1736,8 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
+                 }
+ 
+                 // Look up: check pure expr map, or load map with generation check
+-                let existing = if is_load {
+-                    let ptr_vn = match &expr_key {
+-                        ExprKey::Load { ptr, .. } => ptr.clone(),
+-                        _ => unreachable!(),
+-                    };
+-                    state
+-                        .load_expr_to_value
+-                        .get(&expr_key)
+-                        .and_then(|&(val, version)| {
+-                            if state.entry_valid_for(&ptr_vn, version)
+-                                && !state.multi_def_values.contains(&val.0)
+-                            {
+-                                Some(val)
+-                            } else {
+-                                None
+-                            }
+-                        })
++                let existing_pure: Option<Value> = if is_load {
++                    None
+                 } else {
+                     state
+                         .expr_to_value
+@@ -1541,14 +1745,70 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
+                         .copied()
+                         .filter(|ev| !state.multi_def_values.contains(&ev.0))
+                 };
++                let existing_load: Option<(Value, IrType, bool)> = if is_load {
++                    let ptr_vn = match &expr_key {
++                        ExprKey::Load { ptr, .. } => ptr.clone(),
++                        _ => unreachable!(),
++                    };
++                    state.load_expr_to_value.get(&expr_key).and_then(|entry| {
++                        if state.entry_valid_for(&ptr_vn, entry.version)
++                            && !state.multi_def_values.contains(&entry.canon.0)
++                        {
++                            Some((entry.canon, entry.canon_ty, entry.canon_is_plain_load))
++                        } else {
++                            None
++                        }
++                    })
++                } else {
++                    None
++                };
+ 
+-                // Only CSE within the same block to avoid cross-block Copy issues.
+-                // Cross-block CSE creates Copies whose source values may have
+-                // their registers reused by the allocator before the Copy executes.
+-                let same_block_existing = existing.filter(|ev| block_defs.contains(&ev.0));
+-                if let Some(existing_value) = same_block_existing {
++                // Decide the CSE source value, if any. Returns the canonical
++                // plus, for cross-signedness hits, the (canon, candidate)
++                // exact types for the debug trace.
++                let cse_source: Option<(Value, Option<(IrType, IrType)>)> = if let Some(ev) =
++                    existing_pure
++                {
++                    // Only CSE within the same block to avoid cross-block Copy issues.
++                    // Cross-block CSE creates Copies whose source values may have
++                    // their registers reused by the allocator before the Copy executes.
++                    existing_pure
++                        .filter(|v| block_defs.contains(&v.0))
++                        .map(|v| (v, None))
++                } else if let Some((canon, canon_ty, canon_is_load)) = existing_load {
++                    let cand_ty = match &inst {
++                        Instruction::Load { ty, .. } => *ty,
++                        _ => unreachable!("load lookup from non-load"),
++                    };
++                    if canon_ty == cand_ty {
++                        // Exact-type load CSE: same-block only (unchanged).
++                        if block_defs.contains(&canon.0) {
++                            Some((canon, None))
++                        } else {
++                            None
++                        }
++                    } else if cross_type_load_cse_ok(state, canon_ty, canon_is_load, dest, cand_ty)
++                    {
++                        // Cross-signedness hit: the dominator-scoped entry
++                        // guarantees the canonical dominates and no clobber
++                        // sits between, so the cross-block Copy is sound.
++                        Some((canon, Some((canon_ty, cand_ty))))
++                    } else {
++                        None
++                    }
++                } else {
++                    None
++                };
++                if let Some((existing_value, xload_tys)) = cse_source {
+                     if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+-                        eprintln!("[GVNDBG] CSE load dest={} <- {}", dest.0, existing_value.0);
++                        if let Some((canon_ty, cand_ty)) = xload_tys {
++                            eprintln!(
++                                "[GVNDBG] CSE xload dest={} <- {} ({:?}->{:?})",
++                                dest.0, existing_value.0, canon_ty, cand_ty
++                            );
++                        } else {
++                            eprintln!("[GVNDBG] CSE load dest={} <- {}", dest.0, existing_value.0);
++                        }
+                     }
+                     let idx = existing_value.0 as usize;
+                     let existing_vn = if idx < state.value_numbers.len()
+@@ -1602,7 +1862,19 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
+                         };
+                         let version = state.memory_version(&ptr_vn);
+                         let key_for_log = expr_key.clone();
+-                        let old_val = state.load_expr_to_value.insert(expr_key, (dest, version));
++                        let record_ty = match &inst {
++                            Instruction::Load { ty, .. } => *ty,
++                            _ => unreachable!("load record from non-load"),
++                        };
++                        let old_val = state.load_expr_to_value.insert(
++                            expr_key,
++                            LoadCseEntry {
++                                canon: dest,
++                                canon_ty: record_ty,
++                                canon_is_plain_load: true,
++                                version,
++                            },
++                        );
+                         state.load_rollback_log.push((key_for_log, old_val));
+                     } else {
+                         let key_for_log = expr_key.clone();
+diff --git a/tests/regression/check_demorgan_branch_split.sh b/tests/regression/check_demorgan_branch_split.sh
+new file mode 100644
+index 00000000..c9302456
 --- /dev/null
-+++ b/tests/regression/check_bool_pair_prune.sh
-@@ -0,0 +1,117 @@
++++ b/tests/regression/check_demorgan_branch_split.sh
+@@ -0,0 +1,26 @@
 +#!/usr/bin/env bash
-+# ============================================================================
-+# check_bool_pair_prune.sh — pin the bool-pair post-RA prune's atomicity.
-+#
-+# The bool-pair fusion skips both legs' setcc/movzbl and re-emits the
-+# compares at the branch. When a leg operand has no readable home at the
-+# branch (post-RA prune in prologue.rs), the pair must be dropped
-+# ATOMICALLY: the And entry AND both legs' skip memberships. A prune that
-+# forgets the leg dests leaves both setccs skipped while the And falls
-+# back to a real `andl` over never-written boolean homes (half-pruned
-+# miscompile — every leg reads stale garbage).
-+#
-+# Pruning is deterministic under CCC_NO_FOLDED_INDEX_LIVENESS=1 (register
-+# homes lose their replay guarantee there), so each input below runs
-+# differentially (lccc vs gcc) at default flags AND with the prune-forcing
-+# env var. Pre-fix binaries fail the nofold leg (all-true branches).
-+# ============================================================================
-+set -euo pipefail
++# De Morgan branch split: the And-direct site (fill) and the Or-cast
++# passthru site (scan) must both fire, and the split binary must agree
++# with the unsplit baseline (CCC_NO_DEMORGAN=1) on the checksum.
++set -eu
 +
-+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-+CCC=${CCC:-$here/../../target/fastbuild/lccc}
-+[[ -x $CCC ]] || { echo "check_bool_pair_prune: lccc not found at $CCC" >&2; exit 1; }
++CCC=${CCC:-./target/fastbuild/lccc}
++dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++tmp="${TMPDIR:-/tmp}/lccc-demorgan-split.$$"
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++mkdir -p "$tmp"
 +
-+work=$(mktemp -d)
-+trap 'rm -rf "$work"' EXIT
++LCCC_DEBUG_DEMORGAN=1 "$CCC" -O2 "$dir/demorgan_branch_split.c" \
++    -o "$tmp/test" 2>"$tmp/compile.log"
++# Exactly one And fire and one Or fire.
++test "$(grep -c '^\[demorgan\] fire andor=[0-9]* is_and=true$' "$tmp/compile.log")" -eq 1
++test "$(grep -c '^\[demorgan\] fire andor=[0-9]* is_and=false$' "$tmp/compile.log")" -eq 1
 +
-+fail=0
++"$tmp/test" >"$tmp/run.log"
++grep -Eq '^OK demorgan_branch_split [0-9]+$' "$tmp/run.log"
 +
-+# BinOp-fed legs: each leg compares an immediately-produced value, so under
-+# the nofold switch the leg operands are unreadable at the branch and the
-+# pair must prune back to two materialized booleans + andl. The global
-+# accumulator is load-bearing: its load/add/store traffic shapes the
-+# register homes so the prune actually fires (a local accumulator keeps
-+# everything homed and the test would pass vacuously — verified: pre-fix
-+# binaries print hits=1024 here instead of 256).
-+cat > "$work/prune_binop_legs.c" <<'EOF'
-+#include <stdio.h>
-+int hits;
-+void f(unsigned *a, unsigned n) {
-+    for (unsigned i = 0; i < n; i++) {
-+        unsigned x = a[i];
-+        if (((x & 1u) != 0u) && ((x & 2u) != 0u)) hits++;
-+    }
-+}
-+int main(void) {
-+    static unsigned a[1024];
-+    for (unsigned i = 0; i < 1024; i++) a[i] = (i * 2654435761u) >> 8;
-+    f(a, 1024);
-+    printf("hits=%d\n", hits);
-+    return hits != 256;
-+}
-+EOF
-+
-+# Arithmetic-fed legs with mixed widths: same prune contract, different
-+# operand home shapes (truncation + extension traffic near the legs).
-+cat > "$work/prune_arith_legs.c" <<'EOF'
-+#include <stdio.h>
-+int hits;
-+void f(unsigned *a, unsigned char *b, unsigned n) {
-+    for (unsigned i = 0; i < n; i++) {
-+        unsigned v = a[i] + b[i];
-+        if ((int)v > 1000 && (v & 255u) < 200u) hits++;
-+    }
-+}
-+int main(void) {
-+    static unsigned a[512];
-+    static unsigned char b[512];
-+    for (unsigned i = 0; i < 512; i++) { a[i] = i * 7u + 3u; b[i] = (unsigned char)(i * 13u); }
-+    f(a, b, 512);
-+    printf("hits=%d\n", hits);
-+    return 0;
-+}
-+EOF
-+
-+for t in prune_binop_legs prune_arith_legs; do
-+    if ! gcc -O2 "$work/$t.c" -o "$work/$t.gcc" 2>"$work/cc.err"; then
-+        echo "FAIL($t): gcc reference compile"; head -5 "$work/cc.err"; exit 1
-+    fi
-+    if ! "$CCC" -O2 "$work/$t.c" -o "$work/$t.lccc" 2>"$work/cl.err"; then
-+        echo "FAIL($t): lccc compile"; head -5 "$work/cl.err"; exit 1
-+    fi
-+    if ! CCC_NO_FOLDED_INDEX_LIVENESS=1 "$CCC" -O2 "$work/$t.c" -o "$work/$t.nofold" 2>"$work/cn.err"; then
-+        echo "FAIL($t): lccc nofold compile"; head -5 "$work/cn.err"; exit 1
-+    fi
-+    rc_gcc=0; "$work/$t.gcc" > "$work/$t.out.gcc" || rc_gcc=$?
-+    rc_lccc=0; "$work/$t.lccc" > "$work/$t.out.lccc" || rc_lccc=$?
-+    rc_nofold=0; "$work/$t.nofold" > "$work/$t.out.nofold" || rc_nofold=$?
-+    if ! cmp -s "$work/$t.out.gcc" "$work/$t.out.lccc" || [ $rc_gcc -ne $rc_lccc ]; then
-+        echo "FAIL($t): default differential mismatch (lccc vs gcc)"
-+        diff "$work/$t.out.gcc" "$work/$t.out.lccc" | head -5 || true
-+        fail=1
-+    else
-+        echo "ok($t/default): outputs identical"
-+    fi
-+    if ! cmp -s "$work/$t.out.gcc" "$work/$t.out.nofold" || [ $rc_gcc -ne $rc_nofold ]; then
-+        echo "FAIL($t): nofold differential mismatch (prune path miscompile?)"
-+        diff "$work/$t.out.gcc" "$work/$t.out.nofold" | head -5 || true
-+        fail=1
-+    else
-+        echo "ok($t/nofold): prune-path outputs identical"
-+    fi
-+done
-+
-+# Control: with the fusion disabled the nofold path must agree too (guards
-+# against a broken test input rather than a broken fusion).
-+if ! CCC_NO_FOLDED_INDEX_LIVENESS=1 CCC_NO_BOOL_PAIR=1 "$CCC" -O2 "$work/prune_binop_legs.c" -o "$work/ctl" 2>"$work/ctl.err"; then
-+    echo "FAIL(control): lccc nofold+nobp compile"; head -5 "$work/ctl.err"; exit 1
-+fi
-+rc_ctl=0; "$work/ctl" > "$work/ctl.out" || rc_ctl=$?
-+if ! cmp -s "$work/prune_binop_legs.out.gcc" "$work/ctl.out"; then
-+    echo "FAIL(control): fusion-disabled output differs from gcc (bad input?)"
-+    fail=1
-+else
-+    echo "ok(control): fusion-disabled path agrees with gcc"
-+fi
-+
-+exit $fail
-diff --git a/tests/regression/vecreg_map_liveout.c b/tests/regression/vecreg_map_liveout.c
++# Differential: split vs unsplit must produce identical output.
++CCC_NO_DEMORGAN=1 "$CCC" -O2 "$dir/demorgan_branch_split.c" \
++    -o "$tmp/test_base" 2>/dev/null
++"$tmp/test_base" >"$tmp/run_base.log"
++cmp -s "$tmp/run.log" "$tmp/run_base.log"
+diff --git a/tests/regression/check_gvn_xsign_load_cse.sh b/tests/regression/check_gvn_xsign_load_cse.sh
 new file mode 100644
-index 000000000..81c1d5d77
+index 00000000..006eecd0
 --- /dev/null
-+++ b/tests/regression/vecreg_map_liveout.c
-@@ -0,0 +1,20 @@
-+// S10 pin: a vectorized map loop whose induction variable escapes (read
-+// after the loop). The IV is the loop's only carried value, so the map
-+// vectorizes; the vectorizer must then rewire the escaping post-loop IV
-+// use to the widened loop's final value. An unwired escape reads a stale
-+// scalar IV and `i` below diverges from GCC (which prints N).
-+#include <stdio.h>
++++ b/tests/regression/check_gvn_xsign_load_cse.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++# GVN cross-signedness load CSE: the I8->U8 forwarding must fire on the
++# dispatch chain, and the optimized binary must agree with the GVN-off
++# baseline (differential against sext/zext confusion).
++set -eu
 +
-+unsigned IN[512], OUT[512];
-+unsigned N;
++CCC=${CCC:-./target/fastbuild/lccc}
++dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++tmp="${TMPDIR:-/tmp}/lccc-gvn-xload.$$"
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++mkdir -p "$tmp"
 +
-+int main(void) {
-+    N = 512;
-+    for (unsigned k = 0; k < N; k++) IN[k] = (k * 3u + 1u) & 255u;
-+    unsigned i;
-+    for (i = 0; i < N; i++) OUT[i] = IN[i] + 1u;
-+    unsigned wsum = 0;
-+    for (unsigned k = 0; k < N; k++) wsum += OUT[k] * (k & 7u);
-+    printf("i=%u wsum=%u\n", i, wsum);
-+    return 0;
-+}
-diff --git a/tests/regression/vecreg_stencil_liveout.c b/tests/regression/vecreg_stencil_liveout.c
++CCC_DEBUG_GVN=1 "$CCC" -O2 "$dir/gvn_xsign_load_cse.c" \
++    -o "$tmp/test" 2>"$tmp/compile.log"
++# At least the p[0] U8 reloads (exit arm + later arms) forward from the I8
++# sign-test load.
++test "$(grep -c '^\[GVNDBG\] CSE xload .* (I8->U8)$' "$tmp/compile.log")" -ge 2
++
++"$tmp/test" >"$tmp/run.log"
++grep -Eq '^OK gvn_xsign_load_cse [0-9]+$' "$tmp/run.log"
++
++# Differential: GVN off must produce identical output.
++CCC_DISABLE_PASSES=gvn "$CCC" -O2 "$dir/gvn_xsign_load_cse.c" \
++    -o "$tmp/test_base" 2>/dev/null
++"$tmp/test_base" >"$tmp/run_base.log"
++cmp -s "$tmp/run.log" "$tmp/run_base.log"
+diff --git a/tests/regression/cmp_replay_multi_select.c b/tests/regression/cmp_replay_multi_select.c
 new file mode 100644
-index 000000000..6d7024b37
+index 00000000..1296a052
 --- /dev/null
-+++ b/tests/regression/vecreg_stencil_liveout.c
-@@ -0,0 +1,20 @@
-+// S10 pin: a vectorized 3-point FP stencil whose induction variable
-+// escapes (read after the loop). The IV is the loop's only carried value,
-+// so the stencil vectorizes; the vectorizer must then rewire the escaping
-+// post-loop IV use to the widened loop's final value. An unwired escape
-+// reads a stale scalar IV and `i` below diverges from GCC (which prints N).
++++ b/tests/regression/cmp_replay_multi_select.c
+@@ -0,0 +1,47 @@
++/* Multi-select compare replay: one compare feeding two selects (min/max
++   updates) plus a branch re-emits at every consumer instead of
++   materializing setcc+movzbl+test per use (binary_search's lo/hi shape,
++   linux_find_bit's select+branch shape). */
 +#include <stdio.h>
 +
-+double IN[516], OUT[512];
-+unsigned N;
++static int data[256];
 +
 +int main(void) {
-+    N = 512;
-+    for (unsigned k = 0; k < N + 4; k++) IN[k] = (double)((k * 5u - 3u) & 127) / 16.0 - 4.0;
-+    unsigned i;
-+    for (i = 0; i < N; i++) OUT[i] = IN[i] + IN[i + 1] + IN[i + 2];
-+    double sum = 0.0;
-+    for (unsigned k = 0; k < N; k++) sum += OUT[k];
-+    printf("i=%u sum=%.1f\n", i, sum);
++    for (int i = 0; i < 256; ++i)
++        data[i] = (i * 37 + 11) & 255;
++    int lo = 1000000, hi = -1000000;
++    long sum = 0;
++    for (int i = 0; i < 256; ++i) {
++        int v = data[i];
++        int c = v < 128;
++        int a = v * 3 + 1;
++        int b = v * 5 + 2;
++        lo = c ? (a < lo ? a : lo) : lo;
++        hi = c ? hi : (b > hi ? b : hi);
++        if (c)
++            sum += a;
++        else
++            sum -= b;
++    }
++    printf("%d %d %ld\n", lo, hi, sum);
++    int elo = 1000000, ehi = -1000000;
++    long esum = 0;
++    for (int i = 0; i < 256; ++i) {
++        int v = (i * 37 + 11) & 255;
++        int a = v * 3 + 1, b = v * 5 + 2;
++        if (v < 128) {
++            if (a < elo)
++                elo = a;
++            esum += a;
++        } else {
++            if (b > ehi)
++                ehi = b;
++            esum -= b;
++        }
++    }
++    if (lo != elo || hi != ehi || sum != esum) {
++        printf("MISMATCH %d %d %ld\n", elo, ehi, esum);
++        return 1;
++    }
 +    return 0;
 +}
--- 
-2.47.3
-
+diff --git a/tests/regression/demorgan_branch_split.c b/tests/regression/demorgan_branch_split.c
+new file mode 100644
+index 00000000..f94263f8
+--- /dev/null
++++ b/tests/regression/demorgan_branch_split.c
+@@ -0,0 +1,61 @@
++// De Morgan branch split: `if (CmpA && CmpB)` / `if (CmpA || CmpB)` where
++// both comparisons are single-use must compile to cmpA; jcc; cmpB; jcc
++// (short-circuit) instead of two boolean materializations plus and/or/test.
++// The loop-carried shapes below mirror lz4's fill_source/compress_block
++// sites (the frontend keeps them as And/Or+branch IR; see the census).
++// Exit status 0 + "OK demorgan_branch_split <checksum>" on success.
++#include <stdio.h>
++
++static unsigned int rng_state = 0x5a1b3c7dU;
++static unsigned char buf[512];
++
++static void fill(void) {
++  unsigned int i;
++  for (i = 0; i < sizeof(buf); i++) {
++    rng_state = rng_state * 1664525U + 1013904223U;
++    // AND site: must fire the split (both Cmps single-use, same block).
++    if ((rng_state & 0x0fU) < 6 && i >= 128)
++      buf[i] = buf[i - 128 + (rng_state & 0x3fU)];
++    else
++      buf[i] = (unsigned char)(rng_state >> 24);
++  }
++}
++
++// OR site needs call arms: pure-arithmetic arms get if-converted to a
++// Select (cmov), and direct `||` is control-flow-lowered by the frontend
++// and never merged back — so the materialized `|`+Cast+branch shape below
++// (via a noinline sink) is what exercises the Or passthru path.
++__attribute__((noinline)) static void sink(unsigned int x, unsigned int i) {
++  buf[(x + i) & 511] ^= (unsigned char)x;
++}
++
++static unsigned long scan(void) {
++  unsigned int i;
++  unsigned long acc = 0;
++  for (i = 0; i < sizeof(buf); i++) {
++    unsigned int v = buf[i];
++    // OR site: must fire the split (short-circuit on true). The `|`
++    // materializes an Or binop, the `unsigned` assignment adds a Cast
++    // passthru, and the calls keep a real CondBranch.
++    unsigned int c = (v < 16) | (i > 400);
++    if (c)
++      sink(v * 3 + i, i);
++    else
++      sink(v + 7, i);
++    acc += buf[i] + i;
++  }
++  return acc;
++}
++
++int main(void) {
++  unsigned long h;
++  unsigned int i;
++  unsigned long mix = 0;
++  fill();
++  h = scan();
++  for (i = 0; i < sizeof(buf); i++)
++    mix = mix * 31 + buf[i];
++  mix ^= h * 0x9e3779b1UL;
++  printf("OK demorgan_branch_split %lu\n", mix);
++  return 0;
++}
+diff --git a/tests/regression/gvn_xsign_load_cse.c b/tests/regression/gvn_xsign_load_cse.c
+new file mode 100644
+index 00000000..5f69c11f
+--- /dev/null
++++ b/tests/regression/gvn_xsign_load_cse.c
+@@ -0,0 +1,57 @@
++/* GVN cross-signedness load CSE: an I8 sign-test load that dominates U8
++ * reloads of the same address must forward the loaded register instead of
++ * reloading memory (sqlite_get_varint chain shape). Also covers
++ * GEP(param+i) address canonicalization across blocks: p[1]/p[2] loads in
++ * later arms reuse the sign-test loads from earlier blocks.
++ *
++ * Tripwires baked in:
++ * - high-bit bytes (0x80..0xff): a sext/zext confusion forwards the wrong
++ *   value (0xffffff80 vs 0x80) and corrupts the checksum;
++ * - stores to *out in every exit arm: sibling-subtree stores must not kill
++ *   the dominator-scoped entries (rollback check);
++ * - single-use rule: each reloaded byte feeds exactly one integer widening
++ *   cast (if the shape drifts multi-use, the optimization simply stops
++ *   firing and the test still passes functionally).
++ */
++#include <stdio.h>
++
++static unsigned t(const unsigned char *p, unsigned *out) {
++    signed char c0 = *(const signed char *)p;
++    if (c0 >= 0) {
++        *out = (unsigned)p[0];
++        return 1;
++    }
++    signed char c1 = *(const signed char *)(p + 1);
++    if (c1 >= 0) {
++        *out = ((unsigned)p[0] << 7) | (unsigned)p[1];
++        return 2;
++    }
++    *out = ((unsigned)p[0] << 14) | ((unsigned)p[1] << 7) | (unsigned)p[2];
++    return 3;
++}
++
++int main(void) {
++    static const unsigned char vals[][4] = {
++        {0x00, 0x00, 0x00, 0x00},
++        {0x01, 0x7f, 0x00, 0x00},
++        {0x7f, 0x01, 0x7e, 0x00},
++        {0x80, 0x00, 0x00, 0x00},
++        {0x80, 0x7f, 0x00, 0x00},
++        {0x81, 0x80, 0x00, 0x00},
++        {0xff, 0x00, 0x00, 0x00},
++        {0xff, 0x7f, 0x00, 0x00},
++        {0xff, 0xff, 0x00, 0x00},
++        {0xff, 0xff, 0x7f, 0x00},
++        {0xff, 0xff, 0xff, 0x00},
++        {0x80, 0x80, 0x80, 0x00},
++    };
++    unsigned checksum = 0;
++    unsigned i;
++    for (i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
++        unsigned out = 0;
++        unsigned n = t(vals[i], &out);
++        checksum += out ^ (n * 0x9e3779b1u) ^ (unsigned)vals[i][0];
++    }
++    printf("OK gvn_xsign_load_cse %u\n", checksum);
++    return 0;
++}
