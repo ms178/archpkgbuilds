@@ -1,40 +1,1337 @@
-diff --git a/src/backend/mod.rs b/src/backend/mod.rs
-index 56e307ce..f6d3f712 100644
---- a/src/backend/mod.rs
-+++ b/src/backend/mod.rs
-@@ -21,6 +21,7 @@ pub(crate) mod traits; // ArchCodegen trait with default implementations
- pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, asm template parsing
+diff --git a/.github/scripts/ci-codegen-baseline.json b/.github/scripts/ci-codegen-baseline.json
+index c84533ec..db25ccaf 100644
+--- a/.github/scripts/ci-codegen-baseline.json
++++ b/.github/scripts/ci-codegen-baseline.json
+@@ -62,5 +62,13 @@
+   "moves": 30,
+   "ymm": 0,
+   "fma": 0
++ },
++ "chacha20_block": {
++  "insns": 264,
++  "stackmem": 48,
++  "pushes": 9,
++  "moves": 23,
++  "ymm": 5,
++  "fma": 0
+  }
+ }
+\ No newline at end of file
+diff --git a/.github/scripts/ci-codegen-gate.py b/.github/scripts/ci-codegen-gate.py
+index 8aaf876b..c223b2ee 100644
+--- a/.github/scripts/ci-codegen-gate.py
++++ b/.github/scripts/ci-codegen-gate.py
+@@ -56,6 +56,10 @@ WORKLOADS = [
+     # what the x86 boot path decompresses with, so it belongs in the golden set.
+     ("zstd_count.c", "zstd_count"),
+     ("fp_memfold_stencil5.c", "stencil5"),
++    # chacha20: the largest hot-function oracle gap (core 178 vs 63 insns).
++    # Tracked so the gap-closure project measures against a pinned floor and
++    # no change regresses it silently while the gap is open.
++    ("chacha20_block.c", "chacha20_block"),
+ ]
  
- // Register allocation and liveness analysis
-+pub(crate) mod global_alloc; // Global Location Allocation — P0-A
- pub(crate) mod live_range; // Linear scan data structures (LiveRange, LinearScanAllocator)
- pub(crate) mod liveness; // Live interval computation
- pub(crate) mod regalloc; // Linear scan register allocator
+ # Metric -> default max regression (fraction). A metric that got BETTER
+diff --git a/engineering/evidence/i686-reuse-precision-2026-09-12/README.md b/engineering/evidence/i686-reuse-precision-2026-09-12/README.md
+new file mode 100644
+index 00000000..1abfcf10
+--- /dev/null
++++ b/engineering/evidence/i686-reuse-precision-2026-09-12/README.md
+@@ -0,0 +1,51 @@
++# i686 reload-reuse precision (2026-09-12)
++
++Closes the explicit follow-up in #505 §4 (`%esp`/`%ebp` in `parse_frame_slot`),
++validated by execution where #505 could only diff: 32-bit glibc dev headers are
++installed (`gcc-multilib`), and 32-bit ELFs run natively on the x86-64 host.
++
++## What changed (`passes/dead_writes.rs`)
++
++* `parse_frame_slot` accepts `%esp`/`%ebp` as families 4/5 — the same proof as
++  x86-64, verified to transfer: `%esp`/`%ebp` map to families 4/5 in
++  `scan_register_refs` (the `b'e'` arm), so `subl $N, %esp` ends the scan;
++  push/pop/call/ret/Jmp breaks are arch-independent `LineKind`s; SIB and
++  segment overrides are rejected by shared code; the proof never uses the
++  red zone, and call-arg staging windows always adjust `%esp` first (which
++  breaks the scan before any staged store is judged).
++* #505's "two-line change" claim was INCOMPLETE: `classify_line` only
++  recognizes 64-bit `pushq`/`popq`, so 32-bit pushes classify as `Other`
++  and their implicit `%esp` motion is invisible both to the `Push`/`Pop`
++  scan break and to `writes_family` (no effects-table row either). Found by
++  the `i686_push_breaks_reuse` barrier test (the pass forwarded across
++  `pushl %ebx`). Fixed with a textual push/pop break scoped to
++  `%esp`-cached scans in this pass only — deliberately not pipeline-wide,
++  because push/pop consumers elsewhere may assume 8-byte frames. A
++  pipeline-wide 32-bit-push classification is a separate project with its
++  own audit (it would also change how `callee_saves`/`frame_compact` treat
++  i686 frames).
++* 10 new unit tests: same-dst delete, disjoint esp/ebp forwarding, overlap,
++  esp movement, push break, esp-vs-ebp conservatism, push-across-ebp
++  precision, `leave` (via the effects table), and one full-pipeline
++  end-to-end. `dead_writes`: 45/45 green.
++
++## Measured
++
++* Corpus sweep (`lccc-i686 -O2 -S` over benchmark programs + kernel corpus +
++  regression corpus, new vs pristine `a0e03144`): **0 differing TUs**. The
++  precision is currently inert on i686 (shapes do not occur), so the
++  "execute every differing TU" requirement is vacuously satisfied — and the
++  change provably cannot regress what it does not alter.
++* `asmdiff.py --32`: 20/20 vs GAS. i686 adler32 executes natively under both
++  binaries to identical output (`8c331ae0`, rc=0) with identical hashes
++  (`ec011476…`, `paired_ab` UNINFORMATIVE): zero impact, as predicted.
++* x86-64 blast radius: none (no shared-path edits; the textual break only
++  matches 32-bit push/pop mnemonics, which x86-64 output never contains).
++
++## Follow-ups found while testing
++
++* Downstream load-folds reintroduce memory operands after reuse forwards
++  (`movl S,%ecx; addl %ecx,%esi` → `addl S,%esi`): legitimate (it deletes an
++  instruction), but it hides this pass's firing end-to-end on both targets.
++* The unconditional `Push`/`Pop` scan break also fires for `%rbp`-cached
++  scans, where pushes are harmless: precision loss on both targets.
+diff --git a/engineering/evidence/pr506-audit-2026-09-12/README.md b/engineering/evidence/pr506-audit-2026-09-12/README.md
+new file mode 100644
+index 00000000..77bd8f6d
+--- /dev/null
++++ b/engineering/evidence/pr506-audit-2026-09-12/README.md
+@@ -0,0 +1,37 @@
++# PR #506 Red-Team Audit — x86 RORX, default-on loop idiom, width fixes, unroll retune
++
++Date: 2026-09-12. Auditor: Arena agent (adversarial). Scope: `6f43fe45` vs `a0e03144`
++(14 files, +396/−132). Method: full-diff read + gate-chain tracing to main +
++liveness/escape/trap analysis. The PR ran **zero builds** ("No local build run");
++every claim below was re-verified against the diff, not the description.
++
++## Verdicts (agree / disagree + why)
++
++| # | Slice | Verdict |
++|---|-------|---------|
++| 1 | RORX isel + MachInst + alloc + emit arms | **AGREE** — amount math provably sound (`rem_euclid`, Rol→Ror, nonzero gates); S32/S64-only; liveness `Read+PureWrite` correct; single ctor (isel); text syntax `rorxl/q $i,%s,%d` correct |
++| 2 | RORX gate chain | **AGREE (wart)** — `bmi2=false→Never`, `bmi2→Always/WhenItSavesAMove` traced through `emit.rs:1186`, `cpu_model prefer_shlx/shlx_saves_move`, cli `-mbmi2`/v3/native. No SIGILL risk at baseline. WART: SHLX-conflated, no independent kill switch → perfection adds `CCC_NO_RORX` |
++| 3 | RORX acc/legacy text paths (alu, emit) | **AGREE (wart)** — `src==dst` 3-operand form legal; amount-0 emits nothing = correct no-op (value already in acc; safer than `ror $0` which clobbers OF). WART: silent-nothing shape → perfection uses `debug_assert!` + unconditional emit |
++| 4 | loop_idiom default-on + self-loops + Param/Other→memmove | **AGREE CONDITIONAL** — memmove predicate correct (memcpy kept only for provably-distinct Global/Alloca pairs); escape check (matcher ~L1160-1255) closes the exit-phi hole for the new body-BinOp arm; whole-loop DCE makes load/store order irrelevant. CONDITIONS (done in perfection): remove 3 dead fns, Div/Rem trap-bail, predicate simplification, stale-comment fix, test updates, full validation (suite+outputs+torture+fuzz+SSA) |
++| 5 | loop_idiom body-BinOp tolerance | **AGREE (hardened)** — safe for escapes (proven above); latent trap-removal vector (dead `Div/Rem` DCE'd) predates the PR for header BinOps and widens to bodies → perfection bails on `Div/Rem` anywhere in header/body (zero recall cost: no copy idiom contains division) |
++| 6 | bit_idioms `width>=64 → true` | **AGREE** — fixes debug-panic (`1u64<<64`) + release wrong-answer (`c<1`); + unit test |
++| 7 | loop_memset 64-bit trip counts (for + while) | **AGREE** — old `% (1<<64)` was panic (debug) / `%1=0` refuse (release, safe but pessimal); fix unlocks 64-bit-IV memsets; + for/while regression tests |
++| 8 | loop_unroll retune (4×@≤40, 2×@≤80) | **REVERTED (measured dead)** — corpus sweep with temporary size instrumentation: sha256's loop never reaches the table (bails at steps 1–8; the "~40-insn SHA-256 round" justification is fiction — 4×/2× assemblies byte-identical); all 12 corpus loops that query the table have bodies ≤19 where both tables agree. Zero effect + false comment → full revert (table + test) |
++| 9 | vectorize window 5..=64 + mod.rs comment | **REVERTED (measured dead + backwards)** — trip sweep: zero const trips in 17..=64 corpus-wide (observed: 11, 16×3, 10⁷, non-const); the complete unroller's bound is `2..=16` in code, so the PR's "limit <= 64" comment is wrong (old "limit <= 16" was right) and trips 17–64 were never "eaten". Full revert (window + comment) |
++| 10 | global_alloc hook (`pipeline.rs`) + `mod` line | **DISAGREE (dropped)** — references `global_alloc.rs` which is NOT in the PR: certain E0583 build failure (CI cause #0). No implementation exists → dropping loses nothing. P0-A stays a follow-up; hook warts (duplicated 20-line block, force-beats-killswitch, MAX=0 runs one func) die with it |
++| 11 | PR description reliability | **UNRELIABLE** — hallucinates `encode_bmi2_rorx()` and `--total-push-budget` (neither in diff); omits dead `roots_distinct`, `n_self`/`n_param` test flips; "zero-fuzz" with zero builds. Audit-the-diff only |
++
++## CI failure mechanisms (reproduced by inspection; full-build repro skipped as certain)
++
++1. `src/backend/mod.rs`: `mod global_alloc;` with no file → E0583 (build gate).
++2. Dead `env_flag_truthy`, `is_unique_root`, `roots_distinct` → `-D warnings` clippy gate.
++3. (Latent, not CI-run) `check_loop_idiom.sh`: `n_self`/`n_param`/inert expectations
++   invalidated → updated in perfection (flips + memmove assertions + default-on cover).
++
++## Why the fold is safe to land default-on
++
++- RORX: fires only when `opts.bmi2` (explicit `-mbmi2`, v3 profile, native-detect);
++  baseline codegen byte-identical (verified: corpus A/B + `asmdiff`).
++- loop_idiom: default-on proven by `cargo test` + regression `.sh` + benchmark-output
++  parity + C torture + fuzz + `CCC_VALIDATE_SSA` (see validation log in patch).
++- Unroll/vectorize: landed only at measured-good settings (see §8–9 data).
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/README.md b/engineering/evidence/steal-fragility-2026-09-12/README.md
+new file mode 100644
+index 00000000..e6815506
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/README.md
+@@ -0,0 +1,92 @@
++# RA-SPAN-STEAL-X64: machine-fragility finding and revert (2026-09-12)
++
++Host: Intel Xeon @ 2.60 GHz, 2 vCPU, 4 GB swap. Toolchain: rustc 1.98.1,
++lccc fastbuild (-O1, -j2). Method: `scripts/paired_ab.py`, 15 interleaved
++order-alternated rounds, identity-hash + correctness screens, sign test.
++All ratios are B/A (median, min) with B = second arm named.
++
++## Verdict
++
++The S22 span-steal investigation (rebased onto `a0e03144`, applied clean,
++all gates green, byte-identical fire set to the old host) concluded the
++rule must NOT ship. It was reverted before merge; this record exists so
++the direction is not re-attempted naively.
++It regresses `sha256_transform` by **-11.27 %** on this host (p=0.0003,
++min agrees) while its wins do not transfer. No subset, budget, heat floor,
++or arm gating repairs sha: every non-empty subset harms (-8.5 % to -50 %).
++The rule is a packing perturbation whose outcome is invisible to every
++decision-time quantity (cost, depth, lock state, cascade, recurrence all
++overlap between the harmed and helped cases). It second-guesses the
++validated span-pressure valve with an inferior cost model; the structural
++project is valve cost-awareness (FOLLOWUP-2026-09-11-valve-cost-blindness),
++not a parallel escape hatch.
++
++## Shipping-config results (steal ON vs OFF, precision ON)
++
++| benchmark | med B/A | min B/A | p | verdict |
++|---|---|---|---|---|
++| sha256_transform | 0.8873 | 0.9044 | 0.0003 | ON slower 11.27 % |
++| sqlite_varint | 1.0576 | 1.0564 | 0.0003 | ON faster 5.76 % |
++| zlib_ng_adler32 | 1.0072 | 1.0073 | 0.0003 | ON faster 0.72 % |
++| csv_field_sum | 1.0075 | 0.9974 | 0.6056 | noise (median/min disagree) |
++
++Old host (same binaries, verified byte-identical fire set): sha +7.0 %,
++varint +3.7 %, adler neutral. Same code, opposite verdicts: the sha shape
++(spill state words to stack, keep loop temps in registers) is
++host-sensitive. Static codegen is IDENTICAL across hosts (census
++-1/+11/-22/+1 over the same 5 files; supply-gate ISO arms reproduce the
++S22 2x2 record exactly), so this is purely a dynamic/packing effect.
++
++## Attribution lattice (sha256, this host; every arm vs steal-OFF)
++
++| arm | shape | med | verdict |
++|---|---|---|---|
++| full steal | 8 incomings fire | 0.887 | -11.3 % |
++| K=12 (kill cost-11 dead fires) | 3rd shape | 0.915 | -8.5 % |
++| K=22 (kill all dead fires; locked only) | 4th shape | 0.500 | **-50.0 %** |
++| dead-only (no locked arm) | novel | 0.785 | -21.5 % |
++| single-shot (first win only, v392) | novel | 0.501 | **-49.9 %** |
++
++The fires mitigate each other (locked-only -50 %, dead-only -21 %,
++together -11 %): the set is violently non-compositional (L3), and no
++decision-time separator exists (incoming cost 11..1600 spans varint's 100;
++depths 0..2; lock mixed; cascade all 0 because non-span incomings can
++never be re-victimized, which also makes the cascade gate vacuous here).
++A per-function budget cannot work either: the allocator cannot know future
++fires when deciding the first, and the first win alone is already -50 %.
++
++## Controls (exonerations)
++
++* Precision interaction: steal ON vs OFF with precision OFF both sides:
++  -12.16 % (same inversion) — #505's `reuse_redundant_loads` precision is
++  EXONERATED.
++* Symmetric web-wide flag: scratch build with #505's `live_range.rs` hunks
++  reverse-applied produces byte-identical sha for steal-ON and steal-OFF —
++  #505's output-neutrality claim EXTENDS to the steal context (agrees).
++* Supply (S14): ON vs OFF (steal OFF, shipping precision): +6.35 %
++  (min 1.0624, p=0.0003) — TRANSFERS across hosts (+6.06 % old). The
++  supply is systematic policy (robust); the steal is perturbation
++  (fragile). #505's +6.06 % claim independently CONFIRMED.
++
++## Fire traces (shipped rule, CCC_TRACE_ALLOC)
++
++* sha: v392/c61/d1 (5 locked v10 victims), v393/395/396/c21 (dead),
++  v399/391/c11 (dead), v398/c21 (dead), v184/c1600/d2 (6 locked
++  v100-300 victims: the inner round loop).
++* varint: v140/c100/d1 (4 locked v10 victims). adler: v460/v531/c2000/d3
++  (dead victims). csv: v14/c80/d1 (6 locked v10-40 victims).
++  k21: v80/c20/d1 (3 locked v10 victims).
++* adler under first-only collapses to OFF bytes: v460's escapes lose the
++  rank (phantom selection) while blocking v531 — selections != wins.
++
++## Follow-ups
++
++1. Valve cost-awareness (FOLLOWUP-2026-09-11-valve-cost-blindness): the
++   original v184 complaint (prio 1600 demoted behind prio-100..400 spans)
++   should be fixed IN the valve with its turnover model, not beside it.
++2. sqlite_varint oracle gap (lccc 121 vs gcc 116 / clang 115) is now a
++   peephole/isel project, not an RA gamble.
++3. Lesson L6: packing-perturbation rules must prove robustness across
++   hosts (or be systematic policy); single-host paired wins do not
++   transfer. Lesson L7: never ship an .s-shape whose benefit depends on
++   downstream packing — price the packing or revert.
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-adler-newmain.json b/engineering/evidence/steal-fragility-2026-09-12/paired-adler-newmain.json
+new file mode 100644
+index 00000000..780b03c9
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-adler-newmain.json
+@@ -0,0 +1,97 @@
++{
++  "label": "S22-steal adler (new main)",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_mxh_dfkt/arm_a",
++    "sha256": "3c0fe4b2db75b91a828435c0b2890ad7bdc66f21229b0ac783c992c0fcde590e",
++    "env": "",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "75892c2c22fb049af2b61a68d7942d191ca8abb62c94b307c1bb7ab724562017"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_mxh_dfkt/arm_b",
++    "sha256": "491235eff8ed0f2e4c50a5c9f01aed17439c15adb5f191f36a76d417bb33be49",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "75892c2c22fb049af2b61a68d7942d191ca8abb62c94b307c1bb7ab724562017"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "stealON",
++    "n": 15,
++    "min_ms": 38.494,
++    "median_ms": 38.627,
++    "mean_ms": 38.68,
++    "stdev_ms": 0.137,
++    "samples_ms": [
++      38.733,
++      38.785,
++      38.727,
++      39.032,
++      38.864,
++      38.627,
++      38.66,
++      38.592,
++      38.532,
++      38.775,
++      38.584,
++      38.494,
++      38.567,
++      38.607,
++      38.618
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "stealOFF",
++    "n": 15,
++    "min_ms": 38.774,
++    "median_ms": 38.904,
++    "mean_ms": 39.246,
++    "stdev_ms": 1.15,
++    "samples_ms": [
++      38.936,
++      38.897,
++      39.08,
++      39.475,
++      38.998,
++      38.964,
++      38.815,
++      38.874,
++      43.507,
++      38.904,
++      38.861,
++      38.862,
++      38.774,
++      38.829,
++      38.911
++    ]
++  },
++  "paired_diffs_ms": [
++    -0.203,
++    -0.112,
++    -0.353,
++    -0.443,
++    -0.134,
++    -0.336,
++    -0.156,
++    -0.283,
++    -4.975,
++    -0.129,
++    -0.277,
++    -0.368,
++    -0.207,
++    -0.223,
++    -0.292
++  ],
++  "median_ratio_b_over_a": 1.00716,
++  "min_ratio_b_over_a": 1.00726,
++  "sign_test_p": 0.0003,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "stealON FASTER by 0.72% (median)"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-csv.json b/engineering/evidence/steal-fragility-2026-09-12/paired-csv.json
+new file mode 100644
+index 00000000..c7ffac92
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-csv.json
+@@ -0,0 +1,97 @@
++{
++  "label": "csv steal vs OFF",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_p4pg6e0t/arm_a",
++    "sha256": "91a0c3747bc488cd02514300dc51f61024a7660cc2ab12124f370c24170153b6",
++    "env": "",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "07fe34b2abab2669bf69e6a0ed325583c1f6d406105bea940e9981d03dd0daf1"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_p4pg6e0t/arm_b",
++    "sha256": "c058a81b933c77c500641c9d3589035fce7e5fc58c0570a9d7366c21ece6accf",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "07fe34b2abab2669bf69e6a0ed325583c1f6d406105bea940e9981d03dd0daf1"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "ON",
++    "n": 15,
++    "min_ms": 1.15,
++    "median_ms": 1.19,
++    "mean_ms": 1.227,
++    "stdev_ms": 0.092,
++    "samples_ms": [
++      1.178,
++      1.15,
++      1.157,
++      1.19,
++      1.357,
++      1.411,
++      1.196,
++      1.368,
++      1.152,
++      1.207,
++      1.161,
++      1.153,
++      1.362,
++      1.162,
++      1.193
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "OFF",
++    "n": 15,
++    "min_ms": 1.147,
++    "median_ms": 1.199,
++    "mean_ms": 1.208,
++    "stdev_ms": 0.058,
++    "samples_ms": [
++      1.214,
++      1.199,
++      1.28,
++      1.171,
++      1.295,
++      1.252,
++      1.152,
++      1.203,
++      1.147,
++      1.346,
++      1.213,
++      1.161,
++      1.166,
++      1.153,
++      1.167
++    ]
++  },
++  "paired_diffs_ms": [
++    -0.035,
++    -0.049,
++    -0.123,
++    0.019,
++    0.062,
++    0.159,
++    0.044,
++    0.166,
++    0.005,
++    -0.139,
++    -0.052,
++    -0.008,
++    0.196,
++    0.01,
++    0.026
++  ],
++  "median_ratio_b_over_a": 1.0075,
++  "min_ratio_b_over_a": 0.99745,
++  "sign_test_p": 0.60558,
++  "median_and_min_agree": false,
++  "significant": false,
++  "verdict": "ON FASTER by 0.75% (median) \u2014 NOT significant (sign test p > 0.05); treat as noise"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-sha-CvD.json b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-CvD.json
+new file mode 100644
+index 00000000..974dffec
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-CvD.json
+@@ -0,0 +1,97 @@
++{
++  "label": "steal x precisionOFF",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_ki1_uhav/arm_a",
++    "sha256": "edb4079e161d02a1193e78eb090dde8c0fdb6c33618558b5361292274756306f",
++    "env": "CCC_NO_SAME_DST_RELOAD=1,CCC_NO_FRAME_SLOT_ALIASING=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_ki1_uhav/arm_b",
++    "sha256": "c8a89e258196067f12972c12fdab95fb7e648d24e985a4141c2f9bf459f423ee",
++    "env": "CCC_NO_X64_SPAN_STEAL=1,CCC_NO_SAME_DST_RELOAD=1,CCC_NO_FRAME_SLOT_ALIASING=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "stONprOFF",
++    "n": 15,
++    "min_ms": 454.788,
++    "median_ms": 464.342,
++    "mean_ms": 463.791,
++    "stdev_ms": 8.061,
++    "samples_ms": [
++      456.067,
++      454.79,
++      454.788,
++      454.834,
++      464.342,
++      470.611,
++      457.377,
++      458.123,
++      467.812,
++      455.687,
++      467.309,
++      470.155,
++      478.418,
++      476.752,
++      469.799
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "stOFFprOFF",
++    "n": 15,
++    "min_ms": 405.247,
++    "median_ms": 407.88,
++    "mean_ms": 413.834,
++    "stdev_ms": 9.855,
++    "samples_ms": [
++      405.827,
++      407.09,
++      406.228,
++      405.678,
++      406.642,
++      423.489,
++      407.88,
++      405.247,
++      409.238,
++      405.78,
++      423.218,
++      411.559,
++      432.203,
++      430.875,
++      426.552
++    ]
++  },
++  "paired_diffs_ms": [
++    50.24,
++    47.7,
++    48.56,
++    49.156,
++    57.7,
++    47.122,
++    49.497,
++    52.876,
++    58.574,
++    49.907,
++    44.092,
++    58.596,
++    46.214,
++    45.877,
++    43.246
++  ],
++  "median_ratio_b_over_a": 0.87841,
++  "min_ratio_b_over_a": 0.89107,
++  "sign_test_p": 0.0003,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "stONprOFF SLOWER by 12.16% (median)"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-sha-DEADvOFF.json b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-DEADvOFF.json
+new file mode 100644
+index 00000000..bf371f65
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-DEADvOFF.json
+@@ -0,0 +1,97 @@
++{
++  "label": "sha {dead-only} vs OFF",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_f49i5m1z/arm_a",
++    "sha256": "20fc42135db539d98140b5c4f1367e8f72e1b33ac4b372d258e0b3c1454ad233",
++    "env": "CCC_SPAN_STEAL_NO_LOCKED=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_f49i5m1z/arm_b",
++    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "DEAD",
++    "n": 15,
++    "min_ms": 525.978,
++    "median_ms": 532.005,
++    "mean_ms": 552.821,
++    "stdev_ms": 39.265,
++    "samples_ms": [
++      637.188,
++      532.928,
++      527.408,
++      531.469,
++      633.696,
++      566.964,
++      525.978,
++      538.253,
++      527.49,
++      532.005,
++      535.459,
++      614.728,
++      531.681,
++      529.42,
++      527.647
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "OFF",
++    "n": 15,
++    "min_ms": 405.852,
++    "median_ms": 417.777,
++    "mean_ms": 463.462,
++    "stdev_ms": 90.721,
++    "samples_ms": [
++      419.265,
++      412.324,
++      410.09,
++      405.852,
++      570.122,
++      729.977,
++      417.777,
++      410.553,
++      424.992,
++      408.399,
++      510.131,
++      574.143,
++      406.996,
++      440.455,
++      410.857
++    ]
++  },
++  "paired_diffs_ms": [
++    217.923,
++    120.604,
++    117.318,
++    125.617,
++    63.575,
++    -163.013,
++    108.201,
++    127.7,
++    102.498,
++    123.606,
++    25.328,
++    40.585,
++    124.685,
++    88.965,
++    116.789
++  ],
++  "median_ratio_b_over_a": 0.78529,
++  "min_ratio_b_over_a": 0.77161,
++  "sign_test_p": 0.00195,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "DEAD SLOWER by 21.47% (median)"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-sha-E5.json b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-E5.json
+new file mode 100644
+index 00000000..7a78875a
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-E5.json
+@@ -0,0 +1,97 @@
++{
++  "label": "E5: sha single-shot(v392-win) vs OFF",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_hfjz2q4y/arm_a",
++    "sha256": "09d36ae8a51e2997f3c5c92e495a38ba428bd92d6e928f071b06b96cb07e8fc3",
++    "env": "CCC_SPAN_STEAL_FIRST_ONLY=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_hfjz2q4y/arm_b",
++    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "SHOT1",
++    "n": 15,
++    "min_ms": 807.765,
++    "median_ms": 813.511,
++    "mean_ms": 817.222,
++    "stdev_ms": 10.363,
++    "samples_ms": [
++      810.44,
++      827.53,
++      813.511,
++      846.061,
++      834.424,
++      812.163,
++      812.476,
++      811.42,
++      815.417,
++      816.215,
++      818.044,
++      814.875,
++      809.345,
++      807.765,
++      808.64
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "OFF",
++    "n": 15,
++    "min_ms": 405.564,
++    "median_ms": 407.618,
++    "mean_ms": 412.629,
++    "stdev_ms": 13.972,
++    "samples_ms": [
++      405.834,
++      405.564,
++      436.962,
++      406.842,
++      407.618,
++      407.412,
++      408.083,
++      406.693,
++      411.733,
++      407.999,
++      407.915,
++      407.619,
++      406.774,
++      405.648,
++      456.742
++    ]
++  },
++  "paired_diffs_ms": [
++    404.606,
++    421.967,
++    376.548,
++    439.22,
++    426.806,
++    404.751,
++    404.394,
++    404.728,
++    403.684,
++    408.216,
++    410.129,
++    407.256,
++    402.571,
++    402.116,
++    351.898
++  ],
++  "median_ratio_b_over_a": 0.50106,
++  "min_ratio_b_over_a": 0.50208,
++  "sign_test_p": 0.0003,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "SHOT1 SLOWER by 49.89% (median)"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-sha-E6-supply.json b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-E6-supply.json
+new file mode 100644
+index 00000000..65a60e80
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-E6-supply.json
+@@ -0,0 +1,97 @@
++{
++  "label": "E6: supply ON vs OFF on sha (steal OFF, shipping precision)",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_zf37x0gi/arm_a",
++    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_zf37x0gi/arm_b",
++    "sha256": "b35e503c91813d3a80f78cc9be5f49f4b39bf8fb67c4529e740216bb3c433d38",
++    "env": "CCC_NO_X64_SPAN_STEAL=1,CCC_NO_WEB_INLOOP_USE=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "SUPon",
++    "n": 15,
++    "min_ms": 405.51,
++    "median_ms": 407.806,
++    "mean_ms": 409.507,
++    "stdev_ms": 5.649,
++    "samples_ms": [
++      411.809,
++      429.828,
++      407.105,
++      411.046,
++      407.436,
++      406.469,
++      408.196,
++      408.46,
++      408.265,
++      407.318,
++      408.763,
++      405.51,
++      407.806,
++      406.802,
++      407.79
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "SUPoff",
++    "n": 15,
++    "min_ms": 430.83,
++    "median_ms": 433.721,
++    "mean_ms": 442.155,
++    "stdev_ms": 17.69,
++    "samples_ms": [
++      437.261,
++      461.806,
++      433.721,
++      430.83,
++      432.034,
++      432.597,
++      432.113,
++      433.209,
++      484.498,
++      434.403,
++      431.694,
++      439.109,
++      431.424,
++      435.706,
++      481.923
++    ]
++  },
++  "paired_diffs_ms": [
++    -25.452,
++    -31.979,
++    -26.615,
++    -19.784,
++    -24.599,
++    -26.128,
++    -23.916,
++    -24.749,
++    -76.233,
++    -27.085,
++    -22.931,
++    -33.599,
++    -23.618,
++    -28.905,
++    -74.133
++  ],
++  "median_ratio_b_over_a": 1.06355,
++  "min_ratio_b_over_a": 1.06244,
++  "sign_test_p": 0.0003,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "SUPon FASTER by 6.35% (median)"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-sha-K12vOFF.json b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-K12vOFF.json
+new file mode 100644
+index 00000000..07466e5b
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-K12vOFF.json
+@@ -0,0 +1,97 @@
++{
++  "label": "sha K=12 vs stealOFF",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_40_l59ud/arm_a",
++    "sha256": "8cc0dd5096ffb95feb3b9bc15c81b7afb8083feb155bb06c7f132572a534fb2e",
++    "env": "CCC_SPAN_STEAL_DEAD_FLOOR=12",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_40_l59ud/arm_b",
++    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "K12",
++    "n": 15,
++    "min_ms": 441.432,
++    "median_ms": 446.17,
++    "mean_ms": 447.343,
++    "stdev_ms": 4.855,
++    "samples_ms": [
++      457.752,
++      446.17,
++      446.553,
++      456.282,
++      445.307,
++      445.271,
++      446.193,
++      442.322,
++      453.398,
++      443.131,
++      443.144,
++      450.513,
++      444.188,
++      441.432,
++      448.494
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "OFF",
++    "n": 15,
++    "min_ms": 406.333,
++    "median_ms": 408.049,
++    "mean_ms": 409.701,
++    "stdev_ms": 3.577,
++    "samples_ms": [
++      407.865,
++      413.354,
++      409.188,
++      408.049,
++      409.564,
++      407.984,
++      409.247,
++      413.555,
++      406.333,
++      406.837,
++      410.801,
++      407.776,
++      420.502,
++      407.867,
++      406.587
++    ]
++  },
++  "paired_diffs_ms": [
++    49.887,
++    32.816,
++    37.365,
++    48.233,
++    35.743,
++    37.288,
++    36.946,
++    28.768,
++    47.065,
++    36.294,
++    32.342,
++    42.737,
++    23.685,
++    33.564,
++    41.907
++  ],
++  "median_ratio_b_over_a": 0.91456,
++  "min_ratio_b_over_a": 0.92049,
++  "sign_test_p": 0.0003,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "K12 SLOWER by 8.54% (median)"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-sha-K22vOFF.json b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-K22vOFF.json
+new file mode 100644
+index 00000000..c09610a9
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-K22vOFF.json
+@@ -0,0 +1,97 @@
++{
++  "label": "sha K=22 vs stealOFF",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_6550yr7i/arm_a",
++    "sha256": "09d36ae8a51e2997f3c5c92e495a38ba428bd92d6e928f071b06b96cb07e8fc3",
++    "env": "CCC_SPAN_STEAL_DEAD_FLOOR=22",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_6550yr7i/arm_b",
++    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "K22",
++    "n": 15,
++    "min_ms": 808.176,
++    "median_ms": 817.46,
++    "mean_ms": 816.391,
++    "stdev_ms": 4.537,
++    "samples_ms": [
++      820.659,
++      817.46,
++      818.716,
++      810.586,
++      819.362,
++      823.354,
++      812.691,
++      821.834,
++      817.667,
++      815.246,
++      813.883,
++      808.176,
++      810.609,
++      822.025,
++      813.594
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "OFF",
++    "n": 15,
++    "min_ms": 406.51,
++    "median_ms": 408.988,
++    "mean_ms": 410.613,
++    "stdev_ms": 4.121,
++    "samples_ms": [
++      415.348,
++      408.811,
++      406.51,
++      410.564,
++      409.835,
++      408.363,
++      408.828,
++      408.224,
++      408.193,
++      409.183,
++      408.988,
++      417.76,
++      406.637,
++      421.577,
++      410.371
++    ]
++  },
++  "paired_diffs_ms": [
++    405.312,
++    408.649,
++    412.207,
++    400.022,
++    409.527,
++    414.991,
++    403.863,
++    413.61,
++    409.474,
++    406.063,
++    404.895,
++    390.416,
++    403.972,
++    400.448,
++    403.223
++  ],
++  "median_ratio_b_over_a": 0.50032,
++  "min_ratio_b_over_a": 0.503,
++  "sign_test_p": 0.0003,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "K22 SLOWER by 49.97% (median)"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-sha-s22-newmain.json b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-s22-newmain.json
+new file mode 100644
+index 00000000..2254b726
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-sha-s22-newmain.json
+@@ -0,0 +1,97 @@
++{
++  "label": "S22-steal sha256 (new main)",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_2e48wk_m/arm_a",
++    "sha256": "b60832fcbec7d4702c833b1103f1d4c958e91069a2e3c3a2ca68a5a374df5639",
++    "env": "",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_2e48wk_m/arm_b",
++    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "stealON",
++    "n": 15,
++    "min_ms": 449.212,
++    "median_ms": 460.844,
++    "mean_ms": 471.577,
++    "stdev_ms": 30.892,
++    "samples_ms": [
++      453.067,
++      451.889,
++      450.207,
++      462.198,
++      449.212,
++      451.093,
++      451.729,
++      549.281,
++      491.716,
++      461.741,
++      460.844,
++      466.256,
++      451.682,
++      538.565,
++      484.17
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "stealOFF",
++    "n": 15,
++    "min_ms": 406.266,
++    "median_ms": 408.907,
++    "mean_ms": 411.933,
++    "stdev_ms": 11.856,
++    "samples_ms": [
++      407.544,
++      406.496,
++      408.907,
++      407.059,
++      406.266,
++      409.524,
++      413.28,
++      410.032,
++      407.1,
++      409.229,
++      455.5,
++      414.165,
++      407.19,
++      407.481,
++      409.217
++    ]
++  },
++  "paired_diffs_ms": [
++    45.523,
++    45.393,
++    41.3,
++    55.139,
++    42.946,
++    41.569,
++    38.449,
++    139.249,
++    84.615,
++    52.512,
++    5.344,
++    52.091,
++    44.492,
++    131.084,
++    74.952
++  ],
++  "median_ratio_b_over_a": 0.8873,
++  "min_ratio_b_over_a": 0.9044,
++  "sign_test_p": 0.0003,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "stealON SLOWER by 11.27% (median)"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-varint-NLvOFF.json b/engineering/evidence/steal-fragility-2026-09-12/paired-varint-NLvOFF.json
+new file mode 100644
+index 00000000..b6b8f49a
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-varint-NLvOFF.json
+@@ -0,0 +1,25 @@
++{
++  "label": "varint no-locked vs OFF",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_mo34ol45/arm_a",
++    "sha256": "bdeea5e90f27172f9bebf7f4232cc28844f75436855cf772e8c9d177d80f291f",
++    "env": "CCC_SPAN_STEAL_NO_LOCKED=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "32165525e62db7a4b2cf7eb6f8618e6b1e895603c9c4ffed9639b83768c6d682"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_mo34ol45/arm_b",
++    "sha256": "bdeea5e90f27172f9bebf7f4232cc28844f75436855cf772e8c9d177d80f291f",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "32165525e62db7a4b2cf7eb6f8618e6b1e895603c9c4ffed9639b83768c6d682"
++    }
++  },
++  "identical_binaries": true,
++  "rounds": 5,
++  "warmup": 2,
++  "verdict": "uninformative-identical-binaries"
++}
+\ No newline at end of file
+diff --git a/engineering/evidence/steal-fragility-2026-09-12/paired-varint-newmain.json b/engineering/evidence/steal-fragility-2026-09-12/paired-varint-newmain.json
+new file mode 100644
+index 00000000..55b8f5f4
+--- /dev/null
++++ b/engineering/evidence/steal-fragility-2026-09-12/paired-varint-newmain.json
+@@ -0,0 +1,97 @@
++{
++  "label": "S22-steal varint (new main)",
++  "arm_a": {
++    "binary": "/tmp/paired_ab_rexro2gq/arm_a",
++    "sha256": "bc895da72707e382f88891c75b5d114040e513ad97633b6fcc8979efdc4e4251",
++    "env": "",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "32165525e62db7a4b2cf7eb6f8618e6b1e895603c9c4ffed9639b83768c6d682"
++    }
++  },
++  "arm_b": {
++    "binary": "/tmp/paired_ab_rexro2gq/arm_b",
++    "sha256": "bdeea5e90f27172f9bebf7f4232cc28844f75436855cf772e8c9d177d80f291f",
++    "env": "CCC_NO_X64_SPAN_STEAL=1",
++    "warmup": {
++      "rc": 0,
++      "stdout_sha256": "32165525e62db7a4b2cf7eb6f8618e6b1e895603c9c4ffed9639b83768c6d682"
++    }
++  },
++  "identical_binaries": false,
++  "rounds": 15,
++  "warmup": 2,
++  "arm_a_timings": {
++    "arm": "stealON",
++    "n": 15,
++    "min_ms": 27.348,
++    "median_ms": 27.535,
++    "mean_ms": 27.559,
++    "stdev_ms": 0.143,
++    "samples_ms": [
++      27.724,
++      27.921,
++      27.62,
++      27.368,
++      27.348,
++      27.561,
++      27.652,
++      27.506,
++      27.591,
++      27.471,
++      27.535,
++      27.686,
++      27.495,
++      27.436,
++      27.475
++    ]
++  },
++  "arm_b_timings": {
++    "arm": "stealOFF",
++    "n": 15,
++    "min_ms": 28.89,
++    "median_ms": 29.12,
++    "mean_ms": 29.186,
++    "stdev_ms": 0.186,
++    "samples_ms": [
++      29.324,
++      29.526,
++      29.038,
++      28.89,
++      29.077,
++      29.12,
++      29.411,
++      29.278,
++      29.04,
++      29.02,
++      29.179,
++      29.539,
++      29.196,
++      29.097,
++      29.049
++    ]
++  },
++  "paired_diffs_ms": [
++    -1.601,
++    -1.606,
++    -1.418,
++    -1.522,
++    -1.729,
++    -1.559,
++    -1.758,
++    -1.772,
++    -1.449,
++    -1.549,
++    -1.644,
++    -1.853,
++    -1.701,
++    -1.661,
++    -1.573
++  ],
++  "median_ratio_b_over_a": 1.05759,
++  "min_ratio_b_over_a": 1.05639,
++  "sign_test_p": 0.0003,
++  "median_and_min_agree": true,
++  "significant": true,
++  "verdict": "stealON FASTER by 5.76% (median)"
++}
+\ No newline at end of file
 diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
-index 5bf659bc..cac4e953 100644
+index 5bf659bc..fe73815f 100644
 --- a/src/backend/x86/codegen/alu.rs
 +++ b/src/backend/x86/codegen/alu.rs
-@@ -916,8 +916,25 @@ impl X86Codegen {
+@@ -916,8 +916,30 @@ impl X86Codegen {
                  Some(imm) => {
                      let amount = (imm as i64).rem_euclid(width);
                      if amount != 0 {
 -                        self.state
 -                            .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
-+                        if self.bmi2_enabled && (width == 32 || width == 64) {
++                        if self.bmi2_enabled
++                            && super::isel::rorx_allowed()
++                            && (width == 32 || width == 64)
++                        {
 +                            let ror_amount = match op {
 +                                IrBinOp::RotateLeft => (width - amount) % width,
 +                                IrBinOp::RotateRight => amount,
 +                                _ => amount,
 +                            };
-+                            if ror_amount != 0 {
-+                                let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
-+                                // acc_typed is al/ax/eax/rax, but rorx needs 3-operand form with src==dst
-+                                // For accumulator path, src and dst are same accumulator.
-+                                self.state.emit_fmt(format_args!(
-+                                    "    {} ${}, %{}, %{}",
-+                                    ror_mnem, ror_amount, acc_typed, acc_typed
-+                                ));
-+                            }
++                            // amount != 0 above proves ror_amount != 0 (and a
++                            // hypothetical 0 is still a correct no-op: the
++                            // value is already in acc, `rorx $0` the identity).
++                            debug_assert!(ror_amount != 0);
++                            let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
++                            // acc_typed is al/ax/eax/rax, but rorx needs 3-operand form with src==dst
++                            // For accumulator path, src and dst are same accumulator.
++                            self.state.emit_fmt(format_args!(
++                                "    {} ${}, %{}, %{}",
++                                ror_mnem, ror_amount, acc_typed, acc_typed
++                            ));
 +                        } else {
 +                            self.state
 +                                .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
@@ -43,10 +1340,10 @@ index 5bf659bc..cac4e953 100644
                  }
                  None => {
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 968df204..9d35325c 100644
+index 968df204..548b0fba 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
-@@ -4589,15 +4589,34 @@ impl X86Codegen {
+@@ -4589,15 +4589,37 @@ impl X86Codegen {
              // no-op.
              let amount = (imm as i64).rem_euclid(width);
              if amount != 0 {
@@ -59,20 +1356,23 @@ index 968df204..9d35325c 100644
 -                    // actually use. Sub-word results keep their zero-extended
 -                    // homes: `rolw`/`rolb` only write the low bits.
 -                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
-+                if self.bmi2_enabled && (width == 32 || width == 64) {
++                if self.bmi2_enabled && super::isel::rorx_allowed() && (width == 32 || width == 64)
++                {
 +                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
 +                    let ror_amount = match op {
 +                        IrBinOp::RotateLeft => (width - amount) % width,
 +                        IrBinOp::RotateRight => amount,
 +                        _ => amount,
 +                    };
-+                    if ror_amount != 0 {
-+                        let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
-+                        self.state.emit_fmt(format_args!(
-+                            "    {} ${}, %{}, %{}",
-+                            ror_mnem, ror_amount, dest_typed, dest_typed
-+                        ));
-+                    }
++                    // amount != 0 above proves ror_amount != 0 (and a
++                    // hypothetical 0 is still a correct no-op: `rorx $0`
++                    // is the identity on the already-moved value).
++                    debug_assert!(ror_amount != 0);
++                    let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
++                    self.state.emit_fmt(format_args!(
++                        "    {} ${}, %{}, %{}",
++                        ror_mnem, ror_amount, dest_typed, dest_typed
++                    ));
 +                    if width == 32 {
 +                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
 +                    }
@@ -91,10 +1391,10 @@ index 968df204..9d35325c 100644
              }
              self.state.reg_cache.invalidate_acc();
 diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
-index 6c3c7ce7..29919e44 100644
+index 6c3c7ce7..5b64d7bf 100644
 --- a/src/backend/x86/codegen/isel.rs
 +++ b/src/backend/x86/codegen/isel.rs
-@@ -577,6 +577,55 @@ pub fn lower_binop(
+@@ -577,6 +577,57 @@ pub fn lower_binop(
  
      // ── Shift operations ─────────────────────────────────────────────
      if let Some(shift_op) = binop_to_shift(op) {
@@ -104,6 +1404,7 @@ index 6c3c7ce7..29919e44 100644
 +        if matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror)
 +            && matches!(size, OpSize::S32 | OpSize::S64)
 +            && shlx_mode() != ShlxMode::Never
++            && rorx_allowed()
 +        {
 +            if let Some(imm) = const_as_imm32(rhs) {
 +                let width = if size == OpSize::S32 { 32 } else { 64 };
@@ -114,33 +1415,34 @@ index 6c3c7ce7..29919e44 100644
 +                        ShiftOp::Ror => amt,
 +                        _ => amt,
 +                    };
-+                    if ror_amt != 0 {
-+                        // Try to keep src in its home to avoid extra mov.
-+                        let src_reg = match lhs {
-+                            Operand::Value(v) => value_to_reg(v, ra),
++                    // amt != 0 proves ror_amt != 0 for both Rol and Ror (and a
++                    // hypothetical 0 would still be a correct no-op: `rorx $0`
++                    // is the identity). Single match, single mov at most: the
++                    // old double match could emit the mov twice (non-Value
++                    // lhs with a virtual dst) — idempotent but wasteful.
++                    debug_assert!(ror_amt != 0);
++                    // Keep src in its home when already physical (saves the
++                    // mov the legacy path always emits); otherwise move once.
++                    let src_final = match lhs {
++                        Operand::Value(v) => match value_to_reg(v, ra) {
++                            r @ MachReg::Phys(_) => r,
 +                            _ => {
 +                                emit_mov_operand_r(lhs, dst, size, ra, out);
 +                                dst
 +                            }
-+                        };
-+                        let src_final = match src_reg {
-+                            MachReg::Phys(_) => src_reg,
-+                            _ => {
-+                                emit_mov_operand_r(lhs, dst, size, ra, out);
-+                                dst
-+                            }
-+                        };
-+                        out.push(MachInst::Rorx {
-+                            amount: ror_amt,
-+                            src: src_final,
-+                            dst,
-+                            size,
-+                        });
-+                        return true;
-+                    } else {
-+                        emit_mov_operand_r(lhs, dst, size, ra, out);
-+                        return true;
-+                    }
++                        },
++                        _ => {
++                            emit_mov_operand_r(lhs, dst, size, ra, out);
++                            dst
++                        }
++                    };
++                    out.push(MachInst::Rorx {
++                        amount: ror_amt,
++                        src: src_final,
++                        dst,
++                        size,
++                    });
++                    return true;
 +                } else {
 +                    emit_mov_operand_r(lhs, dst, size, ra, out);
 +                    return true;
@@ -150,6 +1452,23 @@ index 6c3c7ce7..29919e44 100644
          if let Some(imm) = const_as_imm32(rhs) {
              emit_mov_operand_r(lhs, dst, size, ra, out);
              let mask = if size == OpSize::S32 { 31 } else { 63 };
+@@ -1244,6 +1295,16 @@ pub fn shlx_mode() -> ShlxMode {
+     }
+ }
+ 
++/// Independent RORX kill switch: any `CCC_NO_RORX` value disables all
++/// BMI2 RORX selection (isel + legacy/acc text paths) so bisection can
++/// isolate RORX from SHLX without dropping the BMI2 gate. Cached: env
++/// is never unset mid-compile.
++pub fn rorx_allowed() -> bool {
++    static OPT_OUT: std::sync::LazyLock<bool> =
++        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_RORX").is_some());
++    !*OPT_OUT
++}
++
+ thread_local! {
+     static APX_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+ }
 diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
 index 5bb0e6e6..8e5341eb 100644
 --- a/src/backend/x86/codegen/machinst.rs
@@ -239,60 +1558,768 @@ index 25639168..911aaa86 100644
          MachInst::Lea {
              base,
              index,
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index ea5f3489..57a2d81a 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -1707,6 +1707,47 @@ impl Driver {
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+index b6dbe0fe..9bef0d0a 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+@@ -270,6 +270,35 @@ fn reuse_redundant_loads_with(
+                 continue;
              }
-         }
- 
-+        // Global Location Allocation (P0-A): cross-block call splitting with
-+        // dominance + SSA repair, grouped deterministically. Default-on for -O2+.
-+        if std::env::var("CCC_NO_GLOBAL_LOCATION").is_err()
-+            && std::env::var("CCC_RA_GLOBAL_LOCATION").is_err()
-+        {
-+            if self.opt_level >= 2 {
-+                let gmax = std::env::var("CCC_GLOBAL_SPLIT_MAX")
-+                    .ok()
-+                    .and_then(|s| s.parse().ok())
-+                    .unwrap_or(4);
-+                let mut gtotal = 0;
-+                for func in &mut module.functions {
-+                    if !func.is_declaration && func.blocks.len() >= 2 {
-+                        let n = crate::backend::global_alloc::run_global_location_pass(func);
-+                        gtotal += n;
-+                        if gtotal >= gmax {
-+                            break;
-+                        }
-+                    }
+             let t = infos[j].trimmed(store.get(j));
++            // i686: `classify_line` only recognizes 64-bit `pushq`/`popq`,
++            // so 32-bit pushes classify as `Other` and their implicit
++            // `%esp` motion is invisible both here and in `writes_family`
++            // (no effects-table row either). Break textually when the
++            // cached slot is `%esp`-relative; `%ebp`-relative scans may
++            // continue across pushes (ebp is stable). Scoped to this pass
++            // on purpose: classifying 32-bit pushes pipeline-wide would
++            // hand `pushl` to push/pop consumers that may assume 8-byte
++            // frames.
++            {
++                let mnemonic = t.split_whitespace().next().unwrap_or("");
++                if addr_fams.contains(&4)
++                    && matches!(
++                        mnemonic,
++                        "pushl"
++                            | "pushw"
++                            | "push"
++                            | "popl"
++                            | "popw"
++                            | "pop"
++                            | "pushfl"
++                            | "pushfw"
++                            | "popfl"
++                            | "popfw"
++                    )
++                {
++                    break;
 +                }
 +            }
-+        } else if let Ok(v) = std::env::var("CCC_RA_GLOBAL_LOCATION") {
-+            let v = v.to_ascii_lowercase();
-+            if v == "1" || v == "true" || v == "yes" || v == "on" {
-+                let gmax = std::env::var("CCC_GLOBAL_SPLIT_MAX")
-+                    .ok()
-+                    .and_then(|s| s.parse().ok())
-+                    .unwrap_or(4);
-+                let mut gtotal = 0;
-+                for func in &mut module.functions {
-+                    if !func.is_declaration && func.blocks.len() >= 2 {
-+                        let n = crate::backend::global_alloc::run_global_location_pass(func);
-+                        gtotal += n;
-+                        if gtotal >= gmax {
-+                            break;
+             match infos[j].kind {
+                 // A label is normally a join point: another predecessor may
+                 // have stored to this address. A label nobody branches to is
+@@ -430,9 +459,19 @@ fn parse_frame_slot(mem: &str, width: i64) -> Option<FrameSlot> {
+     if mem.contains(':') {
+         return None;
+     }
++    // i686: `%esp`/`%ebp` are the same families 4/5 in `scan_register_refs`
++    // (types.rs, the `b'e'` arm), so the "base register cannot move inside
++    // the scan" barrier transfers verbatim: `subl $N, %esp` writes family 4
++    // and ends the scan exactly like `subq $N, %rsp`. Push/pop/call/ret/Jmp
++    // breaks are arch-independent `LineKind`s. The proof never uses the
++    // x86-64 red zone (disjoint displacements under a fixed base are disjoint
++    // bytes with or without one), so i686's lack of it is irrelevant; and
++    // call-arg staging windows always adjust `%esp` first, which breaks the
++    // scan before any staged store can be misjudged. Validated by executing
++    // every differing TU natively (32-bit ELF runs on the x86-64 host).
+     let base = match inside {
+-        "%rsp" => 4,
+-        "%rbp" => 5,
++        "%rsp" | "%esp" => 4,
++        "%rbp" | "%ebp" => 5,
+         _ => return None,
+     };
+     let disp_txt = mem[..open].trim();
+@@ -1548,4 +1587,151 @@ mod tests {
+             "redundant load was not eliminated: {out}"
+         );
+     }
++
++    /// i686: same-destination reload through `%esp` is deleted, mirroring
++    /// `same_destination_reload_is_deleted`.
++    #[test]
++    fn i686_same_destination_reload_through_esp_is_deleted() {
++        let out = run_reuse(
++            &frame("    movl 12(%esp), %eax\n    movl %edx, %esi\n    movl 12(%esp), %eax\n"),
++            ReusePolicy::full(),
++        );
++        assert_eq!(
++            slot_refs(&out, "12(%esp)"),
++            1,
++            "second same-dst reload must go:\n{out}"
++        );
++    }
++
++    /// i686: a store to a disjoint `%esp` slot does not break reuse.
++    #[test]
++    fn i686_store_to_a_different_esp_slot_does_not_break_reuse() {
++        let body = "    movl 12(%esp), %eax\n    movl %edx, 24(%esp)\n    movl 12(%esp), %ecx\n";
++        let out = run_reuse(&frame(body), ReusePolicy::full());
++        assert!(
++            out.contains("movl %eax, %ecx"),
++            "must forward from the register:\n{out}"
++        );
++        assert_eq!(slot_refs(&out, "12(%esp)"), 1, "only one slot read:\n{out}");
++    }
++
++    /// i686: a dword store at 14 overlaps the cached dword at [12,16).
++    #[test]
++    fn i686_overlapping_esp_store_breaks_reuse() {
++        let body = "    movl 12(%esp), %eax\n    movl %edx, 14(%esp)\n    movl 12(%esp), %ecx\n";
++        let out = run_reuse(&frame(body), ReusePolicy::full());
++        assert_eq!(
++            slot_refs(&out, "12(%esp)"),
++            2,
++            "overlap must keep both reads:\n{out}"
++        );
++    }
++
++    /// i686: `%esp` movement ends the scan. This is the barrier staging
++    /// windows rely on: `subl $N, %esp` writes family 4, so no cached slot
++    /// survives it.
++    #[test]
++    fn i686_esp_movement_breaks_reuse() {
++        let body = "    movl 12(%esp), %eax\n    subl $16, %esp\n    movl 12(%esp), %ecx\n";
++        let out = run_reuse(&frame(body), ReusePolicy::full());
++        assert_eq!(
++            slot_refs(&out, "12(%esp)"),
++            2,
++            "esp moved: both reads must survive:\n{out}"
++        );
++    }
++
++    /// i686: push/pop end the scan like any other `%esp` motion.
++    #[test]
++    fn i686_push_breaks_reuse() {
++        let body = "    movl 12(%esp), %eax\n    pushl %ebx\n    movl 12(%esp), %ecx\n";
++        let out = run_reuse(&frame(body), ReusePolicy::full());
++        assert_eq!(
++            slot_refs(&out, "12(%esp)"),
++            2,
++            "push moved esp: both reads must survive:\n{out}"
++        );
++    }
++
++    /// i686: `%esp` vs `%ebp` are different bases (families 4/5), not a
++    /// provable fixed distance apart here — stays conservative.
++    #[test]
++    fn i686_esp_vs_ebp_bases_stay_conservative() {
++        let body = "    movl 12(%esp), %eax\n    movl %edx, 12(%ebp)\n    movl 12(%esp), %ecx\n";
++        let out = run_reuse(&frame(body), ReusePolicy::full());
++        assert_eq!(
++            slot_refs(&out, "12(%esp)"),
++            2,
++            "different base: both reads must survive:\n{out}"
++        );
++    }
++
++    /// i686: disjoint `%ebp` slots forward, mirroring the `%rsp` case.
++    #[test]
++    fn i686_store_to_a_different_ebp_slot_does_not_break_reuse() {
++        let body = "    movl 12(%ebp), %eax\n    movl %edx, 24(%ebp)\n    movl 12(%ebp), %ecx\n";
++        let out = run_reuse(&frame(body), ReusePolicy::full());
++        assert!(
++            out.contains("movl %eax, %ecx"),
++            "must forward from the register:\n{out}"
++        );
++        assert_eq!(slot_refs(&out, "12(%ebp)"), 1, "only one slot read:\n{out}");
++    }
++
++    /// i686: pushes do NOT disturb `%ebp`-relative scans (ebp is stable
++    /// across them) — the break above is scoped to `%esp`-cached slots.
++    #[test]
++    fn i686_push_does_not_break_ebp_cached_reuse() {
++        let body = "    movl 12(%ebp), %eax\n    pushl %ebx\n    movl %edx, 24(%ebp)\n    movl 12(%ebp), %ecx\n";
++        let out = run_reuse(&frame(body), ReusePolicy::full());
++        assert!(
++            out.contains("movl %eax, %ecx"),
++            "ebp scan must survive the push:\n{out}"
++        );
++    }
++
++    /// i686: `leave` moves both `%esp` and `%ebp` (effects table), so it
++    /// ends any frame-slot scan.
++    #[test]
++    fn i686_leave_breaks_reuse() {
++        let body = "    movl 12(%ebp), %eax\n    leave\n    movl 12(%ebp), %ecx\n";
++        let out = run_reuse(&frame(body), ReusePolicy::full());
++        assert_eq!(
++            slot_refs(&out, "12(%ebp)"),
++            2,
++            "leave moved the base: both reads must survive:\n{out}"
++        );
++    }
++
++    /// i686 end-to-end through the FULL pipeline: an `%ebp`-cached reload
++    /// separated by a disjoint-slot store survives a `pushl` (ebp is stable
++    /// across pushes) and only one slot read remains. (The consumer is a
++    /// store on purpose: an arithmetic consumer would let a downstream
++    /// load-fold reintroduce the memory operand while deleting an
++    /// instruction — a legitimate pre-existing pipeline interaction, but
++    /// one that hides this pass's firing.) Guards the integration, not
++    /// just the pass in isolation.
++    #[test]
++    fn i686_ebp_reuse_across_push_end_to_end() {
++        let out = run(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    pushl %ebp\n",
++            "    movl %esp, %ebp\n",
++            "    movl 12(%ebp), %eax\n",
++            "    pushl %ebx\n",
++            "    movl %edx, 24(%ebp)\n",
++            "    movl 12(%ebp), %ecx\n",
++            "    movl %ecx, 4(%esp)\n",
++            "    popl %ebx\n",
++            "    popl %ebp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert_eq!(
++            slot_refs(&out, "12(%ebp)"),
++            1,
++            "full pipeline must eliminate the second slot read:\n{out}"
++        );
++    }
+ }
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index e7ca9030..287661ba 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -6,7 +6,9 @@ use super::emit::{
+ };
+ use crate::backend::call_abi::{ParamClass, classify_params};
+ use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
+-use crate::backend::liveness::{for_each_operand_in_instruction, for_each_operand_in_terminator};
++use crate::backend::liveness::{
++    LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator,
++};
+ use crate::backend::regalloc::PhysReg;
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::common::types::{AddressSpace, EightbyteClass, IrType};
+@@ -79,6 +81,222 @@ fn va_root_is_stable(func: &IrFunction, root: u32) -> bool {
+     false
+ }
+ 
++/// Liveness inputs for [`replay_span_home_collision`], snapshotted before
++/// `cached_liveness` is moved into slot assignment. The veto runs after
++/// slots are final (coalesced webs included), so it cannot borrow the moved
++/// value; the snapshot clones only the pieces the veto reads. Empty when no
++/// replay-family record exists or RA is disabled — the veto then fails
++/// closed (every span def collides).
++struct ReplayLivSnapshot {
++    starts: Vec<u32>,
++    ends: Vec<u32>,
++    depth: Vec<u32>,
++    segments: Vec<LiveInterval>,
++    intervals: Vec<LiveInterval>,
++}
++
++/// Precomputed function-wide tables for [`replay_span_home_collision`],
++/// built once per function before the compare-replay prunes.
++struct ReplayCollisionTables {
++    /// Every definition position of every value: value -> [(block, inst)].
++    /// Multi-def phi-elimination webs contribute every Copy position and
++    /// inline-asm outputs are included (`Instruction::dest` omits them).
++    def_points: FxHashMap<u32, Vec<(usize, usize)>>,
++    /// Assigned stack slot (frame offset) per value.
++    slot_of: FxHashMap<u32, i64>,
++    /// Inverse of `slot_of`: slot offset -> homed values.
++    slot_members: FxHashMap<i64, Vec<u32>>,
++}
++
++/// One compare-replay read span for the home-collision veto: the operand
++/// homes must survive every definition from just after `start` through
++/// `end` (inclusive; `None` selects the end block's terminator point).
++struct ReplayCheckSpan<'a> {
++    operands: &'a [u32],
++    start: (usize, usize),
++    end: (usize, Option<usize>),
++    /// Defs that never collide: values whose in-span definition emits no
++    /// home write (skipped De Morgan Cmps/And-Or/passthru, the last Select
++    /// consumer — which replays its operands before writing its home). Only
++    /// defs inside a span block are excused, so a hypothetical out-of-span
++    /// redefinition of an excluded value still vetoes.
++    exclude_values: &'a FxHashSet<u32>,
++}
++
++/// Compare-replay home-collision veto (pr27285 class).
++///
++/// A replay record re-reads the Cmp's operands at every consumer position
++/// (each Select; the terminator branch for select+branch mixes and De
++/// Morgan splits) — backend reads with no IR operand at the read point.
++/// Those reads are sound only if no definition between the Cmp and the last
++/// consumer writes a home (register or stack slot) the operand lives in.
++///
++/// The scan-time redefinition guard covers IR redefinitions of the operand
++/// ITSELF in the same block, and `operand_links` stops the allocator from
++/// handing the register to an unrelated later value — but neither sees a
++/// coalesced phi-web member: phi coalescing (register AND slot) deliberately
++/// shares one home across overlapping live ranges, proven safe by an
++/// update-window argument that only considers IR-visible reads. When a web
++/// member is defined strictly between the Cmp and a later consumer
++/// (pr27285: the latch value and the second Select share r8d; the Select's
++/// false-arm staging overwrites the home, and the third Select's replay
++/// then reads the clobbered register), the later replay reads clobbered
++/// state: a loud home-freshness panic for register homes, a silent
++/// wrong-operand miscompile for slot homes (slots have no freshness gate).
++///
++/// This veto runs post-RA/post-slots in the replay/demorgan/fp-select
++/// prunes, where every home is known, and prunes the record when any
++/// definition D in the span (Cmp, last consumer] writes the operand's
++/// register home or slot:
++/// - same-block defs strictly between the Cmp and the last consumer
++///   (the last Select consumer's OWN def is excluded by the caller: it
++///   replays before writing, so its write cannot affect any replay read);
++/// - cross-block defs in loop blocks (the split-latch shape the scan's
++///   same-block redefinition guard cannot see): a latch copy of the operand
++///   itself, or a coalesced web member, executes between the Cmp and the
++///   consumer on some iteration — this also closes the scan guard's
++///   cross-block hole (silent next-iteration comparison);
++/// - every candidate def must also fall inside the operand's live coverage
++///   (hole-aware segments, fat intervals when segments are absent): a def
++///   in a liveness hole, or one sharing only a PACKED (disjoint-lifetime)
++///   slot, does not disturb the replay.
++/// Staging/scratch writes need no check: on x86-64 rax/rcx are never homes,
++/// call-clobbered homes are saved/restored around calls, and inline-asm
++/// clobbers are excluded from allocation — definitions are the only span
++/// writers of a home.
++///
++/// Fail-closed: any missing input (empty snapshot, no coverage for the
++/// operand, a home without a sharer entry, a sharer that is never defined)
++/// vetoes — pruning only ever falls back to the always-correct
++/// materialized-boolean path.
++fn replay_span_home_collision(
++    tables: &ReplayCollisionTables,
++    reg_assignments: &FxHashMap<u32, PhysReg>,
++    reg_sharers: &FxHashMap<u8, Vec<u32>>,
++    snap: &ReplayLivSnapshot,
++    func_name: &str,
++    span: &ReplayCheckSpan,
++) -> bool {
++    let debug = std::env::var_os("CCC_DEBUG_REPLAY_PRUNE").is_some();
++    let collide = |o: u32, d: u32, pos: (usize, usize), why: &str| -> bool {
++        if debug {
++            eprintln!(
++                "[replay-prune] fn={func_name} collide: operand=v{o} sharer=v{d} def={pos:?} ({why})"
++            );
++        }
++        true
++    };
++    // Live coverage of one operand: hole-aware segments when the value has
++    // any, else its fat interval (mirrors the machine_reg_busy convention).
++    // `None` means unknown — the caller fails closed (every span def
++    // collides).
++    let coverage_of = |o: u32| -> Option<Vec<(u32, u32)>> {
++        let mut cov: Vec<(u32, u32)> = snap
++            .segments
++            .iter()
++            .filter(|s| s.value_id == o)
++            .map(|s| (s.start, s.end))
++            .collect();
++        if cov.is_empty() {
++            cov = snap
++                .intervals
++                .iter()
++                .filter(|s| s.value_id == o)
++                .map(|s| (s.start, s.end))
++                .collect();
++        }
++        if cov.is_empty() {
++            None
++        } else {
++            Some(cov)
++        }
++    };
++    let point_of = |b: usize, i: usize| -> Option<u32> {
++        snap.starts.get(b).map(|s| s + i as u32)
++    };
++    let end_point = match span.end {
++        (eb, Some(ei)) => point_of(eb, ei),
++        (eb, None) => snap.ends.get(eb).copied(),
++    };
++    // Without liveness (empty snapshot: RA disabled) every cross-block
++    // def collides.
++    let depth_of = |b: usize| -> u32 {
++        snap.depth.get(b).copied().unwrap_or(u32::MAX)
++    };
++    for &o in span.operands {
++        // Sharers of the operand's homes (register + slot). The operand
++        // itself is included: an in-span redefinition of O collides (the
++        // split-latch shape the scan guard cannot see).
++        let mut sharers: Vec<u32> = Vec::new();
++        if let Some(reg) = reg_assignments.get(&o) {
++            match reg_sharers.get(&reg.0) {
++                Some(m) => sharers.extend(m.iter().copied()),
++                None => return collide(o, o, span.start, "home without sharer entry"),
++            }
++        }
++        if let Some(slot) = tables.slot_of.get(&o) {
++            match tables.slot_members.get(slot) {
++                Some(m) => sharers.extend(m.iter().copied()),
++                None => return collide(o, o, span.start, "slot without member entry"),
++            }
++        }
++        if sharers.is_empty() {
++            // No home at all: the readability prune owns this case.
++            continue;
++        }
++        let coverage = coverage_of(o);
++        for &d in &sharers {
++            let Some(defs) = tables.def_points.get(&d) else {
++                return collide(o, d, span.start, "sharer never defined");
++            };
++            for &(db, di) in defs {
++                if span.exclude_values.contains(&d) && (db == span.start.0 || db == span.end.0)
++                {
++                    continue;
++                }
++                let covered = match (coverage.as_ref(), point_of(db, di)) {
++                    (Some(cov), Some(p)) => cov.iter().any(|&(s, e)| s <= p && p <= e),
++                    // Unknown coverage or unmapped point: fail closed.
++                    _ => true,
++                };
++                if !covered {
++                    continue;
++                }
++                if db == span.start.0 {
++                    if di <= span.start.1 {
++                        continue;
++                    }
++                    if db == span.end.0 {
++                        if let Some(e) = span.end.1 {
++                            if di > e {
++                                continue;
++                            }
 +                        }
++                    }
++                    return collide(o, d, (db, di), "same-block span def");
++                } else if db == span.end.0 {
++                    // Cross-block span with defs in the end block: at or
++                    // before the span end (position test, not loop depth:
++                    // the end block may sit outside any loop).
++                    match (end_point, point_of(db, di)) {
++                        (Some(end_p), Some(p)) if p <= end_p => {
++                            return collide(o, d, (db, di), "end-block span def");
++                        }
++                        (Some(_), Some(_)) => continue,
++                        _ => return collide(o, d, (db, di), "unmapped end-block def"),
++                    }
++                } else if depth_of(db) > 0 {
++                    // Elsewhere, in a loop: executes between the Cmp and
++                    // the consumer on some iteration (split-latch webs and
++                    // the scan guard's cross-block hole).
++                    return collide(o, d, (db, di), "in-loop cross-block def");
++                }
++            }
++        }
++    }
++    false
++}
++
+ /// Destination selector for parameter-capture stores: the raw
+ /// rbp-relative slot offset, or the effective (over-aligned) base
+ /// pre-computed in %r11.
+@@ -1843,6 +2061,31 @@ impl X86Codegen {
+         let fpo = self.state.omit_frame_pointer;
+         self.state.ra_accumulator_values =
+             accumulator_assignments.iter().map(|a| a.value_id).collect();
++        // Liveness snapshot for the post-slot replay home-collision veto
++        // (see replay_span_home_collision): cached_liveness is moved into
++        // calculate_stack_space_common below, while the veto must run after
++        // it — slots, including coalesced webs, are final only then.
++        // Snapshotted only when a replay-family record exists, so functions
++        // without one pay nothing.
++        let mut collision_liv = ReplayLivSnapshot {
++            starts: Vec::new(),
++            ends: Vec::new(),
++            depth: Vec::new(),
++            segments: Vec::new(),
++            intervals: Vec::new(),
++        };
++        if !(self.cmp_replay.is_empty()
++            && self.fp_select_cmps.is_empty()
++            && self.demorgan_branch.is_empty())
++        {
++            if let Some(l) = cached_liveness.as_ref() {
++                collision_liv.starts = l.block_starts.clone();
++                collision_liv.ends = l.block_ends.clone();
++                collision_liv.depth = l.block_loop_depth.clone();
++                collision_liv.segments = l.segments.clone();
++                collision_liv.intervals = l.intervals.clone();
++            }
++        }
+         let mut space = calculate_stack_space_common(
+             &mut self.state,
+             func,
+@@ -1897,6 +2140,216 @@ impl X86Codegen {
+             cached_liveness,
+         );
+ 
++        // ── REPLAY home-collision veto (pr27285) ─────────────────
++        // Post-slot companion to the readability prunes above: a definition
++        // strictly between the Cmp and the last consumer that writes a
++        // replayed operand's register home or slot makes the later replay
++        // read clobbered state (see replay_span_home_collision). Runs here —
++        // after the tiered slot allocator — because coalesced slot webs only
++        // exist now; register homes were already final at the earlier prune.
++        // Pruning falls back to the always-correct materialized-boolean path.
++        let mut collision_tables = ReplayCollisionTables {
++            def_points: FxHashMap::default(),
++            slot_of: FxHashMap::default(),
++            slot_members: FxHashMap::default(),
++        };
++        for (bi, block) in func.blocks.iter().enumerate() {
++            for (ii, inst) in block.instructions.iter().enumerate() {
++                if let Some(d) = inst.dest() {
++                    collision_tables
++                        .def_points
++                        .entry(d.0)
++                        .or_default()
++                        .push((bi, ii));
++                }
++                // Inline-asm outputs define values but Instruction::dest
++                // omits them; an in-span asm def of a sharer collides.
++                if let Instruction::InlineAsm { outputs, .. } = inst {
++                    for (_, v, _) in outputs {
++                        collision_tables
++                            .def_points
++                            .entry(v.0)
++                            .or_default()
++                            .push((bi, ii));
 +                    }
 +                }
 +            }
 +        }
++        let all_values: Vec<u32> = collision_tables.def_points.keys().copied().collect();
++        for v in all_values {
++            if let Some(slot) = self.state.get_slot(v) {
++                collision_tables.slot_of.insert(v, slot.0);
++                collision_tables
++                    .slot_members
++                    .entry(slot.0)
++                    .or_default()
++                    .push(v);
++            }
++        }
++        let func_name: &str = &func.name;
++        // Integer replay records surviving the readability prune.
++        {
++            let mut prune: Vec<u32> = Vec::new();
++            for (cdest, (_op, lhs, rhs, _ty)) in self.cmp_replay.iter() {
++                let cmp_pos: Option<(usize, usize)> =
++                    match collision_tables.def_points.get(cdest) {
++                        Some(v) if v.len() == 1 => Some(v[0]),
++                        _ => None,
++                    };
++                let Some((cb, ci)) = cmp_pos else {
++                    prune.push(*cdest);
++                    continue;
++                };
++                if !matches!(
++                    func.blocks[cb].instructions.get(ci),
++                    Some(Instruction::Cmp { .. })
++                ) {
++                    prune.push(*cdest);
++                    continue;
++                }
++                let block = &func.blocks[cb];
++                let mut select_count: usize = 0;
++                let mut last_select: Option<(usize, u32)> = None;
++                for (ii, inst) in block.instructions.iter().enumerate() {
++                    if let Instruction::Select {
++                        dest,
++                        cond: Operand::Value(v),
++                        ..
++                    } = inst
++                    {
++                        if v.0 == *cdest {
++                            select_count += 1;
++                            last_select = Some((ii, dest.0));
++                        }
++                    }
++                }
++                let term_consumer = matches!(
++                    &block.terminator,
++                    Terminator::CondBranch {
++                        cond: Operand::Value(v),
++                        ..
++                    } if v.0 == *cdest
++                );
++                let expected = self.cmp_replay_multi.get(cdest).copied().unwrap_or(1) as usize;
++                let found = select_count + usize::from(term_consumer);
++                if found != expected || found == 0 {
++                    // Inconsistent with the scan: fail closed.
++                    prune.push(*cdest);
++                    continue;
++                }
++                let mut exclude_values = FxHashSet::default();
++                let span_end: (usize, Option<usize>) = if term_consumer {
++                    (cb, None)
++                } else if let Some((li, ld)) = last_select {
++                    // The last Select replays before writing its home.
++                    exclude_values.insert(ld);
++                    (cb, Some(li))
++                } else {
++                    prune.push(*cdest);
++                    continue;
++                };
++                let mut operands: Vec<u32> = Vec::new();
++                for op in [lhs, rhs] {
++                    if let Operand::Value(v) = op {
++                        operands.push(v.0);
++                    }
++                }
++                let span = ReplayCheckSpan {
++                    operands: &operands,
++                    start: (cb, ci),
++                    end: span_end,
++                    exclude_values: &exclude_values,
++                };
++                if replay_span_home_collision(
++                    &collision_tables,
++                    &self.reg_assignments,
++                    &self.home_sharers,
++                    &collision_liv,
++                    func_name,
++                    &span,
++                ) {
++                    prune.push(*cdest);
++                }
++            }
++            for d in prune {
++                self.cmp_replay.remove(&d);
++                self.cmp_replay_multi.remove(&d);
++            }
++        }
++        // FP-select records surviving the readability prune (single Select
++        // consumer by construction; branches never take fp_select).
++        {
++            let mut prune_fp: Vec<u32> = Vec::new();
++            for (cdest, (_op, lhs, rhs, _ty)) in self.fp_select_cmps.iter() {
++                let cmp_pos: Option<(usize, usize)> =
++                    match collision_tables.def_points.get(cdest) {
++                        Some(v) if v.len() == 1 => Some(v[0]),
++                        _ => None,
++                    };
++                let Some((cb, ci)) = cmp_pos else {
++                    prune_fp.push(*cdest);
++                    continue;
++                };
++                if !matches!(
++                    func.blocks[cb].instructions.get(ci),
++                    Some(Instruction::Cmp { .. })
++                ) {
++                    prune_fp.push(*cdest);
++                    continue;
++                }
++                let mut consumer: Option<(usize, u32)> = None;
++                let mut consumer_count: usize = 0;
++                for (ii, inst) in func.blocks[cb].instructions.iter().enumerate() {
++                    if let Instruction::Select {
++                        dest,
++                        cond: Operand::Value(v),
++                        ..
++                    } = inst
++                    {
++                        if v.0 == *cdest {
++                            consumer_count += 1;
++                            consumer = Some((ii, dest.0));
++                        }
++                    }
++                }
++                let Some((sel_idx, sel_dest)) = consumer else {
++                    prune_fp.push(*cdest);
++                    continue;
++                };
++                if consumer_count != 1 {
++                    prune_fp.push(*cdest);
++                    continue;
++                }
++                let mut exclude_values = FxHashSet::default();
++                exclude_values.insert(sel_dest);
++                let mut operands: Vec<u32> = Vec::new();
++                for op in [lhs, rhs] {
++                    if let Operand::Value(v) = op {
++                        operands.push(v.0);
++                    }
++                }
++                let span = ReplayCheckSpan {
++                    operands: &operands,
++                    start: (cb, ci),
++                    end: (cb, Some(sel_idx)),
++                    exclude_values: &exclude_values,
++                };
++                if replay_span_home_collision(
++                    &collision_tables,
++                    &self.reg_assignments,
++                    &self.home_sharers,
++                    &collision_liv,
++                    func_name,
++                    &span,
++                ) {
++                    prune_fp.push(*cdest);
++                }
++            }
++            for d in prune_fp {
++                self.fp_select_cmps.remove(&d);
++            }
++        }
 +
-         // Live range splitting: split call-spanning values, then clean up
-         if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
-             let max_splits = std::env::var("CCC_SPLIT_MAX")
+         // ── DE MORGAN post-slot-assignment prune ────────────────────────
+         // Same readability contract as the compare-replay prune above
+         // (Const, slot, register home with the folded-index extension
+@@ -1975,6 +2428,58 @@ impl X86Codegen {
+                         eprintln!("[demorgan] prune andor={}", andor_id);
+                     }
+                     prune_dm.push(*andor_id);
++                    continue;
++                }
++                // Home-collision veto (same pr27285 class as cmp_replay):
++                // the terminator replays both comparisons, re-reading all
++                // four operands there. The span runs from the earlier Cmp
++                // to the block terminator; the skipped defs (both Cmps,
++                // the And/Or, its passthru) emit nothing and are excluded.
++                let c0 = collision_tables.def_points.get(&rec.cmp_dests[0]);
++                let c1 = collision_tables.def_points.get(&rec.cmp_dests[1]);
++                let collides = match (c0, c1) {
++                    (Some(a), Some(b))
++                        if a.len() == 1 && b.len() == 1 && a[0].0 == b[0].0 =>
++                    {
++                        let (cb, start) = (a[0].0, a[0].1.min(b[0].1));
++                        let mut excludes = FxHashSet::default();
++                        excludes.insert(*andor_id);
++                        excludes.insert(rec.binop_id);
++                        excludes.insert(rec.cmp_dests[0]);
++                        excludes.insert(rec.cmp_dests[1]);
++                        if let Some(p) = rec.passthru {
++                            excludes.insert(p);
++                        }
++                        let mut operands = Vec::new();
++                        for op in [&rec.a.1, &rec.a.2, &rec.b.1, &rec.b.2] {
++                            if let Operand::Value(v) = op {
++                                operands.push(v.0);
++                            }
++                        }
++                        let span = ReplayCheckSpan {
++                            operands: &operands,
++                            start: (cb, start),
++                            end: (cb, None),
++                            exclude_values: &excludes,
++                        };
++                        let func_name: &str = &func.name;
++                        replay_span_home_collision(
++                            &collision_tables,
++                            &self.reg_assignments,
++                            &self.home_sharers,
++                            &collision_liv,
++                            func_name,
++                            &span,
++                        )
++                    }
++                    // Inconsistent with the scan: fail closed.
++                    _ => true,
++                };
++                if collides {
++                    if debug {
++                        eprintln!("[demorgan] prune andor={} (home collision)", andor_id);
++                    }
++                    prune_dm.push(*andor_id);
+                 } else if debug {
+                     eprintln!("[demorgan] survive andor={}", andor_id);
+                 }
 diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
-index 3ec94a4f..9afb6811 100644
+index 3ec94a4f..b2c2ded1 100644
 --- a/src/passes/bit_idioms.rs
 +++ b/src/passes/bit_idioms.rs
 @@ -316,6 +316,9 @@ fn narrow_width_bits(ty: IrType) -> Option<u64> {
@@ -305,8 +2332,31 @@ index 3ec94a4f..9afb6811 100644
          return c < (1u64 << width);
      }
      let Operand::Value(id) = v else {
+@@ -1696,4 +1699,22 @@ mod tests {
+             &defs
+         ));
+     }
++
++    #[test]
++    fn high_bits_zero_width64_accepts_any_const() {
++        // At width >= 64 a u64 has no upper bits: every constant passes.
++        // (Before the fix this computed `1u64 << 64`: debug panic, and in
++        // release `c < 1`, wrongly rejecting every nonzero constant.)
++        let defs: Vec<Option<Instruction>> = Vec::new();
++        assert!(high_bits_zero(Operand::Const(IrConst::I64(5)), 64, &defs));
++        assert!(high_bits_zero(Operand::Const(IrConst::I64(-1)), 64, &defs));
++        assert!(high_bits_zero(Operand::Const(IrConst::I64(0)), 64, &defs));
++        // Narrow widths still enforce the bound.
++        assert!(!high_bits_zero(
++            Operand::Const(IrConst::I64(1 << 33)),
++            32,
++            &defs
++        ));
++        assert!(high_bits_zero(Operand::Const(IrConst::I64(0)), 0, &defs));
++    }
+ }
 diff --git a/src/passes/loop_idiom.rs b/src/passes/loop_idiom.rs
-index 3a715063..9e73fc16 100644
+index 3a715063..adbbcdcb 100644
 --- a/src/passes/loop_idiom.rs
 +++ b/src/passes/loop_idiom.rs
 @@ -148,9 +148,15 @@ fn is_int_type(ty: IrType) -> bool {
@@ -343,35 +2393,18 @@ index 3a715063..9e73fc16 100644
          Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
              Operand::Value(inner) => {
                  object_root_inner(defs, label_to_idx, preheader_label, *inner, depth + 1)
-@@ -249,7 +257,26 @@ fn object_root_inner(
+@@ -248,10 +256,6 @@ fn object_root_inner(
+     }
  }
  
- fn is_unique_root(root: &ObjectRoot) -> bool {
+-fn is_unique_root(root: &ObjectRoot) -> bool {
 -    matches!(root, ObjectRoot::Global(_) | ObjectRoot::Alloca(_))
-+    matches!(
-+        root,
-+        ObjectRoot::Global(_) | ObjectRoot::Alloca(_) | ObjectRoot::Param(_)
-+    )
-+}
-+
-+/// Returns true if two roots are provably distinct objects (no overlap).
-+fn roots_distinct(a: &ObjectRoot, b: &ObjectRoot) -> bool {
-+    match (a, b) {
-+        (ObjectRoot::Global(ga), ObjectRoot::Global(gb)) => ga != gb,
-+        (ObjectRoot::Alloca(aa), ObjectRoot::Alloca(ab)) => aa != ab,
-+        (ObjectRoot::Param(pa), ObjectRoot::Param(pb)) => pa != pb,
-+        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
-+        | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
-+        | (ObjectRoot::Global(_), ObjectRoot::Param(_))
-+        | (ObjectRoot::Param(_), ObjectRoot::Global(_))
-+        | (ObjectRoot::Alloca(_), ObjectRoot::Param(_))
-+        | (ObjectRoot::Param(_), ObjectRoot::Alloca(_)) => true,
-+        _ => false,
-+    }
- }
- 
+-}
+-
  /// A matched byte-copy loop with everything the rewrite needs.
-@@ -278,6 +305,8 @@ struct CopyLoop {
+ #[allow(dead_code)]
+ struct CopyLoop {
+@@ -278,6 +282,8 @@ struct CopyLoop {
      load_is_bump: bool,
      load_base: Value,
      load_init: Value,
@@ -380,7 +2413,25 @@ index 3a715063..9e73fc16 100644
  }
  
  fn debug_enabled() -> bool {
-@@ -312,11 +341,10 @@ pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
+@@ -294,29 +300,14 @@ macro_rules! dlog {
+     };
+ }
+ 
+-/// True when `name` is set to a truthy value (`1`/`true`/`yes`/`on`).
+-fn env_flag_truthy(name: &str) -> bool {
+-    match std::env::var(name) {
+-        Ok(v) => {
+-            let t = v.trim();
+-            t == "1"
+-                || t.eq_ignore_ascii_case("true")
+-                || t.eq_ignore_ascii_case("yes")
+-                || t.eq_ignore_ascii_case("on")
+-        }
+-        Err(_) => false,
+-    }
+-}
+-
+ pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
      if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
          return 0;
      }
@@ -396,7 +2447,7 @@ index 3a715063..9e73fc16 100644
      if func.blocks.len() < 3 {
          return 0;
      }
-@@ -382,9 +410,11 @@ fn try_match_copy_loop(
+@@ -382,9 +373,11 @@ fn try_match_copy_loop(
      cfg: &CfgAnalysis,
  ) -> Option<CopyLoop> {
      let name = func.name.as_str();
@@ -411,7 +2462,7 @@ index 3a715063..9e73fc16 100644
          dlog!(
              "{name} loop@{}: bail (body size {})",
              lp.header,
-@@ -532,91 +562,78 @@ fn try_match_copy_loop(
+@@ -532,91 +525,87 @@ fn try_match_copy_loop(
      }
  
      // Body scan: exactly one U8 load + one U8 store, plumbing otherwise.
@@ -448,9 +2499,6 @@ index 3a715063..9e73fc16 100644
 -                    if *ty != IrType::U8
 -                        || *seg_override != crate::common::types::AddressSpace::Default
 -                        || *volatile
--                    {
--                        dlog!("{name} loop@{header}: bail (non-U8/volatile load)");
--                        return None;
 +
 +    if !is_self_loop {
 +        for &b in lp.body.iter() {
@@ -462,6 +2510,19 @@ index 3a715063..9e73fc16 100644
 +                    Instruction::Copy { .. }
 +                    | Instruction::Cast { .. }
 +                    | Instruction::GetElementPtr { .. } => {}
++                    Instruction::BinOp { op, .. }
++                        if matches!(
++                            op,
++                            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
++                        ) =>
+                     {
+-                        dlog!("{name} loop@{header}: bail (non-U8/volatile load)");
++                        dlog!("{name} loop@{header}: bail (trapping div/rem)");
+                         return None;
+                     }
+-                    if load_inst.is_some() {
+-                        dlog!("{name} loop@{header}: bail (second load)");
+-                        return None;
 +                    Instruction::BinOp { .. } => {}
 +                    Instruction::GlobalAddr { .. }
 +                    | Instruction::ParamRef { .. }
@@ -486,8 +2547,20 @@ index 3a715063..9e73fc16 100644
 +                        }
 +                        load_inst = Some((b, *dest, *ptr));
                      }
--                    if load_inst.is_some() {
--                        dlog!("{name} loop@{header}: bail (second load)");
+-                    load_inst = Some((b, *dest, *ptr));
+-                }
+-                Instruction::Store {
+-                    val,
+-                    ptr,
+-                    ty,
+-                    seg_override,
+-                    volatile,
+-                } => {
+-                    if *ty != IrType::U8
+-                        || *seg_override != crate::common::types::AddressSpace::Default
+-                        || *volatile
+-                    {
+-                        dlog!("{name} loop@{header}: bail (non-U8/volatile store)");
 -                        return None;
 +                    Instruction::Store {
 +                        val,
@@ -509,28 +2582,12 @@ index 3a715063..9e73fc16 100644
 +                        }
 +                        store_inst = Some((b, val.clone(), *ptr));
                      }
--                    load_inst = Some((b, *dest, *ptr));
--                }
--                Instruction::Store {
--                    val,
--                    ptr,
--                    ty,
--                    seg_override,
--                    volatile,
--                } => {
--                    if *ty != IrType::U8
--                        || *seg_override != crate::common::types::AddressSpace::Default
--                        || *volatile
--                    {
--                        dlog!("{name} loop@{header}: bail (non-U8/volatile store)");
+-                    if store_inst.is_some() {
+-                        dlog!("{name} loop@{header}: bail (second store)");
 +                    _ => {
 +                        dlog!("{name} loop@{header}: bail (body inst {inst:?})");
                          return None;
                      }
--                    if store_inst.is_some() {
--                        dlog!("{name} loop@{header}: bail (second store)");
--                        return None;
--                    }
 -                    store_inst = Some((b, val.clone(), *ptr));
 -                }
 -                _ => {
@@ -548,14 +2605,14 @@ index 3a715063..9e73fc16 100644
 -        dlog!("{name} loop@{header}: bail (missing store)");
 -        return None;
 -    };
--
+ 
 -    // Load/store dominance: load dominates store in its block OR store
 -    // dominates load in its block — either way same block, load first.
 -    // (Pointer-equal `*p++ = *p` reads pre-bump `*p` then writes it back;
 -    // that is a same-root copy and bails at the root check. Order still
 -    // matters for the bump analysis below: the load must read the
 -    // pre-bump value.)
- 
+-
 -    // Header scan: phis + pure plumbing only (the IV test `Cmp`, bump
 -    // `Add`s, address `GEP`s, `Select`s, and rematerializable leaves all
 -    // routinely live here). Anything effectful bails.
@@ -564,7 +2621,7 @@ index 3a715063..9e73fc16 100644
      struct PhiInfo {
          dest: Value,
          ty: IrType,
-@@ -624,8 +641,6 @@ fn try_match_copy_loop(
+@@ -624,8 +613,6 @@ fn try_match_copy_loop(
          latch: Operand,
      }
      let mut phis: Vec<PhiInfo> = Vec::new();
@@ -573,15 +2630,35 @@ index 3a715063..9e73fc16 100644
      let mut header_loads: Vec<Value> = Vec::new();
      for inst in &func.blocks[header].instructions {
          match inst {
-@@ -664,19 +679,50 @@ fn try_match_copy_loop(
+@@ -653,6 +640,15 @@ fn try_match_copy_loop(
+                     latch: latch_op?,
+                 });
+             }
++            Instruction::BinOp { op, .. }
++                if matches!(
++                    op,
++                    IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
++                ) =>
++            {
++                dlog!("{name} loop@{header}: bail (trapping div/rem)");
++                return None;
++            }
+             Instruction::Copy { .. }
+             | Instruction::Cast { .. }
+             | Instruction::BinOp { .. }
+@@ -664,19 +660,50 @@ fn try_match_copy_loop(
              | Instruction::LabelAddr { .. } => {}
              Instruction::Load {
                  dest,
 +                ptr,
-+                ty,
-+                seg_override,
-+                volatile,
-+            } => {
+                 ty,
+                 seg_override,
+                 volatile,
+-                ..
+             } => {
+-                if *volatile
+-                    || *seg_override != crate::common::types::AddressSpace::Default
+-                    || !is_int_type(*ty)
 +                if *volatile || *seg_override != crate::common::types::AddressSpace::Default {
 +                    dlog!("{name} loop@{header}: bail (header load volatile/seg)");
 +                    return None;
@@ -603,14 +2680,10 @@ index 3a715063..9e73fc16 100644
 +            Instruction::Store {
 +                val,
 +                ptr,
-                 ty,
-                 seg_override,
-                 volatile,
--                ..
-             } => {
--                if *volatile
--                    || *seg_override != crate::common::types::AddressSpace::Default
--                    || !is_int_type(*ty)
++                ty,
++                seg_override,
++                volatile,
++            } => {
 +                if is_self_loop
 +                    && is_byte_type(*ty)
 +                    && *seg_override == crate::common::types::AddressSpace::Default
@@ -630,7 +2703,7 @@ index 3a715063..9e73fc16 100644
              }
              _ => {
                  dlog!("{name} loop@{header}: bail (header inst {inst:?})");
-@@ -685,6 +731,15 @@ fn try_match_copy_loop(
+@@ -685,6 +712,15 @@ fn try_match_copy_loop(
          }
      }
  
@@ -646,7 +2719,7 @@ index 3a715063..9e73fc16 100644
      // Header test: exactly `Ult(iv, bound)` where iv is one of the phis.
      let cond_def = defs.get(&cond_val.0)?;
      let (iv_phi, bound, ult_ty) = match cond_def {
-@@ -1030,18 +1085,33 @@ fn try_match_copy_loop(
+@@ -1030,18 +1066,33 @@ fn try_match_copy_loop(
          }
      }
  
@@ -672,20 +2745,20 @@ index 3a715063..9e73fc16 100644
          dlog!("{name} loop@{header}: bail (same root {store_root:?})");
          return None;
      }
-+    // For Other vs Other with different inits, allow with memmove.
++    // memcpy only for provably-distinct Global/Alloca pairs (same-name
++    // roots bailed above); every Param/Other involvement uses memmove.
 +    let use_memmove = !matches!(
 +        (&store_root, &load_root),
 +        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
 +            | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
 +            | (ObjectRoot::Global(_), ObjectRoot::Global(_))
 +            | (ObjectRoot::Alloca(_), ObjectRoot::Alloca(_))
-+            | (ObjectRoot::Param(_), ObjectRoot::Param(_))
 +    ) || matches!(store_root, ObjectRoot::Param(_) | ObjectRoot::Other)
 +        || matches!(load_root, ObjectRoot::Param(_) | ObjectRoot::Other);
  
      // Bound loads: every header load must be THE bound — resolving
      // through copies to the `Ult` rhs — read through a bare
-@@ -1201,6 +1271,7 @@ fn try_match_copy_loop(
+@@ -1201,6 +1252,7 @@ fn try_match_copy_loop(
          load_is_bump,
          load_base,
          load_init,
@@ -693,7 +2766,20 @@ index 3a715063..9e73fc16 100644
      })
  }
  
-@@ -1537,14 +1608,16 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
+@@ -1346,9 +1398,9 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
+                 reusable = true;
+             }
+         } else {
+-            // Function argument: available in the preheader. (Pointer
+-            // operands are never args in a v1 match — param roots bail —
+-            // but treat them uniformly.)
++            // Function argument: available in the preheader. (Param roots
++            // rewrite to memmove; their pointers reuse as args or clone
++            // as ParamRef leaves — treat them uniformly.)
+             reusable = true;
+         }
+         if reusable {
+@@ -1537,14 +1589,16 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
          }
      };
  
@@ -713,7 +2799,7 @@ index 3a715063..9e73fc16 100644
              info: crate::ir::reexports::CallInfo {
                  dest: Some(ret),
                  args: vec![Operand::Value(dst), Operand::Value(src), len],
-@@ -1701,6 +1774,10 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
+@@ -1701,6 +1755,312 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
      // Retarget the preheader at the exit and drop the dead loop.
      func.blocks[m.preheader].terminator = Terminator::Branch(exit_label);
      let _ = crate::passes::cfg_simplify::eliminate_unreachable_blocks(func);
@@ -725,6 +2811,308 @@ index 3a715063..9e73fc16 100644
 +    );
      true
  }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::common::types::AddressSpace;
++    use crate::ir::reexports::{BasicBlock, IrParam};
++
++    fn val(id: u32) -> Operand {
++        Operand::Value(Value(id))
++    }
++    fn i32c(v: i32) -> Operand {
++        Operand::Const(IrConst::I32(v))
++    }
++    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
++        BasicBlock {
++            label: BlockId(label),
++            instructions,
++            terminator,
++            source_spans: Vec::new(),
++        }
++    }
++    fn ptr_param() -> IrParam {
++        IrParam {
++            ty: IrType::Ptr,
++            noalias: false,
++            struct_size: None,
++            struct_align: None,
++            param_align: None,
++            struct_eightbyte_classes: Vec::new(),
++            is_f128_sse: false,
++            riscv_float_class: None,
++        }
++    }
++    fn load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
++        Instruction::Load {
++            dest: Value(dest),
++            ptr: Value(ptr),
++            ty,
++            seg_override: AddressSpace::Default,
++            volatile: false,
++        }
++    }
++    fn store(v: Operand, ptr: u32, ty: IrType) -> Instruction {
++        Instruction::Store {
++            val: v,
++            ptr: Value(ptr),
++            ty,
++            seg_override: AddressSpace::Default,
++            volatile: false,
++        }
++    }
++    fn has_call(f: &IrFunction, name: &str) -> bool {
++        f.blocks
++            .iter()
++            .flat_map(|b| &b.instructions)
++            .any(|i| matches!(i, Instruction::Call { func, .. } if func == name))
++    }
++
++    /// Single-block indexed copy over two globals:
++    ///   P -> H (self) -> E   `for (i = 0; i < 16; i++) D[i] = S[i];`
++    /// Values: 1 = D base, 2 = S base, 10 = iv phi, 11 = Ult,
++    /// 12 = dst GEP, 13 = iv bump, 14 = src GEP, 15 = loaded byte.
++    fn self_loop_copy_func(elem_ty: IrType) -> IrFunction {
++        let mut f = IrFunction::new("self_loop_copy".into(), IrType::I32, vec![], false);
++        f.next_value_id = 30;
++        f.next_label = 3;
++        f.blocks.push(block(
++            0, // P
++            vec![
++                Instruction::GlobalAddr {
++                    dest: Value(1),
++                    name: "D".into(),
++                },
++                Instruction::GlobalAddr {
++                    dest: Value(2),
++                    name: "S".into(),
++                },
++            ],
++            Terminator::Branch(BlockId(1)),
++        ));
++        f.blocks.push(block(
++            1, // H (self-loop: header == latch)
++            vec![
++                Instruction::Phi {
++                    dest: Value(10),
++                    ty: IrType::U32,
++                    incoming: vec![(i32c(0), BlockId(0)), (val(13), BlockId(1))],
++                },
++                Instruction::Cmp {
++                    dest: Value(11),
++                    op: IrCmpOp::Ult,
++                    lhs: val(10),
++                    rhs: i32c(16),
++                    ty: IrType::U32,
++                },
++                Instruction::GetElementPtr {
++                    dest: Value(12),
++                    base: Value(1),
++                    offset: val(10),
++                    ty: IrType::Ptr,
++                },
++                Instruction::GetElementPtr {
++                    dest: Value(14),
++                    base: Value(2),
++                    offset: val(10),
++                    ty: IrType::Ptr,
++                },
++                load(15, 14, elem_ty),
++                store(val(15), 12, elem_ty),
++                Instruction::BinOp {
++                    dest: Value(13),
++                    op: IrBinOp::Add,
++                    lhs: val(10),
++                    rhs: i32c(1),
++                    ty: IrType::U32,
++                },
++            ],
++            Terminator::CondBranch {
++                cond: val(11),
++                true_label: BlockId(1),
++                false_label: BlockId(2),
++            },
++        ));
++        f.blocks
++            .push(block(2, vec![], Terminator::Return(Some(i32c(0)))));
++        f
++    }
++
++    #[test]
++    fn self_loop_global_copy_rewrites_to_memcpy() {
++        let mut f = self_loop_copy_func(IrType::U8);
++        let n = run_function(&mut f);
++        assert_eq!(n, 1, "single-block distinct-global copy must rewrite");
++        assert!(has_call(&f, "memcpy"), "distinct globals lower to memcpy");
++        assert!(
++            !f.blocks.iter().any(|b| b.label.0 == 1),
++            "dead loop header removed"
++        );
++    }
++
++    #[test]
++    fn self_loop_i8_copy_rewrites() {
++        // Pins the U8 -> byte-type (I8|U8) widening: signed bytes match too.
++        let mut f = self_loop_copy_func(IrType::I8);
++        let n = run_function(&mut f);
++        assert_eq!(n, 1, "I8 copy loop must rewrite");
++        assert!(has_call(&f, "memcpy"), "distinct globals lower to memcpy");
++    }
++
++    #[test]
++    fn self_loop_param_copy_rewrites_to_memmove() {
++        // Same single-block shape, but over two pointer params: distinct
++        // params may still alias in C, so the rewrite must be memmove.
++        let mut f = IrFunction::new(
++            "self_loop_pcopy".into(),
++            IrType::I32,
++            vec![ptr_param(), ptr_param()],
++            false,
++        );
++        f.next_value_id = 30;
++        f.next_label = 3;
++        f.blocks.push(block(
++            0, // P
++            vec![
++                Instruction::ParamRef {
++                    dest: Value(1),
++                    param_idx: 0,
++                    ty: IrType::Ptr,
++                },
++                Instruction::ParamRef {
++                    dest: Value(2),
++                    param_idx: 1,
++                    ty: IrType::Ptr,
++                },
++            ],
++            Terminator::Branch(BlockId(1)),
++        ));
++        // Header identical to the global shape (values 10..=15).
++        let mut g = self_loop_copy_func(IrType::U8);
++        let header = g.blocks.remove(1);
++        f.blocks.push(header);
++        f.blocks
++            .push(block(2, vec![], Terminator::Return(Some(i32c(0)))));
++        let n = run_function(&mut f);
++        assert_eq!(n, 1, "single-block param copy must rewrite");
++        assert!(has_call(&f, "memmove"), "param roots lower to memmove");
++        assert!(
++            !has_call(&f, "memcpy"),
++            "param roots must never lower to memcpy"
++        );
++    }
++
++    #[test]
++    fn header_div_bails() {
++        // A dead trapping UDiv in the header: the rewrite DCEs the loop,
++        // which would delete a potential trap. Must not match.
++        let mut f = self_loop_copy_func(IrType::U8);
++        f.blocks[1].instructions.push(Instruction::BinOp {
++            dest: Value(20),
++            op: IrBinOp::UDiv,
++            lhs: val(10),
++            rhs: i32c(2),
++            ty: IrType::U32,
++        });
++        // The div rides after the iv bump (scan order is irrelevant: every
++        // header BinOp is classified).
++        let n = run_function(&mut f);
++        assert_eq!(n, 0, "trapping div in header must bail");
++    }
++
++    /// Two-block indexed copy (header test + body latch) with a dead UDiv
++    /// in the body: pins the body-scan trapping bail.
++    fn two_block_copy_with_body_div() -> IrFunction {
++        let mut f = IrFunction::new("two_block_div".into(), IrType::I32, vec![], false);
++        f.next_value_id = 30;
++        f.next_label = 4;
++        f.blocks.push(block(
++            0, // P
++            vec![
++                Instruction::GlobalAddr {
++                    dest: Value(1),
++                    name: "D".into(),
++                },
++                Instruction::GlobalAddr {
++                    dest: Value(2),
++                    name: "S".into(),
++                },
++            ],
++            Terminator::Branch(BlockId(1)),
++        ));
++        f.blocks.push(block(
++            1, // H: phis + test only
++            vec![
++                Instruction::Phi {
++                    dest: Value(10),
++                    ty: IrType::U32,
++                    incoming: vec![(i32c(0), BlockId(0)), (val(13), BlockId(2))],
++                },
++                Instruction::Cmp {
++                    dest: Value(11),
++                    op: IrCmpOp::Ult,
++                    lhs: val(10),
++                    rhs: i32c(16),
++                    ty: IrType::U32,
++                },
++            ],
++            Terminator::CondBranch {
++                cond: val(11),
++                true_label: BlockId(2),
++                false_label: BlockId(3),
++            },
++        ));
++        f.blocks.push(block(
++            2, // B (latch): copy + iv bump + dead trapping div
++            vec![
++                Instruction::GetElementPtr {
++                    dest: Value(12),
++                    base: Value(1),
++                    offset: val(10),
++                    ty: IrType::Ptr,
++                },
++                Instruction::GetElementPtr {
++                    dest: Value(14),
++                    base: Value(2),
++                    offset: val(10),
++                    ty: IrType::Ptr,
++                },
++                load(15, 14, IrType::U8),
++                store(val(15), 12, IrType::U8),
++                Instruction::BinOp {
++                    dest: Value(13),
++                    op: IrBinOp::Add,
++                    lhs: val(10),
++                    rhs: i32c(1),
++                    ty: IrType::U32,
++                },
++                Instruction::BinOp {
++                    dest: Value(20),
++                    op: IrBinOp::UDiv,
++                    lhs: val(10),
++                    rhs: i32c(2),
++                    ty: IrType::U32,
++                },
++            ],
++            Terminator::Branch(BlockId(1)),
++        ));
++        f.blocks
++            .push(block(3, vec![], Terminator::Return(Some(i32c(0)))));
++        f
++    }
++
++    #[test]
++    fn body_div_bails() {
++        let mut f = two_block_copy_with_body_div();
++        let n = run_function(&mut f);
++        assert_eq!(n, 0, "trapping div in body must bail");
++        assert!(
++            f.blocks.iter().any(|b| b.label.0 == 2),
++            "bailed loop left intact"
++        );
++    }
++}
 diff --git a/src/passes/loop_memset.rs b/src/passes/loop_memset.rs
 index 30918089..a4155e81 100644
 --- a/src/passes/loop_memset.rs
@@ -773,78 +3161,188 @@ index 30918089..a4155e81 100644
                  };
                  if n > 0 && n > u64::MAX / u64::from(store_width) {
                      refuse!("static trip count {n} overflows the byte-range of the call");
-diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
-index 894f87d8..5bb71f87 100644
---- a/src/passes/loop_unroll.rs
-+++ b/src/passes/loop_unroll.rs
-@@ -46,10 +46,10 @@ fn choose_unroll_factor(body_inst_count: usize) -> u32 {
-     match body_inst_count {
-         // Tiny bodies (e.g. a single FmaF64x4 after vectorize): aggressive
-         // unroll exposes independent accumulators without code-size blow-up.
-+        // Retuned for hot crypto loops (SHA-256 ~40 insns): 4× up to 40, 2× to 80 like GCC.
-         0..=4 => 8,
--        5..=8 => 4,
--        9..=20 => 4,
--        21..=60 => 2,
-+        5..=40 => 4,
-+        41..=80 => 2,
-         _ => 1, // too large — skip
-     }
+diff --git a/tests/regression/check_loop_idiom.sh b/tests/regression/check_loop_idiom.sh
+index f8bf28c2..c70198ac 100755
+--- a/tests/regression/check_loop_idiom.sh
++++ b/tests/regression/check_loop_idiom.sh
+@@ -4,12 +4,13 @@
+ #
+ # The differential tests (loop_idiom_copy_basic/norewrite) pin SEMANTICS.
+ # This script pins the DECISIONS, which are compile-time properties:
+-#   1. recognised shapes lower to `call memcpy` (indexed, bump, nested,
+-#      const-bound, wide-IV, exit-value forms),
++#   1. recognised shapes lower to `call memcpy`/`call memmove` (indexed,
++#      bump, exit-value, single-block self-loop, and parameter-rooted forms),
+ #   2. near misses keep their loops (same-root, overlap smear, extra
+-#      loop-carried state, parameter roots, two-condition test),
+-#   3. the pass is inert without CCC_LOOP_IDIOM=1 (default pipeline
+-#      bit-identical).
++#      loop-carried state, same-parameter copy),
++#   3. the pass is DEFAULT-ON (no env flag needed); CCC_NO_LOOP_IDIOM=1
++#      restores the pre-pass codegen; the legacy CCC_LOOP_IDIOM=1 knob is
++#      accepted as a no-op.
+ # ============================================================================
+ set -euo pipefail
+ 
+@@ -21,24 +22,29 @@ work=$(mktemp -d)
+ trap 'rm -rf "$work"' EXIT
+ 
+ fail=0
+-check() { # name, want_memcpy(1/0), c-file, extra-env...
+-    local name=$1 want=$2 src=$3; shift 3
++compile() { # name, c-file, extra-env... -> $work/name.s
++    local name=$1 src=$2; shift 2
+     local asm="$work/$name.s"
+     if ! env "$@" "$CCC" -O2 -S "$src" -o "$asm" 2>"$work/$name.err"; then
+-        echo "FAIL($name): compile error"; head -5 "$work/$name.err"; fail=1; return
++        echo "FAIL($name): compile error"; head -5 "$work/$name.err"; fail=1; return 1
+     fi
++}
++check() { # name, want(1/0), ere-pattern, c-file, extra-env...
++    local name=$1 want=$2 pat=$3 src=$4; shift 4
++    compile "$name" "$src" "$@" || return 0
+     local got=0
+-    grep -q "call memcpy" "$asm" && got=1
++    grep -qE "$pat" "$work/$name.s" && got=1
+     if [[ $got != "$want" ]]; then
+-        echo "FAIL($name): want_memcpy=$want got=$got"
++        echo "FAIL($name): want='$pat'=$want got=$got"
+         fail=1
+     else
+-        echo "ok($name): memcpy=$got"
++        echo "ok($name): '$pat'=$got"
+     fi
  }
-@@ -4237,10 +4237,11 @@ mod tests {
++REWRITE='call (memcpy|memmove)'
  
-     #[test]
-     fn test_no_unroll_large_body() {
--        // Build a loop whose body has > 60 instructions → factor = 1 → no unroll.
-+        // Build a loop whose body has > 80 instructions → factor = 1 → no unroll.
-+        // Threshold retuned from 60 to 80 for SHA-256 4× unroll.
-         let mut func = make_counting_loop(100);
--        // Pad body (B2) with NOPs (Copy %0 = %0) until > 60 instructions.
--        for _ in 0..65 {
-+        // Pad body (B2) with NOPs (Copy %0 = %0) until > 80 instructions.
-+        for _ in 0..85 {
-             func.blocks[2].instructions.push(Instruction::Copy {
-                 dest: Value(0),
-                 src: Operand::Value(Value(0)),
-@@ -4249,7 +4250,7 @@ mod tests {
-         let n = unroll_loops(&mut func);
-         assert_eq!(
-             n, 0,
--            "loop with > 60 body instructions should not be unrolled"
-+            "loop with > 80 body instructions should not be unrolled"
-         );
-     }
+ # --- must rewrite (one TU per shape: rotating one function must not
+-# --- perturb another's text) ---
++# --- perturb another's text). Default pipeline: no env flag. ---
+ cat > "$work/r_indexed.c" <<'EOF'
+ unsigned char G1[4096], G2[4096];
+ unsigned LEN;
+@@ -62,9 +68,24 @@ void f(void) {
+     after = d;
+ }
+ EOF
+-check r_indexed 1 "$work/r_indexed.c" CCC_LOOP_IDIOM=1
+-check r_bump    1 "$work/r_bump.c"    CCC_LOOP_IDIOM=1
+-check r_exit    1 "$work/r_exit.c"    CCC_LOOP_IDIOM=1
++cat > "$work/r_selfloop.c" <<'EOF'
++void f(unsigned char *d, unsigned char *s, unsigned n) {
++    unsigned char *p, *q;
++    unsigned i;
++    for (p = d, q = s, i = 0; i < n; ++i) *p++ = *q++;
++}
++EOF
++cat > "$work/r_param.c" <<'EOF'
++void f(unsigned char *d, unsigned char *s, unsigned n) {
++    for (unsigned i = 0; i < n; i++) d[i] = s[i];
++}
++EOF
++check r_indexed 1 'call memcpy' "$work/r_indexed.c"
++check r_bump    1 'call memcpy' "$work/r_bump.c"
++check r_exit    1 'call memcpy' "$work/r_exit.c"
++check r_selfloop 1 "$REWRITE"   "$work/r_selfloop.c"
++check r_param_move 1 'call memmove' "$work/r_param.c"
++check r_param_nomemcpy 0 'call memcpy' "$work/r_param.c"
  
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index aef2319e..aecbdc46 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -1407,12 +1407,12 @@ pub(crate) fn run_passes(
+ # --- must NOT rewrite ---
+ cat > "$work/n_self.c" <<'EOF'
+@@ -84,20 +105,22 @@ void f(void) {
+     sum = s;
+ }
+ EOF
+-cat > "$work/n_param.c" <<'EOF'
+-void f(unsigned char *d, unsigned char *s, unsigned n) {
+-    for (unsigned i = 0; i < n; i++) d[i] = s[i];
++cat > "$work/n_sameparam.c" <<'EOF'
++void f(unsigned char *p, unsigned n) {
++    for (unsigned i = 0; i < n; i++) p[i] = p[i];
+ }
+ EOF
+-check n_self  0 "$work/n_self.c"  CCC_LOOP_IDIOM=1
+-check n_smear 0 "$work/n_smear.c" CCC_LOOP_IDIOM=1
+-check n_sum   0 "$work/n_sum.c"   CCC_LOOP_IDIOM=1
+-check n_param 0 "$work/n_param.c" CCC_LOOP_IDIOM=1
++check n_self      0 "$REWRITE" "$work/n_self.c"
++check n_smear     0 "$REWRITE" "$work/n_smear.c"
++check n_sum       0 "$REWRITE" "$work/n_sum.c"
++check n_sameparam 0 "$REWRITE" "$work/n_sameparam.c"
++
++# --- kill switch: CCC_NO_LOOP_IDIOM=1 restores loop codegen ---
++check kill_r_indexed 0 "$REWRITE" "$work/r_indexed.c" CCC_NO_LOOP_IDIOM=1
++check kill_r_param   0 "$REWRITE" "$work/r_param.c"   CCC_NO_LOOP_IDIOM=1
  
-         // Phase 2b-pre: pre-unroll CONST-TRIP map vectorization. The complete
-         // unroller below runs BEFORE the Phase 2b-vec vectorizer and steals
--        // every constant-trip elementwise loop (limit <= 16), leaving 16
-+        // every constant-trip elementwise loop (limit <= 64), leaving 64
-         // scalar copies where ONE packed op per iteration is strictly better
-         // (4x lanes, 1/4 the memory ops). This focused entry takes exactly
--        // the map-shaped const-trip 5..=16 loops FIRST (the map transform
-+        // the map-shaped const-trip 5..=64 loops FIRST (the map transform
-         // itself declines trips <= the vector width); the unroller then
--        // either unrolls the remaining vector iterations (trip <= 4 — the
-+        // either unrolls the remaining vector iterations (trip <= 16 — the
-         // ideal no-branch shape) or leaves them rolled.
-         // Pass name for CCC_DISABLE_PASSES: "vectorize".
-         if iter == 0
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index a58b0dab..0544086d 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -21165,7 +21165,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
-                 continue;
-             };
-             if !matches!(&pattern.limit, Operand::Const(c)
--                if c.to_i64().is_some_and(|t| (5..=16).contains(&t)))
-+                if c.to_i64().is_some_and(|t| (5..=64).contains(&t)))
-             {
-                 continue;
-             }
+-# --- default pipeline inert: without the opt-in flag no TU may change ---
+-for t in r_indexed r_bump r_exit n_self n_smear n_sum n_param; do
+-    check "off_$t" 0 "$work/$t.c"
+-done
++# --- legacy knob CCC_LOOP_IDIOM=1 accepted as a no-op (still rewrites) ---
++check legacy_r_indexed 1 'call memcpy' "$work/r_indexed.c" CCC_LOOP_IDIOM=1
+ 
+ if [[ $fail != 0 ]]; then echo "check_loop_idiom: FAILED"; exit 1; fi
+ echo "check_loop_idiom: all decisions pinned"
+diff --git a/tests/regression/check_loop_memset.sh b/tests/regression/check_loop_memset.sh
+index 83896e79..26145dc5 100755
+--- a/tests/regression/check_loop_memset.sh
++++ b/tests/regression/check_loop_memset.sh
+@@ -69,6 +69,14 @@ cat > "$work/m_nested.c" <<'EOF'
+ unsigned char G[4096]; unsigned N;
+ void f(unsigned k) { for (unsigned i = 0; i < N; i++) for (unsigned j = 0; j < k; j++) G[j] = 0; }
+ EOF
++cat > "$work/m_u64_for.c" <<'EOF'
++unsigned char G[4096]; unsigned long N;
++void f(void) { for (unsigned long i = 0; i < N; i++) G[i] = 0; }
++EOF
++cat > "$work/m_u64_while.c" <<'EOF'
++unsigned char G[4096]; unsigned long N;
++void f(void) { unsigned long i = 0; while (i < N) { G[i] = 0; i++; } }
++EOF
+ 
+ # --- must NOT rewrite ---
+ cat > "$work/n_computed.c" <<'EOF'
+@@ -96,6 +104,8 @@ check wide_pattern     1 "$work/m_wide_pattern.c"
+ check bump_fill        1 "$work/m_bump.c"
+ check exit_value_fill  1 "$work/m_exituse.c"
+ check nested_fill      1 "$work/m_nested.c"
++check u64_for_fill     1 "$work/m_u64_for.c"
++check u64_while_fill   1 "$work/m_u64_while.c"
+ 
+ check keep_computed    0 "$work/n_computed.c"
+ check keep_copy        0 "$work/n_copy.c"
+diff --git a/tests/regression/pr27285_replay_coalesce.c b/tests/regression/pr27285_replay_coalesce.c
+new file mode 100644
+index 00000000..fb1cb2ab
+--- /dev/null
++++ b/tests/regression/pr27285_replay_coalesce.c
+@@ -0,0 +1,29 @@
++/* Regression (GCC PR tree-optimization/27285, reduced): a loop-carried value
++   feeding a compare with two if-converted Select consumers must not be
++   compare-replay-pruned when RA coalesces the latch copy onto the same home.
++   The second select's replay would re-emit the compare after the first select
++   clobbered the shared home, tripping the stale-home ICE. The home-collision
++   veto in the prologue replay scan must keep the second replay. */
++extern void abort(void);
++
++static unsigned foo(unsigned b) {
++    unsigned c = 0, acc = 0;
++    while (b) {
++        if (b >= 8) {
++            c = 0xff;
++            b -= 8;
++        } else {
++            c = 0xffu << (8 - b);
++            b = 0;
++        }
++        acc += c;
++    }
++    return acc;
++}
++
++int main(void) {
++    /* 25->17->9->1->0: 255+255+255+32640 = 33405 */
++    if (foo(25) != 33405)
++        abort();
++    return 0;
++}
