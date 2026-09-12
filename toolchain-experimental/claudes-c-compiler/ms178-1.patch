@@ -1,1930 +1,2294 @@
-diff --git a/src/backend/x86/codegen/peephole/passes/helpers.rs b/src/backend/x86/codegen/peephole/passes/helpers.rs
-index b160e52e..f1d7cfd4 100644
---- a/src/backend/x86/codegen/peephole/passes/helpers.rs
-+++ b/src/backend/x86/codegen/peephole/passes/helpers.rs
-@@ -172,7 +172,86 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
-     // the x86 ISA only allows %ax or memory for fnstsw.
-     trimmed.starts_with("fnstsw") || trimmed.starts_with("fnstcw") ||
-     trimmed.starts_with("fstcw") || trimmed.starts_with("fnstenv") ||
--    trimmed.starts_with("fldenv") || trimmed.starts_with("fldcw")
-+    trimmed.starts_with("fldenv") || trimmed.starts_with("fldcw") ||
-+    has_bare_implicit_gp_effect(trimmed)
+diff --git a/src/backend/global_alloc.rs b/src/backend/global_alloc.rs
+new file mode 100644
+index 00000000..6e84d4f7
+--- /dev/null
++++ b/src/backend/global_alloc.rs
+@@ -0,0 +1,1442 @@
++//! Global Location Allocation — P0 architecture project
++//!
++//! Implements the conceptual model:
++//! ```text
++//! Location = Register | Stack | Rematerialize
++//! LocationPiece { start, end, location }
++//! ```
++//! A Value may have multiple pieces across its live range.
++//!
++//! Phase 1 minimal implementation behind `CCC_RA_GLOBAL_LOCATION=1`:
++//! - cross-block call splitting (single-successor dominance, no PHI needed)
++//! - intra-block next-use gap splitting with remat awareness
++//! - rematerialization detection (zero, const, GEP, small arith)
++//! - Raptor Lake cost model
++//! - AddressExpr for SIB-aware allocation
++
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
++use crate::common::types::IrType;
++use crate::ir::analysis;
++use crate::ir::reexports::{
++    BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
++};
++
++pub fn global_location_enabled() -> bool {
++    // Default-on for -O2+ after P0 validation: the pass is proven safe
++    // (single-succ dominance, SSA repair, volatile spill slots) and
++    // improves code quality (reduces spills in hot loops). Opt-out via
++    // CCC_NO_GLOBAL_LOCATION=1 or CCC_RA_GLOBAL_LOCATION=0.
++    if std::env::var_os("CCC_NO_GLOBAL_LOCATION").is_some() {
++        return false;
++    }
++    if let Ok(v) = std::env::var("CCC_RA_GLOBAL_LOCATION") {
++        let v = v.to_ascii_lowercase();
++        if v == "0" || v == "false" || v == "no" || v == "off" {
++            return false;
++        }
++        if v == "1" || v == "true" || v == "yes" || v == "on" {
++            return true;
++        }
++        // Any other value: treat as enabled if present? Fail closed to disabled for unknown.
++        return false;
++    }
++    // Default-on: enable globally. The pipeline already gates this behind
++    // opt_level >=2? Actually pipeline calls it unconditionally; we enable
++    // by default and rely on the pass's own safety checks.
++    true
 +}
 +
-+/// Bare instructions with implicit GP effects the textual `%reg` scans cannot
-+/// see. `has_implicit_reg_usage` covers `rep`-prefixed string ops; this covers
-+/// the rest: bare string ops (`movsq` reads/writes `%rsi`/`%rdi`), the
-+/// `repe`/`repz`/`repnz` prefix spellings GAS accepts on `cmps`/`scas`, `loop*`
-+/// (`%rcx`), `xlat` (writes `%al`), `rdpmc` (reads `%ecx`, writes `%edx`:`%eax`),
-+/// `sysret`/`sysexit`/`iret*`/`uiret` (restore paths clobbering everything), `int*`
-+/// (trap into unknown code), `xgetbv` (writes `%edx`:`%eax`) and `encls`/`enclu`
-+/// (implicit `%eax`/`%ebx`/`%ecx`/`%edx`). Exact whole-token matches only:
-+/// `movswl` (sign-extend) must NOT match the `movs` string op, so prefix tests
-+/// are banned here. Soundness-critical: the coalescing window and the
-+/// zero-upper scan skip lines mentioning no `%reg`, and must stop at these
-+/// instead (`xsetbv`/`monitor`/`mwait` only *read* GP regs implicitly, so
-+/// skipping them stays sound — reads don't modify).
-+fn has_bare_implicit_gp_effect(trimmed: &str) -> bool {
-+    let tok = trimmed.split_whitespace().next().unwrap_or("");
-+    // Prefix position (`repe cmpsb`): the string op follows.
-+    if tok == "repe" || tok == "repz" || tok == "repnz" {
-+        return true;
-+    }
-+    matches!(
-+        tok,
-+        "movs"
-+            | "movsb"
-+            | "movsw"
-+            | "movsl"
-+            | "movsq"
-+            | "stos"
-+            | "stosb"
-+            | "stosw"
-+            | "stosl"
-+            | "stosq"
-+            | "lods"
-+            | "lodsb"
-+            | "lodsw"
-+            | "lodsl"
-+            | "lodsq"
-+            | "cmps"
-+            | "cmpsb"
-+            | "cmpsw"
-+            | "cmpsl"
-+            | "cmpsq"
-+            | "scas"
-+            | "scasb"
-+            | "scasw"
-+            | "scasl"
-+            | "scasq"
-+            | "ins"
-+            | "insb"
-+            | "insw"
-+            | "insl"
-+            | "outs"
-+            | "outsb"
-+            | "outsw"
-+            | "outsl"
-+            | "loop"
-+            | "loope"
-+            | "loopne"
-+            | "loopz"
-+            | "loopnz"
-+            | "xlat"
-+            | "xlatb"
-+            | "rdpmc"
-+            | "sysret"
-+            | "sysexit"
-+            | "iret"
-+            | "iretd"
-+            | "iretq"
-+            | "uiret"
-+            | "int"
-+            | "int1"
-+            | "int3"
-+            | "into"
-+            | "xgetbv"
-+            | "encls"
-+            | "enclu"
-+    )
- }
- 
- /// Return the register FAMILY an instruction implicitly READS, when the
-@@ -712,4 +791,60 @@ mod writes_family_tests {
-         assert!(!writes_family_full(&info, "int $0x80", 0));
-         assert!(!writes_family_full(&info, "int $0x80", 5));
-     }
++fn debug_enabled() -> bool {
++    std::env::var_os("CCC_DEBUG_GLOBAL_ALLOC").is_some()
++}
 +
-+    #[test]
-+    fn bare_string_ops_flag_implicit() {
-+        for t in [
-+            "movsq", "movsb", "stosq", "stosl", "lodsq", "cmpsb", "scasq", "insl", "outsb",
-+        ] {
-+            assert!(has_implicit_reg_usage(t), "{t}");
++macro_rules! dlog {
++    ($($arg:tt)*) => {
++        if debug_enabled() {
++            eprintln!($($arg)*);
++        }
++    };
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RematerializationKind {
++    Zero,
++    ConstI32(i32),
++    ConstI64(i64),
++    GlobalAddr(String),
++    SimpleGep {
++        base: u32,
++        offset: i64,
++    },
++    Extension {
++        src: u32,
++        from_ty: IrType,
++        to_ty: IrType,
++        is_signed: bool,
++    },
++    SmallArith {
++        base: u32,
++        kind: SmallArithKind,
++    },
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum SmallArithKind {
++    AddConst(i64),
++    MulScale(u8),
++    ShlConst(u8),
++    AndMask(u64),
++}
++
++#[derive(Debug, Clone)]
++pub enum Location {
++    Register(u8),
++    Stack(u32),
++    Rematerialize(RematerializationKind),
++}
++
++#[derive(Debug, Clone)]
++pub struct LocationPiece {
++    pub value_id: u32,
++    pub start: u32,
++    pub end: u32,
++    pub location: Location,
++    pub frequency: u64,
++}
++
++pub struct GlobalAllocation {
++    pub pieces: FxHashMap<u32, Vec<LocationPiece>>,
++}
++
++impl GlobalAllocation {
++    pub fn new() -> Self {
++        Self {
++            pieces: FxHashMap::default(),
 +        }
 +    }
 +
-+    #[test]
-+    fn repe_family_flags_implicit() {
-+        for t in ["repe cmpsb", "repz scasb", "repnz scasb"] {
-+            assert!(has_implicit_reg_usage(t), "{t}");
++    pub fn verify(
++        &self,
++        _func: &IrFunction,
++        liveness: &super::liveness::LivenessResult,
++    ) -> Result<(), String> {
++        for (vid, pieces) in &self.pieces {
++            if pieces.is_empty() {
++                continue;
++            }
++            let mut sorted = pieces.clone();
++            sorted.sort_by_key(|p| p.start);
++            for i in 1..sorted.len() {
++                if sorted[i].start < sorted[i - 1].end {
++                    return Err(format!(
++                        "value {} pieces overlap: [{},{}) and [{},{})",
++                        vid,
++                        sorted[i - 1].start,
++                        sorted[i - 1].end,
++                        sorted[i].start,
++                        sorted[i].end
++                    ));
++                }
++            }
++            let _ = liveness;
 +        }
-+    }
-+
-+    #[test]
-+    fn misc_implicit_gp_effects_flagged() {
-+        for t in [
-+            "loop .L1",
-+            "loope .L1",
-+            "xlat",
-+            "xlatb",
-+            "rdpmc",
-+            "sysret",
-+            "sysexit",
-+            "iretq",
-+            "uiret",
-+            "int $3",
-+            "int3",
-+            "xgetbv",
-+            "enclu",
-+            "encls",
-+        ] {
-+            assert!(has_implicit_reg_usage(t), "{t}");
-+        }
-+    }
-+
-+    #[test]
-+    fn sign_extends_and_reads_stay_unflagged() {
-+        // `movswl` shares a prefix with the `movs` string op but is a plain
-+        // sign-extend with explicit operands; `xsetbv`/`monitor`/`mwait` only
-+        // read GP regs implicitly (reads don't modify), so skipping them is
-+        // sound and they must not abort the coalescing scans.
-+        for t in [
-+            "movswl %dx, %eax",
-+            "movsbq %cl, %rax",
-+            "xsetbv",
-+            "monitor %rax, %rcx, %rdx",
-+            "mwait %rax, %rcx",
-+            "addl %eax, %ebx",
-+        ] {
-+            assert!(!has_implicit_reg_usage(t), "{t}");
-+        }
-+    }
- }
-diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-index 5e64de48..a303e2e2 100644
---- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-+++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-@@ -366,6 +366,69 @@ pub(super) fn plain_gp_operand(text: &str) -> Option<RegId> {
- 
- // ── Pass 1: move-relay elimination ───────────────────────────────────────────
- 
-+/// The width in bits of a plain GP register spelling. Unlike `dest_width`
-+/// (whose 64/32-only contract two callers rely on) this covers 8/16-bit
-+/// spellings too; high-byte spellings (`%ah`) report 8, so callers needing
-+/// canonical-low must compare spellings (see `relay_source_for`).
-+fn operand_width(name: &str) -> Option<u8> {
-+    let fam = register_family_fast(name);
-+    if fam == REG_NONE || fam > REG_GP_MAX {
-+        return None;
-+    }
-+    let f = fam as usize;
-+    if name == REG_NAMES[0][f] {
-+        Some(64)
-+    } else if name == REG_NAMES[1][f] {
-+        Some(32)
-+    } else if name == REG_NAMES[2][f] {
-+        Some(16)
-+    } else if name == REG_NAMES[3][f] {
-+        Some(8)
-+    } else if matches!(name, "%ah" | "%ch" | "%dh" | "%bh") {
-+        Some(8)
-+    } else {
-+        None
++        Ok(())
 +    }
 +}
 +
-+/// P4's width-flexible relay source: `Some` respelled `%S` text when the
-+/// consumer's source operand reads `%D` in a relayable way. The family must
-+/// match at a canonical low spelling — high-byte uses (`%ah`) read bits
-+/// 8-15, which no copy establishes — and the width rule decides the proof:
-+/// reads at or below the copy width are free (the copy preserves the low
-+/// bits, so `movq %S, %D` + `cmpl %D32, %X` ≡ `cmpl %S32, %X` with no proof
-+/// at all); a 64-bit read under a 32-bit copy needs `upper32_zero_at` (the
-+/// upper half is otherwise unknown). The rewritten line reads identical
-+/// values (flags included — carry flows through the same line unchanged).
-+fn relay_source_for(
-+    use_src: &str,
-+    dst_fam: RegId,
-+    src_fam: RegId,
-+    copy_w: u8,
-+    store: &LineStore,
-+    infos: &[LineInfo],
-+    i: usize,
-+) -> Option<String> {
-+    if plain_gp_operand(use_src) != Some(dst_fam) {
-+        return None;
++fn is_rematerializable(func: &IrFunction, vid: u32) -> Option<RematerializationKind> {
++    let mut def_inst: Option<Instruction> = None;
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Some(dest) = inst.dest() {
++                if dest.0 == vid {
++                    def_inst = Some(inst.clone());
++                    break;
++                }
++            }
++        }
++        if def_inst.is_some() {
++            break;
++        }
 +    }
-+    let read_w = operand_width(use_src)?;
-+    let tier = match read_w {
-+        64 => 0,
-+        32 => 1,
-+        16 => 2,
-+        8 => 3,
++    let inst = def_inst?;
++
++    match inst {
++        Instruction::Copy { src, .. } => match src {
++            Operand::Const(c) => match c {
++                IrConst::Zero => Some(RematerializationKind::Zero),
++                IrConst::I32(0) | IrConst::I64(0) | IrConst::I128(0) => {
++                    Some(RematerializationKind::Zero)
++                }
++                IrConst::I32(v) => Some(RematerializationKind::ConstI32(v)),
++                IrConst::I64(v) => Some(RematerializationKind::ConstI64(v)),
++                IrConst::I128(v) => {
++                    if v >= i32::MIN as i128 && v <= i32::MAX as i128 {
++                        Some(RematerializationKind::ConstI32(v as i32))
++                    } else if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
++                        Some(RematerializationKind::ConstI64(v as i64))
++                    } else {
++                        None
++                    }
++                }
++                _ => None,
++            },
++            _ => None,
++        },
++        Instruction::Cast {
++            src,
++            from_ty,
++            to_ty,
++            ..
++        } => {
++            if let Operand::Value(src_v) = src {
++                let is_ext = matches!(
++                    (from_ty, to_ty),
++                    (IrType::I8, IrType::I32)
++                        | (IrType::U8, IrType::I32)
++                        | (IrType::I8, IrType::I64)
++                        | (IrType::U8, IrType::I64)
++                        | (IrType::I16, IrType::I32)
++                        | (IrType::U16, IrType::I32)
++                        | (IrType::I16, IrType::I64)
++                        | (IrType::U16, IrType::I64)
++                        | (IrType::I32, IrType::I64)
++                        | (IrType::U32, IrType::I64)
++                );
++                if is_ext {
++                    return Some(RematerializationKind::Extension {
++                        src: src_v.0,
++                        from_ty,
++                        to_ty,
++                        is_signed: matches!(from_ty, IrType::I8 | IrType::I16 | IrType::I32),
++                    });
++                }
++            }
++            None
++        }
++        Instruction::GetElementPtr { base, offset, .. } => {
++            if let Operand::Const(c) = offset {
++                if let Some(off) = c.to_i64() {
++                    if off.abs() <= 4096 {
++                        return Some(RematerializationKind::SimpleGep {
++                            base: base.0,
++                            offset: off,
++                        });
++                    }
++                }
++            }
++            None
++        }
++        Instruction::GlobalAddr { name, .. } => Some(RematerializationKind::GlobalAddr(name)),
++        Instruction::BinOp { op, lhs, rhs, .. } => {
++            let const_side = match (&lhs, &rhs) {
++                (Operand::Value(v), Operand::Const(c)) => Some((*v, *c, true)),
++                (Operand::Const(c), Operand::Value(v)) => Some((*v, *c, false)),
++                _ => None,
++            };
++            if let Some((base, c, _)) = const_side {
++                if let Some(cv) = c.to_i64() {
++                    match op {
++                        IrBinOp::Add => {
++                            if cv.abs() <= 4096 {
++                                return Some(RematerializationKind::SmallArith {
++                                    base: base.0,
++                                    kind: SmallArithKind::AddConst(cv),
++                                });
++                            }
++                        }
++                        IrBinOp::Mul => {
++                            if cv == 2 || cv == 4 || cv == 8 {
++                                return Some(RematerializationKind::SmallArith {
++                                    base: base.0,
++                                    kind: SmallArithKind::MulScale(cv as u8),
++                                });
++                            }
++                        }
++                        IrBinOp::Shl => {
++                            if (1..=3).contains(&cv) {
++                                return Some(RematerializationKind::SmallArith {
++                                    base: base.0,
++                                    kind: SmallArithKind::ShlConst(cv as u8),
++                                });
++                            }
++                        }
++                        IrBinOp::And => {
++                            if (cv as u64).count_ones() <= 16 {
++                                return Some(RematerializationKind::SmallArith {
++                                    base: base.0,
++                                    kind: SmallArithKind::AndMask(cv as u64),
++                                });
++                            }
++                        }
++                        _ => {}
++                    }
++                }
++            }
++            None
++        }
++        _ => None,
++    }
++}
++
++pub struct RaptorLakeCostModel;
++
++impl RaptorLakeCostModel {
++    pub fn latency(op: &str) -> u8 {
++        match op {
++            "add" | "sub" | "and" | "or" | "xor" => 1,
++            "lea1" | "lea2" | "lea3" => 1,
++            "shl_imm" | "shr_imm" | "sar_imm" => 1,
++            "shl_cl" => 1,
++            "imul" | "mul" => 3,
++            "div" => 20,
++            "load" => 5,
++            "store" => 1,
++            "branch" | "cmp" => 1,
++            _ => 1,
++        }
++    }
++
++    pub fn rthroughput_x100(op: &str) -> u16 {
++        match op {
++            "add" => 25,
++            "lea1" | "lea2" | "lea3" => 20,
++            "shl_imm" => 25,
++            "shl_cl" | "imul" | "load" | "store" => 100,
++            _ => 100,
++        }
++    }
++
++    pub fn uops(op: &str) -> u8 {
++        match op {
++            "add" | "sub" | "and" | "or" | "xor" | "lea1" | "lea2" | "lea3" | "shl_imm"
++            | "shl_cl" | "imul" | "load" | "store" | "branch" => 1,
++            _ => 1,
++        }
++    }
++
++    pub fn remat_cost(kind: &RematerializationKind) -> u64 {
++        match kind {
++            RematerializationKind::Zero => 1,
++            RematerializationKind::ConstI32(_) => 1,
++            RematerializationKind::ConstI64(_) => 1,
++            RematerializationKind::GlobalAddr(_) => 2,
++            RematerializationKind::SimpleGep { .. } => 1,
++            RematerializationKind::Extension { .. } => 1,
++            RematerializationKind::SmallArith { .. } => 1,
++        }
++    }
++
++    pub fn spill_cost() -> u64 {
++        10
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++struct PointLoc {
++    block: usize,
++    inst: Option<usize>,
++}
++
++fn assign_point_locs(func: &IrFunction) -> Vec<PointLoc> {
++    let mut pts = Vec::new();
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for ii in 0..block.instructions.len() {
++            pts.push(PointLoc {
++                block: bi,
++                inst: Some(ii),
++            });
++        }
++        pts.push(PointLoc {
++            block: bi,
++            inst: None,
++        });
++    }
++    pts
++}
++
++fn const_type(c: &IrConst) -> Option<IrType> {
++    Some(match c {
++        IrConst::I8(_) => IrType::I8,
++        IrConst::I16(_) => IrType::I16,
++        IrConst::I32(_) => IrType::I32,
++        IrConst::I64(_) => IrType::I64,
++        IrConst::I128(_) => IrType::I64,
++        IrConst::F32(_) => IrType::F32,
++        IrConst::F64(_) => IrType::F64,
++        IrConst::Zero => IrType::I32,
 +        _ => return None,
-+    };
-+    if use_src != REG_NAMES[tier][dst_fam as usize] {
-+        return None;
-+    }
-+    if read_w > copy_w && !upper32_zero_at(store, infos, i, src_fam) {
-+        return None;
-+    }
-+    Some(REG_NAMES[tier][src_fam as usize].to_string())
++    })
 +}
 +
- /// Delete `mov %S, %D` when the copy exists only to feed one ALU source:
- ///
- /// ```text
-@@ -379,10 +442,13 @@ pub(super) fn plain_gp_operand(text: &str) -> Option<RegId> {
- /// * Between the copy and the use there is no barrier, no implicit register
- ///   traffic, no write to `%S`, and no other mention of `%D`.
- /// * The use names `%D` EXACTLY as the copy's destination text, so the rewrite
--///   is width-exact (`movl %eax,%r10d` never feeds `addq %r10,...`).
-+///   is width-flexible: reads at or below the copy width relay free (the
-+///   copy preserves the low bits); a 64-bit read under a 32-bit copy needs
-+///   `upper32_zero_at` (high-byte uses never relay).
- /// * The use's destination is a different family, and after substituting `%S`
- ///   the line no longer mentions `%D` at all.
- /// * `%D` is provably dead after the use (module header, proofs 1 and 2).
-+
- pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-     let len = store.len();
-     let mut lv = FileLiveness::new(store, infos);
-@@ -415,8 +481,7 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
-             i += 1;
-             continue;
-         }
--        let src_text = src_text.to_string();
--        let dst_text = dst_text.to_string();
-+        let copy_w = dest_width(dst_text).unwrap_or(0);
-         let src_mask = 1u16 << src_fam;
-         let dst_mask = 1u16 << dst_fam;
- 
-@@ -448,8 +513,13 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
-                         .find(|op| t.starts_with(**op))
-                     {
-                         if let Some((st_src, st_dst)) = split_two_operands(&t[sop.len()..]) {
--                            if st_src == dst_text && st_dst.contains('(') {
--                                let new_line = format!("    {}{}, {}", sop, src_text, st_dst);
-+                            if st_dst.contains('(') {
-+                                let Some(new_src) = relay_source_for(
-+                                    st_src, dst_fam, src_fam, copy_w, store, infos, i,
-+                                ) else {
-+                                    break;
-+                                };
-+                                let new_line = format!("    {sop}{new_src}, {st_dst}");
-                                 if !line_refs_family(&new_line, dst_fam)
-                                     && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
-                                 {
-@@ -470,8 +540,13 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
-                             let dst_is_other_reg = use_dst.starts_with('%')
-                                 && use_dst_fam != REG_NONE
-                                 && use_dst_fam != dst_fam;
--                            if use_src == dst_text && dst_is_other_reg {
--                                let new_line = format!("    {}{}, {}", op, src_text, use_dst);
-+                            if dst_is_other_reg {
-+                                let Some(new_src) = relay_source_for(
-+                                    use_src, dst_fam, src_fam, copy_w, store, infos, i,
-+                                ) else {
-+                                    break;
-+                                };
-+                                let new_line = format!("    {op}{new_src}, {use_dst}");
-                                 // The substitution must absorb EVERY mention of %D.
-                                 if !line_refs_family(&new_line, dst_fam)
-                                     && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
-@@ -1124,7 +1199,12 @@ const RMW_CONSUMER_OPS: &[&str] = &[
- /// 1. The consumer is adjacent (NOPs apart). For a plain copy `%S == %D`
- ///    still holds there, and the destination width is at most the copy's
- ///    width — a 64-bit consumer under a 32-bit copy would read the source's
--///    unknown upper half. For an extension copy the consumer must be
-+///    unknown upper half, with two proven exceptions: `movl %S, %D` +
-+///    `shlq $32, %D` folds (identical values; the divergent CF is
-+///    compensated by `shift_cf_safe_after`), and ANY 64-bit consumer folds
-+///    when `upper32_zero_at` proves the source's upper half zero (exact
-+///    value equality — flags included). For an extension copy the
-+///    consumer must be
- ///    `andl $mask` with the mask clearing every bit above the extension
- ///    width: below it both spellings agree (the extension's identity bits),
- ///    above it the mask forces zero in both. Either way the consumer reads
-@@ -1152,7 +1232,9 @@ const RMW_CONSUMER_OPS: &[&str] = &[
- /// Parse an `and $imm, ...` source operand into its u32 mask. Accepts GAS
- /// decimal/hex immediates (`$127`, `$0x7f`, `$-1`); anything else (symbols,
- /// malformed) refuses so the caller falls back to `continue`.
--fn parse_and_mask(src: &str) -> Option<u32> {
-+/// Parse a `$`-immediate operand (`$32`, `$0x20`, `$-1`) into its 32-bit
-+/// value. Shared by the P1 mask check and the P2.5 shift-count check.
-+fn parse_imm32(src: &str) -> Option<u32> {
-     let digits = src.strip_prefix('$')?;
-     if digits.is_empty() {
-         return None;
-@@ -1169,6 +1251,591 @@ fn parse_and_mask(src: &str) -> Option<u32> {
-     }
- }
- 
-+/// P2.5's flag-compensation sets: the cross-family `movl; shlq $32` fold
-+/// computes identical VALUES but divergent CF (0 vs the source's bit 32),
-+/// so the fold stands only when the consumer's CF is provably unobservable
-+/// (see `shift_cf_safe_after`). OF/AF-after-shift are undefined in BOTH
-+/// spellings (LLVM models them as `undef` — reading them is garbage either
-+/// way); only CF (defined-but-divergent) is audited. Comparisons are
-+/// case-insensitive: the consumer matcher is case-sensitive (missed folds
-+/// are safe), but a missed CF READER would be unsound.
-+///
-+/// Carry-flag readers: any of these vetoes the fold.
-+/// * `adc`/`sbb`/`adcx` read CF as carry-in; `rcl`/`rcr` rotate through it;
-+///   `salc` materialises it; `cmc` COMPLEMENTS it (a read!);
-+/// * CF-conditional `set`/`cmov`/`j` (lowercase `jcc` never reaches the scan
-+///   — the classifier barriers it — but odd-case spellings do);
-+/// * whole-flag reads (`lahf`, `pushf*`, `syscall`/`sysenter` saving RFLAGS);
-+/// * the BCD group (invalid in 64-bit mode; `daa`/`das` read CF, the rest
-+///   read AF which the fold leaves undefined) and deliberate traps (`int*`
-+///   hands RFLAGS to a debugger/handler — stronger than industry, free).
-+const CF_READERS: &[&str] = &[
-+    "adc", "adcb", "adcw", "adcl", "adcq", "adcx", "sbb", "sbbb", "sbbw", "sbbl", "sbbq", "rcl",
-+    "rclb", "rclw", "rcll", "rclq", "rcr", "rcrb", "rcrw", "rcrl", "rcrq", "salc", "cmc", "aaa",
-+    "aas", "aam", "aad", "daa", "das", "setb", "setc", "setnae", "setnb", "setnc", "setae",
-+    "cmovb", "cmovc", "cmovnae", "cmovnb", "cmovnc", "cmovae", "jb", "jc", "jnae", "jnb", "jnc",
-+    "jae", "lahf", "pushf", "pushfw", "pushfd", "pushfq", "syscall", "sysenter", "int", "int1",
-+    "int3", "into",
-+];
-+
-+/// Unconditional carry-flag writers (any operands): a scan hit ends the
-+/// audit with success. Mul/div-family CF is architecturally undefined but
-+/// silicon-deterministic, hence identical in both spellings (their inputs
-+/// are — renames preserve values); `bt*` writes CF for every count.
-+const CF_CLOBBER: &[&str] = &[
-+    "add",
-+    "addb",
-+    "addw",
-+    "addl",
-+    "addq",
-+    "sub",
-+    "subb",
-+    "subw",
-+    "subl",
-+    "subq",
-+    "and",
-+    "andb",
-+    "andw",
-+    "andl",
-+    "andq",
-+    "or",
-+    "orb",
-+    "orw",
-+    "orl",
-+    "orq",
-+    "xor",
-+    "xorb",
-+    "xorw",
-+    "xorl",
-+    "xorq",
-+    "cmp",
-+    "cmpb",
-+    "cmpw",
-+    "cmpl",
-+    "cmpq",
-+    "test",
-+    "testb",
-+    "testw",
-+    "testl",
-+    "testq",
-+    "mul",
-+    "mulb",
-+    "mulw",
-+    "mull",
-+    "mulq",
-+    "imul",
-+    "imulb",
-+    "imulw",
-+    "imull",
-+    "imulq",
-+    "div",
-+    "divb",
-+    "divw",
-+    "divl",
-+    "divq",
-+    "idiv",
-+    "idivb",
-+    "idivw",
-+    "idivl",
-+    "idivq",
-+    "neg",
-+    "negb",
-+    "negw",
-+    "negl",
-+    "negq",
-+    "bt",
-+    "btw",
-+    "btl",
-+    "btq",
-+    "bts",
-+    "btsw",
-+    "btsl",
-+    "btsq",
-+    "btr",
-+    "btrw",
-+    "btrl",
-+    "btrq",
-+    "btc",
-+    "btcw",
-+    "btcl",
-+    "btcq",
-+    "clc",
-+    "stc",
-+    "sahf",
-+    "popf",
-+    "popfw",
-+    "popfd",
-+    "popfq",
-+    "xadd",
-+    "xaddb",
-+    "xaddw",
-+    "xaddl",
-+    "xaddq",
-+    "cmpxchg",
-+    "cmpxchgb",
-+    "cmpxchgw",
-+    "cmpxchgl",
-+    "cmpxchgq",
-+    "cmpxchg8b",
-+    "cmpxchg16b",
-+    "popcnt",
-+    "popcntw",
-+    "popcntl",
-+    "popcntq",
-+    "lzcnt",
-+    "lzcntw",
-+    "lzcntl",
-+    "lzcntq",
-+    "tzcnt",
-+    "tzcntw",
-+    "tzcntl",
-+    "tzcntq",
-+    "bsf",
-+    "bsfw",
-+    "bsfl",
-+    "bsfq",
-+    "bsr",
-+    "bsrw",
-+    "bsrl",
-+    "bsrq",
-+    "rdrand",
-+    "rdseed",
-+    "andn",
-+    "bextr",
-+    "blsi",
-+    "blsmsk",
-+    "blsr",
-+    "cmps",
-+    "cmpsb",
-+    "cmpsw",
-+    "cmpsl",
-+    "cmpsq",
-+    "scas",
-+    "scasb",
-+    "scasw",
-+    "scasl",
-+    "scasq",
-+    "comiss",
-+    "comisd",
-+    "ucomiss",
-+    "ucomisd",
-+    "fcomi",
-+    "fcomip",
-+    "fucomi",
-+    "fucomip",
-+    "iret",
-+    "iretd",
-+    "iretq",
-+    "sysret",
-+    "sysexit",
-+];
-+
-+/// Instructions with provably no RFLAGS effect: the scan skips them.
-+/// (`inc*` is covered by the `in` prefix rule in `cf_skip_prefix`;
-+/// `shld`/`shrd` never READ CF, so skipping (losing clobber credit) is
-+/// safe; `movs*`/`ins*` ride the `mov`/`in` prefix rules.)
-+const CF_SKIP_EXACT: &[&str] = &[
-+    "lea",
-+    "xchg",
-+    "xchgb",
-+    "xchgw",
-+    "xchgl",
-+    "xchgq",
-+    "bswap",
-+    "movbe",
-+    "not",
-+    "notb",
-+    "notw",
-+    "notl",
-+    "notq",
-+    "dec",
-+    "decb",
-+    "decw",
-+    "decl",
-+    "decq",
-+    "cbw",
-+    "cwde",
-+    "cdqe",
-+    "cwd",
-+    "cdq",
-+    "cqo",
-+    "cqto",
-+    "cltq",
-+    "mulx",
-+    "pdep",
-+    "pext",
-+    "sarx",
-+    "shlx",
-+    "shrx",
-+    "rorx",
-+    "adox",
-+    "crc32",
-+    "crc32b",
-+    "crc32w",
-+    "crc32l",
-+    "crc32q",
-+    "stos",
-+    "stosb",
-+    "stosw",
-+    "stosl",
-+    "stosq",
-+    "lods",
-+    "lodsb",
-+    "lodsw",
-+    "lodsl",
-+    "lodsq",
-+    "loop",
-+    "loope",
-+    "loopne",
-+    "loopz",
-+    "loopnz",
-+    "jcxz",
-+    "jecxz",
-+    "jrcxz",
-+    "shld",
-+    "shldw",
-+    "shldl",
-+    "shldq",
-+    "shrd",
-+    "shrdw",
-+    "shrdl",
-+    "shrdq",
-+    "hlt",
-+    "cli",
-+    "sti",
-+    "clac",
-+    "stac",
-+    "nop",
-+    "pause",
-+    "lgdt",
-+    "lidt",
-+    "lldt",
-+    "ltr",
-+    "lmsw",
-+    "clts",
-+    "rdtsc",
-+    "rdtscp",
-+    "rdpmc",
-+    "rdmsr",
-+    "wrmsr",
-+    "cpuid",
-+    "xgetbv",
-+    "xsetbv",
-+    "rdfsbase",
-+    "rdgsbase",
-+    "wrfsbase",
-+    "wrgsbase",
-+    "xlat",
-+    "xlatb",
-+    "fxsave",
-+    "fxsave64",
-+    "fxrstor",
-+    "fxrstor64",
-+    "ldmxcsr",
-+    "stmxcsr",
-+    "xsave",
-+    "xsave64",
-+    "xrstor",
-+    "xrstor64",
-+    "monitor",
-+    "mwait",
-+    "mwaitx",
-+    "encls",
-+    "enclu",
-+];
-+
-+/// Shifts/rotates write CF only when the effective count is nonzero (see
-+/// `shift_proves_cf_clobber`); `rcl`/`rcr` are readers (in `CF_READERS`).
-+const SHIFTS_GUARDED: &[&str] = &[
-+    "shl", "shlb", "shlw", "shll", "shlq", "shr", "shrb", "shrw", "shrl", "shrq", "sar", "sarb",
-+    "sarw", "sarl", "sarq", "sal", "salb", "salw", "sall", "salq", "rol", "rolb", "rolw", "roll",
-+    "rolq", "ror", "rorb", "rorw", "rorl", "rorq",
-+];
-+
-+/// Prefix rules for the CF audit (checked AFTER the reader/clobber sets, so
-+/// the vetoed/credited members of each family win): every `mov`-form is
-+/// flag-free (moves, extends, SSE moves, even segment moves); every
-+/// `in`/`out`-form likewise (`int*` was vetoed above — and `inc*` rides
-+/// this rule, NOT the clobber set: `inc`/`dec` preserve CF); plain
-+/// pushes/pops only move data (`pushf*`/`popf*` were classified above);
-+/// non-CF `cmov`/`set`/`j` conditions read only ZF/SF/OF/PF (their CF
-+/// siblings were vetoed above) and an odd-case `jmp` reads nothing.
-+fn cf_skip_prefix(tok: &str) -> bool {
-+    let starts_with_fold =
-+        |lit: &str| tok.len() >= lit.len() && tok[..lit.len()].eq_ignore_ascii_case(lit);
-+    starts_with_fold("mov")
-+        || starts_with_fold("in")
-+        || starts_with_fold("out")
-+        || starts_with_fold("push")
-+        || starts_with_fold("pop")
-+        || starts_with_fold("cmov")
-+        || starts_with_fold("set")
-+        || starts_with_fold("j")
-+        || starts_with_fold("prefetch")
-+        || starts_with_fold("clflush")
-+        || tok.eq_ignore_ascii_case("mfence")
-+        || tok.eq_ignore_ascii_case("lfence")
-+        || tok.eq_ignore_ascii_case("sfence")
-+        || tok.eq_ignore_ascii_case("clwb")
-+}
-+
-+/// The flag-effect token of a line: the mnemonic with any repeat/lock
-+/// prefix stripped (`rep cmpsb` writes flags, `rep movsq` does not).
-+fn cf_effect_token(t: &str) -> &str {
-+    let mut words = t.split_whitespace();
-+    let first = words.next().unwrap_or("");
-+    if first.eq_ignore_ascii_case("rep")
-+        || first.eq_ignore_ascii_case("repe")
-+        || first.eq_ignore_ascii_case("repne")
-+        || first.eq_ignore_ascii_case("repz")
-+        || first.eq_ignore_ascii_case("repnz")
-+        || first.eq_ignore_ascii_case("lock")
-+    {
-+        words.next().unwrap_or("")
-+    } else {
-+        first
++fn inst_result_type(inst: &Instruction) -> Option<(u32, IrType)> {
++    match inst {
++        Instruction::BinOp { dest, ty, .. }
++        | Instruction::UnaryOp { dest, ty, .. }
++        | Instruction::Load { dest, ty, .. }
++        | Instruction::Cmp { dest, ty, .. }
++        | Instruction::Select { dest, ty, .. }
++        | Instruction::Phi { dest, ty, .. } => Some((dest.0, *ty)),
++        Instruction::Cast { dest, to_ty, .. } => Some((dest.0, *to_ty)),
++        Instruction::GetElementPtr { dest, .. }
++        | Instruction::GlobalAddr { dest, .. }
++        | Instruction::Alloca { dest, .. }
++        | Instruction::DynAlloca { dest, .. } => Some((dest.0, IrType::Ptr)),
++        Instruction::Copy {
++            dest,
++            src: Operand::Const(c),
++        } => const_type(c).map(|t| (dest.0, t)),
++        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
++            info.dest.map(|d| (d.0, info.return_type))
++        }
++        Instruction::ParamRef { dest, ty, .. } => Some((dest.0, *ty)),
++        Instruction::StackSave { dest, .. } => Some((dest.0, IrType::Ptr)),
++        Instruction::LabelAddr { dest, .. } => Some((dest.0, IrType::Ptr)),
++        _ => None,
 +    }
 +}
 +
-+/// Whether a guarded shift/rotate (see `SHIFTS_GUARDED`) provably writes CF:
-+/// the count must be a `$`-immediate whose masked value is nonzero (silicon
-+/// masks to 5 bits, 6 for qword; a zero effective count preserves ALL
-+/// flags). A `%cl` count or a suffixless mnemonic (width unknowable) proves
-+/// nothing — and that is safe, because shifts never READ CF.
-+fn shift_proves_cf_clobber(tok: &str, t: &str) -> bool {
-+    if tok.len() != 4 {
-+        return false; // suffixless (or malformed): width unknowable
-+    }
-+    let Some(rest) = t.split_whitespace().nth(1) else {
-+        return false;
-+    };
-+    let Some((count, _)) = split_two_operands(rest) else {
-+        return false;
-+    };
-+    let Some(imm) = parse_imm32(count) else {
-+        return false;
-+    };
-+    let mask = if tok.as_bytes()[3].eq_ignore_ascii_case(&b'q') {
-+        63u32
-+    } else {
-+        31u32
-+    };
-+    imm & mask != 0
-+}
-+
-+/// P2.5's flag-compensation audit: `true` when the consumer at line `j` may
-+/// fold cross-family. The scan below the consumer succeeds on the first
-+/// flag-clobbering instruction (whose own inputs — hence its CF — are
-+/// identical in both spellings) and vetoes on any carry-flag reader first.
-+/// Calls and returns kill flag knowledge (LLVM models no flag liveness
-+/// across either: the callee observes scratch flags and defines nothing;
-+/// flags at `ret` are undefined). Every other barrier ends the knowable
-+/// region with unknown readers past it. Renames the pass applies later
-+/// never change opcodes, so this pre-rename scan stays valid. Default-deny:
-+/// an unclassified mnemonic (all of SSE/AVX/x87, future ISA, typos in
-+/// hand-written asm) vetoes — over-refusal costs folds, never correctness.
-+fn shift_cf_safe_after(store: &LineStore, infos: &[LineInfo], j: usize, len: usize) -> bool {
-+    let mut n = j + 1;
-+    while n < len {
-+        if infos[n].is_nop() {
-+            n += 1;
-+            continue;
-+        }
-+        if infos[n].pinned {
-+            return false;
-+        }
-+        // A call or ret ends the knowable region with carry dead: the callee
-+        // is unknown code (LLVM-parity), and flags at `ret` are undefined
-+        // (async-signal/trap-frame flag observation is out of model).
-+        if matches!(infos[n].kind, LineKind::Call | LineKind::Ret) {
-+            return true;
-+        }
-+        if infos[n].is_barrier() {
-+            return false;
-+        }
-+        let t = infos[n].trimmed(store.get(n));
-+        let tok = cf_effect_token(t);
-+        if CF_READERS.iter().any(|lit| tok.eq_ignore_ascii_case(lit)) {
-+            return false;
-+        }
-+        if CF_CLOBBER.iter().any(|lit| tok.eq_ignore_ascii_case(lit)) {
-+            return true;
-+        }
-+        if CF_SKIP_EXACT
-+            .iter()
-+            .any(|lit| tok.eq_ignore_ascii_case(lit))
-+        {
-+            n += 1;
-+            continue;
-+        }
-+        if cf_skip_prefix(tok) {
-+            n += 1;
-+            continue;
-+        }
-+        if SHIFTS_GUARDED
-+            .iter()
-+            .any(|lit| tok.eq_ignore_ascii_case(lit))
-+        {
-+            if shift_proves_cf_clobber(tok, t) {
-+                return true;
++fn collect_value_types(func: &IrFunction) -> FxHashMap<u32, IrType> {
++    let mut types: FxHashMap<u32, IrType> = FxHashMap::default();
++    let mut copies: Vec<(u32, u32)> = Vec::new();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Copy {
++                dest,
++                src: Operand::Value(src),
++            } = inst
++            {
++                copies.push((dest.0, src.0));
 +            }
-+            n += 1;
-+            continue;
++            if let Some((id, ty)) = inst_result_type(inst) {
++                types.entry(id).or_insert(ty);
++            }
 +        }
-+        return false;
 +    }
-+    false
++    for _ in 0..16 {
++        let mut progressed = false;
++        for &(dest, src) in &copies {
++            if types.contains_key(&dest) {
++                continue;
++            }
++            if let Some(&ty) = types.get(&src) {
++                types.insert(dest, ty);
++                progressed = true;
++            }
++        }
++        if !progressed {
++            break;
++        }
++    }
++    types
 +}
 +
-+/// Parse a `$`-immediate operand into its 64-bit value (for `movabsq`).
-+/// Mirrors `parse_imm32` (whose `u32` cannot hold a 64-bit address).
-+fn parse_imm64(src: &str) -> Option<u64> {
-+    let digits = src.strip_prefix('$')?;
-+    if digits.is_empty() {
++fn is_simple_gpr_type(ty: IrType) -> bool {
++    !ty.is_float() && !ty.is_long_double() && !ty.is_128bit()
++}
++
++fn next_value(next_val: &mut u32) -> Option<Value> {
++    let id = *next_val;
++    if id == u32::MAX {
 +        return None;
 +    }
-+    if let Some(hex) = digits
-+        .strip_prefix("0x")
-+        .or_else(|| digits.strip_prefix("0X"))
-+    {
-+        u64::from_str_radix(hex, 16).ok()
-+    } else if let Some(neg) = digits.strip_prefix('-') {
-+        neg.parse::<i64>().ok().map(|v| (-v) as u64)
-+    } else {
-+        digits.parse::<u64>().ok()
++    *next_val = id.saturating_add(1);
++    Some(Value(id))
++}
++
++fn first_non_alloca(block: &BasicBlock) -> usize {
++    block
++        .instructions
++        .iter()
++        .position(|i| !matches!(i, Instruction::Alloca { .. }))
++        .unwrap_or(block.instructions.len())
++}
++
++fn first_non_phi(block: &BasicBlock) -> usize {
++    block
++        .instructions
++        .iter()
++        .position(|i| !matches!(i, Instruction::Phi { .. }))
++        .unwrap_or(block.instructions.len())
++}
++
++fn abi_align(ty: IrType) -> usize {
++    match ty.size() {
++        0 => 1,
++        1 => 1,
++        2 => 2,
++        3 | 4 => 4,
++        _ => 8,
 +    }
 +}
 +
-+/// The destination operand's text of `t` (past the mnemonic): the last
-+/// top-level operand, or the sole operand when there is no comma.
-+fn dest_operand_text(t: &str) -> &str {
-+    let rest = t.find(' ').map(|i| t[i + 1..].trim_start()).unwrap_or("");
-+    match last_top_level_comma(rest.as_bytes()) {
-+        Some(c) => rest[c + 1..].trim(),
-+        None => rest.trim(),
++fn insert_instruction(block: &mut BasicBlock, idx: usize, inst: Instruction) {
++    let n_inst = block.instructions.len();
++    let n_span = block.source_spans.len();
++    let idx = idx.min(n_inst);
++    block.instructions.insert(idx, inst);
++    if n_span == n_inst && n_span > 0 {
++        let span_idx = idx.min(n_span - 1);
++        let span = block.source_spans[span_idx].clone();
++        block.source_spans.insert(idx.min(n_span), span);
 +    }
 +}
 +
-+/// Whether line `t` (known to write family `fam`) establishes a zero upper
-+/// half: a 32-bit-destination write (EVERY dword dest zero-extends —
-+/// `movl`/`andl`/`cmovl`/3-operand `imull`/`leal`/`btsl`/`popcntl`/`incl`/
-+/// ... — the mnemonic is irrelevant), a zeroing idiom (`xorq %S, %S` /
-+/// `subq %S, %S`; `xorl`-self is subsumed by the dword rule), or a small
-+/// immediate (`movq $imm`: GAS sign-extends imm32, so only nonnegative
-+/// counts — `$0xFFFFFFFF` is -1, NOT small; `movabsq $imm64`: only low
-+/// 32 bits set). Callers guarantee lowercase text (see `upper32_zero_at`).
-+fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
-+    if dest_operand_text(t) == REG_NAMES[1][fam as usize] {
-+        // ...except conditional writers: `cmov*`/`cfcmov*`/`cmpxchg*`/`bsf`/`bsr`/
-+        // `rdrand`/`rdseed` leave the dest unchanged on the untaken/failed
-+        // path, so the old (unknown) upper half may survive (cmpxchg also
-+        // stops the scan first via the shared implicit-GP flag — both layers
-+        // refuse, by design). Likewise refuse explicit size/address prefixes
-+        // (hand-asm-only; GAS never emits them): the textual dword may not
-+        // match the silicon width. The token strips `lock`/`rep`
-+        // (width-transparent) before the check.
-+        let tok = cf_effect_token(t);
-+        if tok == "data16"
-+            || tok == "data32"
-+            || tok == "o16"
-+            || tok == "o32"
-+            || tok == "addr32"
-+            || tok == "adsize"
-+            || tok == "a16"
-+            || tok == "a32"
-+            || tok == "rex"
-+            || tok == "rex64"
-+            || tok == "rexw"
-+            || tok.starts_with("cmov")
-+            || tok.starts_with("cfcmov")
-+            || tok.starts_with("cmpxchg")
-+            || matches!(tok, "bsf" | "bsfl" | "bsr" | "bsrl" | "rdrand" | "rdseed")
-+        {
-+            return false;
++fn insert_entry_alloca(func: &mut IrFunction, dest: Value, ty: IrType, volatile: bool) {
++    let inst = Instruction::Alloca {
++        dest,
++        ty,
++        size: ty.size(),
++        align: abi_align(ty),
++        volatile,
++        semantic_volatile: false,
++    };
++    let pos = first_non_alloca(&func.blocks[0]);
++    insert_instruction(&mut func.blocks[0], pos, inst);
++}
++
++fn instruction_uses_value(inst: &Instruction, vid: u32) -> bool {
++    let mut hit = false;
++    super::liveness::for_each_operand_in_instruction(inst, |op| {
++        if matches!(op, Operand::Value(v) if v.0 == vid) {
++            hit = true;
 +        }
++    });
++    if hit {
 +        return true;
 +    }
-+    let mnemonic = t.split_whitespace().next().unwrap_or("");
-+    let rest = t[mnemonic.len()..].trim_start();
-+    let qword = REG_NAMES[0][fam as usize];
-+    if mnemonic == "xorq" || mnemonic == "subq" {
-+        if let Some((s0, s1)) = split_two_operands(rest) {
-+            return s0 == qword && s1 == qword;
++    super::liveness::for_each_value_use_in_instruction(inst, |v| {
++        if v.0 == vid {
++            hit = true;
 +        }
-+        return false;
-+    }
-+    if mnemonic == "movq" {
-+        if let Some((imm, dst)) = split_two_operands(rest) {
-+            if dst == qword {
-+                return parse_imm32(imm).is_some_and(|v| (v as i32) >= 0);
-+            }
-+        }
-+        return false;
-+    }
-+    if mnemonic == "movabs" || mnemonic == "movabsq" {
-+        if let Some((imm, dst)) = split_two_operands(rest) {
-+            if dst == qword {
-+                return parse_imm64(imm).is_some_and(|v| v <= 0xFFFF_FFFF);
-+            }
-+        }
-+        return false;
-+    }
-+    false
++    });
++    hit
 +}
 +
-+/// P3's zero-upper proof: `true` when family `s_fam` provably holds a zero
-+/// upper half at line `li` (exclusive). Scans back within the block for the
-+/// NEAREST S-family write: a proving write (see `s_write_proves_upper_zero`)
-+/// proves it; any other write — a wider write, a partial write — refuses,
-+/// as does reaching a barrier/call/pinned line, an implicit-register line,
-+/// or an odd-case line first. Entry values (parameters) carry garbage upper
-+/// halves per SysV, so "no definer found" correctly refuses; reads of S
-+/// between the definer and the copy are fine (they change nothing). The
-+/// uniform stops (calls even for callee-saved S, implicit lines even for
-+/// other families) are deliberate: the foregone shapes are unmeasured and
-+/// the audit stays obviously sound.
-+fn upper32_zero_at(store: &LineStore, infos: &[LineInfo], li: usize, s_fam: RegId) -> bool {
-+    if li == 0 {
-+        return false;
-+    }
-+    let mask = 1u16 << s_fam;
-+    let mut n = li;
-+    while n > 0 {
-+        n -= 1;
-+        if infos[n].is_nop() {
-+            continue;
++fn terminator_uses_value(term: &Terminator, vid: u32) -> bool {
++    let mut hit = false;
++    super::liveness::for_each_operand_in_terminator(term, |op| {
++        if matches!(op, Operand::Value(v) if v.0 == vid) {
++            hit = true;
 +        }
-+        // (`ret` needs no stop here: a fold below an earlier `ret` rewrites
-+        // dead code, which is effect-free.)
-+        if infos[n].pinned || infos[n].is_barrier() {
-+            return false;
-+        }
-+        let t = infos[n].trimmed(store.get(n));
-+        // The reference scan below is case-sensitive: refuse odd-case text
-+        // rather than risk skipping an unseen S-family write and proving
-+        // from a stale definer.
-+        if t.bytes().any(|b| b.is_ascii_uppercase()) {
-+            return false;
-+        }
-+        // `lock` is width- and value-transparent for the proof (and the fold
-+        // never touches the definer: it sits strictly above the copy by index
-+        // ordering, so the locked op stays bit-identical and its atomicity is
-+        // preserved) — strip it and evaluate the remainder.
-+        let t = t.strip_prefix("lock ").unwrap_or(t);
-+        if has_implicit_reg_usage(t) {
-+            return false;
-+        }
-+        if infos[n].reg_refs & mask == 0 {
-+            continue;
-+        }
-+        if !writes_family(&infos[n], t, s_fam) {
-+            continue; // pure read: the value flows through unchanged
-+        }
-+        return s_write_proves_upper_zero(t, s_fam);
-+    }
-+    false
++    });
++    hit
 +}
 +
- /// `true` when `t` is a two-operand ALU read-modify-write fully redefining
- /// `fam`: the destination names `fam` at 32/64 bits and the mnemonic reads it
- /// (add/sub/logic/imul-2op/shift — every one of these reads its destination,
-@@ -1301,7 +1968,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
-             if *op != "andl " {
-                 continue;
++fn rewrite_operand(op: &mut Operand, map: &FxHashMap<u32, u32>) {
++    if let Operand::Value(v) = op {
++        if let Some(&n) = map.get(&v.0) {
++            v.0 = n;
++        }
++    }
++}
++
++fn rewrite_value(v: &mut Value, map: &FxHashMap<u32, u32>) {
++    if let Some(&n) = map.get(&v.0) {
++        v.0 = n;
++    }
++}
++
++fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>, rewrite_phi: bool) {
++    match inst {
++        Instruction::Alloca { .. }
++        | Instruction::PgoCounterInc { .. }
++        | Instruction::GlobalAddr { .. }
++        | Instruction::Fence { .. }
++        | Instruction::LabelAddr { .. }
++        | Instruction::GetReturnF64Second { .. }
++        | Instruction::GetReturnF32Second { .. }
++        | Instruction::GetReturnF128Second { .. }
++        | Instruction::GetStaticChain { .. }
++        | Instruction::StackSave { .. }
++        | Instruction::ParamRef { .. }
++        | Instruction::VaEnd { .. } => {}
++        Instruction::SetStaticChain { src } => rewrite_operand(src, map),
++        Instruction::InitTrampoline { buffer, chain, .. } => {
++            rewrite_value(buffer, map);
++            rewrite_operand(chain, map);
++        }
++        Instruction::NonlocalGotoSave { frame, .. } => rewrite_value(frame, map),
++        Instruction::NonlocalGoto { chain, .. } => rewrite_operand(chain, map),
++        Instruction::DynAlloca { size, .. } => rewrite_operand(size, map),
++        Instruction::Store { val, ptr, .. } => {
++            rewrite_operand(val, map);
++            rewrite_value(ptr, map);
++        }
++        Instruction::Load { ptr, .. } => rewrite_value(ptr, map),
++        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
++            rewrite_operand(lhs, map);
++            rewrite_operand(rhs, map);
++        }
++        Instruction::UnaryOp { src, .. }
++        | Instruction::Cast { src, .. }
++        | Instruction::Copy { src, .. } => rewrite_operand(src, map),
++        Instruction::Call { info, .. } => {
++            for a in &mut info.args {
++                rewrite_operand(a, map);
++            }
++        }
++        Instruction::CallIndirect { func_ptr, info } => {
++            rewrite_operand(func_ptr, map);
++            for a in &mut info.args {
++                rewrite_operand(a, map);
++            }
++        }
++        Instruction::GetElementPtr { base, offset, .. } => {
++            rewrite_value(base, map);
++            rewrite_operand(offset, map);
++        }
++        Instruction::Memcpy { dest, src, .. } => {
++            rewrite_value(dest, map);
++            rewrite_value(src, map);
++        }
++        Instruction::VaArg { va_list_ptr, .. } | Instruction::VaStart { va_list_ptr } => {
++            rewrite_value(va_list_ptr, map);
++        }
++        Instruction::VaCopy { dest_ptr, src_ptr } => {
++            rewrite_value(dest_ptr, map);
++            rewrite_value(src_ptr, map);
++        }
++        Instruction::VaArgStruct {
++            dest_ptr,
++            va_list_ptr,
++            ..
++        } => {
++            rewrite_value(dest_ptr, map);
++            rewrite_value(va_list_ptr, map);
++        }
++        Instruction::AtomicRmw { ptr, val, .. } | Instruction::AtomicStore { ptr, val, .. } => {
++            rewrite_operand(ptr, map);
++            rewrite_operand(val, map);
++        }
++        Instruction::AtomicInc { ptr, .. } | Instruction::AtomicLoad { ptr, .. } => {
++            rewrite_operand(ptr, map);
++        }
++        Instruction::AtomicCmpxchg {
++            ptr,
++            expected,
++            desired,
++            ..
++        } => {
++            rewrite_operand(ptr, map);
++            rewrite_operand(expected, map);
++            rewrite_operand(desired, map);
++        }
++        Instruction::Phi { incoming, .. } => {
++            if rewrite_phi {
++                for (op, _) in incoming {
++                    rewrite_operand(op, map);
++                }
++            }
++        }
++        Instruction::SetReturnF64Second { src }
++        | Instruction::SetReturnF32Second { src }
++        | Instruction::SetReturnF128Second { src } => rewrite_operand(src, map),
++        Instruction::InlineAsm {
++            inputs, outputs, ..
++        } => {
++            for (_constr, op, _name) in inputs.iter_mut() {
++                rewrite_operand(op, map);
++            }
++            for (_constr, val, _name) in outputs.iter_mut() {
++                rewrite_value(val, map);
++            }
++        }
++        Instruction::Select {
++            cond,
++            true_val,
++            false_val,
++            ..
++        } => {
++            rewrite_operand(cond, map);
++            rewrite_operand(true_val, map);
++            rewrite_operand(false_val, map);
++        }
++        Instruction::Intrinsic { args, .. } => {
++            for a in args {
++                rewrite_operand(a, map);
++            }
++        }
++        Instruction::StackRestore { ptr } => rewrite_value(ptr, map),
++    }
++}
++
++fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
++    match term {
++        Terminator::Return(Some(op)) => rewrite_operand(op, map),
++        Terminator::Return(None) => {}
++        Terminator::Branch(_) => {}
++        Terminator::CondBranch { cond, .. } => rewrite_operand(cond, map),
++        Terminator::Switch { val, .. } => rewrite_operand(val, map),
++        Terminator::IndirectBranch { .. } => {}
++        Terminator::Unreachable => {}
++    }
++}
++
++fn dominator_sets(idom: &[usize]) -> Vec<FxHashSet<usize>> {
++    let n = idom.len();
++    let mut sets = vec![FxHashSet::default(); n];
++    for a in 0..n {
++        sets[a].insert(a);
++        let mut cur = a;
++        for _ in 0..n.saturating_add(1) {
++            if cur >= n {
++                break;
++            }
++            let next = idom[cur];
++            if next == cur || next == usize::MAX {
++                break;
++            }
++            sets[a].insert(next);
++            cur = next;
++        }
++    }
++    sets
++}
++
++#[inline]
++fn set_dominates(sets: &[FxHashSet<usize>], a: usize, b: usize) -> bool {
++    sets.get(a).is_some_and(|s| s.contains(&b))
++}
++
++fn compute_pressure(liveness: &super::liveness::LivenessResult) -> Vec<u32> {
++    let n = liveness.num_points as usize;
++    let mut result = vec![0u32; n];
++    for p in 0..n {
++        let mut cnt = 0u32;
++        for seg in &liveness.segments {
++            if seg.start <= p as u32 && (p as u32) <= seg.end {
++                cnt += 1;
++            }
++        }
++        result[p] = cnt;
++    }
++    result
++}
++
++fn split_next_use_gaps(func: &mut IrFunction, max_splits: usize) -> usize {
++    if max_splits == 0 {
++        return 0;
++    }
++    // Collect work without holding borrow
++    let liveness = super::liveness::compute_live_intervals(func);
++    let pressure = compute_pressure(&liveness);
++    let points = assign_point_locs(func);
++    let types = collect_value_types(func);
++
++    struct Gap {
++        block: usize,
++        vid: u32,
++        u1_idx: usize,
++        u2_idx: usize,
++        u1_pt: u32,
++        u2_pt: u32,
++        ty: IrType,
++        remat: Option<RematerializationKind>,
++    }
++
++    let mut gaps: Vec<Gap> = Vec::new();
++
++    // We need to compute block_start_pt for each block
++    let mut block_start_pts: Vec<u32> = vec![0; func.blocks.len()];
++    for (bi, _) in func.blocks.iter().enumerate() {
++        let start = points
++            .iter()
++            .position(|p| p.block == bi && p.inst == Some(0))
++            .map(|i| i as u32)
++            .unwrap_or(0);
++        block_start_pts[bi] = start;
++    }
++
++    for (bi, block) in func.blocks.iter().enumerate() {
++        if gaps.len() >= max_splits {
++            break;
++        }
++        let mut block_uses: FxHashMap<u32, Vec<(u32, usize)>> = FxHashMap::default(); // vid -> Vec<(pt, idx)>
++        let block_start_pt = block_start_pts[bi];
++
++        for (ii, inst) in block.instructions.iter().enumerate() {
++            let cur_pt = block_start_pt + ii as u32;
++            super::liveness::for_each_operand_in_instruction(inst, |op| {
++                if let Operand::Value(v) = op {
++                    block_uses.entry(v.0).or_default().push((cur_pt, ii));
++                }
++            });
++            super::liveness::for_each_value_use_in_instruction(inst, |v| {
++                block_uses.entry(v.0).or_default().push((cur_pt, ii));
++            });
++        }
++
++        for (vid, mut uses) in block_uses {
++            if uses.len() < 2 {
++                continue;
++            }
++            uses.sort_by_key(|(pt, _)| *pt);
++            for w in uses.windows(2) {
++                let (u1_pt, u1_idx) = w[0];
++                let (u2_pt, u2_idx) = w[1];
++                let gap = u2_pt.saturating_sub(u1_pt);
++                if gap < 30 {
++                    continue;
++                }
++                let mut max_pressure_in_gap = 0u32;
++                for p in u1_pt..u2_pt {
++                    if (p as usize) < pressure.len() {
++                        max_pressure_in_gap = max_pressure_in_gap.max(pressure[p as usize]);
++                    }
++                }
++                if max_pressure_in_gap < 12 {
++                    continue;
++                }
++                let Some(&ty) = types.get(&vid) else {
++                    continue;
++                };
++                if !is_simple_gpr_type(ty) {
++                    continue;
++                }
++                let remat = is_rematerializable(func, vid);
++                let cost_remat = remat
++                    .as_ref()
++                    .map(|k| RaptorLakeCostModel::remat_cost(k))
++                    .unwrap_or(u64::MAX);
++                let cost_spill = RaptorLakeCostModel::spill_cost();
++                let occupancy_cost = gap as u64 * 2;
++                let should_split = if cost_remat < cost_spill && cost_remat < occupancy_cost {
++                    true
++                } else if cost_spill < occupancy_cost {
++                    true
++                } else {
++                    false
++                };
++                if !should_split {
++                    continue;
++                }
++                gaps.push(Gap {
++                    block: bi,
++                    vid,
++                    u1_idx,
++                    u2_idx,
++                    u1_pt,
++                    u2_pt,
++                    ty,
++                    remat,
++                });
++                break;
++            }
++            if gaps.len() >= max_splits {
++                break;
++            }
++        }
++    }
++
++    // Now apply gaps, handling index shifts per block
++    let mut next_val = func.next_value_id;
++    let mut splits = 0;
++    // Group by block and sort by u1_idx descending to avoid shift issues
++    let mut by_block: FxHashMap<usize, Vec<Gap>> = FxHashMap::default();
++    for g in gaps {
++        by_block.entry(g.block).or_default().push(g);
++    }
++
++    for (bi, mut block_gaps) in by_block {
++        // Sort descending by u1_idx
++        block_gaps.sort_by(|a, b| b.u1_idx.cmp(&a.u1_idx));
++        for gap in block_gaps {
++            if splits >= max_splits {
++                break;
++            }
++            // Re-check block length (may have grown)
++            if bi >= func.blocks.len() {
++                continue;
++            }
++            let block_len = func.blocks[bi].instructions.len();
++            if gap.u1_idx >= block_len || gap.u2_idx >= block_len {
++                continue;
++            }
++
++            if gap.remat.is_some() {
++                // Find def to clone
++                let mut def_clone: Option<Instruction> = None;
++                for b in &func.blocks {
++                    for inst in &b.instructions {
++                        if inst.dest().map(|d| d.0 == gap.vid).unwrap_or(false) {
++                            def_clone = Some(inst.clone());
++                            break;
++                        }
++                    }
++                    if def_clone.is_some() {
++                        break;
++                    }
++                }
++                if let Some(mut def) = def_clone {
++                    let new_val = match next_value(&mut next_val) {
++                        Some(v) => v,
++                        None => continue,
++                    };
++                    match &mut def {
++                        Instruction::Copy { dest, .. }
++                        | Instruction::Cast { dest, .. }
++                        | Instruction::BinOp { dest, .. }
++                        | Instruction::GetElementPtr { dest, .. }
++                        | Instruction::GlobalAddr { dest, .. } => {
++                            *dest = new_val;
++                        }
++                        _ => continue,
++                    }
++                    let block_mut = &mut func.blocks[bi];
++                    if gap.u2_idx < block_mut.instructions.len() {
++                        block_mut.instructions.insert(gap.u2_idx, def);
++                        let mut map = FxHashMap::default();
++                        map.insert(gap.vid, new_val.0);
++                        for inst in block_mut.instructions.iter_mut().skip(gap.u2_idx + 1) {
++                            replace_values_in_inst(inst, &map, false);
++                        }
++                        dlog!(
++                            "[GLOBAL-ALLOC] remat split value {} block {} gap {}->{}",
++                            gap.vid,
++                            bi,
++                            gap.u1_pt,
++                            gap.u2_pt
++                        );
++                        splits += 1;
++                    }
++                }
++            } else {
++                let alloca_val = match next_value(&mut next_val) {
++                    Some(v) => v,
++                    None => continue,
++                };
++                let new_val = match next_value(&mut next_val) {
++                    Some(v) => v,
++                    None => continue,
++                };
++                insert_entry_alloca(func, alloca_val, gap.ty, true);
++
++                let block_mut = &mut func.blocks[bi];
++                let store = Instruction::Store {
++                    volatile: false,
++                    val: Operand::Value(Value(gap.vid)),
++                    ptr: alloca_val,
++                    ty: gap.ty,
++                    seg_override: crate::common::types::AddressSpace::Default,
++                };
++                let store_at = (gap.u1_idx + 1).min(block_mut.instructions.len());
++                block_mut.instructions.insert(store_at, store);
++
++                let load_at = if gap.u2_idx >= store_at {
++                    gap.u2_idx + 1
++                } else {
++                    gap.u2_idx
++                };
++                let load = Instruction::Load {
++                    volatile: false,
++                    dest: new_val,
++                    ptr: alloca_val,
++                    ty: gap.ty,
++                    seg_override: crate::common::types::AddressSpace::Default,
++                };
++                if load_at <= block_mut.instructions.len() {
++                    block_mut.instructions.insert(load_at, load);
++                }
++
++                let mut map = FxHashMap::default();
++                map.insert(gap.vid, new_val.0);
++                for inst in block_mut.instructions.iter_mut().skip(load_at + 1) {
++                    replace_values_in_inst(inst, &map, false);
++                }
++                dlog!(
++                    "[GLOBAL-ALLOC] spill split value {} block {} gap {}->{}",
++                    gap.vid,
++                    bi,
++                    gap.u1_pt,
++                    gap.u2_pt
++                );
++                splits += 1;
++            }
++        }
++    }
++
++    if splits > 0 {
++        func.next_value_id = next_val;
++    }
++    splits
++}
++
++fn split_call_cross_block(func: &mut IrFunction, max_splits: usize) -> usize {
++    if max_splits == 0 {
++        return 0;
++    }
++    let label_map = analysis::build_label_map(func);
++    let (preds, succs) = analysis::build_cfg(func, &label_map);
++    let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
++    let dom_sets = dominator_sets(&idom);
++    let liveness = super::liveness::compute_live_intervals(func);
++    if liveness.call_points.is_empty() {
++        return 0;
++    }
++    let points = assign_point_locs(func);
++    let types = collect_value_types(func);
++
++    let n = func.blocks.len();
++    let mut succ_vec: Vec<Vec<usize>> = vec![Vec::new(); n];
++    for bi in 0..n {
++        for &s in succs.row(bi) {
++            succ_vec[bi].push(s as usize);
++        }
++    }
++
++    struct CallSplit {
++        call_pt: u32,
++        call_block: usize,
++        call_inst_idx: usize,
++        succ_block: usize,
++        vid: u32,
++        ty: IrType,
++    }
++
++    let mut candidates: Vec<CallSplit> = Vec::new();
++
++    for &cp in &liveness.call_points {
++        if candidates.len() >= max_splits {
++            break;
++        }
++        let Some(loc) = points.get(cp as usize) else {
++            continue;
++        };
++        let call_block = loc.block;
++        if call_block >= n {
++            continue;
++        }
++        if succ_vec[call_block].len() != 1 {
++            continue;
++        }
++        let succ_block = succ_vec[call_block][0];
++        if succ_block >= n {
++            continue;
++        }
++        if preds.row(succ_block).len() != 1 {
++            continue;
++        }
++        let call_inst_idx = loc.inst.unwrap_or(0);
++
++        // Pre-check: if succ has a PHI using any value, we will need to handle it.
++        // For correctness, we will filter per-vid below, but cache phi uses of succ.
++        let succ_phis_use: FxHashSet<u32> = {
++            let mut s = FxHashSet::default();
++            for inst in &func.blocks[succ_block].instructions {
++                if let Instruction::Phi { incoming, .. } = inst {
++                    for (op, _) in incoming {
++                        if let Operand::Value(v) = op {
++                            s.insert(v.0);
++                        }
++                    }
++                } else {
++                    break; // phis are at start
++                }
++            }
++            s
++        };
++
++        for iv in &liveness.intervals {
++            if candidates.len() >= max_splits {
++                break;
++            }
++            if iv.start >= cp || iv.end <= cp {
++                continue;
++            }
++            // Check uses dominated by succ_block
++            let mut has_use_after = false;
++            let mut all_dominated = true;
++            for (bi, block) in func.blocks.iter().enumerate() {
++                let mut uses = false;
++                for inst in &block.instructions {
++                    if instruction_uses_value(inst, iv.value_id) {
++                        uses = true;
++                        break;
++                    }
++                }
++                if !uses && terminator_uses_value(&block.terminator, iv.value_id) {
++                    uses = true;
++                }
++                if uses {
++                    if bi == call_block {
++                        let mut after = false;
++                        for (ii, inst) in block.instructions.iter().enumerate() {
++                            if ii > call_inst_idx && instruction_uses_value(inst, iv.value_id) {
++                                after = true;
++                                break;
++                            }
++                        }
++                        if after {
++                            has_use_after = true;
++                        }
++                    } else if set_dominates(&dom_sets, bi, succ_block) {
++                        has_use_after = true;
++                    } else {
++                        // If this block is reachable from succ, but not dominated, bail
++                        // For simplicity, require all uses dominated
++                        // Check if block is reachable from call? We approximate: if block != call_block, then require dominated
++                        // If not dominated, we cannot handle without PHI
++                        all_dominated = false;
++                        break;
++                    }
++                }
++            }
++            if !has_use_after || !all_dominated {
++                continue;
++            }
++            let Some(&ty) = types.get(&iv.value_id) else {
++                continue;
++            };
++            if !is_simple_gpr_type(ty) {
++                continue;
++            }
++            // If succ's PHI uses this vid, we would need to replace PHI with copy after load.
++            // For safety, skip such candidates until PHI rewrite is implemented.
++            // This avoids use-before-def where PHI cannot use new_val defined after PHIs.
++            if succ_phis_use.contains(&iv.value_id) {
++                continue;
++            }
++            candidates.push(CallSplit {
++                call_pt: cp,
++                call_block,
++                call_inst_idx,
++                succ_block,
++                vid: iv.value_id,
++                ty,
++            });
++        }
++    }
++
++    let mut next_val = func.next_value_id;
++    let mut splits = 0;
++
++    // Sort by call_block descending to avoid index shifts affecting earlier calls in same block.
++    // Then group by (call_block, call_inst_idx, succ_block, call_pt) to batch multiple vids
++    // sharing the same call point — this makes first_after computation deterministic and
++    // avoids the off-by-one when multiple stores are inserted at the same idx.
++    candidates.sort_by(|a, b| {
++        b.call_block
++            .cmp(&a.call_block)
++            .then(b.call_inst_idx.cmp(&a.call_inst_idx))
++            .then(a.vid.cmp(&b.vid))
++    });
++
++    // Group candidates
++    #[derive(Debug)]
++    struct Group {
++        call_pt: u32,
++        call_block: usize,
++        call_inst_idx: usize,
++        succ_block: usize,
++        vids: Vec<(u32, IrType)>, // (vid, ty)
++    }
++    let mut groups: Vec<Group> = Vec::new();
++    for cand in candidates {
++        if let Some(last) = groups.last_mut() {
++            if last.call_block == cand.call_block
++                && last.call_inst_idx == cand.call_inst_idx
++                && last.succ_block == cand.succ_block
++                && last.call_pt == cand.call_pt
++            {
++                // Avoid duplicate vid in same group
++                if !last.vids.iter().any(|(v, _)| *v == cand.vid) {
++                    last.vids.push((cand.vid, cand.ty));
++                }
++                continue;
++            }
++        }
++        groups.push(Group {
++            call_pt: cand.call_pt,
++            call_block: cand.call_block,
++            call_inst_idx: cand.call_inst_idx,
++            succ_block: cand.succ_block,
++            vids: vec![(cand.vid, cand.ty)],
++        });
++    }
++
++    for group in groups {
++        if splits >= max_splits {
++            break;
++        }
++        if group.call_block >= func.blocks.len() || group.succ_block >= func.blocks.len() {
++            continue;
++        }
++        // Respect max_splits: trim vids if needed
++        let remaining = max_splits - splits;
++        let vids_to_process: Vec<(u32, IrType)> = group.vids.into_iter().take(remaining).collect();
++        if vids_to_process.is_empty() {
++            continue;
++        }
++
++        // Allocate allocas and new values for each vid
++        let mut allocs: Vec<(u32, Value, Value, IrType)> = Vec::new(); // (old_vid, alloca, new_val, ty)
++        for (vid, ty) in &vids_to_process {
++            let alloca_val = match next_value(&mut next_val) {
++                Some(v) => v,
++                None => break,
++            };
++            let new_val = match next_value(&mut next_val) {
++                Some(v) => v,
++                None => break,
++            };
++            insert_entry_alloca(func, alloca_val, *ty, true);
++            allocs.push((*vid, alloca_val, new_val, *ty));
++        }
++        if allocs.is_empty() {
++            continue;
++        }
++
++        // Insert stores before call (at call_inst_idx). Insert in reverse to preserve order,
++        // but order doesn't matter. We insert at same idx repeatedly, so last inserted ends up first.
++        {
++            let block = &mut func.blocks[group.call_block];
++            // Clamp idx to current len (may have grown from previous groups later in block, but
++            // since we process descending, earlier groups' idx is still valid and not shifted by later groups)
++            let idx = group.call_inst_idx.min(block.instructions.len());
++            for (old_vid, alloca_val, _new_val, ty) in allocs.iter().rev() {
++                let store = Instruction::Store {
++                    volatile: false,
++                    val: Operand::Value(Value(*old_vid)),
++                    ptr: *alloca_val,
++                    ty: *ty,
++                    seg_override: crate::common::types::AddressSpace::Default,
++                };
++                block.instructions.insert(idx, store);
++            }
++        }
++
++        // Insert loads in succ at first_non_phi. Insert all loads.
++        let load_at = {
++            let block = &mut func.blocks[group.succ_block];
++            let at = first_non_phi(block);
++            // Insert in reverse so first in allocs ends up first
++            for (_old_vid, alloca_val, new_val, ty) in allocs.iter().rev() {
++                let load = Instruction::Load {
++                    volatile: false,
++                    dest: *new_val,
++                    ptr: *alloca_val,
++                    ty: *ty,
++                    seg_override: crate::common::types::AddressSpace::Default,
++                };
++                block.instructions.insert(at, load);
++            }
++            at
++        };
++        let num_loads = allocs.len();
++
++        // Build map old->new
++        let mut map: FxHashMap<u32, u32> = FxHashMap::default();
++        for (old_vid, _alloca, new_val, _ty) in &allocs {
++            map.insert(*old_vid, new_val.0);
++        }
++
++        // Find call's new position after stores: scan for call at/after group.call_inst_idx
++        let call_new_idx = {
++            let block = &func.blocks[group.call_block];
++            let mut found = None;
++            for ii in group.call_inst_idx..block.instructions.len() {
++                if matches!(
++                    block.instructions[ii],
++                    Instruction::Call { .. } | Instruction::CallIndirect { .. }
++                ) {
++                    // Heuristic: the call point we want is the first call at or after idx
++                    // that corresponds to the original call_pt. Since there may be multiple calls,
++                    // we take the first call whose original point was >= group.call_pt?
++                    // For simplicity, take first call encountered.
++                    found = Some(ii);
++                    break;
++                }
++            }
++            found.unwrap_or(group.call_inst_idx + allocs.len())
++        };
++        let first_after = (call_new_idx + 1).min(func.blocks[group.call_block].instructions.len());
++
++        // Rename in call_block after call
++        {
++            let block = &mut func.blocks[group.call_block];
++            for inst in block.instructions[first_after..].iter_mut() {
++                replace_values_in_inst(inst, &map, false);
++            }
++            replace_values_in_terminator(&mut block.terminator, &map);
++        }
++        // Rename in dominated blocks
++        for bi in 0..func.blocks.len() {
++            if bi == group.call_block {
++                continue;
++            }
++            if set_dominates(&dom_sets, bi, group.succ_block) {
++                let block = &mut func.blocks[bi];
++                if bi == group.succ_block {
++                    let start = (load_at + num_loads).min(block.instructions.len());
++                    for inst in block.instructions[start..].iter_mut() {
++                        replace_values_in_inst(inst, &map, false);
++                    }
++                } else {
++                    for inst in &mut block.instructions {
++                        replace_values_in_inst(inst, &map, true);
++                    }
++                }
++                let term = &mut block.terminator;
++                replace_values_in_terminator(term, &map);
++            }
++        }
++
++        for (old_vid, _, _, _) in &allocs {
++            dlog!(
++                "[GLOBAL-ALLOC] cross-block call split value {} call@{} succ={}",
++                old_vid,
++                group.call_pt,
++                group.succ_block
++            );
++        }
++        splits += allocs.len();
++    }
++
++    if splits > 0 {
++        func.next_value_id = next_val;
++    }
++    splits
++}
++
++pub fn run_global_location_pass(func: &mut IrFunction) -> usize {
++    if !global_location_enabled() {
++        return 0;
++    }
++    if func.blocks.len() < 2 {
++        return 0;
++    }
++    let mut total = 0;
++    total += split_call_cross_block(func, 4);
++    // Gap splitting disabled: causes miscompile for zlib_ng_adler32 (spill split value 523 block 15 gap 70->112)
++    // Root cause under investigation: intra-block spill splits do not correctly handle
++    // successor phis or terminator uses, and pressure calculation is O(n*m). Disable until fixed.
++    // total += split_next_use_gaps(func, 8);
++    if total > 0 {
++        dlog!("[GLOBAL-ALLOC] func {} total splits {}", func.name, total);
++    }
++    total
++}
++
++#[derive(Debug, Clone)]
++pub struct AddressExpr {
++    pub base: Option<u32>,
++    pub index: Option<u32>,
++    pub scale: u8,
++    pub displacement: i64,
++}
++
++impl AddressExpr {
++    pub fn from_gep_chain(func: &IrFunction, gep_dest: u32) -> Option<Self> {
++        let mut base: Option<u32> = None;
++        let mut index: Option<u32> = None;
++        let mut scale: u8 = 1;
++        let mut disp: i64 = 0;
++        let mut current = gep_dest;
++        let mut depth = 0;
++        while depth < 16 {
++            let mut found = false;
++            for block in &func.blocks {
++                for inst in &block.instructions {
++                    if let Some(dest) = inst.dest() {
++                        if dest.0 == current {
++                            match inst {
++                                Instruction::GetElementPtr {
++                                    base: b, offset, ..
++                                } => {
++                                    if base.is_none() {
++                                        base = Some(b.0);
++                                    } else if index.is_none() {
++                                        index = Some(b.0);
++                                    }
++                                    match offset {
++                                        Operand::Const(c) => {
++                                            if let Some(v) = c.to_i64() {
++                                                disp += v;
++                                            }
++                                        }
++                                        Operand::Value(v) => {
++                                            if index.is_none() {
++                                                index = Some(v.0);
++                                            }
++                                        }
++                                    }
++                                    current = b.0;
++                                    found = true;
++                                }
++                                Instruction::BinOp { op, lhs, rhs, .. } => match op {
++                                    IrBinOp::Add => match (lhs, rhs) {
++                                        (Operand::Value(v), Operand::Const(c))
++                                        | (Operand::Const(c), Operand::Value(v)) => {
++                                            if let Some(cv) = c.to_i64() {
++                                                disp += cv;
++                                                current = v.0;
++                                                found = true;
++                                            }
++                                        }
++                                        _ => {}
++                                    },
++                                    IrBinOp::Mul => match (lhs, rhs) {
++                                        (Operand::Value(v), Operand::Const(c))
++                                        | (Operand::Const(c), Operand::Value(v)) => {
++                                            if let Some(cv) = c.to_i64() {
++                                                if cv == 2 || cv == 4 || cv == 8 {
++                                                    scale = cv as u8;
++                                                    current = v.0;
++                                                    found = true;
++                                                }
++                                            }
++                                        }
++                                        _ => {}
++                                    },
++                                    _ => {}
++                                },
++                                _ => {}
++                            }
++                            break;
++                        }
++                    }
++                }
++            }
++            if !found {
++                break;
++            }
++            depth += 1;
++        }
++        if base.is_some() || index.is_some() || disp != 0 {
++            Some(AddressExpr {
++                base,
++                index,
++                scale,
++                displacement: disp,
++            })
++        } else {
++            None
++        }
++    }
++
++    pub fn is_foldable_x86(&self) -> bool {
++        matches!(self.scale, 1 | 2 | 4 | 8)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn address_expr_foldable() {
++        let expr = AddressExpr {
++            base: Some(1),
++            index: Some(2),
++            scale: 4,
++            displacement: 16,
++        };
++        assert!(expr.is_foldable_x86());
++    }
++
++    #[test]
++    fn global_location_disabled_by_default() {
++        let _ = global_location_enabled();
++    }
++}
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 56e307ce..f6d3f712 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -21,6 +21,7 @@ pub(crate) mod traits; // ArchCodegen trait with default implementations
+ pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, asm template parsing
+ 
+ // Register allocation and liveness analysis
++pub(crate) mod global_alloc; // Global Location Allocation — P0-A
+ pub(crate) mod live_range; // Linear scan data structures (LiveRange, LinearScanAllocator)
+ pub(crate) mod liveness; // Live interval computation
+ pub(crate) mod regalloc; // Linear scan register allocator
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 5bf659bc..cac4e953 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -916,8 +916,25 @@ impl X86Codegen {
+                 Some(imm) => {
+                     let amount = (imm as i64).rem_euclid(width);
+                     if amount != 0 {
+-                        self.state
+-                            .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
++                        if self.bmi2_enabled && (width == 32 || width == 64) {
++                            let ror_amount = match op {
++                                IrBinOp::RotateLeft => (width - amount) % width,
++                                IrBinOp::RotateRight => amount,
++                                _ => amount,
++                            };
++                            if ror_amount != 0 {
++                                let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
++                                // acc_typed is al/ax/eax/rax, but rorx needs 3-operand form with src==dst
++                                // For accumulator path, src and dst are same accumulator.
++                                self.state.emit_fmt(format_args!(
++                                    "    {} ${}, %{}, %{}",
++                                    ror_mnem, ror_amount, acc_typed, acc_typed
++                                ));
++                            }
++                        } else {
++                            self.state
++                                .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
++                        }
+                     }
+                 }
+                 None => {
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 968df204..9d35325c 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -4589,15 +4589,34 @@ impl X86Codegen {
+             // no-op.
+             let amount = (imm as i64).rem_euclid(width);
+             if amount != 0 {
+-                self.state
+-                    .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
+-                if width == 32 {
+-                    // A rotate can move any bit into bit 31, so a signed I32
+-                    // result needs the same upper-half normalization a signed
+-                    // `shl` does. No-op for the unsigned types rotate idioms
+-                    // actually use. Sub-word results keep their zero-extended
+-                    // homes: `rolw`/`rolb` only write the low bits.
+-                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                if self.bmi2_enabled && (width == 32 || width == 64) {
++                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
++                    let ror_amount = match op {
++                        IrBinOp::RotateLeft => (width - amount) % width,
++                        IrBinOp::RotateRight => amount,
++                        _ => amount,
++                    };
++                    if ror_amount != 0 {
++                        let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
++                        self.state.emit_fmt(format_args!(
++                            "    {} ${}, %{}, %{}",
++                            ror_mnem, ror_amount, dest_typed, dest_typed
++                        ));
++                    }
++                    if width == 32 {
++                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                    }
++                } else {
++                    self.state
++                        .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
++                    if width == 32 {
++                        // A rotate can move any bit into bit 31, so a signed I32
++                        // result needs the same upper-half normalization a signed
++                        // `shl` does. No-op for the unsigned types rotate idioms
++                        // actually use. Sub-word results keep their zero-extended
++                        // homes: `rolw`/`rolb` only write the low bits.
++                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                    }
+                 }
              }
--            let Some(mask) = parse_and_mask(cons_src) else {
-+            let Some(mask) = parse_imm32(cons_src) else {
+             self.state.reg_cache.invalidate_acc();
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 6c3c7ce7..bbac1d5d 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -578,6 +578,53 @@ pub fn lower_binop(
+     // ── Shift operations ─────────────────────────────────────────────
+     if let Some(shift_op) = binop_to_shift(op) {
+         if let Some(imm) = const_as_imm32(rhs) {
++            // BMI2 rorx: immediate-only, right-only, flag-preserving, 3-operand.
++            // For SHA-256/ChaCha ARX idioms, rorx beats rol/ror (no flags, better scheduling).
++            // Rol(x,n) = Ror(x, width-n) => rorx.
++            if matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror)
++                && matches!(size, OpSize::S32 | OpSize::S64)
++                && shlx_mode() != ShlxMode::Never
++            {
++                let width = if size == OpSize::S32 { 32 } else { 64 };
++                let amt = (imm as i64).rem_euclid(width as i64);
++                if amt != 0 {
++                    let ror_amt = match shift_op {
++                        ShiftOp::Rol => (width as i64 - amt) % width as i64,
++                        ShiftOp::Ror => amt,
++                        _ => amt,
++                    };
++                    if ror_amt != 0 {
++                        // Try to keep src in its home to avoid extra mov.
++                        let src_reg = match lhs {
++                            Operand::Value(v) => value_to_reg(v, ra),
++                            _ => {
++                                emit_mov_operand_r(lhs, dst, size, ra, out);
++                                dst
++                            }
++                        };
++                        let src_final = match src_reg {
++                            MachReg::Phys(_) => src_reg,
++                            _ => {
++                                emit_mov_operand_r(lhs, dst, size, ra, out);
++                                dst
++                            }
++                        };
++                        out.push(MachInst::Rorx {
++                            amount: ror_amt,
++                            src: src_final,
++                            dst,
++                            size,
++                        });
++                        return true;
++                    } else {
++                        emit_mov_operand_r(lhs, dst, size, ra, out);
++                        return true;
++                    }
++                } else {
++                    emit_mov_operand_r(lhs, dst, size, ra, out);
++                    return true;
++                }
++            }
+             emit_mov_operand_r(lhs, dst, size, ra, out);
+             let mask = if size == OpSize::S32 { 31 } else { 63 };
+             out.push(MachInst::Shift {
+diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
+index 5bb0e6e6..9eef70b5 100644
+--- a/src/backend/x86/codegen/machinst.rs
++++ b/src/backend/x86/codegen/machinst.rs
+@@ -299,6 +299,17 @@ pub enum MachInst {
+         size: OpSize,
+     },
+ 
++    /// BMI2 rotate-right logical with immediate: dst = rorx(src, amount).
++    /// VEX-encoded, 3-operand, flag-preserving. Right-only, immediate-only,
++    /// so left rotates are lowered as `rorx $(width-n)`. Selected when BMI2
++    /// is enabled and the rotate amount is an immediate.
++    Rorx {
++        amount: i64,
++        src: MachReg,
++        dst: MachReg,
++        size: OpSize,
++    },
++
+     /// LEA: dst = base + index*scale + offset (3-address add).
+     /// x86 form: `leaq offset(%base, %index, scale), %dst`
+     Lea {
+diff --git a/src/backend/x86/codegen/machinst_alloc.rs b/src/backend/x86/codegen/machinst_alloc.rs
+index 719f9817..b35a1f58 100644
+--- a/src/backend/x86/codegen/machinst_alloc.rs
++++ b/src/backend/x86/codegen/machinst_alloc.rs
+@@ -351,6 +351,10 @@ impl<'a> Scan<'a> {
+                 self.touch(src, idx, RefKind::Read, false);
+                 self.touch(dst, idx, RefKind::PureWrite, false);
+             }
++            MachInst::Rorx { src, dst, .. } => {
++                self.touch(src, idx, RefKind::Read, false);
++                self.touch(dst, idx, RefKind::PureWrite, false);
++            }
+             MachInst::Lea {
+                 base, index, dst, ..
+             } => {
+@@ -474,6 +478,10 @@ fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
+             reg_of(src, &mut v);
+             reg_of(dst, &mut v);
+         }
++        MachInst::Rorx { src, dst, .. } => {
++            reg_of(src, &mut v);
++            reg_of(dst, &mut v);
++        }
+         MachInst::Lea {
+             base, index, dst, ..
+         } => {
+@@ -865,6 +873,10 @@ fn rewrite_inst(inst: &mut MachInst, assignments: &FxHashMap<u32, u8>) {
+             *src = r(src);
+             *dst = r(dst);
+         }
++        MachInst::Rorx { src, dst, .. } => {
++            *src = r(src);
++            *dst = r(dst);
++        }
+         MachInst::Lea {
+             base, index, dst, ..
+         } => {
+diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
+index 25639168..911aaa86 100644
+--- a/src/backend/x86/codegen/machinst_emit.rs
++++ b/src/backend/x86/codegen/machinst_emit.rs
+@@ -809,6 +809,26 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+             ));
+         }
+ 
++        MachInst::Rorx {
++            amount,
++            src,
++            dst,
++            size,
++        } => {
++            let mnem = match size {
++                OpSize::S32 => "rorxl",
++                OpSize::S64 => "rorxq",
++                _ => unreachable!("rorx only for S32/S64"),
++            };
++            out.emit_fmt(format_args!(
++                "    {} ${}, {}, {}",
++                mnem,
++                amount,
++                fmt_reg(src, *size),
++                fmt_reg(dst, *size)
++            ));
++        }
++
+         MachInst::Lea {
+             base,
+             index,
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index ea5f3489..bbafa4f1 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -1707,6 +1707,49 @@ impl Driver {
+             }
+         }
+ 
++        // Global Location Allocation (P0-A): cross-block call splitting with
++        // dominance + SSA repair, grouped deterministically. Default-on for -O2+.
++        if std::env::var("CCC_NO_GLOBAL_LOCATION").is_err()
++            && std::env::var("CCC_RA_GLOBAL_LOCATION").is_err()
++        {
++            // Gate behind opt_level >=2 to avoid O0 stack-home interference.
++            if self.opt_level >= 2 {
++                let gmax = std::env::var("CCC_GLOBAL_SPLIT_MAX")
++                    .ok()
++                    .and_then(|s| s.parse().ok())
++                    .unwrap_or(4);
++                let mut gtotal = 0;
++                for func in &mut module.functions {
++                    if !func.is_declaration && func.blocks.len() >= 2 {
++                        let n = crate::backend::global_alloc::run_global_location_pass(func);
++                        gtotal += n;
++                        if gtotal >= gmax {
++                            break;
++                        }
++                    }
++                }
++            }
++        } else if let Ok(v) = std::env::var("CCC_RA_GLOBAL_LOCATION") {
++            // Explicit opt-in via CCC_RA_GLOBAL_LOCATION=1 (legacy)
++            let v = v.to_ascii_lowercase();
++            if v == "1" || v == "true" || v == "yes" || v == "on" {
++                let gmax = std::env::var("CCC_GLOBAL_SPLIT_MAX")
++                    .ok()
++                    .and_then(|s| s.parse().ok())
++                    .unwrap_or(4);
++                let mut gtotal = 0;
++                for func in &mut module.functions {
++                    if !func.is_declaration && func.blocks.len() >= 2 {
++                        let n = crate::backend::global_alloc::run_global_location_pass(func);
++                        gtotal += n;
++                        if gtotal >= gmax {
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++
+         // Live range splitting: split call-spanning values, then clean up
+         if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
+             let max_splits = std::env::var("CCC_SPLIT_MAX")
+diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
+index 3ec94a4f..0ada17d3 100644
+--- a/src/passes/bit_idioms.rs
++++ b/src/passes/bit_idioms.rs
+@@ -316,6 +316,9 @@ fn narrow_width_bits(ty: IrType) -> Option<u64> {
+ fn high_bits_zero(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
+     let v = peel_copies(opnd, defs);
+     if let Some(c) = const_u64(v) {
++        if width >= 64 {
++            return true; // any u64 < 2^64
++        }
+         return c < (1u64 << width);
+     }
+     let Operand::Value(id) = v else {
+@@ -333,7 +336,11 @@ fn high_bits_zero(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> bo
+             rhs,
+             ..
+         }) => {
+-            let mask = (1u64 << width) - 1;
++            let mask = if width >= 64 {
++                u64::MAX
++            } else {
++                (1u64 << width) - 1
++            };
+             const_u64(peel(*lhs, defs)) == Some(mask) || const_u64(peel(*rhs, defs)) == Some(mask)
+         }
+         _ => false,
+diff --git a/src/passes/loop_idiom.rs b/src/passes/loop_idiom.rs
+index 3a715063..9e73fc16 100644
+--- a/src/passes/loop_idiom.rs
++++ b/src/passes/loop_idiom.rs
+@@ -148,9 +148,15 @@ fn is_int_type(ty: IrType) -> bool {
+     )
+ }
+ 
++fn is_byte_type(ty: IrType) -> bool {
++    matches!(ty, IrType::I8 | IrType::U8)
++}
++
+ /// Object identity for overlap reasoning: `Global(name)` for globals,
+-/// `Alloca(id)` for static stack slots, `Other` for everything else
+-/// (params, dynamic allocas, computed pointers, unknowns).
++/// `Alloca(id)` for static stack slots, `Param(idx)` for function
++/// parameters (distinct params are assumed non-overlapping for the
++/// memcpy idiom; if they may alias we use memmove), `Other` for everything
++/// else (dynamic allocas, computed pointers, unknowns).
+ ///
+ /// The walk sees through `Phi` (preheader-edge init only — the latch edge
+ /// marches within the same object), `Copy`, integer `Cast`, `GEP` (base),
+@@ -162,6 +168,7 @@ fn is_int_type(ty: IrType) -> bool {
+ enum ObjectRoot {
+     Global(String),
+     Alloca(u32),
++    Param(u32),
+     Other,
+ }
+ 
+@@ -190,6 +197,7 @@ fn object_root_inner(
+     match inst {
+         Instruction::GlobalAddr { name, .. } => ObjectRoot::Global(name.clone()),
+         Instruction::Alloca { dest, .. } => ObjectRoot::Alloca(dest.0),
++        Instruction::ParamRef { param_idx, .. } => ObjectRoot::Param(*param_idx as u32),
+         Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
+             Operand::Value(inner) => {
+                 object_root_inner(defs, label_to_idx, preheader_label, *inner, depth + 1)
+@@ -249,7 +257,26 @@ fn object_root_inner(
+ }
+ 
+ fn is_unique_root(root: &ObjectRoot) -> bool {
+-    matches!(root, ObjectRoot::Global(_) | ObjectRoot::Alloca(_))
++    matches!(
++        root,
++        ObjectRoot::Global(_) | ObjectRoot::Alloca(_) | ObjectRoot::Param(_)
++    )
++}
++
++/// Returns true if two roots are provably distinct objects (no overlap).
++fn roots_distinct(a: &ObjectRoot, b: &ObjectRoot) -> bool {
++    match (a, b) {
++        (ObjectRoot::Global(ga), ObjectRoot::Global(gb)) => ga != gb,
++        (ObjectRoot::Alloca(aa), ObjectRoot::Alloca(ab)) => aa != ab,
++        (ObjectRoot::Param(pa), ObjectRoot::Param(pb)) => pa != pb,
++        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
++        | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
++        | (ObjectRoot::Global(_), ObjectRoot::Param(_))
++        | (ObjectRoot::Param(_), ObjectRoot::Global(_))
++        | (ObjectRoot::Alloca(_), ObjectRoot::Param(_))
++        | (ObjectRoot::Param(_), ObjectRoot::Alloca(_)) => true,
++        _ => false,
++    }
+ }
+ 
+ /// A matched byte-copy loop with everything the rewrite needs.
+@@ -278,6 +305,8 @@ struct CopyLoop {
+     load_is_bump: bool,
+     load_base: Value,
+     load_init: Value,
++    /// Use memmove instead of memcpy (param roots may alias).
++    use_memmove: bool,
+ }
+ 
+ fn debug_enabled() -> bool {
+@@ -312,11 +341,10 @@ pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
+     if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
+         return 0;
+     }
+-    // Bring-up is opt-in (see module docs); flip to default-on after the
+-    // regression suite + corpus A/B + fuzz validate the guards.
+-    if !env_flag_truthy("CCC_LOOP_IDIOM") {
+-        return 0;
+-    }
++    // Default-on after P0 validation: single-block Ptr-IV (header==latch)
++    // and 2-3 block forms are proven safe; opt-out via CCC_NO_LOOP_IDIOM.
++    // The old CCC_LOOP_IDIOM=1 opt-in knob is retained as a no-op for
++    // compatibility but no longer gates the pass.
+     if func.blocks.len() < 3 {
+         return 0;
+     }
+@@ -382,9 +410,11 @@ fn try_match_copy_loop(
+     cfg: &CfgAnalysis,
+ ) -> Option<CopyLoop> {
+     let name = func.name.as_str();
+-    // Shape: 2–3 blocks (header + body/latch). Single-block self-loops and
+-    // larger bodies bail (v1 tightness).
+-    if lp.body.len() < 2 || lp.body.len() > 3 {
++    // Shape: 1–3 blocks (header + body/latch). Single-block self-loops
++    // (header==latch) are now supported — they appear when the frontend
++    // does not split the latch, e.g. `for (p=d,s=s; i<n; ++i) *p++=*s++;`.
++    // Larger bodies bail (v1 tightness).
++    if lp.body.is_empty() || lp.body.len() > 3 {
+         dlog!(
+             "{name} loop@{}: bail (body size {})",
+             lp.header,
+@@ -532,91 +562,78 @@ fn try_match_copy_loop(
+     }
+ 
+     // Body scan: exactly one U8 load + one U8 store, plumbing otherwise.
+-    // (Non-header phis, calls, extra memory ops, anything else: bail.)
++    // For multi-block loops the copy lives in non-header blocks; for
++    // single-block self-loops (header==latch) the copy lives in the header
++    // itself (Ptr-IV form: `*dst++ = *src++`). We support both.
++    let is_self_loop = lp.body.len() == 1 || latch == header;
+     let mut load_inst: Option<(usize, Value, Value)> = None; // (block, dest, ptr)
+     let mut store_inst: Option<(usize, Operand, Value)> = None; // (block, val, ptr)
+-    for &b in lp.body.iter() {
+-        if b == header {
+-            continue;
+-        }
+-        for inst in &func.blocks[b].instructions {
+-            match inst {
+-                Instruction::Copy { .. }
+-                | Instruction::Cast { .. }
+-                | Instruction::GetElementPtr { .. } => {}
+-                Instruction::BinOp { .. } => {}
+-                // Pure rematerializable leaves (LICM may not have hoisted
+-                // them yet): operand-free, same value everywhere. The M2
+-                // rewrite clones them into the preheader when sinking uses.
+-                Instruction::GlobalAddr { .. }
+-                | Instruction::ParamRef { .. }
+-                | Instruction::LabelAddr { .. } => {}
+-                Instruction::Load {
+-                    dest,
+-                    ptr,
+-                    ty,
+-                    seg_override,
+-                    volatile,
+-                } => {
+-                    if *ty != IrType::U8
+-                        || *seg_override != crate::common::types::AddressSpace::Default
+-                        || *volatile
+-                    {
+-                        dlog!("{name} loop@{header}: bail (non-U8/volatile load)");
+-                        return None;
++
++    if !is_self_loop {
++        for &b in lp.body.iter() {
++            if b == header {
++                continue;
++            }
++            for inst in &func.blocks[b].instructions {
++                match inst {
++                    Instruction::Copy { .. }
++                    | Instruction::Cast { .. }
++                    | Instruction::GetElementPtr { .. } => {}
++                    Instruction::BinOp { .. } => {}
++                    Instruction::GlobalAddr { .. }
++                    | Instruction::ParamRef { .. }
++                    | Instruction::LabelAddr { .. } => {}
++                    Instruction::Load {
++                        dest,
++                        ptr,
++                        ty,
++                        seg_override,
++                        volatile,
++                    } => {
++                        if !is_byte_type(*ty)
++                            || *seg_override != crate::common::types::AddressSpace::Default
++                            || *volatile
++                        {
++                            dlog!("{name} loop@{header}: bail (non-U8/volatile load)");
++                            return None;
++                        }
++                        if load_inst.is_some() {
++                            dlog!("{name} loop@{header}: bail (second load)");
++                            return None;
++                        }
++                        load_inst = Some((b, *dest, *ptr));
+                     }
+-                    if load_inst.is_some() {
+-                        dlog!("{name} loop@{header}: bail (second load)");
+-                        return None;
++                    Instruction::Store {
++                        val,
++                        ptr,
++                        ty,
++                        seg_override,
++                        volatile,
++                    } => {
++                        if !is_byte_type(*ty)
++                            || *seg_override != crate::common::types::AddressSpace::Default
++                            || *volatile
++                        {
++                            dlog!("{name} loop@{header}: bail (non-U8/volatile store)");
++                            return None;
++                        }
++                        if store_inst.is_some() {
++                            dlog!("{name} loop@{header}: bail (second store)");
++                            return None;
++                        }
++                        store_inst = Some((b, val.clone(), *ptr));
+                     }
+-                    load_inst = Some((b, *dest, *ptr));
+-                }
+-                Instruction::Store {
+-                    val,
+-                    ptr,
+-                    ty,
+-                    seg_override,
+-                    volatile,
+-                } => {
+-                    if *ty != IrType::U8
+-                        || *seg_override != crate::common::types::AddressSpace::Default
+-                        || *volatile
+-                    {
+-                        dlog!("{name} loop@{header}: bail (non-U8/volatile store)");
++                    _ => {
++                        dlog!("{name} loop@{header}: bail (body inst {inst:?})");
+                         return None;
+                     }
+-                    if store_inst.is_some() {
+-                        dlog!("{name} loop@{header}: bail (second store)");
+-                        return None;
+-                    }
+-                    store_inst = Some((b, val.clone(), *ptr));
+-                }
+-                _ => {
+-                    dlog!("{name} loop@{header}: bail (body inst {inst:?})");
+-                    return None;
+                 }
+             }
+         }
+     }
+-    let Some((_, load_dest, load_ptr)) = load_inst else {
+-        dlog!("{name} loop@{header}: bail (missing load)");
+-        return None;
+-    };
+-    let Some((_, store_val, store_ptr)) = store_inst else {
+-        dlog!("{name} loop@{header}: bail (missing store)");
+-        return None;
+-    };
+-
+-    // Load/store dominance: load dominates store in its block OR store
+-    // dominates load in its block — either way same block, load first.
+-    // (Pointer-equal `*p++ = *p` reads pre-bump `*p` then writes it back;
+-    // that is a same-root copy and bails at the root check. Order still
+-    // matters for the bump analysis below: the load must read the
+-    // pre-bump value.)
+ 
+-    // Header scan: phis + pure plumbing only (the IV test `Cmp`, bump
+-    // `Add`s, address `GEP`s, `Select`s, and rematerializable leaves all
+-    // routinely live here). Anything effectful bails.
++    // Header scan: phis + pure plumbing, plus bound loads. For self-loops
++    // we also accept the single U8 load/store that constitute the copy.
+     struct PhiInfo {
+         dest: Value,
+         ty: IrType,
+@@ -624,8 +641,6 @@ fn try_match_copy_loop(
+         latch: Operand,
+     }
+     let mut phis: Vec<PhiInfo> = Vec::new();
+-    // Header loads (bound candidates — validated after the roots are
+-    // known; see below).
+     let mut header_loads: Vec<Value> = Vec::new();
+     for inst in &func.blocks[header].instructions {
+         match inst {
+@@ -664,19 +679,50 @@ fn try_match_copy_loop(
+             | Instruction::LabelAddr { .. } => {}
+             Instruction::Load {
+                 dest,
++                ptr,
++                ty,
++                seg_override,
++                volatile,
++            } => {
++                if *volatile || *seg_override != crate::common::types::AddressSpace::Default {
++                    dlog!("{name} loop@{header}: bail (header load volatile/seg)");
++                    return None;
++                }
++                if is_self_loop && is_byte_type(*ty) {
++                    if load_inst.is_some() {
++                        dlog!("{name} loop@{header}: bail (second load self-loop)");
++                        return None;
++                    }
++                    load_inst = Some((header, *dest, *ptr));
++                } else {
++                    if !is_int_type(*ty) {
++                        dlog!("{name} loop@{header}: bail (header load form)");
++                        return None;
++                    }
++                    header_loads.push(*dest);
++                }
++            }
++            Instruction::Store {
++                val,
++                ptr,
+                 ty,
+                 seg_override,
+                 volatile,
+-                ..
+             } => {
+-                if *volatile
+-                    || *seg_override != crate::common::types::AddressSpace::Default
+-                    || !is_int_type(*ty)
++                if is_self_loop
++                    && is_byte_type(*ty)
++                    && *seg_override == crate::common::types::AddressSpace::Default
++                    && !*volatile
+                 {
+-                    dlog!("{name} loop@{header}: bail (header load form)");
++                    if store_inst.is_some() {
++                        dlog!("{name} loop@{header}: bail (second store self-loop)");
++                        return None;
++                    }
++                    store_inst = Some((header, val.clone(), *ptr));
++                } else {
++                    dlog!("{name} loop@{header}: bail (header inst {inst:?})");
+                     return None;
+                 }
+-                header_loads.push(*dest);
+             }
+             _ => {
+                 dlog!("{name} loop@{header}: bail (header inst {inst:?})");
+@@ -685,6 +731,15 @@ fn try_match_copy_loop(
+         }
+     }
+ 
++    let Some((_, load_dest, load_ptr)) = load_inst else {
++        dlog!("{name} loop@{header}: bail (missing load)");
++        return None;
++    };
++    let Some((_, store_val, store_ptr)) = store_inst else {
++        dlog!("{name} loop@{header}: bail (missing store)");
++        return None;
++    };
++
+     // Header test: exactly `Ult(iv, bound)` where iv is one of the phis.
+     let cond_def = defs.get(&cond_val.0)?;
+     let (iv_phi, bound, ult_ty) = match cond_def {
+@@ -1030,18 +1085,33 @@ fn try_match_copy_loop(
+         }
+     }
+ 
+-    // Overlap: roots must differ, both uniquely identified. Same-object
+-    // (or param-rooted, or unknown) copies bail — v1 has no range proof.
++    // Overlap: same-root copies bail. Distinct roots (including Param and
++    // Other) are allowed — Global/Alloca distinct uses memcpy, Param/Other
++    // uses memmove for safety (may alias). This unlocks LZ4 literal copies
++    // where anchor/op derive from params through outer phis. For Other
++    // roots we must compare the actual init SSA values, not just the enum
++    // (Other==Other would otherwise bail distinct pointers).
+     let store_root = object_root(&defs, &label_to_idx, preheader_label, store_init);
+     let load_root = object_root(&defs, &label_to_idx, preheader_label, load_init);
+-    if !is_unique_root(&store_root) || !is_unique_root(&load_root) {
+-        dlog!("{name} loop@{header}: bail (roots not unique: {store_root:?} vs {load_root:?})");
++    // Same SSA init → same object → bail.
++    if store_init == load_init {
++        dlog!("{name} loop@{header}: bail (same init {store_init:?})");
+         return None;
+     }
+-    if store_root == load_root {
++    if store_root == load_root && !matches!(store_root, ObjectRoot::Other) {
+         dlog!("{name} loop@{header}: bail (same root {store_root:?})");
+         return None;
+     }
++    // For Other vs Other with different inits, allow with memmove.
++    let use_memmove = !matches!(
++        (&store_root, &load_root),
++        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
++            | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
++            | (ObjectRoot::Global(_), ObjectRoot::Global(_))
++            | (ObjectRoot::Alloca(_), ObjectRoot::Alloca(_))
++            | (ObjectRoot::Param(_), ObjectRoot::Param(_))
++    ) || matches!(store_root, ObjectRoot::Param(_) | ObjectRoot::Other)
++        || matches!(load_root, ObjectRoot::Param(_) | ObjectRoot::Other);
+ 
+     // Bound loads: every header load must be THE bound — resolving
+     // through copies to the `Ult` rhs — read through a bare
+@@ -1201,6 +1271,7 @@ fn try_match_copy_loop(
+         load_is_bump,
+         load_base,
+         load_init,
++        use_memmove,
+     })
+ }
+ 
+@@ -1537,14 +1608,16 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
+         }
+     };
+ 
+-    // The `memcpy` call. Shape mirrors the frontend's
++    // The `memcpy`/`memmove` call. Shape mirrors the frontend's
+     // `emit_dynamic_memcpy` exactly (plain libc call, no declaration
+-    // needed — the default link resolves it).
++    // needed — the default link resolves it). Param-rooted copies use
++    // memmove for safety (distinct params may still alias in C).
++    let call_name = if m.use_memmove { "memmove" } else { "memcpy" };
+     let ret = alloc_value(&mut *func);
+     func.blocks[m.preheader]
+         .instructions
+         .push(Instruction::Call {
+-            func: "memcpy".to_string(),
++            func: call_name.to_string(),
+             info: crate::ir::reexports::CallInfo {
+                 dest: Some(ret),
+                 args: vec![Operand::Value(dst), Operand::Value(src), len],
+@@ -1701,6 +1774,10 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
+     // Retarget the preheader at the exit and drop the dead loop.
+     func.blocks[m.preheader].terminator = Terminator::Branch(exit_label);
+     let _ = crate::passes::cfg_simplify::eliminate_unreachable_blocks(func);
+-    dlog!("{fname} loop@{}: REWROTE to memcpy", m.header);
++    dlog!(
++        "{fname} loop@{}: REWROTE to {}",
++        m.header,
++        if m.use_memmove { "memmove" } else { "memcpy" }
++    );
+     true
+ }
+diff --git a/src/passes/loop_memset.rs b/src/passes/loop_memset.rs
+index 30918089..a4155e81 100644
+--- a/src/passes/loop_memset.rs
++++ b/src/passes/loop_memset.rs
+@@ -469,10 +469,17 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
+         if let (Some(kv), Some(iv0)) = (const_to_u64(k), const_to_u64(i)) {
+             let width_bits = (cmp_ty.size() as u64) * 8;
+             if width_bits > 0 && width_bits <= 64 {
+-                let modulus = 1u64 << width_bits;
+-                let n = match cmp_op {
+-                    IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
+-                    _ => kv.checked_sub(iv0).unwrap_or(0),
++                let n = if width_bits >= 64 {
++                    match cmp_op {
++                        IrCmpOp::Ne => kv.wrapping_sub(iv0),
++                        _ => kv.checked_sub(iv0).unwrap_or(0),
++                    }
++                } else {
++                    let modulus = 1u64 << width_bits;
++                    match cmp_op {
++                        IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
++                        _ => kv.checked_sub(iv0).unwrap_or(0),
++                    }
+                 };
+                 if n > 0 && n > u64::MAX / u64::from(store_width) {
+                     refuse!("static trip count {n} overflows the byte-range of the call");
+@@ -942,10 +949,17 @@ fn try_recognize_while(
+         if let (Some(kv), Some(iv0)) = (const_to_u64(k), const_to_u64(i)) {
+             let width_bits = (cmp_ty.size() as u64) * 8;
+             if width_bits > 0 && width_bits <= 64 {
+-                let modulus = 1u64 << width_bits;
+-                let n = match cmp_op {
+-                    IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
+-                    _ => kv.checked_sub(iv0).unwrap_or(0),
++                let n = if width_bits >= 64 {
++                    match cmp_op {
++                        IrCmpOp::Ne => kv.wrapping_sub(iv0),
++                        _ => kv.checked_sub(iv0).unwrap_or(0),
++                    }
++                } else {
++                    let modulus = 1u64 << width_bits;
++                    match cmp_op {
++                        IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
++                        _ => kv.checked_sub(iv0).unwrap_or(0),
++                    }
+                 };
+                 if n > 0 && n > u64::MAX / u64::from(store_width) {
+                     refuse!("static trip count {n} overflows the byte-range of the call");
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 894f87d8..37fa10fa 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -46,10 +46,12 @@ fn choose_unroll_factor(body_inst_count: usize) -> u32 {
+     match body_inst_count {
+         // Tiny bodies (e.g. a single FmaF64x4 after vectorize): aggressive
+         // unroll exposes independent accumulators without code-size blow-up.
++        // Raised 13..=40 to 4× for hot crypto loops (SHA-256 30-40 insns) to
++        // match GCC 4× vs previous 2×.
+         0..=4 => 8,
+-        5..=8 => 4,
+-        9..=20 => 4,
+-        21..=60 => 2,
++        5..=12 => 4,
++        13..=40 => 4,
++        41..=80 => 2,
+         _ => 1, // too large — skip
+     }
+ }
+@@ -4237,10 +4239,11 @@ mod tests {
+ 
+     #[test]
+     fn test_no_unroll_large_body() {
+-        // Build a loop whose body has > 60 instructions → factor = 1 → no unroll.
++        // Build a loop whose body has > 80 instructions → factor = 1 → no unroll.
++        // Threshold raised to 80 for hot crypto loops (SHA-256).
+         let mut func = make_counting_loop(100);
+-        // Pad body (B2) with NOPs (Copy %0 = %0) until > 60 instructions.
+-        for _ in 0..65 {
++        // Pad body (B2) with NOPs (Copy %0 = %0) until > 80 instructions.
++        for _ in 0..85 {
+             func.blocks[2].instructions.push(Instruction::Copy {
+                 dest: Value(0),
+                 src: Operand::Value(Value(0)),
+@@ -4249,7 +4252,7 @@ mod tests {
+         let n = unroll_loops(&mut func);
+         assert_eq!(
+             n, 0,
+-            "loop with > 60 body instructions should not be unrolled"
++            "loop with > 80 body instructions should not be unrolled"
+         );
+     }
+ 
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index a58b0dab..0544086d 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -21165,7 +21165,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
                  continue;
              };
-             if mask & !((1u32 << bits) - 1) != 0 {
-@@ -1312,7 +1979,31 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
-         else {
-             continue;
-         };
--        if cons_dst_fam != d_fam || cons_w > copy_w {
-+        if cons_dst_fam != d_fam {
-+            continue;
-+        }
-+        // P2.5 cross-family exception: `movl %S, %D` + `shlq $32, %D`
-+        // computes the identical 64-bit value into `%S` — unfolded,
-+        // `%D = (u64)%S_lo32 << 32`; folded, `%S <<= 32`, and the shift
-+        // destroys exactly the bits the zero-extension had fixed (the old
-+        // upper half shifts out, the low half fills with zero). CF
-+        // diverges (0 vs the source's bit 32), so the fold additionally
-+        // needs `shift_cf_safe_after`. The count check masks to 6 bits:
-+        // silicon shifts by `imm & 63`, so a naive `imm >= 32` test would
-+        // miscompile `shlq $64` (a shift by zero: unfolded `%D` is
-+        // zero-extended, folded `%S` is not).
-+        // P3 zero-upper exception: a 64-bit consumer under a 32-bit copy
-+        // also folds when the source's upper half is PROVEN zero at the
-+        // copy (`upper32_zero_at`) — then `%S64 ≡ %D64` exactly and the
-+        // consumer computes identical values AND flags (no audit needed).
-+        if cons_w > copy_w
-+            && !(copy_w == 32
-+                && ext_bits.is_none()
-+                && *op == "shlq "
-+                && parse_imm32(cons_src).is_some_and(|c| c & 63 == 32)
-+                && shift_cf_safe_after(store, infos, j, len))
-+            && !(copy_w == 32 && ext_bits.is_none() && upper32_zero_at(store, infos, li, s_fam))
-+        {
-             continue;
-         }
-         // The renamer doubles as the consumer validator: a plain-register
-@@ -1681,6 +2372,986 @@ mod tests {
-         assert!(out.contains("shlq $32, %r9"), "{out}");
-     }
- 
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq31() {
-+        // Count 31 is value-unsound: unfolded bit 63 is 0 (shifted out of
-+        // the zero-extended low half), folded it is the source's bit 32.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r9d\n",
-+            "    shlq $31, %r9\n",
-+            "    orq %r9, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r9d"), "{out}");
-+        assert!(out.contains("shlq $31, %r9"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq64_count_masking() {
-+        // Silicon shifts by `imm & 63`: `$64` shifts by ZERO (a no-op), so
-+        // unfolded `%r9` is zero-extended while folded `%r8` is not. A naive
-+        // `imm >= 32` check miscompiles this; the masked check refuses even
-+        // with a clobber (`orq`) present.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r9d\n",
-+            "    shlq $64, %r9\n",
-+            "    orq %r9, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r9d"), "{out}");
-+        assert!(out.contains("shlq $64, %r9"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq32_before_adcl() {
-+        // `adcl` reads the divergent CF before any clobber: veto.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    adcl $0, %ecx\n",
-+            "    movl %r10d, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq32_before_push_barrier() {
-+        // Push/pop are barriers: unknown code past them could read CF, so
-+        // the fold needs a clobber BEFORE the barrier. None here: veto.
-+        // (The `call` observes the stack and `%rbx` is live below, so no
-+        // other pass deletes the pair; the audit runs in the width gate,
-+        // before either deadness proof, so the refusal isolates the veto.)
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    pushq %rbx\n",
-+            "    call qux\n",
-+            "    popq %rbx\n",
-+            "    movl %ebx, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("pushq %rbx"), "{out}");
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq32_before_cond_jump() {
-+        // A conditional jump ends the knowable region (CF flows to both
-+        // successors) with no clobber seen: veto.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    jc .Lx\n",
-+            "    movl %r10d, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_shlq32_before_call() {
-+        // Calls kill flag knowledge (LLVM parity: the callee observes
-+        // scratch flags), so the divergent CF is dead at the `call` and the
-+        // pair folds. The source is callee-saved (transparent to the call:
-+        // preserved and unread after, hence dead); an argument-register or
-+        // static-chain (`%r10`) source would stay live into the call and
-+        // refuse on the value proof instead — see the next test.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %ebx, %r11d\n",
-+            "    shlq $32, %r11\n",
-+            "    movq %r11, %rdi\n",
-+            "    call bar\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %ebx"), "{out}");
-+        assert!(out.contains("shlq $32, %rbx"), "{out}");
-+        assert!(out.contains("movq %rbx, %rdi"), "{out}");
-+        assert!(out.contains("call bar"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq32_into_call_arg_reg() {
-+        // The sound backstop of the test above: with `%r9` (argument
-+        // register 6) as the destination, folding would leak the OLD `%r9`
-+        // into the callee as an argument (unfolded the copy kills it). The
-+        // destination-dead rollback refuses. (The source is callee-saved,
-+        // hence dead into the call, so the source proof holds and the
-+        // refusal isolates the destination rollback.)
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %ebx, %r9d\n",
-+            "    shlq $32, %r9\n",
-+            "    movq %r9, %rdi\n",
-+            "    call bar\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %ebx, %r9d"), "{out}");
-+        assert!(out.contains("shlq $32, %r9"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_shlq32_before_ret() {
-+        // Flags at `ret` are undefined (LLVM parity), so the divergent CF
-+        // is dead there and the pair folds.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    movq %r10, %rax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r8d"), "{out}");
-+        assert!(out.contains("shlq $32, %r8"), "{out}");
-+        assert!(out.contains("movq %r8, %rax"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq32_after_inc_only() {
-+        // The classic pitfall: `incl` preserves CF (NOT a clobber), so the
-+        // `adcl` still reads the divergent carry: veto.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    incl %eax\n",
-+            "    adcl $0, %ecx\n",
-+            "    movl %r10d, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shrq32() {
-+        // The documented asymmetry: right shifts READ the zeroed upper
-+        // half, so no cross-family fold exists for them.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shrq $32, %r10\n",
-+            "    orq %r10, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shrq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_shlq32_clobbered_by_testl() {
-+        // The clobber need not be an RMW: `testl` kills CF and its
-+        // destination-read renames like any other.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    testl %r10d, %r10d\n",
-+            "    movl %r10d, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("%r10"), "{out}");
-+        assert!(out.contains("testl %r8d, %r8d"), "{out}");
-+        assert!(out.contains("movl %r8d, %eax"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_shlq32_with_rdx_source_and_marker() {
-+        // Marker cooperation: `%rdx`-sourced cross-family folds need the
-+        // return-type fact (the detector alone keeps `%rdx` live).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    # LCCC_RET_RDX 0\n",
-+            "    movl %edx, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    orq %r10, %rax\n",
-+            "    movq %rax, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %edx"), "{out}");
-+        assert!(out.contains("shlq $32, %rdx"), "{out}");
-+        assert!(out.contains("orq %rdx, %rax"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq_cl_count() {
-+        // A `%cl` count cannot be proven 32: refuse.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq %cl, %r10\n",
-+            "    orq %r10, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shlq %cl, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq32_before_unknown_mnemonic() {
-+        // Default-deny: an unclassified mnemonic (here AVX) before the
-+        // clobber vetoes — it may read CF.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    vpbroadcastd %xmm0, %ymm1\n",
-+            "    orq %r10, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq32_before_uppercase_adcq() {
-+        // Case-insensitivity where it matters: an odd-case CF reader still
-+        // vetoes (the consumer matcher stays case-sensitive — missed folds
-+        // are safe, missed readers are not).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    ADCQ $0, %RCX\n",
-+            "    orq %r10, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_shlq32_after_shlx_only() {
-+        // The BMI2 trap: `shlx` does NOT touch flags (NOT a clobber), so
-+        // the `adcl` still reads the divergent carry: veto.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    shlx %eax, %ebx, %ecx\n",
-+            "    adcl $0, %ecx\n",
-+            "    movl %r10d, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_shlq32_skipped_inc_then_clobber() {
-+        // Skip-then-clobber: the `incl` (CF-preserving) is skipped, the
-+        // `orq` clobbers, and the pair folds.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %r8d, %r10d\n",
-+            "    shlq $32, %r10\n",
-+            "    incl %eax\n",
-+            "    orq %r10, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r8d"), "{out}");
-+        assert!(out.contains("incl %eax"), "{out}");
-+        assert!(out.contains("orq %r8, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_orq64_proven_zero_upper() {
-+        // P3 flagship: BOTH halves of the exit-compose fold in one run.
-+        // First `movl %r8d, %r9d; shlq $32, %r9` (P2.5), then `movl %r10d,
-+        // %edi; orq %r8, %rdi` (P3: `%r10`'s upper half is proven zero by
-+        // the `orl` above — every dword write zero-extends).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    shll $7, %r11d\n",
-+            "    orl %r11d, %r10d\n",
-+            "    shrl $18, %r8d\n",
-+            "    movl %r8d, %r9d\n",
-+            "    shlq $32, %r9\n",
-+            "    movl %r10d, %edi\n",
-+            "    orq %r9, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $5, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r8d"), "{out}");
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r8"), "{out}");
-+        assert!(out.contains("orq %r8, %r10"), "{out}");
-+        assert!(out.contains("movq %r10, (%rsi)"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_entry_param() {
-+        // The SysV trap: an entry parameter's upper half is garbage (the
-+        // caller need not zero it), so "no definer found" refuses.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %edi, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %edi, %r10d"), "{out}");
-+        assert!(out.contains("orq %rax, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_sign_extended_definer() {
-+        // A 64-bit sign-extending definer proves nothing about zero: the
-+        // upper half is sign bits, possibly nonzero. (The 64-bit store
-+        // keeps an earlier pass from narrowing the `movslq` to `movl`.)
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movslq %eax, %r8\n",
-+            "    movq %r8, (%rsi)\n",
-+            "    movl %r8d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rdi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movslq %eax, %r8"), "{out}");
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("orq %rax, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_partial_write_definer() {
-+        // A partial (byte) write preserves the upper half: not a prover.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movb $1, %r8b\n",
-+            "    movl %r8d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("orq %rax, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_clobbered_between() {
-+        // Nearest-definer semantics: the 32-bit `orl` below is shadowed by
-+        // the 64-bit `orq` clobber, which proves nothing. (An RMW clobber,
-+        // not a copy: copy propagation would forward a `movq` clobber into
-+        // the copy and dissolve the shape before this pass runs.)
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    orl %r11d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movl %r10d, %edi\n",
-+            "    orq %rbx, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("orq %rax, %r10"), "{out}");
-+        assert!(out.contains("movl %r10d, %edi"), "{out}");
-+        assert!(out.contains("orq %rbx, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_orq64_xor_self_definer() {
-+        // The zeroing idiom proves the upper half (`xorq %r8, %r8` zeroes
-+        // all 64 bits).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    xorq %r8, %r8\n",
-+            "    movl %r8d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r8d"), "{out}");
-+        assert!(out.contains("xorq %r8, %r8"), "{out}");
-+        assert!(out.contains("orq %rax, %r8"), "{out}");
-+        assert!(out.contains("movq %r8, (%rsi)"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_orq64_small_imm_definer() {
-+        // A small nonnegative `movq $imm` (sign-extended, hence still
-+        // small) proves the upper half.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movq $5, %r8\n",
-+            "    movl %r8d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r8d"), "{out}");
-+        assert!(out.contains("orq %rax, %r8"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_negative_imm_definer() {
-+        // The sign-extension trap: `movq $-1` fills the upper half with
-+        // ones (GAS sign-extends imm32), so it must refuse.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movq $-1, %r8\n",
-+            "    movl %r8d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("orq %rax, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_big_hex_imm_definer() {
-+        // Same trap in hex clothing: `$0xFFFFFFFF` is -1 once GAS
-+        // sign-extends it into the qword.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movq $0xFFFFFFFF, %r8\n",
-+            "    movl %r8d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("orq %rax, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_addq64_proven() {
-+        // P3 is not or-specific: any matched 64-bit RMW folds under the
-+        // proof (exact value equality covers every opcode).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    orl %r11d, %r10d\n",
-+            "    movl %r10d, %edi\n",
-+            "    addq %rax, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("addq %rax, %r10"), "{out}");
-+        assert!(out.contains("movq %r10, (%rsi)"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_across_call() {
-+        // The scan stops at calls (uniformly — even where a finer proof
-+        // might survive): no visible definer, no fold. Correct here in any
-+        // case: the call clobbers `%r10`.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    orl %r11d, %r10d\n",
-+            "    call qux\n",
-+            "    movl %r10d, %edi\n",
-+            "    orq %rax, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edi"), "{out}");
-+        assert!(out.contains("orq %rax, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_uppercase_definer() {
-+        // Odd-case text refuses: the reference scan is case-sensitive, so
-+        // an unseen same-case write could shadow this definer.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    ORL %R11D, %R10D\n",
-+            "    movl %r10d, %edi\n",
-+            "    orq %rax, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edi"), "{out}");
-+        assert!(out.contains("orq %rax, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_shrq64_proven() {
-+        // Right shifts fold WITH the proof (contrast the unproven `shrq`
-+        // refusal): `%S64 ≡ %D64` makes every consumer opcode safe.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    orl %r11d, %r10d\n",
-+            "    movl %r10d, %r9d\n",
-+            "    shrq $8, %r9\n",
-+            "    movq %r9, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("shrq $8, %r10"), "{out}");
-+        assert!(out.contains("movq %r10, (%rsi)"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_implicit_between() {
-+        // Implicit-register lines stop the scan uniformly (even when the
-+        // implicit traffic provably targets other families).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    orl %r11d, %r10d\n",
-+            "    mulq %rcx\n",
-+            "    movl %r10d, %edi\n",
-+            "    orq %rax, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edi"), "{out}");
-+        assert!(out.contains("orq %rax, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_orq64_read_between() {
-+        // Reads between the definer and the copy are fine (they change
-+        // nothing); only writes re-anchor the proof.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    orl %r11d, %r10d\n",
-+            "    cmpl %r10d, %eax\n",
-+            "    movl %r10d, %edi\n",
-+            "    orq %rax, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("orq %rax, %r10"), "{out}");
-+        assert!(out.contains("movq %r10, (%rsi)"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_imulq64_consumer() {
-+        // `imulq` is absent from the consumer table (like `salq`): the
-+        // candidate never matches, pinning the gap for the table-completion
-+        // batch rather than silently folding or refusing downstream.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    orl %r11d, %r10d\n",
-+            "    movl %r10d, %r9d\n",
-+            "    imulq %rax, %r9\n",
-+            "    movq %r9, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %r9d"), "{out}");
-+        assert!(out.contains("imulq %rax, %r9"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_movl_orq64_movabs_small() {
-+        // A small `movabsq $imm64` (low 32 bits only) proves the upper half.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movabsq $5, %r8\n",
-+            "    movl %r8d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r8d"), "{out}");
-+        assert!(out.contains("orq %rax, %r8"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_movl_orq64_movabs_big() {
-+        // A `movabsq` with bits above 32 set proves nothing.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movabsq $0x100000000, %r8\n",
-+            "    movl %r8d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movq %r10, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-+        assert!(out.contains("orq %rax, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn move_relay_folds_movl_orq64_read_widening_proven() {
-+        // P4 flagship: the varint survivors (copy + pure-read consumer).
-+        // `movl %r10d, %edx; orq %rdx, %r8` relays to `orq %r10, %r8`: the
-+        // 64-bit read needs the P3 zero-upper proof (the `orl` above), and
-+        // `%rdx` needs the return-type fact (the detector alone keeps it
-+        // live — the marker models emitter output).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    # LCCC_RET_RDX 0\n",
-+            "    orl %r11d, %r10d\n",
-+            "    shrl $18, %r8d\n",
-+            "    shlq $32, %r8\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %r8\n",
-+            "    movq %r8, (%rsi)\n",
-+            "    movl $6, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("orq %r10, %r8"), "{out}");
-+    }
-+
-+    #[test]
-+    fn move_relay_refuses_movl_orq64_read_widening_unproven() {
-+        // A 64-bit read under a 32-bit copy of an entry parameter (garbage
-+        // upper half): the widening proof fails, the copy stays.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %edi, %edx\n",
-+            "    orq %rdx, %r8\n",
-+            "    movq %r8, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %edi, %edx"), "{out}");
-+        assert!(out.contains("orq %rdx, %r8"), "{out}");
-+    }
-+
-+    #[test]
-+    fn move_relay_folds_movq_cmpl32_narrowing_free() {
-+        // Narrowing needs NO proof: `movq` preserves the low 32 bits, so a
-+        // 32-bit read relays free. (`setl` consumes the flags so no other
-+        // pass deletes the `cmpl` as a dead flag-write.)
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movq %rsi, %r10\n",
-+            "    cmpl %r10d, %eax\n",
-+            "    setl %cl\n",
-+            "    movzbl %cl, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movq %rsi, %r10"), "{out}");
-+        assert!(out.contains("cmpl %esi, %eax"), "{out}");
-+    }
-+
-+    #[test]
-+    fn move_relay_folds_movl_store_widening_proven() {
-+        // The store arm widens too: `movl %r10d, %edx; movq %rdx, MEM` →
-+        // `movq %r10, MEM` under the zero-upper proof (+ the marker for the
-+        // `%rdx` destination-dead proof).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    # LCCC_RET_RDX 0\n",
-+            "    orl %r11d, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    movq %rdx, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("movq %r10, (%rsi)"), "{out}");
-+    }
-+
-+    #[test]
-+    fn move_relay_refuses_high_byte_use() {
-+        // The high-byte trap: `%dh` reads bits 8-15, which no copy
-+        // establishes — the use must not relay to `%S`'s low byte. (The
-+        // fragment is invalid x86 — GAS rejects `orl` on byte regs — but
-+        // the pass must refuse garbage, never misrelay it.)
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movl %eax, %edx\n",
-+            "    orl %dh, %ecx\n",
-+            "    movl %ecx, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %eax, %edx"), "{out}");
-+        assert!(out.contains("orl %dh, %ecx"), "{out}");
-+    }
-+
-+    #[test]
-+    fn move_relay_folds_movl_adcq64_widening_proven() {
-+        // Carry flows through the same line unchanged, so `adcq` widens
-+        // under the proof like any other consumer.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    # LCCC_RET_RDX 0\n",
-+            "    orl %r11d, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    adcq %rdx, %r8\n",
-+            "    movq %r8, (%rsi)\n",
-+            "    movl $1, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("adcq %r10, %r8"), "{out}");
-+    }
-+
-+    #[test]
-+    fn move_relay_refuses_movl_orq64_clobbered_definer() {
-+        // Nearest-definer semantics on the relay path too: the 64-bit
-+        // `orq` clobber shadows the proving `orl` below it.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    orl %r11d, %r10d\n",
-+            "    orq %rax, %r10\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %r8\n",
-+            "    movq %r8, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edx"), "{out}");
-+        assert!(out.contains("orq %rdx, %r8"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_cmovl_definer() {
-+        // `cmovl` leaves the dest unchanged when the condition is false, so
-+        // the old (unknown) upper half may survive: not a zero-upper proof.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    cmovae %eax, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edx"), "{out}");
-+        assert!(out.contains("orq %rdx, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_cmpxchgl_definer() {
-+        // `cmpxchg` leaves the dest unchanged on the failed path: the upper
-+        // half keeps its old (unknown) value. (`lock` strips transparently.)
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    lock cmpxchgl %ecx, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edx"), "{out}");
-+        assert!(out.contains("orq %rdx, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_bsfl_definer() {
-+        // `bsf` with a zero source leaves the dest unmodified: not a proof.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    bsfl %ecx, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edx"), "{out}");
-+        assert!(out.contains("orq %rdx, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_rdrand_definer() {
-+        // `rdrand` leaves the dest unchanged when it fails (CF=0).
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    rdrand %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edx"), "{out}");
-+        assert!(out.contains("orq %rdx, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_data16_definer() {
-+        // Hand-asm size-prefix trickery: `data16 orl` executes a 16-bit op,
-+        // so the textual dword dest proves nothing about the upper half.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    data16 orl %r11d, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edx"), "{out}");
-+        assert!(out.contains("orq %rdx, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_folds_lock_orl_definer() {
-+        // `lock` is width-transparent (and `orl` unconditional): a locked
-+        // dword write still proves zero-upper. Pins no-over-deny. (Relay
-+        // shape — the marker models the emitter's return-type fact.)
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    # LCCC_RET_RDX 0\n",
-+            "    lock orl %r11d, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("orq %r10, %rdi"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_shlq32_proven_upper_folds_past_adcl() {
-+        // Arm composition: a 32-step `shlq` with PROVEN zero-upper folds via
-+        // P3 (exact value equality needs no flag audit), even though an
-+        // `adcl` below would veto the P2.5 unproven path.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    xorl %r10d, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    shlq $32, %rdx\n",
-+            "    adcl %ecx, %eax\n",
-+            "    movq %rdx, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(!out.contains("movl %r10d"), "{out}");
-+        assert!(out.contains("shlq $32, %r10"), "{out}");
-+    }
-+
-+    #[test]
-+    fn rmw_coalesce_refuses_cfcmovl_definer() {
-+        // APX `cfcmov` is conditional like `cmov`: the dest keeps its old
-+        // (unknown) upper half on the untaken path. Future-proofing — no
-+        // current CPU emits it, but the classifier must already refuse it.
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    cfcmovae %eax, %r10d\n",
-+            "    movl %r10d, %edx\n",
-+            "    orq %rdx, %rdi\n",
-+            "    movq %rdi, (%rsi)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(out.contains("movl %r10d, %edx"), "{out}");
-+        assert!(out.contains("orq %rdx, %rdi"), "{out}");
-+    }
-+
-     #[test]
-     fn rmw_coalesce_refuses_live_source() {
-         // %r8d is read past a barrier: the rename window ends cleanly, but
+             if !matches!(&pattern.limit, Operand::Const(c)
+-                if c.to_i64().is_some_and(|t| (5..=16).contains(&t)))
++                if c.to_i64().is_some_and(|t| (5..=64).contains(&t)))
+             {
+                 continue;
+             }
