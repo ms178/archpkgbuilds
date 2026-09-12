@@ -1,1209 +1,850 @@
-diff --git a/engineering/AUDIT-2026-09-12-S15-redteam.md b/engineering/AUDIT-2026-09-12-S15-redteam.md
-new file mode 100644
-index 000000000..8bb7336e4
---- /dev/null
-+++ b/engineering/AUDIT-2026-09-12-S15-redteam.md
-@@ -0,0 +1,151 @@
-+# Red-team audit of the S15 increment (self-audit, 2026-09-12)
-+
-+Scope: the three changes in `113adf119` — reload-reuse precision in
-+`passes/dead_writes.rs`, the symmetric web-wide flag in `live_range.rs`, and the
-+confounder isolation in `check_ra_web_inloop_use.sh`. Method: re-read each hunk as an
-+adversarial reviewer, enumerate what could make it wrong, and check the enumeration against
-+execution rather than against my own reasoning.
-+
-+## 1. Reload-reuse precision
-+
-+### What I verified rather than assumed
-+
-+* **Width underestimation is the only way this miscompiles**, so I attacked it first. The
-+  suffix rule alone charges `vmovdqu %ymm0, 24(%rsp)` 16 bytes when it writes 32; `max`
-+  with the vector-register width closes that, and two tests pin `%ymm` (32) and `%zmm` (64)
-+  against a cached slot at 48 and 80 respectively. The estimate is over-broad on purpose:
-+  a `%xmm` appearing *anywhere* on the line forces ≥16 even when it is only a source.
-+* **Segment overrides.** `%fs:360(%rsp)` reaches `parse_frame_slot` with `disp_txt`
-+  = `"%fs:"`, whose `parse::<i64>` fails, so it returns `None` and the scan breaks. Safe by
-+  accident of parsing rather than by design — I would prefer an explicit `:` rejection, and
-+  have noted it below as residual risk.
-+* **String ops.** `movsl` with no operands: `store_destination` finds no space and returns
-+  `None` → break. `line_writes_memory`'s own `movs`-without-`%` branch still fires first.
-+* **Calls.** `call *(%rax)` would parse a destination, but `LineKind::Call` breaks the scan
-+  before `line_writes_memory` is ever consulted. Order matters here and is correct.
-+* **`xchgl %eax, 24(%rsp)`** — a read-modify-write of a *different* slot. Treated as
-+  non-aliasing, which is right: it writes 4 bytes at 24 and writes `%eax`, and the register
-+  half is handled by the separate destination-invalidation check.
-+* **All 34 differing TUs were executed**, not just diffed: identical exit status and stdout
-+  under both compilers. This pass has a documented miscompile history
-+  (`pic_indexed_store_static_global.c`), so asm-diff parity was not sufficient evidence.
-+
-+### Where I think the criticism is fair
-+
-+**(a) It is runtime-neutral, and I am shipping it anyway.** `+0.26 %` on `sha256_transform`
-+and `−0.27 %` on `fannkuch`+`linux_rbtree`, both inside the 1 % threshold. My justification
-+is that each rewrite replaces a load with a register move or deletes it, so it cannot be
-+slower *locally*, and 143 fewer frame-slot loads is a real reduction in memory traffic
-+(−2.0 %) that the timing harness cannot resolve on this corpus. A stricter reviewer would
-+say: an unmeasured benefit does not pay for touching a pass with a miscompile history. I
-+disagree, but only because the risk is bounded by 11 barrier tests plus executed-TU parity,
-+and because the alternative — leaving a *provably* over-conservative rule in place because
-+its cost is currently unmeasurable — is how such rules become permanent.
-+
-+**(b) I overclaimed in the evidence README.** I wrote that the precision is "the enabler"
-+for the displacement-propagation increment. Re-deriving it: after propagation the epilogue
-+groups become `movq 360(%rsp),%rax; movl 4(%rax),%eax; addl 24(%rsp),%eax; movl %eax,4(%rax)`,
-+and the reloads are *still* separated by an indirect store, which this precision explicitly
-+refuses to reason about. So it does not enable that increment. Corrected here rather than
-+left in the record.
-+
-+**(c) Same-destination deletion is the weaker half.** It accounts for a small minority of
-+the 100 removed instructions (the frame-slot disjointness rule does most of the work), and
-+its value is concentrated in exactly the shape that the aliasing rule then blocks. It is
-+sound and free, but if I had to drop one half to reduce surface, this is the one I would
-+drop.
-+
-+**(d) Residual risk I am not closing now.** `parse_frame_slot` should reject a `:` in the
-+operand explicitly instead of relying on the integer parse failing. Two lines, no behaviour
-+change, and it removes a coincidence from the soundness argument.
-+
-+### What I deliberately did not do
-+
-+Extend to `%esp`/`%ebp`. They map to the same families (4/5) in `scan_register_refs`, so the
-+argument transfers and the change is two lines. I refused because this sandbox cannot
-+*execute* i686 binaries (no 32-bit glibc dev headers), and every claim above rests on
-+execution. An asm-diff-only validation of an aliasing refinement is weaker evidence than I
-+am willing to put in a compiler. The current state is i686-neutral and CI's i686 gates ran
-+against an `lccc-i686` built after both edits.
-+
-+## 2. F3 — symmetric web-wide flag
-+
-+**The monotonicity argument is the whole justification, so I checked it exhaustively.** For
-+a range `R`:
-+
-+* `R` is an owner: old = `own(R) || ∃m∈members(R)`. New = same, plus a redundant term.
-+  Identical.
-+* `R` is a member that owns a range, owner `O`: old = `own(R)`. New = `own(R) || web(O)` ⊇
-+  old. Widened.
-+* `R` is in no web: old = `own(R)`; new = `own(R)` (map miss, both fallbacks empty).
-+  Identical.
-+
-+So the change can only ever widen the flag. That matters more than it looks: **widening this
-+exact flag is what caused the −40.53 % `lz4_compress` regression** in an earlier round, so a
-+transform that can only widen deserves scrutiny. It is output-neutral on 805 TUs (0 diffs,
-+0 instruction delta), and the mechanism that keeps it safe is the decoupling already
-+upstream — the flag feeds the boolean, never the admission cap's counts.
-+
-+**Kill-switch fidelity checked by hand, because the gate cannot see it.** With
-+`web_inloop_use == false`, `member_in_extent` and `web_in_loop_use_of` are both empty, and
-+the three-term OR reduces to `own(R) > 0 || ∃m∈members(R): uses_in_extents[m] > 0` — which
-+is exactly the pre-S09 base expression (`in_loop_uses = own + Σ members`, flag `> 0`). The
-+historical arm is bit-for-bit preserved, not merely similar.
-+
-+**Fair criticism:** this is churn in a hot RA path for a defect that is unreachable in the
-+corpus. I accept the churn because the asymmetry is a *reasoning* error — two ranges of one
-+web disagreeing about a physically shared property is the kind of thing that becomes a real
-+bug the moment coalescing changes — and because the cost is one extra `FxHashMap` per
-+function, which I did not measure but which is dominated by the existing three maps. If
-+compile time ever becomes the binding constraint, this map is the first thing to fold into
-+`members_of`.
-+
-+## 3. The gate change — did I weaken a safety net?
-+
-+This is the change I would most want challenged, so let me state the strongest objection and
-+answer it.
-+
-+**Objection:** the gate existed to prove the web-wide supply fires in the *shipping*
-+configuration. By compiling its structural arms with `CCC_NO_SAME_DST_RELOAD=1
-+CCC_NO_FRAME_SLOT_ALIASING=1` I made it prove something about a configuration nobody ships.
-+
-+**Answer:** the structural arms were never about the shipping binary — they are a *proxy*
-+for "does the supply change allocation in the intended direction", and a proxy is only valid
-+with its confounders held constant. The alternative readings were both worse: relaxing the
-+threshold would have destroyed the gate's discriminating power, and deleting the structural
-+section would have removed the only check that the supply fires at all. The sections that
-+*are* about shipping behaviour — correctness against gcc on both arms, and the lz4
-+blast-radius byte-identity — were left on the shipping configuration untouched.
-+
-+**What the evidence says the gate was right about:** with the precision on, the smallest
-+`sha256_transform` (192 insns, 47 slot refs) is the arm with the supply **off**, and that
-+arm is **6.06 % slower** at runtime (15 amplified interleaved reps, low3 1.062). Instruction
-+count and stack-traffic count both point the wrong way. The gate failing was the system
-+working; the fix was to give it a valid instrument.
-+
-+**Residual weakness:** the isolation means the structural numbers (195 vs 208) no longer
-+describe the shipped binary (194). The comment says so, but a reader skimming the gate
-+output could still be misled. A cleaner design would print both configurations. Not done:
-+the gate is already long and the value is marginal.
-+
-+## 4. Things I got wrong earlier that this round corrected
-+
-+* I rejected "x86 slot-load dedup" as worthless after implementing it in the *wrong pass*.
-+  The capability already existed in `reuse_redundant_loads`; my version duplicated it and
-+  therefore measured 2 instructions. The correct question was never "does x86 lack this
-+  pass" but "why does the existing pass stop early", and `CCC_PEEPHOLE_TRACE` answered it in
-+  one run. Lesson recorded: trace the pipeline before writing a pass.
-+* I reported clang as having "0 in-loop slot refs" using a span detector whose caveat I had
-+  already documented. The honest whole-function numbers are clang 20 / gcc 22 / lccc 53.
-+  The conclusion (2.4× the stack traffic) survives; the "0" did not, and the evidence README
-+  now carries the whole-function figures.
-+
-+## 5. Verdict
-+
-+Ship. The precision is sound by a width argument that is deliberately over-broad, validated
-+by execution on every TU it touches, and honest about being runtime-neutral. F3 is monotone
-+by construction and preserves the historical arm bit-for-bit. The gate was repaired with a
-+valid instrument rather than a looser one. The oracle gap is **not** closed — lccc 194
-+instructions and 52 frame-slot references against clang's 126 and 20 — and the next
-+increment (displacement propagation through destructive `leaq D(%B), %B`) is specified with
-+its mechanism and its liveness prerequisites in `TASK-RA-06A`.
-diff --git a/engineering/evidence/reuse-precision-2026-09-12/README.md b/engineering/evidence/reuse-precision-2026-09-12/README.md
-new file mode 100644
-index 000000000..548f9a657
---- /dev/null
-+++ b/engineering/evidence/reuse-precision-2026-09-12/README.md
-@@ -0,0 +1,169 @@
-+# Reload-reuse precision + the instruction-count/runtime inversion (2026-09-12)
-+
-+Base: upstream `52e01b9f6` (my S14 work landed as PR #502, `b99135872`; the upstream tree
-+is byte-identical to the delivered patch, tree `08c49ccc`).
-+
-+Two changes, one measurement discovery that changed a CI gate, and one deliberate refusal.
-+
-+## 1. What was actually wrong with the earlier "slot-load dedup" attempt
-+
-+The previous session concluded that x86 had no slot-load dedup and that porting the ARM
-+backend's `eliminate_repeated_slot_loads` was worth 2 instructions out of 8414, so it was
-+rejected. **That conclusion was wrong about the mechanism.** x86 already has the pass —
-+`reuse_redundant_loads` in `passes/dead_writes.rs` — which is exactly why bolting a second
-+copy onto `global_store_forwarding` bought almost nothing: the work was already done.
-+
-+Tracing `CCC_PEEPHOLE_TRACE` over `sha256_transform` shows the pipeline behaving well in
-+the prologue and badly in the epilogue:
-+
-+| stage | prologue (state-word loads) | epilogue (write-back) |
-+|---|---|---|
-+| `006 reuse_redundant_loads` | 14 slot reloads → 7 reloads + 7 register copies | reloads **survive** |
-+| `009 fuse_copy_and_operation` | `movq %rcx,%rax` + `leaq 4(%rax),%rax` → `leaq 4(%rcx),%rax` | — |
-+| `012 fold_lea_into_load` | `movl 4(%rcx), %r11d` — one reload, displacement addressing | — |
-+
-+The epilogue fails because every group contains `movl %eax, (%r8)` and the pass broke its
-+scan on **any** memory write, on the sound-but-blunt principle that without alias analysis
-+every store may hit the cached address. Two precise gaps, both now closed:
-+
-+* **Same-destination reload.** The scan broke on the destination-write check *before* ever
-+  attempting the match, and the match itself required `dst2 != dst_owned`. So a reload into
-+  the *same* register — which writes the destination the value it already holds — was the
-+  one case guaranteed to survive. Now deleted.
-+* **Frame-slot aliasing.** A store to a *different, non-overlapping* `D(%rsp)` range is not
-+  an aliasing guess, it is a fact about the static frame layout. Now reasoned about
-+  explicitly, with everything else left conservative.
-+
-+Policy is threaded as an explicit `ReusePolicy { same_dst_reload, frame_slot_aliasing }`
-+with `full()` / `legacy()` constructors and kill switches `CCC_NO_SAME_DST_RELOAD` /
-+`CCC_NO_FRAME_SLOT_ALIASING`, so both arms are unit-testable without mutating the process
-+environment.
-+
-+### Soundness
-+
-+* Widths come from `mnemonic_mem_width`, which takes `max(suffix_width, vector_reg_width)`.
-+  The vector half is load-bearing: `vmovdqu %ymm0, 24(%rsp)` has a `v`-class letter in the
-+  suffix position, so the suffix rule alone charges 16 bytes for a **32-byte** store and
-+  would report it disjoint from a cached qword at 48. `%zmm` charges 64. An underestimate
-+  here is a miscompile, so the estimate is deliberately over-broad (a `%xmm` anywhere on
-+  the line forces ≥16 even if it is only a source).
-+* Indexed (`D(%rsp,%rax,4)`) and rip-relative destinations are rejected: no fixed range.
-+* A different frame base (`%rbp` vs the cached `%rsp`) is rejected: not provably a fixed
-+  distance apart in this scan.
-+* A store through a register makes **no** points-to claim at all and still breaks the scan.
-+* The base register cannot move inside the scan: `%rsp`/`%rbp` are families 4/5 in
-+  `reg_refs`, they are in the cached load's `addr_fams`, and a write to any address family
-+  already ends the scan.
-+* 11 new unit tests pin each barrier, including both policy arms, the overlap case, the
-+  indirect store, the different base, `%rsp` movement, and the `%ymm`/`%zmm` widths.
-+
-+### Measured
-+
-+* Corpus: 805 TUs compiled, **34 differ**, **100 instructions** and **143 frame-slot
-+  loads** removed (7196 → 7053, −2.0 %).
-+* All 34 differing TUs **executed** with both compilers: identical exit status and stdout.
-+* `cargo test --lib`: **2425 passed, 0 failed**. `ci_local.sh --fast`: **25/0/3 GREEN**.
-+* Runtime: neutral (`sha256_transform` +0.26 %, `fannkuch`+`linux_rbtree` −0.27 %, both
-+  inside the 1 % threshold). Fewer loads cannot be slower by construction — each rewrite
-+  replaces a load with a register move or deletes it — but this is not sold as a speedup.
-+
-+## 2. The discovery: instruction count and runtime now DISAGREE, and a gate encoded the wrong one
-+
-+With the precision enabled, the 2×2 matrix on `sha256_transform` reads:
-+
-+| RA web-wide supply | reload-reuse precision | insns | frame-slot refs |
-+|---|---|---|---|
-+| ON | ON | 194 | 52 |
-+| ON | OFF | 195 | 53 |
-+| **OFF** | **ON** | **192** | **47** |
-+| OFF | OFF | 208 | 55 |
-+
-+The smallest, lowest-stack-traffic configuration is **RA supply OFF**. That broke
-+`check_ra_web_inloop_use.sh`, whose structural contract asserts the supply makes the
-+function smaller — and the gate was right to break, because it was measuring a proxy.
-+
-+Runtime, 15 amplified interleaved reps (`-DPASSES=8 -DBLOCK_COUNT=131072`):
-+
-+```
-+A = supply ON  + precision ON : 405.13 ms
-+B = supply OFF + precision ON : 429.69 ms      B/A = 1.0606  (low3 1.062)
-+VERDICT: A is 6.06% FASTER
-+```
-+
-+**The arm with fewer instructions and less stack traffic is 6 % slower.** This is precisely
-+the trap `TASK-RA-06A` already warns about ("do not judge the fix by instruction count; the
-+opt-in arm has fewer instructions and stack refs and is slower"), now reproduced
-+independently. The supply is still worth **+6.06 %**; the precision removes loads the
-+supply's spill pattern happened to create.
-+
-+The gate was therefore fixed by **holding the confounder constant**, not by weakening the
-+assertion: its structural and presence-semantics arms now compile with
-+`CCC_NO_SAME_DST_RELOAD=1 CCC_NO_FRAME_SLOT_ALIASING=1` on *both* sides, so they measure
-+the supply in isolation (default 195 insns / max-per-slot 10 vs kill-switch 208 / 17).
-+The correctness-vs-gcc and lz4 blast-radius sections still exercise the shipping
-+configuration. When an independent optimization invalidates a proxy metric, the fix is to
-+isolate the variable — never to relax the threshold.
-+
-+## 3. F3 fixed: the web-wide boolean is now symmetric, and monotone by construction
-+
-+`mark_loop_spanning` answered "does this web have an in-extent read?" only through
-+`members_of.get(range.value_id)`, i.e. only for a coalesce **owner**. A value that owns a
-+`LiveRange` *and* is a member of some owner heard about nobody, so two ranges of one web
-+could disagree about a property that is physically shared — coalesced members occupy one
-+register, so a hot reload happens for the whole web or not at all.
-+
-+Now the flag is resolved once per web (`web_in_loop_use_of`, keyed by owner) and read by
-+every range in it. The per-range answer is the OR of three terms — its own reads, its
-+owner's web, and the members it owns itself. The third is redundant while
-+`coalesce_member_of` is flattened to roots (it is today), and keeping it makes the change
-+**monotone by construction**: it can only ever widen the flag, never narrow it, even if the
-+coalesce map ever became a chain. That matters because widening this flag is what caused the
-+−40.53 % `lz4_compress` regression in an earlier round.
-+
-+Verified **output-neutral: 0 differing TUs of 805, 0 instruction delta**, isolated against
-+the peephole change. So F3 is a consistency/robustness fix, not a performance one, and it is
-+honestly reported as such: the asymmetry was real in the code and unreachable in this corpus.
-+
-+## 4. Deliberate refusal: the precision is x86-64-only
-+
-+`parse_frame_slot` accepts only `%rsp`/`%rbp`. `%esp`/`%ebp` map to the *same* register
-+families (4/5) in `scan_register_refs`, so extending it would be sound by an identical
-+argument and would be a two-line change.
-+
-+It is deliberately not done here. This sandbox has no 32-bit glibc dev headers, so **i686
-+binaries cannot be executed**. Every x86-64 claim above is backed by running the 34
-+differing translation units; the same claim on i686 could only be backed by an asm diff.
-+Shipping a soundness-critical aliasing refinement on a target whose behaviour cannot be
-+executed is not a trade worth making for a benefit measured at 0.06 % of instructions on
-+the target where it *was* measurable.
-+
-+Current state is safe: the change is i686-neutral, and CI's `i686-atomics` and
-+`i686-asm-diff` gates ran against an `lccc-i686` binary built *after* both source edits.
-+
-+**Follow-up**, if someone with a 32-bit toolchain wants it: add `"%esp" => 4, "%ebp" => 5`
-+to `parse_frame_slot`, then validate by executing — not just diffing — every differing TU,
-+with particular attention to `subl $N, %esp` staging windows and to i686's red zone
-+absence.
-+
-+## 5. Oracle standing (whole-function, `-O2`)
-+
-+| compiler | insns | frame-slot refs | distinct slots |
-+|---|---|---|---|
-+| clang 23.1.0 | **126** | 20 | 12 |
-+| gcc 16.2 | 154 | 22 | 14 |
-+| lccc before this change | 195 | 53 | 15 |
-+| **lccc after** | **194** | **52** | 15 |
-+| gcc 14.2 (local, gate's oracle) | 142 | 8 | — |
-+
-+The gap is **not** closed and is not claimed to be. What remains is register residency: the
-+epilogue still materializes each `&state[i]` with `movq 360(%rsp),%rax; leaq 4(%rax),%rax;
-+movq %rax,%r8` — three instructions where clang emits `movl 4(%rbase),%eax` with the base
-+held in a callee-saved register. `fold_lea_into_load` bails on that shape by design
-+(`addr_fams.contains(&dst_fam)`), correctly, because splicing the LEA's address text into a
-+later use would read `base + 2D`. The valid dual is displacement *propagation* — delete the
-+destructive LEA and add `D` to each of its uses, which also preserves the base register.
-+Note that propagation alone does **not** let reload reuse collapse the remaining reloads:
-+each group still ends in an indirect store (`movl %eax, 4(%rax)`), which the precision in §1
-+deliberately refuses to reason about. Closing the reloads needs either a points-to fact about
-+the spilled parameter or register residency for the base, i.e. the P0-A/P0-C work. That is the next increment, recorded
-+against `TASK-RA-06A` with the oracle-derived target (slot refs 52 → 20, insns 194 → 126).
-diff --git a/engineering/evidence/reuse-precision-2026-09-12/matrix-ra-on-vs-off.json b/engineering/evidence/reuse-precision-2026-09-12/matrix-ra-on-vs-off.json
-new file mode 100644
-index 000000000..c6dcbfacb
---- /dev/null
-+++ b/engineering/evidence/reuse-precision-2026-09-12/matrix-ra-on-vs-off.json
-@@ -0,0 +1,56 @@
-+{
-+  "header": "A: w_ON_ON.sh vs B: w_OFF_ON.sh",
-+  "flags": [
-+    "-O2",
-+    "-DPASSES=8",
-+    "-DBLOCK_COUNT=131072"
-+  ],
-+  "reps": 15,
-+  "floor_ms": 1.0576419990684371,
-+  "geomean_b_over_a": 1.060621866834534,
-+  "benchmarks": [
-+    {
-+      "benchmark": "sha256_transform",
-+      "a_min_ms": 405.13374600050156,
-+      "b_min_ms": 429.6937100007199,
-+      "ratio_b_over_a": 1.060621866834534,
-+      "ratio_low3": 1.0618354383582669,
-+      "samples_a": [
-+        415.9241199995449,
-+        423.4608480001043,
-+        417.4334920007823,
-+        415.9678609994444,
-+        409.9235009998665,
-+        415.31624299932446,
-+        418.0065429991373,
-+        407.0508789991436,
-+        411.6870950001612,
-+        438.06643999960215,
-+        405.53445300065505,
-+        405.94656100074644,
-+        405.5516049993457,
-+        405.13374600050156,
-+        405.2661450004962
-+      ],
-+      "samples_b": [
-+        435.1306400003523,
-+        437.70222300008754,
-+        436.2393029987288,
-+        440.94708999909926,
-+        430.3062510007294,
-+        429.6937100007199,
-+        477.1109939993039,
-+        431.095607998941,
-+        430.989292999584,
-+        434.10939300156315,
-+        455.95832300023176,
-+        479.67837900068844,
-+        431.7980609994265,
-+        447.76225200075714,
-+        430.71482599953015
-+      ],
-+      "excluded": false
-+    }
-+  ],
-+  "failures": []
-+}
-\ No newline at end of file
-diff --git a/engineering/evidence/reuse-precision-2026-09-12/matrix-ra-on-vs-off.md b/engineering/evidence/reuse-precision-2026-09-12/matrix-ra-on-vs-off.md
-new file mode 100644
-index 000000000..a8f27f755
---- /dev/null
-+++ b/engineering/evidence/reuse-precision-2026-09-12/matrix-ra-on-vs-off.md
-@@ -0,0 +1,8 @@
-+# Benchmark Screen: A: w_ON_ON.sh vs B: w_OFF_ON.sh
-+- **Flags**: `-O2 -DPASSES=8 -DBLOCK_COUNT=131072`
-+- **Rounds**: `15`
-+- **Aggregate B/A Geomean**: `1.0606`
-+
-+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
-+| :--- | :---: | :---: | :---: | :---: | :--- |
-+| `sha256_transform` | 405.13 | 429.69 | 1.061 | 1.062 |  |
-diff --git a/engineering/evidence/reuse-precision-2026-09-12/paired-fannkuch-rbtree.json b/engineering/evidence/reuse-precision-2026-09-12/paired-fannkuch-rbtree.json
-new file mode 100644
-index 000000000..4b21f1018
---- /dev/null
-+++ b/engineering/evidence/reuse-precision-2026-09-12/paired-fannkuch-rbtree.json
-@@ -0,0 +1,80 @@
-+{
-+  "header": "A: lccc_S15_base vs B: lccc_v4",
-+  "flags": [
-+    "-O2"
-+  ],
-+  "reps": 11,
-+  "floor_ms": 1.0521519998292206,
-+  "geomean_b_over_a": 0.9972940574203907,
-+  "benchmarks": [
-+    {
-+      "benchmark": "fannkuch",
-+      "a_min_ms": 2796.131824999975,
-+      "b_min_ms": 2804.890396000701,
-+      "ratio_b_over_a": 1.0031323884383478,
-+      "ratio_low3": 1.0025770832413616,
-+      "samples_a": [
-+        2829.413479001232,
-+        2824.353968999276,
-+        2836.7502660003083,
-+        2828.9905989986437,
-+        2819.3424729997787,
-+        2812.411905000772,
-+        2796.131824999975,
-+        2817.863333000787,
-+        2812.55335700007,
-+        2802.531105999151,
-+        2843.7334390000615
-+      ],
-+      "samples_b": [
-+        2826.770290999775,
-+        2813.7791130011465,
-+        2822.087257000021,
-+        2815.3047190007783,
-+        2823.231192000094,
-+        2824.397972000952,
-+        2828.745657001491,
-+        2804.890396000701,
-+        2831.8192420010746,
-+        2814.081366999744,
-+        2847.340623000491
-+      ],
-+      "excluded": false
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 56e307ce..f6d3f712 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -21,6 +21,7 @@ pub(crate) mod traits; // ArchCodegen trait with default implementations
+ pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, asm template parsing
+ 
+ // Register allocation and liveness analysis
++pub(crate) mod global_alloc; // Global Location Allocation — P0-A
+ pub(crate) mod live_range; // Linear scan data structures (LiveRange, LinearScanAllocator)
+ pub(crate) mod liveness; // Live interval computation
+ pub(crate) mod regalloc; // Linear scan register allocator
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 5bf659bc..cac4e953 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -916,8 +916,25 @@ impl X86Codegen {
+                 Some(imm) => {
+                     let amount = (imm as i64).rem_euclid(width);
+                     if amount != 0 {
+-                        self.state
+-                            .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
++                        if self.bmi2_enabled && (width == 32 || width == 64) {
++                            let ror_amount = match op {
++                                IrBinOp::RotateLeft => (width - amount) % width,
++                                IrBinOp::RotateRight => amount,
++                                _ => amount,
++                            };
++                            if ror_amount != 0 {
++                                let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
++                                // acc_typed is al/ax/eax/rax, but rorx needs 3-operand form with src==dst
++                                // For accumulator path, src and dst are same accumulator.
++                                self.state.emit_fmt(format_args!(
++                                    "    {} ${}, %{}, %{}",
++                                    ror_mnem, ror_amount, acc_typed, acc_typed
++                                ));
++                            }
++                        } else {
++                            self.state
++                                .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
++                        }
+                     }
+                 }
+                 None => {
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 968df204..9d35325c 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -4589,15 +4589,34 @@ impl X86Codegen {
+             // no-op.
+             let amount = (imm as i64).rem_euclid(width);
+             if amount != 0 {
+-                self.state
+-                    .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
+-                if width == 32 {
+-                    // A rotate can move any bit into bit 31, so a signed I32
+-                    // result needs the same upper-half normalization a signed
+-                    // `shl` does. No-op for the unsigned types rotate idioms
+-                    // actually use. Sub-word results keep their zero-extended
+-                    // homes: `rolw`/`rolb` only write the low bits.
+-                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                if self.bmi2_enabled && (width == 32 || width == 64) {
++                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
++                    let ror_amount = match op {
++                        IrBinOp::RotateLeft => (width - amount) % width,
++                        IrBinOp::RotateRight => amount,
++                        _ => amount,
++                    };
++                    if ror_amount != 0 {
++                        let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
++                        self.state.emit_fmt(format_args!(
++                            "    {} ${}, %{}, %{}",
++                            ror_mnem, ror_amount, dest_typed, dest_typed
++                        ));
++                    }
++                    if width == 32 {
++                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                    }
++                } else {
++                    self.state
++                        .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
++                    if width == 32 {
++                        // A rotate can move any bit into bit 31, so a signed I32
++                        // result needs the same upper-half normalization a signed
++                        // `shl` does. No-op for the unsigned types rotate idioms
++                        // actually use. Sub-word results keep their zero-extended
++                        // homes: `rolw`/`rolb` only write the low bits.
++                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                    }
+                 }
+             }
+             self.state.reg_cache.invalidate_acc();
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 6c3c7ce7..29919e44 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -577,6 +577,55 @@ pub fn lower_binop(
+ 
+     // ── Shift operations ─────────────────────────────────────────────
+     if let Some(shift_op) = binop_to_shift(op) {
++        // BMI2 RORX for immediate rotates: flag-preserving, non-destructive,
++        // 3-operand VEX. Converts Rol(n) -> Ror(width-n). S32/S64 only,
++        // immediate-only right rotate. Removes mov + flags dep for SHA-256/ChaCha ARX.
++        if matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror)
++            && matches!(size, OpSize::S32 | OpSize::S64)
++            && shlx_mode() != ShlxMode::Never
++        {
++            if let Some(imm) = const_as_imm32(rhs) {
++                let width = if size == OpSize::S32 { 32 } else { 64 };
++                let amt = (imm as i64).rem_euclid(width as i64);
++                if amt != 0 {
++                    let ror_amt = match shift_op {
++                        ShiftOp::Rol => (width as i64 - amt) % width as i64,
++                        ShiftOp::Ror => amt,
++                        _ => amt,
++                    };
++                    if ror_amt != 0 {
++                        // Try to keep src in its home to avoid extra mov.
++                        let src_reg = match lhs {
++                            Operand::Value(v) => value_to_reg(v, ra),
++                            _ => {
++                                emit_mov_operand_r(lhs, dst, size, ra, out);
++                                dst
++                            }
++                        };
++                        let src_final = match src_reg {
++                            MachReg::Phys(_) => src_reg,
++                            _ => {
++                                emit_mov_operand_r(lhs, dst, size, ra, out);
++                                dst
++                            }
++                        };
++                        out.push(MachInst::Rorx {
++                            amount: ror_amt,
++                            src: src_final,
++                            dst,
++                            size,
++                        });
++                        return true;
++                    } else {
++                        emit_mov_operand_r(lhs, dst, size, ra, out);
++                        return true;
++                    }
++                } else {
++                    emit_mov_operand_r(lhs, dst, size, ra, out);
++                    return true;
++                }
++            }
++        }
+         if let Some(imm) = const_as_imm32(rhs) {
+             emit_mov_operand_r(lhs, dst, size, ra, out);
+             let mask = if size == OpSize::S32 { 31 } else { 63 };
+diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
+index 5bb0e6e6..8e5341eb 100644
+--- a/src/backend/x86/codegen/machinst.rs
++++ b/src/backend/x86/codegen/machinst.rs
+@@ -299,6 +299,16 @@ pub enum MachInst {
+         size: OpSize,
+     },
+ 
++    /// BMI2 RORX: dst = ror(src, imm). Three-operand VEX, flag-preserving,
++    /// non-destructive, immediate-only right rotate. Removes a mov and the
++    /// flags dependency of `rol/ror`. Selected for S32/S64 when BMI2 enabled.
++    Rorx {
++        amount: i64,
++        src: MachReg,
++        dst: MachReg,
++        size: OpSize,
 +    },
-+    {
-+      "benchmark": "linux_rbtree",
-+      "a_min_ms": 15.90391600075236,
-+      "b_min_ms": 15.768569001011201,
-+      "ratio_b_over_a": 0.9914897060739785,
-+      "ratio_low3": 0.9916545217979491,
-+      "samples_a": [
-+        16.147704000104568,
-+        15.980808000676916,
-+        16.08315900011803,
-+        15.965833999871393,
-+        16.01415699951758,
-+        15.91241300047841,
-+        16.16732900038187,
-+        15.90391600075236,
-+        16.052787999797147,
-+        16.046283999457955,
-+        15.993044000424561
-+      ],
-+      "samples_b": [
-+        16.15537200086692,
-+        15.921231999527663,
-+        15.857592999964254,
-+        15.840911999475793,
-+        15.854070999921532,
-+        15.855966999879456,
-+        15.829762000066694,
-+        15.768569001011201,
-+        16.187403000003542,
-+        15.89292700009537,
-+        15.785067000251729
-+      ],
-+      "excluded": false
-+    }
-+  ],
-+  "failures": []
-+}
-\ No newline at end of file
-diff --git a/engineering/evidence/reuse-precision-2026-09-12/paired-fannkuch-rbtree.md b/engineering/evidence/reuse-precision-2026-09-12/paired-fannkuch-rbtree.md
-new file mode 100644
-index 000000000..c6efc4db3
---- /dev/null
-+++ b/engineering/evidence/reuse-precision-2026-09-12/paired-fannkuch-rbtree.md
-@@ -0,0 +1,9 @@
-+# Benchmark Screen: A: lccc_S15_base vs B: lccc_v4
-+- **Flags**: `-O2`
-+- **Rounds**: `11`
-+- **Aggregate B/A Geomean**: `0.9973`
 +
-+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
-+| :--- | :---: | :---: | :---: | :---: | :--- |
-+| `fannkuch` | 2796.13 | 2804.89 | 1.003 | 1.003 |  |
-+| `linux_rbtree` | 15.90 | 15.77 | 0.991 | 0.992 |  |
-diff --git a/engineering/evidence/reuse-precision-2026-09-12/paired-sha256.json b/engineering/evidence/reuse-precision-2026-09-12/paired-sha256.json
-new file mode 100644
-index 000000000..8d0af85e6
---- /dev/null
-+++ b/engineering/evidence/reuse-precision-2026-09-12/paired-sha256.json
-@@ -0,0 +1,48 @@
-+{
-+  "header": "A: lccc_S15_base vs B: lccc_v4",
-+  "flags": [
-+    "-O2",
-+    "-DPASSES=8",
-+    "-DBLOCK_COUNT=131072"
-+  ],
-+  "reps": 11,
-+  "floor_ms": 1.0718569992604898,
-+  "geomean_b_over_a": 1.002602275425064,
-+  "benchmarks": [
-+    {
-+      "benchmark": "sha256_transform",
-+      "a_min_ms": 404.954829999042,
-+      "b_min_ms": 406.0086340014095,
-+      "ratio_b_over_a": 1.002602275425064,
-+      "ratio_low3": 1.0018530624295714,
-+      "samples_a": [
-+        407.1538420012075,
-+        410.25221800009604,
-+        415.46197699972254,
-+        408.38317000088864,
-+        408.50351300105103,
-+        404.954829999042,
-+        406.137943999056,
-+        405.385820000447,
-+        405.9060159997898,
-+        406.1700969996309,
-+        407.5724300000729
-+      ],
-+      "samples_b": [
-+        408.79062299973157,
-+        406.0086340014095,
-+        417.4213409987715,
-+        407.69931400063797,
-+        411.21508499963966,
-+        407.42220200081647,
-+        407.3448819999612,
-+        406.3158109984215,
-+        408.80420000030426,
-+        406.18127299967455,
-+        406.3105400000495
-+      ],
-+      "excluded": false
-+    }
-+  ],
-+  "failures": []
-+}
-\ No newline at end of file
-diff --git a/engineering/evidence/reuse-precision-2026-09-12/paired-sha256.md b/engineering/evidence/reuse-precision-2026-09-12/paired-sha256.md
-new file mode 100644
-index 000000000..fd3397f28
---- /dev/null
-+++ b/engineering/evidence/reuse-precision-2026-09-12/paired-sha256.md
-@@ -0,0 +1,8 @@
-+# Benchmark Screen: A: lccc_S15_base vs B: lccc_v4
-+- **Flags**: `-O2 -DPASSES=8 -DBLOCK_COUNT=131072`
-+- **Rounds**: `11`
-+- **Aggregate B/A Geomean**: `1.0026`
+     /// LEA: dst = base + index*scale + offset (3-address add).
+     /// x86 form: `leaq offset(%base, %index, scale), %dst`
+     Lea {
+diff --git a/src/backend/x86/codegen/machinst_alloc.rs b/src/backend/x86/codegen/machinst_alloc.rs
+index 719f9817..b35a1f58 100644
+--- a/src/backend/x86/codegen/machinst_alloc.rs
++++ b/src/backend/x86/codegen/machinst_alloc.rs
+@@ -351,6 +351,10 @@ impl<'a> Scan<'a> {
+                 self.touch(src, idx, RefKind::Read, false);
+                 self.touch(dst, idx, RefKind::PureWrite, false);
+             }
++            MachInst::Rorx { src, dst, .. } => {
++                self.touch(src, idx, RefKind::Read, false);
++                self.touch(dst, idx, RefKind::PureWrite, false);
++            }
+             MachInst::Lea {
+                 base, index, dst, ..
+             } => {
+@@ -474,6 +478,10 @@ fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
+             reg_of(src, &mut v);
+             reg_of(dst, &mut v);
+         }
++        MachInst::Rorx { src, dst, .. } => {
++            reg_of(src, &mut v);
++            reg_of(dst, &mut v);
++        }
+         MachInst::Lea {
+             base, index, dst, ..
+         } => {
+@@ -865,6 +873,10 @@ fn rewrite_inst(inst: &mut MachInst, assignments: &FxHashMap<u32, u8>) {
+             *src = r(src);
+             *dst = r(dst);
+         }
++        MachInst::Rorx { src, dst, .. } => {
++            *src = r(src);
++            *dst = r(dst);
++        }
+         MachInst::Lea {
+             base, index, dst, ..
+         } => {
+diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
+index 25639168..911aaa86 100644
+--- a/src/backend/x86/codegen/machinst_emit.rs
++++ b/src/backend/x86/codegen/machinst_emit.rs
+@@ -809,6 +809,26 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+             ));
+         }
+ 
++        MachInst::Rorx {
++            amount,
++            src,
++            dst,
++            size,
++        } => {
++            let mnem = match size {
++                OpSize::S32 => "rorxl",
++                OpSize::S64 => "rorxq",
++                _ => unreachable!("rorx only for S32/S64"),
++            };
++            out.emit_fmt(format_args!(
++                "    {} ${}, {}, {}",
++                mnem,
++                amount,
++                fmt_reg(src, *size),
++                fmt_reg(dst, *size)
++            ));
++        }
 +
-+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
-+| :--- | :---: | :---: | :---: | :---: | :--- |
-+| `sha256_transform` | 404.95 | 406.01 | 1.003 | 1.002 |  |
-diff --git a/engineering/tasks/TASK-RA-06A-RELOAD-AT-USE.md b/engineering/tasks/TASK-RA-06A-RELOAD-AT-USE.md
-index 18d10e500..c3c35ee1d 100644
---- a/engineering/tasks/TASK-RA-06A-RELOAD-AT-USE.md
-+++ b/engineering/tasks/TASK-RA-06A-RELOAD-AT-USE.md
-@@ -169,3 +169,44 @@ amplified benchmark, not by instruction count alone (see "Do not" below).
- - **Do not relax `has_indirect_mem → invalidate_all_mappings` for read-only indirect
-   operands** (`addl (%rcx), %eax`) to unlock the above: it widens the risk surface of
-   every slot-tracking pass for a measured payoff of nil.
-+
-+## 2026-09-12 — reload-reuse precision landed; next increment is displacement propagation
-+
-+Two precisions were added to `reuse_redundant_loads` (same-destination reload deletion, and
-+frame-slot range disjointness), worth 100 instructions and 143 frame-slot loads across the
-+corpus and runtime-neutral. Full record: `engineering/evidence/reuse-precision-2026-09-12/`.
-+
-+### The metric warning in this task just reproduced itself
-+
-+With that precision on, the *smallest* `sha256_transform` (192 insns, 47 slot refs) is the
-+arm with the web-wide supply **OFF** — and it is **6.06 % slower** at runtime than the
-+194-instruction arm with the supply ON (15 amplified interleaved reps, low3 1.062). This is
-+the third independent confirmation of "do not judge the fix by instruction count".
-+`check_ra_web_inloop_use.sh` encoded the instruction-count proxy and correctly failed; it
-+was fixed by holding the new confounder constant on both arms, not by relaxing a threshold.
-+
-+### Next increment, with the mechanism already identified
-+
-+What is left of the gap is the write-back epilogue, which per state word emits
-+
-+```asm
-+    movq 360(%rsp), %rax      ; reload the spilled base
-+    leaq 4(%rax), %rax        ; DESTRUCTIVE: overwrites the base with base+4
-+    movq %rax, %r8            ; relay copy of the address
-+    movl (%r8), %eax
-+    addl 24(%rsp), %eax
-+    movl %eax, (%r8)
-+```
-+
-+where clang emits `movl 4(%rbase), %eax` / `movl %eax, 4(%rbase)` with the base held in a
-+callee-saved register across the whole block.
-+
-+`fold_lea_into_load` bails on this shape at `addr_fams.contains(&dst_fam)` — correctly,
-+because splicing the LEA's own address text into a later use would compute `base + 2D`.
-+The valid dual is **displacement propagation**: delete `leaq D(%B), %B` and add `D` to each
-+of `%B`'s uses in the window (register-operand uses become `leaq D(%B), %X`), which both
-+removes an instruction per group and *preserves the base*, after which the reload-reuse
-+precision above can collapse the remaining reloads. The existing liveness contract
-+(`dead_in_block_after`, `family_private_to`, `provably_dead_lv`) is what must gate it.
-+
-+Oracle target, whole-function `-O2`: frame-slot refs **52 → 20**, insns **194 → 126**.
-diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
-index 27ebc077c..6daeb3040 100644
---- a/src/backend/live_range.rs
-+++ b/src/backend/live_range.rs
-@@ -792,6 +792,32 @@ pub(crate) fn mark_loop_spanning(
+         MachInst::Lea {
+             base,
+             index,
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index ea5f3489..57a2d81a 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -1707,6 +1707,47 @@ impl Driver {
              }
          }
-     }
-+    // Per-WEB resolution of the boolean, keyed by coalesce owner.
-+    //
-+    // The supply above answers "does this web have a read inside an extent?".
-+    // Asking it only through `members_of.get(range.value_id)` makes the answer
-+    // depend on WHICH member of the web happens to own the range being marked:
-+    // an owner's range heard about its members, but a member that owns a range
-+    // of its own heard about nobody, so two ranges of one web could disagree
-+    // about a property that is physically shared -- coalesced members occupy one
-+    // register, so a hot reload either happens for the whole web or not at all.
-+    // Resolve the flag once per web and let every range in it read the same
-+    // answer. Ranges that belong to no web are simply absent from this map and
-+    // keep falling back to their own count, so nothing widens for them.
-+    // "Does value `v` get read inside any measured extent?" A member that owns a
-+    // range is answered by `uses_in_extents`; a merged member by
-+    // `member_in_extent`. Shared by the web precompute and the per-range lookup
-+    // below so the two can never drift.
-+    let has_extent_use = |v: u32| -> bool {
-+        member_in_extent.contains(&v) || uses_in_extents.get(&v).copied().unwrap_or(0) > 0
-+    };
-+    let mut web_in_loop_use_of: FxHashMap<u32, bool> = FxHashMap::default();
-+    if web_inloop_use {
-+        for (&owner, members) in members_of.iter() {
-+            let flag = has_extent_use(owner) || members.iter().any(|&m| has_extent_use(m));
-+            web_in_loop_use_of.insert(owner, flag);
-+        }
-+    }
-     for range in ranges.iter_mut() {
-         let mut spans = false;
-         let mut reserve = 0u32;
-@@ -847,16 +873,31 @@ pub(crate) fn mark_loop_spanning(
-             .get(&range.value_id)
-             .copied()
-             .unwrap_or(0);
--        // (a), web-wide: this range's own reads, or any member's. A member that
--        // owns a range is already accounted for in `uses_in_extents`; a merged
--        // member is in `member_in_extent`.
--        let mut web_in_loop_use = in_loop_uses > 0;
-+        // (a), web-wide: this range's own reads, or any web-mate's. A member
-+        // that owns a range is accounted for in `uses_in_extents`; a merged
-+        // member is in `member_in_extent`; and the union over the whole web was
-+        // precomputed above so a member's range gets the same answer its owner
-+        // would (F3 -- the lookup used to be owner-only).
-+        //
-+        // Monotone by construction, not by measurement: the answer is the OR of
-+        // this range's own reads, the web it belongs to (via its coalesce
-+        // owner), and -- retained deliberately -- the members it owns itself.
-+        // The third term is redundant whenever `coalesce_member_of` is flattened
-+        // to roots, which it is today; keeping it means a value that is BOTH an
-+        // owner and a member can never see its sub-web dropped, so the fix can
-+        // only ever widen the flag and can never narrow it. Verified
-+        // output-neutral across all 805 corpus TUs.
-+        let mut web_in_loop_use = in_loop_uses > 0 || has_extent_use(range.value_id);
-+        if !web_in_loop_use {
-+            let owner = coalesce_member_of
-+                .get(&range.value_id)
-+                .copied()
-+                .unwrap_or(range.value_id);
-+            web_in_loop_use = web_in_loop_use_of.get(&owner).copied().unwrap_or(false);
-+        }
-         if !web_in_loop_use {
-             if let Some(members) = members_of.get(&range.value_id) {
--                web_in_loop_use = members.iter().any(|&m| {
--                    member_in_extent.contains(&m)
--                        || uses_in_extents.get(&m).copied().unwrap_or(0) > 0
--                });
-+                web_in_loop_use = members.iter().any(|&m| has_extent_use(m));
-             }
-         }
-         if !in_loop_use {
-diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-index 77e3cef2b..b6dbe0fe7 100644
---- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-+++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-@@ -164,6 +164,51 @@ fn load_operand(t: &str) -> Option<(&'static str, &str, &str, Vec<RegId>)> {
  
- /// Replace a repeated load of the same address with a register copy.
- pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    // Bisect switches for the two precisions added here, read once per
-+    // invocation. Both default ON; each can be disabled independently so a
-+    // miscompile can be attributed to exactly one of them.
-+    let policy = ReusePolicy {
-+        same_dst_reload: std::env::var("CCC_NO_SAME_DST_RELOAD").is_err(),
-+        frame_slot_aliasing: std::env::var("CCC_NO_FRAME_SLOT_ALIASING").is_err(),
-+    };
-+    reuse_redundant_loads_with(store, infos, policy)
-+}
-+
-+/// The two precisions this pass can apply, as explicit policy so both arms are
-+/// unit-testable without mutating the process environment (env mutation in
-+/// tests is racy: every test in the binary shares one environment).
-+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-+pub(super) struct ReusePolicy {
-+    /// Delete a reload of the same operand into the same destination.
-+    pub(super) same_dst_reload: bool,
-+    /// Let a store to a different, non-overlapping frame slot survive the scan.
-+    pub(super) frame_slot_aliasing: bool,
-+}
-+
-+impl ReusePolicy {
-+    /// Both precisions on: the shipping configuration.
-+    pub(super) const fn full() -> Self {
-+        Self {
-+            same_dst_reload: true,
-+            frame_slot_aliasing: true,
-+        }
-+    }
-+    /// Both off: the historical behaviour, kept testable as a baseline.
-+    pub(super) const fn legacy() -> Self {
-+        Self {
-+            same_dst_reload: false,
-+            frame_slot_aliasing: false,
-+        }
-+    }
-+}
-+
-+fn reuse_redundant_loads_with(
-+    store: &mut LineStore,
-+    infos: &mut [LineInfo],
-+    policy: ReusePolicy,
-+) -> bool {
-+    let redundant_same_dst_reload = policy.same_dst_reload;
-+    let frame_slot_aliasing = policy.frame_slot_aliasing;
-     let len = store.len();
-     let mut changed = false;
-     let mut i = 0;
-@@ -208,6 +253,15 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
-         let dst_mask = 1u16 << dst_fam;
-         let mem_owned = mem.to_string();
-         let dst_owned = dst.to_string();
-+        // Frame-slot precision for the aliasing test below (see
-+        // `store_cannot_alias_slot`). `None` for anything that is not a plain
-+        // `D(%rsp)` / `D(%rbp)` operand, which restores the historical
-+        // "every store invalidates" behaviour verbatim.
-+        let cached_slot = if frame_slot_aliasing {
-+            parse_frame_slot(&mem_owned, mnemonic_mem_width(op))
-+        } else {
-+            None
-+        };
- 
-         let mut j = i + 1;
-         while j < len {
-@@ -239,8 +293,11 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
-                 break;
-             }
-             // Any write to memory invalidates the cached value: without alias
--            // analysis every store is assumed to hit this address.
--            if line_writes_memory(t) {
-+            // analysis every store is assumed to hit this address. The one
-+            // exception is a store to a DIFFERENT, non-overlapping frame slot,
-+            // which is not an aliasing claim but a fact about the static frame
-+            // layout (see `store_cannot_alias_slot`).
-+            if line_writes_memory(t) && !store_cannot_alias_slot(cached_slot, t) {
-                 break;
-             }
-             // A write to an address register invalidates the operand. The
-@@ -252,6 +309,24 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
-             {
-                 break;
-             }
-+            // A reload of the SAME operand into the SAME destination is wholly
-+            // redundant: the address registers are unchanged, no aliasing store
-+            // intervened, and it writes the destination the value it already
-+            // holds. Delete it rather than rewriting it. This must be tested
-+            // BEFORE the destination-write break below, because that break is
-+            // exactly what otherwise ends the scan on this line -- which is why
-+            // same-register reloads survived here while different-register ones
-+            // were already being folded into copies.
-+            if redundant_same_dst_reload {
-+                if let Some((op2, mem2, dst2, _)) = load_operand(t) {
-+                    if op2 == op && mem2 == mem_owned && dst2 == dst_owned {
-+                        mark_nop(&mut infos[j]);
-+                        changed = true;
-+                        j += 1;
-+                        continue;
++        // Global Location Allocation (P0-A): cross-block call splitting with
++        // dominance + SSA repair, grouped deterministically. Default-on for -O2+.
++        if std::env::var("CCC_NO_GLOBAL_LOCATION").is_err()
++            && std::env::var("CCC_RA_GLOBAL_LOCATION").is_err()
++        {
++            if self.opt_level >= 2 {
++                let gmax = std::env::var("CCC_GLOBAL_SPLIT_MAX")
++                    .ok()
++                    .and_then(|s| s.parse().ok())
++                    .unwrap_or(4);
++                let mut gtotal = 0;
++                for func in &mut module.functions {
++                    if !func.is_declaration && func.blocks.len() >= 2 {
++                        let n = crate::backend::global_alloc::run_global_location_pass(func);
++                        gtotal += n;
++                        if gtotal >= gmax {
++                            break;
++                        }
 +                    }
 +                }
 +            }
-             // The first load's destination must still hold the value.
-             if infos[j].reg_refs & dst_mask != 0 && writes_family(&infos[j], t, dst_fam) {
-                 break;
-@@ -324,6 +399,153 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
-     changed
++        } else if let Ok(v) = std::env::var("CCC_RA_GLOBAL_LOCATION") {
++            let v = v.to_ascii_lowercase();
++            if v == "1" || v == "true" || v == "yes" || v == "on" {
++                let gmax = std::env::var("CCC_GLOBAL_SPLIT_MAX")
++                    .ok()
++                    .and_then(|s| s.parse().ok())
++                    .unwrap_or(4);
++                let mut gtotal = 0;
++                for func in &mut module.functions {
++                    if !func.is_declaration && func.blocks.len() >= 2 {
++                        let n = crate::backend::global_alloc::run_global_location_pass(func);
++                        gtotal += n;
++                        if gtotal >= gmax {
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++
+         // Live range splitting: split call-spanning values, then clean up
+         if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
+             let max_splits = std::env::var("CCC_SPLIT_MAX")
+diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
+index 3ec94a4f..9afb6811 100644
+--- a/src/passes/bit_idioms.rs
++++ b/src/passes/bit_idioms.rs
+@@ -316,6 +316,9 @@ fn narrow_width_bits(ty: IrType) -> Option<u64> {
+ fn high_bits_zero(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
+     let v = peel_copies(opnd, defs);
+     if let Some(c) = const_u64(v) {
++        if width >= 64 {
++            return true;
++        }
+         return c < (1u64 << width);
+     }
+     let Operand::Value(id) = v else {
+diff --git a/src/passes/loop_idiom.rs b/src/passes/loop_idiom.rs
+index 3a715063..9e73fc16 100644
+--- a/src/passes/loop_idiom.rs
++++ b/src/passes/loop_idiom.rs
+@@ -148,9 +148,15 @@ fn is_int_type(ty: IrType) -> bool {
+     )
  }
  
-+/// A plain frame-relative operand `D(%rsp)` / `D(%rbp)` and the byte range it
-+/// accesses. Indexed forms (`D(%rsp,%rax,4)`) and rip-relative forms are
-+/// rejected: their effective address is not a fixed range, so nothing can be
-+/// proven disjoint from them.
-+#[derive(Clone, Copy)]
-+struct FrameSlot {
-+    /// Register family of the base (`%rsp` = 4, `%rbp` = 5).
-+    base: RegId,
-+    disp: i64,
-+    width: i64,
++fn is_byte_type(ty: IrType) -> bool {
++    matches!(ty, IrType::I8 | IrType::U8)
 +}
 +
-+fn parse_frame_slot(mem: &str, width: i64) -> Option<FrameSlot> {
-+    let open = mem.find('(')?;
-+    if !mem.ends_with(')') {
-+        return None;
-+    }
-+    let inside = &mem[open + 1..mem.len() - 1];
-+    // Reject SIB (base,index[,scale]) and anything that is not exactly the
-+    // stack pointer or the frame pointer.
-+    if inside.contains(',') {
-+        return None;
-+    }
-+    // Reject a segment override (`%fs:360(%rsp)`) EXPLICITLY. It happens to be
-+    // rejected anyway, because the displacement text then parses as "%fs:360"
-+    // and `parse::<i64>` fails - but soundness should not rest on a parse
-+    // failure in a different field. A segmented stack access is a different
-+    // address space as far as this proof is concerned.
-+    if mem.contains(':') {
-+        return None;
-+    }
-+    let base = match inside {
-+        "%rsp" => 4,
-+        "%rbp" => 5,
-+        _ => return None,
-+    };
-+    let disp_txt = mem[..open].trim();
-+    let disp = if disp_txt.is_empty() {
-+        0
-+    } else {
-+        disp_txt.parse::<i64>().ok()?
-+    };
-+    Some(FrameSlot { base, disp, width })
-+}
-+
-+/// Bytes an instruction touches in memory.
-+///
-+/// Two independent estimates, combined with `max` so the answer is never an
-+/// underestimate — an underestimate here is a miscompile, because it can make
-+/// two overlapping accesses look disjoint:
-+///
-+/// 1. The FIRST width suffix letter of the mnemonic, which in AT&T names the
-+///    memory operand's width for both plain (`movl`, `addq`, `incl`) and
-+///    extending (`movzbl`, `movslq`) forms. Unrecognized mnemonics (string ops,
-+///    x87 `fstpt`, no suffix) get 16, the widest scalar access.
-+/// 2. The width of any vector register mentioned on the line. This is the half
-+///    the suffix cannot supply: `vmovdqu %ymm0, 24(%rsp)` has a `d` in the
-+///    suffix position, so rule 1 charges it 16 bytes while it really writes 32.
-+///    Charging only 16 would report a cached load at slot 48 as disjoint from
-+///    it. `%zmm` (AVX-512) writes 64.
-+///
-+/// The register scan is deliberately textual and over-broad: a `%xmm` appearing
-+/// anywhere on the line forces at least 16 bytes even if it is only a source.
-+/// Over-estimating merely loses an optimization.
-+fn mnemonic_mem_width(t: &str) -> i64 {
-+    let start = if t.starts_with("lock ") { 5 } else { 0 };
-+    let suffix = match t.as_bytes().get(start + 3) {
-+        Some(b'b') => 1,
-+        Some(b'w') => 2,
-+        Some(b'l') => 4,
-+        Some(b'q') => 8,
-+        _ => 16,
-+    };
-+    let vector = if t.contains("%zmm") {
-+        64
-+    } else if t.contains("%ymm") {
-+        32
-+    } else if t.contains("%xmm") {
-+        16
-+    } else {
-+        0
-+    };
-+    suffix.max(vector)
-+}
-+
-+/// The memory operand a store writes to, or `None`. Mirrors
-+/// [`line_writes_memory`]'s destination-finding rules (which must use
-+/// [`last_top_level_comma`], not `rfind`, because an AT&T memory operand
-+/// carries its own commas) but returns the operand instead of a bool.
-+fn store_destination(t: &str) -> Option<&str> {
-+    if t.starts_with("lea") {
-+        return None;
-+    }
-+    if let Some(comma) = last_top_level_comma(t.as_bytes()) {
-+        let dst = t[comma + 1..].trim();
-+        return if dst.contains('(') { Some(dst) } else { None };
-+    }
-+    // Single-operand read-modify-write form: `incl 24(%rsp)`, `negq (%rax)`.
-+    let sp = t.find(' ')?;
-+    let only = t[sp + 1..].trim();
-+    if !t.starts_with('j') && only.contains('(') {
-+        Some(only)
-+    } else {
-+        None
-+    }
-+}
-+
-+/// True when a store on this line provably cannot touch the byte range of
-+/// `cached`, so it must not invalidate a load cached from that frame slot.
-+///
-+/// This is the precision [`reuse_redundant_loads`] lacked: it broke the scan on
-+/// *every* memory write, on the (sound but blunt) principle that without alias
-+/// analysis any store may hit the cached address. For a FRAME-SLOT operand that
-+/// principle gives away too much, because the frame layout is static and known:
-+/// two distinct, non-overlapping `D(%rsp)` ranges are different bytes, full
-+/// stop. Spill-heavy code interleaves slot accesses constantly, so this is what
-+/// lets a cached reload survive the neighbouring spills around it.
-+///
-+/// Everything not provably disjoint stays conservative:
-+///
-+/// * a store through a register (`movl %eax, (%r8)`) has no parseable frame
-+///   destination and returns false — no points-to claim is attempted;
-+/// * a store to a different base (`(%rbp)` vs the cached `(%rsp)`) returns
-+///   false, since the two bases are not provably a fixed distance apart here;
-+/// * an indexed or rip-relative destination returns false;
-+/// * an unrecognized mnemonic is charged 16 bytes, so it overlaps almost
-+///   everything.
-+///
-+/// The base register itself cannot move inside the scan: `%rsp`/`%rbp` are
-+/// members of the cached load's `addr_fams`, and a write to any address family
-+/// already ends the scan above. So the displacements compared here are stable.
-+fn store_cannot_alias_slot(cached: Option<FrameSlot>, t: &str) -> bool {
-+    let Some(slot) = cached else {
-+        return false;
-+    };
-+    let Some(dst) = store_destination(t) else {
-+        return false;
-+    };
-+    let Some(other) = parse_frame_slot(dst, mnemonic_mem_width(t)) else {
-+        return false;
-+    };
-+    if other.base != slot.base {
-+        return false;
-+    }
-+    other.disp + other.width <= slot.disp || slot.disp + slot.width <= other.disp
-+}
-+
- /// Conservative "this instruction writes memory" test: any instruction whose
- /// LAST operand is a memory reference, plus the string/atomic families.
+ /// Object identity for overlap reasoning: `Global(name)` for globals,
+-/// `Alloca(id)` for static stack slots, `Other` for everything else
+-/// (params, dynamic allocas, computed pointers, unknowns).
++/// `Alloca(id)` for static stack slots, `Param(idx)` for function
++/// parameters (distinct params are assumed non-overlapping for the
++/// memcpy idiom; if they may alias we use memmove), `Other` for everything
++/// else (dynamic allocas, computed pointers, unknowns).
  ///
-@@ -639,6 +861,191 @@ mod tests {
-         peephole_optimize(asm.to_string())
+ /// The walk sees through `Phi` (preheader-edge init only — the latch edge
+ /// marches within the same object), `Copy`, integer `Cast`, `GEP` (base),
+@@ -162,6 +168,7 @@ fn is_int_type(ty: IrType) -> bool {
+ enum ObjectRoot {
+     Global(String),
+     Alloca(u32),
++    Param(u32),
+     Other,
+ }
+ 
+@@ -190,6 +197,7 @@ fn object_root_inner(
+     match inst {
+         Instruction::GlobalAddr { name, .. } => ObjectRoot::Global(name.clone()),
+         Instruction::Alloca { dest, .. } => ObjectRoot::Alloca(dest.0),
++        Instruction::ParamRef { param_idx, .. } => ObjectRoot::Param(*param_idx as u32),
+         Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
+             Operand::Value(inner) => {
+                 object_root_inner(defs, label_to_idx, preheader_label, *inner, depth + 1)
+@@ -249,7 +257,26 @@ fn object_root_inner(
+ }
+ 
+ fn is_unique_root(root: &ObjectRoot) -> bool {
+-    matches!(root, ObjectRoot::Global(_) | ObjectRoot::Alloca(_))
++    matches!(
++        root,
++        ObjectRoot::Global(_) | ObjectRoot::Alloca(_) | ObjectRoot::Param(_)
++    )
++}
++
++/// Returns true if two roots are provably distinct objects (no overlap).
++fn roots_distinct(a: &ObjectRoot, b: &ObjectRoot) -> bool {
++    match (a, b) {
++        (ObjectRoot::Global(ga), ObjectRoot::Global(gb)) => ga != gb,
++        (ObjectRoot::Alloca(aa), ObjectRoot::Alloca(ab)) => aa != ab,
++        (ObjectRoot::Param(pa), ObjectRoot::Param(pb)) => pa != pb,
++        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
++        | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
++        | (ObjectRoot::Global(_), ObjectRoot::Param(_))
++        | (ObjectRoot::Param(_), ObjectRoot::Global(_))
++        | (ObjectRoot::Alloca(_), ObjectRoot::Param(_))
++        | (ObjectRoot::Param(_), ObjectRoot::Alloca(_)) => true,
++        _ => false,
++    }
+ }
+ 
+ /// A matched byte-copy loop with everything the rewrite needs.
+@@ -278,6 +305,8 @@ struct CopyLoop {
+     load_is_bump: bool,
+     load_base: Value,
+     load_init: Value,
++    /// Use memmove instead of memcpy (param roots may alias).
++    use_memmove: bool,
+ }
+ 
+ fn debug_enabled() -> bool {
+@@ -312,11 +341,10 @@ pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
+     if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
+         return 0;
+     }
+-    // Bring-up is opt-in (see module docs); flip to default-on after the
+-    // regression suite + corpus A/B + fuzz validate the guards.
+-    if !env_flag_truthy("CCC_LOOP_IDIOM") {
+-        return 0;
+-    }
++    // Default-on after P0 validation: single-block Ptr-IV (header==latch)
++    // and 2-3 block forms are proven safe; opt-out via CCC_NO_LOOP_IDIOM.
++    // The old CCC_LOOP_IDIOM=1 opt-in knob is retained as a no-op for
++    // compatibility but no longer gates the pass.
+     if func.blocks.len() < 3 {
+         return 0;
+     }
+@@ -382,9 +410,11 @@ fn try_match_copy_loop(
+     cfg: &CfgAnalysis,
+ ) -> Option<CopyLoop> {
+     let name = func.name.as_str();
+-    // Shape: 2–3 blocks (header + body/latch). Single-block self-loops and
+-    // larger bodies bail (v1 tightness).
+-    if lp.body.len() < 2 || lp.body.len() > 3 {
++    // Shape: 1–3 blocks (header + body/latch). Single-block self-loops
++    // (header==latch) are now supported — they appear when the frontend
++    // does not split the latch, e.g. `for (p=d,s=s; i<n; ++i) *p++=*s++;`.
++    // Larger bodies bail (v1 tightness).
++    if lp.body.is_empty() || lp.body.len() > 3 {
+         dlog!(
+             "{name} loop@{}: bail (body size {})",
+             lp.header,
+@@ -532,91 +562,78 @@ fn try_match_copy_loop(
      }
  
-+    /// Run ONLY `reuse_redundant_loads` and return the surviving lines, so an
-+    /// assertion is about this pass rather than about whatever the rest of the
-+    /// pipeline would do to the same input.
-+    fn run_reuse(asm: &str, policy: ReusePolicy) -> String {
-+        let mut store = LineStore::new(asm.to_string());
-+        let mut infos: Vec<LineInfo> = (0..store.len())
-+            .map(|i| classify_line(store.get(i)))
-+            .collect();
-+        reuse_redundant_loads_with(&mut store, &mut infos, policy);
-+        (0..store.len())
-+            .filter(|&i| !infos[i].is_nop())
-+            .map(|i| store.get(i).trim().to_string())
-+            .collect::<Vec<_>>()
-+            .join("\n")
-+    }
+     // Body scan: exactly one U8 load + one U8 store, plumbing otherwise.
+-    // (Non-header phis, calls, extra memory ops, anything else: bail.)
++    // For multi-block loops the copy lives in non-header blocks; for
++    // single-block self-loops (header==latch) the copy lives in the header
++    // itself (Ptr-IV form: `*dst++ = *src++`). We support both.
++    let is_self_loop = lp.body.len() == 1 || latch == header;
+     let mut load_inst: Option<(usize, Value, Value)> = None; // (block, dest, ptr)
+     let mut store_inst: Option<(usize, Operand, Value)> = None; // (block, val, ptr)
+-    for &b in lp.body.iter() {
+-        if b == header {
+-            continue;
+-        }
+-        for inst in &func.blocks[b].instructions {
+-            match inst {
+-                Instruction::Copy { .. }
+-                | Instruction::Cast { .. }
+-                | Instruction::GetElementPtr { .. } => {}
+-                Instruction::BinOp { .. } => {}
+-                // Pure rematerializable leaves (LICM may not have hoisted
+-                // them yet): operand-free, same value everywhere. The M2
+-                // rewrite clones them into the preheader when sinking uses.
+-                Instruction::GlobalAddr { .. }
+-                | Instruction::ParamRef { .. }
+-                | Instruction::LabelAddr { .. } => {}
+-                Instruction::Load {
+-                    dest,
+-                    ptr,
+-                    ty,
+-                    seg_override,
+-                    volatile,
+-                } => {
+-                    if *ty != IrType::U8
+-                        || *seg_override != crate::common::types::AddressSpace::Default
+-                        || *volatile
+-                    {
+-                        dlog!("{name} loop@{header}: bail (non-U8/volatile load)");
+-                        return None;
 +
-+    fn frame(body: &str) -> String {
-+        format!("f:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n")
-+    }
-+
-+    fn slot_refs(out: &str, slot: &str) -> usize {
-+        out.lines().filter(|l| l.contains(slot)).count()
-+    }
-+
-+    /// A reload of the same operand into the SAME register is pure waste: it
-+    /// writes the destination the value it already holds. This is the shape the
-+    /// pass used to miss, because the destination-write break below fired on
-+    /// exactly that line before the match was ever attempted.
-+    #[test]
-+    fn same_destination_reload_is_deleted() {
-+        let out = run_reuse(
-+            &frame("    movq 360(%rsp), %rax\n    movl %edx, %esi\n    movq 360(%rsp), %rax\n"),
-+            ReusePolicy::full(),
-+        );
-+        assert_eq!(
-+            slot_refs(&out, "360(%rsp)"),
-+            1,
-+            "second same-dst reload must go:\n{out}"
-+        );
-+    }
-+
-+    /// Same input under the legacy policy: the reload must survive, which is
-+    /// what proves the deletion above is the new precision and not something
-+    /// the pass already did.
-+    #[test]
-+    fn same_destination_reload_survives_under_legacy_policy() {
-+        let out = run_reuse(
-+            &frame("    movq 360(%rsp), %rax\n    movl %edx, %esi\n    movq 360(%rsp), %rax\n"),
-+            ReusePolicy::legacy(),
-+        );
-+        assert_eq!(
-+            slot_refs(&out, "360(%rsp)"),
-+            2,
-+            "legacy arm must keep both:\n{out}"
-+        );
-+    }
-+
-+    /// The headline precision: a spill to a DIFFERENT frame slot is not an
-+    /// aliasing hazard for a cached reload. Slot ranges in a static frame are
-+    /// a fact, not a points-to guess.
-+    #[test]
-+    fn store_to_a_different_frame_slot_does_not_break_reuse() {
-+        let body = "    movq 360(%rsp), %rax\n    movl %edx, 24(%rsp)\n    movq 360(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::full());
-+        assert!(
-+            out.contains("movq %rax, %rcx"),
-+            "must forward from the register:\n{out}"
-+        );
-+        assert_eq!(
-+            slot_refs(&out, "360(%rsp)"),
-+            1,
-+            "only one slot read:\n{out}"
-+        );
-+    }
-+
-+    /// The same input under the legacy policy breaks on the intervening store.
-+    #[test]
-+    fn store_to_a_different_frame_slot_breaks_reuse_under_legacy_policy() {
-+        let body = "    movq 360(%rsp), %rax\n    movl %edx, 24(%rsp)\n    movq 360(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::legacy());
-+        assert!(
-+            !out.contains("movq %rax, %rcx"),
-+            "legacy arm must not forward:\n{out}"
-+        );
-+        assert_eq!(
-+            slot_refs(&out, "360(%rsp)"),
-+            2,
-+            "legacy arm keeps both reads:\n{out}"
-+        );
-+    }
-+
-+    /// A dword store at 364 overlaps the cached qword at [360,368).
-+    #[test]
-+    fn overlapping_frame_slot_store_breaks_reuse() {
-+        let body = "    movq 360(%rsp), %rax\n    movl %edx, 364(%rsp)\n    movq 360(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::full());
-+        assert_eq!(
-+            slot_refs(&out, "360(%rsp)"),
-+            2,
-+            "overlapping store must break reuse:\n{out}"
-+        );
-+    }
-+
-+    /// A store through a register makes no claim at all: without points-to
-+    /// analysis it may write anywhere, including the cached slot.
-+    #[test]
-+    fn indirect_store_breaks_reuse() {
-+        let body = "    movq 360(%rsp), %rax\n    movl %edx, (%rbx)\n    movq 360(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::full());
-+        assert_eq!(
-+            slot_refs(&out, "360(%rsp)"),
-+            2,
-+            "indirect store must break reuse:\n{out}"
-+        );
-+    }
-+
-+    /// `%rsp` and `%rbp` are not provably a fixed distance apart in this scan,
-+    /// so a store to an `%rbp` slot must not be reasoned about.
-+    #[test]
-+    fn store_through_a_different_frame_base_breaks_reuse() {
-+        let body = "    movq 360(%rsp), %rax\n    movl %edx, 24(%rbp)\n    movq 360(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::full());
-+        assert_eq!(
-+            slot_refs(&out, "360(%rsp)"),
-+            2,
-+            "different frame base must break reuse:\n{out}"
-+        );
-+    }
-+
-+    /// Moving the stack pointer renames every displacement, so the offsets
-+    /// compared by the disjointness test would no longer name the same bytes.
-+    #[test]
-+    fn stack_pointer_movement_breaks_reuse() {
-+        let body = "    movq 360(%rsp), %rax\n    subq $8, %rsp\n    movq 360(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::full());
-+        assert_eq!(
-+            slot_refs(&out, "360(%rsp)"),
-+            2,
-+            "an %rsp write must break reuse:\n{out}"
-+        );
-+    }
-+
-+    /// `vmovdqu %ymm0, 24(%rsp)` writes 32 bytes, i.e. [24,56), which reaches
-+    /// the cached qword at 48. The mnemonic's suffix position holds a `v`-class
-+    /// letter, so the suffix rule alone charges 16 bytes and would report the
-+    /// two as disjoint. This test is what keeps the vector-register half of
-+    /// `mnemonic_mem_width` from being "simplified" away.
-+    #[test]
-+    fn wide_vector_store_reaches_a_distant_slot() {
-+        let body =
-+            "    movq 48(%rsp), %rax\n    vmovdqu %ymm0, 24(%rsp)\n    movq 48(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::full());
-+        assert_eq!(
-+            slot_refs(&out, "48(%rsp)"),
-+            2,
-+            "a 32-byte store must break reuse of slot 48:\n{out}"
-+        );
-+    }
-+
-+    /// AVX-512: `%zmm` reaches 64 bytes.
-+    #[test]
-+    fn zmm_store_reaches_even_further() {
-+        let body =
-+            "    movq 80(%rsp), %rax\n    vmovdqu64 %zmm0, 24(%rsp)\n    movq 80(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::full());
-+        assert_eq!(
-+            slot_refs(&out, "80(%rsp)"),
-+            2,
-+            "a 64-byte store must break reuse of slot 80:\n{out}"
-+        );
-+    }
-+
-+    /// A narrow store genuinely outside the cached range still permits reuse,
-+    /// so the vector rule is not simply "any vector register blocks everything".
-+    #[test]
-+    fn narrow_vector_store_clear_of_the_slot_permits_reuse() {
-+        let body =
-+            "    movq 360(%rsp), %rax\n    movdqu %xmm0, 24(%rsp)\n    movq 360(%rsp), %rcx\n";
-+        let out = run_reuse(&frame(body), ReusePolicy::full());
-+        assert!(
-+            out.contains("movq %rax, %rcx"),
-+            "a 16-byte store at 24 cannot touch slot 360:\n{out}"
-+        );
-+    }
-+
-     #[test]
-     fn load_and_self_test_become_a_memory_compare() {
-         let out = run(concat!(
-diff --git a/tests/regression/check_ra_web_inloop_use.sh b/tests/regression/check_ra_web_inloop_use.sh
-index b52aee432..30dedd5e1 100755
---- a/tests/regression/check_ra_web_inloop_use.sh
-+++ b/tests/regression/check_ra_web_inloop_use.sh
-@@ -136,8 +136,21 @@ fi
- # 2 + 3. The mechanism fires, and the kill switch is wired.
- # --------------------------------------------------------------------------
- echo "$SELF: structural contract on sha256_transform"
--"$CCC" -O2 -S "$sha" -o "$work/on.s"
--CCC_NO_WEB_INLOOP_USE=1 "$CCC" -O2 -S "$sha" -o "$work/off.s"
-+# These two arms hold an INDEPENDENT optimization constant. The contract below
-+# discriminates the supply by instruction count and stack traffic, and an
-+# unrelated pass can mask that proxy: `reuse_redundant_loads` now deletes a
-+# reload of a frame slot that survives a store to a *different*, non-overlapping
-+# slot, which strips stack traffic from BOTH arms. With it enabled the
-+# kill-switch arm came out SMALLER (192 insns / 47 slot refs) than the default
-+# arm (194 / 52) even though the supply was still worth +6.06% at runtime
-+# (15 amplified interleaved reps, low3 1.062 in agreement) -- the exact
-+# "fewer instructions and stack refs, yet slower" trap RA-06B warns about.
-+# So the structural arms disable that pass on both sides and measure the supply
-+# in isolation. The shipping configuration is still what the correctness-vs-gcc
-+# and lz4 blast-radius sections exercise.
-+ISO="CCC_NO_SAME_DST_RELOAD=1 CCC_NO_FRAME_SLOT_ALIASING=1"
-+env $ISO "$CCC" -O2 -S "$sha" -o "$work/on.s"
-+env $ISO CCC_NO_WEB_INLOOP_USE=1 "$CCC" -O2 -S "$sha" -o "$work/off.s"
- "$GCC" -O2 -S "$sha" -o "$work/gcc.s"
++    if !is_self_loop {
++        for &b in lp.body.iter() {
++            if b == header {
++                continue;
++            }
++            for inst in &func.blocks[b].instructions {
++                match inst {
++                    Instruction::Copy { .. }
++                    | Instruction::Cast { .. }
++                    | Instruction::GetElementPtr { .. } => {}
++                    Instruction::BinOp { .. } => {}
++                    Instruction::GlobalAddr { .. }
++                    | Instruction::ParamRef { .. }
++                    | Instruction::LabelAddr { .. } => {}
++                    Instruction::Load {
++                        dest,
++                        ptr,
++                        ty,
++                        seg_override,
++                        volatile,
++                    } => {
++                        if !is_byte_type(*ty)
++                            || *seg_override != crate::common::types::AddressSpace::Default
++                            || *volatile
++                        {
++                            dlog!("{name} loop@{header}: bail (non-U8/volatile load)");
++                            return None;
++                        }
++                        if load_inst.is_some() {
++                            dlog!("{name} loop@{header}: bail (second load)");
++                            return None;
++                        }
++                        load_inst = Some((b, *dest, *ptr));
+                     }
+-                    if load_inst.is_some() {
+-                        dlog!("{name} loop@{header}: bail (second load)");
+-                        return None;
++                    Instruction::Store {
++                        val,
++                        ptr,
++                        ty,
++                        seg_override,
++                        volatile,
++                    } => {
++                        if !is_byte_type(*ty)
++                            || *seg_override != crate::common::types::AddressSpace::Default
++                            || *volatile
++                        {
++                            dlog!("{name} loop@{header}: bail (non-U8/volatile store)");
++                            return None;
++                        }
++                        if store_inst.is_some() {
++                            dlog!("{name} loop@{header}: bail (second store)");
++                            return None;
++                        }
++                        store_inst = Some((b, val.clone(), *ptr));
+                     }
+-                    load_inst = Some((b, *dest, *ptr));
+-                }
+-                Instruction::Store {
+-                    val,
+-                    ptr,
+-                    ty,
+-                    seg_override,
+-                    volatile,
+-                } => {
+-                    if *ty != IrType::U8
+-                        || *seg_override != crate::common::types::AddressSpace::Default
+-                        || *volatile
+-                    {
+-                        dlog!("{name} loop@{header}: bail (non-U8/volatile store)");
++                    _ => {
++                        dlog!("{name} loop@{header}: bail (body inst {inst:?})");
+                         return None;
+                     }
+-                    if store_inst.is_some() {
+-                        dlog!("{name} loop@{header}: bail (second store)");
+-                        return None;
+-                    }
+-                    store_inst = Some((b, val.clone(), *ptr));
+-                }
+-                _ => {
+-                    dlog!("{name} loop@{header}: bail (body inst {inst:?})");
+-                    return None;
+                 }
+             }
+         }
+     }
+-    let Some((_, load_dest, load_ptr)) = load_inst else {
+-        dlog!("{name} loop@{header}: bail (missing load)");
+-        return None;
+-    };
+-    let Some((_, store_val, store_ptr)) = store_inst else {
+-        dlog!("{name} loop@{header}: bail (missing store)");
+-        return None;
+-    };
+-
+-    // Load/store dominance: load dominates store in its block OR store
+-    // dominates load in its block — either way same block, load first.
+-    // (Pointer-equal `*p++ = *p` reads pre-bump `*p` then writes it back;
+-    // that is a same-root copy and bails at the root check. Order still
+-    // matters for the bump analysis below: the load must read the
+-    // pre-bump value.)
  
- if cmp -s "$work/on.s" "$work/off.s"; then
-@@ -252,10 +265,13 @@ if [[ $rc != 0 ]]; then fail=1; else note "web-wide supply fires: smaller functi
- #    leaves the fix on. Assert both directions.
- # --------------------------------------------------------------------------
- echo "$SELF: kill switch is presence-based and consistent"
--CCC_NO_WEB_INLOOP_USE=0        "$CCC" -O2 -S "$sha" -o "$work/v0.s"
--CCC_NO_WEB_INLOOP_USE=         "$CCC" -O2 -S "$sha" -o "$work/vempty.s"
--CCC_NO_WEB_INLOOP_USE=true     "$CCC" -O2 -S "$sha" -o "$work/vtrue.s"
--CCC_NO_WEB_INLOOP_USE=enabled  "$CCC" -O2 -S "$sha" -o "$work/venabled.s"
-+# Compiled under the same isolation as on.s/off.s above, so that this section
-+# compares like with like: it is testing the SWITCH's presence semantics, not
-+# the independent reload-reuse precision.
-+env $ISO CCC_NO_WEB_INLOOP_USE=0        "$CCC" -O2 -S "$sha" -o "$work/v0.s"
-+env $ISO CCC_NO_WEB_INLOOP_USE=         "$CCC" -O2 -S "$sha" -o "$work/vempty.s"
-+env $ISO CCC_NO_WEB_INLOOP_USE=true     "$CCC" -O2 -S "$sha" -o "$work/vtrue.s"
-+env $ISO CCC_NO_WEB_INLOOP_USE=enabled  "$CCC" -O2 -S "$sha" -o "$work/venabled.s"
- for v in v0 vempty vtrue venabled; do
-     if ! cmp -s "$work/off.s" "$work/$v.s"; then
-         bad "presence semantics broken: CCC_NO_WEB_INLOOP_USE='$v' does not reproduce the kill-switch arm"
+-    // Header scan: phis + pure plumbing only (the IV test `Cmp`, bump
+-    // `Add`s, address `GEP`s, `Select`s, and rematerializable leaves all
+-    // routinely live here). Anything effectful bails.
++    // Header scan: phis + pure plumbing, plus bound loads. For self-loops
++    // we also accept the single U8 load/store that constitute the copy.
+     struct PhiInfo {
+         dest: Value,
+         ty: IrType,
+@@ -624,8 +641,6 @@ fn try_match_copy_loop(
+         latch: Operand,
+     }
+     let mut phis: Vec<PhiInfo> = Vec::new();
+-    // Header loads (bound candidates — validated after the roots are
+-    // known; see below).
+     let mut header_loads: Vec<Value> = Vec::new();
+     for inst in &func.blocks[header].instructions {
+         match inst {
+@@ -664,19 +679,50 @@ fn try_match_copy_loop(
+             | Instruction::LabelAddr { .. } => {}
+             Instruction::Load {
+                 dest,
++                ptr,
++                ty,
++                seg_override,
++                volatile,
++            } => {
++                if *volatile || *seg_override != crate::common::types::AddressSpace::Default {
++                    dlog!("{name} loop@{header}: bail (header load volatile/seg)");
++                    return None;
++                }
++                if is_self_loop && is_byte_type(*ty) {
++                    if load_inst.is_some() {
++                        dlog!("{name} loop@{header}: bail (second load self-loop)");
++                        return None;
++                    }
++                    load_inst = Some((header, *dest, *ptr));
++                } else {
++                    if !is_int_type(*ty) {
++                        dlog!("{name} loop@{header}: bail (header load form)");
++                        return None;
++                    }
++                    header_loads.push(*dest);
++                }
++            }
++            Instruction::Store {
++                val,
++                ptr,
+                 ty,
+                 seg_override,
+                 volatile,
+-                ..
+             } => {
+-                if *volatile
+-                    || *seg_override != crate::common::types::AddressSpace::Default
+-                    || !is_int_type(*ty)
++                if is_self_loop
++                    && is_byte_type(*ty)
++                    && *seg_override == crate::common::types::AddressSpace::Default
++                    && !*volatile
+                 {
+-                    dlog!("{name} loop@{header}: bail (header load form)");
++                    if store_inst.is_some() {
++                        dlog!("{name} loop@{header}: bail (second store self-loop)");
++                        return None;
++                    }
++                    store_inst = Some((header, val.clone(), *ptr));
++                } else {
++                    dlog!("{name} loop@{header}: bail (header inst {inst:?})");
+                     return None;
+                 }
+-                header_loads.push(*dest);
+             }
+             _ => {
+                 dlog!("{name} loop@{header}: bail (header inst {inst:?})");
+@@ -685,6 +731,15 @@ fn try_match_copy_loop(
+         }
+     }
+ 
++    let Some((_, load_dest, load_ptr)) = load_inst else {
++        dlog!("{name} loop@{header}: bail (missing load)");
++        return None;
++    };
++    let Some((_, store_val, store_ptr)) = store_inst else {
++        dlog!("{name} loop@{header}: bail (missing store)");
++        return None;
++    };
++
+     // Header test: exactly `Ult(iv, bound)` where iv is one of the phis.
+     let cond_def = defs.get(&cond_val.0)?;
+     let (iv_phi, bound, ult_ty) = match cond_def {
+@@ -1030,18 +1085,33 @@ fn try_match_copy_loop(
+         }
+     }
+ 
+-    // Overlap: roots must differ, both uniquely identified. Same-object
+-    // (or param-rooted, or unknown) copies bail — v1 has no range proof.
++    // Overlap: same-root copies bail. Distinct roots (including Param and
++    // Other) are allowed — Global/Alloca distinct uses memcpy, Param/Other
++    // uses memmove for safety (may alias). This unlocks LZ4 literal copies
++    // where anchor/op derive from params through outer phis. For Other
++    // roots we must compare the actual init SSA values, not just the enum
++    // (Other==Other would otherwise bail distinct pointers).
+     let store_root = object_root(&defs, &label_to_idx, preheader_label, store_init);
+     let load_root = object_root(&defs, &label_to_idx, preheader_label, load_init);
+-    if !is_unique_root(&store_root) || !is_unique_root(&load_root) {
+-        dlog!("{name} loop@{header}: bail (roots not unique: {store_root:?} vs {load_root:?})");
++    // Same SSA init → same object → bail.
++    if store_init == load_init {
++        dlog!("{name} loop@{header}: bail (same init {store_init:?})");
+         return None;
+     }
+-    if store_root == load_root {
++    if store_root == load_root && !matches!(store_root, ObjectRoot::Other) {
+         dlog!("{name} loop@{header}: bail (same root {store_root:?})");
+         return None;
+     }
++    // For Other vs Other with different inits, allow with memmove.
++    let use_memmove = !matches!(
++        (&store_root, &load_root),
++        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
++            | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
++            | (ObjectRoot::Global(_), ObjectRoot::Global(_))
++            | (ObjectRoot::Alloca(_), ObjectRoot::Alloca(_))
++            | (ObjectRoot::Param(_), ObjectRoot::Param(_))
++    ) || matches!(store_root, ObjectRoot::Param(_) | ObjectRoot::Other)
++        || matches!(load_root, ObjectRoot::Param(_) | ObjectRoot::Other);
+ 
+     // Bound loads: every header load must be THE bound — resolving
+     // through copies to the `Ult` rhs — read through a bare
+@@ -1201,6 +1271,7 @@ fn try_match_copy_loop(
+         load_is_bump,
+         load_base,
+         load_init,
++        use_memmove,
+     })
+ }
+ 
+@@ -1537,14 +1608,16 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
+         }
+     };
+ 
+-    // The `memcpy` call. Shape mirrors the frontend's
++    // The `memcpy`/`memmove` call. Shape mirrors the frontend's
+     // `emit_dynamic_memcpy` exactly (plain libc call, no declaration
+-    // needed — the default link resolves it).
++    // needed — the default link resolves it). Param-rooted copies use
++    // memmove for safety (distinct params may still alias in C).
++    let call_name = if m.use_memmove { "memmove" } else { "memcpy" };
+     let ret = alloc_value(&mut *func);
+     func.blocks[m.preheader]
+         .instructions
+         .push(Instruction::Call {
+-            func: "memcpy".to_string(),
++            func: call_name.to_string(),
+             info: crate::ir::reexports::CallInfo {
+                 dest: Some(ret),
+                 args: vec![Operand::Value(dst), Operand::Value(src), len],
+@@ -1701,6 +1774,10 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
+     // Retarget the preheader at the exit and drop the dead loop.
+     func.blocks[m.preheader].terminator = Terminator::Branch(exit_label);
+     let _ = crate::passes::cfg_simplify::eliminate_unreachable_blocks(func);
+-    dlog!("{fname} loop@{}: REWROTE to memcpy", m.header);
++    dlog!(
++        "{fname} loop@{}: REWROTE to {}",
++        m.header,
++        if m.use_memmove { "memmove" } else { "memcpy" }
++    );
+     true
+ }
+diff --git a/src/passes/loop_memset.rs b/src/passes/loop_memset.rs
+index 30918089..a4155e81 100644
+--- a/src/passes/loop_memset.rs
++++ b/src/passes/loop_memset.rs
+@@ -469,10 +469,17 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
+         if let (Some(kv), Some(iv0)) = (const_to_u64(k), const_to_u64(i)) {
+             let width_bits = (cmp_ty.size() as u64) * 8;
+             if width_bits > 0 && width_bits <= 64 {
+-                let modulus = 1u64 << width_bits;
+-                let n = match cmp_op {
+-                    IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
+-                    _ => kv.checked_sub(iv0).unwrap_or(0),
++                let n = if width_bits >= 64 {
++                    match cmp_op {
++                        IrCmpOp::Ne => kv.wrapping_sub(iv0),
++                        _ => kv.checked_sub(iv0).unwrap_or(0),
++                    }
++                } else {
++                    let modulus = 1u64 << width_bits;
++                    match cmp_op {
++                        IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
++                        _ => kv.checked_sub(iv0).unwrap_or(0),
++                    }
+                 };
+                 if n > 0 && n > u64::MAX / u64::from(store_width) {
+                     refuse!("static trip count {n} overflows the byte-range of the call");
+@@ -942,10 +949,17 @@ fn try_recognize_while(
+         if let (Some(kv), Some(iv0)) = (const_to_u64(k), const_to_u64(i)) {
+             let width_bits = (cmp_ty.size() as u64) * 8;
+             if width_bits > 0 && width_bits <= 64 {
+-                let modulus = 1u64 << width_bits;
+-                let n = match cmp_op {
+-                    IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
+-                    _ => kv.checked_sub(iv0).unwrap_or(0),
++                let n = if width_bits >= 64 {
++                    match cmp_op {
++                        IrCmpOp::Ne => kv.wrapping_sub(iv0),
++                        _ => kv.checked_sub(iv0).unwrap_or(0),
++                    }
++                } else {
++                    let modulus = 1u64 << width_bits;
++                    match cmp_op {
++                        IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
++                        _ => kv.checked_sub(iv0).unwrap_or(0),
++                    }
+                 };
+                 if n > 0 && n > u64::MAX / u64::from(store_width) {
+                     refuse!("static trip count {n} overflows the byte-range of the call");
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 894f87d8..5bb71f87 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -46,10 +46,10 @@ fn choose_unroll_factor(body_inst_count: usize) -> u32 {
+     match body_inst_count {
+         // Tiny bodies (e.g. a single FmaF64x4 after vectorize): aggressive
+         // unroll exposes independent accumulators without code-size blow-up.
++        // Retuned for hot crypto loops (SHA-256 ~40 insns): 4× up to 40, 2× to 80 like GCC.
+         0..=4 => 8,
+-        5..=8 => 4,
+-        9..=20 => 4,
+-        21..=60 => 2,
++        5..=40 => 4,
++        41..=80 => 2,
+         _ => 1, // too large — skip
+     }
+ }
+@@ -4237,10 +4237,11 @@ mod tests {
+ 
+     #[test]
+     fn test_no_unroll_large_body() {
+-        // Build a loop whose body has > 60 instructions → factor = 1 → no unroll.
++        // Build a loop whose body has > 80 instructions → factor = 1 → no unroll.
++        // Threshold retuned from 60 to 80 for SHA-256 4× unroll.
+         let mut func = make_counting_loop(100);
+-        // Pad body (B2) with NOPs (Copy %0 = %0) until > 60 instructions.
+-        for _ in 0..65 {
++        // Pad body (B2) with NOPs (Copy %0 = %0) until > 80 instructions.
++        for _ in 0..85 {
+             func.blocks[2].instructions.push(Instruction::Copy {
+                 dest: Value(0),
+                 src: Operand::Value(Value(0)),
+@@ -4249,7 +4250,7 @@ mod tests {
+         let n = unroll_loops(&mut func);
+         assert_eq!(
+             n, 0,
+-            "loop with > 60 body instructions should not be unrolled"
++            "loop with > 80 body instructions should not be unrolled"
+         );
+     }
+ 
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index aef2319e..aecbdc46 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1407,12 +1407,12 @@ pub(crate) fn run_passes(
+ 
+         // Phase 2b-pre: pre-unroll CONST-TRIP map vectorization. The complete
+         // unroller below runs BEFORE the Phase 2b-vec vectorizer and steals
+-        // every constant-trip elementwise loop (limit <= 16), leaving 16
++        // every constant-trip elementwise loop (limit <= 64), leaving 64
+         // scalar copies where ONE packed op per iteration is strictly better
+         // (4x lanes, 1/4 the memory ops). This focused entry takes exactly
+-        // the map-shaped const-trip 5..=16 loops FIRST (the map transform
++        // the map-shaped const-trip 5..=64 loops FIRST (the map transform
+         // itself declines trips <= the vector width); the unroller then
+-        // either unrolls the remaining vector iterations (trip <= 4 — the
++        // either unrolls the remaining vector iterations (trip <= 16 — the
+         // ideal no-branch shape) or leaves them rolled.
+         // Pass name for CCC_DISABLE_PASSES: "vectorize".
+         if iter == 0
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index a58b0dab..0544086d 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -21165,7 +21165,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
+                 continue;
+             };
+             if !matches!(&pattern.limit, Operand::Const(c)
+-                if c.to_i64().is_some_and(|t| (5..=16).contains(&t)))
++                if c.to_i64().is_some_and(|t| (5..=64).contains(&t)))
+             {
+                 continue;
+             }
