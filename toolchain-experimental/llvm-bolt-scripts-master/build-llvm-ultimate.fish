@@ -883,6 +883,12 @@ if test -d llvm-project
 end
 git clone --filter=blob:none --depth=1 https://github.com/llvm/llvm-project.git || die "Clone failed"
 cd llvm-project || die "cd llvm-project failed"
+# v2 patch contexts are certified only for this exact official LLVM revision.
+set -g LLVM_REBASE_COMMIT e476e76df9b17ace8d12f85616482718901d4854
+if test (git rev-parse HEAD) != "$LLVM_REBASE_COMMIT"
+    git fetch --depth=1 origin "$LLVM_REBASE_COMMIT"; or die "Could not fetch the v2 LLVM base"
+end
+git checkout --detach "$LLVM_REBASE_COMMIT"; or die "Could not select the v2 LLVM base"
 
 log "Using pristine upstream lld CMake configuration (complete lld; no ELF-only sed mutation)."
 
@@ -923,10 +929,14 @@ if not test -f "$STAMP"
         set -l pf (find_patch $p)
         if test -n "$pf"
             set -l dry_log "/tmp/patch-$p-dry.log"
-            if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$dry_log" 2>&1
+            if not patch --batch --forward --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$dry_log" 2>&1
                 log "--- DRY RUN OUTPUT FOR $p ---"
                 cat "$dry_log"
                 die "Patch $p failed --dry-run against current llvm-project main. Rebase it first."
+            end
+            if grep -Ei 'offset|fuzz|FAILED|reject|Reversed|malformed' "$dry_log"
+                cat "$dry_log"
+                die "Patch $p is not an exact-context match"
             end
             log "  + $p OK"
             rm -f "$dry_log"
@@ -938,10 +948,10 @@ if not test -f "$STAMP"
         set -l pf (find_patch $p)
         if test -n "$pf"
             set -l real_log "/tmp/patch-$p.log"
-            patch -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$real_log" 2>&1
+            patch --batch --forward -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$real_log" 2>&1
             set -l patch_status $status
             grep -E '^patching file |^Hunk |reject|FAILED|offset|fuzz' "$real_log" | sed 's/^/      /'
-            if test $patch_status -ne 0
+            if test $patch_status -ne 0; or grep -Eiq 'offset|fuzz|FAILED|reject|Reversed|malformed' "$real_log"
                 log "--- FULL PATCH LOG FOR $p ---"
                 cat "$real_log"
                 die "Failed to apply $p"
@@ -1329,7 +1339,7 @@ for f in $TRAIN_FILES
     if test -f "$f"
         set -l ext (path extension -- $f)
         if test "$ext" = ".cpp"; or test "$ext" = ".cc"; or test "$ext" = ".cxx"
-            "$INSTR_CLANGXX" $CXX_PGO_MATCH_FLAGS_LIST -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
+            "$INSTR_CLANGXX" $CXX_PGO_MATCH_FLAGS_LIST -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -I "$LLVM_SRC/libc" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
         else if test "$ext" = ".c"
             "$INSTR_CLANG" $C_PGO_MATCH_FLAGS_LIST -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
         end
@@ -1390,7 +1400,7 @@ for f in $TRAIN_FILES
     if test -f "$f"
         set -l ext (path extension -- $f)
         if test "$ext" = ".cpp"; or test "$ext" = ".cc"; or test "$ext" = ".cxx"
-            "$csd/bin/clang++" $CXX_PGO_MATCH_FLAGS_LIST -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
+            "$csd/bin/clang++" $CXX_PGO_MATCH_FLAGS_LIST -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -I "$LLVM_SRC/libc" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
         else if test "$ext" = ".c"
             "$csd/bin/clang" $C_PGO_MATCH_FLAGS_LIST -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
         end
@@ -1642,9 +1652,9 @@ function is_already_bolted --argument-names BinPath
 end
 
 function bolt_train_clang --argument-names Bin
-    "$Bin" $COMMON_FLAGS_LIST -fno-lto -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$LLVM_SRC/llvm/lib/Support/APFloat.cpp" -o /dev/null 2>/dev/null
-    "$Bin" $COMMON_FLAGS_LIST -fno-lto -I "$LLVM_SRC/llvm/include" -std=c++17 -c "$LLVM_SRC/llvm/lib/CodeGen/SelectionDAG/SelectionDAG.cpp" -o /dev/null 2>/dev/null
-    "$Bin" $COMMON_FLAGS_LIST -fno-lto -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$LLVM_SRC/llvm/lib/Support/regcomp.c" -o /dev/null 2>/dev/null
+    "$Bin" $COMMON_FLAGS_LIST -fno-lto -I "$BUILD_ROOT/stage2/include" -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -I "$LLVM_SRC/libc" -std=c++17 -c "$LLVM_SRC/llvm/lib/Support/APFloat.cpp" -o /dev/null ; or return 1
+    "$Bin" $COMMON_FLAGS_LIST -fno-lto -I "$BUILD_ROOT/stage2/include" -I "$LLVM_SRC/llvm/include" -std=c++17 -c "$LLVM_SRC/llvm/lib/CodeGen/SelectionDAG/SelectionDAG.cpp" -o /dev/null ; or return 1
+    "$Bin" $COMMON_FLAGS_LIST -fno-lto -I "$BUILD_ROOT/stage2/include" -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$LLVM_SRC/llvm/lib/Support/regcomp.c" -o /dev/null ; or return 1
     return 0
 end
 
@@ -1658,8 +1668,8 @@ function bolt_train_lld --argument-names Bin
     printf '%s\n' '#include <vector>' '#include <string>' '#include <map>' '#include <algorithm>' '#include <cstdio>' \
         'static int f(const std::vector<std::string>&v){std::map<std::string,int>m; for(auto&s:v)m[s]++;int n=0;for(auto&kv:m)n+=kv.second;return n;}' \
         'int main(int c,char**v){std::vector<std::string> s; for(int i=0;i<c;i++)s.push_back(v[i]);std::sort(s.begin(),s.end()); std::printf("%d %zu\\n",f(s),s.size());return 0;}' >"$src"
-    "$drv" -O2 -B "$lddir" -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=all "$src" -o "$BUILD_ROOT/bolt-lld-train.out" 2>/dev/null
-    "$drv" -O2 -B "$lddir" -fuse-ld=lld -static-libstdc++ -Wl,--gc-sections "$src" -o "$BUILD_ROOT/bolt-lld-train2.out" 2>/dev/null
+    "$drv" -O2 -B "$lddir" -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=all "$src" -o "$BUILD_ROOT/bolt-lld-train.out" ; or return 1
+    "$drv" -O2 -B "$lddir" -fuse-ld=lld -static-libstdc++ -Wl,--gc-sections "$src" -o "$BUILD_ROOT/bolt-lld-train2.out" ; or return 1
     rm -f "$lddir/ld.lld" "$src" "$BUILD_ROOT/bolt-lld-train.out" "$BUILD_ROOT/bolt-lld-train2.out"
     return 0
 end
@@ -1683,7 +1693,14 @@ function bolt_optimize_binary --argument-names Name BinPath
     else
         run "$BOLT" "$Real" -o "$Inst" --instrument --instrumentation-file="$Prof" --instrumentation-file-append-pid
     end
-    bolt_train_$Name "$Inst"
+    if not bolt_train_$Name "$Inst"
+        rm -f "$Inst"
+        if test "$BOLT_BEST_EFFORT" = 1
+            log "[$Name] BOLT training failed; keeping the unmodified binary"
+            return 0
+        end
+        die "BOLT training failed for $Name"
+    end
     if test "$Name" = lld
         for waited in 1 2 3 4 5
             test -s "$Prof"; and break
