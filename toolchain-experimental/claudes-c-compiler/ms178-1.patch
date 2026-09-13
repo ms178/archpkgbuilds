@@ -1,884 +1,1318 @@
-diff --git a/engineering/DECISIONS.md b/engineering/DECISIONS.md
-index d7765b3..9ec84ff 100644
---- a/engineering/DECISIONS.md
-+++ b/engineering/DECISIONS.md
-@@ -1876,7 +1876,300 @@ Validation: `cargo test --lib` 2645 passed / 0 failed / 6 ignored
- with the gate forced on, zero mismatches; gate on/off equivalence was
- re-run with the final binary on both targets.
+diff --git a/engineering/AUDIT-2026-09-13-i686-tls-ie-relax-c7.md b/engineering/AUDIT-2026-09-13-i686-tls-ie-relax-c7.md
+new file mode 100644
+index 00000000..85bb060d
+--- /dev/null
++++ b/engineering/AUDIT-2026-09-13-i686-tls-ie-relax-c7.md
+@@ -0,0 +1,146 @@
++# AUDIT 2026-09-13 — i686 TLS IE relaxation: the `C7 /reg` #UD bug
++
++**Status:** FIXED, regression-gated, CI-green.
++**Blast radius:** every i686 executable whose initial-exec TLS sequence
++relaxes to a destination register other than `%eax` (i.e., almost every
++program with more than one TLS variable, or any variable the allocator
++puts in ecx/edx/esi/edi/ebp).
++
++## Symptom
++
++`lccc -m32` linked executables using `__thread` variables crashed with
++SIGILL (`trap invalid opcode`, `error:0`) at IPs that *looked* random and
++decoded as "valid" in isolation. Two wrong theories were chased and
++killed before the real one was found (see "Dead ends" below).
++
++## Root cause
++
++The main-image GOTIE→LE relaxation
++(`src/backend/i686/linker/reloc.rs`, `relax_gotie_to_le`) rewrites
++
++    movl  slot(%ebx), %reg     ; 8b /r disp32   (6 bytes)
++    addl  %gs:0, %reg          ; 65 03 …        (7 bytes)
++
++into the local-exec form
++
++    movl  $tpoff, %reg         ; C7 /0 imm32    (6 bytes, same footprint)
++    addl  %gs:0, %reg          ; untouched
++
++The opcode write was
++
++    out_sec.data[off - 2] = 0xc7;
++    out_sec.data[off - 1] = 0xC0 | (reg << 3);   // BUG
++
++`C7 /0` (MOV r/m32, imm32) fixes the ModRM **REG field to 000** and takes
++the destination in the **r/m field**. Writing `0xC0 | (reg << 3)` puts the
++destination in the REG field, selecting the *undefined* `C7 /reg` form.
++Only `%eax` (reg=0) survives, because there the REG and r/m fields happen
++to coincide (`0xC0`). Every other destination register emits an illegal
++opcode and the kernel/QEMU raise #UD on first execution.
++
++Measured proof (real CPU, no VM involved):
++
++    $ cat > c7test.s   # _start: .byte 0xc7,0xd0,1,0,0,0; test ecx; …
++    $ gcc -m32 -nostdlib -static c7test.s -o c7test && ./c7test
++    Illegal instruction (SIGILL)          # C7 D0 = C7 /2, undefined
++
++The same bytes GCC would emit (`B9` for `mov ecx, imm32`, or `C7 C1` for
++the r/m form) run fine. QEMU-user (`qemu-i386`) reproduces the #UD, which
++is what finally separated "binary defect" from "host CPU quirk".
++
++## Why it was invisible for so long
++
++* The pre-S01 linker had **no** GOTIE relaxation at all — the pair kept
++  its GOT-slot form and worked (unoptimized). The relaxation is new
++  session work; the bug shipped with it.
++* The first regression gate only exercised `%eax` destinations (compiler
++  allocation happened to use it), where the encoding is accidentally
++  valid.
++* The faulting IP is far from the write site, and the byte sequence at
++  the fault decodes "legitimately" when you start disassembly at the
++  wrong alignment — so disassembly-based inspection kept producing
++  false leads.
++
++## Fix
++
++1. `src/backend/i686/linker/reloc.rs`
++   * `0xC0 | (reg << 3)` → `0xC0 | reg`, with an explicit "encoding trap"
++     doc comment so the mistake is documented at the site.
++   * Removed the dead "3-byte `add %gs:0`" detection branch: the absolute
++     `%gs:0` operand requires a disp32 in every encoding, so the 7-byte
++     form is the only possible one. The branch could only ever
++     false-match a self-add (`add %reg, %reg`) and relax garbage.
++2. `src/backend/i686/assembler/elf_writer.rs` — `is_tls_reloc` corrected
++   and commented against the real ABI numbers (elf.h, EM_386):
++   `14..=19 | 24..=37 | 39..=41`.  (The earlier list missed the
++   GD/LDM-sequence parts 24–29 and `TLS_DESC` 41, and its comment
++   contained wrong type numbers; 38 = R_386_SIZE32 is NOT TLS.)
++3. `src/backend/x86/assembler/elf_writer.rs` — `is_tls_reloc` corrected:
++   `16..=23 | 34..=36`. (The earlier list contained unverifiable 44–51
++   "CODE_*" numbers; the lccc assembler never emits the binutils 2.41+
++   relaxable extensions, and this predicate only ever sees relocations
++   produced by the lccc assembler, so the documented standard set is the
++   correct one.)
++4. Audit of every other `C7` writer in the tree: x86-64 GOTIE relax
++   (`emit_exec.rs:2429`, already `0xc0 | reg`), x86-64 TLSDESC→LE
++   (hardcoded `c7 c0`, rax-only by construction), `0x81`/`0x01`-family
++   relaxations (legitimate `/ext` field), and the i686 compiler-assembler
++   `C6/C7` memory-store path (`reg` field = 0). All correct.
++
++## Regression gate
++
++`tests/regression/check_i686_tls_ie_relax.sh` (registered in
++`scripts/ci_local.sh` as `i686-tls-ie-relax`) now includes, in addition to
++the original structure checks:
++
++* a **deterministic per-register probe** (hand assembly, no compiler
++  allocation luck): one TLS variable, six GOTIE pairs driving
++  eax/ecx/edx/esi/edi/ebp, exact-value readback (765432; exit-code mod
++  256 compare);
++* a **static C7 /0 scan** over the executable LOAD segment(s) of the
++  linked probe: every `C7` byte must have ModRM REG field == 000, so any
++  regression to `C7 /reg` fails the gate even before execution.
++
++Proven to catch the bug: with the fix reverted, the gate dies with exit
++132 (SIGILL from the probe itself); with the fix, it prints OK.
++
++## Validation
++
++* `ci_local.sh --fast`: green (see ledger entry for this snapshot).
++* TLS runtime probes all match gcc byte-for-byte in output:
++  `mini.c` (inline-asm LE + IE, prints `x=0` on both), `tls32.c`
++  (`le=6 ld=6 g=10`), `tprobe.s` (raw-syscall probe, exit 80 = 20304 mod
++  256 on both), `tpv.c` (C equivalent, exit 80 on both), plus the
++  per-register gate probe.
++* All pre-existing i686 gates green: `i686-atomics`,
++  `i686-code16-relax`, `i686-const-div` (run with `CCC=target/fastbuild/lccc`
++  — the gate defaults to `./target/release/lccc`, a pre-existing
++  convention), `i686-overalign-interop` (20 combos).
++
++## Dead ends (do not retry)
++
++1. **"Missing/corrupted thunk"** — the `__x86.get_pc_thunk.bx` bytes
++   (`8b 1c 24 c3`) are present and correct in every crasher.
++2. **`_start` passes a misaligned main / PLT call off-by-one** — both
++   were analysis artifacts of an off-by-one in my own next-IP arithmetic
++   during manual decode (`call rel32` next-IP is e8+5, not e8+4). The
++   PLT stubs, the trampoline, and the displacements are all correct.
++3. **ndisasm offset trap** — disassembling a stream at the wrong base
++   produces garbage that looks like proof of corruption. Always confirm
++   the true function start (entry-relative) before trusting a decode.
++
++## Notes for future agents
++
++* `C7 /0` is the classic "one field is fixed" trap. Same shape as the
++  x86-64 REX.R→REX.B transplantation the x86-64 relaxer documents. When
++  writing a relaxation that moves a register between ModRM fields, the
++  doc comment must state which field is fixed and which carries the
++  operand.
++* The i686 linker's GD→LE relaxation (`lea sym@tlsgd + call
++  ___tls_get_addr` → `mov %gs:0,%eax; add $tpoff,%eax`) only handles an
++  `%eax` destination by construction (`dest == 0`); a non-eax GD
++  destination is a hard error. That is deliberate (the rewrite has no
++  register-agnostic 6-byte+5-byte footprint) — keep it that way.
++* `objdump -d` prints nothing for lccc i386 executables: they carry no
++  section headers (program headers only). Use `ndisasm`/qemu tracing or
++  raw byte scans for post-link inspection.
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index bb14bd05..8607b04f 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -196,6 +196,8 @@ gate "i686-atomics" fast \
  
--
-+## RA-GLA-02 (2026-09-13) — source-less rematerialization default ON:
-+## hardening, four-target evidence, structural verifier, Godbolt validation
-+
-+Supersedes RA-GLA-01 for the source-less rematerialization vocabulary
-+only: GlobalAddr and const-Copy clones graduate from gated-OFF to
-+default ON. Spill gaps, intra-block gaps and the Size tier stay OFF,
-+and `CCC_RA_GLOBAL_LOCATION` becomes the emergency kill switch
-+(0/off/no/false/empty disables; unset ⇒ ON). This record is the
-+graduation evidence and the hardening delta; the addendum below is the
-+second line-by-line red-team pass.
-+
-+**Unconditional post-rewrite verification with byte-for-byte rollback.**
-+The structural verifier now runs for EVERY applied GLA rewrite with no
-+environment gate (the graduation rule: a default-on feature cannot rely on
-+an opt-in checker). Before the first mutation the materializer snapshots
-+`blocks`, `next_value_id` and `next_label`; on any violation it restores
-+all three verbatim, prints `[GLA] … rewrite failed structural verification
-+… aborting plan with zero edits`, and reports zero edits — exact gate-off
-+behavior. `CCC_VERIFY_REGALLOC=1` upgrades the warning to a panic for
-+development backtraces. The seven invariants are: (1) unique definition
-+sites; (2) every capture-slot reload dominated by its store (including the
-+in-block ordering); (3) fresh ids bounded by `next_value_id`; (4) φ nodes
-+remain a contiguous block prefix; (5) unique block labels and every static
-+terminator edge (Branch/CondBranch/Switch/IndirectBranch) resolving to a
-+real block; (6) each φ incoming names a real, distinct CFG predecessor;
-+(7) the φ incoming predecessor SET equals the block's CFG predecessor set
-+(set comparison, because `build_cfg` records both arms of a CondBranch
-+that targets one block). Empirically zero rollbacks over the complete
-+compiler corpus × {-O0..-O3,-Os} × all four targets (the fire census
-+`aborts` column is 0 everywhere below).
-+
-+**Retarget fixes (red-team findings).** `retarget_edge` moved only one
-+CondBranch arm (`if/else if`) and stopped at a matching Switch `default`
-+without walking cases. A CondBranch whose two arms name the same block —
-+or duplicate Switch cases — are ONE unique CFG edge (`build_cfg`
-+deduplicates successor labels) with one shared φ incoming; a fan-out
-+trampoline must reroute every occurrence or the un-rewired arm enters the
-+merge expecting trampoline-defined names. Both arms / every matching case
-+are now moved together; the Switch/default ordering is also corrected.
-+Pinned by `retarget_edge_moves_both_equal_cond_arms_together`,
-+`retarget_edge_moves_all_duplicate_switch_cases`, and
-+`remat_on_switch_fanout_phi_edge_isolates_edge_with_trampoline` (full IR
-+shape: case edge isolated, default edge untouched, φ rewired, jump-table
-+emission references the appended block purely by symbolic label, which
-+the block-iteration emission at `generation.rs` resolves like any other
-+block). `clone_remat`'s silent catch-all (which would have cloned a
-+template with the OLD destination) is now an `unreachable!` documenting
-+that only `GlobalAddr`/const-`Copy` are ever certified — re-reading memory
-+is not a sound rematerialization (the store may have happened since).
-+
-+**Knob vocabulary harmonized.** The experimental shipped-OFF switches
-+`CCC_GLA_SPILL_GAPS`/`CCC_GLA_ALLOW_INTRA` parsed only `0`/`false`; an
-+emergency `=off`/`=no`/`=FALSE`/empty would have ENABLED them. All boolean
-+knobs now parse through one `is_off_token` helper with the master gate's
-+full vocabulary (unit: `token_tests`).
-+
-+**Harness defects fixed.** `check_gla_remat_policy.sh`'s negative
-+assertions were written as `! grep …` under `set -e`: negated commands are
-+exempt from errexit, so every "must not apply" assertion was vacuous
-+(including the default-policy nbody rejection). They are explicit
-+`must_not_grep` helpers with diagnostics; the off-token sweep now covers
-+`OFF/NO/False` as well, and the master-gate proof uses a known-firing TU
-+for every token. The equiv runner's ELF32 smoke probe entered `int $0x80`
-+with undefined registers and could never observe exit 42 (it segfaulted,
-+which hid the decision between native and qemu-i386); the probe now sets
-+eax=1/ebx=42. The fuzz harness passed multi-word runners
-+(`qemu-riscv64 -L …`) as one argv element, making every cross synthetic
-+case die with SIGHUP and get mis-filed as GEN-BUG; runners are now
-+`shlex`-split (this unlocked real RISC-V fuzzing). GCC include paths are
-+resolved via `-print-file-name=include` everywhere (fire census, callgrind
-+A/B) instead of a hardcoded gcc-14 directory.
-+
-+**Module-wide cleanup coupling (the i686 positive-insn cases, root
-+cause).** When ANY splitter edits ANY function, the pipeline's
-+`did_split` flag runs copy propagation + DCE over every function in the
-+TU. GLA merely became a new trigger for this pre-existing, sound cleanup.
-+On i686 matmul -O2, GLA edits only the standalone `matmul` kernel; the
-+`main` +6 insn / frame 60→44 change is that cleanup re-materializing two
-+cold double constants around printf setup, not a GLA rewrite — proven by
-+`CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_REACH=0` (zero GLA edits) assembling
-+byte-identical to gate-off. Runtime measured neutral-to-positive
-+(matmul 0.992× in RA-GLA-01's paired run); the pre-existing coupling is
-+intentionally left untouched (refactoring it changes all three splitters,
-+out of scope for graduation).
-+
-+**Four-target fire census (rebase a361f26, 794 TUs × 5 opts, gate ON):**
-+
-+| target | firing TUs | edits | remat | capture slots | trampolines | rollbacks | gate-induced build failures |
-+|---|---:|---:|---:|---:|---:|---:|---:|
-+| x86-64 | 106 | 586 | 586 | 0 | 3 | 0 | 0 |
-+| i686 | 335 | 1170 | 1170 | 0 | 4 | 0 | 0 |
-+| aarch64 | 128 | 496 | 496 | 0 | 3 | 0 | 0 |
-+| riscv64 | 158 | 780 | 780 | 0 | 3 | 0 | 0 |
-+
-+**Godbolt oracle cross-validation** (live Compiler Explorer audit
-+`scripts/godbolt.py audit`: gcc 16.2 / clang 23.1 / icc 2021.10 / icx
-+latest all current; local gcc 14.2 is NOT used for oracle claims). Static
-+per-function stats via `scripts/codegen_oracle.py`:
-+
-+* x86-64 zlib_ng_adler32 `main`, -O2: gate-off 242 insn / 40 loads / 6
-+  stores / **19 spills** → gate-on 242 / 40 / 4 / **7 spills**; oracles
-+  gcc16.2 156/20/3/2, clang23 148/30/0/0, icc 73/8/5/9, icx 147/23/4/3.
-+  GLA closes part of the spill gap with zero added instructions; the
-+  residual 7 are computed (non-source-less) values — out of the remat
-+  vocabulary, P0-B territory; the trace confirms the remaining
-+  global/const candidates fail the calibrated use-weight/segment gates
-+  for good reason (v57 50 uses, v819 220 uses/2 segments).
-+* aarch64 zlib_ng_adler32 `main`, -O2: 388/66/35/**80 spills** →
-+  364/46/20/**45 spills** vs ARM64 gcc 16.1 126/20/5/6.
-+* riscv64 same TU: 711/71/37/6 → 707/58/25/6 vs RISC-V gcc 16.1
-+  151/22/7/10.
-+* x86-64 strlen_bench: on/off text-identical (three cold setup remats,
-+  Callgrind Ir 1.00000).
-+* aarch64 sha256_transform: on/off function text identical (the one
-+  remat is a relocation of a 1-use globaladdr; recurrence-carried φ
-+  accumulators remain protected).
-+
-+The inherited x86-64-derived budget/band on the 30+ GPR targets is
-+therefore validated as fail-safe in the right direction: it fires only at
-+genuine pressure extremes and the measured changes are large spill
-+reductions or neutral; per-ISA calibration remains future optimization
-+headroom, not a safety question.
-+
-+**Runtime / performance evidence:** Callgrind -O2 31-program fast corpus
-+rerun on the rebase: geomean Ir mine/ref **0.99952**, zlib_ng_adler32
-+**0.98548 (−1.45 %)**, every other program 1.00000 or within ±0.002 %
-+with I1/LLi/branch events unchanged (`results/callgrind-a361f26-o2.md`).
-+Valgrind clean on the compiler while firing and on the resulting
-+trampoline/adler binaries. Differential fuzz with the gate forced on:
-+phi_cfg 1000/1000, x86-64 differential 600/600, i686 m32 1000 seeds
-+(~3000 case-arms), aarch64 400 cases, riscv64 synthetic 400/400 — zero
-+mismatches. The equiv runner now compiles/runs an independent gcc oracle
-+best-effort in EVERY mode (host gcc, gcc -m32 under qemu-i386, cross gcc
-+under qemu-user); cases where both gates agree but neither matches gcc
-+are classified as pre-existing backend gaps and reported separately, so
-+they never masquerade as gate divergences.
-+
-+**Test/CI state:** `location_alloc` 40 unit tests (was 30 at graduation);
-+`cargo test --lib` 2716/0/6; clippy `-D warnings` and rustfmt clean;
-+`ci_local.sh --fast` 31/0/3 with the codegen golden gate within tolerance.
-+
-+### Addendum — second red-team pass on the final binary (2026-09-13)
-+
-+A full line-by-line re-audit of planner/policy/materializer/verifier
-+plus the definitive four-target matrix on the final binaries produced
-+five additional hardenings, with no production behavior change for the
-+shipped (remat-only) policy:
-+
-+1. **Indirect-branch edges, exact fail-closed semantics.** The edge
-+   planner already refused to trampoline an `IndirectBranch` predecessor
-+   (the jump target is a runtime blockaddress). Two refinements: (a) when
-+   such an edge also carries a rename that IS fully defined before the
-+   terminator (a name already emitted in the predecessor), that rename is
-+   now applied in place instead of being discarded with the deferred set;
-+   (b) `retarget_edge` no longer has an arm that rewrites
-+   `IndirectBranch.possible_targets` — the edge planner never creates a
-+   trampoline there, and rewriting the table would not redirect the
-+   computed jump. Pinned by
-+   `retarget_edge_never_rewrites_indirect_branch_targets` and the existing
-+   `remat_through_indirect_branch_edge_is_refused` (which asserts both the
-+   φ incoming and the target table are untouched).
-+
-+2. **Deterministic emission order, no dependence on FxHash table layout.**
-+   The split value worklist (`gap_ids ∪ remat_ids`) and the capture-slot
-+   alloca insertion iterated `FxHashMap`/`FxHashSet` collections; the
-+   multi-definition fan-out trampoline body and the entry alloca order
-+   therefore depended on table layout. Both are now sorted by value id
-+   before emission, matching the deterministic ordering every other event
-+   stream already uses (events sort by point/vid; candidate selection
-+   tie-breaks on vid; blocks and tramps are built in index order). Pinned
-+   by `trampoline_multiple_defs_are_sorted_by_value_id` (two globals
-+   deferred onto one fan-out edge: one shared trampoline, clones in
-+   ascending id order).
-+
-+3. **Equivalence harness: target-incompatible TUs are SKIPped and
-+   argv[0] is fully controlled.** The four-target matrix found two
-+   classes of false "output divergence" on byte-identical gate binaries:
-+   (a) `builtin_avx256_raw` under qemu-aarch64 carries an
-+   `-mavx -mavx2` sidecar that aarch64 cross-gcc rejects outright (the
-+   x86-only vector ABI test is meaningless on aarch64); the program also
-+   reads uninitialized stack and its garbage output under qemu-user
-+   varies with the **argv[0] layout** (proven: copies of one binary named
-+   `n2` vs `aaaa` print different denormals). Such TUs are now SKIPped
-+   when the cross oracle cannot compile them rather than comparing
-+   undefined-behavior output. (b) `arm_f128_param_preserves_gp_param`
-+   on riscv64: both gate binaries are byte-identical and both fail to
-+   run because lccc's riscv64 link lacks compiler-rt (`undefined symbol:
-+   __trunctfdf2`), and the loader prints the program path TWICE in its
-+   diagnostic — so differing artifact names manufacture a diff even at
-+   equal basename lengths. The harness now runs every binary (both
-+   gates and the oracle) with one fixed argv[0] (`lccc-equiv-prog`, via
-+   qemu-user `-0`, native via `exec -a`) and scrubs the work directory
-+   from captured output; equal-length artifact names remain as a third
-+   layer. The loader-failure case then classifies correctly as a
-+   gate-independent pre-existing oracle gap rather than a divergence.
-+   Host and `-m32` modes keep the oracle-best-effort semantics;
-+   shellcheck and `bash -n` clean.
-+
-+4. **DWARF source-span 1:1 discipline in the block sweep.** Materializing
-+   events rebuilds each touched block's instruction vector; previously
-+   `source_spans` was left untouched, so a spanful block (one entry per
-+   instruction, which `generation.rs` walks when emitting `.debug_line`)
-+   desynchronized after the first inserted clone — every following
-+   instruction could be attributed to the wrong source line. The sweep
-+   now mirrors the established `split_ranges::insert_instruction`
-+   precedent: when a block was spanful it stays exactly spanful, each
-+   inserted event clones the span of the instruction it executes before
-+   (the last span for terminator-boundary events), originals keep their
-+   own spans, and a `debug_assert!` pins the 1:1 correspondence. Snapshot
-+   rollback already restores spans wholesale (they live in `blocks`).
-+   Pinned by `inserted_remats_keep_source_spans_one_to_one`.
-+
-+5. **Doc-comment hygiene:** the shared `is_off_token` doc comment was
-+   attached to the wrong item after the earlier insertion reorder; fixed.
-+
-+The i686 `loop_patterns` calibration site was re-checked on the final
-+binary: GLA still fires there (one `globaladdr` remat in `main`) but the
-+gate-on/gate-off emitted text is identical — the band-2 calibration keeps
-+excluding the historical counter-spill edit; oracle A/B remains
-+209/51/49/70 spills under both gates.
-+
-+**Rebase note (2026-09-13, upstream main `0ad4633`).** The addendum was
-+rebased across PR #522 (S38: class-agnostic GEP CSE keys, x86-backend
-+GlobalAddr rematerialization through `Copy`, static-chain call marker
-+protocol, call-liveness ABI refinements). S38 changes only GVN and
-+post-regalloc x86 codegen — all strictly DOWNSTREAM of GLA's pre-regalloc
-+IR rewrites — and touches no `location_alloc/` file. Its backend
-+Copy-remat is deliberately NOT mirrored into the IR-level planner: GLA
-+is target-independent across all four targets, while the S38 remat is
-+x86 text/MachInst specific; admitting `Copy <- GlobalAddr` to GLA's
-+template set would be a new four-target policy needing its own census.
-+The rebase changed no GLA fire site (see census below), and the
-+equiv matrices remain failed=0. The rebase also repaired a documentation
-+defect from the graduation commit: the `## ALIGN-01` section header had
-+been overwritten by the RA-GLA-02 insertion, orphaning the whole
-+tight-loop record under the wrong section; it is restored, and the
-+RA-GLA-02 / addendum heading levels are fixed.
-+
-+**Test/CI state after addendum:** `location_alloc` **45** unit tests;
-+`cargo test --lib` **2722/0/6** (one upstream-added test); clippy
-+`-D warnings` and rustfmt clean. Rebased fastbuild binaries md5:
-+x86-64 `aa78c076…`, lccc-i686 `f5da2fa2…`, lccc-arm `5507f212…`,
-+lccc-riscv `bdabce5d…` (all four targets rebuilt via
-+`scripts/build_lccc_fast.sh`).
-+
-+**Definitive gate on/off matrices (rebased binaries, five opt levels
-+each), all `failed=0`:**
-+
-+| target | ran | oracle-confirmed | gate-indep. gaps | skipped | rc |
-+|---|---|---|---|---|---|
-+| x86-64 | 3499 | 3408 | 7 | 21 | 0 |
-+| i686 | 3337 | 3103 | 70 | 48 | 0 |
-+| aarch64 | 2687 | 2647 | 40 | 216 | 0 |
-+| riscv64 | 2698 | 2584 | 114 | 522 | 0 |
-+
-+The i686 counts move by 2 ran / +4 gaps / −2 skips vs the pre-rebase run
-+(S38 text-path changes flip two unstable/skippable cases into
-+gate-independent gaps); all other targets are identical. The seven
-+x86-64 gate-independent gaps are the same hand-verified set as before
-+graduation (asm_alternative_length_template -O1, bitop_nonneg_zext -O0,
-+bitops_builtins -O0/-O1/-Os, deflate_setparams_cmp_cast -O1,
-+glibc_const_p_strlen -O1); cross-target gaps are cross-ABI / missing
-+compiler-rt link shapes present under BOTH gates.
-+Logs: `results/rerun-rebase-20260913/equiv-{x64,m32,arm64,riscv64}.log`.
-+
-+**Fire census on the rebased tree (gate forced on, 794 TUs × 5 opts,
-+`aborts=0`, capture slots 0 everywhere):** x86-64 106 TUs / 586 remats /
-+3 trampolines; i686 335 / 1170 / 4; aarch64 128 / 496 / 3; riscv64
-+158 / 780 / 3 — bit-identical to the pre-rebase census, proving S38 did
-+not move any GLA decision (`results/rerun-rebase-20260913/fire-*.json`).
-+
-+**Whole-corpus static emitted-text delta (gate OFF→ON, rebased
-+binaries):** x86-64 **−450 instructions / −342 frame references** (S38
-+improves the pre-rebase −436/−341 by another 14 insn/1 stkref; the lone
-++insn row is the documented `-m32` TU at -O0 trading one compare for a
-+56→40-byte frame); i686 **−570 / −1645** unchanged (the matmul `main`
-++6/-2 row remains the documented, runtime-neutral copy-prop coupling).
-+Logs `results/rerun-rebase-20260913/static-{x64,m32}.log`.
-+
-+**Gate-forced-ON fuzzing on rebased binaries, zero mismatches:**
-+phi_cfg 1000/1000 (363 s), differential 600/600 (203 s), m32 forwarded
-+engine 1000 seeds × 3 opts ≈ 3000 case-arms (267 s), aarch64 400 seeds ×
-+{O2,Os} ≈ 800 case-arms (69 s), riscv64 synthetic 400 × -O2 under
-+qemu-riscv64 vs riscv64 cross-gcc (48 s). Note the synthetic engine
-+requires an explicit `--runner "qemu-riscv64 -L
-+/usr/riscv64-linux-gnu" --refs riscv64-linux-gnu-gcc`; without them the
-+lccc binaries are not executable on the host and every case reports a
-+spurious rc=−1 "mismatch" — a harness-config failure, not a compiler one.
-+
-+Valgrind (`--error-exitcode=99 --leak-check=full`) on gate-on and
-+gate-off zlib_ng_adler32 binaries is clean; lccc-ld linker fuzz gates
-+(128 linker mutants + 64×7 ELF grammar links) report zero defects.
-+
-+## ALIGN-01 (2026-09-12) — structural hot-loop alignment ("tight loops"): two-layer GCC 16.2 mirror with exact encoded spans
+ gate "i686-asm-diff" fast \
+     python3 scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686
++gate "i686-tls-ie-relax" fast \
++    bash tests/regression/check_i686_tls_ie_relax.sh
  
- **Code:** structural audit in `src/passes/loop_align.rs`
- (`audit_tight_loop_inner`, `tight_bucket_log2`, `TightLoopMode`),
-diff --git a/scripts/gla_equiv_check.sh b/scripts/gla_equiv_check.sh
-index f765b6b..a49f0a7 100644
---- a/scripts/gla_equiv_check.sh
-+++ b/scripts/gla_equiv_check.sh
-@@ -130,10 +130,32 @@ elif [ "$MODE" = cross ]; then
-     read -ra RUN_PREFIX <<<"$QEMU"
- fi
+ gate "cross-backend-atomics" fast \
+     bash tests/regression/check_atomic_backends.sh
+diff --git a/src/backend/elf/linker_symbols.rs b/src/backend/elf/linker_symbols.rs
+index 13f0143c..5ec2153f 100644
+--- a/src/backend/elf/linker_symbols.rs
++++ b/src/backend/elf/linker_symbols.rs
+@@ -95,6 +95,14 @@ pub fn get_standard_linker_symbols(addrs: &LinkerSymbolAddresses) -> Vec<LinkerD
+             value: addrs.bss_addr,
+             binding: STB_GLOBAL,
+         },
++        // Underscore-less spellings: GNU ld defines both forms, and
++        // `--defsym` expressions as well as hand assembly habitually use
++        // `end`/`edata` (measured: `nm` on a gcc+ld link lists both).
++        LinkerDefinedSym {
++            name: "edata",
++            value: addrs.bss_addr,
++            binding: STB_GLOBAL,
++        },
+         LinkerDefinedSym {
+             name: "_end",
+             value: end_addr,
+@@ -105,6 +113,11 @@ pub fn get_standard_linker_symbols(addrs: &LinkerSymbolAddresses) -> Vec<LinkerD
+             value: end_addr,
+             binding: STB_GLOBAL,
+         },
++        LinkerDefinedSym {
++            name: "end",
++            value: end_addr,
++            binding: STB_GLOBAL,
++        },
+         // Text boundaries
+         LinkerDefinedSym {
+             name: "_etext",
+diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
+index e73a29d7..d65fc6e3 100644
+--- a/src/backend/elf_writer_common.rs
++++ b/src/backend/elf_writer_common.rs
+@@ -72,6 +72,26 @@ pub trait X86Arch {
+     /// stored in the relocation entry.
+     fn uses_rel_format() -> bool;
  
-+# Fixed guest argv[0] for EVERY binary (both gates and the oracle). The
-+# dynamic loader, qemu-user diagnostics and several libc abort paths embed
-+# argv[0] verbatim ("/path/gate1: symbol lookup error: …/gate1: …"), so two
-+# BYTE-IDENTICAL gate binaries compared under different file names would
-+# show a spurious "output divergence" (the arm_f128_param_preserves_gp_param
-+# case on riscv64: the missing __trunctfdf2 lookup prints the path twice).
-+# qemu-user gets it via `-0`; a native exec uses bash's `exec -a`.
-+ARGV0="lccc-equiv-prog"
++    /// True for TLS relocation types (R_386_TLS_* / R_X86_64_*TLS*).
++    ///
++    /// TLS relocs are excluded from local-label folding: the fold rewrites a
++    /// relocation against a local symbol into (section symbol,
++    /// addend+offset), which is value-identical for plain/PC relocs but WRONG
++    /// for TLS ones.  A GOT-style TLS reloc (R_386_TLS_GOTIE, the i386
++    /// encoding of `@GOTNTPOFF`) is a pure GOT-slot reference — its addend
++    /// must stay 0 — and the linker computes the slot's contents from the
++    /// STT_TLS symbol's position in the TLS block, not from a section symbol.
++    /// Folding also destroys the offset for REL-format i686, where the
++    /// addend is baked into the instruction bytes and then clobbered by the
++    /// linker's write.  (Measured: lccc-i686 `movl lv@GOTNTPOFF(%ebx)`
++    /// folded to `.tdata@GOTIE` linked a zero into the displacement and
++    /// segfaulted on the first TLS touch; GAS keeps the STT_TLS symbol in
++    /// the reloc.)
++    fn is_tls_reloc(reloc_type: u32) -> bool {
++        let _ = reloc_type;
++        false
++    }
 +
- run_bin() { # run_bin <bin> ; echoes "stdout|exitcode"
-     local bin=$1 out ec
--    out=$(timeout 25 "${RUN_PREFIX[@]}" "$bin" 2>&1); ec=$?
-+    if [ "$MODE" = cross ]; then
-+        # QEMU is "<emulator> -L <sysroot>"; insert -0 before the binary.
-+        local -a qa
-+        read -ra qa <<<"$QEMU"
-+        out=$(timeout 25 "${qa[@]}" -0 "$ARGV0" "$bin" 2>&1); ec=$?
-+    elif [ ${#RUN_PREFIX[@]} -eq 0 ]; then
-+        out=$(timeout 25 bash -c 'exec -a "$0" "$@"' "$ARGV0" "$bin" 2>&1); ec=$?
-+    else
-+        out=$(timeout 25 "${RUN_PREFIX[@]}" -0 "$ARGV0" "$bin" 2>&1); ec=$?
-+    fi
-     [ $ec -eq 124 ] && { echo "TIMEOUT"; return; }
-+    # Defensive second layer: scrub every absolute work-dir path (and the
-+    # current bin's path) so no diagnostic can leak the artifact name.
-+    out=${out//$bin/PROG}
-+    out=${out//$WORK/PROGDIR}
-     printf '%s|%d' "$out" "$ec"
+     /// Optional: PC8 internal relocation type for loop/jrcxz instructions.
+     /// Only x86-64 has this; i686 returns None.
+     fn reloc_pc8_internal() -> Option<u32> {
+@@ -2591,9 +2611,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                 // their own symbol table entry ONLY if the reloc is
+                 // PC-relative to a different section (identical to section+
+                 // offset anyway), so folding is always safe here.
++                // TLS relocs are NOT foldable (see X86Arch::is_tls_reloc):
++                // the linker resolves them through the STT_TLS symbol, and a
++                // GOT-style TLS reloc's addend must remain 0.
+                 let is_foldable_local = self.label_positions.contains_key(&reloc.symbol)
+                     && !self.pending_globals.contains(&reloc.symbol)
+-                    && !self.pending_weaks.contains(&reloc.symbol);
++                    && !self.pending_weaks.contains(&reloc.symbol)
++                    && !A::is_tls_reloc(reloc.reloc_type);
+                 let (sym_name, mut addend) = if is_foldable_local {
+                     let &(target_sec, target_off) =
+                         self.label_positions.get(&reloc.symbol).unwrap();
+diff --git a/src/backend/i686/assembler/elf_writer.rs b/src/backend/i686/assembler/elf_writer.rs
+index 98298c3d..0224fe23 100644
+--- a/src/backend/i686/assembler/elf_writer.rs
++++ b/src/backend/i686/assembler/elf_writer.rs
+@@ -133,6 +133,20 @@ impl X86Arch for I686Arch {
+     fn uses_rel_format() -> bool {
+         true
+     }
++    fn is_tls_reloc(reloc_type: u32) -> bool {
++        // i386 TLS relocation types (elf.h, EM_386).  Every one resolves
++        // through the STT_TLS symbol (or a per-symbol TLS descriptor), so
++        // local-label folding must never apply to any of them:
++        //   14 TPOFF, 15 IE, 16 GOTIE, 17 LE, 18 GD, 19 LDM,
++        //   24 GD_32, 25 GD_PUSH, 26 GD_CALL, 27 GD_POP,
++        //   28 LDM_32, 29 LDM_PUSH, 30 LDM_CALL, 31 LDM_POP,
++        //   32 LDO_32, 33 IE_32, 34 LE_32,
++        //   35 DTPMOD32, 36 DTPOFF32, 37 TPOFF32,
++        //   39 GOTDESC, 40 DESC_CALL, 41 DESC
++        // (20-23 are R_386_{16,PC16,8,PC8} and 38 is R_386_SIZE32 —
++        // NOT TLS types.)
++        matches!(reloc_type, 14..=19 | 24..=37 | 39..=41)
++    }
+     fn supports_deferred_skips() -> bool {
+         true
+     }
+diff --git a/src/backend/i686/linker/dynsym.rs b/src/backend/i686/linker/dynsym.rs
+index b3f40a06..d437a7e0 100644
+--- a/src/backend/i686/linker/dynsym.rs
++++ b/src/backend/i686/linker/dynsym.rs
+@@ -37,6 +37,14 @@ pub(super) fn read_dynsyms_with_search(
+     let e_shentsize = read_u16(&data, 46) as usize;
+     let e_shnum = read_u16(&data, 48) as usize;
+ 
++    // Sectionless images: lccc's own i686 `.so` output carries no section
++    // header table, so `lccc -L. -lfoo` against it would find the library
++    // but zero symbols and fail every reference as undefined.  Fall back to
++    // locating the tables through the `.dynamic` segment.
++    if e_shnum == 0 {
++        return read_dynsyms_from_dynamic(&data);
++    }
++
+     // First pass: find dynsym, versym, verdef sections
+     let mut dynsym_idx = None;
+     let mut versym_shdr: Option<(usize, usize)> = None;
+@@ -147,6 +155,132 @@ pub(super) fn read_dynsyms_with_search(
+     Ok(syms)
  }
  
-@@ -182,18 +204,22 @@ for src in "$REG"/*.c; do
-     fi
-     if [ $skip -eq 1 ]; then nskip=$((nskip+1)); continue; fi
-     for opt in $OPTS; do
--        bon="$WORK/on"; boff="$WORK/off"; bora="$WORK/oracle"
--        if ! build "$CC_ON" 1 "$opt" "$src" "$bon" "$WORK/on.err"; then
--            if build "$CC_OFF" 0 "$opt" "$src" "$boff" "$WORK/off.err"; then
-+        # Equal-length basenames gate1/gate0: qemu-user binaries that read
-+        # uninitialized stack can emit output that depends on the byte
-+        # layout of argv/envp (e.g. $WORK/on vs $WORK/off differ in length);
-+        # equal-length names remove that spurious perturbation.
-+        bon="$WORK/gate1"; boff="$WORK/gate0"; bora="$WORK/gatex"
-+        if ! build "$CC_ON" 1 "$opt" "$src" "$bon" "$WORK/gate1.err"; then
-+            if build "$CC_OFF" 0 "$opt" "$src" "$boff" "$WORK/gate0.err"; then
-                 echo "FAIL $name $opt: gate-ON build failed, gate-OFF built"
--                head -3 "$WORK/on.err" | sed 's/^/     /'
-+                head -3 "$WORK/gate1.err" | sed 's/^/     /'
-                 nfail=$((nfail+1)); FAILED+=("$name:$opt:build"); continue
-             fi
-             continue   # unsupported TU on this target
-         fi
--        if ! build "$CC_OFF" 0 "$opt" "$src" "$boff" "$WORK/off.err"; then
-+        if ! build "$CC_OFF" 0 "$opt" "$src" "$boff" "$WORK/gate0.err"; then
-             echo "FAIL $name $opt: gate-OFF build failed, gate-ON built"
--            head -3 "$WORK/off.err" | sed 's/^/     /'
-+            head -3 "$WORK/gate0.err" | sed 's/^/     /'
-             nfail=$((nfail+1)); FAILED+=("$name:$opt:buildoff"); continue
-         fi
-         ron=$(run_stable "$bon"); roff=$(run_stable "$boff")
-@@ -230,6 +256,16 @@ for src in "$REG"/*.c; do
-                 nprexist=$((nprexist+1))
-                 PREEXIST+=("$name:$opt")
-             fi
-+        elif [ -n "$CROSS" ]; then
-+            # Cross mode: the cross-gcc oracle is the authority that this TU
-+            # is meaningful for the target. A rejected TU (e.g. -mavx2
-+            # sidecars or ia32 vector intrinsics on aarch64) is
-+            # target-incompatible; its binary can depend on undefined or
-+            # uninitialized state whose observed output even changes with
-+            # argv[0] under qemu-user (stack garbage), so gate1/gate0 run
-+            # comparison cannot prove anything. Skip rather than fail.
-+            echo "SKIP $name $opt: cross oracle cannot build (target-incompatible)"
-+            nskip=$((nskip+1)); continue
-         fi
-         nrun=$((nrun+1))
-         if [ "$ron" != "$roff" ]; then
-diff --git a/src/backend/location_alloc/materializer.rs b/src/backend/location_alloc/materializer.rs
-index 5396777..3738f5e 100644
---- a/src/backend/location_alloc/materializer.rs
-+++ b/src/backend/location_alloc/materializer.rs
-@@ -2,6 +2,7 @@
- //! See the module docs in [`super`] for the full design and policy record.
- 
- use super::*;
-+use crate::common::source::Span;
- 
- /// Instantiate a planner-certified remat template at a fresh destination.
- /// Templates come exclusively from [`rematerializable_template`], i.e.
-@@ -89,7 +90,13 @@ pub(super) fn materialize(
- 
-     let remat_ids: FxHashSet<u32> = plan.remats.iter().copied().collect();
-     let gap_ids: FxHashSet<u32> = plan.gaps.iter().map(|g| g.vid).collect();
--    let split_vids: Vec<u32> = gap_ids.union(&remat_ids).copied().collect();
-+    // Sorted: this vector drives cluster/edge event construction, including
-+    // the instruction order of freshly built trampoline blocks. HashSet
-+    // iteration is randomized per process, so an unsorted union would make
-+    // multi-definition trampolines build-nondeterministic even though every
-+    // other event stream is sorted by point/vid below.
-+    let mut split_vids: Vec<u32> = gap_ids.union(&remat_ids).copied().collect();
-+    split_vids.sort_unstable();
- 
-     // Fail-closed rollback state: every mutation below touches only the
-     // blocks and the two id counters. If the unconditional structural
-@@ -283,7 +290,15 @@ pub(super) fn materialize(
-                     func.blocks[bi].terminator,
-                     Terminator::IndirectBranch { .. }
-                 ) {
--                    if split_debug_enabled() {
-+                    // The deferred values cannot be served (no static edge
-+                    // to reroute), but `renames` already holds names that
-+                    // ARE defined in this block before the terminator
-+                    // (memory-served terminator reads); those rewrites are
-+                    // valid on every runtime edge and must not be dropped.
-+                    if !renames.is_empty() {
-+                        inline_edge_rename.push((bi, s, std::mem::take(&mut renames)));
-+                    }
-+                    if split_debug_enabled() && !deferred.is_empty() {
-                         eprintln!(
-                             "[GLA] {}: skip edge remat b{}->b{}: indirect-branch pred",
-                             func.name, bi, s
-@@ -361,10 +376,38 @@ pub(super) fn materialize(
-     for bi in 0..nblocks {
-         let old = std::mem::take(&mut func.blocks[bi].instructions);
-         let n = old.len();
-+        // DWARF fidelity: when the block carried one source span per
-+        // instruction, the rebuilt block must keep that 1:1 correspondence
-+        // (the split_ranges precedent in `insert_instruction`: clearing or
-+        // desynchronizing spans wiped/mis-attributed line info). Every
-+        // inserted event clones the span of the instruction it executes
-+        // before (the last span for terminator-boundary events).
-+        let spanful = func.blocks[bi].source_spans.len() == n && n > 0;
-+        let old_spans: Vec<Span> = if spanful {
-+            std::mem::take(&mut func.blocks[bi].source_spans)
-+        } else {
-+            Vec::new()
-+        };
-         let mut out: Vec<Instruction> = Vec::with_capacity(old.len() + events[bi].len() + 2);
-+        let mut out_spans: Vec<Span> = if spanful {
-+            Vec::with_capacity(old.len() + events[bi].len() + 2)
-+        } else {
-+            Vec::new()
-+        };
-         let mut active: FxHashMap<u32, u32> = FxHashMap::default();
-         let mut ev_idx = 0usize;
- 
-+        // Event point `p` precedes original instruction p; clone that
-+        // instruction's span (the final span for the terminator point).
-+        let span_for_event = |p: usize| -> Option<Span> {
-+            if spanful {
-+                let idx = p.min(n - 1);
-+                Some(old_spans[idx].clone())
-+            } else {
-+                None
-+            }
-+        };
++/// Read dynamic symbols from an ELF32 image WITHOUT a section header table
++/// (e.g. lccc's own i686 `.so` output).  The `.dynamic` segment carries
++/// `DT_SYMTAB`/`DT_STRTAB` directly; vaddrs are mapped to file offsets with
++/// the `PT_LOAD` segments.  There is no symbol count in `.dynamic`, so the
++/// scan stops at the first entry whose `st_name` is out of range for the
++/// string table (every genuine entry satisfies `st_name < STRSZ`).
++fn read_dynsyms_from_dynamic(data: &[u8]) -> Result<Vec<DynSymInfo>, String> {
++    const DT_NULL: u32 = 0;
++    const DT_STRTAB: u32 = 5;
++    const DT_SYMTAB: u32 = 6;
++    const DT_STRSZ: u32 = 10;
++    const DT_SYMENT: u32 = 11;
++    const PT_LOAD: u32 = 1;
++    const PT_DYNAMIC: u32 = 2;
 +
-         for (i, mut inst) in old.into_iter().enumerate() {
-             while ev_idx < events[bi].len() && events[bi][ev_idx].0 == i {
-                 emit_event(
-@@ -375,12 +418,18 @@ pub(super) fn materialize(
-                     templates,
-                     &mut active,
-                 );
-+                if let Some(sp) = span_for_event(i) {
-+                    out_spans.push(sp);
-+                }
-                 ev_idx += 1;
-             }
-             if !matches!(inst, Instruction::Phi { .. }) && !active.is_empty() {
-                 replace_values_in_inst(&mut inst, &active, false);
-             }
-             out.push(inst);
-+            if spanful {
-+                out_spans.push(old_spans[i].clone());
-+            }
-         }
-         // Trailing events at point n (before the terminator).
-         while ev_idx < events[bi].len() && events[bi][ev_idx].0 == n {
-@@ -392,6 +441,9 @@ pub(super) fn materialize(
-                 templates,
-                 &mut active,
-             );
-+            if let Some(sp) = span_for_event(n) {
-+                out_spans.push(sp);
-+            }
-             ev_idx += 1;
-         }
-         debug_assert_eq!(
-@@ -400,6 +452,10 @@ pub(super) fn materialize(
-             "all scheduled events must be consumed"
-         );
-         func.blocks[bi].instructions = out;
-+        if spanful {
-+            debug_assert_eq!(out_spans.len(), func.blocks[bi].instructions.len());
-+            func.blocks[bi].source_spans = out_spans;
-+        }
-         if !active.is_empty() {
-             replace_values_in_terminator(&mut func.blocks[bi].terminator, &active);
-         }
-@@ -461,7 +517,11 @@ pub(super) fn materialize(
-     }
- 
-     // ── Insert volatile capture allocas (coordinates are now settled) ──
--    for (&vid, &slot) in &slot_of {
-+    // Sorted by value id: HashMap iteration is randomized and alloca order
-+    // feeds frame layout; bit-for-bit reproducible output is a project rule.
-+    let mut slots_sorted: Vec<(u32, Value)> = slot_of.iter().map(|(v, s)| (*v, *s)).collect();
-+    slots_sorted.sort_unstable_by_key(|(v, _)| *v);
-+    for (vid, slot) in slots_sorted {
-         let ty = all_types[&vid];
-         insert_entry_alloca(func, slot, ty, true);
-     }
-@@ -607,15 +667,13 @@ pub(super) fn retarget_edge(term: &mut Terminator, old: BlockId, new: BlockId) {
-                 }
-             }
-         }
--        Terminator::IndirectBranch {
--            possible_targets, ..
--        } => {
--            for t in possible_targets.iter_mut() {
--                if *t == old {
--                    *t = new;
--                }
--            }
--        }
-+        // IndirectBranch is deliberately absent above: its
-+        // possible_targets are runtime blockaddress operands rather than
-+        // static terminator edges. The edge planner fails closed and never
-+        // creates a trampoline off such a predecessor, and even if it
-+        // somehow did, rewriting possible_targets would not redirect the
-+        // jump — so it, like every other terminator without static edges
-+        // (Return/Unreachable), falls through untouched.
-         _ => {}
-     }
- }
-diff --git a/src/backend/location_alloc/mod.rs b/src/backend/location_alloc/mod.rs
-index 79535e9..8bc931b 100644
---- a/src/backend/location_alloc/mod.rs
-+++ b/src/backend/location_alloc/mod.rs
-@@ -951,6 +951,31 @@ mod tests {
-         }
-     }
- 
-+    #[test]
-+    fn retarget_edge_never_rewrites_indirect_branch_targets() {
-+        // IndirectBranch possible_targets are runtime blockaddress
-+        // operands, not static edges: the edge planner fails closed and
-+        // never builds a trampoline off such a predecessor, and even a
-+        // stray retarget call must not mutate the table (doing so would
-+        // not redirect the computed jump and would corrupt the target
-+        // list's CFG contract).
-+        let mut term = Terminator::IndirectBranch {
-+            target: Operand::Value(Value(500)),
-+            possible_targets: vec![BlockId(7), BlockId(8), BlockId(7)],
-+        };
-+        retarget_edge(&mut term, BlockId(7), BlockId(42));
-+        match term {
-+            Terminator::IndirectBranch {
-+                possible_targets, ..
-+            } => assert_eq!(
-+                possible_targets,
-+                vec![BlockId(7), BlockId(8), BlockId(7)],
-+                "indirect target table must be untouched"
-+            ),
-+            ref other => panic!("terminator variant changed: {other:?}"),
-+        }
++    let e_phoff = read_u32(data, 28) as usize;
++    let e_phentsize = read_u16(data, 42) as usize;
++    let e_phnum = read_u16(data, 44) as usize;
++    if e_phentsize < 32 || e_phoff > data.len() {
++        return Ok(Vec::new());
 +    }
 +
-     #[test]
-     fn verifier_catches_phi_missing_predecessor_incoming() {
-         // b1 has two CFG predecessors (b0, b2) but its φ lists only b0 —
-@@ -1473,6 +1498,163 @@ mod tests {
-         verify_rewrite(&f, &FxHashSet::default()).expect("rewrite verifies");
-     }
- 
-+    #[test]
-+    fn zero_edit_budget_plans_nothing() {
-+        // CCC_RA_GLOBAL_LOCATION_MAX=0 must be an emergency stop that is
-+        // exactly as inert as the master gate: the same function that
-+        // rematerializes under the shipped budget keeps every original
-+        // instruction and gains no block.
-+        let insts = remat_ladder();
-+        let mut f = func_with(
-+            vec![blk(
-+                0,
-+                insts,
-+                Terminator::Return(Some(Operand::Value(Value(211)))),
-+            )],
-+            900,
-+        );
-+        let before = format!("{f:?}");
-+        let n = run_with_policy(&mut f, conservative_policy(0));
-+        assert_eq!(n, 0);
-+        assert_eq!(format!("{f:?}"), before, "zero budget must be a no-op");
++    let mut loads: Vec<(u32, u32, u32)> = Vec::new(); // (p_vaddr, p_offset, p_filesz)
++    let mut dynamic_off: Option<usize> = None;
++    for i in 0..e_phnum {
++        let off = e_phoff + i * e_phentsize;
++        if off + 32 > data.len() {
++            break;
++        }
++        let p_type = read_u32(data, off);
++        let p_offset = read_u32(data, off + 4);
++        let p_vaddr = read_u32(data, off + 8);
++        let p_filesz = read_u32(data, off + 16);
++        match p_type {
++            PT_LOAD => loads.push((p_vaddr, p_offset, p_filesz)),
++            PT_DYNAMIC => dynamic_off = Some(p_offset as usize),
++            _ => {}
++        }
 +    }
++    let Some(doff) = dynamic_off else {
++        return Ok(Vec::new());
++    };
 +
-+    #[test]
-+    fn inserted_remats_keep_source_spans_one_to_one() {
-+        // DWARF line fidelity: a spanful block must leave materialize with
-+        // exactly one span per instruction; original instructions keep
-+        // their own spans and inserted clones duplicate the span of the
-+        // instruction they execute before (the split_ranges precedent).
-+        let insts = remat_ladder();
-+        let mut f = func_with(
-+            vec![blk(
-+                0,
-+                insts,
-+                Terminator::Return(Some(Operand::Value(Value(211)))),
-+            )],
-+            900,
-+        );
-+        let n = f.blocks[0].instructions.len();
-+        f.blocks[0].source_spans = (0..n)
-+            .map(|i| crate::common::source::Span::new(100 + 10 * i as u32, 109 + 10 * i as u32, 7))
-+            .collect();
-+        let applied = run_with_policy(&mut f, conservative_policy(64));
-+        assert!(applied >= 1);
-+        let b = &f.blocks[0];
-+        assert_eq!(
-+            b.source_spans.len(),
-+            b.instructions.len(),
-+            "spans and instructions must stay 1:1 after insertion"
-+        );
-+        // Original instructions (dest id < 900) retain their own span in
-+        // order; clones (fresh ids >= 900) borrow the following original's
-+        // span (they are emitted immediately before their first use).
-+        let mut orig_idx = 0usize;
-+        for (ii, inst) in b.instructions.iter().enumerate() {
-+            let id = inst.dest().map(|v| v.0).unwrap_or(0);
-+            if id < 900 {
-+                assert_eq!(b.source_spans[ii].start, 100 + 10 * orig_idx as u32);
-+                orig_idx += 1;
-+            } else if ii + 1 < b.instructions.len() {
-+                assert_eq!(b.source_spans[ii], b.source_spans[ii + 1]);
++    let va_to_off = |va: u32| -> Option<usize> {
++        for (v, o, fs) in &loads {
++            if va >= *v && va < *v + (*fs).max(1) {
++                return Some(*o as usize + (va - *v) as usize);
 +            }
 +        }
-+        assert_eq!(orig_idx, n, "every original instruction retained");
++        None
++    };
++
++    // Walk the .dynamic entries (8 bytes: tag/value)
++    let mut strtab_va: u32 = 0;
++    let mut symtab_va: u32 = 0;
++    let mut strsz: u32 = 0;
++    let mut syment: u32 = 16;
++    let mut pos = doff;
++    while pos + 8 <= data.len() {
++        let tag = read_u32(data, pos);
++        let val = read_u32(data, pos + 4);
++        pos += 8;
++        match tag {
++            DT_NULL => break,
++            DT_STRTAB => strtab_va = val,
++            DT_SYMTAB => symtab_va = val,
++            DT_STRSZ => strsz = val,
++            DT_SYMENT => syment = val,
++            _ => {}
++        }
 +    }
++    if syment == 0 || strsz == 0 {
++        return Ok(Vec::new());
++    }
++    let (Some(str_off), Some(sym_off)) = (va_to_off(strtab_va), va_to_off(symtab_va)) else {
++        return Ok(Vec::new());
++    };
++    if str_off + strsz as usize > data.len() || sym_off + syment as usize > data.len() {
++        return Ok(Vec::new());
++    }
++    let strtab = &data[str_off..str_off + strsz as usize];
 +
-+    #[test]
-+    fn remat_on_single_successor_phi_edge_is_inline_without_trampoline() {
-+        // A φ incoming served from an unconditional-branch predecessor
-+        // (unique successor) is rebuilt at the predecessor's terminator
-+        // point and the φ incoming renamed IN PLACE: no critical-edge
-+        // trampoline block is allowed (the edge is not critical — a
-+        // trampoline would add a label, a jump, and I-cache footprint for
-+        // zero isolation benefit).
-+        let mut b0 = vec![global(1, "G")];
-+        for k in 0..12u32 {
-+            b0.push(add(100 + k, 600 + k, 620 + k));
++    let mut syms: Vec<DynSymInfo> = Vec::new();
++    let mut j: usize = 0;
++    loop {
++        let sym_off = sym_off + j * syment as usize;
++        if sym_off + 16 > data.len() {
++            break;
 +        }
-+        let b2 = vec![add(3, 400, 501)];
-+        let mut b1 = vec![Instruction::Phi {
-+            dest: Value(9),
-+            ty: IrType::I64,
-+            incoming: vec![
-+                (Operand::Value(Value(1)), BlockId(0)),
-+                (Operand::Value(Value(3)), BlockId(2)),
-+            ],
-+        }];
-+        b1.push(add(200, 9, 100));
-+        for k in 1..12u32 {
-+            b1.push(add(200 + k, 199 + k, 100 + k));
++        let st_name = read_u32(data, sym_off) as usize;
++        if st_name >= strtab.len() {
++            break; // ran past the end of the array
 +        }
-+        let blocks = vec![
-+            blk(0, b0, Terminator::Branch(BlockId(1))),
-+            blk(2, b2, Terminator::Branch(BlockId(1))),
-+            blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
-+        ];
-+        let mut f = func_with(blocks, 900);
-+        f.next_label = 3;
-+        let n = run_with_policy(&mut f, conservative_policy(64));
-+        assert_eq!(n, 1);
-+        assert_eq!(
-+            f.blocks.len(),
-+            3,
-+            "no trampoline block on a single-succ edge"
-+        );
-+
-+        let find = |label: u32| f.blocks.iter().position(|b| b.label.0 == label);
-+        let (i0, i1) = (find(0).unwrap(), find(1).unwrap());
-+        match f.blocks[i0].terminator {
-+            Terminator::Branch(b) => assert_eq!(b, BlockId(1)),
-+            ref other => panic!("unconditional edge must not be rerouted: {other:?}"),
++        let st_size = read_u32(data, sym_off + 8);
++        let st_info = data[sym_off + 12];
++        let st_shndx = read_u16(data, sym_off + 14);
++        let binding = st_info >> 4;
++        j += 1;
++        if j == 1 || st_shndx == SHN_UNDEF {
++            continue; // null entry / undefined import
 +        }
-+        let (edge_name, edge_pred) = match f.blocks[i1].instructions[0] {
-+            Instruction::Phi {
-+                dest,
-+                ty: IrType::I64,
-+                ref incoming,
-+            } => {
-+                assert_eq!(dest, Value(9));
-+                assert_eq!(incoming.len(), 2);
-+                let from0 = incoming
-+                    .iter()
-+                    .find(|(_, p)| *p == BlockId(0))
-+                    .expect("b0 incoming retained");
-+                let name = match from0 {
-+                    (Operand::Value(Value(v)), _) => *v,
-+                    other => panic!("expected value operand, got {other:?}"),
-+                };
-+                assert!(name >= 900, "edge remat must use a fresh id, got {name}");
-+                assert!(
-+                    !incoming.iter().any(|(_, p)| *p == BlockId(3)),
-+                    "no incoming may reference a non-existent trampoline label"
-+                );
-+                (name, from0.1)
-+            }
-+            ref other => panic!("expected φ, got {other:?}"),
-+        };
-+        assert_eq!(
-+            edge_pred,
-+            BlockId(0),
-+            "inline rename keeps the real predecessor"
-+        );
-+
-+        // The clone lives at b0's terminator boundary, distinct per edge.
-+        let clones = f.blocks[i0]
-+            .instructions
++        if binding != STB_GLOBAL && binding != STB_WEAK {
++            continue;
++        }
++        let end = strtab[st_name..]
 +            .iter()
-+            .filter_map(|i| match i {
-+                Instruction::GlobalAddr { dest, name } if name == "G" && dest.0 != 1 => {
-+                    Some(dest.0)
-+                }
-+                _ => None,
-+            })
-+            .collect::<Vec<_>>();
-+        assert!(clones.contains(&edge_name));
-+        assert_eq!(clones.len(), 1, "exactly one end-of-block edge clone");
-+        verify_rewrite(&f, &FxHashSet::default()).expect("inline edge rewrite verifies");
++            .position(|&b| b == 0)
++            .map(|p| st_name + p)
++            .unwrap_or(strtab.len());
++        let name = String::from_utf8_lossy(&strtab[st_name..end]).into_owned();
++        if name.is_empty() {
++            continue;
++        }
++        syms.push(DynSymInfo {
++            name,
++            sym_type: st_info & 0xf,
++            size: st_size,
++            binding,
++            version: None,
++            is_default_ver: false,
++        });
 +    }
 +
-     #[test]
-     fn remat_segment_cap_is_one_in_shipped_policy() {
-         // The two-segment liveness shape (edge-point holes around nested
-@@ -2004,4 +2186,94 @@ mod tests {
-         }
-         verify_rewrite(&f, &FxHashSet::default()).expect("two-trampoline rewrite verifies");
-     }
-+
-+    #[test]
-+    fn trampoline_multiple_defs_are_sorted_by_value_id() {
-+        // TWO remattable globals deferred onto the SAME fan-out edge share
-+        // one trampoline; its clone instructions must appear in ascending
-+        // value-id order regardless of the internal HashSet iteration order
-+        // that produced the edge worklist (bit-for-bit reproducible output
-+        // is a project rule).
-+        let mut b0 = vec![global(1, "G1"), global(2, "G2")];
-+        for k in 0..12u32 {
-+            b0.push(add(100 + k, 600 + k, 620 + k));
-+        }
-+        // b1 has THREE predecessors (b0, b3, b4), so EVERY φ must list one
-+        // incoming from each of them; each alternate pred supplies its own
-+        // non-rematted values for both φs.
-+        let b3 = vec![add(5, 600, 601), add(6, 604, 605)];
-+        let b4 = vec![add(7, 602, 603), add(8, 606, 607)];
-+        let mut b1 = vec![
-+            Instruction::Phi {
-+                dest: Value(9),
-+                ty: IrType::I64,
-+                incoming: vec![
-+                    (Operand::Value(Value(1)), BlockId(0)),
-+                    (Operand::Value(Value(5)), BlockId(3)),
-+                    (Operand::Value(Value(8)), BlockId(4)),
-+                ],
-+            },
-+            Instruction::Phi {
-+                dest: Value(11),
-+                ty: IrType::I64,
-+                incoming: vec![
-+                    (Operand::Value(Value(2)), BlockId(0)),
-+                    (Operand::Value(Value(6)), BlockId(3)),
-+                    (Operand::Value(Value(7)), BlockId(4)),
-+                ],
-+            },
-+        ];
-+        for k in 0..12u32 {
-+            b1.push(add(200 + k, 100 + k, 300 + k));
-+        }
-+        b1.push(add(302, 9, 11));
-+        let blocks = vec![
-+            blk(
-+                0,
-+                b0,
-+                Terminator::CondBranch {
-+                    cond: Operand::Const(IrConst::I64(1)),
-+                    true_label: BlockId(1),
-+                    false_label: BlockId(2),
-+                },
-+            ),
-+            blk(3, b3, Terminator::Branch(BlockId(1))),
-+            blk(4, b4, Terminator::Branch(BlockId(1))),
-+            blk(1, b1, Terminator::Return(Some(Operand::Value(Value(302))))),
-+            blk(
-+                2,
-+                vec![],
-+                Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
-+            ),
-+        ];
-+        let mut f = func_with(blocks, 900);
-+        f.next_label = 5;
-+        let n = run_with_policy(&mut f, conservative_policy(64));
-+        assert_eq!(n, 2, "both globals rematerialized");
-+        // Exactly one trampoline on the b0->b1 edge, carrying two clones.
-+        let tramp: Vec<_> = f
-+            .blocks
-+            .iter()
-+            .filter(|b| matches!(b.terminator, Terminator::Branch(t) if t == BlockId(1)))
-+            .filter(|b| !matches!(b.label, BlockId(3) | BlockId(4)))
-+            .collect();
-+        assert_eq!(tramp.len(), 1, "one shared edge trampoline");
-+        let ids: Vec<(u32, String)> = tramp[0]
-+            .instructions
-+            .iter()
-+            .filter_map(|i| match i {
-+                Instruction::GlobalAddr { dest, name } => Some((dest.0, name.clone())),
-+                _ => None,
-+            })
-+            .collect();
-+        assert_eq!(ids.len(), 2, "both globals cloned in the trampoline");
-+        let mut sorted = ids.clone();
-+        sorted.sort_by_key(|(d, _)| *d);
-+        assert_eq!(ids, sorted, "trampoline defs must be id-sorted");
-+        assert_eq!(
-+            ids.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
-+            ["G1", "G2"]
-+        );
-+        verify_rewrite(&f, &FxHashSet::default()).expect("multi-def trampoline verifies");
-+    }
- }
-diff --git a/src/backend/location_alloc/policy.rs b/src/backend/location_alloc/policy.rs
-index 27be6cc..011c050 100644
---- a/src/backend/location_alloc/policy.rs
-+++ b/src/backend/location_alloc/policy.rs
-@@ -7,6 +7,17 @@ use super::*;
- // Tunables (env-overridable for A/B work; clamped)
- // ─────────────────────────────────────────────────────────────────────────────
- 
-+/// Whether `value` is one of the documented OFF tokens (case-insensitive):
-+/// `0`, `off`, `no`, `false` or the empty string. Every GLA boolean knob
-+/// parses through this one helper so the emergency-kill-switch vocabulary
-+/// cannot drift between knobs.
-+fn is_off_token(value: &str) -> bool {
-+    matches!(
-+        value.to_ascii_lowercase().as_str(),
-+        "0" | "off" | "no" | "false" | ""
-+    )
++    Ok(syms)
 +}
 +
- /// Master gate for the global location allocator.
- ///
- /// **Default: ON.** The source-less rematerialization policy this gate
-@@ -22,17 +33,6 @@ use super::*;
- /// `CCC_RA_GLOBAL_LOCATION` to `0`, `off`, `no`, `false` (any case) or the
- /// empty string disables the pass. Any other value (incl. `1`/`on`)
- /// enables it; an unset variable follows the default (enabled).
--/// Whether `value` is one of the documented OFF tokens (case-insensitive):
--/// `0`, `off`, `no`, `false` or the empty string. Every GLA boolean knob
--/// parses through this one helper so the emergency-kill-switch vocabulary
--/// cannot drift between knobs.
--fn is_off_token(value: &str) -> bool {
--    matches!(
--        value.to_ascii_lowercase().as_str(),
--        "0" | "off" | "no" | "false" | ""
--    )
--}
+ /// Parse GNU version definitions to build index -> version string mapping.
+ fn parse_verdef(
+     data: &[u8],
+diff --git a/src/backend/i686/linker/emit.rs b/src/backend/i686/linker/emit.rs
+index 52c857a7..cedb7708 100644
+--- a/src/backend/i686/linker/emit.rs
++++ b/src/backend/i686/linker/emit.rs
+@@ -30,6 +30,7 @@ pub(super) fn emit_executable(
+     is_nostdlib: bool,
+     _needed_libs_param: &[&str],
+     output_path: &str,
++    pending_defsyms: &[(String, String)],
+ ) -> Result<(), String> {
+     let num_ifunc = ifunc_symbols.len();
+ 
+@@ -833,7 +834,8 @@ pub(super) fn emit_executable(
+         fini_array_size,
+         rel_iplt_vaddr,
+         rel_iplt_size,
+-    );
++        pending_defsyms,
++    )?;
+ 
+     // Override IFUNC symbol addresses to point to IPLT entries
+     let mut ifunc_resolver_addrs: Vec<u32> = Vec::new();
+@@ -1505,7 +1507,8 @@ fn assign_symbol_addresses(
+     fini_array_size: u32,
+     rel_iplt_vaddr: u32,
+     rel_iplt_size: u32,
+-) {
++    pending_defsyms: &[(String, String)],
++) -> Result<(), String> {
+     global_symbols
+         .entry("_GLOBAL_OFFSET_TABLE_".to_string())
+         .or_insert(LinkerSymbol {
+@@ -1557,6 +1560,35 @@ fn assign_symbol_addresses(
+         .map(|s| (s.name, s.value))
+         .collect();
+ 
++    // GNU ld's language symbols (`_start`, `end`, `_etext`, …) always exist,
++    // whether or not the inputs reference them.  Seed the symbol table with
++    // all of them so that a `--defsym` expression naming one (e.g.
++    // `half=(end-_start)/2`) resolves even when nothing else did.  Seeding is
++    // harmless to the output: the executable carries no .symtab, and the
++    // dynsym writer only emits dynamic symbols.
++    for (name, value) in &linker_sym_map {
++        global_symbols.entry(name.to_string()).or_insert(LinkerSymbol {
++            address: *value as u32,
++            size: 0,
++            sym_type: STT_NOTYPE,
++            binding: STB_GLOBAL,
++            visibility: STV_DEFAULT,
++            is_defined: true,
++            needs_plt: false,
++            needs_got: false,
++            output_section: usize::MAX,
++            section_offset: 0,
++            plt_index: 0,
++            got_index: 0,
++            is_dynamic: false,
++            dynlib: String::new(),
++            needs_copy: false,
++            copy_addr: 0,
++            version: None,
++            uses_textrel: false,
++        });
++    }
++
+     for (name, sym) in global_symbols.iter_mut() {
+         if sym.is_dynamic {
+             if sym.needs_plt {
+@@ -1599,6 +1631,11 @@ fn assign_symbol_addresses(
+             }
+         }
+     }
++
++    // Last: finalise --defsym constants/expressions, so they see the section
++    // addresses and the standard linker symbols, and so a user definition of
++    // a standard name (e.g. `--defsym _end=...`) wins over the auto value.
++    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)
+ }
+ 
+ pub(super) fn build_plt(
+diff --git a/src/backend/i686/linker/link.rs b/src/backend/i686/linker/link.rs
+index 29b394a5..bf1b455b 100644
+--- a/src/backend/i686/linker/link.rs
++++ b/src/backend/i686/linker/link.rs
+@@ -88,16 +88,20 @@ pub fn link_builtin(
+         &mut global_symbols,
+     );
+ 
++    // Apply --defsym definitions: alias, constant or arithmetic expression
++    // (see `apply_defsyms` below for the rationale; the classification lives
++    // in linker_common::defsym so the backends cannot disagree about what
++    // `--defsym a=b+4` means).
++    //
++    // Order matters: the placeholders must exist BEFORE `mark_plt_got_needs`
++    // scans the input relocations. A defsym'd symbol referenced from PIC code
++    // (GOT load) needs a GOT slot; created after the scan it never gets one
++    // and the link silently emits a load from an unallocated slot.
++    let pending_defsyms = apply_defsyms(&mut global_symbols, &defsym_defs)?;
++
+     // Phase 7: Mark PLT/GOT needs and check undefined
+     mark_plt_got_needs(&inputs, &mut global_symbols, is_static);
+ 
+-    // Apply --defsym definitions: alias one symbol to another
+-    for (alias, target) in &defsym_defs {
+-        if let Some(target_sym) = global_symbols.get(target).cloned() {
+-            global_symbols.insert(alias.clone(), target_sym);
+-        }
+-    }
 -
- pub(crate) fn gate_enabled() -> bool {
-     // Unset follows the default (enabled); only an explicit off token
-     // disables the pass.
+     check_undefined_symbols(&global_symbols)?;
+ 
+     // Phase 8: Build PLT/GOT structures
+@@ -147,9 +151,114 @@ pub fn link_builtin(
+         is_nostdlib,
+         needed_libs_param,
+         output_path,
++        &pending_defsyms,
+     )
+ }
+ 
++/// Apply `--defsym` definitions to the resolved symbol table.
++///
++/// The right-hand side is classified once, in `linker_common::defsym`, by
++/// every link path so the backends cannot disagree:
++/// * **Alias** (`a=b`): copy the target's whole symbol, exactly as the old
++///   alias-only loop did. Resolvable before layout.
++/// * **Constant** (`a=0x100`): a new absolute symbol with that value.
++///   Resolvable before layout.
++/// * **Expression** (`a=(b-c)/2`): validated now (a typo or a division by
++///   zero must fail the link here) but evaluated after layout, when the
++///   referenced symbols have their final addresses. The returned list is the
++///   set of pending `(name, expression)` pairs for the emitter.
++///
++/// Constants and expressions are inserted as defined absolute symbols
++/// (`output_section == usize::MAX` is this backend's "no section" marker);
++/// the undefined-symbol check and the PLT/GOT need scan both see them.
++fn apply_defsyms(
++    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
++    defs: &[(String, String)],
++) -> Result<Vec<(String, String)>, String> {
++    use crate::backend::linker_common::defsym::{self, Defsym};
++    let mut pending: Vec<(String, String)> = Vec::new();
++    for (name, expr) in defs {
++        let shown = format!("--defsym {name}={expr}");
++        // "Defined" means the same thing it means to
++        // `check_undefined_symbols`: the symbol is resolved in this link.
++        let classified =
++            defsym::classify(expr, |n| global_symbols.get(n).is_some_and(|g| g.is_defined))
++                .map_err(|e| format!("{shown}: {}", e.message()))?;
++        let value = match classified {
++            Defsym::Alias(target) => {
++                let target_sym = global_symbols.get(&target).cloned().ok_or_else(|| {
++                    format!("{shown}: target symbol '{target}' is not defined in this link")
++                })?;
++                global_symbols.insert(name.clone(), target_sym);
++                continue;
++            }
++            Defsym::Constant(v) => v,
++            // Validated now, evaluated after layout.
++            Defsym::Expression(e) => {
++                pending.push((name.clone(), e));
++                0
++            }
++        };
++        global_symbols.insert(
++            name.clone(),
++            LinkerSymbol {
++                address: value as u32,
++                size: 0,
++                sym_type: STT_NOTYPE,
++                binding: STB_GLOBAL,
++                visibility: STV_DEFAULT,
++                is_defined: true,
++                needs_plt: false,
++                needs_got: false,
++                output_section: usize::MAX,
++                section_offset: 0,
++                plt_index: 0,
++                got_index: 0,
++                is_dynamic: false,
++                dynlib: String::new(),
++                needs_copy: false,
++                copy_addr: 0,
++                version: None,
++                uses_textrel: false,
++            },
++        );
++    }
++    Ok(pending)
++}
++
++/// Evaluate pending `--defsym` expressions against the finalised symbol
++/// table.
++///
++/// Must run inside the emitter, after (1) section addresses are assigned to
++/// every global symbol and (2) the linker-provided symbols (`_end`, `end`,
++/// `_etext`, `__bss_start`, …) are seeded, so the expression sees exactly
++/// the values GNU ld's language-symbol machinery would see.
++///
++/// Lookup mirrors the classification predicate: only defined symbols
++/// participate, an expression over an undefined name is an error rather
++/// than a silent zero, and arithmetic wraps as unsigned 64-bit.
++pub(super) fn evaluate_pending_defsyms(
++    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
++    pending: &[(String, String)],
++) -> Result<(), String> {
++    use crate::backend::linker_common::defsym;
++    for (name, expr) in pending {
++        let value = defsym::eval_with_symbols(expr, &|n| {
++            global_symbols
++                .get(n)
++                .filter(|g| g.is_defined)
++                .map(|g| g.address as u64)
++        })
++        .map_err(|err| format!("--defsym {name}={expr}: {}", err.message()))?;
++        let entry = global_symbols
++            .get_mut(name)
++            .ok_or_else(|| format!("--defsym {name}: symbol vanished before evaluation"))?;
++        entry.address = value as u32;
++        entry.is_defined = true;
++    }
++    Ok(())
++}
++
+ // ══════════════════════════════════════════════════════════════════════════════
+ // Shared library linker (-shared)
+ // ══════════════════════════════════════════════════════════════════════════════
+@@ -169,6 +278,7 @@ pub fn link_shared(
+     let mut libs_to_load: Vec<String> = Vec::new();
+     let mut extra_object_files: Vec<String> = Vec::new();
+     let mut soname: Option<String> = None;
++    let mut defsym_defs: Vec<(String, String)> = Vec::new();
+     let mut i = 0;
+     let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
+     while i < args.len() {
+@@ -203,6 +313,24 @@ pub fn link_shared(
+                     extra_lib_paths.push(lpath.to_string());
+                 } else if let Some(lib) = part.strip_prefix("-l") {
+                     libs_to_load.push(lib.to_string());
++                } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
++                    // --defsym=SYM=EXPR: alias, constant or arithmetic
++                    // expression (same semantics as the executable path).
++                    if let Some(eq_pos) = defsym_arg.find('=') {
++                        defsym_defs.push((
++                            defsym_arg[..eq_pos].to_string(),
++                            defsym_arg[eq_pos + 1..].to_string(),
++                        ));
++                    }
++                } else if part == "--defsym" && j + 1 < parts.len() {
++                    // Two-argument form: --defsym SYM=EXPR
++                    j += 1;
++                    if let Some(eq_pos) = parts[j].find('=') {
++                        defsym_defs.push((
++                            parts[j][..eq_pos].to_string(),
++                            parts[j][eq_pos + 1..].to_string(),
++                        ));
++                    }
+                 }
+                 j += 1;
+             }
+@@ -221,7 +349,6 @@ pub fn link_shared(
+     all_objs.extend(extra_object_files);
+ 
+     // Parse all input objects
+-    let defsym_defs: Vec<(String, String)> = Vec::new();
+     let (inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
+ 
+     // Merge sections
+@@ -233,6 +360,11 @@ pub fn link_shared(
+     let (mut global_symbols, _sym_resolution) =
+         resolve_symbols(&inputs, &output_sections, &section_map, &dynlib_syms);
+ 
++    // Apply --defsym definitions (same order and rationale as the executable
++    // path: aliases/constants take effect here, expressions are evaluated
++    // after the layout in `emit_shared_library_32`).
++    let pending_defsyms = apply_defsyms(&mut global_symbols, &defsym_defs)?;
++
+     // Load -l libraries (resolve into archives and load them)
+     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
+     let mut all_lib_paths: Vec<String> = extra_lib_paths;
+@@ -275,5 +407,6 @@ pub fn link_shared(
+         &needed_sonames,
+         output_path,
+         soname,
++        &pending_defsyms,
+     )
+ }
+diff --git a/src/backend/i686/linker/reloc.rs b/src/backend/i686/linker/reloc.rs
+index 2b628cb6..0a067c21 100644
+--- a/src/backend/i686/linker/reloc.rs
++++ b/src/backend/i686/linker/reloc.rs
+@@ -174,10 +174,69 @@ fn apply_one_reloc(
+             let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32;
+             (tpoff + addend) as u32
+         }
+-        R_386_TLS_IE => resolve_tls_ie(sym, sym_addr, addend, ctx),
+-        R_386_TLS_GOTIE => resolve_tls_gotie(sym, sym_addr, addend, ctx),
++        R_386_TLS_IE => {
++            // This function is reached only from the executable path
++            // (emit.rs).  The bare two-instruction IE form cannot be
++            // relaxed in place, so main-image locals are refused loudly
++            // instead of silently mislinked; everything else keeps the
++            // shared resolver's semantics.
++            if ctx.has_tls
++                && sym.sym_type == STT_TLS
++                && ctx.global_symbols.get(sym.name.as_str()).is_none()
++            {
++                return Err(format!(
++                    "TLS IE access to local symbol '{}' in {} is not supported; use @GOTNTPOFF",
++                    sym.name, obj.filename
++                ));
++            }
++            resolve_tls_ie(sym, sym_addr, addend, ctx)
++        }
++        R_386_TLS_GOTIE => {
++            // Executable-only relaxation: for a main-image TLS symbol
++            // (local, or a non-dynamic global) GNU ld rewrites the
++            // `mov slot(%ebx), %reg; add %gs:0, %reg` pair into the
++            // local-exec form; dynamic symbols keep the GOT slot path.
++            let main_image = match ctx.global_symbols.get(sym.name.as_str()) {
++                Some(gs) => !gs.is_dynamic,
++                None => sym.sym_type == STT_TLS,
++            };
++            if ctx.has_tls && main_image {
++                let tpoff =
++                    sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32 + addend;
++                relax_gotie_to_le(out_sec_idx, patch_offset, &sym.name, &obj.filename, ctx)?;
++                tpoff as u32
++            } else if ctx
++                .global_symbols
++                .get(sym.name.as_str())
++                .map(|gs| gs.is_dynamic)
++                .unwrap_or(false)
++            {
++                // A DSO variable reached through the one-instruction
++                // initial-exec form cannot be right at runtime: the slot
++                // would hold the variable's absolute address (GLOB_DAT) or
++                // its DSO-block offset, and the following `add %gs:0`
++                // adds the main executable's TP to whichever.  Only the
++                // GD sequence is valid for DSO TLS — refuse loudly.
++                return Err(format!(
++                    "initial-exec TLS access to dynamic symbol '{}' in {} is not valid for a shared-library TLS variable; the i686 linker supports main-image TLS (relaxed to local-exec) and nothing else",
++                    sym.name, obj.filename
++                ));
++            } else {
++                resolve_tls_gotie(sym, sym_addr, addend, ctx)
++            }
++        }
+         R_386_TLS_GD => {
+-            if ctx.has_tls && sym.sym_type == STT_TLS {
++            // Only main-image symbols can be relaxed (the relaxed form
++            // uses %gs:0, the main executable's TP).  A DSO TLS variable
++            // needs a tlsgd descriptor + ___tls_get_addr, which the i686
++            // linker does not emit — so a dynamic symbol here is refused
++            // loudly instead of being silently rewritten to an
++            // address that is off by the DSO's block position.
++            let gd_main_image = match ctx.global_symbols.get(sym.name.as_str()) {
++                Some(gs) => !gs.is_dynamic,
++                None => sym.sym_type == STT_TLS,
++            };
++            if ctx.has_tls && gd_main_image && sym.sym_type == STT_TLS {
+                 let tpoff =
+                     sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32 + addend;
+                 // GD→LE relaxation for executables (matches GNU ld's
+@@ -248,7 +307,10 @@ fn apply_one_reloc(
+                 }
+                 tpoff as u32
+             } else {
+-                addend as u32
++                return Err(format!(
++                    "general-dynamic TLS access to symbol '{}' in {}: the i686 linker has no tlsgd descriptor support for dynamic TLS symbols (main-image TLS is relaxed to local-exec instead)",
++                    sym.name, obj.filename
++                ));
+             }
+         }
+         R_386_TLS_DTPMOD32 => 1u32,
+@@ -359,6 +421,72 @@ pub(super) fn resolve_got_reloc(
+     }
+ }
+ 
++/// Rewrite the `mov disp32(%ebx), %reg` + `add %gs:0, %reg` pair into the
++/// local-exec form.  The pair is the i386 initial-exec sequence for a TLS
++/// address in the main image:
++///     movl  slot(%ebx), %reg    ; 8b /r disp32  (6 bytes; reloc at disp)
++///     addl  %gs:0, %reg         ; 65 03 modrm [00000000]
++/// GNU ld relaxes exactly this pair for main-image symbols to
++///     movl  $tpoff, %reg        ; c7 /0 imm32  (6 bytes, same footprint)
++///     addl  %gs:0, %reg         ; untouched
++/// so `reg = tpoff + TP = &var` with no GOT reference.  Only the two
++/// instruction bytes change; the 4-byte imm32 sits exactly at the reloc
++/// offset, so the caller's generic patch writes the tpoff value.
++///
++/// Encoding trap: `C7 /0` fixes the ModRM REG field to 000 and puts the
++/// destination in the r/m field, so the byte is `0xC0 | reg` (NOT
++/// `0xC0 | (reg << 3)` — that would select the undefined `C7 /reg` form
++/// and #UD on every register except %eax, where the two fields happen
++/// to coincide).
++fn relax_gotie_to_le(
++    out_sec_idx: usize,
++    patch_offset: u32,
++    name: &str,
++    filename: &str,
++    ctx: &mut RelocContext,
++) -> Result<(), String> {
++    let out_sec = &mut ctx.output_sections[out_sec_idx];
++    let off = patch_offset as usize;
++    // `mov disp32(%ebx), %reg`: opcode 8b at off-2, modrm mod=10 (disp32),
++    // base=%ebx (rm=011, no index/SIB).  rm=101 would be the disp32-only
++    // (no-base) form — an absolute load, NOT a GOT reference — and must
++    // never be relaxed.
++    if !(off >= 2
++        && off + 4 <= out_sec.data.len()
++        && out_sec.data[off - 2] == 0x8b
++        && (out_sec.data[off - 1] & 0xC7) == 0x83)
++    {
++        return Err(format!(
++            "cannot relax GOTIE reloc for TLS symbol '{}' in {}: expected `mov disp32(%ebx), %reg` at offset 0x{:x}",
++            name, filename, patch_offset
++        ));
++    }
++    let reg = ((out_sec.data[off - 1] >> 3) & 7) as u8;
++    // `add %gs:0, %reg` immediately after the mov.  The absolute
++    // `%gs:0` memory operand needs a disp32 in every encoding (mod=00
++    // rm=101), so the 7-byte form is the ONLY possible encoding:
++    //   65 03 <modrm mod=00 reg=%reg rm=101> 00 00 00 00   (7 bytes)
++    // (verified byte-for-byte against both GAS and lccc-as output).
++    // Opcode 0x03 with the GS prefix adds the memory operand to the
++    // REG-field register.
++    let has_add = off + 11 <= out_sec.data.len()
++        && out_sec.data[off + 4] == 0x65
++        && out_sec.data[off + 5] == 0x03
++        && (out_sec.data[off + 6] & 0xC7) == 0x05
++        && ((out_sec.data[off + 6] >> 3) & 7) == reg
++        && out_sec.data[off + 7..off + 11] == [0u8; 4];
++    if !has_add {
++        return Err(format!(
++            "cannot relax GOTIE reloc for TLS symbol '{}' in {}: the `mov slot(%ebx)` at offset 0x{:x} is not followed by `add %gs:0`",
++            name, filename, patch_offset
++        ));
++    }
++    // The `add %gs:0, %reg` is left in place, untouched.
++    out_sec.data[off - 2] = 0xc7;
++    out_sec.data[off - 1] = 0xC0 | reg;
++    Ok(())
++}
++
+ /// Resolve R_386_TLS_IE relocation.
+ pub(super) fn resolve_tls_ie(
+     sym: &InputSymbol,
+diff --git a/src/backend/i686/linker/shared.rs b/src/backend/i686/linker/shared.rs
+index 035bcf91..781b73f1 100644
+--- a/src/backend/i686/linker/shared.rs
++++ b/src/backend/i686/linker/shared.rs
+@@ -129,6 +129,7 @@ pub(super) fn emit_shared_library_32(
+     needed_sonames: &[String],
+     output_path: &str,
+     soname: Option<String>,
++    pending_defsyms: &[(String, String)],
+ ) -> Result<(), String> {
+     let base_addr: u32 = 0;
+ 
+@@ -398,6 +399,21 @@ pub(super) fn emit_shared_library_32(
+         }
+     }
+ 
++    // GOT entries for section-defined local symbols hold this image's own
++    // vaddrs and need R_386_RELATIVE (counted here because the layout must
++    // size .rel.dyn before the relocations are applied).  Absolute symbols
++    // (--defsym constants) are excluded: their slots hold the value itself,
++    // which must NOT receive the load bias.
++    let mut num_local_got_relative = 0usize;
++    for name in &got_names {
++        if let Some(gs) = global_symbols.get(name) {
++            if gs.is_defined && !gs.is_dynamic && gs.output_section < output_sections.len() {
++                num_local_got_relative += 1;
++            }
++        }
++    }
++    num_relative += num_local_got_relative;
++
+     let num_rel_dyn = num_relative + num_glob_dat;
+     let num_rel_plt = num_plt;
+ 
+@@ -749,6 +765,59 @@ pub(super) fn emit_shared_library_32(
+         }
+     }
+ 
++    // Seed all standard linker symbols (`end`, `edata`, `_etext`, …) so a
++    // `--defsym` expression can name one even when nothing else did (same
++    // rationale as the executable emitter), then evaluate any deferred
++    // `--defsym` expressions against the final layout addresses.
++    let bss_addr = if let Some(&idx) = section_name_to_idx.get(".bss") {
++        output_sections[idx].addr
++    } else {
++        data_seg_vaddr_end
++    };
++    let linker_addrs = LinkerSymbolAddresses {
++        base_addr: 0,
++        got_addr: got_base as u64,
++        dynamic_addr: dynamic_vaddr as u64,
++        bss_addr: bss_addr as u64,
++        bss_size: (data_seg_vaddr_end - bss_addr) as u64,
++        text_end: text_seg_vaddr_end as u64,
++        data_start: data_seg_vaddr_start as u64,
++        init_array_start: init_array_vaddr as u64,
++        init_array_size: init_array_size as u64,
++        fini_array_start: fini_array_vaddr as u64,
++        fini_array_size: fini_array_size as u64,
++        preinit_array_start: 0,
++        preinit_array_size: 0,
++        rela_iplt_start: 0,
++        rela_iplt_size: 0,
++    };
++    for sym in &get_standard_linker_symbols(&linker_addrs) {
++        if sym.name.starts_with("__rela_iplt") {
++            continue;
++        }
++        global_symbols.entry(sym.name.to_string()).or_insert(LinkerSymbol {
++            address: sym.value as u32,
++            size: 0,
++            sym_type: STT_NOTYPE,
++            binding: STB_GLOBAL,
++            visibility: STV_DEFAULT,
++            is_defined: true,
++            needs_plt: false,
++            needs_got: false,
++            output_section: usize::MAX,
++            section_offset: 0,
++            plt_index: 0,
++            got_index: 0,
++            is_dynamic: false,
++            dynlib: String::new(),
++            needs_copy: false,
++            copy_addr: 0,
++            version: None,
++            uses_textrel: false,
++        });
++    }
++    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)?;
++
+     // ── Apply relocations ─────────────────────────────────────────────────
+     // For shared libraries, we need to handle relocations differently:
+     // R_386_32 -> write resolved value, emit R_386_RELATIVE
+@@ -941,6 +1010,24 @@ pub(super) fn emit_shared_library_32(
+         }
+     }
+ 
++    // GOT entries for section-defined local symbols hold this image's own
++    // vaddrs.  The dynamic linker must add the load bias before the slot is
++    // usable, so each such slot needs an R_386_RELATIVE (the x86-64 emitter
++    // does the same for PIE self-references).  Without it, a PIC data load
++    // inside the .so dereferences the raw vaddr and segfaults (measured:
++    // a lccc-built .so's own `movl var@GOT(%ebx),%r; movl (%r),%r` read).
++    // Absolute symbols are excluded: their slots hold the value itself,
++    // which must NOT receive the load bias.
++    for name in &got_names {
++        if let Some(gs) = global_symbols.get(name) {
++            if gs.is_defined && !gs.is_dynamic && gs.output_section < output_sections.len() {
++                let got_entry_addr =
++                    got_vaddr + (got_reserved as u32 + (gs.got_index - num_plt) as u32) * 4;
++                relative_relocs.push(got_entry_addr);
++            }
++        }
++    }
++
+     // ── Build PLT ────────────────────────────────────────────────────────
+     let plt_data = build_plt(
+         num_plt,
+@@ -1048,13 +1135,21 @@ pub(super) fn emit_shared_library_32(
+         if let Some(gs) = global_symbols.get(name) {
+             if gs.is_defined {
+                 dynsym_entries[i + 1].value = gs.address;
+-                // Determine section index for dynsym
+-                if gs.output_section < output_sections.len() {
+-                    // Find the section number. For simplicity, mark as SHN_ABS=0xfff1
+-                    // Real implementations map to proper section indices but
+-                    // dynamic symbols usually don't need exact shndx
++                if gs.output_section >= output_sections.len() {
++                    // Absolute symbol (e.g. a --defsym constant or a
++                    // standard linker symbol): the dynamic linker uses the
++                    // value as-is, so it must be marked SHN_ABS.
+                     dynsym_entries[i + 1].shndx = SHN_ABS;
+                 }
++                // Section-defined symbols keep the placeholder shndx=1: it
++                // marks the symbol as defined (non-UNDEF), which is all the
++                // dynamic linker checks — it computes load-bias + value and
++                // never consults the actual section index (same convention
++                // as the x86-64 shared emitter).  Marking these SHN_ABS
++                // breaks position-independent resolution: the loader takes
++                // the raw value as an absolute address (measured: a call
++                // through such an entry jumped to a raw value and
++                // segfaulted).
+             }
+         }
+     }
+diff --git a/src/backend/i686/linker/types.rs b/src/backend/i686/linker/types.rs
+index 022b74dd..07c4aacd 100644
+--- a/src/backend/i686/linker/types.rs
++++ b/src/backend/i686/linker/types.rs
+@@ -14,7 +14,8 @@ pub(super) use crate::backend::elf::{
+     PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_DYNSYM,
+     SHT_FINI_ARRAY, SHT_GROUP, SHT_INIT_ARRAY, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL,
+     SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_FUNC,
+-    STT_GNU_IFUNC, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT, get_standard_linker_symbols,
++    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT,
++    get_standard_linker_symbols,
+     is_thin_archive, parse_archive_members, parse_linker_script_entries,
+     parse_thin_archive_members, read_cstr, read_i32, read_u16, read_u32,
+ };
+diff --git a/src/backend/x86/assembler/elf_writer.rs b/src/backend/x86/assembler/elf_writer.rs
+index a86f1ab4..ffa12cfd 100644
+--- a/src/backend/x86/assembler/elf_writer.rs
++++ b/src/backend/x86/assembler/elf_writer.rs
+@@ -192,6 +192,19 @@ impl X86Arch for X86_64Arch {
+         false
+     }
+ 
++    fn is_tls_reloc(reloc_type: u32) -> bool {
++        // x86-64 TLS relocation types (elf.h, EM_X86_64):
++        //   16 DTPMOD64, 17 DTPOFF64, 18 TPOFF64, 19 TLSGD, 20 TLSLD,
++        //   21 DTPOFF32, 22 GOTTPOFF, 23 TPOFF32,
++        //   34 GOTPC32_TLSDESC, 35 TLSDESC_CALL, 36 TLSDESC
++        // The binutils 2.41+ relaxable extensions (R_X86_64_GOTPCRELAT
++        // family and R_X86_64_CODE_{1,4,5,6}_* from 43 up) are NOT
++        // emitted by the lccc assembler, and folding here only ever sees
++        // relocations produced by it — external .o files are linker
++        // inputs, not folding inputs.
++        matches!(reloc_type, 16..=23 | 34..=36)
++    }
++
+     fn reloc_pc8_internal() -> Option<u32> {
+         Some(R_X86_64_PC8_INTERNAL)
+     }
+diff --git a/tests/linker/setup_oracles.sh b/tests/linker/setup_oracles.sh
+index 54d2b720..9fd88d22 100644
+--- a/tests/linker/setup_oracles.sh
++++ b/tests/linker/setup_oracles.sh
+@@ -242,7 +242,16 @@ else
+     git -C "$SRC/llvm-src" fetch --depth 1 origin "release/${LLD_MAJOR}.x" && \
+     git -C "$SRC/llvm-src" reset --hard FETCH_HEAD
+   fi
+-  cmake -S "$SRC/llvm-src/lld" -B "$SRC/llvm-src/lld/build" -G Ninja \
++  # Configure the MONOREPO root (llvm/), not the lld/ subdirectory: `cmake
++  # -S lld` runs find_package(LLVM) and happily adopts a DISTRO LLVM of a
++  # different major (e.g. Debian's llvm-19), after which lld's sources fail
++  # against their own newer headers (measured: DWARFDebugLine.h, 4-arg vs
++  # 5-arg constructor mismatch).  The monorepo build uses its own headers and
++  # libraries by construction — the only self-consistent setup.  The GCC
++  # driver is forced for the same reason: a distro clang can leak its private
++  # headers into the translation units.
++  cmake -S "$SRC/llvm-src/llvm" -B "$SRC/llvm-src/build" -G Ninja \
++        -DCMAKE_C_COMPILER=cc -DCMAKE_CXX_COMPILER=g++ \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DLLVM_TARGETS_TO_BUILD=X86 \
+         -DLLVM_ENABLE_PROJECTS=lld \
+@@ -250,11 +259,15 @@ else
+         -DLLVM_INCLUDE_BENCHMARKS=OFF \
+         -DLLVM_INCLUDE_EXAMPLES=OFF \
+         -DLLVM_ENABLE_ASSERTIONS=OFF \
++        -DLLVM_PARALLEL_LINK_JOBS=1 \
+         -DCMAKE_C_FLAGS="-O2 $NATIVE" \
+         -DCMAKE_CXX_FLAGS="-O2 $NATIVE" \
+         -DCMAKE_INSTALL_PREFIX="$SRC/llvm-inst"
+-  cmake --build "$SRC/llvm-src/lld/build" -j "$JOBS"
+-  cmake --install "$SRC/llvm-src/lld/build"
++  # The `lld` target drags in exactly the LLVM libraries it links against,
++  # not the rest of the toolchain's targets.
++  cmake --build "$SRC/llvm-src/build" --target lld -j "$JOBS"
++  cmake --install "$SRC/llvm-src/build" --component lld \
++      2>/dev/null || cmake --install "$SRC/llvm-src/build"
+   install -m755 "$SRC/llvm-inst/bin/lld" "$BIN/lld"
+   ln -sf lld "$BIN/ld.lld"
+   log "lld: $(\"$BIN/lld\" --version | head -1)"
+diff --git a/tests/regression/check_i686_tls_ie_relax.sh b/tests/regression/check_i686_tls_ie_relax.sh
+new file mode 100644
+index 00000000..26c54397
+--- /dev/null
++++ b/tests/regression/check_i686_tls_ie_relax.sh
+@@ -0,0 +1,220 @@
++#!/usr/bin/env bash
++# Regression gate for the i686 initial-exec TLS pipeline:
++#
++#   1. The assembler must keep the STT_TLS symbol in GOTIE relocations
++#      (local-label folding is value-identical for plain relocs but WRONG
++#      for TLS: a GOT-style TLS reloc is a whole-slot reference whose
++#      addend must stay 0, and on REL-format i686 the folded offset is
++#      baked into the instruction bytes and then clobbered by the
++#      linker's write — measured: first TLS touch segfaulted).
++#   2. The linker must relax the main-image
++#        movl slot(%ebx), %reg / addl %gs:0, %reg
++#      pair to the local-exec form
++#        movl $tpoff, %reg / addl %gs:0, %reg
++#      (the transform GNU ld applies), for local AND global main-image
++#      TLS variables alike.
++#   3. The linked program must run and print the expected values.
++set -euo pipefail
++cd "$(dirname "$0")/../.."
++ccc=${LCCC_BIN:-target/fastbuild/lccc}
++td=$(mktemp -d)
++trap 'rm -rf "$td"' EXIT
++
++cat >"$td/tls.c" <<'CEOF'
++#include <stdio.h>
++static __thread int le_var = 5;   /* local, offset 0 in the block */
++static __thread int mid_var = 6;  /* local, offset 4 */
++__thread int g_var = 9;           /* global, offset 8 */
++int main(void){
++    le_var += 1; mid_var += 1; g_var += 1;
++    printf("le=%d mid=%d g=%d\n", le_var, mid_var, g_var);
++    return (le_var == 6) && (mid_var == 7) && (g_var == 10) ? 0 : 1;
++}
++CEOF
++
++"$ccc" -m32 -O1 -c "$td/tls.c" -o "$td/tls.o"
++
++# ── 1. object structure: GOTIE relocs must reference STT_TLS symbols ──
++relocs=$(readelf -rW "$td/tls.o")
++if ! grep -q "R_386_TLS_GOTIE" <<<"$relocs"; then
++    echo "SKIP: no GOTIE relocations emitted (codegen changed?)"
++    exit 0
++fi
++for sym in $(readelf -rW "$td/tls.o" | awk '/R_386_TLS_GOTIE/{print $NF}'); do
++    case "$sym" in
++        .*)
++            echo "FAIL: GOTIE reloc references section symbol '$sym' (local-label folding leaked into a TLS reloc)"
++            exit 1
++            ;;
++    esac
++    kind=$(readelf -sW "$td/tls.o" | awk -v s="$sym" '$8==s {print $4; exit}')
++    if [ "$kind" != "TLS" ]; then
++        echo "FAIL: GOTIE reloc references '$sym' of type '$kind' (expected TLS)"
++        exit 1
++    fi
++done
++
++# ── 2. full link + runtime ──
++"$ccc" -m32 -O1 "$td/tls.c" -o "$td/tls_exe"
++out=$("$td/tls_exe")
++if [ "$out" != "le=6 mid=7 g=10" ]; then
++    echo "FAIL: i686 TLS runtime output '$out' (expected 'le=6 mid=7 g=10')"
++    exit 1
++fi
++
++# ── 3. the linked code must be relaxed: no live GOT load before the add ──
++# The relaxed `movl $tpoff, %reg` is 0xc7; the unrelaxed
++# `movl slot(%ebx), %reg` is 0x8b.  Count `add %gs:0` instructions whose
++# predecessor is still a disp32-based load — that must be zero for
++# main-image TLS.
++if command -v objdump >/dev/null 2>&1; then
++    unrelaxed=$(objdump -d "$td/tls_exe" | awk '
++        /add.*%gs:0/ { if (prev ~ /mov.*\(.*%ebx\)/) n++ }
++        { sub(/:.*$/, "", $0); prev = $0 }
++        END { print n + 0 }')
++    if [ "$unrelaxed" -gt 0 ]; then
++        echo "FAIL: $unrelaxed unrelaxed GOT-load TLS sequence(s) in main image"
++        exit 1
++    fi
++fi
++
++# ── 4. deterministic per-register probe (hand assembly) ──────────────────
++# The C7 /0 encoding trap: `movl $tpoff, %reg` after relaxation is C7 /0,
++# which fixes the ModRM REG field to 000 and puts the destination in the
++# r/m field.  Writing 0xC0|(reg<<3) instead emits the undefined C7 /reg
++# form and #UDs on every destination except %eax (where the two fields
++# coincide).  Drive every register through the GOTIE pair and check both
++# the exact relaxed bytes and the runtime value.
++cat >"$td/tls_regs.s" <<'SEOF'
++.section .tdata,"awT",@progbits
++.align 4
++.type rv0, @tls_object
++.size rv0, 4
++rv0: .long 1
++.type rv1, @tls_object
++.size rv1, 4
++rv1: .long 2
++.type rv2, @tls_object
++.size rv2, 4
++rv2: .long 3
++.type rv3, @tls_object
++.size rv3, 4
++rv3: .long 4
++.type rv4, @tls_object
++.size rv4, 4
++rv4: .long 5
++.type rv5, @tls_object
++.size rv5, 4
++rv5: .long 6
++.text
++.globl main
++.type main, @function
++main:
++    pushl %ebx
++    call __x86.get_pc_thunk.bx
++    addl $_GLOBAL_OFFSET_TABLE_, %ebx
++    movl rv0@GOTNTPOFF(%ebx), %eax
++    addl %gs:0, %eax
++    incl (%eax)
++    movl rv1@GOTNTPOFF(%ebx), %ecx
++    addl %gs:0, %ecx
++    incl (%ecx)
++    movl rv2@GOTNTPOFF(%ebx), %edx
++    addl %gs:0, %edx
++    incl (%edx)
++    movl rv3@GOTNTPOFF(%ebx), %esi
++    addl %gs:0, %esi
++    incl (%esi)
++    movl rv4@GOTNTPOFF(%ebx), %edi
++    addl %gs:0, %edi
++    incl (%edi)
++    movl rv5@GOTNTPOFF(%ebx), %ebp
++    addl %gs:0, %ebp
++    incl (%ebp)
++    popl %ebx
++    /* read back: acc = r0 + r1*10 + r2*100 + r3*1000 + r4*10000 + r5*100000 */
++    pushl %ebx
++    call __x86.get_pc_thunk.bx
++    addl $_GLOBAL_OFFSET_TABLE_, %ebx
++    movl rv0@GOTNTPOFF(%ebx), %eax
++    addl %gs:0, %eax
++    movl (%eax), %eax
++    movl rv1@GOTNTPOFF(%ebx), %ecx
++    addl %gs:0, %ecx
++    movl (%ecx), %edx
++    imull $10, %edx
++    addl %edx, %eax
++    movl rv2@GOTNTPOFF(%ebx), %ecx
++    addl %gs:0, %ecx
++    movl (%ecx), %edx
++    imull $100, %edx
++    addl %edx, %eax
++    movl rv3@GOTNTPOFF(%ebx), %esi
++    addl %gs:0, %esi
++    movl (%esi), %edx
++    imull $1000, %edx
++    addl %edx, %eax
++    movl rv4@GOTNTPOFF(%ebx), %esi
++    addl %gs:0, %esi
++    movl (%esi), %edx
++    imull $10000, %edx
++    addl %edx, %eax
++    movl rv5@GOTNTPOFF(%ebx), %esi
++    addl %gs:0, %esi
++    movl (%esi), %edx
++    imull $100000, %edx
++    addl %edx, %eax
++    popl %ebx
++    ret
++SEOF
++
++"$ccc" -m32 -O1 "$td/tls_regs.s" -o "$td/tls_regs"
++# Expected after the increments: 2 + 3*10 + 4*100 + 5*1000 + 6*10000 + 7*100000
++want=$(( 2 + 3*10 + 4*100 + 5*1000 + 6*10000 + 7*100000 ))
++got=$("$td/tls_regs"; echo $?)
++# main returns the value; the shell only keeps the low 8 bits — compare mod 256
++if [ $(( got % 256 )) -ne $(( want % 256 )) ]; then
++    echo "FAIL: per-register TLS probe returned $got (expected $want)"
++    exit 1
++fi
++
++# Static check: every C7 in the linked text must be the /0 form
++# (ModRM REG field == 000).  Any other C7 form is an undefined opcode.
++python3 - "$td/tls_regs" <<'PEOF'
++import subprocess, sys
++path = sys.argv[1]
++data = open(path, "rb").read()
++# Restrict the scan to the executable LOAD segment(s) so data bytes
++# (ELF header, .tdata, dynamic relocations) cannot false-positive.
++phdrs = subprocess.run(
++    ["readelf", "-lW", path], capture_output=True, text=True).stdout
++segs = []
++for line in phdrs.splitlines():
++    parts = line.split()
++    if len(parts) >= 8 and parts[0] == "LOAD" and "E" in parts[6:8]:
++        p_offset = int(parts[1], 16)
++        p_vaddr = int(parts[2], 16)
++        fsize = int(parts[4], 16)
++        segs.append((p_vaddr - p_offset, p_vaddr - p_offset + fsize))
++assert segs, "no executable LOAD segment found"
++bad = []
++for f0, f1 in segs:
++    i = f0
++    while True:
++        i = data.find(b"\xc7", i, f1)
++        if i < 0 or i + 1 >= f1:
++            break
++        modrm = data[i + 1]
++        if (modrm >> 3) & 7:
++            bad.append(i)
++        i += 1
++if bad:
++    print("FAIL: C7 bytes with non-zero ModRM REG field at file offsets:",
++          ", ".join(hex(b) for b in bad[:8]))
++    sys.exit(1)
++PEOF
++if [ $? -ne 0 ]; then
++    exit 1
++fi
++
++echo "OK: i686 TLS IE relaxation (GOTIE keeps STT_TLS symbols; main-image pair relaxed; per-register C7 /0 encoding; runtime correct)"
