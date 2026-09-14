@@ -1,6 +1,10 @@
 #!/usr/bin/env fish
 
 # build-llvm-ultimate.v26.fish
+# Integrated i386 PGO runtime support: native fish, no external repair helpers.
+# Linux x86-64 default: BUILD_I386_PROFILE_RUNTIME=1, I386_PROFILE_JOBS=4.
+# Arch prerequisite: multilib enabled, lib32-glibc, lib32-gcc-libs, gcc.
+# Final checks exercise ELF32 IR-PGO and CS-PGO with LTO; logs are retained.
 #
 # Modernized multi-stage LLVM build pipeline for the ms178 patch stack.
 #
@@ -547,6 +551,16 @@ set -q KEEP_PRE_BOLT_BACKUP; or set -g KEEP_PRE_BOLT_BACKUP 0
 set -q REQUIRE_GOLD_PLUGIN; or set -g REQUIRE_GOLD_PLUGIN 1
 set -q LLVM_ENABLE_BINDINGS; or set -g LLVM_ENABLE_BINDINGS OFF
 set -q BUILD_COMPILER_RT; or set -g BUILD_COMPILER_RT 1
+# Linux x86-64 users need lib32-glibc/lib32-gcc-libs (Arch multilib) for -m32 PGO.
+# Default follows the runtime-build switch; explicitly opting out removes -m32
+# PGO coverage, not the native compiler's ability to generate 32-bit code.
+set -q BUILD_I386_PROFILE_RUNTIME; or set -g BUILD_I386_PROFILE_RUNTIME "$BUILD_COMPILER_RT"
+set -q I386_PROFILE_JOBS; or set -g I386_PROFILE_JOBS 4
+contains -- "$BUILD_I386_PROFILE_RUNTIME" 0 1; or die "BUILD_I386_PROFILE_RUNTIME must be 0 or 1"
+string match -qr '^[1-9][0-9]*$' -- "$I386_PROFILE_JOBS"; or die "I386_PROFILE_JOBS must be a positive integer"
+if test "$BUILD_I386_PROFILE_RUNTIME" = 1; and test "$BUILD_COMPILER_RT" != 1
+    die "BUILD_I386_PROFILE_RUNTIME=1 requires BUILD_COMPILER_RT=1"
+end
 set -q BUILD_STAGE1_COMPILER_RT; or set -g BUILD_STAGE1_COMPILER_RT 1
 set -q COMPILER_RT_BUILD_SANITIZERS; or set -g COMPILER_RT_BUILD_SANITIZERS OFF
 set -q COMPILER_RT_BUILD_XRAY; or set -g COMPILER_RT_BUILD_XRAY OFF
@@ -832,6 +846,21 @@ if test $_probe_c_status -ne 0; or test $_probe_cxx_status -ne 0
     cat "$_host_probe_log" >&2
     die "host compiler cannot compile/link with COMMON_FLAGS_LIST and lld"
 end
+# Fail before the expensive bootstrap if requested i386 support is impossible.
+# These plain probes do NOT require a host i386 profiling runtime.
+if test "$BUILD_I386_PROFILE_RUNTIME" = 1; and string match -qr '^x86_64-.*linux' -- ("$HOST_CLANG" -dumpmachine)
+    "$HOST_CLANG" -m32 -O0 -fuse-ld=lld -B"$_host_lld_dir" "$_host_probe_dir/probe.c" -o "$_host_probe_dir/probe-c32" >>"$_host_probe_log" 2>&1
+    set -l c32_status $status
+    "$HOST_CLANGXX" -m32 -O0 -std=c++17 -fuse-ld=lld -B"$_host_lld_dir" "$_host_probe_dir/probe.cpp" -o "$_host_probe_dir/probe-cxx32" >>"$_host_probe_log" 2>&1
+    set -l cxx32_status $status
+    if test $c32_status -ne 0; or test $cxx32_status -ne 0
+        cat "$_host_probe_log" >&2
+        die "i386 C/C++ prerequisites missing. On Arch enable multilib and install lib32-glibc, lib32-gcc-libs and gcc. Check configured runtime/CRT paths too. Set BUILD_I386_PROFILE_RUNTIME=0 only to deliberately omit 32-bit PGO support."
+    end
+    "$_host_probe_dir/probe-c32"; or die "Host cannot execute 32-bit C binaries; check the i386 loader/libc and kernel compatibility support"
+    "$_host_probe_dir/probe-cxx32"; or die "Host cannot execute 32-bit C++ binaries; check the i386 loader/libstdc++"
+    log "i386 C/C++ link and execution prerequisites passed."
+end
 rm -rf "$_host_probe_dir"
 
 set -g CMAKE_POLICY_ARGS
@@ -1038,6 +1067,142 @@ function configure_clean
     end
     assert_clean_cmake_log "$cmake_log" "$bdir"
 end
+
+# Native fish implementation: no companion repair script is required.
+# Keep this runtime free of application PGO/LTO/native-ISA flags. Function-local
+# exported variables restore the caller's environment automatically on return.
+function build_final_i386_profile_runtime --argument-names ClangPath SourceDir WorkDir BuilderPath Jobs
+    set -lx CC ""
+    set -lx CXX ""
+    set -lx CFLAGS ""
+    set -lx CXXFLAGS ""
+    set -lx CPPFLAGS ""
+    set -lx LDFLAGS ""
+    set -lx CCLDFLAGS ""
+    set -lx CXXLDFLAGS ""
+    set -lx ASFLAGS ""
+    set -lx LLVM_PROFILE_FILE ""
+    set -lx LD_PRELOAD ""
+    set -lx LC_ALL C
+
+    string match -qr '^[1-9][0-9]*$' -- "$Jobs"; or die "I386_PROFILE_JOBS must be a positive integer"
+    set -l builder_bin (dirname "$BuilderPath")
+    set -l final_bin (dirname "$ClangPath")
+    set -l prefix (dirname "$final_bin")
+    set -l ar "$builder_bin/llvm-ar"
+    set -l profdata "$final_bin/llvm-profdata"
+    set -l readelf "$builder_bin/llvm-readelf"
+    if not test -x "$readelf"
+        set readelf (command -s readelf)
+    end
+    for tool in "$ClangPath" "$BuilderPath" "$builder_bin/clang++" "$builder_bin/ld.lld" "$final_bin/ld.lld" "$ar" "$builder_bin/llvm-ranlib" "$profdata" "$readelf"
+        test -x "$tool"; or die "i386 profile runtime: required executable missing: $tool"
+    end
+    test -f "$SourceDir/runtimes/CMakeLists.txt"; or die "i386 profile runtime: missing LLVM runtimes source"
+    test -f "$SourceDir/compiler-rt/lib/profile/CMakeLists.txt"; or die "i386 profile runtime: missing compiler-rt profile source"
+    test -d "$WorkDir"; or die "i386 profile runtime: missing private work directory: $WorkDir"
+
+    set -l resource ("$ClangPath" -print-resource-dir)
+    test $status -eq 0; or die "Cannot query final Clang resource directory"
+    string match -qr '^/' -- "$resource"; or die "Expected an absolute Clang resource directory, got: $resource"
+    set -l triple ("$ClangPath" -m32 -print-target-triple)
+    test $status -eq 0; or die "Cannot query final Clang 32-bit target"
+    string match -qr '^i[3-6]86-[^-]+-linux-.+$' -- "$triple"; or die "Unexpected i386 Linux target: $triple"
+    log "i386 profiling runtime: target=$triple resource=$resource; clean compiler=$BuilderPath"
+
+    # Exercise a branch and an indirect call, not just an empty instrumented main.
+    set -l source "$WorkDir/probe.c"
+    printf '%s\n' \
+        '#include <stdint.h>' \
+        '_Static_assert(sizeof(void *) == 4, "32-bit target required");' \
+        '__attribute__((noinline)) int work(int x) { return x > 2 ? x * 3 : x + 7; }' \
+        'int main(int argc, char **argv) {' \
+        '  (void)argv; int (*volatile fn)(int) = work;' \
+        '  return fn(argc) != (argc > 2 ? argc * 3 : argc + 7);' \
+        '}' >"$source"; or die "Cannot write i386 runtime probe"
+    # Do not hide missing 32-bit CRT/libgcc/libc/loader behind static try-compiles.
+    "$BuilderPath" --target="$triple" -m32 -fuse-ld=lld -B"$builder_bin" "$source" -o "$WorkDir/plain-probe"
+    if test $status -ne 0
+        die "i386 link prerequisite failed. On Arch enable multilib and install lib32-glibc, lib32-gcc-libs and gcc. Runtime log: $WorkDir/runtime.log"
+    end
+    "$WorkDir/plain-probe"; or die "Cannot execute ELF32 programs; check the 32-bit loader/libc and kernel compatibility support"
+    run "$WorkDir/plain-probe" exercise branch
+
+    configure_clean "$WorkDir/cmake" -S "$SourceDir/runtimes" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="$prefix" \
+        -DLLVM_ENABLE_RUNTIMES=compiler-rt \
+        -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=ON \
+        -DLLVM_HOST_TRIPLE="$triple" \
+        -DLLVM_DEFAULT_TARGET_TRIPLE="$triple" \
+        -DCOMPILER_RT_INSTALL_PATH="$resource" \
+        -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+        -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+        -DCOMPILER_RT_BUILD_PROFILE=ON \
+        -DCOMPILER_RT_BUILD_BUILTINS=OFF \
+        -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+        -DCOMPILER_RT_BUILD_XRAY=OFF \
+        -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+        -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+        -DCOMPILER_RT_BUILD_ORC=OFF \
+        -DCOMPILER_RT_BUILD_GWP_ASAN=OFF \
+        -DCOMPILER_RT_USE_BUILTINS_LIBRARY=OFF \
+        -DCMAKE_C_COMPILER="$BuilderPath" \
+        -DCMAKE_CXX_COMPILER="$builder_bin/clang++" \
+        -DCMAKE_ASM_COMPILER="$BuilderPath" \
+        -DCMAKE_C_COMPILER_TARGET="$triple" \
+        -DCMAKE_CXX_COMPILER_TARGET="$triple" \
+        -DCMAKE_ASM_COMPILER_TARGET="$triple" \
+        -DCMAKE_AR="$ar" \
+        -DCMAKE_RANLIB="$builder_bin/llvm-ranlib" \
+        -DCMAKE_C_FLAGS="-O2 -fPIC -fno-lto" \
+        -DCMAKE_CXX_FLAGS="-O2 -fPIC -fno-lto" \
+        -DCMAKE_ASM_FLAGS="-fPIC -fno-lto" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -B$builder_bin" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -B$builder_bin" \
+        -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=lld -B$builder_bin"
+    run_ninja_logged "$WorkDir/cmake" -j "$Jobs" install-profile
+
+    set -l archive "$resource/lib/$triple/libclang_rt.profile.a"
+    test -s "$archive"; or die "i386 profile archive was not installed where Clang expects it: $archive"
+    run "$ar" t "$archive" >"$WorkDir/archive-members.txt"
+    set -l members (cat "$WorkDir/archive-members.txt")
+    test (count $members) -gt 0; or die "Empty i386 profile archive: $archive"
+    run "$ar" p "$archive" "$members[1]" >"$WorkDir/member.o"
+    run "$readelf" -h "$WorkDir/member.o" >"$WorkDir/member-header.txt"
+    grep -Eq 'Class:[[:space:]]+ELF32' "$WorkDir/member-header.txt"; or die "Profile archive is not ELF32: $archive"
+    grep -Eq 'Machine:.*Intel 80386' "$WorkDir/member-header.txt"; or die "Profile archive is not i386: $archive"
+
+    # Use the final installed driver and its companion LLD/profdata. Fresh work
+    # directories prevent stale profiles from making any of these checks pass.
+    set -l flags -m32 -O2 -flto -fuse-ld=lld -B"$final_bin"
+    run "$ClangPath" $flags -fprofile-generate "$source" -o "$WorkDir/pgo-probe"
+    run env LLVM_PROFILE_FILE="$WorkDir/ir-1.profraw" "$WorkDir/pgo-probe"
+    run env LLVM_PROFILE_FILE="$WorkDir/ir-3.profraw" "$WorkDir/pgo-probe" exercise branch
+    for raw in "$WorkDir/ir-1.profraw" "$WorkDir/ir-3.profraw"
+        test -s "$raw"; or die "i386 IR-PGO execution did not produce a profile: $raw"
+    end
+    run "$profdata" merge -o "$WorkDir/ir.profdata" "$WorkDir/ir-1.profraw" "$WorkDir/ir-3.profraw"
+    run "$profdata" show "$WorkDir/ir.profdata"
+    run "$ClangPath" $flags -fprofile-use="$WorkDir/ir.profdata" "$source" -o "$WorkDir/use-probe"
+    run "$WorkDir/use-probe"
+    run "$WorkDir/use-probe" exercise branch
+    run "$ClangPath" $flags -fprofile-use="$WorkDir/ir.profdata" -fcs-profile-generate "$source" -o "$WorkDir/cs-probe"
+    run env LLVM_PROFILE_FILE="$WorkDir/cs-1.profraw" "$WorkDir/cs-probe"
+    run env LLVM_PROFILE_FILE="$WorkDir/cs-3.profraw" "$WorkDir/cs-probe" exercise branch
+    for raw in "$WorkDir/cs-1.profraw" "$WorkDir/cs-3.profraw"
+        test -s "$raw"; or die "i386 CS-PGO execution did not produce a profile: $raw"
+    end
+    run "$profdata" merge -o "$WorkDir/merged.profdata" "$WorkDir/ir.profdata" "$WorkDir/cs-1.profraw" "$WorkDir/cs-3.profraw"
+    run "$profdata" show "$WorkDir/merged.profdata"
+    run "$profdata" show --showcs "$WorkDir/merged.profdata" >"$WorkDir/cs-summary.txt"
+    grep -Eq '^Total functions:[[:space:]]+[1-9][0-9]*' "$WorkDir/cs-summary.txt"; or die "Merged i386 profile contains no context-sensitive function data"
+    run "$ClangPath" $flags -fprofile-use="$WorkDir/merged.profdata" "$source" -o "$WorkDir/final-probe"
+    run "$WorkDir/final-probe"
+    run "$WorkDir/final-probe" exercise branch
+    log "PASS: installed $archive; ELF32, IR-PGO and CS-PGO with LTO generate/run/merge/use verified."
+end
+
 
 set -g GOLD_CMAKE_ARGS
 if test -n "$LLVM_BINUTILS_INCDIR"
@@ -1590,17 +1755,24 @@ if test "$BUILD_COMPILER_RT" = 1
     rm -rf "$_final_pgo_probe"
     log "Final compiler-rt/profile runtime probe passed."
 
-    # The native runtime above does not provide -m32 PGO support.
-    # Linux x86-64 desktop builds default to installing the i386 profile runtime.
-    set -q BUILD_I386_PROFILE_RUNTIME; or set -g BUILD_I386_PROFILE_RUNTIME 1
-    if test "$BUILD_I386_PROFILE_RUNTIME" = 1; and string match -qr '^x86_64-.*linux' -- "$FINAL_TARGET_TRIPLE"
-        set -l i386_helper "$SCRIPT_DIR/repair-i386-profile-runtime.sh"
-        test -f "$i386_helper"; or die "Missing i386 profile runtime helper: $i386_helper"
-        set -l i386_work (mktemp -d "$BUILD_ROOT/compiler-rt-i386-profile.XXXXXXXX")
-        test -d "$i386_work"; or die "Could not create i386 runtime build directory"
-        log ">>> Stage 5c: install and execute-test the final Clang i386 PGO runtime..."
-        run bash "$i386_helper" "$FINAL_CLANG" "$LLVM_SRC" "$i386_work/build" "$STAGE1_CLANG"
+    # The native runtime does not supply the archive selected by clang -m32.
+    if test "$BUILD_I386_PROFILE_RUNTIME" = 1
+        if string match -qr '^x86_64-.*linux' -- "$FINAL_TARGET_TRIPLE"
+            set -l i386_work (mktemp -d "$BUILD_ROOT/compiler-rt-i386-profile.XXXXXXXX")
+            test -d "$i386_work"; or die "Could not create i386 runtime work directory"
+            log ">>> Stage 5c: native fish i386 profile runtime build and PGO/CS-PGO/LTO validation..."
+            build_final_i386_profile_runtime "$FINAL_CLANG" "$LLVM_SRC" "$i386_work" "$STAGE1_CLANG" "$I386_PROFILE_JOBS" 2>&1 | tee "$i386_work/runtime.log"
+            set -l i386_status $pipestatus
+            if test "$i386_status[1]" -ne 0; or test "$i386_status[2]" -ne 0
+                die "i386 profile runtime build/validation failed (log: $i386_work/runtime.log)"
+            end
+        else
+            log "i386 profile runtime stage is only applicable to Linux x86-64; skipping $FINAL_TARGET_TRIPLE."
+        end
+    else
+        log "BUILD_I386_PROFILE_RUNTIME=0: 32-bit PGO runtime installation was explicitly disabled."
     end
+
 else
     log "BUILD_COMPILER_RT=0: skipping post-install compiler-rt runtime build."
 end
