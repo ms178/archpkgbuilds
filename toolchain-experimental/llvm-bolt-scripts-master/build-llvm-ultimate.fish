@@ -1589,6 +1589,18 @@ if test "$BUILD_COMPILER_RT" = 1
     end
     rm -rf "$_final_pgo_probe"
     log "Final compiler-rt/profile runtime probe passed."
+
+    # The native runtime above does not provide -m32 PGO support.
+    # Linux x86-64 desktop builds default to installing the i386 profile runtime.
+    set -q BUILD_I386_PROFILE_RUNTIME; or set -g BUILD_I386_PROFILE_RUNTIME 1
+    if test "$BUILD_I386_PROFILE_RUNTIME" = 1; and string match -qr '^x86_64-.*linux' -- "$FINAL_TARGET_TRIPLE"
+        set -l i386_helper "$SCRIPT_DIR/repair-i386-profile-runtime.sh"
+        test -f "$i386_helper"; or die "Missing i386 profile runtime helper: $i386_helper"
+        set -l i386_work (mktemp -d "$BUILD_ROOT/compiler-rt-i386-profile.XXXXXXXX")
+        test -d "$i386_work"; or die "Could not create i386 runtime build directory"
+        log ">>> Stage 5c: install and execute-test the final Clang i386 PGO runtime..."
+        run bash "$i386_helper" "$FINAL_CLANG" "$LLVM_SRC" "$i386_work/build" "$STAGE1_CLANG"
+    end
 else
     log "BUILD_COMPILER_RT=0: skipping post-install compiler-rt runtime build."
 end
