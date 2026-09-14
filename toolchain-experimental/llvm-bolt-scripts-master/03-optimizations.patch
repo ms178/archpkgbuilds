@@ -2957,7 +2957,7 @@ index 5215bb0704..8093990b2a 100644
      SDValue LowerSETCC(SDValue Op, SelectionDAG &DAG) const;
      SDValue LowerSETCCCARRY(SDValue Op, SelectionDAG &DAG) const;
 diff --git a/llvm/lib/Target/X86/X86ISelLoweringCall.cpp b/llvm/lib/Target/X86/X86ISelLoweringCall.cpp
-index 9a03da14ee..f04591ad58 100644
+index 9a03da14ee..0b51e212e7 100644
 --- a/llvm/lib/Target/X86/X86ISelLoweringCall.cpp
 +++ b/llvm/lib/Target/X86/X86ISelLoweringCall.cpp
 @@ -2084,6 +2084,29 @@ X86TargetLowering::ByValCopyKind X86TargetLowering::ByValNeedsCopyForTailCall(
@@ -3007,6 +3007,25 @@ index 9a03da14ee..f04591ad58 100644
        FI = MF.getFrameInfo().CreateFixedObject(OpSize, Offset, true);
        FIN = DAG.getFrameIndex(FI, getPointerTy(DAG.getDataLayout()));
  
+@@ -2606,6 +2635,18 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
+         GA->getGlobal(), dl, GA->getValueType(0), 0, X86II::MO_NO_FLAG);
+   }
+ 
++  if (Is64Bit && !Subtarget.isTarget64BitILP32() &&
++      Callee.getValueType() == MVT::i32) {
++    // On 64-bit targets, extend 32-bit MS __ptr32 callees before the call.
++    // Use sign-extension for __sptr and zero-extension for __uptr.
++    assert(CB && "CallBase expected for 32-bit callee");
++    ISD::NodeType ExtOpc = ISD::SIGN_EXTEND;
++    unsigned AS = CB->getCalledOperand()->getType()->getPointerAddressSpace();
++    if (AS == X86AS::PTR32_UPTR)
++      ExtOpc = ISD::ZERO_EXTEND;
++    Callee = DAG.getNode(ExtOpc, dl, MVT::i64, Callee);
++  }
++
+   SmallVector<SDValue, 8> Ops;
+ 
+   if (!IsSibcall && isTailCall && !IsMustTail) {
 diff --git a/llvm/lib/Target/X86/X86InstrInfo.cpp b/llvm/lib/Target/X86/X86InstrInfo.cpp
 index ca864d02b3..f1ec644f0b 100644
 --- a/llvm/lib/Target/X86/X86InstrInfo.cpp
@@ -3944,8 +3963,175 @@ index 422e4aad23..132ff0e5ba 100644
  
    InstructionCost getMinMaxCost(Intrinsic::ID IID, Type *Ty,
                                  TTI::TargetCostKind CostKind,
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp
+index 317d587dde..6cdc1f0260 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp
+@@ -1984,6 +1984,22 @@ Instruction *InstCombinerImpl::visitAdd(BinaryOperator &I) {
+     I.setHasNoUnsignedWrap(true);
+   }
+ 
++  // X + umax(X, 1) --> umax(X << 1, 1) if X + X does not overflow.
++  if (match(&I, m_c_Add(m_Value(A), m_OneUse(m_c_UMax(m_Value(B), m_One())))) &&
++      A == B) {
++    auto Cache = A == LHSCache ? LHSCache : RHSCache;
++    auto One = ConstantInt::get(Ty, 1);
++    bool NoUW =
++        I.hasNoUnsignedWrap() || willNotOverflowUnsignedAdd(Cache, Cache, I);
++    // Do not apply this transformation if the original add might overflow.
++    if (NoUW || I.hasNoSignedWrap())
++      return replaceInstUsesWith(
++          I, Builder.CreateIntrinsic(
++                 Intrinsic::umax, {Ty},
++                 {One, Builder.CreateShl(A, One, "mul2", NoUW,
++                                         I.hasNoSignedWrap())}));
++  }
++
+   if (Instruction *V = canonicalizeLowbitMask(I, Builder))
+     return V;
+ 
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp
+index 7fd49370fa..b674072ac2 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp
+@@ -4997,8 +4997,15 @@ static Instruction *visitMaskedMerge(BinaryOperator &I,
+   Value *NotM;
+   if (match(M, m_Not(m_Value(NotM)))) {
+     // De-invert the mask and swap the value in B part.
+-    Value *NewA = Builder.CreateAnd(D, NotM);
+-    return BinaryOperator::CreateXor(NewA, X);
++    // If X isn't already known undef-free then freeze it.
++    Value *NewX = X;
++    Value *NewD = D;
++    if (!isGuaranteedNotToBeUndef(X)) {
++      NewX = Builder.CreateFreeze(X);
++      NewD = Builder.CreateXor(B, NewX);
++    }
++    Value *NewA = Builder.CreateAnd(NewD, NotM);
++    return BinaryOperator::CreateXor(NewA, NewX);
+   }
+ 
+   Constant *C;
+@@ -5461,6 +5468,18 @@ Instruction *InstCombinerImpl::visitXor(BinaryOperator &I) {
+   if (Instruction *R = foldBinOpShiftWithShift(I))
+     return R;
+ 
++  // ((X ^ SignMask) >>u ShiftAmt) ^ SignMask --> X >>s ShiftAmt
++  // where SignMask = X >>s (BitWidth - 1).
++  Value *Base, *SignMask, *ShiftAmt;
++  if (match(&I, m_c_Xor(m_Value(SignMask),
++                        m_OneUse(
++                            m_LShr(m_c_Xor(m_Deferred(SignMask), m_Value(Base)),
++                                   m_Value(ShiftAmt))))) &&
++      match(SignMask, m_AShr(m_Specific(Base),
++                             m_SpecificIntAllowPoison(
++                                 I.getType()->getScalarSizeInBits() - 1))))
++    return BinaryOperator::CreateAShr(Base, ShiftAmt);
++
+   Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);
+   Value *X, *Y, *M;
+ 
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp
+index d0c9c159a3..03db0896ec 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp
+@@ -7873,6 +7873,20 @@ Instruction *InstCombinerImpl::foldICmpCommutative(CmpPredicate Pred,
+     }
+   }
+ 
++  {
++    // For a nonzero constant C:
++    // usub.sat(X, C) == X  --> X == 0
++    // usub.sat(X, C) != X  --> X != 0
++    // usub.sat(X, C) <  X  --> X != 0
++    if (match(Op0, m_Intrinsic<Intrinsic::usub_sat>(m_Specific(Op1),
++                                                    m_NonZeroInt())) &&
++        (CmpInst::isEquality(Pred) || Pred == ICmpInst::ICMP_ULT)) {
++      ICmpInst::Predicate NewPred =
++          CmpInst::isEquality(Pred) ? Pred.dropSameSign() : ICmpInst::ICMP_NE;
++      return new ICmpInst(NewPred, Op1, Constant::getNullValue(Op1->getType()));
++    }
++  }
++
+   const SimplifyQuery Q = SQ.getWithInstruction(&CxtI);
+   if (Value *V = foldICmpWithLowBitMaskedVal(Pred, Op0, Op1, Q, *this))
+     return replaceInstUsesWith(CxtI, V);
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp
+index 7e32abcd6e..ad34bd17da 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp
+@@ -474,31 +474,53 @@ Instruction *InstCombinerImpl::commonShiftTransforms(BinaryOperator &I) {
+         (-*AddC).ult(BitWidth)) {
+       unsigned PosOffset = (-*AddC).getZExtValue();
+ 
+-      auto isSuitableForPreShift = [PosOffset, &I, AC]() {
++      auto isRoundtrippable = [PosOffset, &I, AC]() {
+         switch (I.getOpcode()) {
+         default:
+           return false;
+         case Instruction::Shl:
+-          return (I.hasNoSignedWrap() || I.hasNoUnsignedWrap()) &&
+-                 AC->eq(AC->lshr(PosOffset).shl(PosOffset));
++          return AC->eq(AC->lshr(PosOffset).shl(PosOffset));
+         case Instruction::LShr:
+-          return I.isExact() && AC->eq(AC->shl(PosOffset).lshr(PosOffset));
++          return AC->eq(AC->shl(PosOffset).lshr(PosOffset));
+         case Instruction::AShr:
+-          return I.isExact() && AC->eq(AC->shl(PosOffset).ashr(PosOffset));
++          return AC->eq(AC->shl(PosOffset).ashr(PosOffset));
+         }
+       };
+-      if (isSuitableForPreShift()) {
+-        Constant *NewC = ConstantInt::get(Ty, I.getOpcode() == Instruction::Shl
+-                                                  ? AC->lshr(PosOffset)
+-                                                  : AC->shl(PosOffset));
+-        BinaryOperator *NewShiftOp =
+-            BinaryOperator::Create(I.getOpcode(), NewC, A);
+-        if (I.getOpcode() == Instruction::Shl) {
+-          NewShiftOp->setHasNoUnsignedWrap(I.hasNoUnsignedWrap());
+-        } else {
+-          NewShiftOp->setIsExact();
++
++      if (isRoundtrippable()) {
++        // The shift flags (exact/nsw/nuw) guarantee correctness for any
++        // shift amount. Without them, we need X to be known less than
++        // BitWidth to avoid converting a defined result to poison.
++        bool HasShiftFlags;
++        switch (I.getOpcode()) {
++        default:
++          HasShiftFlags = false;
++          break;
++        case Instruction::Shl:
++          HasShiftFlags = I.hasNoSignedWrap() || I.hasNoUnsignedWrap();
++          break;
++        case Instruction::LShr:
++        case Instruction::AShr:
++          HasShiftFlags = I.isExact();
++          break;
++        }
++
++        if (HasShiftFlags ||
++            computeKnownBits(A, &I).getMaxValue().ult(BitWidth)) {
++          Constant *NewC = ConstantInt::get(
++              Ty, I.getOpcode() == Instruction::Shl ? AC->lshr(PosOffset)
++                                                    : AC->shl(PosOffset));
++          BinaryOperator *NewShiftOp =
++              BinaryOperator::Create(I.getOpcode(), NewC, A);
++          if (HasShiftFlags) {
++            if (I.getOpcode() == Instruction::Shl) {
++              NewShiftOp->setHasNoUnsignedWrap(I.hasNoUnsignedWrap());
++            } else {
++              NewShiftOp->setIsExact();
++            }
++          }
++          return NewShiftOp;
+         }
+-        return NewShiftOp;
+       }
+     }
+ 
 diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
-index 0182eb7c78..80dd660259 100644
+index 0182eb7c78..fbe649be6f 100644
 --- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
 +++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
 @@ -107,6 +107,7 @@
@@ -4047,6 +4233,14 @@ index 0182eb7c78..80dd660259 100644
    SmallVector<int64_t> SortedOffsetsFromBase(Sz);
    // Go through `PointerOps` in sorted order and record offsets from
    // PointerOps[0]. We use PointerOps[0] rather than Ptr0 because
+@@ -23255,6 +23285,7 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
+              "Cannot vectorize Instruction::Select");
+       Value *V =
+           Builder.CreateSelectWithUnknownProfile(Cond, True, False, DEBUG_TYPE);
++      V = PropagateIRFlags(V);
+       V = FinalShuffle(V, E);
+ 
+       E->VectorizedValue = V;
 diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer/SLPMemoryUtils.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer/SLPMemoryUtils.cpp
 index 382adb71ce..d07ddd62e7 100644
 --- a/llvm/lib/Transforms/Vectorize/SLPVectorizer/SLPMemoryUtils.cpp
@@ -5110,6 +5304,74 @@ index 8fc7c8e8f5..ce7e9f252f 100644
 +    CMP8ri %0, -1, implicit-def $eflags
 +    $bl = SETCCr 6, implicit $eflags
 +...
+diff --git a/llvm/test/CodeGen/X86/ptr32-call.ll b/llvm/test/CodeGen/X86/ptr32-call.ll
+new file mode 100644
+index 0000000000..a88d7b8b46
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/ptr32-call.ll
+@@ -0,0 +1,62 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
++; RUN: llc -mtriple=x86_64-unknown-linux-gnu < %s | FileCheck %s
++
++; Tail call through addrspace(270) (__ptr32 __sptr) function pointer.
++; The callee should be sign-extended from i32 to i64.
++define i32 @tailcall_sptr(ptr addrspace(270) %fptr, i32 %arg) {
++; CHECK-LABEL: tailcall_sptr:
++; CHECK:       # %bb.0: # %entry
++; CHECK-NEXT:    movslq %edi, %rax
++; CHECK-NEXT:    movl %esi, %edi
++; CHECK-NEXT:    jmpq *%rax # TAILCALL
++entry:
++  %call = tail call addrspace(270) i32 %fptr(i32 %arg)
++  ret i32 %call
++}
++
++; Tail call through addrspace(271) (__ptr32 __uptr) function pointer.
++; The callee should be zero-extended from i32 to i64.
++define i32 @tailcall_uptr(ptr addrspace(271) %fptr, i32 %arg) {
++; CHECK-LABEL: tailcall_uptr:
++; CHECK:       # %bb.0: # %entry
++; CHECK-NEXT:    movq %rdi, %rax
++; CHECK-NEXT:    movl %esi, %edi
++; CHECK-NEXT:    jmpq *%rax # TAILCALL
++entry:
++  %call = tail call addrspace(271) i32 %fptr(i32 %arg)
++  ret i32 %call
++}
++
++; Non-tail call through addrspace(270) (__ptr32 __sptr) function pointer.
++define i32 @call_sptr(ptr addrspace(270) %fptr, i32 %arg) {
++; CHECK-LABEL: call_sptr:
++; CHECK:       # %bb.0: # %entry
++; CHECK-NEXT:    pushq %rax
++; CHECK-NEXT:    .cfi_def_cfa_offset 16
++; CHECK-NEXT:    movslq %edi, %rax
++; CHECK-NEXT:    movl %esi, %edi
++; CHECK-NEXT:    callq *%rax
++; CHECK-NEXT:    popq %rcx
++; CHECK-NEXT:    .cfi_def_cfa_offset 8
++; CHECK-NEXT:    retq
++entry:
++  %call = call addrspace(270) i32 %fptr(i32 %arg)
++  ret i32 %call
++}
++
++; Non-tail call through addrspace(271) (__ptr32 __uptr) function pointer.
++define i32 @call_uptr(ptr addrspace(271) %fptr, i32 %arg) {
++; CHECK-LABEL: call_uptr:
++; CHECK:       # %bb.0: # %entry
++; CHECK-NEXT:    pushq %rax
++; CHECK-NEXT:    .cfi_def_cfa_offset 16
++; CHECK-NEXT:    movq %rdi, %rax
++; CHECK-NEXT:    movl %esi, %edi
++; CHECK-NEXT:    callq *%rax
++; CHECK-NEXT:    popq %rcx
++; CHECK-NEXT:    .cfi_def_cfa_offset 8
++; CHECK-NEXT:    retq
++entry:
++  %call = call addrspace(271) i32 %fptr(i32 %arg)
++  ret i32 %call
++}
 diff --git a/llvm/test/CodeGen/X86/replace-load-and-with-bzhi.ll b/llvm/test/CodeGen/X86/replace-load-and-with-bzhi.ll
 index a0bd35d5d2..4ef16b16ef 100644
 --- a/llvm/test/CodeGen/X86/replace-load-and-with-bzhi.ll
@@ -5891,3 +6153,995 @@ index 44c28d67cf..35a4fd5ed3 100644
  ; SSE2-NEXT:    retq
  ;
  ; SSE41-LABEL: perlane_shl_v64i8:
+diff --git a/llvm/test/Transforms/InstCombine/add-self-umax-1.ll b/llvm/test/Transforms/InstCombine/add-self-umax-1.ll
+new file mode 100644
+index 0000000000..529f06464d
+--- /dev/null
++++ b/llvm/test/Transforms/InstCombine/add-self-umax-1.ll
+@@ -0,0 +1,138 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py UTC_ARGS: --version 6
++; RUN: opt < %s -passes=instcombine -S | FileCheck %s
++
++; X + umax(X, 1) --> umax(X << 1, 1) if X + X does not overflow.
++
++define i32 @src_i32_check_no_overflow(i32 noundef %a) {
++; CHECK-LABEL: define i32 @src_i32_check_no_overflow(
++; CHECK-SAME: i32 noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i32 [[A]], -1
++; CHECK-NEXT:    tail call void @llvm.assume(i1 [[CMP]])
++; CHECK-NEXT:    [[MUL2:%.*]] = shl nuw i32 [[A]], 1
++; CHECK-NEXT:    [[ADD:%.*]] = call i32 @llvm.umax.i32(i32 [[MUL2]], i32 1)
++; CHECK-NEXT:    ret i32 [[ADD]]
++;
++entry:
++  %cmp = icmp sgt i32 %a, -1
++  tail call void @llvm.assume(i1 %cmp)
++  %cond = tail call i32 @llvm.umax.i32(i32 %a, i32 1)
++  %add = add i32 %cond, %a
++  ret i32 %add
++}
++
++define i32 @src_i32_nuw(i32 noundef %a) {
++; CHECK-LABEL: define i32 @src_i32_nuw(
++; CHECK-SAME: i32 noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[MUL2:%.*]] = shl nuw i32 [[A]], 1
++; CHECK-NEXT:    [[ADD:%.*]] = call i32 @llvm.umax.i32(i32 [[MUL2]], i32 1)
++; CHECK-NEXT:    ret i32 [[ADD]]
++;
++entry:
++  %cond = tail call i32 @llvm.umax.i32(i32 %a, i32 1)
++  %add = add nuw i32 %cond, %a
++  ret i32 %add
++}
++
++define i32 @src_i32_nsw(i32 noundef %a) {
++; CHECK-LABEL: define i32 @src_i32_nsw(
++; CHECK-SAME: i32 noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[MUL2:%.*]] = shl nsw i32 [[A]], 1
++; CHECK-NEXT:    [[ADD:%.*]] = call i32 @llvm.umax.i32(i32 [[MUL2]], i32 1)
++; CHECK-NEXT:    ret i32 [[ADD]]
++;
++entry:
++  %cond = tail call i32 @llvm.umax.i32(i32 1, i32 %a)
++  %add = add nsw i32 %a, %cond
++  ret i32 %add
++}
++
++define <4 x i32> @src_v4i32_nsw(<4 x i32> noundef %a) {
++; CHECK-LABEL: define <4 x i32> @src_v4i32_nsw(
++; CHECK-SAME: <4 x i32> noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[MUL2:%.*]] = shl nuw <4 x i32> [[A]], splat (i32 1)
++; CHECK-NEXT:    [[ADD:%.*]] = call <4 x i32> @llvm.umax.v4i32(<4 x i32> [[MUL2]], <4 x i32> splat (i32 1))
++; CHECK-NEXT:    ret <4 x i32> [[ADD]]
++;
++entry:
++  %cond = tail call <4 x i32> @llvm.umax.v4i32(<4 x i32> %a, <4 x i32> splat (i32 1))
++  %add = add nuw <4 x i32> %cond, %a
++  ret <4 x i32> %add
++}
++
++define i64 @src_i64_nuw(i64 noundef %a) {
++; CHECK-LABEL: define i64 @src_i64_nuw(
++; CHECK-SAME: i64 noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[MUL2:%.*]] = shl nuw i64 [[A]], 1
++; CHECK-NEXT:    [[ADD:%.*]] = call i64 @llvm.umax.i64(i64 [[MUL2]], i64 1)
++; CHECK-NEXT:    ret i64 [[ADD]]
++;
++entry:
++  %cond = tail call i64 @llvm.umax.i32(i64 %a, i64 1)
++  %add = add nuw i64 %cond, %a
++  ret i64 %add
++}
++
++define i128 @src_i128_nuw(i128 noundef %a) {
++; CHECK-LABEL: define i128 @src_i128_nuw(
++; CHECK-SAME: i128 noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[MUL2:%.*]] = shl nuw i128 [[A]], 1
++; CHECK-NEXT:    [[ADD:%.*]] = call i128 @llvm.umax.i128(i128 [[MUL2]], i128 1)
++; CHECK-NEXT:    ret i128 [[ADD]]
++;
++entry:
++  %cond = tail call i128 @llvm.umax.i128(i128 %a, i128 1)
++  %add = add nuw i128 %cond, %a
++  ret i128 %add
++}
++
++define i32 @src_i32(i32 noundef %a) {
++; CHECK-LABEL: define i32 @src_i32(
++; CHECK-SAME: i32 noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[COND:%.*]] = tail call i32 @llvm.umax.i32(i32 [[A]], i32 1)
++; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[COND]], [[A]]
++; CHECK-NEXT:    ret i32 [[ADD]]
++;
++entry:
++  %cond = tail call i32 @llvm.umax.i32(i32 %a, i32 1)
++  %add = add i32 %cond, %a
++  ret i32 %add
++}
++
++define i32 @src_i32_check_overflow(i32 noundef %a) {
++; CHECK-LABEL: define i32 @src_i32_check_overflow(
++; CHECK-SAME: i32 noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i32 [[A]], -2147483647
++; CHECK-NEXT:    tail call void @llvm.assume(i1 [[CMP]])
++; CHECK-NEXT:    [[COND:%.*]] = tail call i32 @llvm.umax.i32(i32 [[A]], i32 1)
++; CHECK-NEXT:    [[ADD:%.*]] = add i32 [[COND]], [[A]]
++; CHECK-NEXT:    ret i32 [[ADD]]
++;
++entry:
++  %cmp = icmp ult i32 %a, -2147483647
++  tail call void @llvm.assume(i1 %cmp)
++  %cond = tail call i32 @llvm.umax.i32(i32 %a, i32 1)
++  %add = add i32 %cond, %a
++  ret i32 %add
++}
++
++define i32 @src_i32_max_2(i32 noundef %a) {
++; CHECK-LABEL: define i32 @src_i32_max_2(
++; CHECK-SAME: i32 noundef [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[COND:%.*]] = tail call i32 @llvm.umax.i32(i32 [[A]], i32 2)
++; CHECK-NEXT:    [[ADD:%.*]] = add nuw i32 [[COND]], [[A]]
++; CHECK-NEXT:    ret i32 [[ADD]]
++;
++entry:
++  %cond = tail call i32 @llvm.umax.i32(i32 %a, i32 2)
++  %add = add nuw i32 %cond, %a
++  ret i32 %add
++}
+diff --git a/llvm/test/Transforms/InstCombine/binop-and-shifts.ll b/llvm/test/Transforms/InstCombine/binop-and-shifts.ll
+index 40275fd29f..8b6cf68249 100644
+--- a/llvm/test/Transforms/InstCombine/binop-and-shifts.ll
++++ b/llvm/test/Transforms/InstCombine/binop-and-shifts.ll
+@@ -1,6 +1,8 @@
+ ; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
+ ; RUN: opt < %s -passes=instcombine -S | FileCheck %s
+ 
++declare void @use(i8)
++
+ define i8 @shl_and_and(i8 %x, i8 %y) {
+ ; CHECK-LABEL: @shl_and_and(
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i8 [[Y:%.*]], [[X:%.*]]
+@@ -951,6 +953,181 @@ define <4 x i8> @xor_ashr_not_vec_poison_2(<4 x i8> %x, <4 x i8> %y, <4 x i8> %s
+   ret <4 x i8> %xor
+ }
+ 
++define i8 @xor_lshr_signmask(i8 %x, i8 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask(
++; CHECK-NEXT:    [[R:%.*]] = ashr i8 [[X:%.*]], [[SHAMT:%.*]]
++; CHECK-NEXT:    ret i8 [[R]]
++;
++  %signmask = ashr i8 %x, 7
++  %flipped = xor i8 %x, %signmask
++  %shifted = lshr i8 %flipped, %shamt
++  %r = xor i8 %shifted, %signmask
++  ret i8 %r
++}
++
++define i8 @xor_lshr_signmask_commuted(i8 %x, i8 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_commuted(
++; CHECK-NEXT:    [[R:%.*]] = ashr i8 [[X:%.*]], [[SHAMT:%.*]]
++; CHECK-NEXT:    ret i8 [[R]]
++;
++  %signmask = ashr i8 %x, 7
++  %flipped = xor i8 %signmask, %x
++  %shifted = lshr i8 %flipped, %shamt
++  %r = xor i8 %signmask, %shifted
++  ret i8 %r
++}
++
++define i8 @xor_lshr_signmask_exact(i8 %x, i8 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_exact(
++; CHECK-NEXT:    [[R:%.*]] = ashr i8 [[X:%.*]], [[SHAMT:%.*]]
++; CHECK-NEXT:    ret i8 [[R]]
++;
++  %signmask = ashr i8 %x, 7
++  %flipped = xor i8 %x, %signmask
++  %shifted = lshr exact i8 %flipped, %shamt
++  %r = xor i8 %shifted, %signmask
++  ret i8 %r
++}
++
++define i1 @xor_lshr_signmask_i1(i1 %x, i1 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_i1(
++; CHECK-NEXT:    ret i1 [[X:%.*]]
++;
++  %signmask = ashr i1 %x, 0
++  %flipped = xor i1 %x, %signmask
++  %shifted = lshr i1 %flipped, %shamt
++  %r = xor i1 %shifted, %signmask
++  ret i1 %r
++}
++
++define i13 @xor_lshr_signmask_i13(i13 %x, i13 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_i13(
++; CHECK-NEXT:    [[R:%.*]] = ashr i13 [[X:%.*]], [[SHAMT:%.*]]
++; CHECK-NEXT:    ret i13 [[R]]
++;
++  %signmask = ashr i13 %x, 12
++  %flipped = xor i13 %x, %signmask
++  %shifted = lshr i13 %flipped, %shamt
++  %r = xor i13 %shifted, %signmask
++  ret i13 %r
++}
++
++define i8 @xor_lshr_signmask_signmask_exact(i8 %x, i8 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_signmask_exact(
++; CHECK-NEXT:    [[R:%.*]] = ashr i8 [[X:%.*]], [[SHAMT:%.*]]
++; CHECK-NEXT:    ret i8 [[R]]
++;
++  %signmask = ashr exact i8 %x, 7
++  %flipped = xor i8 %x, %signmask
++  %shifted = lshr i8 %flipped, %shamt
++  %r = xor i8 %shifted, %signmask
++  ret i8 %r
++}
++
++define { i8, i8 } @xor_lshr_signmask_inner_multiuse(i8 %x, i8 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_inner_multiuse(
++; CHECK-NEXT:    [[SIGNMASK:%.*]] = ashr i8 [[X:%.*]], 7
++; CHECK-NEXT:    [[FLIPPED:%.*]] = xor i8 [[X]], [[SIGNMASK]]
++; CHECK-NEXT:    [[R:%.*]] = ashr i8 [[X]], [[SHAMT:%.*]]
++; CHECK-NEXT:    [[R0:%.*]] = insertvalue { i8, i8 } poison, i8 [[R]], 0
++; CHECK-NEXT:    [[R1:%.*]] = insertvalue { i8, i8 } [[R0]], i8 [[FLIPPED]], 1
++; CHECK-NEXT:    ret { i8, i8 } [[R1]]
++;
++  %signmask = ashr i8 %x, 7
++  %flipped = xor i8 %x, %signmask
++  %shifted = lshr i8 %flipped, %shamt
++  %r = xor i8 %shifted, %signmask
++  %r0 = insertvalue { i8, i8 } poison, i8 %r, 0
++  %r1 = insertvalue { i8, i8 } %r0, i8 %flipped, 1
++  ret { i8, i8 } %r1
++}
++
++define <4 x i8> @xor_lshr_signmask_vec_poison(<4 x i8> %x, <4 x i8> %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_vec_poison(
++; CHECK-NEXT:    [[R:%.*]] = ashr <4 x i8> [[X:%.*]], [[SHAMT:%.*]]
++; CHECK-NEXT:    ret <4 x i8> [[R]]
++;
++  %signmask = ashr <4 x i8> %x, <i8 7, i8 poison, i8 7, i8 poison>
++  %flipped = xor <4 x i8> %x, %signmask
++  %shifted = lshr <4 x i8> %flipped, %shamt
++  %r = xor <4 x i8> %shifted, %signmask
++  ret <4 x i8> %r
++}
++
++define <vscale x 4 x i8> @xor_lshr_signmask_scalable(<vscale x 4 x i8> %x, <vscale x 4 x i8> %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_scalable(
++; CHECK-NEXT:    [[R:%.*]] = ashr <vscale x 4 x i8> [[X:%.*]], [[SHAMT:%.*]]
++; CHECK-NEXT:    ret <vscale x 4 x i8> [[R]]
++;
++  %signmask = ashr <vscale x 4 x i8> %x, splat (i8 7)
++  %flipped = xor <vscale x 4 x i8> %x, %signmask
++  %shifted = lshr <vscale x 4 x i8> %flipped, %shamt
++  %r = xor <vscale x 4 x i8> %shifted, %signmask
++  ret <vscale x 4 x i8> %r
++}
++
++define i8 @xor_lshr_signmask_wrong_source(i8 %x, i8 %y, i8 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_wrong_source(
++; CHECK-NEXT:    [[SIGNMASK:%.*]] = ashr i8 [[Y:%.*]], 7
++; CHECK-NEXT:    [[FLIPPED:%.*]] = xor i8 [[X:%.*]], [[SIGNMASK]]
++; CHECK-NEXT:    [[SHIFTED:%.*]] = lshr i8 [[FLIPPED]], [[SHAMT:%.*]]
++; CHECK-NEXT:    [[R:%.*]] = xor i8 [[SHIFTED]], [[SIGNMASK]]
++; CHECK-NEXT:    ret i8 [[R]]
++;
++  %signmask = ashr i8 %y, 7
++  %flipped = xor i8 %x, %signmask
++  %shifted = lshr i8 %flipped, %shamt
++  %r = xor i8 %shifted, %signmask
++  ret i8 %r
++}
++
++define i8 @xor_lshr_signmask_wrong_full_shift(i8 %x, i8 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_wrong_full_shift(
++; CHECK-NEXT:    [[SIGNMASK:%.*]] = ashr i8 [[X:%.*]], 6
++; CHECK-NEXT:    [[FLIPPED:%.*]] = xor i8 [[X]], [[SIGNMASK]]
++; CHECK-NEXT:    [[SHIFTED:%.*]] = lshr i8 [[FLIPPED]], [[SHAMT:%.*]]
++; CHECK-NEXT:    [[R:%.*]] = xor i8 [[SHIFTED]], [[SIGNMASK]]
++; CHECK-NEXT:    ret i8 [[R]]
++;
++  %signmask = ashr i8 %x, 6
++  %flipped = xor i8 %x, %signmask
++  %shifted = lshr i8 %flipped, %shamt
++  %r = xor i8 %shifted, %signmask
++  ret i8 %r
++}
++
++define i8 @xor_lshr_signmask_lshr_multiuse(i8 %x, i8 %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_lshr_multiuse(
++; CHECK-NEXT:    [[SIGNMASK:%.*]] = ashr i8 [[X:%.*]], 7
++; CHECK-NEXT:    [[FLIPPED:%.*]] = xor i8 [[X]], [[SIGNMASK]]
++; CHECK-NEXT:    [[SHIFTED:%.*]] = lshr i8 [[FLIPPED]], [[SHAMT:%.*]]
++; CHECK-NEXT:    call void @use(i8 [[SHIFTED]])
++; CHECK-NEXT:    [[R:%.*]] = xor i8 [[SHIFTED]], [[SIGNMASK]]
++; CHECK-NEXT:    ret i8 [[R]]
++;
++  %signmask = ashr i8 %x, 7
++  %flipped = xor i8 %x, %signmask
++  %shifted = lshr i8 %flipped, %shamt
++  call void @use(i8 %shifted)
++  %r = xor i8 %shifted, %signmask
++  ret i8 %r
++}
++
++define <4 x i8> @xor_lshr_signmask_vec_nonsplat(<4 x i8> %x, <4 x i8> %shamt) {
++; CHECK-LABEL: @xor_lshr_signmask_vec_nonsplat(
++; CHECK-NEXT:    [[SIGNMASK:%.*]] = ashr <4 x i8> [[X:%.*]], <i8 7, i8 6, i8 7, i8 6>
++; CHECK-NEXT:    [[FLIPPED:%.*]] = xor <4 x i8> [[X]], [[SIGNMASK]]
++; CHECK-NEXT:    [[SHIFTED:%.*]] = lshr <4 x i8> [[FLIPPED]], [[SHAMT:%.*]]
++; CHECK-NEXT:    [[R:%.*]] = xor <4 x i8> [[SHIFTED]], [[SIGNMASK]]
++; CHECK-NEXT:    ret <4 x i8> [[R]]
++;
++  %signmask = ashr <4 x i8> %x, <i8 7, i8 6, i8 7, i8 6>
++  %flipped = xor <4 x i8> %x, %signmask
++  %shifted = lshr <4 x i8> %flipped, %shamt
++  %r = xor <4 x i8> %shifted, %signmask
++  ret <4 x i8> %r
++}
++
+ ; Negative test: outer binop has multiple users
+ 
+ define i8 @shl_add_add_multiuse_binop(i8 %x, i8 %y0, i8 %y1) {
+diff --git a/llvm/test/Transforms/InstCombine/icmp-usub-sat.ll b/llvm/test/Transforms/InstCombine/icmp-usub-sat.ll
+index 2cd07b17af..3a62fe60f2 100644
+--- a/llvm/test/Transforms/InstCombine/icmp-usub-sat.ll
++++ b/llvm/test/Transforms/InstCombine/icmp-usub-sat.ll
+@@ -425,6 +425,185 @@ define <2 x i1> @icmp_eq_vector_multiuse_negative_equal(<2 x i8> %arg) {
+   ret <2 x i1> %cmp
+ }
+ 
++; usub.sat(X, C) == X  --> X == 0 (C is nonzero constant)
++define i1 @icmp_eq_usub_sat_lhs_nonzero_constant(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_eq_usub_sat_lhs_nonzero_constant
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[X]], 0
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp eq i64 %sat, %x
++  ret i1 %cmp
++}
++
++; Commuted form: icmp eq X, usub.sat(X, C)  --> X == 0
++define i1 @icmp_eq_usub_sat_lhs_nonzero_constant_commuted(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_eq_usub_sat_lhs_nonzero_constant_commuted
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[X]], 0
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp eq i64 %x, %sat
++  ret i1 %cmp
++}
++
++; samesign form: icmp samesign eq usub.sat(X, C), X  --> X == 0
++define i1 @icmp_samesign_eq_usub_sat_lhs_nonzero_constant(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_samesign_eq_usub_sat_lhs_nonzero_constant
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[X]], 0
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp samesign eq i64 %sat, %x
++  ret i1 %cmp
++}
++
++; usub.sat(X, C) < X  --> X != 0 (ULT is the same as < for unsigned)
++define i1 @icmp_ult_usub_sat_lhs_nonzero_constant(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_ult_usub_sat_lhs_nonzero_constant
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i64 [[X]], 0
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp ult i64 %sat, %x
++  ret i1 %cmp
++}
++
++; samesign ULT form
++define i1 @icmp_samesign_ult_usub_sat_lhs_nonzero_constant(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_samesign_ult_usub_sat_lhs_nonzero_constant
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i64 [[X]], 0
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp samesign ult i64 %sat, %x
++  ret i1 %cmp
++}
++
++; usub.sat(X, C) != X  --> X != 0
++define i1 @icmp_ne_usub_sat_lhs_nonzero_constant(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_ne_usub_sat_lhs_nonzero_constant
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i64 [[X]], 0
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp ne i64 %sat, %x
++  ret i1 %cmp
++}
++
++; X > usub.sat(X, C)  --> X != 0 (UGT commuted)
++define i1 @icmp_ugt_usub_sat_lhs_nonzero_constant(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_ugt_usub_sat_lhs_nonzero_constant
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i64 [[X]], 0
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp ugt i64 %x, %sat
++  ret i1 %cmp
++}
++
++; Multiuse: intrinsic is used elsewhere, only icmp is folded
++define i1 @icmp_eq_usub_sat_lhs_nonzero_constant_multiuse(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_eq_usub_sat_lhs_nonzero_constant_multiuse
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[SAT:%.*]] = call i64 @llvm.usub.sat.i64(i64 [[X]], i64 10)
++; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[X]], 0
++; CHECK-NEXT:    call void @use.i64(i64 [[SAT]])
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp eq i64 %sat, %x
++  call void @use.i64(i64 %sat)
++  ret i1 %cmp
++}
++
++; Multiuse ULT
++define i1 @icmp_ult_usub_sat_lhs_nonzero_constant_multiuse(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_ult_usub_sat_lhs_nonzero_constant_multiuse
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    [[SAT:%.*]] = call i64 @llvm.usub.sat.i64(i64 [[X]], i64 10)
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ne i64 [[X]], 0
++; CHECK-NEXT:    call void @use.i64(i64 [[SAT]])
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 10)
++  %cmp = icmp ult i64 %sat, %x
++  call void @use.i64(i64 %sat)
++  ret i1 %cmp
++}
++
++; Zero constant: usub.sat(X, 0) == X is always true (negative test)
++define i1 @icmp_eq_usub_sat_lhs_zero_constant(i64 %x) {
++; CHECK-LABEL: define i1 @icmp_eq_usub_sat_lhs_zero_constant
++; CHECK-SAME: (i64 [[X:%.*]]) {
++; CHECK-NEXT:    ret i1 true
++;
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 0)
++  %cmp = icmp eq i64 %sat, %x
++  ret i1 %cmp
++}
++
++; Vector types
++define <2 x i1> @icmp_ult_usub_sat_lhs_nonzero_constant_vector(<2 x i8> %x) {
++; CHECK-LABEL: define <2 x i1> @icmp_ult_usub_sat_lhs_nonzero_constant_vector
++; CHECK-SAME: (<2 x i8> [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ne <2 x i8> [[X]], zeroinitializer
++; CHECK-NEXT:    ret <2 x i1> [[CMP]]
++;
++  %sat = call <2 x i8> @llvm.usub.sat.v2i8(<2 x i8> %x, <2 x i8> <i8 10, i8 10>)
++  %cmp = icmp ult <2 x i8> %sat, %x
++  ret <2 x i1> %cmp
++}
++
++; Vector nonsplat constant (all elements nonzero)
++define <2 x i1> @icmp_ult_usub_sat_lhs_nonzero_constant_vector_nonsplat(<2 x i8> %x) {
++; CHECK-LABEL: define <2 x i1> @icmp_ult_usub_sat_lhs_nonzero_constant_vector_nonsplat
++; CHECK-SAME: (<2 x i8> [[X:%.*]]) {
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ne <2 x i8> [[X]], zeroinitializer
++; CHECK-NEXT:    ret <2 x i1> [[CMP]]
++;
++  %sat = call <2 x i8> @llvm.usub.sat.v2i8(<2 x i8> %x, <2 x i8> <i8 1, i8 10>)
++  %cmp = icmp ult <2 x i8> %sat, %x
++  ret <2 x i1> %cmp
++}
++
++; Vector with some zero elements (negative test - fold not applicable)
++define <2 x i1> @icmp_ult_usub_sat_lhs_zero_constant_vector(<2 x i8> %x) {
++; CHECK-LABEL: define <2 x i1> @icmp_ult_usub_sat_lhs_zero_constant_vector
++; CHECK-SAME: (<2 x i8> [[X:%.*]]) {
++; CHECK-NEXT:    [[SAT:%.*]] = call <2 x i8> @llvm.usub.sat.v2i8(<2 x i8> [[X]], <2 x i8> <i8 1, i8 0>)
++; CHECK-NEXT:    [[CMP:%.*]] = icmp ult <2 x i8> [[SAT]], [[X]]
++; CHECK-NEXT:    ret <2 x i1> [[CMP]]
++;
++  %sat = call <2 x i8> @llvm.usub.sat.v2i8(<2 x i8> %x, <2 x i8> <i8 1, i8 0>)
++  %cmp = icmp ult <2 x i8> %sat, %x
++  ret <2 x i1> %cmp
++}
++
++; Non-constant but known-nonzero RHS via assume (negative test - fold only applies to constants)
++define i1 @icmp_eq_usub_sat_lhs_known_nonzero_rhs(i64 %x, i64 %y) {
++; CHECK-LABEL: define i1 @icmp_eq_usub_sat_lhs_known_nonzero_rhs
++; CHECK-SAME: (i64 [[X:%.*]], i64 [[Y:%.*]]) {
++; CHECK-NEXT:    [[COND:%.*]] = icmp ne i64 [[Y]], 0
++; CHECK-NEXT:    call void @llvm.assume(i1 [[COND]])
++; CHECK-NEXT:    [[SAT:%.*]] = call i64 @llvm.usub.sat.i64(i64 [[X]], i64 [[Y]])
++; CHECK-NEXT:    [[CMP:%.*]] = icmp eq i64 [[SAT]], [[X]]
++; CHECK-NEXT:    ret i1 [[CMP]]
++;
++  %cond = icmp ne i64 %y, 0
++  call void @llvm.assume(i1 %cond)
++  %sat = call i64 @llvm.usub.sat.i64(i64 %x, i64 %y)
++  %cmp = icmp eq i64 %sat, %x
++  ret i1 %cmp
++}
++
+ declare i8 @llvm.usub.sat.i8(i8, i8)
+ declare i16 @llvm.usub.sat.i16(i16, i16)
+ declare i32 @llvm.usub.sat.i32(i32, i32)
+@@ -435,5 +614,8 @@ declare <2 x i32> @llvm.usub.sat.v2i32(<2 x i32>, <2 x i32>)
+ declare <2 x i16> @llvm.usub.sat.v2i16(<2 x i16>, <2 x i16>)
+ declare <2 x i8> @llvm.usub.sat.v2i8(<2 x i8>, <2 x i8>)
+ 
++declare void @llvm.assume(i1)
++
+ declare void @use.i8(i8)
+ declare void @use.v2i8(<2 x i8>)
++declare void @use.i64(i64)
+diff --git a/llvm/test/Transforms/InstCombine/invert-variable-mask-in-masked-merge-scalar.ll b/llvm/test/Transforms/InstCombine/invert-variable-mask-in-masked-merge-scalar.ll
+index abb36b6a78..c49b224712 100644
+--- a/llvm/test/Transforms/InstCombine/invert-variable-mask-in-masked-merge-scalar.ll
++++ b/llvm/test/Transforms/InstCombine/invert-variable-mask-in-masked-merge-scalar.ll
+@@ -8,9 +8,10 @@
+ 
+ define i4 @scalar (i4 %x, i4 %y, i4 %m) {
+ ; CHECK-LABEL: @scalar(
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], [[Y:%.*]]
++; CHECK-NEXT:    [[Y:%.*]] = freeze i4 [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], [[Y]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
++; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[Y]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+ ;
+   %im = xor i4 %m, -1
+@@ -38,7 +39,8 @@ define i4 @in_constant_varx_mone_invmask(i4 %x, i4 %mask) {
+ 
+ define i4 @in_constant_varx_6_invmask(i4 %x, i4 %mask) {
+ ; CHECK-LABEL: @in_constant_varx_6_invmask(
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], 6
++; CHECK-NEXT:    [[X:%.*]] = freeze i4 [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X]], 6
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[MASK:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+@@ -88,7 +90,8 @@ declare i4 @gen4()
+ 
+ define i4 @c_1_0_0 (i4 %x, i4 %y, i4 %m) {
+ ; CHECK-LABEL: @c_1_0_0(
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[Y:%.*]], [[X:%.*]]
++; CHECK-NEXT:    [[X:%.*]] = freeze i4 [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[Y:%.*]], [[X]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+@@ -102,7 +105,8 @@ define i4 @c_1_0_0 (i4 %x, i4 %y, i4 %m) {
+ 
+ define i4 @c_0_1_0 (i4 %x, i4 %y, i4 %m) {
+ ; CHECK-LABEL: @c_0_1_0(
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], [[Y:%.*]]
++; CHECK-NEXT:    [[Y:%.*]] = freeze i4 [[Y1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], [[Y]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[Y]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+@@ -118,9 +122,10 @@ define i4 @c_0_0_1 (i4 %m) {
+ ; CHECK-LABEL: @c_0_0_1(
+ ; CHECK-NEXT:    [[X:%.*]] = call i4 @gen4()
+ ; CHECK-NEXT:    [[Y:%.*]] = call i4 @gen4()
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X]], [[Y]]
++; CHECK-NEXT:    [[TMP2:%.*]] = freeze i4 [[X]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[Y]], [[TMP2]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
++; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[TMP2]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+ ;
+   %im = xor i4 %m, -1
+@@ -134,9 +139,10 @@ define i4 @c_0_0_1 (i4 %m) {
+ 
+ define i4 @c_1_1_0 (i4 %x, i4 %y, i4 %m) {
+ ; CHECK-LABEL: @c_1_1_0(
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[Y:%.*]], [[X:%.*]]
++; CHECK-NEXT:    [[X:%.*]] = freeze i4 [[Y1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[Y:%.*]], [[X]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[Y]]
++; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+ ;
+   %im = xor i4 %m, -1
+@@ -149,7 +155,8 @@ define i4 @c_1_1_0 (i4 %x, i4 %y, i4 %m) {
+ define i4 @c_1_0_1 (i4 %x, i4 %m) {
+ ; CHECK-LABEL: @c_1_0_1(
+ ; CHECK-NEXT:    [[Y:%.*]] = call i4 @gen4()
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[Y]], [[X:%.*]]
++; CHECK-NEXT:    [[X:%.*]] = freeze i4 [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[Y]], [[X]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+@@ -165,7 +172,8 @@ define i4 @c_1_0_1 (i4 %x, i4 %m) {
+ define i4 @c_0_1_1 (i4 %y, i4 %m) {
+ ; CHECK-LABEL: @c_0_1_1(
+ ; CHECK-NEXT:    [[X:%.*]] = call i4 @gen4()
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X]], [[Y:%.*]]
++; CHECK-NEXT:    [[Y:%.*]] = freeze i4 [[Y1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X]], [[Y]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[Y]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+@@ -182,9 +190,10 @@ define i4 @c_1_1_1 (i4 %m) {
+ ; CHECK-LABEL: @c_1_1_1(
+ ; CHECK-NEXT:    [[X:%.*]] = call i4 @gen4()
+ ; CHECK-NEXT:    [[Y:%.*]] = call i4 @gen4()
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[Y]], [[X]]
++; CHECK-NEXT:    [[TMP2:%.*]] = freeze i4 [[Y]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X]], [[TMP2]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[Y]]
++; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[TMP2]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+ ;
+   %im = xor i4 %m, -1
+@@ -198,7 +207,8 @@ define i4 @c_1_1_1 (i4 %m) {
+ 
+ define i4 @commutativity_constant_varx_6_invmask(i4 %x, i4 %mask) {
+ ; CHECK-LABEL: @commutativity_constant_varx_6_invmask(
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], 6
++; CHECK-NEXT:    [[X:%.*]] = freeze i4 [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X]], 6
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[MASK:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret i4 [[R]]
+@@ -234,8 +244,10 @@ declare void @use4(i4)
+ 
+ define i4 @n_oneuse_D_is_ok (i4 %x, i4 %y, i4 %m) {
+ ; CHECK-LABEL: @n_oneuse_D_is_ok(
+-; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], [[Y:%.*]]
+-; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
++; CHECK-NEXT:    [[X:%.*]] = freeze i4 [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X]], [[Y:%.*]]
++; CHECK-NEXT:    [[TMP2:%.*]] = xor i4 [[Y]], [[X]]
++; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[TMP2]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
+ ; CHECK-NEXT:    call void @use4(i4 [[N0]])
+ ; CHECK-NEXT:    ret i4 [[R]]
+diff --git a/llvm/test/Transforms/InstCombine/invert-variable-mask-in-masked-merge-vector.ll b/llvm/test/Transforms/InstCombine/invert-variable-mask-in-masked-merge-vector.ll
+index c73b07cfbc..0b60dada17 100644
+--- a/llvm/test/Transforms/InstCombine/invert-variable-mask-in-masked-merge-vector.ll
++++ b/llvm/test/Transforms/InstCombine/invert-variable-mask-in-masked-merge-vector.ll
+@@ -8,9 +8,10 @@
+ 
+ define <2 x i4> @vector (<2 x i4> %x, <2 x i4> %y, <2 x i4> %m) {
+ ; CHECK-LABEL: @vector(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X:%.*]], [[Y:%.*]]
++; CHECK-NEXT:    [[Y:%.*]] = freeze <2 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X:%.*]], [[Y]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
++; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[Y]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+ ;
+   %im = xor <2 x i4> %m, <i4 -1, i4 -1>
+@@ -22,9 +23,10 @@ define <2 x i4> @vector (<2 x i4> %x, <2 x i4> %y, <2 x i4> %m) {
+ 
+ define <3 x i4> @vector_poison (<3 x i4> %x, <3 x i4> %y, <3 x i4> %m) {
+ ; CHECK-LABEL: @vector_poison(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <3 x i4> [[X:%.*]], [[Y:%.*]]
++; CHECK-NEXT:    [[Y:%.*]] = freeze <3 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <3 x i4> [[X:%.*]], [[Y]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <3 x i4> [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor <3 x i4> [[TMP1]], [[X]]
++; CHECK-NEXT:    [[R:%.*]] = xor <3 x i4> [[TMP1]], [[Y]]
+ ; CHECK-NEXT:    ret <3 x i4> [[R]]
+ ;
+   %im = xor <3 x i4> %m, <i4 -1, i4 poison, i4 -1>
+@@ -52,7 +54,8 @@ define <2 x i4> @in_constant_varx_mone_invmask(<2 x i4> %x, <2 x i4> %mask) {
+ 
+ define <2 x i4> @in_constant_varx_6_invmask(<2 x i4> %x, <2 x i4> %mask) {
+ ; CHECK-LABEL: @in_constant_varx_6_invmask(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X:%.*]], splat (i4 6)
++; CHECK-NEXT:    [[X:%.*]] = freeze <2 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X]], splat (i4 6)
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[MASK:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+@@ -66,7 +69,8 @@ define <2 x i4> @in_constant_varx_6_invmask(<2 x i4> %x, <2 x i4> %mask) {
+ 
+ define <2 x i4> @in_constant_varx_6_invmask_nonsplat(<2 x i4> %x, <2 x i4> %mask) {
+ ; CHECK-LABEL: @in_constant_varx_6_invmask_nonsplat(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X:%.*]], <i4 6, i4 7>
++; CHECK-NEXT:    [[X:%.*]] = freeze <2 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X]], <i4 6, i4 7>
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[MASK:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+@@ -80,7 +84,8 @@ define <2 x i4> @in_constant_varx_6_invmask_nonsplat(<2 x i4> %x, <2 x i4> %mask
+ 
+ define <3 x i4> @in_constant_varx_6_invmask_poison(<3 x i4> %x, <3 x i4> %mask) {
+ ; CHECK-LABEL: @in_constant_varx_6_invmask_poison(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <3 x i4> [[X:%.*]], <i4 6, i4 poison, i4 7>
++; CHECK-NEXT:    [[X:%.*]] = freeze <3 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <3 x i4> [[X]], <i4 6, i4 poison, i4 7>
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <3 x i4> [[N0]], [[MASK:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <3 x i4> [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret <3 x i4> [[R]]
+@@ -158,7 +163,8 @@ declare <2 x i4> @gen4()
+ 
+ define <2 x i4> @c_1_0_0 (<2 x i4> %x, <2 x i4> %y, <2 x i4> %m) {
+ ; CHECK-LABEL: @c_1_0_0(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[Y:%.*]], [[X:%.*]]
++; CHECK-NEXT:    [[X:%.*]] = freeze <2 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[Y:%.*]], [[X]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+@@ -172,7 +178,8 @@ define <2 x i4> @c_1_0_0 (<2 x i4> %x, <2 x i4> %y, <2 x i4> %m) {
+ 
+ define <2 x i4> @c_0_1_0 (<2 x i4> %x, <2 x i4> %y, <2 x i4> %m) {
+ ; CHECK-LABEL: @c_0_1_0(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X:%.*]], [[Y:%.*]]
++; CHECK-NEXT:    [[Y:%.*]] = freeze <2 x i4> [[Y1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X:%.*]], [[Y]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[Y]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+@@ -188,9 +195,10 @@ define <2 x i4> @c_0_0_1 (<2 x i4> %m) {
+ ; CHECK-LABEL: @c_0_0_1(
+ ; CHECK-NEXT:    [[X:%.*]] = call <2 x i4> @gen4()
+ ; CHECK-NEXT:    [[Y:%.*]] = call <2 x i4> @gen4()
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X]], [[Y]]
++; CHECK-NEXT:    [[TMP2:%.*]] = freeze <2 x i4> [[X]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[Y]], [[TMP2]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
++; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[TMP2]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+ ;
+   %im = xor <2 x i4> %m, <i4 -1, i4 -1>
+@@ -204,9 +212,10 @@ define <2 x i4> @c_0_0_1 (<2 x i4> %m) {
+ 
+ define <2 x i4> @c_1_1_0 (<2 x i4> %x, <2 x i4> %y, <2 x i4> %m) {
+ ; CHECK-LABEL: @c_1_1_0(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[Y:%.*]], [[X:%.*]]
++; CHECK-NEXT:    [[X:%.*]] = freeze <2 x i4> [[Y1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[Y:%.*]], [[X]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[Y]]
++; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+ ;
+   %im = xor <2 x i4> %m, <i4 -1, i4 -1>
+@@ -219,7 +228,8 @@ define <2 x i4> @c_1_1_0 (<2 x i4> %x, <2 x i4> %y, <2 x i4> %m) {
+ define <2 x i4> @c_1_0_1 (<2 x i4> %x, <2 x i4> %m) {
+ ; CHECK-LABEL: @c_1_0_1(
+ ; CHECK-NEXT:    [[Y:%.*]] = call <2 x i4> @gen4()
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[Y]], [[X:%.*]]
++; CHECK-NEXT:    [[X:%.*]] = freeze <2 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[Y]], [[X]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+@@ -235,7 +245,8 @@ define <2 x i4> @c_1_0_1 (<2 x i4> %x, <2 x i4> %m) {
+ define <2 x i4> @c_0_1_1 (<2 x i4> %y, <2 x i4> %m) {
+ ; CHECK-LABEL: @c_0_1_1(
+ ; CHECK-NEXT:    [[X:%.*]] = call <2 x i4> @gen4()
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X]], [[Y:%.*]]
++; CHECK-NEXT:    [[Y:%.*]] = freeze <2 x i4> [[Y1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X]], [[Y]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[Y]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+@@ -252,9 +263,10 @@ define <2 x i4> @c_1_1_1 (<2 x i4> %m) {
+ ; CHECK-LABEL: @c_1_1_1(
+ ; CHECK-NEXT:    [[X:%.*]] = call <2 x i4> @gen4()
+ ; CHECK-NEXT:    [[Y:%.*]] = call <2 x i4> @gen4()
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[Y]], [[X]]
++; CHECK-NEXT:    [[TMP2:%.*]] = freeze <2 x i4> [[Y]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X]], [[TMP2]]
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
+-; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[Y]]
++; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[TMP2]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+ ;
+   %im = xor <2 x i4> %m, <i4 -1, i4 -1>
+@@ -268,7 +280,8 @@ define <2 x i4> @c_1_1_1 (<2 x i4> %m) {
+ 
+ define <2 x i4> @commutativity_constant_varx_6_invmask(<2 x i4> %x, <2 x i4> %mask) {
+ ; CHECK-LABEL: @commutativity_constant_varx_6_invmask(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X:%.*]], splat (i4 6)
++; CHECK-NEXT:    [[X:%.*]] = freeze <2 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X]], splat (i4 6)
+ ; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[MASK:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+@@ -304,8 +317,10 @@ declare void @use4(<2 x i4>)
+ 
+ define <2 x i4> @n_oneuse_D_is_ok (<2 x i4> %x, <2 x i4> %y, <2 x i4> %m) {
+ ; CHECK-LABEL: @n_oneuse_D_is_ok(
+-; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X:%.*]], [[Y:%.*]]
+-; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[N0]], [[M:%.*]]
++; CHECK-NEXT:    [[X:%.*]] = freeze <2 x i4> [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor <2 x i4> [[X]], [[Y:%.*]]
++; CHECK-NEXT:    [[TMP2:%.*]] = xor <2 x i4> [[Y]], [[X]]
++; CHECK-NEXT:    [[TMP1:%.*]] = and <2 x i4> [[TMP2]], [[M:%.*]]
+ ; CHECK-NEXT:    [[R:%.*]] = xor <2 x i4> [[TMP1]], [[X]]
+ ; CHECK-NEXT:    call void @use4(<2 x i4> [[N0]])
+ ; CHECK-NEXT:    ret <2 x i4> [[R]]
+diff --git a/llvm/test/Transforms/InstCombine/masked-merge-xor.ll b/llvm/test/Transforms/InstCombine/masked-merge-xor.ll
+index 463f220fcb..dead3467d1 100644
+--- a/llvm/test/Transforms/InstCombine/masked-merge-xor.ll
++++ b/llvm/test/Transforms/InstCombine/masked-merge-xor.ll
+@@ -427,3 +427,32 @@ define i32 @n3_constmask_samemask(i32 %x, i32 %y) {
+   %ret = xor i32 %and, %and1
+   ret i32 %ret
+ }
++
++define i4 @masked_merge_inverted_mask_maybe_undef_x(i4 %x, i4 %y, i4 %m) {
++; CHECK-LABEL: @masked_merge_inverted_mask_maybe_undef_x(
++; CHECK-NEXT:    [[Y:%.*]] = freeze i4 [[X1:%.*]]
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], [[Y]]
++; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
++; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[Y]]
++; CHECK-NEXT:    ret i4 [[R]]
++;
++  %im = xor i4 %m, -1
++  %n0 = xor i4 %x, %y
++  %n1 = and i4 %n0, %im
++  %r = xor i4 %n1, %y
++  ret i4 %r
++}
++
++define i4 @masked_merge_inverted_mask_noundef_x(i4 noundef %x, i4 %y, i4 %m) {
++; CHECK-LABEL: @masked_merge_inverted_mask_noundef_x(
++; CHECK-NEXT:    [[N0:%.*]] = xor i4 [[X:%.*]], [[Y:%.*]]
++; CHECK-NEXT:    [[TMP1:%.*]] = and i4 [[N0]], [[M:%.*]]
++; CHECK-NEXT:    [[R:%.*]] = xor i4 [[TMP1]], [[X]]
++; CHECK-NEXT:    ret i4 [[R]]
++;
++  %im = xor i4 %m, -1
++  %n0 = xor i4 %x, %y
++  %n1 = and i4 %n0, %im
++  %r = xor i4 %n1, %y
++  ret i4 %r
++}
+diff --git a/llvm/test/Transforms/InstCombine/shift-add.ll b/llvm/test/Transforms/InstCombine/shift-add.ll
+index 81cbc2ac23..25f031e93a 100644
+--- a/llvm/test/Transforms/InstCombine/shift-add.ll
++++ b/llvm/test/Transforms/InstCombine/shift-add.ll
+@@ -804,3 +804,108 @@ define <2 x i8> @lshr_fold_or_disjoint_cnt_out_of_bounds(<2 x i8> %x) {
+   %r = lshr <2 x i8> <i8 2, i8 3>, %a
+   ret <2 x i8> %r
+ }
++
++; Pre-shift fold without exact/nsw/nuw flags, guarded by known range of X.
++
++define i32 @lshr_add_negative_no_exact_known_range(i32 %x) {
++; CHECK-LABEL: @lshr_add_negative_no_exact_known_range(
++; CHECK-NEXT:    [[MASKED:%.*]] = and i32 [[X:%.*]], 15
++; CHECK-NEXT:    [[R:%.*]] = lshr i32 4, [[MASKED]]
++; CHECK-NEXT:    ret i32 [[R]]
++;
++  %masked = and i32 %x, 15
++  %a = add i32 %masked, -1
++  %r = lshr i32 2, %a
++  ret i32 %r
++}
++
++define i32 @shl_add_negative_no_flags_known_range(i32 %x) {
++; CHECK-LABEL: @shl_add_negative_no_flags_known_range(
++; CHECK-NEXT:    [[MASKED:%.*]] = and i32 [[X:%.*]], 15
++; CHECK-NEXT:    [[R:%.*]] = shl nuw nsw i32 3, [[MASKED]]
++; CHECK-NEXT:    ret i32 [[R]]
++;
++  %masked = and i32 %x, 15
++  %a = add i32 %masked, -2
++  %r = shl i32 12, %a
++  ret i32 %r
++}
++
++define i32 @ashr_add_negative_no_exact_known_range(i32 %x) {
++; CHECK-LABEL: @ashr_add_negative_no_exact_known_range(
++; CHECK-NEXT:    [[MASKED:%.*]] = and i32 [[X:%.*]], 15
++; CHECK-NEXT:    [[R:%.*]] = ashr i32 -8, [[MASKED]]
++; CHECK-NEXT:    ret i32 [[R]]
++;
++  %masked = and i32 %x, 15
++  %a = add i32 %masked, -1
++  %r = ashr i32 -4, %a
++  ret i32 %r
++}
++
++define <2 x i32> @lshr_add_negative_no_exact_known_range_vec(<2 x i32> %x) {
++; CHECK-LABEL: @lshr_add_negative_no_exact_known_range_vec(
++; CHECK-NEXT:    [[MASKED:%.*]] = and <2 x i32> [[X:%.*]], splat (i32 15)
++; CHECK-NEXT:    [[R:%.*]] = lshr <2 x i32> splat (i32 4), [[MASKED]]
++; CHECK-NEXT:    ret <2 x i32> [[R]]
++;
++  %masked = and <2 x i32> %x, <i32 15, i32 15>
++  %a = add <2 x i32> %masked, <i32 -1, i32 -1>
++  %r = lshr <2 x i32> <i32 2, i32 2>, %a
++  ret <2 x i32> %r
++}
++
++; Motivating example from issue #222281
++define i32 @from_sub_issue222281(i8 %x) {
++; CHECK-LABEL: @from_sub_issue222281(
++; CHECK-NEXT:    [[M:%.*]] = and i8 [[X:%.*]], 120
++; CHECK-NEXT:    [[V:%.*]] = or disjoint i8 [[M]], -128
++; CHECK-NEXT:    [[TZ:%.*]] = call range(i8 3, 8) i8 @llvm.cttz.i8(i8 [[V]], i1 true)
++; CHECK-NEXT:    [[Z:%.*]] = zext nneg i8 [[TZ]] to i32
++; CHECK-NEXT:    [[R:%.*]] = lshr exact i32 512, [[Z]]
++; CHECK-NEXT:    ret i32 [[R]]
++;
++  %m = and i8 %x, -8
++  %v = or i8 %m, -128
++  %tz = call i8 @llvm.cttz.i8(i8 %v, i1 true)
++  %z = zext nneg i8 %tz to i32
++  %s = sub nuw nsw i32 %z, 3
++  %r = lshr i32 64, %s
++  ret i32 %r
++}
++
++; negative test: X range is unknown, fold should not fire without exact
++define i32 @lshr_add_negative_no_exact_unknown_range(i32 %x) {
++; CHECK-LABEL: @lshr_add_negative_no_exact_unknown_range(
++; CHECK-NEXT:    [[A:%.*]] = add i32 [[X:%.*]], -1
++; CHECK-NEXT:    [[R:%.*]] = lshr i32 2, [[A]]
++; CHECK-NEXT:    ret i32 [[R]]
++;
++  %a = add i32 %x, -1
++  %r = lshr i32 2, %a
++  ret i32 %r
++}
++
++; negative test: constant not roundtrippable (3 >> 1 loses bit 0 for shl)
++define i32 @shl_add_negative_no_flags_not_roundtrippable(i32 range(i32 1, 16) %x) {
++; CHECK-LABEL: @shl_add_negative_no_flags_not_roundtrippable(
++; CHECK-NEXT:    [[A:%.*]] = add nsw i32 [[X:%.*]], -1
++; CHECK-NEXT:    [[R:%.*]] = shl i32 3, [[A]]
++; CHECK-NEXT:    ret i32 [[R]]
++;
++  %a = add nsw i32 %x, -1
++  %r = shl i32 3, %a
++  ret i32 %r
++}
++
++; negative test: constant not roundtrippable (64 << 28 overflows 32-bit integer for lshr)
++define i32 @lshr_add_negative_no_exact_overflow(i32 range(i32 28, 32) %x) {
++; CHECK-LABEL: @lshr_add_negative_no_exact_overflow(
++; CHECK-NEXT:    [[A:%.*]] = add nsw i32 [[X:%.*]], -28
++; CHECK-NEXT:    [[R:%.*]] = lshr exact i32 64, [[A]]
++; CHECK-NEXT:    ret i32 [[R]]
++;
++  %a = add nsw i32 %x, -28
++  %r = lshr i32 64, %a
++  ret i32 %r
++}
+diff --git a/llvm/test/Transforms/SLPVectorizer/X86/propagate_ir_flags.ll b/llvm/test/Transforms/SLPVectorizer/X86/propagate_ir_flags.ll
+index afbbf8e4b0..c6d7e0ec8e 100644
+--- a/llvm/test/Transforms/SLPVectorizer/X86/propagate_ir_flags.ll
++++ b/llvm/test/Transforms/SLPVectorizer/X86/propagate_ir_flags.ll
+@@ -578,7 +578,7 @@ define void @call_no_fast(ptr %x) {
+ define void @select_nnan(ptr %d, <4 x i1> %m, <4 x float> %x, <4 x float> %y) {
+ ; CHECK-LABEL: @select_nnan(
+ ; CHECK-NEXT:    [[P1:%.*]] = getelementptr float, ptr [[D:%.*]], i32 0
+-; CHECK-NEXT:    [[TMP1:%.*]] = select <4 x i1> [[M:%.*]], <4 x float> [[X:%.*]], <4 x float> [[Y:%.*]]
++; CHECK-NEXT:    [[TMP1:%.*]] = select nnan <4 x i1> [[M:%.*]], <4 x float> [[X:%.*]], <4 x float> [[Y:%.*]]
+ ; CHECK-NEXT:    store <4 x float> [[TMP1]], ptr [[P1]], align 4
+ ; CHECK-NEXT:    ret void
+ ;
