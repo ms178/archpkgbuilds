@@ -74,4 +74,4 @@ ninja -C build/x64
   by Alec Ari, itself forked from
   [mstorsjo/llvm-mingw](https://github.com/mstorsjo/llvm-mingw) by
   Martin Storsjö.
-- Fish port + PKGBUILD: CachyOS packaging (for ms178).
+- PKGBUILD: CachyOS packaging (for ms178).
