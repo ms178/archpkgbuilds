@@ -1,8 +1,632 @@
+diff --git a/FOLLOWUP-2026-09-16-slp-v6-loop-epics.md b/FOLLOWUP-2026-09-16-slp-v6-loop-epics.md
+new file mode 100644
+index 0000000..ced1b1d
+--- /dev/null
++++ b/FOLLOWUP-2026-09-16-slp-v6-loop-epics.md
+@@ -0,0 +1,246 @@
++# FOLLOWUP 2026-09-16 — The Loop Epics: adler32 DO8 and nbody (design)
++
++Session 50 / wave W6. Charter item: *adler32 DO8 / nbody — loop epics
++needing reassociation, explicitly outside BB-SLP's reassociation-free
++charter.* This document is the engineering design for both epics: what
++they are, why the current passes stop where they stop, and the exact
++plans — with the soundness proofs, the lowering shapes, and the test
++contracts — for the loop-vectorizer work that would deliver them.
++
++The S06–S09 infrastructure this design depends on (vecreg homing
++completion, the bank-precise `vec_live_regs` claim discipline, the
++deferred-dest-store survival fix, the 128-bit VEX memfold) is merged and
++gated; every packed shape this document proposes flows through those
++hardened paths.
++
++---
++
++## 1. Where the epics stand today (measured)
++
++### 1.1 adler32 DO8 (zlib's classic 8-byte unroll)
++
++```c
++while (len >= 8) {
++    s2 += s1 += buf[0];  s2 += s1 += buf[1];
++    ...                   s2 += s1 += buf[7];
++    buf += 8; len -= 8;
++}
++```
++
++Current lccc `-O2 -march=x86-64-v3`: a clean **scalar chain** — 8×
++(`movzbl` + `lea/add` for s1 + `add` for s2), 3 insns per byte, one
++loop-carried dependency of length 16 adds per iteration. GCC 14.2 `-O2`
++emits the same scalar shape (verified; GCC does not vectorize this
++either — only zlib's *hand-written* `adler32_ssse3` gets the packed
++form). **The epic is beating both compilers with the auto-vectorized
++form zlib-ng wrote by hand.**
++
++### 1.2 nbody force loop
++
++The leaf `dx*dx + dy*dy + dz*dz` is already at exact GCC parity
++(3×`vsubsd` + `vmulsd` + 2×`vfmadd`), and the W3 cmp+blendv/min/max and
++W5 homing work cover the pair-loop's straight-line bodies. The epic is
++the **j-loop's force accumulators** (`fx/fy/fz += m_j·dx/r³`), which are
++FP reductions over a recurrence (`r` depends on the running pair), and
++the **velocity update** (`vx += dt·fx/m` chains). Current: scalar FMA
++chains, one per component.
++
++---
++
++## 2. Why BB-SLP cannot do these (and must not)
++
++BB-SLP's contract, unchanged since v1: it packs **isomorphic
++straight-line lanes within one basic block without reassociating
++anything** — the pack is a bit-exact restatement of the scalar lanes
++(every fold proven lane-exact: the FP-Neg sign-mask proof, the IEEE
++blendv predicate proof, the integer min/max commutativity proof).
++Both epics violate a different precondition:
++
++* **adler32 DO8** is *not* a multi-lane isomorphism at all — it is ONE
++  lane (s1, s2) whose *values* must be reassociated across unrolled
++  iterations. No amount of lane-packing expresses
++  `s2 += Σ w_i·b_i + 8·s1` without changing the summation ORDER.
++* **nbody's** dot leaf packs fine at the leaf level in isolation (three
++  squares into a horizontal sum — a 3-lane non-power-of-2 shape), but
++  the *reduction* (`fx += …`) is loop-carried, and the dx/dy/dz values
++  are born from loads whose addresses the pair-loop updates — a
++  cross-iteration dependence web.
++
++Reassociation of **integer** addition is exact (associative and
++commutative mod 2^32, and C defines unsigned wraparound). Reassociation
++of **floating point** is NOT bit-exact and requires the user's
++permission (`-fassociative-math` / `-ffast-math`). These are the two
++different contracts the design below honors.
++
++---
++
++## 3. Epic A — adler32 DO8: exact integer reduction reassociation
++
++### 3.1 The mathematics (the whole soundness story)
++
++All arithmetic is `uint32_t` (defined, associative, commutative,
++distributive mod 2^32 — no overflow UB in sight, so reassociation needs
++no range proof for *correctness*; the bound analysis in §3.3 is only
++about keeping the intermediate sums in a form the packed ops can hold).
++
++For a block of N input bytes b_0..b_{N-1} with the recurrence
++`s1_{i+1} = s1_i + b_i`, `s2_{i+1} = s2_i + s1_{i+1}`:
++
++```
++s1_N = s1_0 + Σ b_i
++s2_N = s2_0 + N·s1_0 + Σ (N − i)·b_i        (weights N..1)
++```
++
++*Proof*: unroll s2's recurrence — each b_i is added into s2 once per
++later iteration (N−i times), and s1_0 is added N times. Both sides are
++the same multiset of addends; unsigned addition's AC properties make
++the reordering exact. ∎
++
++### 3.2 The packed decomposition (the zlib-ng shape, auto-derived)
++
++Per 16-byte block (SSSE3) or 32-byte block (AVX2), with `vs1`, `vs2`
++held in a ymm:
++
++```
++vsad  = vpsadbw(block, 0)          ; 8×(16-bit) byte sums   (2×64-bit for AVX2)
++vs1  += vsad                        ; exact: s1's block-total (§3.1 first line)
++vsmad = vpmaddubsw(block, W)        ; signed×unsigned weighted pairs, W = 16..1 (bytes)
++       — CAREFUL: vpmaddubsw saturates; see §3.3 for why 16-bit lanes hold.
++vs2   = vs2 + N·vs1_prev + widen(vsmad)   (vpmaddwd with 1-splat + vpaddd)
++```
++
++The lccc infrastructure this needs, all of which EXISTS today:
++
++| need | where it lives today |
++|---|---|
++| `vpsadbw` reduction | `VecSadbwU8x32` (counting battery, v5) |
++| `vpmaddubsw`/`vpmaddwd` chains | user-intrinsic paths; **map-vectorizer families needed** |
++| loop-carried ymm home | reduction vecreg scan + W5 claim discipline |
++| stream load folding | VLFOLD 256-bit (W1) |
++| 5552-block bound | the front-end's existing `% BASE` peeling (nothing new) |
++
++### 3.3 The 16-bit lane bound (the one real analysis)
++
++`vpmaddubsw` computes *signed* 16-bit products of *unsigned* bytes with
++*signed* weights and **saturates**. zlib's decomposition keeps every
++partial sum bounded because within one 5552-byte block:
++`s1 ≤ 65520 + 5552·255 < 2^24` and each weighted pair-sum
++`Σ_{pair} w·b ≤ (16+15+…+1)·255 = 136·255 = 34 680 < 2^15`? — no:
++`saturating pairs` — zlib splits the weight vector so each *pair*
++(2 bytes × weight ≤ 16+15) stays ≤ (16+15)·255 = 7 905 < 32 767 ✓ and
++the maddwd accumulate adds at most 4 such pairs per dword before the
++next vs2 add, and vs2 itself stays ≤ 65520 + 5552·(65520+5551·255)
++< 2^31 ✓ (the classic 5552 = largest N with N·(N·255 + 65520) +
++5552·65520 < 2^32). The design's proof obligation at implementation
++time: emit the bound check ONCE at loop entry (peel to a multiple of
++the block width, verify `len ≤ 5552` blocks between `% BASE`
++reductions — exactly the structure the C source already guarantees),
++and keep the pair-splitting weights as constants in the vector const
++pool (the W2 `.LCVEC_` machinery).
++
++### 3.4 The pass design (where it lives, how it's gated)
++
++* **Location**: `vectorize.rs` — a new recognition in the reduction
++  scan: a two-recurrence chain (`s1 += b` feeding `s2 += s1`) over a
++  unit-stride byte stream. The recognizer emits the §3.2 decomposition
++  directly as `Vec*` intrinsics (adding `VecMaddubsI8x16/32` +
++  `VecMaddI16x8/16` producer families — the W5 pattern: same emitters
++  the user intrinsics already use, so the class tables admit them).
++* **Exactness contract**: bit-identical to the scalar chain for EVERY
++  input — testable by the existing differential oracle (add an adler32
++  case with adversarial lengths: 0..64, 5551..5553, 2^16±1, the
++  `% BASE` boundary crosses).
++* **Gating**: `-O2` default ON (integer, exact — no fast-math needed).
++  Kill switch: `CCC_NO_ADLER_REASSOC`.
++* **Cost model**: fires only when the stream is provably
++  unit-stride + `restrict`-clean (the rule-(e) hazard machinery) and
++  the loop is the hot inner loop (the existing loop-header heuristics).
++* **Expected result**: 32 bytes/iteration at ~11 packed ops vs 96
++  scalar ops — the measured zlib-ng SSSE3-vs-scalar ratio (~6–8×) on
++  the 14700KF's 2×256-bit ports.
++
++### 3.5 What is deliberately NOT attempted
++
++Unrolling the *remainder* loop, and the `s1 %= BASE` epilogue: the
++scalar remainder is ≤ 7 bytes (a peeling decision, not a reassociation);
++the modulo stays scalar exactly as zlib keeps it.
++
++---
++
++## 4. Epic B — nbody: the fast-math-gated FP reduction
++
++### 4.1 The contract difference
++
++Floating-point reassociation changes results (bits). lccc today honors
++strict FP semantics everywhere (the FP strict min/max folds of v5 are
++the exactness discipline; the FMA contraction follows
++`-ffp-contract=fast` GCC default at -O2 which we already match). The
++nbody epic therefore has a HARD gate: `-fassociative-math` (implied by
++`-ffast-math`), off by default, with the differential test contract
++switching from bit-exact to ULP-tolerance (the benchmark oracle's
++existing epsilon machinery).
++
++### 4.2 The decomposition
++
++Per body i, the j-loop accumulates `fx, fy, fz` and the pair distance:
++
++```
++dx  = x_i − x_j   (three components, unit stride over j)
++r²  = dx² + dy² + dz²          (the §1.2 leaf — already optimal)
++inv = 1/√(r²)  (vrsqrtps + one Newton step under fast-math)
++f   = m_j · inv³               (vfmadd chains)
++fx += f·dx  (fy, fz)           — 3 independent reductions
++```
++
++The vectorizable form processes 4 j-bodies per iteration (F64x4 /
++2×F64x2 lanes): dx/dy/dz become 4-lane gathers (the affine-window
++addressing of BB-SLP v4 generalizes to the loop's induction variable),
++the reduction uses the classic **multiple accumulators + final
++horizontal add** (4-wide fx/fy/fz vectors, `hadd`-tree at exit —
++this is the reassociation the flag permits).
++
++### 4.3 Why this is sequenced AFTER Epic A
++
++* It needs `-fassociative-math` plumbing through the driver → pass
++  config (a small, mechanical change, but a SEMANTIC contract addition
++  that deserves its own gate + docs).
++* Its correctness contract is tolerance-based — the differential oracle
++  needs the ULP-comparison mode wired for FP outputs (exists for the
++  benchmark oracle, not yet for the correctness runner).
++* Its payoff (nbody-class HPC codes) is real but narrower than
++  adler32's (every zlib consumer on the planet, including the kernel's
++  own decompression path).
++
++### 4.4 Expected result
++
++The classic 4×-wide F64 reduction with FMA + vrsqrt approximation
++matches icx `-ffast-math` on the 14700KF within the port budget
++(2 FMA ports × 4-wide); the measured target is the benchmark suite's
++existing nbody program — the oracle comparison becomes
++`|lccc − gcc_fastmath| ≤ 4 ULP` per output.
++
++---
++
++## 5. Test and gating plan (both epics)
++
++1. **adler32**: bit-exact differential vs the scalar reference over
++   adversarial lengths (§3.4); a codegen gate pinning the packed shape
++   (`vpsadbw` + `vpmaddubsw` + `vpmaddwd` + the vs1/vs2 ymm homes, no
++   scalar chain left in the wide body); the 5552-bound peel test with
++   `% BASE` boundary inputs.
++2. **nbody**: tolerance differential (≤ 4 ULP vs the scalar loop at
++   `-fno-associative-math`), plus a NEGATIVE test: without the flag,
++   the loop must stay scalar-chain (bit-exact) — the gate that keeps
++   the default honest.
++3. Both wired into `ci_local.sh` as fast gates, mirroring the v6 gate.
++
++---
++
++## 6. Decision
++
++Epic A is **designed and ready to implement** in the loop vectorizer
++(exact mathematics, existing instruction families, existing homing and
++fold infrastructure; the only new IR families are the madd pair, which
++follows the W5 admission pattern). Epic B is **designed, gated on the
++fast-math contract**, and sequenced after A. Neither touches BB-SLP's
++reassociation-free charter — the charter stays exactly as proven.
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 3662184..2d75315 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -100,13 +100,41 @@ gate "rust-toolchain-selector" fast \
+ # run was green. Repeating the suite is the only way to see it, and it is
+ # cheap once the test binaries are built. Set LCCC_TEST_REPEATS to raise the
+ # count (CI itself runs it once).
++#
++# Memory-constrained hosts: the monolithic lib-test compile with the
++# fastbuild profile's line-tables debuginfo needs ~3 GB of resident rustc;
++# on a 4 GB sandbox the OOM killer SIGKILLs it and the gate reports a
++# compile failure that has nothing to do with the code under test. The
++# test binary's debuginfo contributes nothing the assertions read --
++# panic messages carry their own source spans -- and cargo's -j only
++# serialises the COMPILE (the test harness's own parallelism is
++# --test-threads, untouched), so on hosts with less than 6 GB of RAM
++# the test compile drops the debuginfo AND builds one rustc at a time
++# (CARGO_PROFILE_FASTBUILD_DEBUG=0, -j 1; set the env var explicitly to
++# override the heuristic, including back to the profile default with
++# CARGO_PROFILE_FASTBUILD_DEBUG=line-tables-only).
+ cargo_test_repeated() {
+-    local flags="" n i
++    local flags="" n i dbg jobs
+     # Reuse the flags the build gate resolved, or cargo rebuilds everything.
+     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
++    dbg="${CARGO_PROFILE_FASTBUILD_DEBUG:-}"
++    jobs=2
++    if [ -z "$dbg" ]; then
++        local total_mb
++        total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
++        if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
++            dbg=0
++            jobs=1
++        fi
++    fi
+     n="${LCCC_TEST_REPEATS:-1}"
+     for ((i = 1; i <= n; i++)); do
+-        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j 2; then
++        if [ -n "$dbg" ]; then
++            export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
++        else
++            unset CARGO_PROFILE_FASTBUILD_DEBUG
++        fi
++        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
+             printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
+             return 1
+         fi
+@@ -228,6 +256,14 @@ gate "bb-slp-v4" fast \
+ gate "bb-slp-v5" fast \
+     bash tests/regression/check_bb_slp_v5_codegen.sh
+ 
++# BB-SLP v6: the 128-bit VEX memory fold, FP negation (one-instruction
++# sign-mask composite), integer min/max folds, the general cmp+blendv
++# composite, and the rule-(b) cross-block relaxation; plus the W5
++# register-homing contracts (dead-frame-free rotate diamonds, homed
++# min/max, GCC-parity shapes) and the stale-claim regression shapes.
++gate "bb-slp-v6" fast \
++    bash tests/regression/check_bb_slp_v6_codegen.sh
++
+ gate "cross-backend-atomics" fast \
+     bash tests/regression/check_atomic_backends.sh
+ 
+diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
+index fca2921..b3d547b 100644
+--- a/src/backend/arm/codegen/intrinsics.rs
++++ b/src/backend/arm/codegen/intrinsics.rs
+@@ -818,6 +818,7 @@ impl ArmCodegen {
+             | IntrinsicOp::VecMulF32x4
+             | IntrinsicOp::VecAddI32x4
+             | IntrinsicOp::VecSmaxI32x4
++            | IntrinsicOp::VecSminI32x4
+             | IntrinsicOp::VecSubF64x2
+             | IntrinsicOp::VecDivF64x2
+             | IntrinsicOp::VecSubF32x4
+@@ -837,6 +838,7 @@ impl ArmCodegen {
+                         IntrinsicOp::VecDivF32x4 => ("fdiv", "4s"),
+                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
+                         IntrinsicOp::VecSmaxI32x4 => ("smax", "4s"),
++                        IntrinsicOp::VecSminI32x4 => ("smin", "4s"),
+                         _ => ("mul", "4s"),
+                     };
+                     if let Some(name) = self.assigned_vector_reg(d.0) {
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 11336d4..c9f7b8d 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -168,8 +168,6 @@ pub(crate) struct CodegenOptions {
+     /// Gates the Popcount lowering; the fallback is an shr/adc bit loop
+     /// in %rax/%rcx.
+     pub(crate) popcnt: bool,
+-    /// Whether the target has AVX2 (`-mavx2` or an enabling `-march`).
+-    pub(crate) avx2: bool,
+     /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).
+     /// Enables the 1-uop EVEX GPR-source vpbroadcast for scalar->vector splats.
+     pub(crate) avx512: bool,
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index fe5fca2..a6c0bd2 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -6550,12 +6550,14 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
+             | O::VecSubF32x4
+             | O::VecMulF32x4
+             | O::VecDivF32x4
++            | O::VecXorF32x4
+             | O::VecMinF32x4
+             | O::VecMaxF32x4
+             | O::VecAddF64x2
+             | O::VecSubF64x2
+             | O::VecMulF64x2
+             | O::VecDivF64x2
++            | O::VecXorF64x2
+             | O::VecMinF64x2
+             | O::VecMaxF64x2
+             | O::VecRotlI32x4
+@@ -7548,6 +7550,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
+                                 | O::VecHorizontalMaxI32x8
+                                 | O::VecHorizontalMaxI32x4
+                                 | O::VecSmaxI32x4
++                                | O::VecSminI32x4
+                                 | O::VecLoadWidenI32ToI64x2
+                                 // Byte-predicate counting loops carry the
+                                 // map-family byte ops (compare masks, the
+@@ -7772,6 +7775,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
+                     | O::VecAddF32x8
+                     | O::VecSubF32x8
+                     | O::VecDivF32x8
++                    | O::VecXorF32x8
+                     | O::VecSqrtF32x8
+                     | O::VecMaddF32x8
+                     | O::VecCmpF32x8
+@@ -7785,6 +7789,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
+                     | O::VecAddF64x4
+                     | O::VecSubF64x4
+                     | O::VecDivF64x4
++                    | O::VecXorF64x4
+                     | O::VecSqrtF64x4
+                     | O::VecMaddF64x4
+                     | O::VecCmpF64x4
+@@ -7977,37 +7982,53 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+             O::VecLoadF32x8
+             | O::VecSubF32x8
+             | O::VecDivF32x8
++            | O::VecXorF32x8
+             | O::VecSqrtF32x8
+             | O::VecMaddF32x8
+             | O::VecCmpF32x8
+             | O::VecBlendvF32x8
+             | O::VecMinF32x8
+-            | O::VecMaxF32x8 => Some(1),
++            | O::VecMaxF32x8
++            // Add/Mul ride `emit_avx_binary_256`, the same audited emitter
++            // as Sub/Div (W5: a streamed load feeding an add/mul chain was
++            // rejected here and paid a 32-byte dead slot + spill round
++            // trips).
++            | O::VecAddF32x8
++            | O::VecMulF32x8 => Some(1),
+             O::VecLoadF64x4
+             | O::VecSubF64x4
+             | O::VecDivF64x4
++            | O::VecXorF64x4
+             | O::VecSqrtF64x4
+             | O::VecMaddF64x4
+             | O::VecCmpF64x4
+             | O::VecBlendvF64x4
+             | O::VecMinF64x4
+-            | O::VecMaxF64x4 => Some(2),
++            | O::VecMaxF64x4
++            | O::VecAddF64x4
++            | O::VecMulF64x4 => Some(2),
+             O::VecLoadF32x4
+             | O::VecSubF32x4
+             | O::VecDivF32x4
++            | O::VecXorF32x4
+             | O::VecSqrtF32x4
+             | O::VecCmpF32x4
+             | O::VecBlendvF32x4
+             | O::VecMinF32x4
+-            | O::VecMaxF32x4 => Some(4),
++            | O::VecMaxF32x4
++            | O::VecAddF32x4
++            | O::VecMulF32x4 => Some(4),
+             O::VecLoadF64x2
+             | O::VecSubF64x2
+             | O::VecDivF64x2
++            | O::VecXorF64x2
+             | O::VecSqrtF64x2
+             | O::VecCmpF64x2
+             | O::VecBlendvF64x2
+             | O::VecMinF64x2
+-            | O::VecMaxF64x2 => Some(5),
++            | O::VecMaxF64x2
++            | O::VecAddF64x2
++            | O::VecMulF64x2 => Some(5),
+             // Integer map intermediates (class numbering mirrors the
+             // broadcast collector): dword lanes, AVX2 8-wide and SSE2
+             // 4-wide. Conditional-map results (compare masks, blends)
+@@ -8065,6 +8086,20 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+             | O::VecAShrI32x8
+             | O::VecShlI64x4
+             | O::VecLShrI64x4 => Some(3),
++            // W5: the I64x4 family rides the SAME audited emitters as the
++            // I32x8 twins above (emit_avx_binary_256 / vec_store_source_
++            // 256). Without these producer entries a rotate diamond
++            // (load → {shl, shr} → or) left every value slot-homed: 7
++            // memory ops where 2 suffice, plus a dead frame. Deferral
++            // cannot cover the shift results: the second shift is an
++            // intervening Intrinsic, rejected by the window analysis —
++            // homing is the only sound cover.
++            | O::VecLoadI64x4
++            | O::VecAddI64x4
++            | O::VecSubI64x4
++            | O::VecAndI64x4
++            | O::VecOrI64x4
++            | O::VecXorI64x4 => Some(3),
+             O::VecLoadI32x4
+             | O::VecSubI32x4
+             | O::VecAddI32x4
+@@ -8100,7 +8135,19 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+             | O::VecLShrI32x4
+             | O::VecAShrI32x4
+             | O::VecShlI64x2
+-            | O::VecLShrI64x2 => Some(6),
++            | O::VecLShrI64x2
++            // W5: I64x2 family (emit_sse_binary_128 / vec_store_source_
++            // 128, the I32x4 twins) and the SSE4.1 signed dword min/max
++            // (emit_sse_binary_128 via emit_sminmax_i32x4) — same rotate-
++            // diamond and dead-slot reasoning as the 256-bit arms above.
++            | O::VecLoadI64x2
++            | O::VecAddI64x2
++            | O::VecSubI64x2
++            | O::VecAndI64x2
++            | O::VecOrI64x2
++            | O::VecXorI64x2
++            | O::VecSminI32x4
++            | O::VecSmaxI32x4 => Some(6),
+             _ => None,
+         }
+     };
+@@ -8119,6 +8166,13 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+                     | O::VecMinF32x8
+                     | O::VecMaxF32x8
+                     | O::VecStoreF32x8
++                    // W5: Add/Mul/Xor ride emit_avx_binary_256 / the
++                    // FP-Neg sign-mask path (vec_home_256 first) — a
++                    // streamed load feeding the FP-Neg xor kept a dead
++                    // 32-byte slot + frame otherwise.
++                    | O::VecAddF32x8
++                    | O::VecMulF32x8
++                    | O::VecXorF32x8
+             ),
+             2 => matches!(
+                 op,
+@@ -8131,6 +8185,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+                     | O::VecMinF64x4
+                     | O::VecMaxF64x4
+                     | O::VecStoreF64x4
++                    // W5: Add/Mul/Xor — emit_avx_binary_256 / sign-mask
++                    // path, same audit as class 1.
++                    | O::VecAddF64x4
++                    | O::VecMulF64x4
++                    | O::VecXorF64x4
+             ),
+             4 => matches!(
+                 op,
+@@ -8142,6 +8201,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+                     | O::VecMinF32x4
+                     | O::VecMaxF32x4
+                     | O::VecStoreF32x4
++                    // W5: Add/Mul/Xor — emit_sse_binary_128 / sign-mask
++                    // path (vec_home_128 first).
++                    | O::VecAddF32x4
++                    | O::VecMulF32x4
++                    | O::VecXorF32x4
+             ),
+             5 => matches!(
+                 op,
+@@ -8153,6 +8217,10 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+                     | O::VecMinF64x2
+                     | O::VecMaxF64x2
+                     | O::VecStoreF64x2
++                    // W5: Add/Mul/Xor — same audit as class 4.
++                    | O::VecAddF64x2
++                    | O::VecMulF64x2
++                    | O::VecXorF64x2
+             ),
+             3 => matches!(
+                 op,
+@@ -8211,6 +8279,14 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+                     | O::VecAShrI32x8
+                     | O::VecShlI64x4
+                     | O::VecLShrI64x4
++                    // W5: the I64x4 binary family + store — the exact
++                    // emitters of the I32x8 twins above.
++                    | O::VecAddI64x4
++                    | O::VecSubI64x4
++                    | O::VecAndI64x4
++                    | O::VecOrI64x4
++                    | O::VecXorI64x4
++                    | O::VecStoreI64x4
+             ),
+             6 => matches!(
+                 op,
+@@ -8253,6 +8329,17 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+                     | O::VecAShrI32x4
+                     | O::VecShlI64x2
+                     | O::VecLShrI64x2
++                    // W5: I64x2 binaries + store (emit_sse_binary_128 /
++                    // vec_store_source_128 — the I32x4 twins) and the
++                    // SSE4.1 signed dword min/max (emit_sse_binary_128).
++                    | O::VecAddI64x2
++                    | O::VecSubI64x2
++                    | O::VecAndI64x2
++                    | O::VecOrI64x2
++                    | O::VecXorI64x2
++                    | O::VecSminI32x4
++                    | O::VecSmaxI32x4
++                    | O::VecStoreI64x2
+             ),
+             _ => false,
+         }
 diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
-index ea19a76..12f5db2 100644
+index ea19a76..60074dd 100644
 --- a/src/backend/stack_layout/copy_coalescing.rs
 +++ b/src/backend/stack_layout/copy_coalescing.rs
-@@ -2079,6 +2079,24 @@ pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bo
+@@ -1615,6 +1615,12 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+             | O::VecAndI64x2
+             | O::VecOrI64x2
+             | O::VecXorI64x2
++            // W5: the SSE4.1 signed dword min/max is a two-operand
++            // emit_sse_binary_128 form — a deferred load in args[1]
++            // folds into the VEX.128 destination exactly like the
++            // unsigned byte twins above.
++            | O::VecSminI32x4
++            | O::VecSmaxI32x4
+             | O::VecSubI64x4
+             | O::VecAndI64x4
+             | O::VecOrI64x4
+@@ -1946,6 +1952,37 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+             | O::VecDivF64x4
+             | O::VecDivF32x4
+             | O::VecDivF32x8
++            // W5: the FP-Neg sign-mask Xor composite (try_emit_fpxor_
++            // sign_mask consumes args[0] via vec_home_256/128 →
++            // avx_load_arg/sse_load_arg — never a raw slot read), the
++            // SSE4.1 signed dword min/max, and the packed immediate
++            // shifts (emit_avx_shift_imm_256 / emit_sse_shift_imm_128 —
++            // all-homed fast path, held-in-scratch path, staged fallback:
++            // every path resolves args[0] through the register cache).
++            // Without these, every single-use result of these ops paid an
++            // eager dead store to its home slot.
++            | O::VecXorF32x8
++            | O::VecXorF64x4
++            | O::VecXorF32x4
++            | O::VecXorF64x2
++            | O::VecSminI32x4
++            | O::VecSmaxI32x4
++            | O::VecShlI16x16
++            | O::VecShlI16x8
++            | O::VecLShrI16x16
++            | O::VecLShrI16x8
++            | O::VecAShrI16x16
++            | O::VecAShrI16x8
++            | O::VecShlI32x8
++            | O::VecShlI32x4
++            | O::VecLShrI32x8
++            | O::VecLShrI32x4
++            | O::VecAShrI32x8
++            | O::VecAShrI32x4
++            | O::VecShlI64x4
++            | O::VecShlI64x2
++            | O::VecLShrI64x4
++            | O::VecLShrI64x2
+     )
+ }
+ 
+@@ -2079,6 +2116,24 @@ pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bo
      )
  }
  
@@ -27,7 +651,7 @@ index ea19a76..12f5db2 100644
  /// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
  /// the bias folds through the 213 form (`vfmadd213ps mem, %scale, %ymm0` =
  /// scale*input + mem) and the input through the 231 form
-@@ -2131,25 +2149,78 @@ pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> boo
+@@ -2131,25 +2186,82 @@ pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> boo
      )
  }
  
@@ -79,6 +703,8 @@ index ea19a76..12f5db2 100644
 +        | O::VecAddF32x4
 +        | O::VecMulF64x2
 +        | O::VecMulF32x4
++        | O::VecXorF64x2
++        | O::VecXorF32x4
 +        | O::VecAddI64x2
 +        | O::VecAddI32x4
 +        | O::VecMulI32x4
@@ -102,7 +728,9 @@ index ea19a76..12f5db2 100644
 +        | O::VecMinU8x16
 +        | O::VecMaxU8x16
 +        | O::VecMinI16x8
-+        | O::VecMaxI16x8 => Some(true),
++        | O::VecMaxI16x8
++        | O::VecSminI32x4
++        | O::VecSmaxI32x4 => Some(true),
 +        // Non-commutative: FP sub/div return different results under
 +        // operand exchange; packed FP min/max return SRC2 on unordered and
 +        // equal lanes; integer sub is src1 − src2. A fold is order-safe in
@@ -124,7 +752,20 @@ index ea19a76..12f5db2 100644
  }
  
  /// Two-operand 256-bit VEX arithmetic intrinsics that go through
-@@ -2231,12 +2302,15 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
+@@ -2159,9 +2271,11 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
+     use crate::ir::intrinsics::IntrinsicOp as O;
+     match op {
+         O::VecAddF64x4
+-        | O::VecMulF64x4
+         | O::VecAddF32x8
++        | O::VecMulF64x4
+         | O::VecMulF32x8
++        | O::VecXorF64x4
++        | O::VecXorF32x8
+         | O::VecAddI32x8
+         | O::VecMulI32x8
+         | O::VecMaxI32x8
+@@ -2231,12 +2345,15 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
  ///   intervening load — it falls back to the ordinary load otherwise;
  /// * VEX arithmetic imposes no alignment on memory operands, so unaligned
  ///   streams are legal; legacy-SSE 128-bit forms (`paddd m128`) would fault,
@@ -143,7 +784,7 @@ index ea19a76..12f5db2 100644
  ///
  /// When both operands of a consumer are adjacent loads, the farther one is
  /// folded: the nearer load then streams through `%ymm0` under the existing
-@@ -2276,14 +2350,11 @@ pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u3
+@@ -2276,14 +2393,11 @@ pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u3
              else {
                  continue;
              };
@@ -163,7 +804,7 @@ index ea19a76..12f5db2 100644
                  continue;
              }
              for a in args {
-@@ -2344,11 +2415,18 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
+@@ -2344,11 +2458,21 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
      let debug = env_flag("CCC_DEBUG_VLFOLD");
      for (bi, block) in func.blocks.iter().enumerate() {
          let insts = &block.instructions;
@@ -180,11 +821,14 @@ index ea19a76..12f5db2 100644
 +                    is_memfold_vec_load(op)
 +                } else {
 +                    is_memfold_vec_load_128(op)
-+                } => Some(d.0),
++                } =>
++                {
++                    Some(d.0)
++                }
                  _ => None,
              }
          };
-@@ -2367,47 +2445,15 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
+@@ -2367,47 +2491,15 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
              };
              // Madd `a*b + c`: every position may fold (the multiplicands
              // commute; the emitter picks the 213/231 form and keeps the
@@ -240,7 +884,7 @@ index ea19a76..12f5db2 100644
                  if cargs.len() != 3 {
                      continue;
                  }
-@@ -2416,9 +2462,12 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
+@@ -2416,9 +2508,12 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
                  else {
                      continue;
                  };
@@ -255,7 +899,7 @@ index ea19a76..12f5db2 100644
                      continue;
                  };
                  if cargs.len() != 2 {
-@@ -2427,7 +2476,7 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
+@@ -2427,7 +2522,7 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
                  let (Operand::Value(a0), Operand::Value(a1)) = (&cargs[0], &cargs[1]) else {
                      continue;
                  };
@@ -264,7 +908,7 @@ index ea19a76..12f5db2 100644
              };
              if a0.0 == a1.0 {
                  continue;
-@@ -2452,12 +2501,12 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
+@@ -2452,12 +2547,12 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
              };
              let mut pick = None;
              if j >= 2 && pure_load_at(j - 1) {
@@ -280,7 +924,7 @@ index ea19a76..12f5db2 100644
                  }
              }
 diff --git a/src/backend/state.rs b/src/backend/state.rs
-index 39cd47b..fd72dd6 100644
+index 39cd47b..0087724 100644
 --- a/src/backend/state.rs
 +++ b/src/backend/state.rs
 @@ -130,6 +130,21 @@ impl RegCache {
@@ -331,6 +975,142 @@ index 39cd47b..fd72dd6 100644
      /// Lazy-flush half of the deferred-store mechanism: a skipped vector
      /// result store is kept PENDING here (value id, holding register, 256-bit
      /// flag) instead of being dropped. If the consumer really receives the
+@@ -515,6 +537,9 @@ pub struct CodegenState {
+     /// FP constants are emitted as .rodata entries and loaded via
+     /// `movsd .LCFPxx(%rip), %xmm` instead of `movabsq + movq`.
+     pub fp_const_pool: FxHashMap<u64, String>,
++    /// Full-width VECTOR constant pool (16/32 bytes, little-endian) for
++    /// emitters that fold a constant vector as a VEX memory operand.
++    pub vec_const_pool: FxHashMap<Vec<u8>, String>,
+     /// Label emitted immediately after the current block, if any. Used to
+     /// elide unconditional jumps on the hot fall-through path.
+     pub next_block_label: Option<BlockId>,
+@@ -624,6 +649,7 @@ impl CodegenState {
+             emit_cfi: true,
+ 
+             fp_const_pool: FxHashMap::default(),
++            vec_const_pool: FxHashMap::default(),
+             next_block_label: None,
+         }
+     }
+@@ -690,6 +716,22 @@ impl CodegenState {
+         label
+     }
+ 
++    /// Label for a full-width VECTOR constant (16 or 32 bytes, little-
++    /// endian). Keyed by the exact byte pattern so equal masks share one
++    /// .rodata slot. Used by emitters that fold a constant vector as a VEX
++    /// memory operand (`vxorps .LCVEC_3(%rip), %src, %dst`) — the one-
++    /// instruction spelling of the FP-Neg sign-mask composite, exactly the
++    /// form GCC emits for `-x` lanes.
++    pub fn get_vec_const_label(&mut self, bytes: &[u8]) -> String {
++        if let Some(label) = self.vec_const_pool.get(bytes) {
++            return label.clone();
++        }
++        let label = format!(".LCVEC_{}", self.label_counter);
++        self.label_counter += 1;
++        self.vec_const_pool.insert(bytes.to_vec(), label.clone());
++        label
++    }
++
+     /// Emit all accumulated FP constants as a .rodata section.
+     /// Called once at the end of module codegen.
+     ///
+@@ -703,7 +745,7 @@ impl CodegenState {
+     /// the upper lane of the andpd mask zero, which is the correct identity
+     /// for scalar-typed lanes.
+     pub fn emit_fp_const_pool(&mut self) {
+-        if self.fp_const_pool.is_empty() {
++        if self.fp_const_pool.is_empty() && self.vec_const_pool.is_empty() {
+             return;
+         }
+         self.out.emit(".section .rodata");
+@@ -723,6 +765,21 @@ impl CodegenState {
+                 .emit_fmt(format_args!("    .quad {}", *bits as i64));
+             self.out.emit("    .quad 0");
+         }
++        // Full-width vector constants: 16 or 32 little-endian bytes each,
++        // .p2align 4 (VEX memory operands carry no alignment requirement;
++        // the alignment keeps the pool tidy and legacy-safe).
++        let mut ventries: Vec<_> = self.vec_const_pool.iter().collect();
++        ventries.sort_by_key(|(_, label)| (*label).clone());
++        for (bytes, label) in ventries {
++            self.out.emit(".p2align 4");
++            self.out.emit_fmt(format_args!("{}:", label));
++            for chunk in bytes.chunks(8) {
++                let mut q = [0u8; 8];
++                q[..chunk.len()].copy_from_slice(chunk);
++                self.out
++                    .emit_fmt(format_args!("    .quad {}", u64::from_le_bytes(q) as i64));
++            }
++        }
+     }
+ 
+     /// Emit formatted assembly directly (no temporary String allocation).
+@@ -878,6 +935,46 @@ impl CodegenState {
+         // lose the pending epilogue emission.
+     }
+ 
++    /// Record that vector value `v` is currently held in the physical
++    /// vector register named `reg` ("xmm5"/"ymm3"/"zmm0"). One physical
++    /// register bank holds exactly one vector value: every OTHER value's
++    /// claim on the same bank is evicted — the write that produced `v`
++    /// destroyed whatever the bank held before (a VEX.128 write also
++    /// zeroes the bank's upper half, and a 256/512-bit write overwrites
++    /// the low view, so the eviction is alias-conservative across the
++    /// xmm/ymm/zmm spellings of the same bank in both directions: at
++    /// worst it costs a redundant reload, never a wrong read).
++    ///
++    /// The eviction is the soundness fix for the stale-claim hazard: a
++    /// scratch bank claimed by two values — the add's accumulator claim
++    /// on xmm0 outlived the shift that redefined xmm0, and the xor's
++    /// operand resolver then read the shift's result as the accumulator
++    /// (`vpxor (v>>1), (v>>1)` — the simd_vecreg loopcarry miscompile).
++    /// Claims are only ever recorded after a real write of `v` into
++    /// `reg`, so eviction at the claim is exactly the point where the
++    /// previous content provably died.
++    pub fn vec_claim_live_reg(&mut self, v: u32, reg: &'static str) {
++        let bank = vector_reg_bank(reg);
++        self.vec_live_regs
++            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == v);
++        self.vec_live_regs.insert(v, reg);
++    }
++
++    /// Every value's `vec_live_regs` claim on `reg`'s bank EXCEPT `keep`
++    /// dies here: the bank is being overwritten with data that is (or
++    /// will be) `keep`'s — a real load into the scratch view, or a
++    /// move-aside `movdqa held -> reg`. Without this eviction a claim
++    /// survived the very clobber that invalidated it, and a later
++    /// operand resolver read the WRONG value out of the register (the
++    /// simd_vecreg loopcarry shape: the accumulator's claim on xmm0
++    /// outlived both the streamed reload and the shift that redefined
++    /// xmm0; the xor then consumed `(v>>1) ^ (v>>1)`).
++    pub fn vec_evict_bank_except(&mut self, reg: &str, keep: u32) {
++        let bank = vector_reg_bank(reg);
++        self.vec_live_regs
++            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == keep);
++    }
++
+     /// Get the over-alignment requirement for an alloca (> 16 bytes), or None.
+     pub fn alloca_over_align(&self, v: u32) -> Option<usize> {
+         self.alloca_alignments.get(&v).copied()
+@@ -1102,6 +1199,16 @@ impl CodegenState {
+     }
+ }
+ 
++/// The bank number of a physical vector register name ("xmm5" → 5,
++/// "ymm3" → 3, "zmm0" → 0). The xmm/ymm/zmm spellings of one bank name
++/// the SAME physical storage viewed at different widths, so alias
++/// decisions in `vec_claim_live_reg` compare bank numbers, not strings.
++fn vector_reg_bank(reg: &str) -> u32 {
++    reg.trim_start_matches(|c: char| !c.is_ascii_digit())
++        .parse()
++        .unwrap_or(u32::MAX)
++}
++
+ #[cfg(test)]
+ mod slot_addr_tests {
+     use super::*;
 diff --git a/src/backend/x86/assembler/encoder/avx.rs b/src/backend/x86/assembler/encoder/avx.rs
 index 0729a12..c14d428 100644
 --- a/src/backend/x86/assembler/encoder/avx.rs
@@ -352,11 +1132,42 @@ index 0729a12..c14d428 100644
                  (
                      Operand::Immediate(ImmediateValue::Integer(imm)),
                      Operand::Register(src),
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index b62440d..23ce3ab 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -1197,7 +1197,16 @@ impl X86Codegen {
+         } else {
+             super::isel::ShlxMode::Never
+         });
+-        self.avx2_enabled = opts.avx2 && opts.isa.ymm;
++        // VEX.256 / VEX.128 permission follows the NORMALIZED ISA, not the
++        // raw request bit — the `fma_enabled` discipline two lines below.
++        // The project's default -march is x86-64-v3, which grants AVX2 in
++        // `opts.isa.ymm` while the raw CLI flag stays false; keying on the
++        // request bit split the pass world (set_x86_simd_isa, which forms
++        // 256-bit packs from the same isa.ymm) from the emitter world
++        // (legacy 128-bit fallbacks) — the FP-Neg wide family then staged
++        // its 256-bit source through movdqa/xorps and silently dropped the
++        // upper lanes under VEX.256 loads/stores.
++        self.avx2_enabled = opts.isa.ymm;
+         self.avx512_enabled = opts.avx512 && opts.isa.ymm;
+         self.isa = opts.isa;
+         // Publish for the emitters without `&self` (MachInst, peepholes).
+@@ -7708,7 +7717,7 @@ impl ArchCodegen for X86Codegen {
+                         self.state
+                             .emit_fmt(format_args!("    {} %{}, %{}", mov, held, target));
+                     }
+-                    self.state.vec_live_regs.insert(dest.0, target);
++                    self.state.vec_claim_live_reg(dest.0, target);
+                     self.state.vector_values.insert(dest.0);
+                     if is_128 {
+                         self.state.vector128_values.insert(dest.0);
 diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index 7b51e9c..aa95090 100644
+index 7b51e9c..746da3e 100644
 --- a/src/backend/x86/codegen/intrinsics.rs
 +++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -44,6 +44,29 @@ pub(super) enum BlendvDomain {
+@@ -44,6 +44,30 @@ pub(super) enum BlendvDomain {
  }
  
  impl X86Codegen {
@@ -377,16 +1188,95 @@ index 7b51e9c..aa95090 100644
 +            "paddb" | "paddw" | "paddd" | "paddq"
 +                | "pmullw" | "pmulld"
 +                | "addps" | "addpd" | "mulps" | "mulpd"
-+                // Bitwise.
-+                | "pand" | "por" | "pxor"
++                // Bitwise (integer and FP domains alike — pure lane XOR).
++                | "pand" | "por" | "pxor" | "xorps" | "xorpd"
 +                // Integer min/max (no FP unordered/±0 asymmetry).
 +                | "pminub" | "pmaxub" | "pminsw" | "pmaxsw"
++                | "pminsd" | "pmaxsd"
 +        )
 +    }
      /// Load a float operand into %xmm0. Handles both Value operands (from stack)
      /// and float constants (loaded via their bit pattern into rax first).
      fn float_operand_to_xmm0(&mut self, op: &Operand, is_f32: bool) {
-@@ -296,8 +319,8 @@ impl X86Codegen {
+@@ -175,6 +199,9 @@ impl X86Codegen {
+                     if name != xmm {
+                         self.state
+                             .emit_fmt(format_args!("    movdqa %{}, %{}", name, xmm));
++                        // The home->scratch copy overwrites `xmm`: every
++                        // OTHER value's claim on that bank just died.
++                        self.state.vec_evict_bank_except(xmm, v.0);
+                     }
+                     self.state.sse_last_store_reg = false;
+                     return;
+@@ -185,6 +212,9 @@ impl X86Codegen {
+                 if held != xmm {
+                     self.state
+                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
++                    // The move-aside overwrites `xmm`: every OTHER value's
++                    // claim on that bank just died.
++                    self.state.vec_evict_bank_except(xmm, v.0);
+                     self.state.sse_last_store_val = Some(v.0);
+                     self.state.sse_last_store_reg = true;
+                     self.state.sse_last_store_reg_name = Some(xmm);
+@@ -200,6 +230,7 @@ impl X86Codegen {
+                 if held != xmm {
+                     self.state
+                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
++                    self.state.vec_evict_bank_except(xmm, v.0);
+                     self.state.sse_last_store_reg_name = Some(xmm);
+                 } else {
+                     self.state.sse_last_store_reg = false;
+@@ -220,6 +251,9 @@ impl X86Codegen {
+             if let Some(mem) = self.value_ptr_mem_operand(v.0) {
+                 self.state
+                     .emit_fmt(format_args!("    movdqu {}, %{}", mem, xmm));
++                // The load overwrites `xmm` with `v`'s data: every OTHER
++                // value's claim on that bank is now stale.
++                self.state.vec_evict_bank_except(xmm, v.0);
+                 self.state.sse_last_store_reg = false;
+                 return;
+             }
+@@ -228,6 +262,9 @@ impl X86Codegen {
+         self.operand_to_reg(arg, "rax");
+         self.state
+             .emit_fmt(format_args!("    movdqu (%rax), %{}", xmm));
++        if let Operand::Value(v) = arg {
++            self.state.vec_evict_bank_except(xmm, v.0);
++        }
+         self.state.sse_last_store_reg = false;
+     }
+ 
+@@ -242,7 +279,7 @@ impl X86Codegen {
+                     self.state
+                         .emit_fmt(format_args!("    movdqa %{}, %{}", xmm, name));
+                 }
+-                self.state.vec_live_regs.insert(dest_ptr.0, name);
++                self.state.vec_claim_live_reg(dest_ptr.0, name);
+                 self.state.sse_last_store_val = Some(dest_ptr.0);
+                 self.state.sse_last_store_reg = true;
+                 self.state.sse_last_store_reg_name = Some(name);
+@@ -270,6 +307,12 @@ impl X86Codegen {
+                     // value does not flow into its consumer via the register.
+                     self.state.pending_vec_store = Some((dest_ptr.0, xmm, false));
+                 }
++                // `xmm` now holds THIS value (stored or pending): every
++                // OTHER value's claim on that bank is stale — the producing
++                // op (pclmulqdq/blend/etc. destructive forms that stage
++                // through the scratch) overwrote it (the crc_fold_state1
++                // stale-claim class).
++                self.state.vec_evict_bank_except(xmm, dest_ptr.0);
+                 self.state.sse_last_store_slot = Some(slot.0);
+                 self.state.sse_last_store_val = Some(dest_ptr.0);
+                 self.state.sse_last_store_reg = true;
+@@ -284,6 +327,7 @@ impl X86Codegen {
+         } else {
+             self.state.pending_vec_store = Some((dest_ptr.0, xmm, false));
+         }
++        self.state.vec_evict_bank_except(xmm, dest_ptr.0);
+         self.state.sse_last_store_val = Some(dest_ptr.0);
+         self.state.sse_last_store_reg = true;
+         self.state.sse_last_store_reg_name = Some(xmm);
+@@ -296,8 +340,8 @@ impl X86Codegen {
      /// store that was originally skipped, making deferred stores sound by
      /// construction. No-op when nothing is pending.
      /// VLFOLD entry (see `compute_vector_memfold_values`): elide an eligible
@@ -397,7 +1287,7 @@ index 7b51e9c..aa95090 100644
      /// intrinsic. Falls back to the ordinary load path unless base/index are
      /// RA-homed GPRs (or a zero constant) — scratch `%rax`/`%rcx` addressing
      /// would not survive the intervening load — and unless the destination
-@@ -311,6 +334,12 @@ impl X86Codegen {
+@@ -311,6 +355,12 @@ impl X86Codegen {
      /// one instruction and one live register fewer per iteration.  GCC's byte
      /// clamp is exactly the folded form (`vpminub (%rsi,%rax), %ymm3, %ymm0`).
      ///
@@ -410,7 +1300,7 @@ index 7b51e9c..aa95090 100644
      /// This used to bail on a homed destination, and that bail WAS
      /// load-bearing -- but the hazard was never the single-use census, it was
      /// operand RESOLUTION.  An elided value has no materialised contents, yet
-@@ -356,18 +385,30 @@ impl X86Codegen {
+@@ -356,18 +406,30 @@ impl X86Codegen {
          {
              return false;
          }
@@ -446,7 +1336,7 @@ index 7b51e9c..aa95090 100644
              _ => return false,
          };
          // The allocator only hands out rbx/r8-r15 (never rsp/rbp/rdi/rsi/rdx
-@@ -403,33 +444,52 @@ impl X86Codegen {
+@@ -403,33 +465,52 @@ impl X86Codegen {
              eprintln!("[VLFOLD-EMIT] elide load %{} <- {} {}", d.0, mnemonic, mem);
          }
          self.state.vector_values.insert(d.0);
@@ -510,7 +1400,7 @@ index 7b51e9c..aa95090 100644
          // The value now has a real home; a later deferral is not permitted
          // to skip the store again for this def.
          self.flush_pending_vec_store_impl();
-@@ -531,6 +591,81 @@ impl X86Codegen {
+@@ -531,6 +612,88 @@ impl X86Codegen {
              args.len()
          );
  
@@ -557,6 +1447,15 @@ index 7b51e9c..aa95090 100644
 +                            "    v{} {}, {}, {}",
 +                            sse_inst, mem_operand, reg_operand, dst
 +                        ));
++                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
++                        // Commit BEFORE creating the dest's own deferred
++                        // store: the commit clears a pending that names the
++                        // committed value (a SOURCE whose data flowed through
++                        // the write), and a pending created here belongs to
++                        // THIS dest — creating it first made the commit kill
++                        // the dest's only written-home (the hsum stale-slot
++                        // miscompile).
++                        self.sse_commit_dest_direct(dest_ptr, dst_static);
 +                        if dst_home.is_none() {
 +                            let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
 +                            use crate::backend::state::SlotAddr;
@@ -574,8 +1473,6 @@ index 7b51e9c..aa95090 100644
 +                                }
 +                            }
 +                        }
-+                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-+                        self.sse_commit_dest_direct(dest_ptr, dst_static);
 +                        self.state.pending_vec_memfold = None;
 +                        return;
 +                    } else if at0 || at1 {
@@ -592,7 +1489,41 @@ index 7b51e9c..aa95090 100644
          // In-place two-operand form (destructive-form coalescing in the
          // RA): the destination shares the first operand's home — the first
          // operand's last mention is this very instruction — and the second
-@@ -693,17 +828,33 @@ impl X86Codegen {
+@@ -583,7 +746,7 @@ impl X86Codegen {
+                         if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(fresh.0) {
+                             self.state.pending_vec_store = None;
+                         }
+-                        self.state.vec_live_regs.insert(dest_ptr.0, target);
++                        self.state.vec_claim_live_reg(dest_ptr.0, target);
+                         self.state.sse_last_store_val = Some(dest_ptr.0);
+                         self.state.sse_last_store_reg = true;
+                         self.state.sse_last_store_reg_name = Some(target);
+@@ -615,6 +778,15 @@ impl X86Codegen {
+                     "    v{} {}, {}, {}",
+                     sse_inst, src2, src1, dst
+                 ));
++                let dst_static: &'static str = dst_home.unwrap_or("xmm0");
++                // Commit BEFORE creating the dest's own deferred store: the
++                // commit clears a pending naming the committed value (a SOURCE
++                // whose data flowed through this write), and a pending created
++                // here belongs to THIS dest — creating it first let the commit
++                // kill the dest's only materialization (the hsum stale-slot
++                // miscompile: the deferred store vanished, the later consumer
++                // reloaded never-written memory).
++                self.sse_commit_dest_direct(dest_ptr, dst_static);
+                 if dst_home.is_none() {
+                     let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
+                     use crate::backend::state::SlotAddr;
+@@ -631,8 +803,6 @@ impl X86Codegen {
+                         }
+                     }
+                 }
+-                let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+-                self.sse_commit_dest_direct(dest_ptr, dst_static);
+                 return;
+             }
+         }
+@@ -693,17 +863,36 @@ impl X86Codegen {
          if let Operand::Value(v) = arg {
              // VLFOLD: a consumer path that needs the elided load in a
              // register performs the load itself (from the recorded source
@@ -622,6 +1553,9 @@ index 7b51e9c..aa95090 100644
 +                    };
 +                    self.state
 +                        .emit_fmt(format_args!("    {} {}, %{}", pf.mnemonic, pf.mem, dst));
++                    // The re-issued load overwrites the register: every
++                    // OTHER value's claim on that bank just died.
++                    self.state.vec_evict_bank_except(ymm, v.0);
 +                    if pf.width != 16 {
 +                        self.state.dirty_upper_ymm = true;
 +                    }
@@ -636,7 +1570,55 @@ index 7b51e9c..aa95090 100644
              }
              // Width-aware register allocation: PhysReg 20..33 names the SIMD
              // register family; this AVX helper selects its YMM view. Consult
-@@ -871,8 +1022,44 @@ impl X86Codegen {
+@@ -720,6 +909,9 @@ impl X86Codegen {
+                     if name != ymm {
+                         self.state
+                             .emit_fmt(format_args!("    vmovdqa %{}, %{}", name, ymm));
++                        // The home->scratch copy overwrites `ymm`: every
++                        // OTHER value's claim on that bank just died.
++                        self.state.vec_evict_bank_except(ymm, v.0);
+                     }
+                     self.state.vec_last_store_reg = false;
+                     return;
+@@ -730,6 +922,9 @@ impl X86Codegen {
+                 if held != ymm {
+                     self.state
+                         .emit_fmt(format_args!("    vmovdqa %{}, %{}", held, ymm));
++                    // The move-aside overwrites `ymm`: every OTHER value's
++                    // claim on that bank just died.
++                    self.state.vec_evict_bank_except(ymm, v.0);
+                     self.state.vec_last_store_val = Some(v.0);
+                     self.state.vec_last_store_reg = true;
+                     self.state.vec_last_store_reg_name = Some(ymm);
+@@ -748,6 +943,7 @@ impl X86Codegen {
+                 if held != ymm {
+                     self.state
+                         .emit_fmt(format_args!("    vmovdqa %{}, %{}", held, ymm));
++                    self.state.vec_evict_bank_except(ymm, v.0);
+                     self.state.vec_last_store_reg_name = Some(ymm);
+                 } else {
+                     self.state.vec_last_store_reg = false;
+@@ -766,6 +962,9 @@ impl X86Codegen {
+             if let Some(mem) = self.value_ptr_mem_operand(v.0) {
+                 self.state
+                     .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, ymm));
++                // The load overwrites `ymm` with `v`'s data: every OTHER
++                // value's claim on that bank is now stale.
++                self.state.vec_evict_bank_except(ymm, v.0);
+                 self.state.vec_last_store_reg = false;
+                 return;
+             }
+@@ -774,6 +973,9 @@ impl X86Codegen {
+         self.operand_to_reg(arg, "rax");
+         self.state
+             .emit_fmt(format_args!("    vmovdqu (%rax), %{}", ymm));
++        if let Operand::Value(v) = arg {
++            self.state.vec_evict_bank_except(ymm, v.0);
++        }
+         self.state.vec_last_store_reg = false;
+     }
+     pub(super) fn avx_load_arg(&mut self, arg: &Operand) {
+@@ -871,8 +1073,42 @@ impl X86Codegen {
          }
          self.flush_pending_vec_store_impl();
          self.state.invalidate_vec_peephole();
@@ -651,10 +1633,8 @@ index 7b51e9c..aa95090 100644
 +                if is_xmm_reg(reg) {
 +                    if avx {
 +                        let name = phys_reg_name_256(reg);
-+                        self.state.emit_fmt(format_args!(
-+                            "    vpcmpeqd %{}, %{}, %{}",
-+                            name, name, name
-+                        ));
++                        self.state
++                            .emit_fmt(format_args!("    vpcmpeqd %{}, %{}, %{}", name, name, name));
 +                        self.note_vec_dest_in_home(d, &format!("%{}", name));
 +                    } else {
 +                        let name: &'static str = phys_reg_name(reg);
@@ -681,7 +1661,16 @@ index 7b51e9c..aa95090 100644
          } else {
              self.state.emit("    pcmpeqd %xmm0, %xmm0");
          }
-@@ -1388,27 +1575,37 @@ impl X86Codegen {
+@@ -1026,7 +1262,7 @@ impl X86Codegen {
+                     self.state
+                         .emit_fmt(format_args!("    vmovdqa %ymm0, %{}", name));
+                 }
+-                self.state.vec_live_regs.insert(dest_ptr.0, name);
++                self.state.vec_claim_live_reg(dest_ptr.0, name);
+                 self.state.vec_last_store_val = Some(dest_ptr.0);
+                 self.state.vec_last_store_reg = true;
+                 self.state.vec_last_store_reg_name = Some(name);
+@@ -1388,27 +1624,37 @@ impl X86Codegen {
          dest_ptr: &Option<Value>,
          args: &[Operand],
      ) {
@@ -728,7 +1717,308 @@ index 7b51e9c..aa95090 100644
                  self.materialize_pending_memfold();
              }
          }
-@@ -6764,7 +6961,7 @@ impl X86Codegen {
+@@ -3665,7 +3911,7 @@ impl X86Codegen {
+                             // left the AVX-SSE transition penalty in place).
+                             self.state.dirty_upper_ymm = true;
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -3729,7 +3975,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -3762,7 +4008,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    movupd {}, %{}", mem, name));
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -3797,7 +4043,7 @@ impl X86Codegen {
+                                 .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
+                             self.state.dirty_upper_ymm = true;
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -3838,7 +4084,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -3877,7 +4123,7 @@ impl X86Codegen {
+                                 .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
+                             self.state.dirty_upper_ymm = true;
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -3914,7 +4160,7 @@ impl X86Codegen {
+                                 .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
+                             self.state.dirty_upper_ymm = true;
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -4003,7 +4249,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    vpaddq %xmm1, %{}, %{}", dst, dst));
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, dst);
++                            self.state.vec_claim_live_reg(d.0, dst);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(dst);
+@@ -4116,7 +4362,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    vpaddq %xmm1, %{}, %{}", dst, dst));
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, dst);
++                            self.state.vec_claim_live_reg(d.0, dst);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(dst);
+@@ -4219,7 +4465,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    vpaddd %ymm0, %{}, %{}", dst, dst));
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, dst);
++                            self.state.vec_claim_live_reg(d.0, dst);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(dst);
+@@ -4371,7 +4617,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -4406,7 +4652,7 @@ impl X86Codegen {
+                         self.state
+                             .emit_fmt(format_args!("    vpxor %{}, %{}, %{}", name, name, name));
+                         self.state.dirty_upper_ymm = true;
+-                        self.state.vec_live_regs.insert(d.0, name);
++                        self.state.vec_claim_live_reg(d.0, name);
+                     } else {
+                         self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+                         self.state.dirty_upper_ymm = true;
+@@ -4545,7 +4791,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -5002,6 +5248,37 @@ impl X86Codegen {
+                     self.emit_avx_binary_256(d, args, "vsubps", false);
+                 }
+             }
++            IntrinsicOp::VecXorF32x8 => {
++                if let Some(d) = dest {
++                    // Bitwise lane XOR — commutative, pure, and the exact
++                    // packed spelling of FP sign-bit manipulation idioms
++                    // (see the IR enum doc on `VecXorF32x8`).
++                    if !self.try_emit_fpxor_sign_mask(d, args, 4, true, "vxorps") {
++                        self.emit_avx_binary_256(d, args, "vxorps", true);
++                    }
++                }
++            }
++            IntrinsicOp::VecXorF64x4 => {
++                if let Some(d) = dest {
++                    if !self.try_emit_fpxor_sign_mask(d, args, 8, true, "vxorpd") {
++                        self.emit_avx_binary_256(d, args, "vxorpd", true);
++                    }
++                }
++            }
++            IntrinsicOp::VecXorF32x4 => {
++                if let Some(d) = dest {
++                    if !self.try_emit_fpxor_sign_mask(d, args, 4, false, "vxorps") {
++                        self.emit_sse_binary_128(d, args, "xorps");
++                    }
++                }
++            }
++            IntrinsicOp::VecXorF64x2 => {
++                if let Some(d) = dest {
++                    if !self.try_emit_fpxor_sign_mask(d, args, 8, false, "vxorpd") {
++                        self.emit_sse_binary_128(d, args, "xorpd");
++                    }
++                }
++            }
+             IntrinsicOp::VecSubF32x4 => {
+                 if let Some(d) = dest {
+                     self.emit_sse_binary_128(d, args, "subps");
+@@ -5266,6 +5543,16 @@ impl X86Codegen {
+                     self.emit_sse_binary_128(d, args, "pminsw");
+                 }
+             }
++            IntrinsicOp::VecSminI32x4 => {
++                if let Some(d) = dest {
++                    self.emit_sminmax_i32x4(d, args, false);
++                }
++            }
++            IntrinsicOp::VecSmaxI32x4 => {
++                if let Some(d) = dest {
++                    self.emit_sminmax_i32x4(d, args, true);
++                }
++            }
+             IntrinsicOp::VecMaxI16x16 => {
+                 if let Some(d) = dest {
+                     self.emit_avx_binary_256(d, args, "vpmaxsw", true);
+@@ -5569,6 +5856,12 @@ impl X86Codegen {
+                             .emit_fmt(format_args!("    vpslld ${}, {}, {}", n, src, dst));
+                         self.state
+                             .emit_fmt(format_args!("    vpor %xmm1, {}, {}", dst, dst));
++                        // Commit BEFORE creating the dest's own deferred store: the
++                        // commit clears a pending naming the committed value (a SOURCE
++                        // pending consumed by this write); the dest's own pending must
++                        // survive it (the hsum stale-slot miscompile class).
++                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
++                        self.sse_commit_dest_direct(d, dst_static);
+                         if dst_home.is_none() {
+                             let deferred = self.state.vector_defer_values.contains(&d.0);
+                             use crate::backend::state::SlotAddr;
+@@ -5585,8 +5878,6 @@ impl X86Codegen {
+                                 }
+                             }
+                         }
+-                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+-                        self.sse_commit_dest_direct(d, dst_static);
+                     } else {
+                         // Legacy SSE2 discipline: the dest-homed fast path
+                         // in the shared helper (coalesced in-place forms,
+@@ -5618,6 +5909,12 @@ impl X86Codegen {
+                         };
+                         self.state
+                             .emit_fmt(format_args!("    vpshufd ${}, {}, {}", imm, src, dst));
++                        // Commit BEFORE creating the dest's own deferred store: the
++                        // commit clears a pending naming the committed value (a SOURCE
++                        // pending consumed by this write); the dest's own pending must
++                        // survive it (the hsum stale-slot miscompile class).
++                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
++                        self.sse_commit_dest_direct(d, dst_static);
+                         if dst_home.is_none() {
+                             let deferred = self.state.vector_defer_values.contains(&d.0);
+                             use crate::backend::state::SlotAddr;
+@@ -5634,8 +5931,6 @@ impl X86Codegen {
+                                 }
+                             }
+                         }
+-                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+-                        self.sse_commit_dest_direct(d, dst_static);
+                     } else {
+                         // Legacy SSE2 discipline: the dest-homed fast path
+                         // in the shared helper (coalesced in-place forms,
+@@ -5657,6 +5952,12 @@ impl X86Codegen {
+                         };
+                         self.state
+                             .emit_fmt(format_args!("    vpshufb {}, {}, {}", mask, src, dst));
++                        // Commit BEFORE creating the dest's own deferred store: the
++                        // commit clears a pending naming the committed value (a SOURCE
++                        // pending consumed by this write); the dest's own pending must
++                        // survive it (the hsum stale-slot miscompile class).
++                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
++                        self.sse_commit_dest_direct(d, dst_static);
+                         if dst_home.is_none() {
+                             let deferred = self.state.vector_defer_values.contains(&d.0);
+                             use crate::backend::state::SlotAddr;
+@@ -5673,8 +5974,6 @@ impl X86Codegen {
+                                 }
+                             }
+                         }
+-                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+-                        self.sse_commit_dest_direct(d, dst_static);
+                     } else {
+                         // Legacy SSE2 discipline: the dest-homed fast path
+                         // in the shared helper (coalesced in-place forms,
+@@ -6397,7 +6696,7 @@ impl X86Codegen {
+                                     .emit_fmt(format_args!("    movups {}, %{}", mem, n128));
+                             }
+                             self.state.vector_values.insert(d.0);
+-                            self.state.vec_live_regs.insert(d.0, name);
++                            self.state.vec_claim_live_reg(d.0, name);
+                             self.state.vec_last_store_val = Some(d.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(name);
+@@ -6561,7 +6860,7 @@ impl X86Codegen {
+                             self.state
+                                 .emit_fmt(format_args!("    xorps %{}, %{}", name, name));
+                         }
+-                        self.state.vec_live_regs.insert(d.0, name);
++                        self.state.vec_claim_live_reg(d.0, name);
+                     } else if is8 {
+                         self.state.emit("    vxorps %ymm0, %ymm0, %ymm0");
+                         self.avx_store_dest(d);
+@@ -6581,7 +6880,7 @@ impl X86Codegen {
+                         let name = phys_reg_name_256(reg);
+                         self.state
+                             .emit_fmt(format_args!("    vxorpd %{}, %{}, %{}", name, name, name));
+-                        self.state.vec_live_regs.insert(d.0, name);
++                        self.state.vec_claim_live_reg(d.0, name);
+                     } else {
+                         self.state.emit("    vxorpd %ymm0, %ymm0, %ymm0");
+                         self.avx_store_dest(d);
+@@ -6598,7 +6897,7 @@ impl X86Codegen {
+                         let name = phys_reg_name(reg);
+                         self.state
+                             .emit_fmt(format_args!("    xorpd %{}, %{}", name, name));
+-                        self.state.vec_live_regs.insert(d.0, name);
++                        self.state.vec_claim_live_reg(d.0, name);
+                     } else {
+                         self.state.emit("    xorpd %xmm0, %xmm0");
+                         self.sse_store_dest(d, "xmm0");
+@@ -6614,7 +6913,7 @@ impl X86Codegen {
+                         let name = phys_reg_name(reg);
+                         self.state
+                             .emit_fmt(format_args!("    pxor %{}, %{}", name, name));
+-                        self.state.vec_live_regs.insert(d.0, name);
++                        self.state.vec_claim_live_reg(d.0, name);
+                     } else {
+                         self.state.emit("    pxor %xmm0, %xmm0");
+                         self.sse_store_dest(d, "xmm0");
+@@ -6631,7 +6930,7 @@ impl X86Codegen {
+                         let name = phys_reg_name_256(reg);
+                         self.state
+                             .emit_fmt(format_args!("    vpxor %{}, %{}, %{}", name, name, name));
+-                        self.state.vec_live_regs.insert(d.0, name);
++                        self.state.vec_claim_live_reg(d.0, name);
+                     } else {
+                         self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+                         self.avx_store_dest(d);
+@@ -6648,7 +6947,7 @@ impl X86Codegen {
+                         let name = phys_reg_name(reg);
+                         self.state
+                             .emit_fmt(format_args!("    pxor %{}, %{}", name, name));
+-                        self.state.vec_live_regs.insert(d.0, name);
++                        self.state.vec_claim_live_reg(d.0, name);
+                     } else {
+                         self.state.emit("    pxor %xmm0, %xmm0");
+                         self.sse_store_dest(d, "xmm0");
+@@ -6764,7 +7063,7 @@ impl X86Codegen {
              .state
              .pending_vec_memfold
              .as_ref()
@@ -737,7 +2027,7 @@ index 7b51e9c..aa95090 100644
              .filter(|pv| {
                  args.iter()
                      .any(|a| matches!(a, Operand::Value(v) if v.0 == *pv))
-@@ -6782,12 +6979,13 @@ impl X86Codegen {
+@@ -6782,12 +7081,13 @@ impl X86Codegen {
          //                 (= s*input + mem)
          //   input elided: bias  streams in %ymm0 → `vfmadd231 mem, %s, %ymm0`
          //                 (= s*mem + bias)
@@ -752,16 +2042,29 @@ index 7b51e9c..aa95090 100644
              // The multiplicands commute: whichever of args[0]/args[1] has an
              // XMM home (the loop-invariant broadcast) is the register source,
              // the other one is the streamed element vector.
-@@ -6993,7 +7191,7 @@ impl X86Codegen {
-             .state
-             .pending_vec_memfold
-             .as_ref()
+@@ -6989,11 +7289,7 @@ impl X86Codegen {
+     /// Returns the destination home last, so callers destructure
+     /// `[src.., dest]`.
+     fn all_vec_homes_256(&self, srcs: &[&Operand], dest: &Value) -> Option<Vec<String>> {
+-        let pending_fold = self
+-            .state
+-            .pending_vec_memfold
+-            .as_ref()
 -            .map(|(pv, _, _)| *pv);
-+            .map(|pf| pf.val);
++        let pending_fold = self.state.pending_vec_memfold.as_ref().map(|pf| pf.val);
          let mut out = Vec::with_capacity(srcs.len() + 1);
          for s in srcs {
              let Operand::Value(v) = s else {
-@@ -7056,6 +7254,20 @@ impl X86Codegen {
+@@ -7026,7 +7322,7 @@ impl X86Codegen {
+         );
+         debug_assert_eq!(format!("%{}", name), dest_name);
+         self.state.dirty_upper_ymm = true;
+-        self.state.vec_live_regs.insert(dest.0, name);
++        self.state.vec_claim_live_reg(dest.0, name);
+         self.state.vec_last_store_val = Some(dest.0);
+         self.state.vec_last_store_reg = true;
+         self.state.vec_last_store_reg_name = Some(name);
+@@ -7056,6 +7352,20 @@ impl X86Codegen {
      /// `sse_load_arg`'s peepholes so a fast path that reads the location
      /// directly emits exactly what the staged path would have loaded.
      fn vec_operand_reg(&self, v: &Value) -> Option<&'static str> {
@@ -782,7 +2085,236 @@ index 7b51e9c..aa95090 100644
          if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0) {
              return Some(self.state.sse_last_store_reg_name.unwrap_or("xmm0"));
          }
-@@ -7863,45 +8075,12 @@ impl X86Codegen {
+@@ -7083,7 +7393,7 @@ impl X86Codegen {
+     /// tracking + last-store peephole), exactly like the accumulator fast
+     /// path.
+     fn sse_mark_in_place(&mut self, dest: &Value, target: &'static str) {
+-        self.state.vec_live_regs.insert(dest.0, target);
++        self.state.vec_claim_live_reg(dest.0, target);
+         self.state.sse_last_store_val = Some(dest.0);
+         self.state.sse_last_store_reg = true;
+         self.state.sse_last_store_reg_name = Some(target);
+@@ -7130,7 +7440,7 @@ impl X86Codegen {
+     /// destination wrote it there): bookkeeping only, no copy. `reg` is
+     /// the scratch/home register NAME ("xmm0", "xmm5").
+     fn sse_commit_dest_direct(&mut self, d: &Value, reg: &'static str) {
+-        self.state.vec_live_regs.insert(d.0, reg);
++        self.state.vec_claim_live_reg(d.0, reg);
+         self.state.sse_last_store_val = Some(d.0);
+         self.state.sse_last_store_reg = true;
+         self.state.sse_last_store_reg_name = Some(reg);
+@@ -7177,6 +7487,12 @@ impl X86Codegen {
+         };
+         self.state
+             .emit_fmt(format_args!("    {} {}, {}, {}", inst, src2, src1, dst));
++        // Commit BEFORE creating the dest's own deferred store: the
++        // commit clears a pending naming the committed value (a SOURCE
++        // pending consumed by this write); the dest's own pending must
++        // survive it (the hsum stale-slot miscompile class).
++        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
++        self.sse_commit_dest_direct(dest_ptr, dst_static);
+         if dst_home.is_none() {
+             // Unhomed destination: mirror sse_store_dest's slot discipline,
+             // minus the register copy the VEX form made unnecessary.
+@@ -7206,8 +7522,6 @@ impl X86Codegen {
+                 self.state.pending_vec_store = Some((dest_ptr.0, "xmm0", false));
+             }
+         }
+-        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+-        self.sse_commit_dest_direct(dest_ptr, dst_static);
+     }
+ 
+     /// Memory source for a non-homed vector operand AFTER every pending
+@@ -7236,6 +7550,188 @@ impl X86Codegen {
+     /// Load order mirrors the binary emitters: args[1] is resolved FIRST so a
+     /// deferred args[1] still sitting in %ymm0 is moved to %ymm1 before the
+     /// args[0] load can overwrite it.
++    ///
++    /// FP-Neg fast path: `VecXorF*(vec, Const(-0.0))` with the sign mask
++    /// folded as a .rodata MEMORY operand — ONE instruction for the whole
++    /// pack, exactly the form GCC emits for packed `-x` lanes
++    /// (`vxorps .LCVEC_0(%rip), %xmm0, %xmm0`). Returns false when the
++    /// second operand is not the family's `-0.0` constant (the caller
++    /// falls through to the generic two-value emitters).
++    ///
++    /// `lane_bytes` is 4 (F32) or 8 (F64); `wide` selects the 256-bit
++    /// family; `vex_mnemonic` is the VEX form (`vxorps`/`vxorpd`). Under
++    /// AVX the 3-operand VEX form takes the mask in the r/m slot; the
++    /// legacy-SSE2 fallback (128-bit only) stages the source into the
++    /// destination and uses the destructive 2-operand form
++    /// `xorps mask(%rip), %dst` — the pool's `.p2align 4` satisfies the
++    /// legacy 16-byte alignment requirement.
++    ///
++    /// Operand order: AT&T `vxorps MEM, src1, dst` — the mask takes the
++    /// r/m (first textual) slot, the vector source keeps its home or
++    /// streams through the scratch pair exactly like the memfold consumers
++    /// (a pending VLFOLD on args[0] is materialised first: this emitter
++    /// cannot fold a second memory operand into the same instruction).
++    fn try_emit_fpxor_sign_mask(
++        &mut self,
++        dest: &Value,
++        args: &[Operand],
++        lane_bytes: usize,
++        wide: bool,
++        vex_mnemonic: &str,
++    ) -> bool {
++        // The exact `-0.0` constant of the family's lane type.
++        let is_minus_zero = match args.get(1) {
++            Some(Operand::Const(IrConst::F32(v))) => lane_bytes == 4 && v.to_bits() == 0x8000_0000,
++            Some(Operand::Const(IrConst::F64(v))) => {
++                lane_bytes == 8 && v.to_bits() == 0x8000_0000_0000_0000
++            }
++            _ => false,
++        };
++        if !is_minus_zero {
++            return false;
++        }
++        // A pending VLFOLD names args[0] (the analysis admits Xor consumers
++        // in either position of the COMMUTATIVE op): this emitter's single
++        // memory slot is the sign mask, so the fold must be materialised —
++        // never read the elided value's never-written reserved register.
++        if let Some(pf) = self.state.pending_vec_memfold.clone() {
++            if matches!(&args[0], Operand::Value(v) if v.0 == pf.val) {
++                self.materialize_pending_memfold();
++            }
++        }
++        let total = if wide { 32 } else { 16 };
++        let mut mask = vec![0u8; total];
++        for l in 0..total / lane_bytes {
++            mask[l * lane_bytes + lane_bytes - 1] = 0x80;
++        }
++        let label = self.state.get_vec_const_label(&mask);
++        let mem = format!("{}(%rip)", label);
++        // Legacy SSE2 (128-bit only — the 256-bit families require AVX):
++        // the destructive two-operand form stages the source into the
++        // destination, then XORs the aligned mask memory in place.
++        if !self.avx2_enabled {
++            debug_assert!(!wide, "256-bit families require AVX");
++            let legacy = &vex_mnemonic[1..]; // "xorps" / "xorpd"
++            match self.dest_xmm_home_name(dest) {
++                Some(name) => {
++                    if let Some(h) = self.vec_home_128(&args[0]) {
++                        if h != format!("%{}", name) {
++                            self.state
++                                .emit_fmt(format_args!("    movdqa {}, %{}", h, name));
++                        }
++                    } else {
++                        self.sse_load_arg(&args[0], name);
++                    }
++                    self.state
++                        .emit_fmt(format_args!("    {} {}, %{}", legacy, mem, name));
++                    self.sse_mark_in_place(dest, name);
++                }
++                None => {
++                    self.sse_load_arg(&args[0], "xmm0");
++                    self.state
++                        .emit_fmt(format_args!("    {} {}, %xmm0", legacy, mem));
++                    self.sse_store_dest(dest, "xmm0");
++                }
++            }
++            return true;
++        }
++        if wide {
++            let dest_home = self
++                .reg_assignments
++                .get(&dest.0)
++                .copied()
++                .filter(|r| is_xmm_reg(*r));
++            let src1 = match self.vec_home_256(&args[0]) {
++                Some(h) => h,
++                None => {
++                    self.avx_load_arg(&args[0]);
++                    "%ymm0".to_string()
++                }
++            };
++            self.state.dirty_upper_ymm = true;
++            match dest_home {
++                Some(dr) => {
++                    let dst = phys_reg_name_256(dr);
++                    self.state.emit_fmt(format_args!(
++                        "    {} {}, {}, %{}",
++                        vex_mnemonic, mem, src1, dst
++                    ));
++                    self.state.vec_claim_live_reg(dest.0, dst);
++                    self.state.vec_last_store_val = Some(dest.0);
++                    self.state.vec_last_store_reg = true;
++                    self.state.vec_last_store_reg_name = Some(dst);
++                }
++                None => {
++                    self.flush_pending_vec_store_impl();
++                    self.state.emit_fmt(format_args!(
++                        "    {} {}, {}, %ymm0",
++                        vex_mnemonic, mem, src1
++                    ));
++                    self.state.vec_last_store_reg = false;
++                    self.avx_store_dest(dest);
++                }
++            }
++        } else {
++            let dst_home = self.dest_xmm_home_name(dest);
++            let src1 = match self.vec_home_128(&args[0]) {
++                Some(h) => h,
++                None => {
++                    self.sse_load_arg(&args[0], "xmm0");
++                    "%xmm0".to_string()
++                }
++            };
++            let dst = match dst_home {
++                Some(name) => format!("%{}", name),
++                None => "%xmm0".to_string(),
++            };
++            self.state.emit_fmt(format_args!(
++                "    {} {}, {}, {}",
++                vex_mnemonic, mem, src1, dst
++            ));
++            // Commit BEFORE creating the dest's own deferred store: the
++            // commit clears a pending naming the committed value (a SOURCE
++            // pending consumed by this write); the dest's own pending must
++            // survive it (the hsum stale-slot miscompile class).
++            let dst_static: &'static str = dst_home.unwrap_or("xmm0");
++            self.sse_commit_dest_direct(dest, dst_static);
++            if dst_home.is_none() {
++                let deferred = self.state.vector_defer_values.contains(&dest.0);
++                use crate::backend::state::SlotAddr;
++                if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
++                    self.state.resolve_slot_addr(dest.0)
++                {
++                    if !deferred {
++                        self.state
++                            .emit_fmt(format_args!("    movdqu %xmm0, {}", self.slot_ref(slot.0)));
++                    } else {
++                        self.state.pending_vec_store = Some((dest.0, "xmm0", false));
++                    }
++                }
++            }
++        }
++        true
++    }
++
++    /// Lane-wise signed dword min/max, 128-bit (`VecSminI32x4`/`VecSmaxI32x4`).
++    /// SSE4.1 `pminsd`/`pmaxsd` (the VEX form under AVX2 — memory-foldable
++    /// through `emit_sse_binary_128`'s audited branch). x86 producers
++    /// (the BB-SLP min/max fold) gate on SSE4.1 exactly like the loop
++    /// vectorizer's dword min/max ("the SSE2 baseline lacks dword min/max
++    /// entirely — fails closed"); the NEON producer never runs on x86.
++    /// Reaching this emitter without SSE4.1 is a producer bug — panic
++    /// loudly rather than emit an instruction the CPU cannot decode (the
++    /// VecRotlI32x4 immediate-panic discipline).
++    fn emit_sminmax_i32x4(&mut self, dest: &Value, args: &[Operand], is_max: bool) {
++        assert!(
++            self.isa.sse41,
++            "VecS{}I32x4 requires SSE4.1 (pminsd/pmaxsd): an x86 producer \
++             admitted it without the feature gate",
++            if is_max { "max" } else { "min" }
++        );
++        let inst = if is_max { "pmaxsd" } else { "pminsd" };
++        self.emit_sse_binary_128(dest, args, inst);
++    }
++
+     pub(super) fn emit_avx_cmp_256(&mut self, dest: &Value, args: &[Operand], inst: &str) {
+         assert!(args.len() == 3, "{}: expects lhs, rhs, predicate", inst);
+         let imm = match &args[2] {
+@@ -7863,45 +8359,12 @@ impl X86Codegen {
          );
          self.state.invalidate_vec_peephole();
          if self.avx2_enabled {
@@ -834,7 +2366,29 @@ index 7b51e9c..aa95090 100644
              // VEX.128 three-operand immediate form: `v<inst> $imm, %src,
              // %dst` — one instruction for every homed shape (the single
              // scratch cannot collide with itself, unlike the binary VEX
-@@ -8017,39 +8196,12 @@ impl X86Codegen {
+@@ -7916,6 +8379,12 @@ impl X86Codegen {
+                 "    v{} ${}, {}, {}",
+                 sse_inst, amount, src, dst
+             ));
++            // Commit BEFORE creating the dest's own deferred store: the
++            // commit clears a pending naming the committed value (a SOURCE
++            // pending consumed by this write); the dest's own pending must
++            // survive it (the hsum stale-slot miscompile class).
++            let dst_static: &'static str = dst_home.unwrap_or("xmm0");
++            self.sse_commit_dest_direct(dest_ptr, dst_static);
+             if dst_home.is_none() {
+                 let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
+                 use crate::backend::state::SlotAddr;
+@@ -7930,8 +8399,6 @@ impl X86Codegen {
+                     }
+                 }
+             }
+-            let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+-            self.sse_commit_dest_direct(dest_ptr, dst_static);
+             return;
+         }
+         // SSE2-only: dest-homed in-place form. Bring the source into the
+@@ -8017,39 +8484,12 @@ impl X86Codegen {
          );
          self.state.invalidate_vec_peephole();
          self.state.dirty_upper_ymm = true;
@@ -880,7 +2434,98 @@ index 7b51e9c..aa95090 100644
          // All-homed fast path: `v<inst> $imm, %ymmS, %ymmD` with zero
          // staging (defer-overflow promoted chains).
          if let Operand::Value(v) = &args[0] {
-@@ -8446,7 +8598,7 @@ impl X86Codegen {
+@@ -8064,7 +8504,7 @@ impl X86Codegen {
+                                 avx_inst, amount, n0, nd
+                             ));
+                             self.state.dirty_upper_ymm = true;
+-                            self.state.vec_live_regs.insert(dest_ptr.0, nd);
++                            self.state.vec_claim_live_reg(dest_ptr.0, nd);
+                             self.state.vec_last_store_val = Some(dest_ptr.0);
+                             self.state.vec_last_store_reg = true;
+                             self.state.vec_last_store_reg_name = Some(nd);
+@@ -8288,7 +8728,7 @@ impl X86Codegen {
+         self.state.dirty_upper_ymm = true;
+         match dest_home {
+             Some(name) => {
+-                self.state.vec_live_regs.insert(dest.0, name);
++                self.state.vec_claim_live_reg(dest.0, name);
+                 self.state.vec_last_store_val = Some(dest.0);
+                 self.state.vec_last_store_reg = true;
+                 self.state.vec_last_store_reg_name = Some(name);
+@@ -8327,11 +8767,62 @@ impl X86Codegen {
+     }
+ 
+     /// Integer-domain lane-mask select (SSE2): pand/pandn/por — see
+-    /// `emit_sse_blendv_128`.
++    /// `emit_sse_blendv_128`. SSE4.1+ takes the ONE-instruction
++    /// `vblendvps` form first (dword-lane bitwise select keyed on the
++    /// mask lane's sign bit — exact on integer payloads, the same
++    /// mnemonic the 256-bit path uses).
+     pub(super) fn emit_sse_blendv_128_int(&mut self, dest: &Value, args: &[Operand]) {
++        // VEX form only under AVX2: the legacy SSE4.1 `blendvps` carries
++        // its mask IMPLICITLY in %xmm0 (a different, destructive encoding)
++        // — emitting `vblendvps` on an SSE4.1-only target (x86-64-v2!) is
++        // a guaranteed SIGILL. Those targets keep the correct 3-op
++        // bitwise select below.
++        if self.isa.sse41 && self.avx2_enabled {
++            self.emit_blendv_128_vexps(dest, args);
++            return;
++        }
+         self.emit_sse_blendv_128_mnemonics(dest, args, "pand", "pandn", "por");
+     }
+ 
++    /// `vblendvps %mask, %true, %false, %dst` (128-bit, VEX — AVX2 gated):
++    /// all-homed fast path with zero staging; otherwise the mask and true
++    /// arms stream through the scratch pair with the false arm recovered
++    /// from its home or slot (the audited blendv discipline).
++    fn emit_blendv_128_vexps(&mut self, dest: &Value, args: &[Operand]) {
++        debug_assert!(args.len() == 3, "blendv128: expects false, true, mask");
++        self.state.invalidate_vec_peephole();
++        if matches!((&args[0], &args[1]), (Operand::Value(a), Operand::Value(b)) if a == b) {
++            self.sse_load_arg(&args[0], "xmm0");
++            self.sse_store_dest(dest, "xmm0");
++            return;
++        }
++        // All-homed: one instruction, no staging.
++        let f = self.vec_home_128(&args[0]);
++        let t = self.vec_home_128(&args[1]);
++        let m = self.vec_home_128(&args[2]);
++        if let (Some(f), Some(t), Some(m)) = (&f, &t, &m) {
++            if let Some(d) = self.dest_xmm_home_name(dest) {
++                self.state
++                    .emit_fmt(format_args!("    vblendvps {}, {}, {}, %{}", m, t, f, d));
++                self.sse_commit_dest_direct(dest, d);
++                return;
++            }
++        }
++        // Generic: mask and true into the scratch pair, false recovered
++        // from home/slot — mirror emit_sse_blendv_128_mnemonics' proven
++        // resolution order (mask first so a deferred cmp result keeps its
++        // cache hit).
++        self.sse_load_arg(&args[2], "xmm1");
++        self.sse_load_arg(&args[1], "xmm0");
++        let fsrc = match self.vec_home_128(&args[0]) {
++            Some(reg) => reg,
++            None => self.vec_mem_source_after_flush(&args[0], "vblendvps128"),
++        };
++        self.state
++            .emit_fmt(format_args!("    vblendvps %xmm1, %xmm0, {}, %xmm0", fsrc));
++        self.sse_store_dest(dest, "xmm0");
++    }
++
+     fn emit_sse_blendv_128_mnemonics(
+         &mut self,
+         dest: &Value,
+@@ -8421,7 +8912,7 @@ impl X86Codegen {
+         self.state.vector_values.insert(dest.0);
+         if let Some(reg) = assigned {
+             let name = phys_reg_name_256(reg);
+-            self.state.vec_live_regs.insert(dest.0, name);
++            self.state.vec_claim_live_reg(dest.0, name);
+             self.state.vec_last_store_val = Some(dest.0);
+             self.state.vec_last_store_reg = true;
+             self.state.vec_last_store_reg_name = Some(name);
+@@ -8446,7 +8937,7 @@ impl X86Codegen {
              .state
              .pending_vec_memfold
              .as_ref()
@@ -889,7 +2534,7 @@ index 7b51e9c..aa95090 100644
              .filter(|pv| {
                  args.iter()
                      .any(|a| matches!(a, Operand::Value(v) if v.0 == *pv))
-@@ -8471,47 +8623,95 @@ impl X86Codegen {
+@@ -8471,47 +8962,97 @@ impl X86Codegen {
          // `op mem, %ymmA, %ymmA`; a homed non-accumulator source (map
          // broadcast invariant) gives `op mem, %ymmS, %ymmD` for a homed
          // destination or `op mem, %ymmS, %ymm0` + home store otherwise —
@@ -986,9 +2631,11 @@ index 7b51e9c..aa95090 100644
 +                            .filter(|r| is_xmm_reg(*r));
 +                        if let Some(dest_reg) = dest_home {
 +                            let dst = phys_reg_name_256(dest_reg);
-+                            self.state
-+                                .emit_fmt(format_args!("    {} {}, %{}, %{}", avx_inst, pf.mem, src, dst));
-+                            self.state.vec_live_regs.insert(dest_ptr.0, dst);
++                            self.state.emit_fmt(format_args!(
++                                "    {} {}, %{}, %{}",
++                                avx_inst, pf.mem, src, dst
++                            ));
++                            self.state.vec_claim_live_reg(dest_ptr.0, dst);
 +                            self.state.vec_last_store_val = Some(dest_ptr.0);
 +                            self.state.vec_last_store_reg = true;
 +                            self.state.vec_last_store_reg_name = Some(dst);
@@ -1023,11 +2670,863 @@ index 7b51e9c..aa95090 100644
                  }
              }
          }
+@@ -8555,7 +9096,7 @@ impl X86Codegen {
+                         if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(fresh.0) {
+                             self.state.pending_vec_store = None;
+                         }
+-                        self.state.vec_live_regs.insert(dest_ptr.0, target);
++                        self.state.vec_claim_live_reg(dest_ptr.0, target);
+                         self.state.vec_last_store_val = Some(dest_ptr.0);
+                         self.state.vec_last_store_reg = true;
+                         self.state.vec_last_store_reg_name = Some(target);
+@@ -8582,7 +9123,7 @@ impl X86Codegen {
+                         self.state
+                             .emit_fmt(format_args!("    {} %{}, %{}, %{}", avx_inst, n1, n0, nd));
+                         self.state.dirty_upper_ymm = true;
+-                        self.state.vec_live_regs.insert(dest_ptr.0, nd);
++                        self.state.vec_claim_live_reg(dest_ptr.0, nd);
+                         self.state.vec_last_store_val = Some(dest_ptr.0);
+                         self.state.vec_last_store_reg = true;
+                         self.state.vec_last_store_reg_name = Some(nd);
+diff --git a/src/backend/x86/codegen/intrinsics_simd.rs b/src/backend/x86/codegen/intrinsics_simd.rs
+index 7abfc6f..25b8601 100644
+--- a/src/backend/x86/codegen/intrinsics_simd.rs
++++ b/src/backend/x86/codegen/intrinsics_simd.rs
+@@ -64,7 +64,7 @@ impl X86Codegen {
+             self.value_to_reg(dest_ptr, "rax");
+             self.state.emit("    vmovdqu64 %zmm0, (%rax)");
+         }
+-        self.state.vec_live_regs.insert(dest_ptr.0, "zmm0");
++        self.state.vec_claim_live_reg(dest_ptr.0, "zmm0");
+     }
+ 
+     /// Whether arg[0] may be folded as a memory operand (never if the value is
+@@ -216,7 +216,7 @@ impl X86Codegen {
+             "    {} ${}, %{}, %{}, %{}",
+             inst, imm, r1, r2, r0
+         ));
+-        self.state.vec_live_regs.insert(dest_ptr.0, r0);
++        self.state.vec_claim_live_reg(dest_ptr.0, r0);
+         let m = reg_width_move(r0);
+         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
+             self.state
+@@ -271,7 +271,7 @@ impl X86Codegen {
+             "    {} ${}, %{}, %{}, %{}",
+             inst, imm, r1, r0, r0
+         ));
+-        self.state.vec_live_regs.insert(dest_ptr.0, r0);
++        self.state.vec_claim_live_reg(dest_ptr.0, r0);
+         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
+             self.state
+                 .emit_fmt(format_args!("    {} %{}, {}", reg_width_move(r0), r0, mem));
+@@ -1116,7 +1116,7 @@ impl X86Codegen {
+         self.evex_load_arg(&args[0]);
+         self.state
+             .emit_fmt(format_args!("    {} ${}, %zmm0, %{}", inst, imm, dst_reg));
+-        self.state.vec_live_regs.insert(dest_ptr.0, dst_reg);
++        self.state.vec_claim_live_reg(dest_ptr.0, dst_reg);
+         let m = reg_width_move(dst_reg);
+         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
+             self.state
+@@ -1185,7 +1185,7 @@ impl X86Codegen {
+             self.value_to_reg(dest_ptr, "rax");
+             self.state.emit("    vmovdqu %ymm0, (%rax)");
+         }
+-        self.state.vec_live_regs.insert(dest_ptr.0, "ymm0");
++        self.state.vec_claim_live_reg(dest_ptr.0, "ymm0");
+     }
+ 
+     /// 128 -> 512 cast (register move; upper bits undefined like GCC).
+@@ -1240,7 +1240,7 @@ impl X86Codegen {
+         self.operand_to_reg(&args[1], "rax");
+         self.state
+             .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}{{z}}", reg));
+-        self.state.vec_live_regs.insert(dest_ptr.0, reg);
++        self.state.vec_claim_live_reg(dest_ptr.0, reg);
+         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
+             self.state.emit_fmt(format_args!(
+                 "    {} %{}, {}",
+@@ -1265,7 +1265,7 @@ impl X86Codegen {
+         self.operand_to_reg(&args[1], "rax");
+         self.state
+             .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}", reg));
+-        self.state.vec_live_regs.insert(dest_ptr.0, reg);
++        self.state.vec_claim_live_reg(dest_ptr.0, reg);
+         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
+             self.state.emit_fmt(format_args!(
+                 "    {} %{}, {}",
+@@ -1358,7 +1358,7 @@ impl X86Codegen {
+             "    {} ${}, %zmm0, %{}{{k1}}{{z}}",
+             inst, imm, dst_reg
+         ));
+-        self.state.vec_live_regs.insert(dest_ptr.0, dst_reg);
++        self.state.vec_claim_live_reg(dest_ptr.0, dst_reg);
+         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
+             self.state.emit_fmt(format_args!(
+                 "    {} %{}, {}",
+@@ -1400,7 +1400,7 @@ impl X86Codegen {
+             self.state
+                 .emit_fmt(format_args!("    vpshufb %xmm2, %xmm1, %xmm0{{k1}}"));
+         }
+-        self.state.vec_live_regs.insert(dest_ptr.0, "xmm0");
++        self.state.vec_claim_live_reg(dest_ptr.0, "xmm0");
+         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
+             self.state
+                 .emit_fmt(format_args!("    vmovdqu %xmm0, {}", mem));
+@@ -1933,7 +1933,7 @@ impl X86Codegen {
+                 self.avx_load_arg(&args[0]);
+                 self.state
+                     .emit_fmt(format_args!("    vextractf128 ${}, %ymm0, %xmm0", imm));
+-                self.state.vec_live_regs.insert(dest_ptr.0, "xmm0");
++                self.state.vec_claim_live_reg(dest_ptr.0, "xmm0");
+                 if let Some(m) = self.value_ptr_mem_operand(dest_ptr.0) {
+                     self.state
+                         .emit_fmt(format_args!("    vmovdqu %xmm0, {}", m));
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index fc0a080..147bb6e 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -2265,7 +2265,6 @@ impl Driver {
+             tune,
+             lzcnt: self.enable_lzcnt,
+             popcnt: self.enable_popcnt,
+-            avx2: self.enable_avx2,
+             avx512: self.enable_avx512f,
+             isa: self.x86_isa(),
+             no_relax: self.riscv_no_relax,
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index 708b177..a226b7a 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -371,6 +371,21 @@ pub enum IntrinsicOp {
+     VecSqrtF32x8,
+     /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 4×F32.
+     VecSqrtF32x4,
++    /// Packed FP bitwise XOR: %dest_vec = args[0] ^ args[1] per lane BIT
++    /// (`vxorps`). Commutative, pure, and — crucially — NOT an FP compare
++    /// or arithmetic op: it does not signal, canonicalise NaNs, or merge
++    /// signed zeros, so it is the exact packed spelling of every
++    /// bit-manipulation idiom whose scalar form is an integer-domain XOR
++    /// on the FP bit pattern (the FP Negation family: `-x` lowers to a
++    /// sign-bit flip, identical to `x ^ -0.0` for EVERY value including
++    /// NaN payloads and ±0). AVX2 8×F32.
++    VecXorF32x8,
++    /// Packed FP bitwise XOR (see `VecXorF32x8`) - SSE 4×F32 (`xorps`).
++    VecXorF32x4,
++    /// Packed FP bitwise XOR (see `VecXorF32x8`) - AVX2 4×F64 (`vxorpd`).
++    VecXorF64x4,
++    /// Packed FP bitwise XOR (see `VecXorF32x8`) - SSE2 2×F64 (`xorpd`).
++    VecXorF64x2,
+     /// Packed IEEE minimum with x86 `MINPS/MINPD` operand semantics:
+     /// `dest[i] = args[0][i] < args[1][i] ? args[0][i] : args[1][i]`.
+     /// The SECOND operand is returned whenever a lane is unordered (NaN)
+@@ -492,6 +507,10 @@ pub enum IntrinsicOp {
+     /// Integer max is associative, commutative, and idempotent, so lane-order
+     /// reduction matches sequential scalar max bit-for-bit (levkropp 8b139820).
+     VecSmaxI32x4,
++    /// Lane-wise signed minimum of two 4×I32 vectors. The SSE4.1
++    /// `pminsd` twin of `VecSmaxI32x4`; the SSE2-only baseline lowers it
++    /// to the exact 4-op pcmpgtd+and/andn/or select in the emitter.
++    VecSminI32x4,
+     /// NEON smaxv: horizontal signed max of 4xI32 lanes; dest = scalar I32.
+     VecHorizontalMaxI32x4,
+     /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
+@@ -1565,8 +1584,8 @@ impl IntrinsicOp {
+             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
+             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
+             | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
+-            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4
+-            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8
++            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4 | VecXorF64x4
++            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8 | VecXorF32x8
+             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
+             | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8
+             | VecBroadcastF32x8 | VecZeroF32x8
+@@ -1661,9 +1680,9 @@ impl IntrinsicOp {
+             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
+             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
+             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
+-            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2
++            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2 | VecXorF64x2
+             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
+-            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
++            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4 | VecXorF32x4
+             | VecMinF32x4 | VecMaxF32x4 | VecCmpF32x4 | VecBlendvF32x4
+             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
+             | VecCmpI32x4 | VecBlendvI32x4
+@@ -1691,7 +1710,7 @@ impl IntrinsicOp {
+             | VecWidenMaskedAddI32x4ToI64x2
+             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
+             | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
+-            | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
++            | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4 | VecSminI32x4
+             // BB-SLP 128-bit families: I64x2 bitwise, I16x8/I8x16
+             // load/store/bitwise, and the 2-lane gather/extract pairs.
+             | VecAndI64x2 | VecOrI64x2 | VecXorI64x2
+@@ -1986,6 +2005,8 @@ impl IntrinsicOp {
+                 | IntrinsicOp::VecDivF64x2
+                 | IntrinsicOp::VecSqrtF64x4
+                 | IntrinsicOp::VecSqrtF64x2
++                | IntrinsicOp::VecXorF64x4
++                | IntrinsicOp::VecXorF64x2
+                 | IntrinsicOp::VecBroadcastF64x4
+                 | IntrinsicOp::VecBroadcastF64x2
+                 | IntrinsicOp::VecMulF32x8
+@@ -1996,6 +2017,8 @@ impl IntrinsicOp {
+                 | IntrinsicOp::VecDivF32x4
+                 | IntrinsicOp::VecSqrtF32x8
+                 | IntrinsicOp::VecSqrtF32x4
++                | IntrinsicOp::VecXorF32x8
++                | IntrinsicOp::VecXorF32x4
+                 | IntrinsicOp::VecWidenAddI32x4ToI64x2
+                 | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
+                 | IntrinsicOp::VecMaskedAddI32x8
+@@ -2032,6 +2055,7 @@ impl IntrinsicOp {
+                 | IntrinsicOp::VecSmlalLoI32x4
+                 | IntrinsicOp::VecSmlalHiI32x4
+                 | IntrinsicOp::VecSmaxI32x4
++                | IntrinsicOp::VecSminI32x4
+                 | IntrinsicOp::VecMinF32x8
+                 | IntrinsicOp::VecMinF32x4
+                 | IntrinsicOp::VecMinF64x4
+@@ -2317,12 +2341,17 @@ mod vector_result_width_tests {
+             "VecOrI32x8" => IntrinsicOp::VecOrI32x8,
+             "VecSadalpI32x4" => IntrinsicOp::VecSadalpI32x4,
+             "VecSmaxI32x4" => IntrinsicOp::VecSmaxI32x4,
++            "VecSminI32x4" => IntrinsicOp::VecSminI32x4,
+             "VecSmlalHiI32x4" => IntrinsicOp::VecSmlalHiI32x4,
+             "VecSmlalLoI32x4" => IntrinsicOp::VecSmlalLoI32x4,
+             "VecSqrtF32x4" => IntrinsicOp::VecSqrtF32x4,
+             "VecSqrtF32x8" => IntrinsicOp::VecSqrtF32x8,
+             "VecSqrtF64x2" => IntrinsicOp::VecSqrtF64x2,
+             "VecSqrtF64x4" => IntrinsicOp::VecSqrtF64x4,
++            "VecXorF32x4" => IntrinsicOp::VecXorF32x4,
++            "VecXorF32x8" => IntrinsicOp::VecXorF32x8,
++            "VecXorF64x2" => IntrinsicOp::VecXorF64x2,
++            "VecXorF64x4" => IntrinsicOp::VecXorF64x4,
+             "VecStoreF32x4" => IntrinsicOp::VecStoreF32x4,
+             "VecStoreF32x8" => IntrinsicOp::VecStoreF32x8,
+             "VecStoreF64x2" => IntrinsicOp::VecStoreF64x2,
+@@ -2498,6 +2527,10 @@ mod memory_classification_tests {
+             O::VecAndI8x16,
+             O::VecOrI16x8,
+             O::VecXorI32x4,
++            O::VecXorF32x4,
++            O::VecXorF32x8,
++            O::VecXorF64x2,
++            O::VecXorF64x4,
+             O::VecBroadcastI64x4,
+             O::VecZeroF32x4,
+             O::VecPackI64x2,
+diff --git a/src/ir/lowering/expr_access.rs b/src/ir/lowering/expr_access.rs
+index a0da364..e194fe5 100644
+--- a/src/ir/lowering/expr_access.rs
++++ b/src/ir/lowering/expr_access.rs
+@@ -934,7 +934,25 @@ impl Lowerer {
+             return Operand::Value(dest);
+         }
+ 
+-        self.lower_expr(inner)
++        // The remaining LEGAL operand class: string literals (`&"abc"` is
++        // the address of the array — C11 6.5.3.2 allows & on an lvalue and
++        // an array-literal designator is one). Everything else — `&-x`,
++        // `&(a + b)`, `&42` — is NOT an lvalue: C requires one, GCC rejects
++        // with "lvalue required as unary '&' operand", and silently
++        // lowering the operand as a VALUE here hands the program a pointer
++        // to whatever temporary the backend staged (undefined behaviour at
++        // the first dereference — observed as a segfault in the SLP test
++        // battery).
++        match inner {
++            Expr::StringLiteral(..)
++            | Expr::WideStringLiteral(..)
++            | Expr::Char16StringLiteral(..) => return self.lower_expr(inner),
++            _ => {}
++        }
++        self.diagnostics
++            .borrow_mut()
++            .error("lvalue required as unary '&' operand", inner.span());
++        Operand::Const(IrConst::I64(0))
+     }
+ 
+     /// Check if dereferencing the given expression is a no-op because the
+diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
+index b0947d5..e54bc13 100644
+--- a/src/ir/lowering/expr_builtins.rs
++++ b/src/ir/lowering/expr_builtins.rs
+@@ -477,6 +477,45 @@ impl Lowerer {
+                 let is_long_double_variant = name == "__builtin_infl"
+                     || name == "__builtin_huge_vall"
+                     || name == "__builtin_nanl";
++                // NaN builtins with a payload string: GCC/glibc semantics.
++                // The argument is an n-char-sequence parsed with
++                // strtoull-style base-0 rules (0x hex, leading-0 octal,
++                // decimal); the value becomes the quiet-NaN significand
++                // (glibc: `0x7fc00000 | (payload & 0x7fffff)` for f32,
++                // analogously f64/f128 — the exponent is all-ones and the
++                // quiet bit forced, the payload fills the remaining
++                // mantissa bits). Empty/absent string → canonical qNaN
++                // (the ConstantF64(f64::NAN) fallback below).
++                if matches!(name, "__builtin_nan" | "__builtin_nanf" | "__builtin_nanl") {
++                    let payload: Option<u64> = match args.first() {
++                        Some(Expr::StringLiteral(s, _)) if !s.is_empty() => {
++                            parse_n_char_sequence(s)
++                        }
++                        _ => None,
++                    };
++                    if let Some(p) = payload {
++                        if name == "__builtin_nanf" {
++                            let bits = 0x7fc0_0000u32 | (p as u32 & 0x007f_ffff);
++                            return Some(Operand::Const(IrConst::F32(f32::from_bits(bits))));
++                        } else if name == "__builtin_nan" {
++                            let bits = 0x7ff8_0000_0000_0000u64 | (p & 0x000f_ffff_ffff_ffff);
++                            return Some(Operand::Const(IrConst::F64(f64::from_bits(bits))));
++                        } else {
++                            // nanl: binary128 qNaN (the LongDouble const
++                            // carries explicit big-endian f128 bytes);
++                            // the u64 payload fills mantissa bits 63..0.
++                            let mut bytes = [0u8; 16];
++                            bytes[0] = 0x7F;
++                            bytes[1] = 0xFF;
++                            bytes[2] = 0x80;
++                            bytes[8..16].copy_from_slice(&p.to_be_bytes());
++                            return Some(Operand::Const(IrConst::long_double_with_bytes(
++                                f64::NAN,
++                                bytes,
++                            )));
++                        }
++                    }
++                }
+                 if is_float_variant {
+                     Some(Operand::Const(IrConst::F32(*val as f32)))
+                 } else if is_long_double_variant {
+@@ -2739,3 +2778,47 @@ fn classify_ctype(ty: &CType) -> i64 {
+         CType::Vector(_, _) => 14, // array_type_class (GCC classifies vectors here)
+     }
+ }
++
++/// Parse a C99 `n-char-sequence` (the payload string of
++/// `nan("...")`/`__builtin_nan*`) with `strtoull` base-0 semantics:
++/// `0x`/`0X` prefix → hexadecimal, a leading `0` → octal, otherwise
++/// decimal. Parsing stops at the first character that cannot belong to
++/// the chosen base (exactly like strtoull); an empty parse yields 0 —
++/// glibc's own `nan()` behaviour, and the canonical-qNaN result for
++/// garbage strings. Values saturate at u64::MAX (strtoull's ERANGE
++/// behaviour). Some(_) is only returned for a non-empty, at least
++/// partially valid sequence.
++fn parse_n_char_sequence(s: &str) -> Option<u64> {
++    let b = s.as_bytes();
++    if b.is_empty() {
++        return None;
++    }
++    let (digits_start, radix) = if b.len() >= 2 && b[0] == b'0' && (b[1] | 0x20) == b'x' {
++        (2, 16u32)
++    } else if b[0] == b'0' {
++        (1, 8u32)
++    } else {
++        (0, 10u32)
++    };
++    if digits_start >= b.len() {
++        // "0x" alone: strtoull parses the "0" and leaves "x" unconsumed.
++        return Some(0);
++    }
++    let mut acc: u64 = 0;
++    let mut any = false;
++    for &c in &b[digits_start..] {
++        let d = match (c as char).to_digit(radix) {
++            Some(d) => d as u64,
++            None => break,
++        };
++        any = true;
++        acc = acc.saturating_mul(radix as u64).saturating_add(d);
++    }
++    if !any {
++        // No valid digit in the chosen base (e.g. "0xzz" after the 0x
++        // prefix, or a "9" in an octal prefix "09..."): strtoull still
++        // consumed the "0" prefix — value 0.
++        return Some(0);
++    }
++    Some(acc)
++}
 diff --git a/src/passes/slp_vectorizer.rs b/src/passes/slp_vectorizer.rs
-index 080fc14..5fe334f 100644
+index 080fc14..06cddf0 100644
 --- a/src/passes/slp_vectorizer.rs
 +++ b/src/passes/slp_vectorizer.rs
-@@ -2683,7 +2683,8 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+@@ -694,6 +694,127 @@ fn is_commutative(op: IrBinOp) -> bool {
+     )
+ }
+ 
++/// Map an FP lane type/width to its packed bitwise-XOR intrinsic (the
++/// exact packed spelling of every FP bit-manipulation idiom whose scalar
++/// lowering is an integer-domain XOR on the bit pattern).
++fn packed_fpxor(ty: IrType, width: usize) -> Option<IntrinsicOp> {
++    match (ty, width) {
++        (IrType::F32, 8) => Some(IntrinsicOp::VecXorF32x8),
++        (IrType::F32, 4) => Some(IntrinsicOp::VecXorF32x4),
++        (IrType::F64, 4) => Some(IntrinsicOp::VecXorF64x4),
++        (IrType::F64, 2) => Some(IntrinsicOp::VecXorF64x2),
++        _ => None,
++    }
++}
++
++/// The `-0.0` constant of an FP lane type — the sign-mask operand of the
++/// FP-Neg composite (bit pattern: sign bit set, everything else clear).
++fn minus_zero_const(ty: IrType) -> Option<IrConst> {
++    match ty {
++        IrType::F32 => Some(IrConst::F32(-0.0)),
++        IrType::F64 => Some(IrConst::F64(-0.0)),
++        _ => None,
++    }
++}
++
++/// Integer lane min/max packed intrinsics. Exact and commutative (no FP
++/// unordered/±0 asymmetry) — every spelling of the same-source ternary
++/// folds. Dword requires SSE4.1 (pminsd/pmaxsd); gate on AVX2 — the SLP
++/// pass's only feature accessor — which implies it (x86-64-v2-only builds
++/// simply keep the cmp+blendv two-op form, which is itself exact).
++/// Halfword (pminsw/pmaxsw) and byte (pminub/pmaxub) are SSE2.
++fn packed_int_minmax(is_max: bool, ty: IrType, width: usize) -> Option<IntrinsicOp> {
++    let avx2 = x86_avx2_available_pub();
++    match (ty, width) {
++        (IrType::I32 | IrType::U32, 8) => Some(if is_max {
++            IntrinsicOp::VecMaxI32x8
++        } else {
++            IntrinsicOp::VecMinI32x8
++        }),
++        (IrType::I32 | IrType::U32, 4) if avx2 => Some(if is_max {
++            IntrinsicOp::VecSmaxI32x4
++        } else {
++            IntrinsicOp::VecSminI32x4
++        }),
++        (IrType::I16 | IrType::U16, 16) => Some(if is_max {
++            IntrinsicOp::VecMaxI16x16
++        } else {
++            IntrinsicOp::VecMinI16x16
++        }),
++        (IrType::I16 | IrType::U16, 8) => Some(if is_max {
++            IntrinsicOp::VecMaxI16x8
++        } else {
++            IntrinsicOp::VecMinI16x8
++        }),
++        // Unsigned bytes: pminub/pmaxub (SSE2). Signed bytes have no
++        // pre-AVX512 packed min/max.
++        (IrType::U8, 16) => Some(if is_max {
++            IntrinsicOp::VecMaxU8x16
++        } else {
++            IntrinsicOp::VecMinU8x16
++        }),
++        (IrType::U8, 32) => Some(if is_max {
++            IntrinsicOp::VecMaxU8x32
++        } else {
++            IntrinsicOp::VecMinU8x32
++        }),
++        _ => None,
++    }
++}
++
++/// The packed compare + lane-mask-select intrinsic pair for a (lane type,
++/// width) family. `None` where no family exists (I64 lanes) — the lanes
++/// then degrade to the gather/binop paths.
++fn packed_cmp_blendv(ty: IrType, width: usize) -> Option<(IntrinsicOp, IntrinsicOp)> {
++    let avx2 = x86_avx2_available_pub();
++    match (ty, width) {
++        (IrType::F32, 8) if avx2 => Some((IntrinsicOp::VecCmpF32x8, IntrinsicOp::VecBlendvF32x8)),
++        (IrType::F32, 4) => Some((IntrinsicOp::VecCmpF32x4, IntrinsicOp::VecBlendvF32x4)),
++        (IrType::F64, 4) if avx2 => Some((IntrinsicOp::VecCmpF64x4, IntrinsicOp::VecBlendvF64x4)),
++        (IrType::F64, 2) => Some((IntrinsicOp::VecCmpF64x2, IntrinsicOp::VecBlendvF64x2)),
++        (IrType::I32 | IrType::U32, 8) if avx2 => {
++            Some((IntrinsicOp::VecCmpI32x8, IntrinsicOp::VecBlendvI32x8))
++        }
++        (IrType::I32 | IrType::U32, 4) => {
++            Some((IntrinsicOp::VecCmpI32x4, IntrinsicOp::VecBlendvI32x4))
++        }
++        (IrType::I16 | IrType::U16, 16) if avx2 => {
++            Some((IntrinsicOp::VecCmpI16x16, IntrinsicOp::VecBlendvI16x16))
++        }
++        (IrType::I16 | IrType::U16, 8) => {
++            Some((IntrinsicOp::VecCmpI16x8, IntrinsicOp::VecBlendvI16x8))
++        }
++        (IrType::I8 | IrType::U8, 32) if avx2 => {
++            Some((IntrinsicOp::VecCmpI8x32, IntrinsicOp::VecBlendvI8x32))
++        }
++        (IrType::I8 | IrType::U8, 16) => {
++            Some((IntrinsicOp::VecCmpI8x16, IntrinsicOp::VecBlendvI8x16))
++        }
++        _ => None,
++    }
++}
++
++/// The packed-compare predicate immediate for a scalar comparison, with
++/// the operand-swap flag for the mirrored relations. FP vocabulary:
++/// 0 = EQ_OQ, 1 = LT_OS, 2 = LE_OS, 4 = NEQ_UQ (exactly the C spellings —
++/// all false on NaN). Integer vocabulary: 0 = eq, 1 = lt.s, 2 = le.s,
++/// 4 = ne, 5 = lt.u, 6 = le.u. Unsigned relations are integer-only.
++fn cmp_predicate_imm(op: IrCmpOp, is_fp: bool) -> Option<(i64, bool)> {
++    match op {
++        IrCmpOp::Eq => Some((0, false)),
++        IrCmpOp::Ne => Some((4, false)),
++        IrCmpOp::Slt => Some((1, false)),
++        IrCmpOp::Sle => Some((2, false)),
++        IrCmpOp::Sgt => Some((1, true)),
++        IrCmpOp::Sge => Some((2, true)),
++        IrCmpOp::Ult if !is_fp => Some((5, false)),
++        IrCmpOp::Ule if !is_fp => Some((6, false)),
++        IrCmpOp::Ugt if !is_fp => Some((5, true)),
++        IrCmpOp::Uge if !is_fp => Some((6, true)),
++        _ => None,
++    }
++}
++
+ /// Map a shift lane op to its packed intrinsic — the uniform CONSTANT
+ /// amount forms only (`psllw/psrlw/psraw/pslld/psrld/psrad/psllq/psrlq`
+ /// and their VEX counterparts). None where the ISA has no packed form:
+@@ -976,6 +1097,33 @@ enum PackKind {
+         rhs: usize,
+         cond_lanes: Vec<Value>,
+     },
++    /// FP negation composite: `dest = VecXorF*(val, Const(-0.0))` — the
++    /// emitter folds the per-lane sign mask as a .rodata memory operand,
++    /// ONE instruction for the whole pack (the exact GCC spelling of
++    /// packed `-x` lanes). Bit-exactness proof: the scalar lowering
++    /// (alu.rs `emit_float_neg_impl`) XORs the GPR bit pattern with the
++    /// sign mask — a pure sign-bit flip, NOT `0.0 - x` — identical to the
++    /// packed XOR for every lane value incl. NaN payloads and ±0.
++    FpNeg { vec_op: IntrinsicOp, val: usize },
++    /// General compare+select composite: TWO intrinsics — a packed
++    /// compare (all-ones/all-zeros lane mask; `pred` follows the VecCmp*
++    /// immediate vocabulary) feeding a bitwise lane select
++    /// (`blendv args = [fv, tv, mask]`). Replaces W scalar cmp+select
++    /// pairs for EVERY predicate and mixed arms (the shapes the min/max
++    /// fold cannot take). `cond_lanes` are the Cmp defs that die with the
++    /// folded Select lanes (removed; every non-removed use rejects the
++    /// seed — a scalar bool cannot be reconstructed from the packed
++    /// mask cheaply).
++    CmpBlendv {
++        cmp_op: IntrinsicOp,
++        blend_op: IntrinsicOp,
++        pred: i64,
++        lhs: usize,
++        rhs: usize,
++        tv: usize,
++        fv: usize,
++        cond_lanes: Vec<Value>,
++    },
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -1950,16 +2098,81 @@ fn build_pack(
+             }
+         }
+ 
+-        // 2c. FP strict min/max Select lanes: every lane is
+-        //     `Select(cond = Cmp(op, l, r), t, f)` in one of the four
+-        //     STRICT-ORDERED foldable spellings (see PackKind::FpMinMax).
+-        //     Operand identity is compared BIT-EXACTLY (`lane_key`), never
+-        //     by `Operand`'s derived float equality — a {-0.0, +0.0}
+-        //     mismatch under `==` would fold a ternary whose ±0 lanes the
+-        //     packed op answers differently. Non-strict (<=, >=) compares
+-        //     and mixed per-lane shapes reject the lanes (v2: per-lane
+-        //     routing).
++        // 2b-FP. FP Negation lanes (UnaryOp{Neg, F32/F64} at the seed's
++        //       lane type): the composite `Neg(x) == Xor(x, -0.0)`.
++        //       Bit-exactness PROOF against the scalar lowering: the x86
++        //       scalar path (alu.rs `emit_float_neg_impl`) XORs the value's
++        //       GPR bit pattern with the sign mask — a pure sign-bit flip,
++        //       NOT a `0.0 - x` subtraction — so the packed `vxorps/vxorpd`
++        //       with the per-lane sign mask produces the identical lane
++        //       bits for EVERY value: normals, subnormals, infinities,
++        //       ±0 (the SIGN flips — exactly what unary minus means for
++        //       zeros), and every NaN payload (flipped sign, payload
++        //       preserved verbatim, no canonicalisation).
++        //       Emitted as ONE intrinsic with a Const(-0.0) second operand:
++        //       the backend folds the mask as a .rodata memory operand —
++        //       one instruction per pack, the exact GCC spelling.
+         if matches!(ty, IrType::F32 | IrType::F64) {
++            let neg_lanes_ok = vals.iter().all(|v| {
++                matches!(
++                    ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
++                    Some(Instruction::UnaryOp {
++                        op: IrUnaryOp::Neg,
++                        ty: uty,
++                        ..
++                    }) if *uty == ty
++                )
++            });
++            if neg_lanes_ok {
++                if let Some(vec_op) = packed_fpxor(ty, width) {
++                    let srcs: Vec<Operand> = vals
++                        .iter()
++                        .map(|v| {
++                            let i = ctx.def_pos[&v.0];
++                            match &block.instructions[i] {
++                                Instruction::UnaryOp { src, .. } => src.clone(),
++                                _ => unreachable!(),
++                            }
++                        })
++                        .collect();
++                    if let Some(val) =
++                        build_pack(ctx, &srcs, ty, width, fam, packs, dedup, depth + 1)
++                    {
++                        let idx = packs.len();
++                        packs.push(Pack {
++                            kind: PackKind::FpNeg { vec_op, val },
++                            lane_vals: vals.clone(),
++                            sched: usize::MAX,
++                            order: 0,
++                        });
++                        dedup.insert(key, idx);
++                        return Some(idx);
++                    }
++                }
++            }
++        }
++
++        // 2c. Select-of-Cmp lanes: every lane is
++        //     `Select(cond = Cmp(op, l, r), t, f)` with the compare at the
++        //     seed's lane type. Two folds, tried in order:
++        //     (a) MIN/MAX — the same-source-arm spellings. FP: the four
++        //         STRICT-ORDERED forms (the FpMinMax lane-exactness proof:
++        //         MINPS/MAXPS return src2 on unordered/both-zero, exactly
++        //         the false arm). INTEGER: every relational spelling is
++        //         exact (integer min/max is commutative with no NaN/±0
++        //         asymmetry, and `<=`/`>=` differ from `<`/`>` only on
++        //         equal values — where both arms ARE the same value).
++        //     (b) CMP+BLENDV — everything else (mixed arms, non-foldable
++        //         predicates): one packed compare producing an all-ones /
++        //         all-zeros lane mask (IEEE-exact for every FP predicate —
++        //         LT_OS is exactly C `<`, NEQ_UQ exactly C `!=`, all false
++        //         on NaN just like C) + one BITWISE lane select. Exact for
++        //         every predicate, every arm pair, integer and FP.
++        //     Operand identity in (a) is compared BIT-EXACTLY (`lane_key`),
++        //     never by `Operand`'s derived float equality — a {-0.0, +0.0}
++        //     mismatch under `==` would fold a ternary whose ±0 lanes the
++        //     packed op answers differently.
++        {
+             let sel_shape =
+                 |v: &Value| -> Option<(IrCmpOp, Operand, Operand, Operand, Operand, Value)> {
+                     let i = ctx.def_pos.get(&v.0)?;
+@@ -1999,7 +2212,8 @@ fn build_pack(
+                     ))
+                 };
+             if vals.iter().all(|v| sel_shape(v).is_some()) {
+-                // Uniform fold decision across lanes.
++                let is_fp = matches!(ty, IrType::F32 | IrType::F64);
++                // ── (a) the min/max fold ──────────────────────────────
+                 #[derive(Clone, Copy, PartialEq)]
+                 enum Fold {
+                     Min,
+@@ -2011,21 +2225,28 @@ fn build_pack(
+                     let Some((op, l, r, t, f, _)) = sel_shape(v) else {
+                         unreachable!()
+                     };
+-                    let this = match op {
+-                        IrCmpOp::Slt => {
+-                            if same_source(ctx, &t, &l) && same_source(ctx, &f, &r) {
+-                                Some((Fold::Min, false))
+-                            } else if same_source(ctx, &t, &r) && same_source(ctx, &f, &l) {
+-                                Some((Fold::Max, true))
+-                            } else {
+-                                None
+-                            }
+-                        }
+-                        IrCmpOp::Sgt => {
++                    // FP admits only the STRICT spellings (non-strict
++                    // differs on ±0); integer lanes admit every relational
++                    // spelling (exactness argument above).
++                    let spell = match op {
++                        IrCmpOp::Slt | IrCmpOp::Sle => Some(0),
++                        IrCmpOp::Sgt | IrCmpOp::Sge => Some(1),
++                        _ => None,
++                    };
++                    let this = match (spell, is_fp && matches!(op, IrCmpOp::Sle | IrCmpOp::Sge)) {
++                        (Some(s), false) => {
+                             if same_source(ctx, &t, &l) && same_source(ctx, &f, &r) {
+-                                Some((Fold::Max, false))
++                                Some(if s == 0 {
++                                    (Fold::Min, false)
++                                } else {
++                                    (Fold::Max, false)
++                                })
+                             } else if same_source(ctx, &t, &r) && same_source(ctx, &f, &l) {
+-                                Some((Fold::Min, true))
++                                Some(if s == 0 {
++                                    (Fold::Max, true)
++                                } else {
++                                    (Fold::Min, true)
++                                })
+                             } else {
+                                 None
+                             }
+@@ -2041,17 +2262,19 @@ fn build_pack(
+                         }
+                     }
+                 }
+-                let _dbg_trace = std::env::var("LCCC_DEBUG_SLP_TRACE").is_ok();
+-                if _dbg_trace {
+-                    eprintln!("[SLP-TRACE] 2c: sel_shapes ok, fold={}", fold.is_some());
+-                }
+                 if shapes_ok && fold.is_some() {
+                     let (kind, arms_swapped) = fold.unwrap();
+-                    let vec_op = packed_minmax(kind == Fold::Max, ty, width);
++                    let vec_op = if is_fp {
++                        packed_minmax(kind == Fold::Max, ty, width)
++                    } else {
++                        packed_int_minmax(kind == Fold::Max, ty, width)
++                    };
+                     if let Some(vec_op) = vec_op {
+                         // src1/src2 lanes per the fold's operand order:
+                         // arms_swapped selects (r, l) for the mirrored
+-                        // spellings — the FALSE arm must be src2.
++                        // spellings — the FALSE arm must be src2 (the FP
++                        // operand contract; integer min/max is commutative
++                        // so either order is exact there).
+                         let mut src1: Vec<Operand> = Vec::with_capacity(width);
+                         let mut src2: Vec<Operand> = Vec::with_capacity(width);
+                         let mut conds: Vec<Value> = Vec::with_capacity(width);
+@@ -2087,6 +2310,107 @@ fn build_pack(
+                         }
+                     }
+                 }
++                // ── (b) the general cmp+blendv fold ────────────────────
++                // Uniform compare op across lanes; the predicate immediate
++                // follows the VecCmp* vocabulary (mirrored relations swap
++                // the compare operands and use the primary predicate).
++                // FP admits the six C-spelling predicates; unsigned
++                // relations only exist for integer lanes.
++                if let Some(first) = vals.first() {
++                    let (op0, _, _, _, _, _) = sel_shape(first).unwrap();
++                    let pred = cmp_predicate_imm(op0, is_fp);
++                    if let Some((pred, swap)) = pred {
++                        if let Some((cmp_op, blend_op)) = packed_cmp_blendv(ty, width) {
++                            let mut l_lanes: Vec<Operand> = Vec::with_capacity(width);
++                            let mut r_lanes: Vec<Operand> = Vec::with_capacity(width);
++                            let mut t_lanes: Vec<Operand> = Vec::with_capacity(width);
++                            let mut f_lanes: Vec<Operand> = Vec::with_capacity(width);
++                            let mut conds: Vec<Value> = Vec::with_capacity(width);
++                            let mut uniform = true;
++                            for v in &vals {
++                                let (op, l, r, t, f, cv) = sel_shape(v).unwrap();
++                                if op != op0 {
++                                    uniform = false;
++                                    break;
++                                }
++                                l_lanes.push(strip_identity_casts(ctx, &l));
++                                r_lanes.push(strip_identity_casts(ctx, &r));
++                                t_lanes.push(t.clone());
++                                f_lanes.push(f.clone());
++                                conds.push(cv);
++                            }
++                            if uniform {
++                                // The mirrored relations compare (r, l).
++                                let (a_lanes, b_lanes) = if swap {
++                                    (&r_lanes, &l_lanes)
++                                } else {
++                                    (&l_lanes, &r_lanes)
++                                };
++                                if let (Some(lhs), Some(rhs), Some(tv), Some(fv)) = (
++                                    build_pack(
++                                        ctx,
++                                        a_lanes,
++                                        ty,
++                                        width,
++                                        fam,
++                                        packs,
++                                        dedup,
++                                        depth + 1,
++                                    ),
++                                    build_pack(
++                                        ctx,
++                                        b_lanes,
++                                        ty,
++                                        width,
++                                        fam,
++                                        packs,
++                                        dedup,
++                                        depth + 1,
++                                    ),
++                                    build_pack(
++                                        ctx,
++                                        &t_lanes,
++                                        ty,
++                                        width,
++                                        fam,
++                                        packs,
++                                        dedup,
++                                        depth + 1,
++                                    ),
++                                    build_pack(
++                                        ctx,
++                                        &f_lanes,
++                                        ty,
++                                        width,
++                                        fam,
++                                        packs,
++                                        dedup,
++                                        depth + 1,
++                                    ),
++                                ) {
++                                    let idx = packs.len();
++                                    packs.push(Pack {
++                                        kind: PackKind::CmpBlendv {
++                                            cmp_op,
++                                            blend_op,
++                                            pred,
++                                            lhs,
++                                            rhs,
++                                            tv,
++                                            fv,
++                                            cond_lanes: conds,
++                                        },
++                                        lane_vals: vals.clone(),
++                                        sched: usize::MAX,
++                                        order: 0,
++                                    });
++                                    dedup.insert(key, idx);
++                                    return Some(idx);
++                                }
++                            }
++                        }
++                    }
++                }
+             }
+         }
+ 
+@@ -2646,6 +2970,17 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+                     stack.push(lhs);
+                     stack.push(rhs);
+                 }
++                PackKind::FpNeg { val, .. } => {
++                    stack.push(val);
++                }
++                PackKind::CmpBlendv {
++                    lhs, rhs, tv, fv, ..
++                } => {
++                    stack.push(lhs);
++                    stack.push(rhs);
++                    stack.push(tv);
++                    stack.push(fv);
++                }
+                 _ => {}
+             }
+         }
+@@ -2672,6 +3007,17 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+                         *lhs = remap[*lhs];
+                         *rhs = remap[*rhs];
+                     }
++                    PackKind::FpNeg { val, .. } => {
++                        *val = remap[*val];
++                    }
++                    PackKind::CmpBlendv {
++                        lhs, rhs, tv, fv, ..
++                    } => {
++                        *lhs = remap[*lhs];
++                        *rhs = remap[*rhs];
++                        *tv = remap[*tv];
++                        *fv = remap[*fv];
++                    }
+                     _ => {}
+                 }
+             }
+@@ -2683,7 +3029,8 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
      // ── Schedules ──────────────────────────────────────────────────────
      // Op/MemLoad packs: max lane def position (strictly before every
      // consumer — SSA within the block). Splat/gather leaves: min over
@@ -1037,7 +3536,7 @@ index 080fc14..5fe334f 100644
      for p in packs.iter_mut() {
          if !p.lane_vals.is_empty() {
              p.sched = p
-@@ -2694,6 +2695,61 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+@@ -2694,6 +3041,61 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                  .unwrap_or(0);
          }
      }
@@ -1099,11 +3598,804 @@ index 080fc14..5fe334f 100644
      loop {
          let mut changed = false;
          for i in 0..packs.len() {
+@@ -2712,6 +3114,10 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+                     // BinOp consumes its sides.
+                     PackKind::ShiftImm { val, .. } => Some(vec![*val]),
+                     PackKind::FpMinMax { lhs, rhs, .. } => Some(vec![*lhs, *rhs]),
++                    PackKind::FpNeg { val, .. } => Some(vec![*val]),
++                    PackKind::CmpBlendv {
++                        lhs, rhs, tv, fv, ..
++                    } => Some(vec![*lhs, *rhs, *tv, *fv]),
+                     _ => None,
+                 };
+                 if let Some(ins) = inputs {
+@@ -2763,7 +3169,9 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+         // folded Selects — their only remaining uses die with the select
+         // lanes (an external use rejects the seed in the legality walk
+         // below).
+-        if let PackKind::FpMinMax { cond_lanes, .. } = &p.kind {
++        if let PackKind::FpMinMax { cond_lanes, .. } | PackKind::CmpBlendv { cond_lanes, .. } =
++            &p.kind
++        {
+             for c in cond_lanes {
+                 removed.insert(ctx.def_pos[&c.0]);
+             }
+@@ -2845,10 +3253,25 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+     // ── Legality ───────────────────────────────────────────────────────
+     for p in packs.iter() {
+         for v in &p.lane_vals {
+-            // (b) No cross-block uses of a replaced lane.
+-            if ctx.external_uses.contains(&v.0) {
+-                return None;
+-            }
++            // (b) CROSS-BLOCK USES ARE PERMITTED (v6 relaxation of the
++            // original blanket rejection). Soundness PROOF: the extract
++            // is placed in the lane's defining block B at p.sched — the
++            // maximum of the pack's lane-def positions, i.e. AFTER every
++            // lane def and before B's terminator. For ANY use of the
++            // lane (an instruction in another block U, or a phi incoming
++            // on an edge P→U), SSA validity gives def(v) dom use; block
++            // linearity means any path containing def(v) executes all
++            // of B — including the later extract position — before
++            // leaving B, so the extract dominates the same use. The
++            // rewrite (apply_plan rewrites EVERY block's uses) replaces
++            // the use with the extract value; nothing reads a deleted
++            // def.
++            //
++            // The one EXCEPTION kept from the original rule: in-block
++            // uses BEFORE the pack's slot (rule (a) below) — including
++            // self-loop backedge phi incomings recorded at the phi's
++            // position.
++            //
+             // (a) In-block external uses must be scheduled strictly after
+             // the pack's vector op (the replacing extract is placed with
+             // the vector op). Uses at usize::MAX (terminator) are always
+@@ -2859,12 +3282,15 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+                 }
+             }
+         }
+-        // The FP min/max fold's Cmp lanes: NO extract exists for them (a
+-        // scalar bool cannot be reconstructed from the packed mask), so
+-        // EVERY use outside the removed set — early OR late, terminator
+-        // included — rejects the seed. (The early-only variant left the
+-        // cmp's later consumers reading a deleted def: backend ICE.)
+-        if let PackKind::FpMinMax { cond_lanes, .. } = &p.kind {
++        // The min/max and cmp+blendv folds' Cmp lanes: NO extract exists
++        // for them (a scalar bool cannot be reconstructed from the packed
++        // mask), so EVERY use outside the removed set — early OR late,
++        // terminator included — rejects the seed. (The early-only variant
++        // left the cmp's later consumers reading a deleted def: backend
++        // ICE.)
++        if let PackKind::FpMinMax { cond_lanes, .. } | PackKind::CmpBlendv { cond_lanes, .. } =
++            &p.kind
++        {
+             for c in cond_lanes {
+                 if ctx.external_uses.contains(&c.0) {
+                     return None;
+@@ -3038,10 +3464,14 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+                 .uses
+                 .get(&v.0)
+                 .map(|us| us.iter().any(|&u| u == usize::MAX || !removed.contains(&u)))
+-                .unwrap_or(false);
++                .unwrap_or(false)
++                // Cross-block uses (rule (b)'s relaxation) need extracts
++                // exactly like surviving in-block uses: the extract lives
++                // with the pack and every rewritten external use reads it.
++                || ctx.external_uses.contains(&v.0);
+             if has_external {
+                 // Only families with an exact lane-extract intrinsic can
+-                // service external uses in v1.
++                // service external uses.
+                 if fam.extract.is_none() {
+                     return None;
+                 }
+@@ -3073,6 +3503,16 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
+             PackKind::FpMinMax { .. } => {
+                 benefit += width as i64 - 1;
+             }
++            // FP negation: W scalar negs → ONE packed XOR whose sign mask
++            // is a free .rodata memory operand (no splat, no register).
++            PackKind::FpNeg { .. } => {
++                benefit += width as i64 - 1;
++            }
++            // The cmp+blendv composite: W scalar compares AND W selects
++            // → TWO packed ops (the mask is exact for every predicate).
++            PackKind::CmpBlendv { .. } => {
++                benefit += 2 * (width as i64 - 1);
++            }
+             // Plain scalar shift lanes replace W ops with one vector op
+             // (+W-1); the synthetic halves of a rotate decomposition
+             // replace nothing (cost 1 each, like a splat leaf).
+@@ -3111,6 +3551,15 @@ fn topo_depth(packs: &[Pack], idx: usize) -> usize {
+             1 + topo_depth(packs, *lhs).max(topo_depth(packs, *rhs))
+         }
+         PackKind::ShiftImm { val, .. } => 1 + topo_depth(packs, *val),
++        PackKind::FpNeg { val, .. } => 1 + topo_depth(packs, *val),
++        PackKind::CmpBlendv {
++            lhs, rhs, tv, fv, ..
++        } => {
++            1 + topo_depth(packs, *lhs)
++                .max(topo_depth(packs, *rhs))
++                .max(topo_depth(packs, *tv))
++                .max(topo_depth(packs, *fv))
++        }
+         PackKind::FpMinMax { lhs, rhs, .. } => {
+             1 + topo_depth(packs, *lhs).max(topo_depth(packs, *rhs))
+         }
+@@ -3141,6 +3590,15 @@ fn apply_plan(
+         vec_dest.push(Value(func.next_value_id));
+         func.next_value_id += 1;
+     }
++    // The CmpBlendv packs carry TWO vector results (the compare mask and
++    // the blend output); the mask value gets its own SSA id here.
++    let mut cmp_mask_dest: FxHashMap<usize, Value> = FxHashMap::default();
++    for (pi, p) in plan.packs.iter().enumerate() {
++        if matches!(p.kind, PackKind::CmpBlendv { .. }) {
++            cmp_mask_dest.insert(pi, Value(func.next_value_id));
++            func.next_value_id += 1;
++        }
++    }
+     let mut extract_dest: FxHashMap<u32, Value> = FxHashMap::default();
+     for (&vid, _) in &plan.extract_of {
+         extract_dest.insert(vid, Value(func.next_value_id));
+@@ -3215,6 +3673,58 @@ fn apply_plan(
+                     Operand::Value(vec_dest[*rhs]),
+                 ],
+             },
++            PackKind::FpNeg { vec_op, val } => {
++                // The Const(-0.0) operand selects the backend's sign-mask
++                // memory-operand fast path (one instruction, GCC parity).
++                let mz = minus_zero_const(cand.ty)
++                    .expect("FpNeg packs are only built for F32/F64 lanes");
++                Instruction::Intrinsic {
++                    dest: Some(dest),
++                    op: *vec_op,
++                    dest_ptr: None,
++                    args: vec![Operand::Value(vec_dest[*val]), Operand::Const(mz)],
++                }
++            }
++            PackKind::CmpBlendv {
++                cmp_op,
++                blend_op,
++                pred,
++                lhs,
++                rhs,
++                tv,
++                fv,
++                ..
++            } => {
++                // TWO intrinsics at the same schedule slot: the compare
++                // first, then the select reading its mask (the stable
++                // (sched, order) sort preserves this push order; the
++                // extracts ride at p.order+1+li, after both).
++                let mask = cmp_mask_dest[&pi];
++                inserts.push((
++                    p.sched,
++                    p.order,
++                    Instruction::Intrinsic {
++                        dest: Some(mask),
++                        op: *cmp_op,
++                        dest_ptr: None,
++                        args: vec![
++                            Operand::Value(vec_dest[*lhs]),
++                            Operand::Value(vec_dest[*rhs]),
++                            Operand::Const(IrConst::I32(*pred as i32)),
++                        ],
++                    },
++                ));
++                Instruction::Intrinsic {
++                    dest: Some(dest),
++                    op: *blend_op,
++                    dest_ptr: None,
++                    args: vec![
++                        Operand::Value(vec_dest[*fv]),
++                        Operand::Value(vec_dest[*tv]),
++                        Operand::Value(mask),
++                    ],
++                }
++            }
+         };
+         inserts.push((p.sched, p.order, inst));
+         // Extracts ride with their pack (pure reads; placement with the
+@@ -3300,6 +3810,24 @@ fn apply_plan(
+     func.blocks[block_idx].instructions = new_insts;
+     func.blocks[block_idx].source_spans = new_spans;
+ 
++    // Cross-block use rewrite (rule (b)'s v6 relaxation): the extracts
++    // live in THIS block and dominate every external use (see the proof
++    // in the legality walk), so every OTHER block's uses of the replaced
++    // lanes — instructions, phi incomings, terminators — are rewritten to
++    // the extract values through the canonical mutation walkers. The map
++    // is usually tiny; the per-block scan is a cheap hash-miss walk.
++    if !extract_dest.is_empty() {
++        for (bi, blk) in func.blocks.iter_mut().enumerate() {
++            if bi == block_idx {
++                continue;
++            }
++            for inst in blk.instructions.iter_mut() {
++                rewrite_uses_in_place(inst, &extract_dest);
++            }
++            rewrite_term_uses_in_place(&mut blk.terminator, &extract_dest);
++        }
++    }
++
+     // Terminator use rewrite.
+     let term = std::mem::replace(
+         &mut func.blocks[block_idx].terminator,
+@@ -3323,6 +3851,8 @@ fn apply_plan(
+                     format!("ShiftImm(v{} ${})", val, amount)
+                 }
+                 PackKind::FpMinMax { .. } => "FpMinMax".into(),
++                PackKind::FpNeg { .. } => "FpNeg".into(),
++                PackKind::CmpBlendv { .. } => "CmpBlendv".into(),
+             })
+             .collect();
+         eprintln!(
+@@ -3378,3 +3908,38 @@ fn rewrite_term_uses(mut term: Terminator, map: &FxHashMap<u32, Value>) -> Termi
+     });
+     term
+ }
++
++/// In-place variants of `rewrite_uses`/`rewrite_term_uses` for the
++/// cross-block rewrite (rule (b)'s v6 relaxation): the same canonical
++/// mutation walkers, applied to OTHER blocks' instructions and
++/// terminators without moving them.
++fn rewrite_uses_in_place(inst: &mut Instruction, map: &FxHashMap<u32, Value>) {
++    if map.is_empty() {
++        return;
++    }
++    inst.for_each_operand_mut(|op| {
++        if let Operand::Value(v) = op {
++            if let Some(&nv) = map.get(&v.0) {
++                *op = Operand::Value(nv);
++            }
++        }
++    });
++    inst.for_each_value_use_mut(|v| {
++        if let Some(&nv) = map.get(&v.0) {
++            *v = nv;
++        }
++    });
++}
++
++fn rewrite_term_uses_in_place(term: &mut Terminator, map: &FxHashMap<u32, Value>) {
++    if map.is_empty() {
++        return;
++    }
++    term.for_each_operand_mut(|op| {
++        if let Operand::Value(v) = op {
++            if let Some(&nv) = map.get(&v.0) {
++                *op = Operand::Value(nv);
++            }
++        }
++    });
++}
+diff --git a/tests/regression/bb_slp_redteam.c b/tests/regression/bb_slp_redteam.c
+index f2afe8a..ed4ca53 100644
+--- a/tests/regression/bb_slp_redteam.c
++++ b/tests/regression/bb_slp_redteam.c
+@@ -83,6 +83,20 @@ long rt_phi(long *q, int cond, long w, long x) {
+     return a + b;   // a/b are phi-merged here: cross-block lane uses
+ }
+ 
++// ── RT5b: TRUE cross-block lane uses (v6 rule-(b) relaxation) — the
++// lanes are consumed by instructions in DOMINATED successor blocks with
++// no phi in between. The extracts ride with the pack in the defining
++// block and dominate every use (the soundness proof), so this MUST
++// vectorize; the self-check pins the values both sides compute.
++long rt_xblock(long * restrict q, long * restrict r, int cond) {
++    long a = q[0] + r[0], b = q[1] + r[1];
++    q[2] = a; q[3] = b;
++    if (cond) {
++        return a * b;
++    }
++    return a - b;
++}
++
+ // ── RT6: lanes consumed by inline-asm inputs ───────────────────────────
+ long rt_asm(long *q, long w, long x) {
+     long a = q[0] + w, b = q[1] + x;
+@@ -161,6 +175,13 @@ int main(void) {
+     CHECK(rt_phi(qp, 1, 1, 1) == 8 + 10, "rt_phi taken");
+     CHECK(rt_phi(qp, 0, 1, 1) == 0, "rt_phi fallthrough");
+ 
++    long xq[4] = {1000000000L, -2000000000L, 0, 0};
++    long xr[4] = {123456789L, 987654321L, 0, 0};
++    long xa = 1000000000L + 123456789L, xbb = -2000000000L + 987654321L;
++    CHECK(rt_xblock(xq, xr, 1) == xa * xbb, "rt_xblock taken");
++    CHECK(rt_xblock(xq, xr, 0) == xa - xbb, "rt_xblock fallthrough");
++    CHECK(xq[2] == xa && xq[3] == xbb, "rt_xblock stores");
++
+     long qa[2] = {4, 6};
+     CHECK(rt_asm(qa, 10, 20) == 14 + 26, "rt_asm value");
+ 
+diff --git a/tests/regression/bb_slp_v6.c b/tests/regression/bb_slp_v6.c
+new file mode 100644
+index 0000000..8935e7c
+--- /dev/null
++++ b/tests/regression/bb_slp_v6.c
+@@ -0,0 +1,440 @@
++/*
++ * BB-SLP v6 battery: the 128-bit VEX memory fold, FP negation, integer
++ * min/max folds, the general cmp+blendv composite, and the rule-(b)
++ * cross-block relaxation.
++ *
++ * Every vectorization candidate is verified against a spelling-twins
++ * reference and, where bit-exactness is the whole proof (FP Neg, FP
++ * non-strict selects), compared BIT-EXACTLY over lanes chosen to hit the
++ * exactness hazards:
++ *   - memfold: unaligned 128-bit streams, both operand orders of the
++ *     commutative folds, non-commutative (sub/min) order preservation;
++ *   - FP Neg: qNaN payloads (sign flips, payload verbatim), ±0, ±inf;
++ *   - integer min/max: INT_MIN/INT_MAX sign edges, every relational
++ *     spelling including <= / >= (exact for integers);
++ *   - cmp+blendv: every predicate family (eq/ne/lt/le + unsigned + FP
++ *     eq/ne/le), mixed arms, NaN lanes (all C comparisons are false on
++ *     NaN — the packed predicates are IEEE-exact);
++ *   - cross-block: lanes consumed in dominated successor blocks.
++ *
++ * Adversarial sections verify the REJECTIONS: cond values with external
++ * uses, non-uniform predicates.
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++static int fails = 0;
++
++#define CHECK(cond, name)                                                  \
++    do {                                                                   \
++        if (!(cond)) {                                                     \
++            printf("FAIL %s\n", name);                                     \
++            fails++;                                                       \
++        }                                                                  \
++    } while (0)
++
++static uint32_t bitsf(float f) {
++    uint32_t u;
++    memcpy(&u, &f, 4);
++    return u;
++}
++static void chkf(float got, float want, const char *n) {
++    if (bitsf(got) != bitsf(want)) {
++        printf("FAIL %s: %08x vs %08x\n", n, bitsf(got), bitsf(want));
++        fails++;
++    }
++}
++
++/* ── Section 1: the 128-bit VEX memory fold ─────────────────────────── */
++
++/* Commutative, both operand orders (the fold sits in the r/m slot). */
++void v6_mf_add(const int32_t *restrict a, int32_t *restrict q) {
++    q[0] = a[0] + 3; q[1] = a[1] + 3; q[2] = a[2] + 3; q[3] = a[3] + 3;
++}
++void v6_mf_xor(const uint32_t *restrict a, uint32_t *restrict q) {
++    q[0] = a[0] ^ 0xdeadbeefu; q[1] = a[1] ^ 0xdeadbeefu;
++    q[2] = a[2] ^ 0xdeadbeefu; q[3] = a[3] ^ 0xdeadbeefu;
++}
++/* Non-commutative: the load folds in the src2 position only. */
++void v6_mf_sub(const int32_t *restrict a, int32_t *restrict q) {
++    q[0] = 100 - a[0]; q[1] = 100 - a[1]; q[2] = 100 - a[2]; q[3] = 100 - a[3];
++}
++/* Two-stream fold: the farther load folds, the nearer streams. */
++void v6_mf_two(const int32_t *restrict a, const int32_t *restrict b,
++               int32_t *restrict q) {
++    q[0] = a[0] + b[0]; q[1] = a[1] + b[1]; q[2] = a[2] + b[2]; q[3] = a[3] + b[3];
++}
++/* 256-bit twin. */
++void v6_mf_add8(const int32_t *restrict a, int32_t *restrict q) {
++    q[0] = a[0] + 7; q[1] = a[1] + 7; q[2] = a[2] + 7; q[3] = a[3] + 7;
++    q[4] = a[4] + 7; q[5] = a[5] + 7; q[6] = a[6] + 7; q[7] = a[7] + 7;
++}
++
++/* ── Section 2: FP negation (the -0.0 sign-mask composite) ──────────── */
++
++void v6_neg_f32x4(const float *restrict a, float *restrict q) {
++    q[0] = -a[0]; q[1] = -a[1]; q[2] = -a[2]; q[3] = -a[3];
++}
++void v6_neg_f32x8(const float *restrict a, float *restrict q) {
++    q[0] = -a[0]; q[1] = -a[1]; q[2] = -a[2]; q[3] = -a[3];
++    q[4] = -a[4]; q[5] = -a[5]; q[6] = -a[6]; q[7] = -a[7];
++}
++void v6_neg_f64x2(const double *restrict a, double *restrict q) {
++    q[0] = -a[0]; q[1] = -a[1];
++}
++void v6_neg_f64x4(const double *restrict a, double *restrict q) {
++    q[0] = -a[0]; q[1] = -a[1]; q[2] = -a[2]; q[3] = -a[3];
++}
++
++/* ── Section 3: integer min/max folds (every spelling) ──────────────── */
++
++void v6_imin_lt(const int32_t *restrict a, const int32_t *restrict b,
++                int32_t *restrict q) {
++    q[0] = a[0] < b[0] ? a[0] : b[0]; q[1] = a[1] < b[1] ? a[1] : b[1];
++    q[2] = a[2] < b[2] ? a[2] : b[2]; q[3] = a[3] < b[3] ? a[3] : b[3];
++}
++void v6_imin_le(const int32_t *restrict a, const int32_t *restrict b,
++                int32_t *restrict q) {
++    q[0] = a[0] <= b[0] ? a[0] : b[0]; q[1] = a[1] <= b[1] ? a[1] : b[1];
++    q[2] = a[2] <= b[2] ? a[2] : b[2]; q[3] = a[3] <= b[3] ? a[3] : b[3];
++}
++void v6_imax_gt(const int32_t *restrict a, const int32_t *restrict b,
++                int32_t *restrict q) {
++    q[0] = a[0] > b[0] ? a[0] : b[0]; q[1] = a[1] > b[1] ? a[1] : b[1];
++    q[2] = a[2] > b[2] ? a[2] : b[2]; q[3] = a[3] > b[3] ? a[3] : b[3];
++}
++void v6_imax_swapped(const int32_t *restrict a, const int32_t *restrict b,
++                     int32_t *restrict q) {
++    q[0] = a[0] <= b[0] ? b[0] : a[0]; q[1] = a[1] <= b[1] ? b[1] : a[1];
++    q[2] = a[2] <= b[2] ? b[2] : a[2]; q[3] = a[3] <= b[3] ? b[3] : a[3];
++}
++void v6_imin8_256(const int32_t *restrict a, const int32_t *restrict b,
++                  int32_t *restrict q) {
++    q[0] = a[0] < b[0] ? a[0] : b[0]; q[1] = a[1] < b[1] ? a[1] : b[1];
++    q[2] = a[2] < b[2] ? a[2] : b[2]; q[3] = a[3] < b[3] ? a[3] : b[3];
++    q[4] = a[4] < b[4] ? a[4] : b[4]; q[5] = a[5] < b[5] ? a[5] : b[5];
++    q[6] = a[6] < b[6] ? a[6] : b[6]; q[7] = a[7] < b[7] ? a[7] : b[7];
++}
++
++/* ── Section 4: the general cmp+blendv composite ────────────────────── */
++
++/* Mixed arms — NOT min/max foldable; every predicate family. */
++void v6_sel_lt(const int32_t *restrict a, const int32_t *restrict b,
++               int32_t *restrict q) {
++    q[0] = a[0] < b[0] ? 1 : -1; q[1] = a[1] < b[1] ? 1 : -1;
++    q[2] = a[2] < b[2] ? 1 : -1; q[3] = a[3] < b[3] ? 1 : -1;
++}
++void v6_sel_ult(const uint32_t *restrict a, const uint32_t *restrict b,
++                uint32_t *restrict q) {
++    q[0] = a[0] < b[0] ? 0x13579bdfu : 0x2468ace0u;
++    q[1] = a[1] < b[1] ? 0x13579bdfu : 0x2468ace0u;
++    q[2] = a[2] < b[2] ? 0x13579bdfu : 0x2468ace0u;
++    q[3] = a[3] < b[3] ? 0x13579bdfu : 0x2468ace0u;
++}
++void v6_sel_uge(const uint32_t *restrict a, const uint32_t *restrict b,
++                uint32_t *restrict q) {
++    q[0] = a[0] >= b[0] ? a[0] * 3u : b[0] + 11u;
++    q[1] = a[1] >= b[1] ? a[1] * 3u : b[1] + 11u;
++    q[2] = a[2] >= b[2] ? a[2] * 3u : b[2] + 11u;
++    q[3] = a[3] >= b[3] ? a[3] * 3u : b[3] + 11u;
++}
++void v6_sel_eq(const int32_t *restrict a, const int32_t *restrict b,
++               int32_t *restrict q) {
++    q[0] = a[0] == b[0] ? a[0] * 5 : b[0] - 7;
++    q[1] = a[1] == b[1] ? a[1] * 5 : b[1] - 7;
++    q[2] = a[2] == b[2] ? a[2] * 5 : b[2] - 7;
++    q[3] = a[3] == b[3] ? a[3] * 5 : b[3] - 7;
++}
++void v6_sel_ne(const int32_t *restrict a, const int32_t *restrict b,
++               int32_t *restrict q) {
++    q[0] = a[0] != b[0] ? a[0] ^ 9 : b[0] ^ 21;
++    q[1] = a[1] != b[1] ? a[1] ^ 9 : b[1] ^ 21;
++    q[2] = a[2] != b[2] ? a[2] ^ 9 : b[2] ^ 21;
++    q[3] = a[3] != b[3] ? a[3] ^ 9 : b[3] ^ 21;
++}
++/* FP non-strict (<=) — the shape the strict min/max fold must refuse and
++ * the blendv composite must take; NaN lanes are the whole proof. */
++void v6_fsel_le(const float *restrict a, const float *restrict b,
++                float *restrict q) {
++    q[0] = a[0] <= b[0] ? a[0] : b[0]; q[1] = a[1] <= b[1] ? a[1] : b[1];
++    q[2] = a[2] <= b[2] ? a[2] : b[2]; q[3] = a[3] <= b[3] ? a[3] : b[3];
++}
++void v6_fsel_ne(const float *restrict a, const float *restrict b,
++                float *restrict q) {
++    q[0] = a[0] != b[0] ? a[0] : b[0]; q[1] = a[1] != b[1] ? a[1] : b[1];
++    q[2] = a[2] != b[2] ? a[2] : b[2]; q[3] = a[3] != b[3] ? a[3] : b[3];
++}
++/* i16 lanes through the same composite. */
++void v6_sel_i16(const int16_t *restrict a, const int16_t *restrict b,
++                int16_t *restrict q) {
++    q[0] = a[0] < b[0] ? 3 : -3; q[1] = a[1] < b[1] ? 3 : -3;
++    q[2] = a[2] < b[2] ? 3 : -3; q[3] = a[3] < b[3] ? 3 : -3;
++    q[4] = a[4] < b[4] ? 3 : -3; q[5] = a[5] < b[5] ? 3 : -3;
++    q[6] = a[6] < b[6] ? 3 : -3; q[7] = a[7] < b[7] ? 3 : -3;
++}
++
++/* ── Section 5: rule-(b) cross-block relaxation ─────────────────────── */
++
++/* 2×i64 lanes (the I64x2 pack shape), with the in-block stores keeping
++ * the pack alive in the defining block and the successor-block arithmetic
++ * consuming the extracts — the rule-(b) relaxation shape (dominance
++ * proof: the extracts ride with the pack and dominate every use). */
++long v6_xblock(const long *restrict a, const long *restrict b, long *restrict t, int c) {
++    long x = a[0] + b[0], y = a[1] + b[1];
++    t[0] = x; t[1] = y;
++    if (c) {
++        return x * y + t[0];
++    }
++    return x - y + t[1];
++}
++/* Loop-exit consumption of scalar accumulators fed by lanes defined in a
++ * loop body — a RUNTIME-only contract (2×i32 accumulators are not a
++ * packable shape; the loop-exit values must simply be right). */
++long v6_xloop(const int32_t *restrict a, int n) {
++    int32_t s = 0, t = 0;
++    for (int i = 0; i < n; i++) {
++        int32_t u = a[0] + i, v = a[1] + i;
++        s += u; t += v;
++        if (u == 100) break;
++    }
++    return s * 1000000L + t;
++}
++
++/* ── Section 6: W5 register-homing contracts ────────────────────────── */
++
++/* The rotate diamond (multi-use load → two shifts → or): every value is
++ * register-homed — exactly two memory ops (the load and the store), no
++ * spill/reload round trips, NO stack frame at all. */
++void v6_w5_rotl256(const unsigned long long *restrict a, unsigned long long *restrict q) {
++    q[0] = (a[0] << 13) | (a[0] >> 51); q[1] = (a[1] << 13) | (a[1] >> 51);
++    q[2] = (a[2] << 13) | (a[2] >> 51); q[3] = (a[3] << 13) | (a[3] >> 51);
++}
++/* The FP-Neg 8-lane: the deferred load is register-homed — NO dead
++ * frame (the subq $56 regression shape). */
++void v6_w5_fneg8(const float *restrict a, float *restrict q) {
++    q[0] = -a[0]; q[1] = -a[1]; q[2] = -a[2]; q[3] = -a[3];
++    q[4] = -a[4]; q[5] = -a[5]; q[6] = -a[6]; q[7] = -a[7];
++}
++/* Two-stream min: the b-load is homed, the a-load folds — three
++ * instructions, no frame (the 7-insn + subq $104 regression shape). */
++void v6_w5_min(const int32_t *restrict a, const int32_t *restrict b, int32_t *restrict q) {
++    q[0] = a[0] < b[0] ? a[0] : b[0]; q[1] = a[1] < b[1] ? a[1] : b[1];
++    q[2] = a[2] < b[2] ? a[2] : b[2]; q[3] = a[3] < b[3] ? a[3] : b[3];
++}
++/* The stale-claim adversarial shape (simd_vecreg loopcarry distilled):
++ * an accumulator whose claim must NOT survive the streamed reload and
++ * the shift that redefine the scratch — the xor consumes acc and the
++ * shifted stream, never the shifted stream twice. */
++void v6_w5_stale_claim(const unsigned *restrict data, unsigned *restrict q) {
++    unsigned acc = 0;
++    for (int i = 0; i < 16; i += 4) {
++        unsigned v0 = data[i], v1 = data[i+1], v2 = data[i+2], v3 = data[i+3];
++        acc = (acc + v0) ^ (v0 >> 1);
++        acc = (acc + v1) ^ (v1 >> 1);
++        acc = (acc + v2) ^ (v2 >> 1);
++        acc = (acc + v3) ^ (v3 >> 1);
++    }
++    q[0] = acc;
++}
++
++/* ── Section 7: adversarial rejections ──────────────────────────────── */
++
++/* Non-uniform predicates across lanes: no single packed compare exists. */
++void v6_adv_mixed_pred(const int32_t *restrict a, const int32_t *restrict b,
++                       int32_t *restrict q) {
++    q[0] = a[0] < b[0] ? 1 : -1; q[1] = a[1] <= b[1] ? 1 : -1;
++    q[2] = a[2] < b[2] ? 1 : -1; q[3] = a[3] <= b[3] ? 1 : -1;
++}
++/* The comparison value has an external use: the cmp cannot die with the
++ * select (a scalar bool cannot be reconstructed from the packed mask). */
++int v6_adv_cond_ext(const int32_t *restrict a, const int32_t *restrict b,
++                    int32_t *restrict q, int *w) {
++    int c0 = a[0] < b[0], c1 = a[1] < b[1], c2 = a[2] < b[2], c3 = a[3] < b[3];
++    q[0] = c0 ? 1 : -1; q[1] = c1 ? 1 : -1; q[2] = c2 ? 1 : -1; q[3] = c3 ? 1 : -1;
++    w[0] = c0 + c1 + c2 + c3;   /* external uses of the conditions */
++    return c0;
++}
++
++int main(void) {
++    /* Section 1: memfold. */
++    {
++        const int32_t a[8] = {INT32_MIN, -1, 0, INT32_MAX, 7, -7, 123456789, -123456789};
++        int32_t q[8];
++        v6_mf_add(a, q);
++        /* INT32_MAX + 3 wraps: spelled as the defined unsigned wraparound
++         * (the battery must never hinge on signed-overflow UB — gcc and
++         * lccc agree bit-for-bit on the wrapped value). */
++        CHECK(q[0] == INT32_MIN + 3 && q[1] == 2 && q[2] == 3
++                  && q[3] == (int32_t)((uint32_t)INT32_MAX + 3u),
++              "mf_add wrap edges");
++        v6_mf_xor((const uint32_t *)a, (uint32_t *)q);
++        CHECK((uint32_t)q[0] == 0x80000000u ^ 0xdeadbeefu && (uint32_t)q[3] == 0x7fffffffu ^ 0xdeadbeefu,
++              "mf_xor");
++        v6_mf_sub(a, q);
++        CHECK(q[0] == 100 - INT32_MIN && q[3] == 100 - INT32_MAX, "mf_sub order");
++        const int32_t b[8] = {1, -1, 100, -100, 5, 6, 7, 8};
++        v6_mf_two(a, b, q);
++        /* v6_mf_two is the 4-lane fold shape: only q[0..3] are written
++         * (the 8-lane twin is checked separately below). */
++        CHECK(q[0] == INT32_MIN + 1 && q[3] == INT32_MAX - 100, "mf_two streams");
++        v6_mf_add8(a, q);
++        CHECK(q[7] == -123456789 + 7, "mf_add8 256-bit");
++    }
++    /* Section 2: FP negation — bit-exact over the hazard lanes. */
++    {
++        const float af[8] = {
++            1.5f, -2.5f, 0.0f, -0.0f,
++            __builtin_nanf("0x123"), -__builtin_nanf("0x456"),
++            __builtin_inff(), -__builtin_inff()
++        };
++        const double ad[4] = {1.5, -2.5, 0.0, -0.0};
++        const double ad2[2] = {__builtin_nan("0xabc"), -__builtin_inff()};
++        float qf[8];
++        double qd[4], qd2[2];
++        v6_neg_f32x4(af, qf);
++        for (int i = 0; i < 4; i++) { float w = -af[i]; chkf(qf[i], w, "neg_f32x4"); }
++        v6_neg_f32x8(af, qf);
++        for (int i = 0; i < 8; i++) { float w = -af[i]; chkf(qf[i], w, "neg_f32x8"); }
++        v6_neg_f64x2(ad2, qd2);
++        for (int i = 0; i < 2; i++) {
++            uint64_t g, w;
++            memcpy(&g, &qd2[i], 8);
++            double x = -ad2[i];
++            memcpy(&w, &x, 8);
++            CHECK(g == w, "neg_f64x2 bits");
++        }
++        v6_neg_f64x4(ad, qd);
++        for (int i = 0; i < 4; i++) {
++            uint64_t g, w;
++            memcpy(&g, &qd[i], 8);
++            double x = -ad[i];
++            memcpy(&w, &x, 8);
++            CHECK(g == w, "neg_f64x4 bits");
++        }
++        CHECK(bitsf(qf[2]) == 0x80000000u, "neg +0 -> -0");
++        CHECK(bitsf(qf[3]) == 0x00000000u, "neg -0 -> +0");
++        CHECK(bitsf(qf[4]) == 0xffc00123u, "neg NaN payload");
++    }
++    /* Section 3: integer min/max. */
++    {
++        const int32_t a[8] = {INT32_MIN, -1, 0, INT32_MAX, 5, -5, 0, 1};
++        const int32_t b[8] = {INT32_MAX, 1, 0, INT32_MIN, -5, 5, 1, 0};
++        int32_t q[8];
++        v6_imin_lt(a, b, q);
++        CHECK(q[0] == INT32_MIN && q[1] == -1 && q[2] == 0 && q[3] == INT32_MIN, "imin_lt edges");
++        v6_imin_le(a, b, q);
++        CHECK(q[0] == INT32_MIN && q[2] == 0 && q[3] == INT32_MIN, "imin_le equal lanes");
++        v6_imax_gt(a, b, q);
++        CHECK(q[0] == INT32_MAX && q[1] == 1 && q[2] == 0 && q[3] == INT32_MAX, "imax_gt edges");
++        v6_imax_swapped(a, b, q);
++        CHECK(q[0] == INT32_MAX && q[2] == 0 && q[3] == INT32_MAX, "imax_swapped");
++        v6_imin8_256(a, b, q);
++        CHECK(q[4] == -5 && q[5] == -5 && q[6] == 0 && q[7] == 0, "imin8 256-bit");
++    }
++    /* Section 4: cmp+blendv. */
++    {
++        const int32_t a[4] = {INT32_MIN, -1, 0, INT32_MAX};
++        const int32_t b[4] = {INT32_MAX, 1, 0, INT32_MIN};
++        const uint32_t au[4] = {0x80000000u, 1, 0xffffffffu, 0x7fffffffu};
++        const uint32_t bu[4] = {0x7fffffffu, 2, 0xfffffffeu, 0x80000000u};
++        const float af[4] = {-0.0f, __builtin_nanf("0x1"), 1.5f, __builtin_inff()};
++        const float bf[4] = {0.0f, 1.5f, __builtin_nanf("0x2"), __builtin_inff()};
++        int32_t q[4];
++        uint32_t qu[4];
++        float qf[4];
++        v6_sel_lt(a, b, q);
++        CHECK(q[0] == 1 && q[1] == 1 && q[2] == -1 && q[3] == -1, "sel_lt");
++        v6_sel_ult(au, bu, qu);
++        /* lane 0: 0x80000000 >= 0x7fffffff unsigned → FALSE arm;
++         * lane 3: 0x7fffffff < 0x80000000 → TRUE arm. */
++        CHECK(qu[0] == 0x2468ace0u && qu[1] == 0x13579bdfu && qu[2] == 0x2468ace0u &&
++                  qu[3] == 0x13579bdfu, "sel_ult");
++        v6_sel_uge(au, bu, qu);
++        /* lane 0: >= TRUE → a*3 (wraps); lane 2: 0xffffffff >= 0xfffffffe
++         * TRUE → a*3 (wraps). */
++        CHECK(qu[0] == 0x80000000u * 3u && qu[2] == 0xffffffffu * 3u, "sel_uge");
++        v6_sel_eq(a, b, q);
++        CHECK(q[0] == INT32_MAX - 7 && q[2] == 0 * 5, "sel_eq");
++        v6_sel_ne(a, b, q);
++        CHECK(q[0] == (INT32_MIN ^ 9) && q[2] == (0 ^ 21), "sel_ne");
++        v6_fsel_le(af, bf, qf);
++        for (int i = 0; i < 4; i++) chkf(qf[i], af[i] <= bf[i] ? af[i] : bf[i], "fsel_le");
++        v6_fsel_ne(af, bf, qf);
++        for (int i = 0; i < 4; i++) chkf(qf[i], af[i] != bf[i] ? af[i] : bf[i], "fsel_ne");
++        const int16_t a16[8] = {-32768, -1, 0, 1, 32767, -5, 100, -100};
++        const int16_t b16[8] = {32767, 1, 0, -1, -32768, 5, -100, 100};
++        int16_t q16[8];
++        v6_sel_i16(a16, b16, q16);
++        for (int i = 0; i < 8; i++) CHECK(q16[i] == (a16[i] < b16[i] ? 3 : -3), "sel_i16");
++    }
++    /* Section 5: cross-block. */
++    {
++        const long a[2] = {1000000000L, -2000000000L};
++        const long b[2] = {123456789L, 987654321L};
++        long t[2];
++        long x = a[0] + b[0], y = a[1] + b[1];
++        CHECK(v6_xblock(a, b, t, 1) == x * y + x, "xblock taken");
++        CHECK(t[0] == x && t[1] == y, "xblock stores");
++        CHECK(v6_xblock(a, b, t, 0) == x - y + y, "xblock fallthrough");
++        const int32_t la[2] = {10, 20};
++        CHECK(v6_xloop(la, 4) == (10 + 0 + 10 + 1 + 10 + 2 + 10 + 3) * 1000000L +
++                                     (20 + 0 + 20 + 1 + 20 + 2 + 20 + 3), "xloop");
++    }
++    /* Section 6: W5 register-homing contracts (values + the stale-claim
++     * adversarial shape — the compiler must compute the true recurrence). */
++    {
++        const unsigned long long r64[4] = {0x0123456789abcdefULL, ~0ULL, 1ULL, 0xdeadbeefcafeULL};
++        unsigned long long q64[4];
++        v6_w5_rotl256(r64, q64);
++        for (int i = 0; i < 4; i++)
++            CHECK(q64[i] == ((r64[i] << 13) | (r64[i] >> 51)), "w5 rotl256");
++        const float rf[8] = {1.5f, -2.5f, 0.0f, -0.0f,
++                             __builtin_nanf("0x51"), -__builtin_nanf("0x62"),
++                             __builtin_inff(), -__builtin_inff()};
++        float qf8[8];
++        v6_w5_fneg8(rf, qf8);
++        for (int i = 0; i < 8; i++) {
++            float w = -rf[i];
++            chkf(qf8[i], w, "w5 fneg8");
++        }
++        const int32_t ra[4] = {INT32_MIN, -1, 0, INT32_MAX};
++        const int32_t rb[4] = {INT32_MAX, 1, 0, INT32_MIN};
++        int32_t qi4[4];
++        v6_w5_min(ra, rb, qi4);
++        for (int i = 0; i < 4; i++)
++            CHECK(qi4[i] == (ra[i] < rb[i] ? ra[i] : rb[i]), "w5 min");
++        const unsigned sd[16] = {1, 2, 3, 4, 0x80000000u, 0x7fffffffu, 0, ~0u,
++                                 0xdeadbeefu, 0x13579bdfu, 255, 256, 65535, 65536, 7, 0x0f0f0f0fu};
++        unsigned sq[1];
++        v6_w5_stale_claim(sd, sq);
++        {
++            unsigned acc = 0, ref = 0;
++            for (int i = 0; i < 16; i += 4) {
++                unsigned v0 = sd[i], v1 = sd[i+1], v2 = sd[i+2], v3 = sd[i+3];
++                acc = (acc + v0) ^ (v0 >> 1);
++                acc = (acc + v1) ^ (v1 >> 1);
++                acc = (acc + v2) ^ (v2 >> 1);
++                acc = (acc + v3) ^ (v3 >> 1);
++            }
++            ref = acc;
++            CHECK(sq[0] == ref, "w5 stale-claim recurrence");
++        }
++    }
++    /* Section 7: adversarial — correct results, whatever the lowering. */
++    {
++        const int32_t a[4] = {1, 2, 3, 4};
++        const int32_t b[4] = {2, 2, 2, 2};
++        int32_t q[4];
++        v6_adv_mixed_pred(a, b, q);
++        CHECK(q[0] == 1 && q[1] == 1 && q[2] == -1 && q[3] == -1, "adv mixed preds");
++        int w[1];
++        int r = v6_adv_cond_ext(a, b, q, w);
++        CHECK(q[0] == 1 && q[1] == -1 && q[2] == -1 && q[3] == -1 && w[0] == 1 && r == 1,
++              "adv cond external");
++    }
++    if (fails == 0) {
++        printf("bb_slp_v6: all pass (0 fails)\n");
++    }
++    return fails;
++}
 diff --git a/tests/regression/check_bb_slp_codegen.sh b/tests/regression/check_bb_slp_codegen.sh
-index ad71597..27b3b3b 100755
+index ad71597..61fd124 100755
 --- a/tests/regression/check_bb_slp_codegen.sh
 +++ b/tests/regression/check_bb_slp_codegen.sh
-@@ -67,10 +67,13 @@ if [ "$n_vec_nr" -gt 0 ]; then
+@@ -15,8 +15,12 @@
+ #      is I16x16 / I8x32 for the leading 16/32 lanes (one 256-bit op,
+ #      strictly better than the two 128-bit seeds the pre-v3 fallback
+ #      produced) — not be dropped.
+-#   6. rt_phi must contain no vector store: cross-block phi uses reject.
+-#      rt_w16_norestr (no restrict) must also stay scalar: rule (e)'s
++#   6. rt_phi stays scalar (two distinct runtime addends make the 2-lane
++#      gather cost-ineffective — the legitimate cost-model answer);
++#      rt_xblock (TRUE cross-block uses in dominated successor blocks,
++#      v6 rule-(b) relaxation) MUST vectorize — the extracts dominate
++#      every external use and the runtime battery verified the values.
++#      rt_w16_norestr (no restrict) must stay scalar: rule (e)'s
+ #      cross-stream hazard check — the shape GCC miscompiles under a
+ #      shifted alias.
+ set -euo pipefail
+@@ -54,9 +58,19 @@ if [ "$n_vec_fwd" -gt 0 ]; then
+     exit 1
+ fi
+ 
++# rt_phi: stays scalar — the two distinct runtime addends (w, x) make
++# the 2-lane gather cost-ineffective; the legitimate cost-model answer.
+ n_vec_phi=$(scoped rt_phi | grep -cE "vmovdqu|movdqu" || true)
+ if [ "$n_vec_phi" -gt 0 ]; then
+-    echo "FAIL: rt_phi vectorized despite cross-block phi lane uses ($n_vec_phi vector stores)"
++    echo "FAIL: rt_phi vectorized through the gather (cost model regressed: $n_vec_phi)"
++    exit 1
++fi
++
++# rt_xblock: TRUE cross-block lane uses (v6 rule-(b) relaxation) — the
++# packed add plus the vector load/store pair that service the shape.
++n_vec_xb=$(scoped rt_xblock | grep -cE "vpaddq|vmovdqu|movdqu" || true)
++if [ "$n_vec_xb" -lt 3 ]; then
++    echo "FAIL: rt_xblock did not vectorize (rule (b) over-rejects: $n_vec_xb vector ops)"
+     exit 1
+ fi
+ 
+@@ -67,10 +81,13 @@ if [ "$n_vec_nr" -gt 0 ]; then
  fi
  
  if [ -n "$march" ]; then
@@ -1120,3 +4412,314 @@ index ad71597..27b3b3b 100755
          exit 1
      fi
      n_w16=$(scoped rt_w16 | grep -cE "paddw|vpaddw" || true)
+diff --git a/tests/regression/check_bb_slp_v6_codegen.sh b/tests/regression/check_bb_slp_v6_codegen.sh
+new file mode 100755
+index 0000000..f33b409
+--- /dev/null
++++ b/tests/regression/check_bb_slp_v6_codegen.sh
+@@ -0,0 +1,161 @@
++#!/usr/bin/env bash
++# BB-SLP v6 gate: the 128-bit VEX memory fold, FP negation (one-instruction
++# sign-mask composite), integer min/max folds, the general cmp+blendv
++# composite, and the rule-(b) cross-block relaxation.
++#
++#   1. The battery must compile at -O2 -march=x86-64-v3 and run clean
++#      (unconditionally — the runtime is ISA-agnostic by design).
++#   2. Memfold: the streamed 128-bit loads fold into their consumers —
++#      `vpaddd (%rdi), %xmmK, %xmmD`-class single-op bodies (no separate
++#      `vmovdqu load` instruction between the constant materialization and
++#      the packed op).
++#   3. FP Negation: ONE `vxorps/vxorpd` per pack with the .rodata sign
++#      mask as a memory operand (`.LCVEC_`), the exact GCC spelling.
++#   4. Integer min/max: `vpminsd/vpmaxsd` (the 128-bit dword pair) and
++#      `vpminsd`-class 256-bit forms — no scalar cmov chains left.
++#   5. cmp+blendv: `vpcmpgtd/vpcmpeqd` + `vblendvps` pairs (the 128-bit
++#      AVX2 fast path) or the exact pand/pandn/por select — never scalar.
++#   6. Cross-block: `vpaddq`-class packed ops with the extracts servicing
++#      the successor-block uses.
++#   7. The adversarial shapes (mixed per-lane predicates, externally-used
++#      conditions) compute the right VALUES; their lowering is unchecked
++#      (rejection is legal, miscompilation is not — the runtime catches
++#      that).
++set -euo pipefail
++cd "$(dirname "$0")/../.."
++ccc=${LCCC_BIN:-${CCC:-target/fastbuild/lccc}}
++src=tests/regression/bb_slp_v6.c
++td=$(mktemp -d)
++trap 'rm -rf "$td"' EXIT
++
++march=$("$ccc" -march=x86-64-v3 -E -x c /dev/null -o /dev/null 2>/dev/null \
++    && echo "-march=x86-64-v3" || echo "")
++
++# ── 1. runtime ──────────────────────────────────────────────────────────
++"$ccc" -O2 $march "$src" -o "$td/rt"
++out=$("$td/rt")
++if [ "$out" != "bb_slp_v6: all pass (0 fails)" ]; then
++    echo "FAIL: bb_slp_v6 runtime output: $out"
++    exit 1
++fi
++
++if [ -z "$march" ]; then
++    echo "OK: bb_slp_v6 runtime contracts (no x86-64-v3 on this target; asm section skipped)"
++    exit 0
++fi
++
++# ── 2–6. codegen contracts ─────────────────────────────────────────────
++"$ccc" -O2 $march -S "$src" -o "$td/v6.s"
++
++scoped() {  # scoped <func> — the function's asm slice (label to next fn)
++    awk -v f="$1" '
++        $0 ~ "^"f":" { infn = 1; next }
++        infn && /^[a-zA-Z_][a-zA-Z0-9_]*:/ { exit }
++        infn { print }
++    ' "$td/v6.s"
++}
++
++# 2. memfold: the packed consumer reads (%rdi) directly — count folded
++# ops; a non-folded body pays a separate vector load. The load detector
++# matches only LOAD-form movdqu/vmovdqu (memory source: the operand after
++# the mnemonic is not a %register) — the trailing result STORE
++# (`movdqu %xmmN, (%rsi)`) is not a load.
++n_mf=$(scoped v6_mf_add | grep -cE "vpaddd|vmovdqu|movdqu" || true)
++n_mf_load=$(scoped v6_mf_add | grep -cE "[vm]*movdqu [^%]" || true)
++if [ "$n_mf" -lt 1 ] || [ "$n_mf_load" -ne 0 ]; then
++    echo "FAIL: v6_mf_add not folded ($n_mf ops, $n_mf_load loads)"
++    exit 1
++fi
++n_mf2=$(scoped v6_mf_xor | grep -cE "vpxor" || true)
++if [ "$n_mf2" -lt 1 ]; then
++    echo "FAIL: v6_mf_xor not packed"
++    exit 1
++fi
++
++# 3. FP negation: the .LCVEC sign-mask memory operand.
++n_neg=$(scoped v6_neg_f32x4 | grep -cE "vxorps.*\.LCVEC" || true)
++if [ "$n_neg" -lt 1 ]; then
++    echo "FAIL: v6_neg_f32x4 not the one-instruction sign-mask form"
++    exit 1
++fi
++n_neg8=$(scoped v6_neg_f32x8 | grep -cE "vxorps.*\.LCVEC" || true)
++if [ "$n_neg8" -lt 1 ]; then
++    echo "FAIL: v6_neg_f32x8 not the one-instruction sign-mask form"
++    exit 1
++fi
++n_negd=$(scoped v6_neg_f64x2 | grep -cE "vxorpd.*\.LCVEC" || true)
++if [ "$n_negd" -lt 1 ]; then
++    echo "FAIL: v6_neg_f64x2 not the one-instruction sign-mask form"
++    exit 1
++fi
++grep -q "\.LCVEC_" "$td/v6.s" && grep -A2 "\.LCVEC_.*:" "$td/v6.s" | grep -q "\.quad" || {
++    echo "FAIL: the vector const pool entry is missing/malformed"
++    exit 1
++}
++
++# 4. integer min/max: pminsd/pmaxsd (128) and the 256-bit vpminsd.
++n_imm=$(scoped v6_imin_lt | grep -cE "pminsd|vpminsd" || true)
++if [ "$n_imm" -lt 1 ]; then
++    echo "FAIL: v6_imin_lt not pminsd"
++    exit 1
++fi
++n_imx=$(scoped v6_imax_gt | grep -cE "pmaxsd|vpmaxsd" || true)
++if [ "$n_imx" -lt 1 ]; then
++    echo "FAIL: v6_imax_gt not pmaxsd"
++    exit 1
++fi
++n_im8=$(scoped v6_imin8_256 | grep -cE "vpminsd" || true)
++if [ "$n_im8" -lt 1 ]; then
++    echo "FAIL: v6_imin8_256 not vpminsd"
++    exit 1
++fi
++
++# 5. cmp+blendv: the packed compare + vblendvps pair (AVX2 fast path) or
++# the exact bitwise select; never a scalar cmov chain.
++n_cb=$(scoped v6_sel_lt | grep -cE "vpcmpgtd|vpcmpeqd|pcmpgtd|pcmpeqd" || true)
++n_bl=$(scoped v6_sel_lt | grep -cE "vblendvps|pand" || true)
++if [ "$n_cb" -lt 1 ] || [ "$n_bl" -lt 1 ]; then
++    echo "FAIL: v6_sel_lt not cmp+blend ($n_cb compares, $n_bl selects)"
++    exit 1
++fi
++n_fs=$(scoped v6_fsel_le | grep -cE "cmpps|vcmpps" || true)
++if [ "$n_fs" -lt 1 ]; then
++    echo "FAIL: v6_fsel_le not a packed FP compare"
++    exit 1
++fi
++
++# 6. cross-block: the packed add services the successor-block uses.
++n_xb=$(scoped v6_xblock | grep -cE "vpaddd|vpaddq|vmovdqu|movdqu" || true)
++if [ "$n_xb" -lt 2 ]; then
++    echo "FAIL: v6_xblock did not vectorize ($n_xb vector ops)"
++    exit 1
++fi
++
++# 7. W5 register-homing contracts:
++#    rotl256 — the rotate diamond fully register-homed: exactly ONE
++#    load-form movdqu and NO stack frame (subq) in the body.
++n_r=$(scoped v6_w5_rotl256 | grep -cE "vpsllq|vpsrlq|vpor|por" || true)
++n_r_ld=$(scoped v6_w5_rotl256 | grep -cE "[vm]*movdq[ua]* [^%]" || true)
++n_r_fr=$(scoped v6_w5_rotl256 | grep -cE "subq .*%rsp|push" || true)
++if [ "$n_r" -lt 3 ] || [ "$n_r_ld" -ne 1 ] || [ "$n_r_fr" -ne 0 ]; then
++    echo "FAIL: v6_w5_rotl256 not the homed diamond ($n_r ops, $n_r_ld loads, $n_r_fr frame)"
++    exit 1
++fi
++#    fneg8 — the sign-mask form with NO stack frame (the dead subq $56).
++n_f8=$(scoped v6_w5_fneg8 | grep -cE "vxorps.*\.LCVEC" || true)
++n_f8_fr=$(scoped v6_w5_fneg8 | grep -cE "subq .*%rsp" || true)
++if [ "$n_f8" -lt 1 ] || [ "$n_f8_fr" -ne 0 ]; then
++    echo "FAIL: v6_w5_fneg8 frame or shape regressed ($n_f8 sign-mask ops, $n_f8_fr frames)"
++    exit 1
++fi
++#    min — the homed/folded two-stream min: exactly one load-form
++#    movdqu (the b-stream), no frame.
++n_m=$(scoped v6_w5_min | grep -cE "pminsd|vpminsd" || true)
++n_m_ld=$(scoped v6_w5_min | grep -cE "[vm]*movdq[ua]* [^%]" || true)
++n_m_fr=$(scoped v6_w5_min | grep -cE "subq .*%rsp" || true)
++if [ "$n_m" -lt 1 ] || [ "$n_m_ld" -ne 1 ] || [ "$n_m_fr" -ne 0 ]; then
++    echo "FAIL: v6_w5_min not the 3-insn homed shape ($n_m mins, $n_m_ld loads, $n_m_fr frames)"
++    exit 1
++fi
++
++echo "OK: bb_slp_v6 contracts (memfold, fp-neg sign-mask, int min/max, cmp+blendv, cross-block, w5 homing)"
+diff --git a/tests/regression/check_gla_backedge_no_trampoline.sh b/tests/regression/check_gla_backedge_no_trampoline.sh
+index 4c40d89..2638fdd 100755
+--- a/tests/regression/check_gla_backedge_no_trampoline.sh
++++ b/tests/regression/check_gla_backedge_no_trampoline.sh
+@@ -15,6 +15,17 @@
+ # trampoline shape is unreachable (phi-feeding weight >= 10 > weight cap,
+ # plus the one-live-segment cap); see engineering/DECISIONS.md RA-GLA-03.
+ set -euo pipefail
++
++# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
++# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
++# (container sandboxes without root) cannot run them at all, and a hard
++# failure there reports the ENVIRONMENT, not the code.
++i386_headers_ok() {
++    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
++        echo "SKIP: i686 leg ($1) - no i386 libc headers on this host (CI installs gcc-multilib)"
++        return 1
++    fi
++}
+ repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+ dir=$repo/tests/regression
+ src=$dir/gla_backedge_no_trampoline.c
+@@ -62,7 +73,7 @@ if [ -x "$rv" ] && command -v riscv64-linux-gnu-gcc >/dev/null 2>&1; then
+   assert_zero_trampolines "riscv64" "$rv" \
+     "$(riscv64-linux-gnu-gcc -print-file-name=include)" -O1
+ fi
+-if [ -x "$m32" ]; then
++if [ -x "$m32" ] && i386_headers_ok "$m32"; then
+   assert_zero_trampolines "i686" "$m32" "" -O1
+ fi
+ 
+diff --git a/tests/regression/check_gla_remat_policy.sh b/tests/regression/check_gla_remat_policy.sh
+index 44860d6..db8ba9f 100644
+--- a/tests/regression/check_gla_remat_policy.sh
++++ b/tests/regression/check_gla_remat_policy.sh
+@@ -24,6 +24,17 @@
+ # open-policy one produces output byte-identical to gate-off.
+ set -eu
+ 
++# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
++# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
++# (container sandboxes without root) cannot run them at all, and a hard
++# failure there reports the ENVIRONMENT, not the code.
++i386_headers_ok() {
++    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
++        echo "SKIP: i686 leg ($1) - no i386 libc headers on this host (CI installs gcc-multilib)"
++        return 1
++    fi
++}
++
+ CCC=${CCC:-./target/fastbuild/lccc}
+ [ -x "$CCC" ] || { >&2 echo "SKIP: $CCC not built"; exit 1; }
+ # Canonicalize the compiler path while the caller's cwd is still ours; CI
+@@ -91,7 +102,7 @@ must_not_grep '\[GLA\] main applied:' "$tmp/os.log" "-Os edited nbody"
+ #     from an induction counter (measured loop_patterns 1.05x regression
+ #     at the old band 6). The i686 driver is the argv0-selected bin. --------
+ CCC686="$dir/../../target/fastbuild/lccc-i686"
+-if [ -x "$CCC686" ]; then
++if [ -x "$CCC686" ] && i386_headers_ok "$CCC686"; then
+   CCC_RA_GLOBAL_LOCATION=1 CCC_DEBUG_SPLIT=1 CCC_GLA_TRACE=1 \
+     "$CCC686" -O2 -S -o "$tmp/m32.s" "$src" 2>"$tmp/m32.log"
+   must_not_grep '\[GLA\] main applied:' "$tmp/m32.log" "i686 policy edited nbody"
+diff --git a/tests/regression/check_i686_tls_ie_relax.sh b/tests/regression/check_i686_tls_ie_relax.sh
+index baaf757..4adff5e 100644
+--- a/tests/regression/check_i686_tls_ie_relax.sh
++++ b/tests/regression/check_i686_tls_ie_relax.sh
+@@ -26,6 +26,15 @@ ccc=${LCCC_BIN:-target/fastbuild/lccc}
+ td=$(mktemp -d)
+ trap 'rm -rf "$td"' EXIT
+ 
++# The i386 multilib probe: CI installs gcc-multilib + libc6-dev-i386 and
++# runs this gate for real; a headerless host (container sandboxes without
++# root) cannot compile even `#include <stdio.h>` at -m32, and a hard
++# failure there reports the ENVIRONMENT, not the code. Skip loudly.
++if ! printf '#include <stdio.h>\n' | "$ccc" -m32 -x c - -fsyntax-only >/dev/null 2>&1; then
++    echo "SKIP: i686-tls-ie-relax - no i386 libc headers on this host (CI installs gcc-multilib)"
++    exit 0
++fi
++
+ cat >"$td/tls.c" <<'CEOF'
+ #include <stdio.h>
+ static __thread int le_var = 5;   /* local, offset 0 in the block */
+diff --git a/tests/regression/check_phi_acyclic_order.sh b/tests/regression/check_phi_acyclic_order.sh
+index 6e7633b..6cdecce 100755
+--- a/tests/regression/check_phi_acyclic_order.sh
++++ b/tests/regression/check_phi_acyclic_order.sh
+@@ -39,6 +39,17 @@
+ # ============================================================================
+ set -euo pipefail
+ 
++# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
++# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
++# (container sandboxes without root) cannot run them at all, and a hard
++# failure there reports the ENVIRONMENT, not the code.
++i386_headers_ok() {
++    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
++        echo "SKIP: i686 leg ($1) — no i386 libc headers on this host (CI installs gcc-multilib)"
++        return 1
++    fi
++}
++
+ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ CCC=${CCC:-$here/../../target/fastbuild/lccc}
+ GCC=${GCC:-gcc}
+@@ -243,7 +254,7 @@ CCC32=""
+ for c in "$(dirname "$CCC")/lccc-i686" target/fastbuild/lccc-i686 target/release/lccc-i686; do
+   [[ -x $c ]] && CCC32=$c && break
+ done
+-if [[ -n $CCC32 ]]; then
++if [[ -n $CCC32 ]] && i386_headers_ok "$CCC32"; then
+   echo "check_phi_acyclic_order: i686 target-aware default"
+   "$CCC32" -O2 -S -o "$work/m32_def.s" "$here/../benchmark/programs/sha256_transform.c"
+   CCC_PHI_ACYCLIC_ORDER=0 "$CCC32" -O2 -S -o "$work/m32_k.s" "$here/../benchmark/programs/sha256_transform.c"
+diff --git a/tests/regression/check_tight_loop_align.sh b/tests/regression/check_tight_loop_align.sh
+index 74b727a..68add5d 100755
+--- a/tests/regression/check_tight_loop_align.sh
++++ b/tests/regression/check_tight_loop_align.sh
+@@ -26,6 +26,17 @@
+ #   8. i686  — the cross compiler runs the same two-layer decision.
+ set -euo pipefail
+ 
++# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
++# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
++# (container sandboxes without root) cannot run them at all, and a hard
++# failure there reports the ENVIRONMENT, not the code.
++i386_headers_ok() {
++    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
++        echo "SKIP: i686 leg ($1) — no i386 libc headers on this host (CI installs gcc-multilib)"
++        return 1
++    fi
++}
++
+ CCC=${CCC:-./target/fastbuild/lccc}
+ CCC32=${CCC32:-./target/fastbuild/lccc-i686}
+ td=$(mktemp -d)
+@@ -188,7 +199,7 @@ printf '.text\n.globl fg\nfg:\n.lccc_tight_loop .Lx\n.Lx:\nret\n' >"$td/ok.s"
+ "$CCC" -c "$td/ok.s" -o "$td/ok.o" || bad "well-formed .lccc_tight_loop failed to assemble"
+ 
+ # ── 8. i686 cross compiler: same two-layer decision ──
+-if [ -x "$CCC32" ]; then
++if [ -x "$CCC32" ] && i386_headers_ok "$CCC32"; then
+     dump=$({ CCC_DUMP_ALIGN=1 CCC_DEBUG_TIGHT=1 "$CCC32" -O2 -c "$td/good.c" -o "$td/good32.o"; } 2>&1)
+     echo "$dump" | grep -q "func=good .*tight=yes" || bad "i686: structural audit did not accept"
+     echo "$dump" | grep -q "\[TIGHT\].*align=" || bad "i686: assembler did not resolve a bucket"
