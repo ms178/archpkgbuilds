@@ -1,57 +1,96 @@
-diff --git a/include/mimalloc/bits.h b/include/mimalloc/bits.h
-index f2c6f3f..f1da20e 100644
---- a/include/mimalloc/bits.h
-+++ b/include/mimalloc/bits.h
-@@ -290,7 +290,11 @@ static inline bool mi_bsf(size_t x, size_t* idx) {
- // return false if `x==0` (with `*idx` undefined) and true otherwise,
- // with the `idx` is set to the bit index (`0 <= *idx < MI_BFIELD_BITS`).
- static inline bool mi_bsr(size_t x, size_t* idx) {
--  #if 0 && defined(_MSC_VER) && (MI_ARCH_X64 || MI_ARCH_X86 || MI_ARCH_ARM64 || MI_ARCH_ARM32)
-+  #if defined(__GNUC__) && MI_ARCH_X64
-+    if (x == 0) return false;
-+    *idx = (size_t)(MI_SIZE_BITS - 1 - __builtin_clzll(x));
-+    return true;
-+  #elif 0 && defined(_MSC_VER) && (MI_ARCH_X64 || MI_ARCH_X86 || MI_ARCH_ARM64 || MI_ARCH_ARM32)
-     unsigned long i;
-     return (mi_msc_builtinz(_BitScanReverse)(&i, x) ? (*idx = (size_t)i, true) : false);
-   #else
-diff --git a/include/mimalloc/internal.h b/include/mimalloc/internal.h
-index 0db1849..b1d0c6b 100644
---- a/include/mimalloc/internal.h
-+++ b/include/mimalloc/internal.h
-@@ -551,7 +551,7 @@ static inline bool mi_mem_is_zero(const void* p, size_t size) {
- // i.e. byte size == `wsize*sizeof(void*)`.
- static inline size_t _mi_wsize_from_size(size_t size) {
-   mi_assert_internal(size <= SIZE_MAX - sizeof(uintptr_t));
--  return (size + sizeof(uintptr_t) - 1) / sizeof(uintptr_t);
-+  return (size + sizeof(uintptr_t) - 1) >> MI_INTPTR_SHIFT;
- }
- 
- // Overflow detecting multiply
 diff --git a/src/alloc-aligned.c b/src/alloc-aligned.c
-index 9b572e9..40e30a0 100644
+index 3a4383e0..221ef26c 100644
 --- a/src/alloc-aligned.c
 +++ b/src/alloc-aligned.c
-@@ -217,7 +217,7 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
-   if mi_likely(theap!=NULL)
-   #endif
+@@ -5,12 +5,38 @@ terms of the MIT license. A copy of the license can be found in the file
+ "LICENSE" at the root of this distribution.
+ -----------------------------------------------------------------------------*/
+ 
++#if defined(__GNUC__) || defined(__clang__)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wundef"
++#pragma GCC diagnostic ignored "-Wsign-conversion"
++#endif
++#if defined(__clang__)
++#pragma GCC diagnostic ignored "-Wstatic-in-inline"   // clang-only warning name
++#endif
+ #include "mimalloc.h"
+ #include "mimalloc/internal.h"
+ #include "mimalloc/prim-tls.h"  // _mi_theap_default
++#if defined(__GNUC__) || defined(__clang__)
++#pragma GCC diagnostic pop
++#endif
+ 
+ #include <string.h>     // memset
+ 
++// ensure conditionally defined configuration macros have a value in this compilation unit
++// (defined *after* all mimalloc headers so header derivations are not disturbed; silences -Wundef on body-level use)
++#ifndef MI_THEAP_INITASNULL
++#define MI_THEAP_INITASNULL 0
++#endif
++#ifndef MI_GUARDED
++#define MI_GUARDED 0
++#endif
++#ifndef MI_PROFILE
++#define MI_PROFILE 0
++#endif
++#ifndef MI_SAMPLE
++#define MI_SAMPLE 0
++#endif
++
+ // ------------------------------------------------------
+ // Aligned Allocation
+ // ------------------------------------------------------
+@@ -208,7 +234,10 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
+   // try first if there happens to be a small block available with just the right alignment
+   // since most small power-of-2 blocks (under MI_PAGE_MAX_BLOCK_START_ALIGN2) are already
+   // naturally aligned this can be often the case.
+-  if mi_likely(size <= MI_SMALL_SIZE_MAX && alignment <= size)
++  // note: we also handle the case where the alignment is at most MI_MAX_ALIGN_SIZE but larger
++  // than the size specially (see below) by allocating from the size class of the alignment
++  // itself to avoid the over-allocation fallback.
++  if mi_likely(size <= MI_SMALL_SIZE_MAX && (alignment <= size || alignment <= MI_MAX_ALIGN_SIZE))
    {
--    if mi_likely(size <= MI_SMALL_SIZE_MAX && alignment <= size) {
-+    if mi_likely(size <= MI_SMALL_SIZE_MAX && (alignment <= size || alignment <= MI_MAX_ALIGN_SIZE)) {
-       const uintptr_t align_mask = alignment-1;       // for any x, `(x & align_mask) == (x % alignment)`
-       const size_t padsize = size + MI_PADDING_SIZE;
-       mi_page_t* page = _mi_theap_get_free_small_page(theap, padsize);
+     #if MI_THEAP_INITASNULL
+     if mi_likely(theap!=NULL)
+@@ -220,6 +249,33 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
+       {
+         const uintptr_t align_mask = alignment-1;       // for any x, `(x & align_mask) == (x % alignment)`
+         const size_t padsize = size + MI_PADDING_SIZE;
++        if mi_unlikely(alignment > padsize && offset == 0) {
++          // `size < alignment <= MI_MAX_ALIGN_SIZE`: allocate directly from the size class of
++          // `alignment` instead of the over-allocation fallback. Such a class is exactly
++          // `alignment` sized (a small power-of-two class) and page block areas start at least
++          // MI_MAX_ALIGN_SIZE aligned, so all its blocks are naturally aligned -- the same
++          // guarantee `mi_malloc_is_naturally_aligned` relies on in the generic path.
++          // This avoids `alignment-1` bytes of extra internal fragmentation and the slower
++          // over-allocation + interior-pointer bookkeeping for e.g. `aligned_alloc(16,8)`.
++          mi_assert_internal(alignment <= MI_MAX_ALIGN_SIZE);
++          mi_page_t* page = NULL;
++          void* p = mi_theap_malloc_zero_no_guarded(theap, alignment, zero, &page);
++          if mi_likely((((uintptr_t)p) & align_mask) == 0) {
++            if (ppage != NULL) { *ppage = page; }
++            if (p != NULL) {
++              // re-track with the requested size (the block was tracked internally as `alignment`)
++              mi_track_free_size(p, alignment);
++              mi_track_malloc(p, size, zero);
++            }
++            return p;
++          }
++          else {
++            // this should never happen since blocks of the `alignment` class are naturally aligned..
++            // (guarded or sampled blocks could deviate, in which case we free and use the generic fallback)
++            mi_assert_internal(false);
++            mi_free(p);
++          }
++        }
+         mi_page_t* page = _mi_theap_get_free_small_page(theap, padsize, false);
+         if mi_likely(page->free != NULL) {
+           const bool is_aligned = (((uintptr_t)page->free + offset) & align_mask)==0;
 diff --git a/src/alloc-posix.c b/src/alloc-posix.c
-index c7d6e3b..345e714 100644
+index a2252494..a39286a2 100644
 --- a/src/alloc-posix.c
 +++ b/src/alloc-posix.c
-@@ -1,5 +1,5 @@
- /* ----------------------------------------------------------------------------
--Copyright (c) 2018-2021, Microsoft Research, Daan Leijen
-+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
- This is free software; you can redistribute it and/or modify it under the
- terms of the MIT license. A copy of the license can be found in the file
- "LICENSE" at the root of this distribution.
 @@ -9,16 +9,27 @@ terms of the MIT license. A copy of the license can be found in the file
  // mi prefixed publi definitions of various Posix, Unix, and C++ functions
  // for convenience and used when overriding these functions.
@@ -81,7 +120,7 @@ index c7d6e3b..345e714 100644
  
  #ifdef _MSC_VER
  #pragma warning(disable:4996)  // getenv _wgetenv
-@@ -46,8 +57,8 @@ int mi_posix_memalign(void** p, size_t alignment, size_t size) {  // mi_attr_noe
+@@ -40,8 +51,8 @@ int mi_posix_memalign(void** p, size_t alignment, size_t size) {  // mi_attr_noe
    // <http://man7.org/linux/man-pages/man3/posix_memalign.3.html>
    if (p == NULL) return EINVAL;
    // it is required that alignment is a power of 2 and a multiple of sizeof(void*)
@@ -92,7 +131,7 @@ index c7d6e3b..345e714 100644
    if (q==NULL && size != 0) return ENOMEM;
    mi_assert_internal(_mi_is_aligned(q,alignment));
    *p = q;
-@@ -102,24 +113,27 @@ mi_decl_nodiscard int mi_reallocarr( void* ptrp, size_t count, size_t size ) mi_
+@@ -96,24 +107,27 @@ mi_decl_nodiscard int mi_reallocarr( void* ptrp, size_t count, size_t size ) mi_
    mi_assert(size != 0);
    mi_assert(ptrp != NULL);
    if (ptrp == NULL || size == 0) {
@@ -129,7 +168,7 @@ index c7d6e3b..345e714 100644
  }
  
  void* mi__expand(void* p, size_t newsize) mi_attr_noexcept {  // Microsoft
-@@ -130,13 +144,18 @@ void* mi__expand(void* p, size_t newsize) mi_attr_noexcept {  // Microsoft
+@@ -124,13 +138,18 @@ void* mi__expand(void* p, size_t newsize) mi_attr_noexcept {  // Microsoft
  
  mi_decl_nodiscard mi_decl_restrict wchar_t* mi_wcsdup(const wchar_t* s) mi_attr_noexcept {
    if (s==NULL) return NULL;
@@ -154,7 +193,7 @@ index c7d6e3b..345e714 100644
    }
    return p;
  }
-@@ -148,15 +167,15 @@ mi_decl_nodiscard mi_decl_restrict unsigned char* mi_mbsdup(const unsigned char*
+@@ -142,15 +161,15 @@ mi_decl_nodiscard mi_decl_restrict unsigned char* mi_mbsdup(const unsigned char*
  int mi_dupenv_s(char** buf, size_t* size, const char* name) mi_attr_noexcept {
    if (size != NULL) *size = 0;
    if (buf==NULL || name==NULL) return EINVAL;
@@ -176,7 +215,7 @@ index c7d6e3b..345e714 100644
    return 0;
  }
  
-@@ -168,15 +187,15 @@ int mi_wdupenv_s(wchar_t** buf, size_t* size, const wchar_t* name) mi_attr_noexc
+@@ -162,15 +181,15 @@ int mi_wdupenv_s(wchar_t** buf, size_t* size, const wchar_t* name) mi_attr_noexc
    *buf = NULL;
    return EINVAL;
  #else
@@ -199,13 +238,19 @@ index c7d6e3b..345e714 100644
  #endif
  }
 diff --git a/src/alloc.c b/src/alloc.c
-index b3b1860..7a72764 100644
+index ded0a00c..8be005bf 100644
 --- a/src/alloc.c
 +++ b/src/alloc.c
-@@ -9,14 +9,46 @@ terms of the MIT license. A copy of the license can be found in the file
+@@ -9,14 +9,82 @@ terms of the MIT license. A copy of the license can be found in the file
  #define _DEFAULT_SOURCE   // for realpath() on Linux
  #endif
  
++#if defined(__clang__)
++// mimalloc intentionally uses `extern inline` API wrappers that call static helper
++// functions (legal in C23; see -Wstatic-in-inline), so suppress this for the whole TU.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wstatic-in-inline"
++#endif
 +#if defined(__GNUC__) || defined(__clang__)
 +#pragma GCC diagnostic push
 +#pragma GCC diagnostic ignored "-Wundef"
@@ -213,11 +258,28 @@ index b3b1860..7a72764 100644
 +#endif
  #include "mimalloc.h"
  #include "mimalloc/internal.h"
+ #include "mimalloc/atomic.h"
+ #include "mimalloc/prim-tls.h"   // _mi_prim_thread_id()
++#if defined(__GNUC__) || defined(__clang__)
++#pragma GCC diagnostic pop
++#endif
+ 
+ #include <string.h>      // memset, strlen (for mi_strdup)
+ #include <stdlib.h>      // malloc, abort
+ 
++// ensure conditionally defined configuration macros have a value in this compilation unit
++// (defined *after* all mimalloc headers so header derivations are not disturbed; silences -Wundef on body-level use)
 +#ifndef MI_TSAN
 +#define MI_TSAN 0
 +#endif
 +#ifndef MI_THEAP_INITASNULL
 +#define MI_THEAP_INITASNULL 0
++#endif
++#ifndef MI_TLS_MODEL_PTHREADS
++#define MI_TLS_MODEL_PTHREADS 0
++#endif
++#ifndef MI_NO_THREAD_POINTER
++#define MI_NO_THREAD_POINTER 0
 +#endif
 +#ifndef MI_GUARDED
 +#define MI_GUARDED 0
@@ -231,15 +293,28 @@ index b3b1860..7a72764 100644
 +#ifndef MI_HUGE_PAGE_ABANDON
 +#define MI_HUGE_PAGE_ABANDON 0
 +#endif
- #include "mimalloc/atomic.h"
- #include "mimalloc/prim-tls.h"   // _mi_prim_thread_id()
-+#if defined(__GNUC__) || defined(__clang__)
-+#pragma GCC diagnostic pop
++#ifndef MI_CHECK_DOUBLE_FREE
++#define MI_CHECK_DOUBLE_FREE 0
 +#endif
- 
- #include <string.h>      // memset, strlen (for mi_strdup)
- #include <stdlib.h>      // malloc, abort
- 
++#ifndef MI_OPT_FREE_SMALL
++#define MI_OPT_FREE_SMALL 0
++#endif
++#ifndef MI_FREE_IS_CHECKED
++#define MI_FREE_IS_CHECKED 0
++#endif
++#ifndef MI_FREE_USE_PAGEMAP
++#define MI_FREE_USE_PAGEMAP 0
++#endif
++#ifndef MI_TRACK_ASAN
++#define MI_TRACK_ASAN 0
++#endif
++#ifndef MI_TRACK_VALGRIND
++#define MI_TRACK_VALGRIND 0
++#endif
++#ifndef MI_TRACK_ETW
++#define MI_TRACK_ETW 0
++#endif
++
 +#if defined(__GNUC__) || defined(__clang__)
 +#define MI_ALLOC_PREFETCH_READ(p) do { const void* mi__pf = (p); if (mi__pf != NULL) { __builtin_prefetch(mi__pf, 0, 3); } } while (0)
 +#else
@@ -249,29 +324,26 @@ index b3b1860..7a72764 100644
  #define MI_IN_ALLOC_C
  #include "alloc-override.c"
  #include "free.c"
-@@ -46,7 +78,8 @@ static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_
-   if (ppage != NULL) { *ppage = page; };
- 
-   // pop from the free list
--  page->free = mi_block_next(page, block);
-+  mi_block_t* const next = mi_block_next(page, block);
-+  page->free = next;
-   page->used++;
-   mi_assert_internal(page->free == NULL || _mi_ptr_page(page->free) == page);
-   mi_assert_internal(page->block_size < MI_MAX_ALIGN_SIZE || _mi_is_aligned(block, MI_MAX_ALIGN_SIZE));
-@@ -141,8 +174,9 @@ static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_non
+@@ -30,15 +98,15 @@ terms of the MIT license. A copy of the license can be found in the file
+ static mi_decl_noinline void mi_page_block_setup_padding(mi_page_t* page, mi_block_t* block, size_t size) mi_attr_noexcept {
+   const size_t bsize = mi_page_usable_block_size(page);
+   mi_padding_t* const padding = (mi_padding_t*)((uint8_t*)block + bsize);
+-  const ptrdiff_t delta = ((uint8_t*)padding - (uint8_t*)block - (size - MI_PADDING_SIZE));
+-  mi_assert_internal(delta >= 0 && bsize >= (size - MI_PADDING_SIZE + delta));
++  const ptrdiff_t delta = ((uint8_t*)padding - (uint8_t*)block - (ptrdiff_t)(size - MI_PADDING_SIZE));
++  mi_assert_internal(delta >= 0 && bsize >= (size - MI_PADDING_SIZE + (size_t)delta));
+   mi_track_mem_defined(padding,sizeof(mi_padding_t));  // note: re-enable since mi_page_usable_block_size may set noaccess
+   padding->canary = mi_ptr_encode_canary(page,block,page->keys);
+   padding->delta  = (uint32_t)(delta);
+   #if MI_PADDING_CHECK_BYTES
+   if (!mi_page_is_huge(page)) {
+     uint8_t* fill = (uint8_t*)padding - delta;
+-    const size_t maxpad = (delta > MI_MAX_ALIGN_SIZE ? MI_MAX_ALIGN_SIZE : delta); // set at most N initial padding bytes
++    const size_t maxpad = ((size_t)delta > MI_MAX_ALIGN_SIZE ? (size_t)MI_MAX_ALIGN_SIZE : (size_t)delta); // set at most N initial padding bytes
+     for (size_t i = 0; i < maxpad; i++) { fill[i] = MI_DEBUG_PADDING; }
+   }
    #endif
- 
-   // get page in constant time, and allocate from it
--  mi_page_t* page = _mi_theap_get_free_small_page(theap, size + MI_PADDING_SIZE);
--  void* const p = mi_page_malloc_zero(theap, page, size + MI_PADDING_SIZE, zero, ppage);
-+  const size_t req_size = size + MI_PADDING_SIZE;
-+  mi_page_t* page = _mi_theap_get_free_small_page(theap, req_size);
-+  void* const p = mi_page_malloc_zero(theap, page, req_size, zero, ppage);
-   mi_track_malloc(p,size,zero);
- 
-   #if MI_DEBUG>3
-@@ -424,6 +458,10 @@ static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, voi
+@@ -484,6 +552,10 @@ static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, voi
        ((uint8_t*)newp)[0] = 0; // work around for applications that expect zero-reallocation to be zero initialized (issue #725)
      }
      if mi_likely(p != NULL) {
@@ -282,7 +354,16 @@ index b3b1860..7a72764 100644
        mi_track_mem_defined(p,copy_size);  // _mi_useable_size may be too large for byte precise memory tracking..
        _mi_memcpy_aligned(newp, p, copy_size);
        mi_free(p); // only free the original pointer if successful
-@@ -963,6 +1001,7 @@ void* _mi_externs[] = {
+@@ -687,7 +759,7 @@ static size_t mi_path_max(void) {
+     if (m <= 0) pmax = 4096;      // guess
+     else if (m < 256) pmax = 256; // at least 256
+     else if (m > 64*1024) pmax = 64*1024;  // at most 64 KiB
+-    else pmax = m;
++    else pmax = (size_t)m;
+     size_t expected = 0;
+     mi_atomic_cas_strong_acq_rel(&path_max, &expected, pmax);
+   }
+@@ -933,8 +1005,13 @@ void* _mi_externs[] = {
    (void*)&mi_zalloc_small,
    (void*)&mi_heap_malloc,
    (void*)&mi_heap_malloc_small,
@@ -290,11 +371,17 @@ index b3b1860..7a72764 100644
    (void*)&mi_malloc_aligned
    // (void*)&mi_theap_alloc_new,
    // (void*)&mi_theap_alloc_new_n
+ };
+ #endif
++
++#if defined(__clang__)
++#pragma GCC diagnostic pop   // -Wstatic-in-inline (pushed at the top of this file)
++#endif
 diff --git a/src/bitmap.c b/src/bitmap.c
-index aad7a55..7e11f4c 100644
+index 01de1999..0963180e 100644
 --- a/src/bitmap.c
 +++ b/src/bitmap.c
-@@ -9,11 +9,37 @@ terms of the MIT license. A copy of the license can be found in the file
+@@ -9,11 +9,42 @@ terms of the MIT license. A copy of the license can be found in the file
  Concurrent bitmap that can set/reset sequences of bits atomically
  ---------------------------------------------------------------------------- */
  
@@ -303,8 +390,19 @@ index aad7a55..7e11f4c 100644
 +#pragma GCC diagnostic ignored "-Wundef"
 +#pragma GCC diagnostic ignored "-Wsign-conversion"
 +#endif
++#if defined(__clang__)
++#pragma GCC diagnostic ignored "-Wstatic-in-inline"   // clang-only warning name
++#endif
  #include "mimalloc.h"
  #include "mimalloc/internal.h"
+ #include "mimalloc/bits.h"
+ #include "mimalloc/prim.h"  // _mi_prim_thread_yield
+ #include "bitmap.h"
++#if defined(__GNUC__) || defined(__clang__)
++#pragma GCC diagnostic pop
++#endif
++
++// ensure conditionally defined configuration macros have a value in this compilation unit
 +#ifndef MI_TSAN
 +#define MI_TSAN 0
 +#endif
@@ -323,38 +421,16 @@ index aad7a55..7e11f4c 100644
 +#ifndef MI_HUGE_PAGE_ABANDON
 +#define MI_HUGE_PAGE_ABANDON 0
 +#endif
- #include "mimalloc/bits.h"
- #include "mimalloc/prim.h"  // _mi_prim_thread_yield
- #include "bitmap.h"
-+#if defined(__GNUC__) || defined(__clang__)
-+#pragma GCC diagnostic pop
-+#endif
  
  #ifndef MI_OPT_SIMD
  #define MI_OPT_SIMD   0
-@@ -133,8 +159,7 @@ static inline void mi_bfield_atomic_clear_once_set(mi_subproc_t* subproc, _Atomi
- // statistics correctly).
- static inline bool mi_bfield_atomic_set_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t mask, size_t* already_set) {
-   mi_assert_internal(mask != 0);
--  mi_bfield_t old = mi_atomic_load_relaxed(b);
--  while (!mi_atomic_cas_weak_acq_rel(b, &old, old|mask)) {};  // try to atomically set the mask bits until success
-+  const mi_bfield_t old = mi_atomic_or_acq_rel(b, mask);  // single lock-prefixed instruction instead of a CAS loop
-   if (already_set!=NULL) { *already_set = mi_bfield_popcount(old&mask); }
-   return ((old&mask) == 0);
- }
-@@ -143,8 +168,7 @@ static inline bool mi_bfield_atomic_set_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t
- // `all_clear` is set to `true` if the new bfield became zero.
- static inline bool mi_bfield_atomic_clear_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t mask, bool* all_clear) {
-   mi_assert_internal(mask != 0);
--  mi_bfield_t old = mi_atomic_load_relaxed(b);
--  while (!mi_atomic_cas_weak_acq_rel(b, &old, old&~mask)) {};  // try to atomically clear the mask bits until success
-+  const mi_bfield_t old = mi_atomic_and_acq_rel(b, ~mask);  // single lock-prefixed instruction instead of a CAS loop
-   if (all_clear != NULL) { *all_clear = ((old&~mask)==0); }
-   return ((old&mask) == mask);
- }
-@@ -221,13 +245,13 @@ static inline bool mi_bfield_atomic_try_clearX(_Atomic(mi_bfield_t)*b, bool* all
+@@ -232,14 +263,17 @@ static inline bool mi_bfield_atomic_try_clearX(_Atomic(mi_bfield_t)*b, bool* all
+ // ------- mi_bfield_atomic_is_set ---------------------------------------
  
  // Check if a bit is set
++// note: relaxed is fine here as this is an advisory check only: any subsequent claim
++// is done with an atomic RMW which provides the required ordering (and on x86-TSO an
++// acquire load compiles to the same `mov` as a relaxed load).
  static inline bool mi_bfield_atomic_is_set(const _Atomic(mi_bfield_t)*b, const size_t idx) {
 -  const mi_bfield_t x = mi_atomic_load_acquire(b);
 +  const mi_bfield_t x = mi_atomic_load_relaxed(b);
@@ -368,7 +444,7 @@ index aad7a55..7e11f4c 100644
    return ((x & mi_bfield_mask(1, idx)) == 0);
  }
  
-@@ -240,14 +264,14 @@ static inline bool mi_bfield_atomic_is_xset(mi_xset_t set, const _Atomic(mi_bfie
+@@ -252,14 +286,14 @@ static inline bool mi_bfield_atomic_is_xset(mi_xset_t set, const _Atomic(mi_bfie
  // Check if all bits corresponding to a mask are set.
  static inline bool mi_bfield_atomic_is_set_mask(const _Atomic(mi_bfield_t)* b, mi_bfield_t mask) {
    mi_assert_internal(mask != 0);
@@ -385,7 +461,7 @@ index aad7a55..7e11f4c 100644
    return ((x & mask) == 0);
  }
  
-@@ -260,7 +284,7 @@ static inline bool mi_bfield_atomic_is_xset_mask(mi_xset_t set, const _Atomic(mi
+@@ -272,7 +306,7 @@ static inline bool mi_bfield_atomic_is_xset_mask(mi_xset_t set, const _Atomic(mi
  
  // Count bits in a mask
  static inline size_t mi_bfield_atomic_popcount_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t mask) {
@@ -394,7 +470,7 @@ index aad7a55..7e11f4c 100644
    return mi_bfield_popcount(x & mask);
  }
  
-@@ -364,12 +388,32 @@ static inline bool mi_bchunk_clear(mi_bchunk_t* chunk, size_t cidx, bool* all_cl
+@@ -376,12 +410,32 @@ static inline bool mi_bchunk_clear(mi_bchunk_t* chunk, size_t cidx, bool* all_cl
    return mi_bfield_atomic_clear(&chunk->bfields[i], idx, all_clear);
  }
  
@@ -430,7 +506,7 @@ index aad7a55..7e11f4c 100644
    return mi_bchunk_xsetNC(MI_BIT_CLEAR, chunk, cidx, n, NULL, maybe_all_clear);
  }
  
-@@ -681,7 +725,7 @@ static inline bool mi_bchunk_try_find_and_clear(mi_bchunk_t* chunk, size_t* pidx
+@@ -698,7 +752,7 @@ static inline bool mi_bchunk_try_find_and_clear(mi_bchunk_t* chunk, size_t* pidx
      #endif
    }
    #else
@@ -439,7 +515,7 @@ index aad7a55..7e11f4c 100644
      if (mi_bchunk_try_find_and_clear_at(chunk, i, pidx)) return true;
    }
    #endif
-@@ -731,7 +775,7 @@ static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, s
+@@ -756,7 +810,7 @@ static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, s
      const uint64_t mask = ((uint64_t)mask2 << 32) | mask1;
      // mask is inverted, so each bit is 0xFF iff the corresponding byte has a bit set (and thus can be cleared)
      if (mask==0) return false;
@@ -448,30 +524,16 @@ index aad7a55..7e11f4c 100644
      const size_t chunk_idx = bidx / 8;
      const size_t idx = (bidx % 8)*8;
      mi_assert_internal(chunk_idx < MI_BCHUNK_FIELDS);
-@@ -741,13 +785,17 @@ static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, s
-       return true;
-     }
-     // try again
--    // note: there must be an atomic release/acquire in between or otherwise the registers may not be reloaded  }
-+    // note: there must be an atomic release/acquire in between or otherwise the registers may not be reloaded
-+    // we add an explicit memory barrier as older gcc compilers do not reload the registers even with an atomic acquire (issue #1206)
-+    #if defined(__GNUC__)
-+    __asm __volatile ("" : : "g"(chunk) : "memory");
-+    #endif
+@@ -773,7 +827,7 @@ static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, s
+     #endif
    }
    #else
 -    for (int i = 0; i < MI_BCHUNK_FIELDS; i++) {
--      if (mi_bchunk_try_find_and_clear8_at(chunk, i, pidx)) return true;
--    }
--    return false;
-+  for (size_t i = 0; i < MI_BCHUNK_FIELDS; i++) {
-+    if (mi_bchunk_try_find_and_clear8_at(chunk, i, pidx)) return true;
-+  }
-+  return false;
++    for (size_t i = 0; i < MI_BCHUNK_FIELDS; i++) {
+       if (mi_bchunk_try_find_and_clear8_at(chunk, i, pidx, did_temp_clear_bits)) return true;
+     }
    #endif
- }
- 
-@@ -765,7 +813,7 @@ mi_decl_noinline static bool mi_bchunk_try_find_and_clearNX(mi_bchunk_t* chunk,
+@@ -794,7 +848,7 @@ mi_decl_noinline static bool mi_bchunk_try_find_and_clearNX(mi_bchunk_t* chunk,
    if (n == 0 || n > MI_BFIELD_BITS) return false;
    const mi_bfield_t mask = mi_bfield_mask(n, 0);
    // for all fields in the chunk
@@ -480,22 +542,21 @@ index aad7a55..7e11f4c 100644
      mi_bfield_t b0 = mi_atomic_load_relaxed(&chunk->bfields[i]);
      mi_bfield_t b = b0;
      size_t idx;
-@@ -904,13 +952,17 @@ static inline void mi_bchunk_clear_once_set(mi_subproc_t* subproc, mi_bchunk_t*
+@@ -933,13 +987,17 @@ static inline void mi_bchunk_clear_once_set(mi_subproc_t* subproc, mi_bchunk_t*
  // are all bits in a bitmap chunk clear?
  static inline bool mi_bchunk_all_are_clear_relaxed(mi_bchunk_t* chunk) {
    #if MI_OPT_SIMD && defined(__AVX2__) && (MI_BCHUNK_BITS==256)
 -  const __m256i vec = _mm256_load_si256((const __m256i*)chunk->bfields);
 -  return mi_mm256_is_zero(vec);
--  #elif MI_OPT_SIMD &&  defined(__AVX2__) && (MI_BCHUNK_BITS==512)
--  // a 64b cache-line contains the entire chunk anyway so load both at once
--  const __m256i vec1 = _mm256_load_si256((const __m256i*)chunk->bfields);
--  const __m256i vec2 = _mm256_load_si256(((const __m256i*)chunk->bfields)+1);
--  return (mi_mm256_is_zero(_mm256_or_si256(vec1,vec2)));
 +  if mi_likely(__builtin_cpu_supports("avx2")) {
 +    const __m256i vec = _mm256_load_si256((const __m256i*)chunk->bfields);
 +    return mi_mm256_is_zero(vec);
 +  }
-+  #elif MI_OPT_SIMD && defined(__AVX2__) && (MI_BCHUNK_BITS==512)
+   #elif MI_OPT_SIMD &&  defined(__AVX2__) && (MI_BCHUNK_BITS==512)
+-  // a 64b cache-line contains the entire chunk anyway so load both at once
+-  const __m256i vec1 = _mm256_load_si256((const __m256i*)chunk->bfields);
+-  const __m256i vec2 = _mm256_load_si256(((const __m256i*)chunk->bfields)+1);
+-  return (mi_mm256_is_zero(_mm256_or_si256(vec1,vec2)));
 +  if mi_likely(__builtin_cpu_supports("avx2")) {
 +    // a 64b cache-line contains the entire chunk anyway so load both at once
 +    const __m256i vec1 = _mm256_load_si256((const __m256i*)chunk->bfields);
@@ -505,7 +566,7 @@ index aad7a55..7e11f4c 100644
    #elif MI_OPT_SIMD && (MI_BCHUNK_BITS==512) && MI_ARCH_ARM64
    const uint64x2_t v0 = vld1q_u64((uint64_t*)chunk->bfields);
    const uint64x2_t v1 = vld1q_u64((uint64_t*)chunk->bfields + 2);
-@@ -918,37 +970,39 @@ static inline bool mi_bchunk_all_are_clear_relaxed(mi_bchunk_t* chunk) {
+@@ -947,37 +1005,39 @@ static inline bool mi_bchunk_all_are_clear_relaxed(mi_bchunk_t* chunk) {
    const uint64x2_t v3 = vld1q_u64((uint64_t*)chunk->bfields + 6);
    const uint64x2_t v  = vorrq_u64(vorrq_u64(v0,v1),vorrq_u64(v2,v3));
    return (vmaxvq_u32(vreinterpretq_u32_u64(v)) == 0);
@@ -535,7 +596,7 @@ index aad7a55..7e11f4c 100644
 +    const __m256i vec = _mm256_load_si256((const __m256i*)chunk->bfields);
 +    return mi_mm256_is_ones(vec);
 +  }
-+  #elif MI_OPT_SIMD && defined(__AVX2__) && (MI_BCHUNK_BITS==512)
++  #elif MI_OPT_SIMD &&  defined(__AVX2__) && (MI_BCHUNK_BITS==512)
 +  if mi_likely(__builtin_cpu_supports("avx2")) {
 +    // a 64b cache-line contains the entire chunk anyway so load both at once
 +    const __m256i vec1 = _mm256_load_si256((const __m256i*)chunk->bfields);
@@ -560,7 +621,7 @@ index aad7a55..7e11f4c 100644
  }
  
  
-@@ -965,7 +1019,52 @@ static bool mi_bchunk_bsr(mi_bchunk_t* chunk, size_t* pidx) {
+@@ -994,7 +1054,52 @@ static bool mi_bchunk_bsr(mi_bchunk_t* chunk, size_t* pidx) {
    return false;
  }
  
@@ -614,15 +675,7 @@ index aad7a55..7e11f4c 100644
    for (size_t i = MI_BCHUNK_FIELDS; i > 0; ) {
      i--;
      mi_bfield_t b = mi_atomic_load_relaxed(&chunk->bfields[i]);
-@@ -1018,7 +1117,6 @@ static bool mi_bitmap_chunkmap_try_clear(mi_bitmap_t* bitmap, size_t chunk_idx)
- -------------------------------------------------------------------------------- */
- 
- size_t mi_bitmap_size(size_t bit_count, size_t* pchunk_count) {
--  mi_assert_internal((bit_count % MI_BCHUNK_BITS) == 0);
-   bit_count = _mi_align_up(bit_count, MI_BCHUNK_BITS);
-   mi_assert_internal(bit_count <= MI_BITMAP_MAX_BIT_COUNT);
-   mi_assert_internal(bit_count > 0);
-@@ -1918,49 +2016,48 @@ rollback:
+@@ -1949,49 +2054,48 @@ rollback:
  // Todo: This scans directly through the chunks -- we might want to consult the cmap as well?
  bool mi_bbitmap_try_find_and_clearN_(mi_bbitmap_t* bbitmap, size_t tseq, size_t n, size_t* pidx) {
    MI_UNUSED(tseq);
@@ -706,10 +759,10 @@ index aad7a55..7e11f4c 100644
    return false;
  }
 diff --git a/src/free.c b/src/free.c
-index 6b38d71..81b1896 100644
+index cf352849..c37371cb 100644
 --- a/src/free.c
 +++ b/src/free.c
-@@ -7,9 +7,39 @@ terms of the MIT license. A copy of the license can be found in the file
+@@ -7,9 +7,55 @@ terms of the MIT license. A copy of the license can be found in the file
  #if !defined(MI_IN_ALLOC_C)
  #error "this file should be included from 'alloc.c' (so aliases can work from alloc-override)"
  // add includes help an IDE
@@ -718,8 +771,17 @@ index 6b38d71..81b1896 100644
 +#pragma GCC diagnostic ignored "-Wundef"
 +#pragma GCC diagnostic ignored "-Wsign-conversion"
 +#endif
++#if defined(__clang__)
++#pragma GCC diagnostic ignored "-Wstatic-in-inline"   // clang-only warning name
++#endif
  #include "mimalloc.h"
  #include "mimalloc/internal.h"
+ #include "mimalloc/prim-tls.h"   // _mi_prim_thread_id()
++#if defined(__GNUC__) || defined(__clang__)
++#pragma GCC diagnostic pop
++#endif
++
++// ensure conditionally defined configuration macros have a value in this compilation unit
 +#ifndef MI_TSAN
 +#define MI_TSAN 0
 +#endif
@@ -738,72 +800,34 @@ index 6b38d71..81b1896 100644
 +#ifndef MI_CHECK_DOUBLE_FREE
 +#define MI_CHECK_DOUBLE_FREE 0
 +#endif
++#ifndef MI_OPT_FREE_SMALL
++#define MI_OPT_FREE_SMALL 0
++#endif
 +#ifndef MI_HUGE_PAGE_ABANDON
 +#define MI_HUGE_PAGE_ABANDON 0
 +#endif
- #include "mimalloc/prim-tls.h"   // _mi_prim_thread_id()
-+#if defined(__GNUC__) || defined(__clang__)
-+#pragma GCC diagnostic pop
++#ifndef MI_TRACK_ASAN
++#define MI_TRACK_ASAN 0
 +#endif
-+
++#ifndef MI_TRACK_VALGRIND
++#define MI_TRACK_VALGRIND 0
++#endif
++#ifndef MI_TRACK_ETW
++#define MI_TRACK_ETW 0
++#endif
  #endif
  
  // forward declarations
-@@ -27,20 +57,28 @@ static void   mi_stat_free(const mi_page_t* page, const mi_block_t* block);
- // fast path written carefully to prevent spilling on the stack
- static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool was_guarded, bool track_stats, bool check_full)
- {
--  MI_UNUSED(was_guarded);
-   // checks  
-   if mi_unlikely(mi_check_is_double_free(page, block)) return;
-   if (!was_guarded) { mi_check_padding(page, block); }
--  if (track_stats) { mi_stat_free(page, block); }
-+  if (track_stats) {
-+    mi_stat_free(page, block);
-+    #if MI_TRACK_ENABLED
-+    mi_track_free_size(block, mi_page_usable_size_of(page, block, was_guarded));
-+    #else
-+    mi_track_free_size(block, 0);
-+    #endif
-+  }
-   #if (MI_DEBUG>0) && !MI_TRACK_ENABLED  && !MI_TSAN
--  size_t dbgsize = mi_page_block_size(page);
--  if (dbgsize > 1*MI_MiB) { dbgsize = 1*MI_MiB; }
--  _mi_memset_aligned(block, MI_DEBUG_FREED, dbgsize);  
-+  if (!was_guarded) { // never memset a guarded block: the guard page directly follows the block
-+    size_t dbgsize = mi_page_block_size(page);
-+    if (dbgsize > 1*MI_MiB) { dbgsize = 1*MI_MiB; }
-+    _mi_memset_aligned(block, MI_DEBUG_FREED, dbgsize);
-+  }
-   #endif
--  if (track_stats) { mi_track_free_size(block, mi_page_usable_size_of(page, block, was_guarded)); } // faster then mi_usable_size as we already know the page and that p is unaligned
- 
-   // actual free: push on the local free list
--  mi_block_set_next(page, block, page->local_free);
-+  mi_block_t* const local_free = page->local_free;
-+  mi_block_set_next(page, block, local_free);
-   page->local_free = block;
-   #if defined(__clang__) && defined(__aarch64__)
-   if mi_unlikely(page->used-- == 1)   // better code on arm64 than using `--page->used == 0`
-@@ -85,7 +123,7 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
-     mi_block_set_next(page, block, mi_tf_block(tf_old));
-     const bool new_owned = (allow_collect ? true : mi_tf_is_owned(tf_old));    // if allow collection then always try to claim it if the page is abandoned 
-     tf_new = mi_tf_create(block, new_owned);
--  } while (!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tf_old, tf_new)); // todo: release is enough?
-+  } while (!mi_atomic_cas_weak_release(&page->xthread_free, &tf_old, tf_new));
- 
-   // and atomically try to collect the page if it was abandoned
-   if (allow_collect) {
-@@ -105,7 +143,7 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
- mi_block_t* _mi_page_ptr_unalign(const mi_page_t* page, const void* p) {
+@@ -100,7 +146,7 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
+ static inline mi_block_t* mi_page_ptr_unalign_ex(const mi_page_t* page, const void* p, size_t* poffset) {
    mi_assert_internal(page!=NULL && p!=NULL);
  
 -  const size_t diff = (uint8_t*)p - mi_page_start(page);
 +  const size_t diff = (size_t)((uintptr_t)p - (uintptr_t)mi_page_start(page));
    const size_t block_size = mi_page_block_size(page);
-   const size_t adjust = (_mi_is_power_of_two(block_size) ? diff & (block_size - 1) : diff % block_size);
-   return (mi_block_t*)((uintptr_t)p - adjust);
-@@ -422,7 +460,7 @@ static size_t mi_decl_noinline mi_page_usable_aligned_size_of(const mi_page_t* p
+   size_t adjust = diff & (block_size - 1); 
+   if mi_unlikely(!_mi_is_power_of_two(block_size)) {
+@@ -554,7 +600,7 @@ static size_t mi_decl_noinline mi_page_usable_aligned_size_of(const mi_page_t* p
    const bool is_guarded = mi_block_ptr_is_guarded(block,p);
    const size_t size = mi_page_usable_size_of(page, block, is_guarded);
    mi_assert_internal((void*)p >= (void*)block);
@@ -813,10 +837,10 @@ index 6b38d71..81b1896 100644
    const size_t aligned_size = (adjust <= size ? size - adjust : 0);  // size can be zero if the padding is corrupted
    return aligned_size;
 diff --git a/src/page.c b/src/page.c
-index e7851d5..e59c5ce 100644
+index aa669cdd..8cf497a2 100644
 --- a/src/page.c
 +++ b/src/page.c
-@@ -11,11 +11,37 @@ terms of the MIT license. A copy of the license can be found in the file
+@@ -11,11 +11,55 @@ terms of the MIT license. A copy of the license can be found in the file
    exported is `mi_malloc_generic`.
  ----------------------------------------------------------- */
  
@@ -825,8 +849,20 @@ index e7851d5..e59c5ce 100644
 +#pragma GCC diagnostic ignored "-Wundef"
 +#pragma GCC diagnostic ignored "-Wsign-conversion"
 +#endif
++#if defined(__clang__)
++#pragma GCC diagnostic ignored "-Wstatic-in-inline"   // clang-only warning name
++#endif
  #include "mimalloc.h"
  #include "mimalloc/internal.h"
+ #include "mimalloc/atomic.h"
+ #include "mimalloc/prim.h"
+ #include "mimalloc/prim-tls.h"
++#if defined(__GNUC__) || defined(__clang__)
++#pragma GCC diagnostic pop
++#endif
++
++// ensure conditionally defined configuration macros have a value in this compilation unit
++// (defined *after* all mimalloc headers so header derivations are not disturbed; silences -Wundef on body-level use)
 +#ifndef MI_TSAN
 +#define MI_TSAN 0
 +#endif
@@ -845,16 +881,22 @@ index e7851d5..e59c5ce 100644
 +#ifndef MI_HUGE_PAGE_ABANDON
 +#define MI_HUGE_PAGE_ABANDON 0
 +#endif
- #include "mimalloc/atomic.h"
- #include "mimalloc/prim.h"
- #include "mimalloc/prim-tls.h"
-+#if defined(__GNUC__) || defined(__clang__)
-+#pragma GCC diagnostic pop
++#ifndef MI_OPT_FREE_SMALL
++#define MI_OPT_FREE_SMALL 0
++#endif
++#ifndef MI_TRACK_ASAN
++#define MI_TRACK_ASAN 0
++#endif
++#ifndef MI_TRACK_VALGRIND
++#define MI_TRACK_VALGRIND 0
++#endif
++#ifndef MI_TRACK_ETW
++#define MI_TRACK_ETW 0
 +#endif
  
  /* -----------------------------------------------------------
    Definition of page queues for each block size
-@@ -25,6 +51,17 @@ terms of the MIT license. A copy of the license can be found in the file
+@@ -25,6 +69,17 @@ terms of the MIT license. A copy of the license can be found in the file
  #include "page-queue.c"
  #undef MI_IN_PAGE_C
  
@@ -872,28 +914,19 @@ index e7851d5..e59c5ce 100644
  
  /* -----------------------------------------------------------
    Page helpers
-@@ -179,7 +216,7 @@ static void mi_page_thread_collect_to_local(mi_page_t* page, mi_block_t* head)
-   // update counts now
-   mi_assert_internal(count <= UINT16_MAX);
-   mi_assert_internal(page->used >= (uint16_t)count);
--  page->used = page->used - (uint16_t)count;
-+  page->used = (uint16_t)(page->used - (uint16_t)count);
- }
+@@ -373,7 +428,7 @@ static void mi_page_thread_free_collect(mi_page_t* page)
  
- // Collect the local `thread_free` list using an atomic exchange.
-@@ -201,7 +238,7 @@ static void mi_page_thread_free_collect(mi_page_t* page)
- }
  
  // returns `true` if after collection `mi_page_immediate_available` is true.
--static bool mi_page_free_quick_collect(mi_page_t* page) {
+-static inline bool mi_page_free_quick_collect(mi_page_t* page) {
 +static mi_decl_forceinline bool mi_page_free_quick_collect(mi_page_t* page) {
-   if (page->free != NULL) return true;
+   if mi_likely(page->free != NULL) return true;
    if (page->local_free == NULL) return false;
    // move local_free to free
-@@ -443,9 +480,9 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
-       #if MI_STAT>0
+@@ -623,9 +678,9 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
+     if (pq->count==1 || bsize < MI_SMALL_SIZE_MAX) {
+       mi_theap_t* theap = mi_page_theap(page);
        mi_theap_stat_counter_increase(theap, pages_retire, 1);
-       #endif
 -      page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
 +      page->retire_expire = (uint8_t)(bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
        mi_assert_internal(pq >= theap->pages);
@@ -902,7 +935,7 @@ index e7851d5..e59c5ce 100644
        mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
        if (index < theap->page_retired_min) theap->page_retired_min = index;
        if (index > theap->page_retired_max) theap->page_retired_max = index;
-@@ -587,17 +624,17 @@ static mi_decl_noinline void mi_page_free_list_extend( mi_page_t* const page, co
+@@ -778,17 +833,17 @@ static mi_decl_noinline void mi_page_free_list_extend( mi_page_t* const page, co
    void* const page_area = mi_page_start(page);
  
    mi_block_t* const start = mi_page_block_at(page, page_area, bsize, page->capacity);
@@ -927,16 +960,16 @@ index e7851d5..e59c5ce 100644
    page->free = start;
  }
  
-@@ -687,7 +724,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
+@@ -876,7 +931,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
      mi_page_free_list_extend_secure(theap, page, bsize, extend);
    }
    // enable the new free list
 -  page->capacity += (uint16_t)extend;
 +  page->capacity = (uint16_t)(page->capacity + (uint16_t)extend);
-   #if MI_STAT>0
    mi_theap_stat_increase(theap, page_committed, extend * bsize);
-   #endif
-@@ -754,13 +791,15 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
+   mi_assert_expensive(mi_page_is_valid_init(page));
+   return true;
+@@ -946,6 +1001,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
    // search through the pages in "next fit" order
    size_t count = 0;
    long candidate_limit = 0;          // we reset this on the first candidate to limit the search
@@ -944,8 +977,9 @@ index e7851d5..e59c5ce 100644
    long page_full_retain = (pq->block_size > MI_SMALL_MAX_OBJ_SIZE ? 0 : theap->page_full_retain); // only retain small pages
    mi_page_t* page_candidate = NULL;  // a page with free space
    mi_page_t* page = pq->first;
+@@ -953,7 +1009,8 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
  
-   while (page != NULL)
+   while (page!=NULL)
    {
 -    mi_page_t* next = page->next; // remember next (as this page can move to another queue)
 +    mi_page_t* const next = page->next; // remember next (as this page can move to another queue)
@@ -953,7 +987,7 @@ index e7851d5..e59c5ce 100644
      count++;
      candidate_limit--;
  
-@@ -788,7 +827,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
+@@ -985,7 +1042,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
        // we prefer non-expandable pages with high usage as candidates (to reduce commit, and increase chances of free-ing up pages)
        if (page_candidate == NULL) {
          page_candidate = page;
@@ -962,46 +996,49 @@ index e7851d5..e59c5ce 100644
        }
        else if (mi_page_all_free(page_candidate)) {
          _mi_page_free(page_candidate, pq);
-@@ -871,6 +910,7 @@ static mi_page_t* mi_find_free_page(mi_theap_t* theap, mi_page_queue_t* pq) {
-   // check the first page: we even do this with candidate search or otherwise we re-search every time
+@@ -1063,6 +1120,7 @@ static inline mi_page_t* mi_page_queue_lookup_free_first(mi_theap_t* theap, mi_p
+   mi_assert_internal(!mi_page_queue_is_huge(pq));
    mi_page_t* page = pq->first;
-   if mi_likely(page != NULL && mi_page_free_quick_collect(page)) {
+   if mi_likely(page!=NULL && mi_page_free_quick_collect(page)) {
 +    mi_prefetch_read(page->free); // prefetch the first free block so the pop in `mi_page_malloc_zero` hits L1
+     // fast path
      #if (MI_SECURE>=2) // in secure mode, we extend half the time to increase randomness
      if (page->capacity < page->reserved && ((_mi_theap_random_next(theap) & 1) == 1)) {
-       (void)mi_page_extend_free(theap, page);  // ok if this fails
-@@ -956,8 +996,8 @@ static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_align
-     return NULL;
+@@ -1138,8 +1196,8 @@ static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_align
    }
    mi_page_queue_t* pq = mi_page_queue(theap, (huge_alignment > 0 ? MI_LARGE_MAX_OBJ_SIZE+1 : size));
+   mi_page_t* page;
 -  // huge allocation?
 -  if mi_unlikely(mi_page_queue_is_huge(pq) || req_size > MI_MAX_ALLOC_SIZE) {
 +  // huge allocation? (note: `req_size > MI_MAX_ALLOC_SIZE` was already checked above)
 +  if mi_unlikely(mi_page_queue_is_huge(pq)) {
-     return mi_huge_page_alloc(theap,size,huge_alignment,pq);
+     page = mi_huge_page_alloc(theap,size,huge_alignment,pq);
    }
    else {
-@@ -979,7 +1019,7 @@ static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_align
- void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, mi_page_t** ppage) mi_attr_noexcept
- {
+@@ -1329,7 +1387,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
+   mi_assert_internal(theap != NULL);
+   #endif
    const bool zero = ((zero_huge_alignment & 1) != 0);
 -  const size_t huge_alignment = (zero_huge_alignment & ~1);
 +  const size_t huge_alignment = (zero_huge_alignment & ~(size_t)1);
+   mi_page_t* page = NULL;
  
-   #if !MI_THEAP_INITASNULL
-   mi_assert_internal(theap != NULL);
+   // fast path objects that fit in a small page
 diff --git a/src/threadlocal.c b/src/threadlocal.c
-index ca94307..7ead7f9 100644
+index 6f280d09..d2198c2a 100644
 --- a/src/threadlocal.c
 +++ b/src/threadlocal.c
-@@ -11,9 +11,18 @@ Unlike most OS native implementations there is no limit on the number
- that can be allocated.
+@@ -11,9 +11,28 @@ terms of the MIT license. A copy of the license can be found in the file
+   that can be allocated.
  -----------------------------------------------------------------------------*/
  
 +#if defined(__GNUC__) || defined(__clang__)
 +#pragma GCC diagnostic push
 +#pragma GCC diagnostic ignored "-Wundef"
 +#pragma GCC diagnostic ignored "-Wsign-conversion"
++#endif
++#if defined(__clang__)
++#pragma GCC diagnostic ignored "-Wstatic-in-inline"   // clang-only warning name
 +#endif
  #include "mimalloc.h"
  #include "mimalloc/internal.h"
@@ -1010,10 +1047,17 @@ index ca94307..7ead7f9 100644
 +#pragma GCC diagnostic pop
 +#endif
 +
++// ensure conditionally defined configuration macros have a value in this compilation unit
++#ifndef MI_TLS_MODEL_PTHREADS
++#define MI_TLS_MODEL_PTHREADS 0
++#endif
++#ifndef MI_TSAN
++#define MI_TSAN 0
++#endif
  
  /* -----------------------------------------------------------
    Each thread can have (a dynamically expanding) array of
-@@ -79,6 +88,7 @@ mi_define_thread_local(void*, mi_slot_fast, NULL)
+@@ -80,6 +99,7 @@ mi_define_thread_local(void*, mi_slot_fast, NULL)
  #endif
  #define MI_TLS_IDX_MASK     ((MI_ZU(1)<<MI_TLS_IDX_BITS)-1)
  #define MI_TLS_IDX_MAX      MI_TLS_IDX_MASK
@@ -1021,7 +1065,7 @@ index ca94307..7ead7f9 100644
  #define MI_TLS_VERSION_MAX  ((MI_ZU(1)<<(MI_SIZE_BITS - MI_TLS_IDX_BITS))-1)
  
  
-@@ -99,26 +109,51 @@ static mi_thread_local_t mi_key_create( size_t index, size_t version ) {
+@@ -100,29 +120,54 @@ static mi_thread_local_t mi_key_create( size_t index, size_t version ) {
  }
  
  
@@ -1073,7 +1117,6 @@ index ca94307..7ead7f9 100644
 +    tls_old = NULL; // so we allocate fresh from mi_thread_locals_empty
    }
 -  if (count > MI_TLS_IDX_MAX) { return NULL; }  // too large
--  mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_rezalloc(tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
 +
 +  const size_t count = mi_thread_locals_next_count(count_old, least_idx);
 +  if (count == 0) return NULL;  // defensive; cannot happen with the growth policy above
@@ -1081,11 +1124,15 @@ index ca94307..7ead7f9 100644
 +  size_t alloc_size = 0;
 +  if mi_unlikely(!mi_thread_locals_alloc_size(count, &alloc_size)) return NULL;
 +
-+  mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_rezalloc(tls_old, alloc_size);
+   // allocate as meta (for secure mode)
+   // we could also allocate on the main heap; this is recursion safe as that uses the fast local key
+   mi_memid_t memid = (tls_old==NULL ? _mi_memid_none() : tls_old->memid);
+-  mi_thread_locals_t* tls = (mi_thread_locals_t*)_mi_meta_rezalloc(_mi_subproc(), tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t), &memid);
++  mi_thread_locals_t* tls = (mi_thread_locals_t*)_mi_meta_rezalloc(_mi_subproc(), tls_old, alloc_size, &memid);
    if mi_unlikely(tls==NULL) return NULL;
+   tls->memid = memid;
    tls->count = count;
-   mi_thread_locals_set(tls);
-@@ -127,6 +162,7 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
+@@ -132,6 +177,7 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
  
  static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key, void* val ) {
    if (val==NULL) return true;
@@ -1093,7 +1140,7 @@ index ca94307..7ead7f9 100644
    const size_t idx = mi_key_index(key);
    mi_thread_locals_t* tls = mi_thread_locals_expand(idx);
    if (tls==NULL) {
-@@ -143,9 +179,9 @@ static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key,
+@@ -148,9 +194,9 @@ static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key,
  // set a tls slot; returns `true` if successful.
  // Can return `false` if we could not reallocate the slots array.
  static mi_decl_noinline bool mi_thread_local_set_regular( mi_thread_local_t key, void* val ) {
@@ -1104,7 +1151,7 @@ index ca94307..7ead7f9 100644
    const size_t idx = mi_key_index(key);
    if mi_likely(idx < tls->count) {
      tls->slots[idx].value = val;
-@@ -158,7 +194,7 @@ static mi_decl_noinline bool mi_thread_local_set_regular( mi_thread_local_t key,
+@@ -163,7 +209,7 @@ static mi_decl_noinline bool mi_thread_local_set_regular( mi_thread_local_t key,
  }
  
  bool _mi_thread_local_set( mi_thread_local_t key, void* val ) {
@@ -1113,29 +1160,19 @@ index ca94307..7ead7f9 100644
    if (key == mi_thread_local_key_fast) {
      return mi_slot_fast_set(val);
    }
-@@ -169,7 +205,7 @@ bool _mi_thread_local_set( mi_thread_local_t key, void* val ) {
+@@ -174,6 +220,7 @@ bool _mi_thread_local_set( mi_thread_local_t key, void* val ) {
  
  // get a tls slot value
  static mi_decl_noinline void* mi_thread_local_get_regular( mi_thread_local_t key ) {
--  mi_assert_internal(key!=0);
 +  if mi_unlikely(key == 0) return NULL;
-   const mi_thread_locals_t* const tls = mi_thread_locals_get();
-   mi_assert_internal(tls!=NULL);
-   const size_t idx = mi_key_index(key);
-@@ -183,7 +219,7 @@ static mi_decl_noinline void* mi_thread_local_get_regular( mi_thread_local_t key
- 
- // get a thread local value
- void* _mi_thread_local_get( mi_thread_local_t key ) {
--  mi_assert_internal(key!=0);
-+  if mi_unlikely(key == 0) return NULL;
-   if mi_likely(key == mi_thread_local_key_fast) {
-     return mi_slot_fast_get();
-   }
-@@ -212,9 +248,12 @@ static mi_lock_t    mi_thread_locals_lock;    // we need a lock in order to re-a
+   const mi_thread_locals_t* const tls = mi_thread_locals_peek();
+   if mi_unlikely(tls==NULL) {
+     // this can happen if a thread local is accessed after the thread local has been freed
+@@ -222,9 +269,12 @@ static mi_lock_t    mi_thread_locals_lock;    // we need a lock in order to re-a
  static mi_bitmap_t* mi_thread_locals_free;    // reuse an arena bitmap to track which slots were assigned (1=free, 0=in-use)
  static mi_memid_t   mi_thread_locals_memid;   // provenance of mi_thread_locals_free
  static size_t       mi_thread_locals_version; // version to be able to reuse slots safely
-+static size_t       mi_thread_locals_search_start; // hint to reduce bitmap scans and spread threads over slots
++static size_t       mi_thread_locals_search_start; // hint to reduce bitmap scans and spread threads over slots (guarded by mi_thread_locals_lock)
  
  void _mi_thread_locals_init(void) {
    mi_lock_init(&mi_thread_locals_lock);
@@ -1144,10 +1181,10 @@ index ca94307..7ead7f9 100644
  }
  
  void _mi_thread_locals_done(void) {
-@@ -224,7 +263,10 @@ void _mi_thread_locals_done(void) {
-       const size_t slots_count = mi_bitmap_max_bits(slots);
-       const size_t slots_size  = mi_bitmap_size(slots_count,NULL);
-       _mi_meta_free(_mi_subproc_main(), slots,slots_size,mi_thread_locals_memid);
+@@ -232,7 +282,10 @@ void _mi_thread_locals_done(void) {
+     mi_bitmap_t* const slots = mi_thread_locals_free;
+     if (slots!=NULL) {
+       _mi_meta_free(_mi_subproc_main(), slots, mi_thread_locals_memid);
 +      mi_thread_locals_free = NULL;
      }
 +    mi_thread_locals_version = 0;
@@ -1155,7 +1192,7 @@ index ca94307..7ead7f9 100644
    }
    mi_lock_done(&mi_thread_locals_lock);
    mi_thread_locals_delete();
-@@ -242,24 +284,35 @@ static bool mi_thread_local_claim_fun(size_t _slice_index, mi_arena_t* _arena, b
+@@ -250,24 +303,35 @@ static bool mi_thread_local_claim_fun(size_t _slice_index, mi_arena_t* _arena, b
  // (so if we reuse a slot it will be returning NULL initially when a thread tries to get it)
  static mi_thread_local_t mi_thread_local_claim(void) {
    size_t idx = 0;
@@ -1181,7 +1218,7 @@ index ca94307..7ead7f9 100644
 +  mi_thread_locals_search_start = (idx + 1 < max_bits ? idx + 1 : 0);
 +
 +  size_t version = mi_thread_locals_version + 1;
-+  if (version == 0 || version > MI_TLS_VERSION_MAX) { version = 1; }  /* wrap around the version */
++  if (version == 0 || version > MI_TLS_VERSION_MAX) { version = 1; }  /* wrap around the version (and never use 0) */
 +  mi_thread_locals_version = version;
 +  return mi_key_create( idx, version);
  }
@@ -1200,10 +1237,10 @@ index ca94307..7ead7f9 100644
    const size_t newsize = mi_bitmap_size( newcount, NULL );
 -  // mi_bitmap_t* newslots = (mi_bitmap_t*)mi_zalloc_aligned(newsize, MI_BCHUNK_SIZE);
    mi_memid_t memid;
-   mi_bitmap_t* newslots = (mi_bitmap_t*)_mi_meta_zalloc(_mi_subproc_main(), newsize, &memid); // always allocate thread locals in the main subprocess
+   mi_bitmap_t* newslots = (mi_bitmap_t*)_mi_meta_zalloc_aligned(_mi_subproc_main(), newsize, MI_BCHUNK_SIZE, &memid); // always allocate thread locals in the main subprocess
    mi_assert_internal(_mi_is_aligned(newslots,MI_BCHUNK_SIZE));
-@@ -271,9 +324,12 @@ static bool mi_thread_local_create_expand(void) {
-     _mi_meta_free(_mi_subproc_main(), slots,oldsize,mi_thread_locals_memid);
+@@ -279,9 +343,12 @@ static bool mi_thread_local_create_expand(void) {
+     _mi_meta_free(_mi_subproc_main(), slots, mi_thread_locals_memid);
    }
    mi_bitmap_init(newslots, newcount, true /* pretend already zero'd so we do not zero out the copied old entries */);
 -  mi_bitmap_unsafe_setN(newslots, oldcount, newcount - oldcount);  /* set the new expanded slots as available */
@@ -1216,7 +1253,7 @@ index ca94307..7ead7f9 100644
    return true;
  }
  
-@@ -302,7 +358,10 @@ void _mi_thread_local_free(mi_thread_local_t key) {
+@@ -310,6 +377,10 @@ void _mi_thread_local_free(mi_thread_local_t key) {
      mi_bitmap_t* const slots = mi_thread_locals_free;
      if (slots!=NULL && idx < mi_bitmap_max_bits(slots)) {
        mi_bitmap_set(slots,idx);
@@ -1227,4 +1264,3 @@ index ca94307..7ead7f9 100644
      }
    }
  }
--
