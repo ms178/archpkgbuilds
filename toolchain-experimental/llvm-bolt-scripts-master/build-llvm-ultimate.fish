@@ -913,7 +913,7 @@ end
 git clone --filter=blob:none --depth=1 https://github.com/llvm/llvm-project.git || die "Clone failed"
 cd llvm-project || die "cd llvm-project failed"
 # v4 patch contexts are pinned to this exact official LLVM revision.
-set -g LLVM_REBASE_COMMIT fd63167bbd7f0193f21129abe49604b98f777cdc
+set -g LLVM_REBASE_COMMIT 02bd47db9d3c4313fe1b5054ed8a1a081f1b7f78 #fd63167bbd7f0193f21129abe49604b98f777cdc
 if test (git rev-parse HEAD) != "$LLVM_REBASE_COMMIT"
     git fetch --depth=1 origin "$LLVM_REBASE_COMMIT"; or die "Could not fetch the v4 LLVM base"
 end
