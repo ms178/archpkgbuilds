@@ -912,12 +912,12 @@ if test -d llvm-project
 end
 git clone --filter=blob:none --depth=1 https://github.com/llvm/llvm-project.git || die "Clone failed"
 cd llvm-project || die "cd llvm-project failed"
-# v2 patch contexts are certified only for this exact official LLVM revision.
-set -g LLVM_REBASE_COMMIT 20b53106931742d2e5e64132f06994980fe94d7d #63d2e62707e8ec6c070a3b258ea81f320920525c
+# v4 patch contexts are pinned to this exact official LLVM revision.
+set -g LLVM_REBASE_COMMIT fd63167bbd7f0193f21129abe49604b98f777cdc
 if test (git rev-parse HEAD) != "$LLVM_REBASE_COMMIT"
-    git fetch --depth=1 origin "$LLVM_REBASE_COMMIT"; or die "Could not fetch the v3 LLVM base"
+    git fetch --depth=1 origin "$LLVM_REBASE_COMMIT"; or die "Could not fetch the v4 LLVM base"
 end
-git checkout --detach "$LLVM_REBASE_COMMIT"; or die "Could not select the v3 LLVM base"
+git checkout --detach "$LLVM_REBASE_COMMIT"; or die "Could not select the v4 LLVM base"
 
 log "Using pristine upstream lld CMake configuration (complete lld; no ELF-only sed mutation)."
 
@@ -958,7 +958,7 @@ if not test -f "$STAMP"
         set -l pf (find_patch $p)
         if test -n "$pf"
             set -l dry_log "/tmp/patch-$p-dry.log"
-            if not patch --batch --forward --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$dry_log" 2>&1
+            if not env LC_ALL=C patch --batch --forward --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$dry_log" 2>&1
                 log "--- DRY RUN OUTPUT FOR $p ---"
                 cat "$dry_log"
                 die "Patch $p failed --dry-run against current llvm-project main. Rebase it first."
@@ -977,7 +977,7 @@ if not test -f "$STAMP"
         set -l pf (find_patch $p)
         if test -n "$pf"
             set -l real_log "/tmp/patch-$p.log"
-            patch --batch --forward -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$real_log" 2>&1
+            env LC_ALL=C patch --batch --forward -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$real_log" 2>&1
             set -l patch_status $status
             grep -E '^patching file |^Hunk |reject|FAILED|offset|fuzz' "$real_log" | sed 's/^/      /'
             if test $patch_status -ne 0; or grep -Eiq 'offset|fuzz|FAILED|reject|Reversed|malformed' "$real_log"
