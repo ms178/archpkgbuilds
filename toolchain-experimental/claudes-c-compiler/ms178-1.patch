@@ -1,3 +1,397 @@
+diff --git a/engineering/FOLLOWUP-2026-09-19-kernel-reloc-addends.md b/engineering/FOLLOWUP-2026-09-19-kernel-reloc-addends.md
+new file mode 100644
+index 00000000..f5d23602
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-19-kernel-reloc-addends.md
+@@ -0,0 +1,150 @@
++# Follow-up 2026-09-19 — x86 relocation addends and CachyMod QEMU boot
++
++Base: upstream `main` at `407eb4927889e9b1b30426c5622e8d07067c99c5` (PR #557 merged).
++Target: patched `linux-cachymod-6.18.52`; compiler and target linker are exclusively
++`target/fastbuild/lccc` and `target/fastbuild/lccc-ld`. Host-only Kbuild tools use
++the system toolchain, as documented by `build_kernel_vm.sh`.
++
++## Result
++
++The current tree builds the boot setup, the complete minimal CachyMod VM kernel,
++and boots two SMP CPUs under QEMU/TCG. The in-guest suite reaches clean poweroff
++and passes all 16 feature, scheduler, networking, SMP, and serial-integrity gates.
++The setup image remains below Linux's hard 32 KiB boundary.
++
++| Gate | Result | Evidence |
++|---|---:|---|
++| Swap | PASS | 4 GiB `/swapfile`, active throughout builds |
++| LCCC build policy | PASS | `fastbuild`, Rust `opt-level=1`, no LTO, `-j2` |
++| Package patch stack | PASS | 28/28 patches applied to Linux 6.18.52 |
++| Package-config boot setup | PASS | `_end=31168`, 1600 B headroom; flat image byte-identical to `ld.bfd` |
++| Post-fix minimal-config setup | PASS | `_end=28416`, 4352 B headroom; flat image byte-identical to `ld.bfd` |
++| Clean full VM kernel build | PASS | 5,071,872 B `bzImage`; 20,577,712 B `vmlinux`; setup `_end=29856` |
++| QEMU boot | PASS | Linux banner identifies lccc; 2 CPUs; all 16 validation checks pass |
++
++The post-fix full build was clean (`make ARCH=x86_64 clean`) rather than an
++incremental relink, so every target C/assembly translation unit was regenerated
++by the fixed LCCC. No target object was substituted from GCC or Clang.
++
++## Correctness defects fixed
++
++### 1. Bare absolute memory displacement lost its addend
++
++The x86 parser must leave a bare operand such as `ext+9` as `Operand::Label`:
++without the instruction mnemonic it cannot know whether the expression is a
++control-flow target or an absolute memory operand. Memory instruction dispatch
++later synthesized `Displacement::Symbol("ext+9")`. The normal parenthesized
++memory parser, in contrast, produced `SymbolPlusOffset("ext", 9)`.
++
++The synthesized path eventually called `add_relocation`, but the relocation
++choke point preserved the literal spelling. The object therefore contained an
++undefined symbol *named* `ext+9`, not symbol `ext` plus addend 9. This affected
++loads, stores, and other bare-memory operations (the reproducer includes `bt`).
++
++Fix: `add_relocation` now uses the parser's one canonical
++`split_relocation_symbol_addend` grammar. It combines the source addend exactly
++once with the architecture-supplied addend, then performs the existing `@PLT`
++normalization. Overflow is never wrapped into a different address.
++
++### 2. `loop` / `jrcxz` addend target escaped as an undefined internal reloc
++
++The same parser ambiguity affected short-only branches such as
++`loop .Lagain+1`. The encoder recorded an internal `R_X86_64_PC8_INTERNAL`
++relocation against the literal undefined symbol `.Lagain+1`. Because internal
++resolution could not find that name, the private relocation type escaped into
++the ELF object and the displacement remained zero.
++
++Normalizing at the common relocation boundary turns the target into `.Lagain`
++and combines `+1` with the PC8 base addend `-1` exactly once. The same-section
++resolver then emits the GAS-identical bytes (`e2 ff`, `e3 fd`) and no PC8
++relocation remains in the object.
++
++## Regression and oracle
++
++`tests/asm-diff/reloc-addend.casefile` is a whole-object GNU-as differential,
++not merely a disassembly check. It pins:
++
++- positive and negative bare-memory addends;
++- both load and store directions;
++- 32- and 64-bit operations;
++- a non-mov memory operation (`btq`);
++- internal PC8 `loop` and `jrcxz` targets with addends.
++
++Before the fix the one case reported 7 extra LCCC relocations, five bogus
++undefined symbols (`ext+9`, `ext-7`, ...), two escaped private PC8 relocations,
++and wrong branch bytes. After the fix:
++
++```text
++=== asm-diff: 1 passed, 0 failed (1 cases, oracle=/usr/bin/as) ===
++```
++
++The parser unit test additionally pins whitespace, `constant+symbol`, local
++labels, plain symbols, and a non-constant symbol difference.
++
++## Reproduction commands
++
++```bash
++./scripts/ensure_swap.sh
++./scripts/build_lccc_fast.sh
++./scripts/prepare_kernel_tree.sh
++OUT=/home/user/bootbuild ./scripts/build_kernel_boot.sh
++python3 scripts/asmdiff.py --lccc target/fastbuild/lccc \
++  --as /usr/bin/as tests/asm-diff/reloc-addend.casefile -v
++
++make -C /home/user/kernel-work/linux-6.18.52 ARCH=x86_64 clean
++BUILD_LOG=/home/user/kernel-vm-build-fixed.log JOBS=2 \
++  ./scripts/build_kernel_vm.sh
++BOOT_LOG=/home/user/qemu-boot-fixed.log ./scripts/qemu_boot_test.sh
++./scripts/ci_local.sh --fast
++```
++
++## Follow-up work
++
++1. Add a 32-bit counterpart to the whole-object addend corpus even though the
++   i686 encoder already normalizes bare addresses through `split_label_offset`.
++2. Make the kernel tool-identity stamp invalidate compile products as well as
++   link products when the compiler hash changes; this session explicitly
++   cleaned the tree to avoid relying on Kbuild command-line timestamps.
++3. Run the package's broad desktop config on a host with sufficient persisted
++   disk/time; the QEMU milestone intentionally uses the audited minimal config
++   while retaining CachyMod's BORE, cache scheduler, HZ=800, CACHY, BBRv3,
++   preemption, SMP, ACPI, PCI, and serial paths.
++4. Continue CPU hotplug stress beyond the two-CPU boot gate and preserve serial
++   logs as compact CI artifacts.
++
++## Default-config follow-up: pointer-table initializer extent
++
++GDB proved the apparent `delay_loop` hang was the panic delay, not the original
++fault.  The first exception was a NULL+0xa0 dereference in
++`default_acpi_madt_oem_check()`: `.apicdrivers` was 0x2a0 bytes instead of the
++required three 8-byte pointer slots.  Each input object declared an 8-byte
++symbol but LCCC appended 0xd8 zero bytes, because global brace initialization
++passed the pointee `struct apic` layout while lowering a pointer object.
++
++`lower_declarator_init()` now suppresses pointee layouts for scalar pointer
++objects.  The focused regression
++`global_braced_pointer_to_struct_section_extent.c` checks both the exact
++three-slot section extent and pointer contents against GCC.  The regression
++passes, and recompiling the real x2APIC objects shrinks every `.apicdrivers`
++input section from 0xe0 to 8 bytes.  An incremental real-objtool default-config
++`bzImage` rebuild completed successfully and now reaches the serial kernel
++banner and initcalls.
++
++A later, separate default-config failure remains: during `scsi_init_devinfo`,
++entry 28 of `scsi_static_device_list` has its model pointer changed in guest
++memory from the linked `ffffffff82d5858c` to `ffffffff00000000`, causing a
++fault in `strlen`.  The stripped and unstripped ELF files both contain the
++correct pointer and `R_X86_64_64` relocation at `ffffffff8382b558`; GDB confirms
++the corruption is already present in the table at fault time.  This is now the
++next default-config root-cause target and is distinct from the fixed
++pointer-table extent bug.
++
++A hardware GDB watchpoint subsequently identified the writer: at
++`llc_populate_cpu_shard_id+0x2d9`, the generated store for
++`cpu_shard_id[c] = shard_id` computes `c << 16` rather than `c * 4`.  For
++`c == 1`, that changes the unrelated SCSI pointer exactly 64 KiB above
++`cpu_shard_id` to `ffffffff00000000`.  LCCC's declaration metadata at lowering
++time is correct (`elem_size=4`, `strides=[4]`, `CType::Array(Int, 64)`), and the
++load of the same expression uses a scale-4 address.  The remaining defect is
++therefore downstream in O2 IR optimization/instruction selection/register
++allocation of the lvalue store, not relocation or initializer lowering.
+diff --git a/engineering/STATE.md b/engineering/STATE.md
+index 6727c2ed..c45fc0fd 100644
+--- a/engineering/STATE.md
++++ b/engineering/STATE.md
+@@ -108,13 +108,14 @@ the range fusion; it used to be a scalar loop.
+   NULs in the serial log (MachInst sub-word arriving-reload fix,
+   `arriving_reload()` in `machinst_alloc.rs`, regression
+   `machinst_subword_reload_sign.c`).
+-- **Defect (d) ROOT-CAUSED + FIXED (2026-09-17)** — every execve failed
+-  with -E2BIG because `pte_mkwrite` (by-value pte_t + inlined helper
+-  chain) returned leftover stack as the PTE: aggregate_sroa's
+-  copy-buffer collapse deleted the initializing Memcpy of a buffer a
+-  forwarded load had just been re-pointed at (`forward_target_roots`
+-  guard; regression `sroa_fwd_load_vs_buffer_collapse.c`). Kernel
+-  rebuild/boot validation of the fix still pending.
++- **Defect (d) ROOT-CAUSED + FIXED + BOOT-VALIDATED (2026-09-19)** — every
++  execve failed with -E2BIG because `pte_mkwrite` (by-value pte_t + inlined
++  helper chain) returned leftover stack as the PTE: aggregate_sroa's
++  copy-buffer collapse deleted the initializing Memcpy of a buffer a forwarded
++  load had just been re-pointed at (`forward_target_roots` guard; regression
++  `sroa_fwd_load_vs_buffer_collapse.c`). A clean full minimal CachyMod rebuild
++  now reaches init, executes the complete busybox validation suite, and powers
++  off cleanly under QEMU.
+ - **Defect (e) FIXED (2026-09-18, commit c256c917)** — the
+   `aes-ctr-avx-x86_64.S` failure was the tip of FOUR assembler
+   defects, three of them silent object corruption: (1) VAES
+@@ -134,8 +135,9 @@ the range fusion; it used to be a scalar loop.
+   VAES has no opmask/broadcast forms) and
+   `tests/asm-diff/macro_vararg.casefile` (4 groups: kernel pattern,
+   forwarding, empty/single invocation).
+-- **Defect (b) OPEN** — CPU1 hotplug bring-up times out (`maxcpus=1`
+-  boots fine).
++- **Defect (b) FIXED / CURRENT GATE PASS (2026-09-19)** — the clean QEMU
++  build brings CPU1 online and the guest reports exactly 2 CPUs. Continue
++  dedicated offline/online hotplug cycling as a stronger follow-up stress gate.
+ - Kernel harness scripts (`build_kernel_vm.sh`, `prepare_kernel_tree.sh`
+   with whole-tree extraction audit, `qemu_boot_test.sh`) are unreviewed
+   deltas in the session patch, not upstream.
+diff --git a/src/backend/x86/assembler/encoder/core.rs b/src/backend/x86/assembler/encoder/core.rs
+index 7a611adc..eef86ebe 100644
+--- a/src/backend/x86/assembler/encoder/core.rs
++++ b/src/backend/x86/assembler/encoder/core.rs
+@@ -929,8 +929,30 @@ impl super::InstructionEncoder {
+         Ok(())
+     }
+ 
+-    /// Add a relocation relative to current position.
++    /// Add a relocation relative to the current instruction stream.
++    ///
++    /// `Operand::Label` is shared by control-flow targets and bare absolute
++    /// memory operands, so the parser cannot eagerly turn `symbol+constant`
++    /// into a `Displacement::SymbolPlusOffset`.  Normalize it here, at the
++    /// single relocation choke point.  Without this, `movq ext+9,%rax` and
++    /// `loop .Ltarget+1` emitted undefined symbols literally named `ext+9`
++    /// and `.Ltarget+1`; the internal PC8 type could then escape into ELF.
+     pub(crate) fn add_relocation(&mut self, symbol: &str, reloc_type: u32, addend: i64) {
++        let (symbol, addend) = if let Some((base, extra)) =
++            super::super::parser::split_relocation_symbol_addend(symbol)
++        {
++            // Parsed source constants and architecture-supplied addends
++            // are both i64. Overflow is not a legal ELF addend; retaining
++            // the unsplit spelling lets the normal undefined-symbol path
++            // diagnose it rather than wrapping to a different address.
++            match addend.checked_add(extra) {
++                Some(sum) => (base, sum),
++                None => (symbol, addend),
++            }
++        } else {
++            (symbol, addend)
++        };
++
+         // Strip @PLT suffix from symbol names - the suffix only affects relocation type,
+         // not the symbol name in the ELF symbol table. Use PLT32 reloc when @PLT is present.
+         let (sym, rtype) = if let Some(base) = symbol.strip_suffix("@PLT") {
+@@ -944,7 +966,7 @@ impl super::InstructionEncoder {
+             (symbol, reloc_type)
+         };
+         self.relocations.push(Relocation {
+-            offset: self.offset + self.bytes.len() as u64 - (self.offset), // adjusted in caller
++            offset: self.bytes.len() as u64,
+             symbol: sym.to_string(),
+             reloc_type: rtype,
+             addend,
+diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
+index 5ad387f7..689ce656 100644
+--- a/src/backend/x86/assembler/parser.rs
++++ b/src/backend/x86/assembler/parser.rs
+@@ -2006,6 +2006,27 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
+     Ok(Displacement::Symbol(s.to_string()))
+ }
+ 
++/// Split a relocation target spelled `symbol+constant` / `symbol-constant`.
++///
++/// Bare operands are deliberately parsed as `Operand::Label` because the
++/// parser cannot know whether `foo+4` is a branch target or an absolute memory
++/// operand.  Every such path ultimately records a relocation, so the encoder's
++/// relocation choke point uses this helper to recover the addend.  Keeping the
++/// grammar here prevents the label and memory-displacement paths from drifting
++/// (the latter already calls `try_parse_symbol_plus_offset` directly).
++pub(crate) fn split_relocation_symbol_addend(s: &str) -> Option<(&str, i64)> {
++    match try_parse_symbol_plus_offset(s)? {
++        Displacement::SymbolPlusOffset(ref symbol, addend) => {
++            // `try_parse_symbol_plus_offset` trims the symbol. Return the
++            // corresponding slice of the caller's string so relocation
++            // recording does not need to allocate just to normalise a name.
++            let start = s.find(symbol.as_str())?;
++            Some((&s[start..start + symbol.len()], addend))
++        }
++        _ => None,
++    }
++}
++
+ /// Try to parse a `symbol+offset` or `symbol-offset` expression.
+ /// Returns None if the string doesn't match this pattern.
+ fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
+@@ -4035,6 +4056,25 @@ mod tests {
+         assert!(parse_memory_operand("sym+4(%esp)").is_ok());
+     }
+ 
++    /// Bare label operands stay context-neutral until instruction dispatch,
++    /// but their relocation addends must use the exact same grammar as a
++    /// parenthesized memory displacement.
++    #[test]
++    fn test_split_relocation_symbol_addend() {
++        assert_eq!(split_relocation_symbol_addend("ext+9"), Some(("ext", 9)));
++        assert_eq!(
++            split_relocation_symbol_addend(" ext - 7 "),
++            Some(("ext", -7))
++        );
++        assert_eq!(split_relocation_symbol_addend("4+ext"), Some(("ext", 4)));
++        assert_eq!(
++            split_relocation_symbol_addend(".Ltarget+1"),
++            Some((".Ltarget", 1))
++        );
++        assert_eq!(split_relocation_symbol_addend("plain"), None);
++        assert_eq!(split_relocation_symbol_addend("sym-other"), None);
++    }
++
+     /// GAS `\@` must be substituted with a DISTINCT value per macro
+     /// expansion (kernel ANNOTATE emits `.Lhere_\@:` once per use; a shared
+     /// value collapses every annotation onto one label).
+diff --git a/src/ir/lowering/global_decl.rs b/src/ir/lowering/global_decl.rs
+index 40726a2b..1a70b274 100644
+--- a/src/ir/lowering/global_decl.rs
++++ b/src/ir/lowering/global_decl.rs
+@@ -398,6 +398,21 @@ impl Lowerer {
+             } else {
+                 da.base_ty
+             };
++            // `struct_layout` may describe the pointee of a pointer declaration.
++            // It must not shape the pointer object's own brace initializer:
++            //
++            //     static const struct big *p = { &object };
++            //
++            // The object is one pointer wide, not `sizeof(struct big)`.  Passing
++            // the pointee layout here made compound lowering append trailing
++            // struct padding after the relocation while IrGlobal::size remained
++            // 8, bloating custom pointer-table sections and making their consumers
++            // iterate across zero-filled phantom entries.
++            let object_struct_layout = if da.is_pointer {
++                None
++            } else {
++                da.struct_layout.clone()
++            };
+             self.lower_global_init(
+                 initializer,
+                 &decl.type_spec,
+@@ -405,7 +420,7 @@ impl Lowerer {
+                 da.is_array,
+                 da.elem_size,
+                 da.actual_alloc_size,
+-                &da.struct_layout,
++                &object_struct_layout,
+                 &da.array_dim_strides,
+             )
+         } else {
+diff --git a/tests/asm-diff/reloc-addend.casefile b/tests/asm-diff/reloc-addend.casefile
+new file mode 100644
+index 00000000..91c1ab5d
+--- /dev/null
++++ b/tests/asm-diff/reloc-addend.casefile
+@@ -0,0 +1,11 @@
++;;; bare_memory_and_internal_pc8_addends
++.text
++.extern ext
++movq ext+9, %rdx
++movq %rdx, ext-7
++movl ext+5, %eax
++movl %eax, ext-3
++btq $7, ext+11
++.Lagain:
++loop .Lagain+1
++jrcxz .Lagain+1
+diff --git a/tests/regression/global_braced_pointer_to_struct_section_extent.c b/tests/regression/global_braced_pointer_to_struct_section_extent.c
+new file mode 100644
+index 00000000..aac95ea7
+--- /dev/null
++++ b/tests/regression/global_braced_pointer_to_struct_section_extent.c
+@@ -0,0 +1,39 @@
++/*
++ * A braced initializer for a pointer-to-struct object must occupy exactly one
++ * pointer slot.  The pointee layout must not leak into the initializer and pad
++ * each slot to sizeof(struct payload).  Linux x86's .apicdrivers table uses
++ * this exact shape and walks from __start to __stop one pointer at a time.
++ */
++struct payload {
++    unsigned long words[28];
++};
++
++static struct payload a, b, c;
++
++__attribute__((used, section("pointer_table")))
++static const struct payload *slot_a = { &a };
++__attribute__((used, section("pointer_table")))
++static const struct payload *slot_b = { &b };
++__attribute__((used, section("pointer_table")))
++static const struct payload *slot_c = { &c };
++
++extern const struct payload *__start_pointer_table[];
++extern const struct payload *__stop_pointer_table[];
++
++int main(void)
++{
++    if (__stop_pointer_table - __start_pointer_table != 3)
++        return 1;
++    unsigned seen = 0;
++    for (unsigned i = 0; i != 3; ++i) {
++        if (__start_pointer_table[i] == &a)
++            seen |= 1;
++        else if (__start_pointer_table[i] == &b)
++            seen |= 2;
++        else if (__start_pointer_table[i] == &c)
++            seen |= 4;
++        else
++            return 2;
++    }
++    return seen != 7;
++}
 diff --git a/engineering/FOLLOWUP-2026-09-19B-post557-perf-and-flake.md b/engineering/FOLLOWUP-2026-09-19B-post557-perf-and-flake.md
 new file mode 100644
 index 00000000..c96908f6
