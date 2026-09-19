@@ -1,824 +1,906 @@
-diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 68124780..19492ae1 100644
---- a/.github/workflows/ci.yml
-+++ b/.github/workflows/ci.yml
-@@ -307,6 +307,18 @@ jobs:
-           CCC: target/fastbuild/lccc
-         run: bash tests/regression/check_vec_adler_epic.sh
- 
-+      # x86 SIMD ISA contract of the middle end: every vectorization
-+      # entry that runs BEFORE the main vectorizer's gate must carry
-+      # its own -mno-sse refusal (the const-trip map path and the
-+      # memory-form ARX vectorizer both left XMM intrinsics in kernel
-+      # TUs otherwise), -mno-avx downgrades to 128-bit instead of
-+      # disabling, and the FMA3 fold only fires when the backend can
-+      # emit vfmadd. Emission AND executed semantics are pinned.
-+      - name: Verify vectorizer ISA gate contracts
-+        env:
-+          CCC: target/fastbuild/lccc
-+        run: bash tests/regression/check_vectorize_isa_gate.sh
-+
-       # BB-SLP v6 (the gate ci.yml was missing — ci_local.sh had it): the
-       # 128-bit VEX memory fold, FP negation sign-mask, integer min/max
-       # folds, the general cmp+blendv composite, and the rule-(b)
-diff --git a/engineering/FOLLOWUP-2026-09-19-pr555-hardening.md b/engineering/FOLLOWUP-2026-09-19-pr555-hardening.md
+diff --git a/engineering/FOLLOWUP-2026-09-19B-post557-perf-and-flake.md b/engineering/FOLLOWUP-2026-09-19B-post557-perf-and-flake.md
 new file mode 100644
-index 00000000..44dc7f9d
+index 00000000..c96908f6
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-19-pr555-hardening.md
-@@ -0,0 +1,133 @@
-+# Follow-up: PR #555 red-team audit — finish line and hardening
++++ b/engineering/FOLLOWUP-2026-09-19B-post557-perf-and-flake.md
+@@ -0,0 +1,246 @@
++# Follow-up: post-#557 audit — hot-path cost, harness wiring, and a live test flake
 +
-+Date: 2026-09-19 (session 55)
-+Base: PR #555 `cfe6a4bc` ("Harden x86 codegen and boot harness regressions")
-+on upstream `11e3a1cd` (merge of #554). Audit commit: see `git log` for
-+`pr555-audit`.
++Date: 2026-09-19 (session 56)
++Base: `407eb492` (merge of PR #557) — the tree is CI-green on all three checks.
 +
-+## What this session did
++PR #557 fixed the CI blocker from PR #555 (`cargo fmt --check`, which runs
++before clippy in the *Clippy* job) and, more importantly, found three real
++defects #555 had shipped: the unsound `rcx_is_live_at` kill heuristic, the
++missing `vec_arx` ISA gate, and `encode_push`'s rejection of segment
++registers. This session audits #557 itself. It found no correctness defect in
++the merged code; it found **cost** defects in the merged fixes, two harness
++wiring gaps, and one **live CI flake** that predates both PRs.
 +
-+PR #555 was red on CI (the Clippy job). Root cause: the job runs
-+`cargo fmt --all -- --check` FIRST; the PR's tree had five formatting
-+divergences (encoder/mod.rs test literal layout, a doubled blank line in
-+passes/mod.rs, a brace placement in lvalue.rs), so the job died at the fmt
-+step and clippy never ran. Local clippy on the identical stable toolchain
-+(rustc 1.98.1) is green on lib/bins/tests with `-D warnings` — after
-+formatting, the CI job is expected green end-to-end.
++## 1. `is_label_like` — two heap allocations per call on the hottest predicate in the assembler
 +
-+The full PR diff (16 files) was then audited hunk-by-hunk. Verdicts and
-+the additional defects found and fixed:
++#557 kept #555's guard verbatim:
 +
-+### PR hunks verified sound (no change needed)
++```rust
++if parse_integer_expr(s).is_ok() { return false; }   // first statement
++```
 +
-+* **i686 `.code16` unsuffixed stack ops** — the guarded match arms route
-+  `push`/`pop` to the 16-bit encoders exactly when `code16 && !code16gcc`;
-+  the `fixup_code16_prefixes` inversion then produces GAS-identical bytes
-+  in all three modes (verified against local binutils: `.code16 push $0`
-+  = `6a 00`, `.code16gcc push $0` = `66 6a 00`, `.code32` = `6a 00`).
-+* **x86 parser hex-constant vs symbol-difference** — `is_label_like` now
-+  rejects anything `parse_integer_expr` accepts. This is correct beyond
-+  the kernel driver (`init_top_pgt - 0xffffffff80000000` →
-+  SymbolPlusOffset with addend `0x80000000`): bare integers can never be
-+  GAS numeric local labels (those are always `Nb`/`Nf` spellings, which
-+  still fail integer parsing), so `sym - <integer>` expressions stop
-+  manufacturing phantom SymbolDiff symbols. All other is_label_like call
-+  sites (displacement and data-value paths) inherit the same correction.
-+* **emit.rs typed-call home-def** — sound. `try_lower_call_typed` builds
-+  `CallRetMove { dst: Reg(home) }` exactly when `reg_assignments` holds
-+  the dest (the Slot form never has a register assignment, so the outer
-+  `continue` already skips it), and `CallTyped` is buffered and flushed as
-+  its own run — nothing can follow the ret-move inside the window, so
-+  "a call result re-establishes its home unconditionally" is exact.
-+  Follow-up note: this fix has no unit test; emit.rs has no test module
-+  (corpus-level coverage is the established pattern there — the
-+  differential oracle + regression suite carry it).
-+* **lvalue/structs pointer-to-array subscripts** — the type-driven
-+  `result_is_array` predicate (Array/Pointer whose element is an Array)
-+  matches C semantics for `T(*)[N]` subscripts and works whether or not
-+  the base type is decayed; the structs.rs arm ordering is safe because
-+  `struct_layout_from_ctype` declines non-struct elements.
-+* **aggregate_copy_forward partial spans** — the `spans_parallel` guard
-+  converts a metadata-mismatch ICE into a no-op sync; computed before the
-+  instruction remove in both sites. Correct.
-+* **vectorize.rs const-trip ISA gate** — correct and necessary (see the
-+  vec_arx finding below for the proof that the failure mode is real).
++`is_label_like` is called from ~20 sites in `parser.rs` and runs for every
++candidate symbol of every operand of every assembly line. On a **miss** — i.e.
++for every ordinary symbol name, which is the overwhelming majority of calls —
++`parse_integer_expr` allocates an error `String` in `parse_single_integer`
++(`format!("bad integer: {}")`), then allocates a second one in `tokenize_expr`
++(`format!("unexpected char '{}' …")`) before the result is discarded.
 +
-+### Defects found by the audit and fixed in this session
++Replaced with an allocation-free byte scan. Equivalence is structural, not
++empirical: a string that survives the label charset contains no operator,
++parenthesis, sign, quote or whitespace, so the evaluator can only accept it
++through its single-literal fast path — and that path necessarily begins with an
++ASCII digit. Identifiers therefore never enter the scan at all.
 +
-+1. **`rcx_is_live_at` kill detection was unsound** (the PR's own new
-+   code). The hand-rolled mnemonic-prefix list treated `cmovcc` into
-+   `%rcx` as a pure write — but a conditional move PRESERVES the old
-+   destination when the condition is false, i.e. reads it — and treated
-+   `setcc %cl` / `movw %ax, %cx` as kills — but sub-width writes leave
-+   the surviving bits of the copied 64-bit value observable. Three new
-+   unit tests fail on the PR's version and pass on the fix (reproduced
-+   both ways); a positive control keeps genuine full kills
-+   (`movq %rbx, %rcx`) eliminating. The kill test now composes the
-+   shared acceptance-grade predicates: `writes_family_full` (sub-width
-+   excluded) ∧ `implicit_read_refs == 0` (`rep` counts, `cpuid`
-+   subleaf) ∧ `!is_read_modify_write` (cmov) ∧ no source-side family
-+   mention (memory bases).
-+2. **`vec_arx::vec_arx_function` had no ISA gate** — the same bug class
-+   the PR fixed for `vectorize_const_trip_map_loops`. It runs in Phase
-+   2b BEFORE the main vectorizer's gate and emits XMM-shaped Vec*
-+   intrinsics. Proven live:
-+   `tests/benchmark/programs/chacha20_block.c` (the array spelling) with
-+   the kernel's `-mno-sse` set failed pre-fix with
-+   `floating-point operation requires SSE ... movdqu (%rax), %xmm2`;
-+   with the gate it compiles to zero SIMD refs at -O2 and -O3. The ISA
-+   gate script now pins both spellings (array + phi) under the kernel
-+   flag set.
-+3. **`encode_push` rejected segment registers** — `push %ds` unsuffixed
-+   hard-errored ("bad register") in `.code32`/`.code16gcc` where GAS
-+   emits `1e` / `66 1e` (binutils 2.44 adds the inert `0x66` in gcc
-+   mode). Added the segment arms mirroring `encode_pop`/`encode_push16`;
-+   the `sized_op` bookkeeping already set at the function top yields
-+   byte-exact GAS parity in all three modes (unit-tested against the
-+   verified binutils dump, including `pushl %ds` = `66 1e` in `.code16`
-+   and the two-byte `fs`/`gs` forms).
-+4. **The ISA gate script was wired into NEITHER CI mirror** — the PR
-+   hardened `check_vectorize_isa_gate.sh` (kernel-FMA diagnostic
-+   contract) but ci.yml/ci_local.sh never ran it, so the very contract
-+   it pins (including the PR's own vectorize.rs fix) was unenforced.
-+   Wired into both; ci_local now runs 45 gates green.
++Measured against the real evaluator, which was included verbatim into an
++out-of-tree harness (`#[path = ".../src/backend/asm_expr.rs"] mod asm_expr;`,
++built with `rustc -O --edition 2021`) so the "before" side is the shipped code
++path and not a model of it. Corpus weighted 18:2 symbol:literal, as in a real
++object file:
 +
-+### Formatting (the CI blocker)
++```
++parity: OK on 22 tokens
++calls: 1136000  main: 156.86ms (138.1 ns/call)   new: 14.19ms (12.5 ns/call)   speedup: 11.06x
++calls: 1136000  main: 153.10ms (134.8 ns/call)   new: 18.52ms (16.3 ns/call)   speedup: 8.27x
++```
 +
-+`cargo fmt --all` applied to the five divergences; `--check` is green.
-+Pure whitespace, no semantic change (diff reviewed line-by-line).
++Guarded by `test_bare_integer_literal_matches_shared_evaluator`, which
++exhaustively compares the recognizer against `parse_integer_expr` over all
++69,904 strings of length ≤ 4 drawn from a 16-char alphabet covering every
++decision the recognizer makes (radix prefixes in both cases, valid and invalid
++digits per radix, the octal-vs-decimal selection on a leading zero, suffix
++stripping, charset-only separators), plus width-boundary cases the corpus
++cannot reach (16/17 hex digits, 63/64 bits, i64::MAX and 2^63 in octal,
++u64::MAX and u64::MAX+1 in decimal, and leading-zero padding).
++
++Note the radix subtleties the recognizer has to reproduce exactly: a leading
++zero selects octal and **never falls back to decimal**, so `09` is not a
++literal; and width limits are applied to the *significant* digits, because
++`from_str_radix` tolerates leading zeros (`0x0000000000000000001` is 1).
++
++## 2. `rcx_is_live_at` — #557's correct kill test is expensive, and the caller runs it three times
++
++#557 replaced the mnemonic-prefix heuristic with the crate's acceptance-grade
++predicates, which is the right call. The cost was not accounted for: per
++candidate line the kill test now runs `writes_family_full` (which itself walks
++the `implicit_full_write_refs` mnemonic table and re-splits the destination),
++`implicit_read_refs` (a **second** mnemonic-table walk through
++`classify_implicit_operands`), `is_read_modify_write`, and four independent
++`contains` substring searches.
++
++Meanwhile `eliminate_rcx_address_copy` still rebuilt the successor index `k`
++and re-ran the whole walk in each of its three sub-patterns — up to **three
++full walks per candidate**, for an answer that cannot differ between them (the
++walk is pure and nothing mutates in between; every success path `continue`s).
++
++Three changes, all semantics-preserving:
++
++* The walk is computed **once per candidate**, behind a guard that is exactly
++  the union of the three sub-pattern guards (`line_j.starts_with("mov")` — both
++  `movq (%rcx), %rax` and `movsd (%rcx), %xmmN` start with "mov"), so it is
++  never paid for a line no fold could use.
++* The conjunction is ordered cheapest-and-most-selective first. The common case
++  for a line that mentions the family is a **use**, which the single-pass
++  source scan now settles before any predicate is called. The cached
++  `reg_refs` bitmask test also moved ahead of the first touch of line text.
++* `mentions_rcx_family` replaces the four `contains` calls with one scan
++  anchored on `%` (unit-tested against the exact four spellings and the
++  look-alikes a coarser search would over-match, e.g. `%ch`, `%rrcx`).
++
++## 3. A robustness defect in #557's source-operand split
++
++#557 derived the source operand by length arithmetic:
++
++```rust
++let dest_token = t.rsplit(',').next().unwrap_or(t).trim();
++let head = &t[..t.len() - dest_token.len()];
++```
++
++`dest_token` is **trimmed** but the cut is taken from the **raw** length, and
++`LineStore::get` returns the raw line slice — `LineStore::new` splits on `\n`
++and never trims the right edge. With four or more trailing blanks (or a stray
++`\r` from a CRLF file plus blanks) the window reaches back into the destination
++itself, the source side then appears to mention `%rcx`, and a genuine
++full-width kill is reported as a use: the address copy survives. Conservative,
++so not a miscompile — but it silently makes the fold dependent on invisible
++trailing whitespace in externally supplied assembly.
++
++Fixed by splitting once on the last comma (`rsplit_once`), which is also one
++pass instead of two. `test_rcx_address_copy_full_kill_ignores_trailing_whitespace`
++pins it. All six of #557's soundness tests still pass unchanged.
++
++## 4. ISA gate placed behind the work it gates
++
++`vectorize_const_trip_map_loops` put its (free) thread-local ISA gate **fourth**,
++after a whole-function `DynAlloca` scan, `func_has_volatile_loop_access`, and a
++`std::env::var("CCC_NO_MAP_VEC")` allocation. A gated TU — the kernel's
++`-mno-sse -mgeneral-regs-only` contract, i.e. precisely the case #557 added the
++gate for — paid two IR walks and an environment allocation per function to
++reach a decision that was made before the pass ran. Hoisted to first; all four
++guards are pure `return 0`, so ordering is semantic-free.
++
++`vec_arx_function` already gates first (#557), and the const-trip call site in
++`passes/mod.rs` is already `Target::X86_64`-only, so neither gate can starve
++AArch64/RISC-V (whose `X86Isa` is `NONE` and would otherwise read as "SIMD
++unavailable").
++
++## 5. `boot_size_oracle.sh` sourced `boot_offsets.sh` and never called it
++
++#557 added `. "$here/boot_offsets.sh"` but no `ensure_boot_offset_stubs` call,
++while `build_kernel_boot.sh` does call it. `LCCC_BOOT_OBJS` (from
++`boot_flags.sh`) includes `header`, and `header.S` includes `zoffset.h` /
++`voffset.h` for `ZO_efi*_stub_entry` / `VO__text`. The oracle therefore died on
++the missing header instead of reporting a size delta — the exact failure the
++helper exists to prevent. #557's own follow-up #4 records that the boot
++harnesses were never run, which is how this survived.
++
++Wired up after `cd "$K"`. Both toolchains compile the identical stubbed header,
++so the oracle's contract ("a delta is a code-generation delta and nothing else")
++holds.
++
++## 6. `qemu_boot_test.sh` firmware union assumed one package split
++
++The union guard hard-coded a single assignment — BIOS in `$bios_dir`, all three
++option ROMs in `$rom_dir` — while the loop that stages the union already
++resolved each file independently. Any other complete split (a bundle with the
++BIOS beside the ROMs but not all four in one directory, or a distro that puts
++`efi-e1000.rom` with SeaBIOS) was rejected with "could not find a complete QEMU
++firmware set", and the naive loosening of that guard would have created
++dangling symlinks.
++
++Now resolved per file: accept the union iff every required file exists in one of
++the two directories, and symlink the resolved path. Verified against four mock
++layouts — Debian split, reversed split, mixed split, and a genuinely incomplete
++set (correctly still rejected), with no dangling links in any accepted case.
++
++## 7. A live CI flake: `CCC_NO_TWO_BLOCK_UNROLL` mutated the process environment under parallel tests
++
++Observed directly during this session's verification: a full
++`cargo test --all-targets` run failed
++`passes::loop_unroll::tests::two_block_unroll_profitability_positive_control`
++with `load+store latch must unroll: left 0, right 1`, on a tree whose only
++changes were in the assembler parser, the peephole and a vectorizer guard — and
++the same test had passed in the previous run.
++
++Root cause: `two_block_unroll_declines_when_killed` did
++
++```rust
++unsafe { std::env::set_var("CCC_NO_TWO_BLOCK_UNROLL", "1") };
++let n = unroll_loops(&mut func, UnrollPhase::PostVec);
++unsafe { std::env::remove_var("CCC_NO_TWO_BLOCK_UNROLL") };
++```
++
++while `unroll_loops` itself read that variable (`loop_unroll.rs:253`).
++`std::env::set_var` is process-global and libtest runs tests on parallel threads
++of one binary, so every sibling `unroll_loops(.., PostVec)` test that happened to
++run inside the window saw the kill switch ON.
++
++Reproduced and measured on the merged tree:
++
++```
++two_block_unroll group, --test-threads=2:  FAILING RUNS 11 / 150   (~7%)
++```
++
++which matches the "~1-in-10 flake in this module" that `loop_invert.rs` documents
++for the identical defect — and that module already states the fix: *"Configuration
++a caller can supply belongs in a parameter, not in ambient global state."*
++
++Applied the crate's own established remediation (the `set_x86_simd_isa` pattern):
++a `TWO_BLOCK_UNROLL_ENABLED` thread-local defaulting to enabled, a
++`set_two_block_unroll_enabled` setter called once at the top of `run_passes`
++(which is where both `unroll_loops` call sites live, spans 921–2594), and the
++kill-switch test now toggles per-thread state instead of the environment. As a
++side benefit the hot path no longer reads the process environment per call.
++
++```
++after:  two_block_unroll group, 200 runs  ->  FAILING RUNS 0 / 200
++```
++
++The driver contract is unchanged and verified end to end:
++`tests/regression/check_two_block_unroll_redteam.sh` (which exercises
++`CCC_NO_TWO_BLOCK_UNROLL=1` differentials) reports
++`ok: two_block_unroll_redteam (runtime, tri-config, kill-switch, SSE2 baseline,
++Max kill-switch, asm contracts)`.
++
++The same `set_var` pattern exists in `vec_interleave.rs`, `vec_load_sink.rs` and
++`loop_align.rs`. Measured at 0/120 each, so they are latent rather than live and
++were left alone; `location_alloc/policy.rs` is already correct by construction
++(uniquely named throwaway variables, with a SAFETY comment saying so).
 +
 +## Verification (final tree)
 +
 +* `cargo fmt --all -- --check`: green.
-+* clippy lib/bins/tests, `--profile fastbuild --locked -D warnings`: green.
-+* `cargo test`: 2890 passed, 0 failed (2861 at the PR base + the PR's and
-+  this session's tests).
-+* Full regression suite: PASS=720 FAIL=3 SKIP=17, AB-diff 0 (the 3 =
-+  the pre-existing environmental i686 multilib-header failures; no root).
-+* `ci_local.sh --fast`: 45 passed, 0 failed, 3 skipped (new gate
-+  `vectorize-isa-gate` included).
-+* Benchmark output oracle: 204/204 PASS.
-+* bash -n on all changed scripts; ci.yml/bench.yml YAML-validated.
-+* GAS byte-parity evidence for the encoder changes captured against the
-+  local binutils (code16 / code16gcc / code32 dumps in the session log).
++* `cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings`: green.
++* `cargo test --profile fastbuild --all-targets --locked -j 2` with
++  `RUSTFLAGS=-D warnings`: **2917 passed, 0 failed, 6 ignored** (5 new tests).
++* `two_block_unroll` group: 0/200 failing runs (was 11/150).
++* `tests/regression/check_two_block_unroll_redteam.sh`: ok.
++* `tests/regression/check_vectorize_isa_gate.sh`: PASS.
++* `bash -n` on both changed shell scripts; `git diff --check` clean.
++* QEMU firmware union: 4/4 mock layouts behave correctly.
++* `is_label_like`: exhaustive evaluator parity over 69,904 inputs + width boundaries.
 +
-+## Follow-ups
++Boot-size harnesses still cannot run here (no kernel tree), as in #557.
 +
-+1. **emit.rs typed-call home-def unit coverage** — needs a MachInst
-+   window harness (reg_assignments + prior home_clobber + CallTyped in
-+   one window); until then the differential oracle is the guard.
-+2. **`.code16gcc` segment pop parity** — `encode_pop`'s unconditional
-+   `sized_op = true` coincidentally matches modern binutils (`66 07`)
-+   in gcc mode; if byte-parity with older GAS is ever wanted, split the
-+   flag per-arm (functionally irrelevant: the prefix is architecturally
-+   ignored on segment push/pop).
-+3. **`xorl %ecx, %ecx` as a kill** — the zeroing idiom is a genuine full
-+   redefinition but `is_read_modify_write`'s conservative default keeps
-+   the address copy; a same-register-source exception in the kill test
-+   would unlock it if it ever shows up in profiles.
-+4. **Boot harness gates** remain SKIP in this sandbox (no kernel tree);
-+   the boot-offset stubs and QEMU firmware-union logic are bash -n /
-+   logic-reviewed only. First run on a kernel-equipped host should
-+   confirm `ensure_boot_offset_stubs` restores deterministic setup
-+   offsets after a full Kbuild.
-diff --git a/scripts/boot_offsets.sh b/scripts/boot_offsets.sh
-new file mode 100644
-index 00000000..388c06eb
---- /dev/null
-+++ b/scripts/boot_offsets.sh
-@@ -0,0 +1,60 @@
-+#!/usr/bin/env bash
-+# Shared setup-only offset fallback for the x86 boot-size harnesses.
-+#
-+# A full kernel build normally regenerates zoffset.h/voffset.h from the
-+# compressed image and vmlinux.  The setup-size harness intentionally links
-+# only arch/x86/boot, so it uses immediates instead.  Keep the fallback
-+# deterministic and restore it when a preceding full build left a generated
-+# zoffset.h without the EFI mixed-mode symbols that header.S requires.
++## Follow-ups not taken (deliberate, with reasons)
 +
-+ensure_boot_offset_stubs() {
-+  local zoffset=${1:-arch/x86/boot/zoffset.h}
-+  local voffset=${2:-arch/x86/boot/voffset.h}
-+  local tmp
-+
-+  if [[ ! -r "$zoffset" ]] || \
-+     ! grep -q '^#define ZO_efi32_stub_entry ' "$zoffset" || \
-+     ! grep -q '^#define ZO_efi64_stub_entry ' "$zoffset"; then
-+    tmp="${zoffset}.tmp.$$"
-+    cat >"$tmp" <<'EOF'
-+/* STUB zoffset.h — normally generated from compressed/vmlinux.
-+ * Values are immediates only; they do not affect setup.elf size. */
-+#define ZO_startup_32 0x1000
-+#define ZO_efi32_stub_entry 0x1000
-+#define ZO_efi64_stub_entry 0x1200
-+#define ZO_efi_pe_entry 0x1300
-+#define ZO_efi32_pe_entry 0x1400
-+#define ZO_input_data 0x200000
-+#define ZO_kernel_info 0x1500
-+#define ZO__end 0x800000
-+#define ZO__ehead 0x200
-+#define ZO__text 0x210
-+#define ZO__data 0x300
-+#define ZO__edata 0x800000
-+#define ZO__sbat 0x400
-+#define ZO__esbat 0x410
-+#define ZO_z_input_len 0x100000
-+#define ZO_z_output_len 0x400000
-+#define ZO_z_extract_offset 0x0
-+#define ZO_z_min_extract_offset 0x1000
-+#define ZO_z_extra_bytes 0x10000
-+#define ZO_INIT_SIZE 0x500000
-+EOF
-+    mv -f "$tmp" "$zoffset"
-+  fi
-+
-+  # Current vmlinux-generated files already contain these symbols.  Only fill
-+  # a missing file: unlike zoffset.h, their values can affect header constants
-+  # in a real build and should not be overwritten unnecessarily.
-+  if [[ ! -r "$voffset" ]] || \
-+     ! grep -q '^#define VO__text ' "$voffset" || \
-+     ! grep -q '^#define VO__end ' "$voffset"; then
-+    tmp="${voffset}.tmp.$$"
-+    cat >"$tmp" <<'EOF'
-+/* STUB voffset.h — normally generated from vmlinux. Immediates only. */
-+#define VO__text 0x100000
-+#define VO__end  0x800000
-+EOF
-+    mv -f "$tmp" "$voffset"
-+  fi
-+}
++1. **`Ret` is not a scan barrier in `rcx_is_live_at`.** Control cannot flow past
++   a `ret`, so `%rcx` is genuinely dead there and returning `false` would be
++   sound and would enable more folds. Not taken: it changes codegen decisions,
++   and the scan already terminates a few lines later at the next function's
++   label, so the compile-time benefit is negligible. Needs the kernel harness to
++   validate the codegen side.
++2. **`writes_family_full` misses single-operand full redefinitions.**
++   `dest_operand_is_full_width` splits on the last comma, so `popq %rcx` — a
++   genuine full kill — is not recognized and the address copy survives.
++   Conservative and pre-existing in a shared helper used by several passes;
++   fixing it is a cross-pass change.
++3. **`xorl %ecx, %ecx` as a kill** — #557's own follow-up #3, unchanged.
++4. **`note_home_written` reads `std::env::var_os("CCC_TRACE_NOTES")` per call.**
++   A per-instruction environment lookup in `emit.rs`; #557's typed-call change
++   routes slightly more traffic through it. Pre-existing and unrelated to this
++   series.
++5. **`vectorize_with_analysis_mode` computes `find_natural_loops` before its ISA
++   gate** — the same class as §4 and more expensive. Not hoisted because the
++   `LCCC_DEBUG_VECTORIZE` diagnostic prints the loop count, so moving the gate
++   would change observable debug output.
 diff --git a/scripts/boot_size_oracle.sh b/scripts/boot_size_oracle.sh
-index dd6d6668..61124054 100644
+index 61124054..5debb97c 100644
 --- a/scripts/boot_size_oracle.sh
 +++ b/scripts/boot_size_oracle.sh
-@@ -44,6 +44,8 @@ CC_ORACLE=${CC_ORACLE:-gcc}
- 
- # shellcheck source=boot_flags.sh
- . "$here/boot_flags.sh"
-+# shellcheck source=boot_offsets.sh
-+. "$here/boot_offsets.sh"
- 
+@@ -50,6 +50,14 @@ CC_ORACLE=${CC_ORACLE:-gcc}
  [[ -d $K ]] || { echo "boot_size_oracle: kernel tree missing: $K" >&2; exit 1; }
  [[ -x $LCCC ]] || { echo "boot_size_oracle: lccc missing: $LCCC" >&2; exit 1; }
-diff --git a/scripts/build_kernel_boot.sh b/scripts/build_kernel_boot.sh
-index af57ef4f..8e60b5c1 100755
---- a/scripts/build_kernel_boot.sh
-+++ b/scripts/build_kernel_boot.sh
-@@ -36,6 +36,12 @@ cd "$K"
- # comparison must never be confounded by a flag difference).
- # shellcheck source=boot_flags.sh
- . "$SCRIPT_DIR/boot_flags.sh"
-+# shellcheck source=boot_offsets.sh
-+. "$SCRIPT_DIR/boot_offsets.sh"
-+# A preceding full Kbuild may have replaced the setup-only zoffset.h with a
-+# generated file that lacks the mixed-mode EFI symbols.  The setup harness is
-+# deliberately stubbed, so restore deterministic immediates before header.S.
+ cd "$K"
++# `LCCC_BOOT_OBJS` includes `header`, and header.S includes zoffset.h/voffset.h
++# for ZO_efi*_stub_entry / VO__text.  A setup-only link never regenerates them,
++# so this harness was sourcing boot_offsets.sh without ever calling it and then
++# dying on the missing header instead of reporting a size delta.  Restore the
++# same deterministic immediates build_kernel_boot.sh uses; both toolchains
++# compile the identical stubbed header, so the lccc-vs-oracle delta stays
++# codegen-only.
 +ensure_boot_offset_stubs
- RMF="$LCCC_BOOT_CFLAGS"
- INC="$LCCC_BOOT_CPPFLAGS"
- # Extra flags for kconfigless staging (see boot_kconfigless_stage.sh): ways to
-diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index a27410ef..5412a20f 100755
---- a/scripts/ci_local.sh
-+++ b/scripts/ci_local.sh
-@@ -325,6 +325,15 @@ gate "two-block-unroll-redteam" fast \
- gate "vec-adler-epic" fast \
-     bash tests/regression/check_vec_adler_epic.sh
  
-+# x86 SIMD ISA contract of the middle end: every vectorization entry that
-+# runs BEFORE the main vectorizer's gate must carry its own -mno-sse
-+# refusal (the const-trip map path and the memory-form ARX vectorizer
-+# both left XMM intrinsics in kernel TUs otherwise), -mno-avx downgrades
-+# to 128-bit instead of disabling, and the FMA3 fold only fires when the
-+# backend can emit vfmadd.  Emission AND executed semantics are pinned.
-+gate "vectorize-isa-gate" fast \
-+    env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_isa_gate.sh
-+
- gate "cross-backend-atomics" fast \
-     bash tests/regression/check_atomic_backends.sh
- 
+ # The KEEP-annotated copy of setup.ld used by build_kernel_boot.sh; regenerate
+ # identically so both links see the same script.
 diff --git a/scripts/qemu_boot_test.sh b/scripts/qemu_boot_test.sh
-index caea3a95..2e5fb0e9 100755
+index 2e5fb0e9..5b6717a8 100755
 --- a/scripts/qemu_boot_test.sh
 +++ b/scripts/qemu_boot_test.sh
-@@ -81,40 +81,59 @@ chmod +x "$WORK/root/bin/busybox"
- ( cd "$WORK/root" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -1 > "$WORK/initramfs.cpio.gz" )
- 
- # ---- boot --------------------------------------------------------------------
--# QEMU loads its PC BIOS from the compiled-in data dir; a locally extracted
--# qemu package (no root install) must point -L at its firmware directory.
--# QEMU_DATA_DIR selects it explicitly; otherwise a share/{qemu,seabios}
--# directory next to the qemu binary is auto-detected.
-+# QEMU loads its PC BIOS from the directory passed with -L.  Debian splits
-+# the firmware across qemu-system-data (/usr/share/qemu) and SeaBIOS
-+# (/usr/share/seabios), while extracted/no-root QEMU bundles often put the
-+# same files in one directory.  Accept both layouts and stage a private union
-+# under WORK when necessary; this makes the harness deterministic instead of
-+# requiring the operator to hand-create a firmware directory.
- qemu_l=()
--if [[ -n ${QEMU_DATA_DIR:-} ]]; then
--    [[ -f "$QEMU_DATA_DIR/bios-256k.bin" ]] || {
--        echo "qemu_boot_test: QEMU_DATA_DIR has no bios-256k.bin: $QEMU_DATA_DIR" >&2
-+firmware_dir=""
-+qemu_data=${QEMU_DATA_DIR:-}
-+if [[ -n "$qemu_data" ]]; then
-+    if [[ -f "$qemu_data/bios-256k.bin" && -f "$qemu_data/linuxboot_dma.bin" \
-+          && -f "$qemu_data/kvmvapic.bin" && -f "$qemu_data/efi-e1000.rom" ]]; then
-+        firmware_dir=$qemu_data
-+    else
-+        echo "qemu_boot_test: QEMU_DATA_DIR is not a complete firmware directory: $qemu_data" >&2
-+        echo "  Need bios-256k.bin, linuxboot_dma.bin, kvmvapic.bin and efi-e1000.rom." >&2
-         exit 1
--    }
--    qemu_l=(-L "$QEMU_DATA_DIR")
-+    fi
- else
--    # A bootable -kernel run needs BOTH the BIOS (seabios package) and the
--    # option ROMs (qemu-system-data: linuxboot_dma.bin, kvmvapic.bin;
--    # ipxe-qemu: efi-*.rom for the default NIC). A dir that has only one
--    # half boots SeaBIOS and then DIES on "failed to find romfile" — worse,
--    # the efi-e1000.rom miss is FATAL and aborts QEMU before the guest
--    # starts. On a no-root harness the three debs are dpkg-extracted side
--    # by side, so accept only a dir holding the complete union.
-     qdir=$(dirname "$(command -v "$QEMU")")
--    for d in "$qdir/../share/qemu" "$qdir/../share/seabios"; do
-+    rom_dir=${QEMU_ROM_DIR:-$qdir/../share/qemu}
-+    bios_dir=${QEMU_BIOS_DIR:-$qdir/../share/seabios}
-+    # Prefer a single self-contained directory (AppImage/tarball layout).
-+    for d in "$rom_dir" "$bios_dir"; do
-         if [[ -f "$d/bios-256k.bin" && -f "$d/linuxboot_dma.bin" \
-               && -f "$d/kvmvapic.bin" && -f "$d/efi-e1000.rom" ]]; then
--            qemu_l=(-L "$d"); break
-+            firmware_dir=$d
-+            break
+@@ -111,19 +111,36 @@ else
+             break
          fi
      done
--    if ((${#qemu_l[@]} == 0)); then
--        echo "qemu_boot_test: no firmware dir holds the full BIOS + option-ROM union" >&2
--        echo "  (bios-256k.bin + linuxboot_dma.bin + kvmvapic.bin + efi-e1000.rom)." >&2
--        echo "  On a no-root host: symlink the contents of qemu-system-data, seabios" >&2
--        echo "  and ipxe-qemu into one dir and export QEMU_DATA_DIR=<that dir>." >&2
-+    # Debian's split layout is the normal system install.  Symlinks are
-+    # sufficient and avoid copying firmware into the persistent workspace.
-+    if [[ -z "$firmware_dir" && -f "$bios_dir/bios-256k.bin" \
-+          && -f "$rom_dir/linuxboot_dma.bin" && -f "$rom_dir/kvmvapic.bin" \
-+          && -f "$rom_dir/efi-e1000.rom" ]]; then
-+        firmware_dir="$WORK/qemu-firmware"
-+        rm -rf "$firmware_dir"
-+        mkdir -p "$firmware_dir"
-+        for f in bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom; do
-+            src="$rom_dir/$f"
-+            [[ -f "$src" ]] || src="$bios_dir/$f"
-+            ln -s "$src" "$firmware_dir/$f"
-+        done
-+    fi
+-    # Debian's split layout is the normal system install.  Symlinks are
+-    # sufficient and avoid copying firmware into the persistent workspace.
+-    if [[ -z "$firmware_dir" && -f "$bios_dir/bios-256k.bin" \
+-          && -f "$rom_dir/linuxboot_dma.bin" && -f "$rom_dir/kvmvapic.bin" \
+-          && -f "$rom_dir/efi-e1000.rom" ]]; then
+-        firmware_dir="$WORK/qemu-firmware"
+-        rm -rf "$firmware_dir"
+-        mkdir -p "$firmware_dir"
+-        for f in bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom; do
+-            src="$rom_dir/$f"
+-            [[ -f "$src" ]] || src="$bios_dir/$f"
+-            ln -s "$src" "$firmware_dir/$f"
++    # Debian's split layout is the normal system install: SeaBIOS ships
++    # bios-256k.bin while qemu-system-data / ipxe-qemu ship the option ROMs.
++    # WHICH directory holds WHICH file is a packaging detail, so resolve every
++    # required file independently and accept any split.  (Requiring one fixed
++    # assignment — bios in $bios_dir, all three ROMs in $rom_dir — rejected
++    # complete unions that merely came from a different package layout, and
++    # resolving per file also makes a dangling symlink impossible.)  Symlinks
++    # are sufficient and avoid copying firmware into the persistent workspace.
 +    if [[ -z "$firmware_dir" ]]; then
-+        echo "qemu_boot_test: could not find a complete QEMU firmware set" >&2
-+        echo "  Looked in: ROMs=$rom_dir BIOS=$bios_dir" >&2
-+        echo "  Need bios-256k.bin, linuxboot_dma.bin, kvmvapic.bin and efi-e1000.rom." >&2
-+        echo "  Override QEMU_DATA_DIR with one directory containing that union." >&2
-         exit 1
++        firmware_required=(bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom)
++        firmware_resolved=()
++        firmware_complete=1
++        for f in "${firmware_required[@]}"; do
++            if [[ -f "$rom_dir/$f" ]]; then
++                firmware_resolved+=("$rom_dir/$f")
++            elif [[ -f "$bios_dir/$f" ]]; then
++                firmware_resolved+=("$bios_dir/$f")
++            else
++                firmware_complete=0
++                break
++            fi
+         done
++        if ((firmware_complete)); then
++            firmware_dir="$WORK/qemu-firmware"
++            rm -rf "$firmware_dir"
++            mkdir -p "$firmware_dir"
++            for i in "${!firmware_required[@]}"; do
++                ln -s "${firmware_resolved[$i]}" "$firmware_dir/${firmware_required[$i]}"
++            done
++        fi
      fi
- fi
-+qemu_l=(-L "$firmware_dir")
+     if [[ -z "$firmware_dir" ]]; then
+         echo "qemu_boot_test: could not find a complete QEMU firmware set" >&2
+diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
+index 5ad387f7..53c0285a 100644
+--- a/src/backend/x86/assembler/parser.rs
++++ b/src/backend/x86/assembler/parser.rs
+@@ -2192,24 +2192,112 @@ fn is_segment_name(s: &str) -> bool {
+ }
  
- echo "boot: $QEMU ${qemu_l[*]} -kernel $BZIMAGE (log: $LOG)"
- # -display none + -serial file: (not -nographic + stdio redirect): the stdio
-diff --git a/src/backend/i686/assembler/encoder/gp_integer.rs b/src/backend/i686/assembler/encoder/gp_integer.rs
-index df9eb994..c5c224e0 100644
---- a/src/backend/i686/assembler/encoder/gp_integer.rs
-+++ b/src/backend/i686/assembler/encoder/gp_integer.rs
-@@ -584,6 +584,26 @@ impl super::InstructionEncoder {
-         self.sized_op = true;
-         match &ops[0] {
-             Operand::Register(reg) => {
-+                // Segment registers keep their own one-byte opcodes and take
-+                // no operand-size variant: `push %ds` is 1e in .code32 and
-+                // 66 1e in .code16gcc (binutils 2.44 emits the inert 0x66
-+                // there because the unsuffixed default is 32-bit; GAS .code16
-+                // `pushl %ds` assembles to the same 66 1e).  The .code16
-+                // unsuffixed form is routed to `encode_push16` by the match
-+                // guard above; without these arms the .code32/.code16gcc
-+                // spelling died with "bad register" where GAS succeeds.
-+                if is_segment_reg(&reg.name) {
-+                    match reg.name.as_str() {
-+                        "es" => self.bytes.push(0x06),
-+                        "cs" => self.bytes.push(0x0E),
-+                        "ss" => self.bytes.push(0x16),
-+                        "ds" => self.bytes.push(0x1E),
-+                        "fs" => self.bytes.extend_from_slice(&[0x0F, 0xA0]),
-+                        "gs" => self.bytes.extend_from_slice(&[0x0F, 0xA8]),
-+                        _ => return Err(format!("cannot push {}", reg.name)),
-+                    }
-+                    return Ok(());
-+                }
-                 let num = reg_num(&reg.name).ok_or("bad register")?;
-                 self.bytes.push(0x50 + num);
-                 Ok(())
-diff --git a/src/backend/i686/assembler/encoder/mod.rs b/src/backend/i686/assembler/encoder/mod.rs
-index 01da69ba..c0d4aedc 100644
---- a/src/backend/i686/assembler/encoder/mod.rs
-+++ b/src/backend/i686/assembler/encoder/mod.rs
-@@ -481,10 +481,19 @@ impl InstructionEncoder {
-                 }
-             }
+ /// Check if a string looks like a label (alphanumeric, underscore, dot).
++///
++/// A bare numeric literal is never label-like.  Hex constants are spelled
++/// with alphabetic digits (`0xffffffff80000000`), so they satisfy the charset
++/// test below and would be mistaken for a symbol by the symbol-difference
++/// probe: the kernel's `init_top_pgt - __START_KERNEL_map` must be parsed as
++/// SymbolPlusOffset so it receives an absolute R_X86_64_32S relocation, not a
++/// PC-relative R_X86_64_PC32 relocation.
++///
++/// The literal test is a single allocation-free byte scan rather than a call
++/// into the shared evaluator.  `is_label_like` runs for every candidate
++/// symbol on every operand of every assembly line, and `parse_integer_expr`
++/// allocates an error `String` on *each* miss — twice, in fact, because
++/// `parse_single_integer` fails first and `tokenize_expr` then fails on the
++/// identifier's leading character.  That turned the hottest predicate in the
++/// assembler into two heap allocations per symbol.
++///
++/// Skipping the evaluator is exactly equivalent here, not an approximation:
++/// a string that reaches the literal test and survives the charset test
++/// contains no operator, parenthesis, sign, quote or whitespace, so the
++/// evaluator can only accept it through its single-literal path — and that
++/// path necessarily begins with an ASCII digit.  Identifiers, which are the
++/// overwhelming majority of call sites, therefore never enter the scan.
+ fn is_label_like(s: &str) -> bool {
+-    if s.is_empty() {
++    let bytes = s.as_bytes();
++    let Some(&first) = bytes.first() else {
+         return false;
+-    }
+-    // Hex constants contain alphabetic digits (`0xffffffff...`) and would
+-    // otherwise be mistaken for a label by the symbol-difference probe.  In
+-    // particular, the kernel's `init_top_pgt - __START_KERNEL_map` must be
+-    // parsed as SymbolPlusOffset so it receives an absolute R_X86_64_32S
+-    // relocation, not a PC-relative R_X86_64_PC32 relocation.
+-    if parse_integer_expr(s).is_ok() {
++    };
++    if first.is_ascii_digit() && is_bare_integer_literal(bytes) {
+         return false;
+     }
+-    let first = s.as_bytes()[0];
+     if !(first.is_ascii_alphabetic() || first == b'_' || first == b'.' || first.is_ascii_digit()) {
+         return false;
+     }
+-    s.bytes()
+-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
++    bytes
++        .iter()
++        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
++}
++
++/// Recognize a bare integer literal — `42`, `0644`, `0x1f`, `0b1010`, and the
++/// same with C integer suffixes — in one allocation-free pass over `bytes`.
++///
++/// Mirrors the accept/reject decision of `asm_expr::parse_single_integer` for
++/// the charset-restricted inputs [`is_label_like`] can observe; see there for
++/// why the evaluator itself must not be called on this path.
++fn is_bare_integer_literal(bytes: &[u8]) -> bool {
++    // C integer suffixes (u/U/l/L/z/Z, incl. LL/ULL combos) are stripped
++    // before the radix is read, exactly as the evaluator strips them.
++    let mut end = bytes.len();
++    while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
++        end -= 1;
++    }
++    let lit = &bytes[..end];
++    let radixed = lit.len() > 1 && lit[0] == b'0';
++    if radixed && matches!(lit[1], b'x' | b'X') {
++        // u64: every 16-digit hexadecimal value fits, so width alone decides.
++        return fits_radix(&lit[2..], |b| b.is_ascii_hexdigit(), 16, None);
++    }
++    if radixed && matches!(lit[1], b'b' | b'B') {
++        // i64: 63 bits is the widest positive value that still fits.
++        return fits_radix(&lit[2..], |b| matches!(b, b'0' | b'1'), 63, None);
++    }
++    if radixed && lit.iter().all(|b| b.is_ascii_digit()) {
++        // A leading zero selects octal and never falls back to decimal, so
++        // `09` is not a literal — the evaluator rejects it identically.
++        return fits_radix(
++            lit,
++            |b| matches!(b, b'0'..=b'7'),
++            21,
++            Some(b"777777777777777777777"),
++        );
++    }
++    // Decimal, widened to u64 like the evaluator's i64-then-u64 retry.
++    fits_radix(
++        lit,
++        |b| b.is_ascii_digit(),
++        20,
++        Some(b"18446744073709551615"),
++    )
++}
++
++/// True when every byte of `body` is a digit of the radix under test and the
++/// value they spell fits the evaluator's target type.
++///
++/// Leading zeros never contribute to the value, so only the significant tail
++/// is measured.  Below `max_significant` digits every value fits; at exactly
++/// that width `limit` — the type's maximum spelled in this radix — is compared
++/// byte-wise, which is a numeric comparison because both operands have the
++/// same length and radix.  `limit` is `None` for the power-of-two radices,
++/// where a full-width value fits by construction.
++fn fits_radix(
++    body: &[u8],
++    is_digit: fn(u8) -> bool,
++    max_significant: usize,
++    limit: Option<&[u8]>,
++) -> bool {
++    if body.is_empty() || !body.iter().copied().all(is_digit) {
++        return false;
++    }
++    let Some(first) = body.iter().position(|&b| b != b'0') else {
++        return true; // the all-zero value fits in every radix
++    };
++    let significant = &body[first..];
++    if significant.len() != max_significant {
++        return significant.len() < max_significant;
++    }
++    limit.is_none_or(|limit| significant <= limit)
+ }
  
--            // Stack ops (32-bit default)
-+            // Stack ops.  An unsuffixed push/pop follows the current
-+            // operand-size default: 16 bits in `.code16`, 32 bits in
-+            // `.code16gcc`/`.code32`.  The explicit `l` spelling always
-+            // selects the 32-bit form; `w` always selects the 16-bit form.
-+            // This distinction is architectural, not cosmetic: `push $0`
-+            // in the real-mode trampoline must decrement SP by two, while a
-+            // mistaken 32-bit encoding leaves the return address stranded
-+            // and sends the AP back into the BIOS reset vector.
-+            "push" if self.code16 && !self.code16gcc => self.encode_push16(ops),
-+            "pop" if self.code16 && !self.code16gcc => self.encode_pop16(ops),
-             "pushl" | "push" => self.encode_push(ops),
-             "popl" | "pop" => self.encode_pop(ops),
--            // Also handle pushw/popw for 16-bit variants
-+            // Also handle explicit 16-bit variants.
-             "pushw" => self.encode_push16(ops),
-             "popw" => self.encode_pop16(ops),
- 
-@@ -1907,3 +1916,93 @@ impl InstructionEncoder {
+ /// Strip balanced outer parentheses from an expression.
+@@ -4318,6 +4406,144 @@ mod tests {
          }
      }
- }
+ 
++    #[test]
++    fn test_is_label_like_numeric_literal_boundaries() {
++        // Literals: rejected as labels, in every radix the evaluator accepts
++        // and with the C integer suffixes it strips.
++        for literal in [
++            "0",
++            "1",
++            "42",
++            "0644",
++            "00",
++            "0x1f",
++            "0X1F",
++            "0b1010",
++            "0xffffffff80000000",
++            "0xffffffffffffffff",
++            "9223372036854775807",
++            "18446744073709551615",
++            "0777777777777777777777",
++            "0x10u",
++            "12ul",
++            "0xffULL",
++            "0000000000000000000000005",
++        ] {
++            assert!(
++                !is_label_like(literal),
++                "{literal} is a numeric literal and must not be label-like"
++            );
++        }
 +
-+#[cfg(test)]
-+mod stack_width_tests {
-+    use super::*;
++        // Charset-valid non-literals: still label-like.  GAS local-label
++        // references (`1f`/`2b`) and overflowing constants are the cases that
++        // a coarser "starts with a digit" rejection would break.
++        for symbol in [
++            "1f",
++            "1b",
++            "2f",
++            "09",                      // octal selection, then '9' is not an octal digit
++            "0x1g",                    // not a hex digit
++            "0x",                      // empty mantissa
++            "0b",                      // empty mantissa
++            "0abc",                    // leading zero but not octal digits
++            "1.5",                     // no floating point in integer expressions
++            "0xfffffffffffffffff",     // 17 hex digits: overflows u64
++            "18446744073709551616",    // u64::MAX + 1
++            "777777777777777777778",   // 21 digits, above the decimal width
++            "07777777777777777777777", // 22 significant octal digits
++            // 21 DECIMAL digits, so above u64::MAX: only the leading-zero
++            // spelling `0777777777777777777777` selects octal and fits i64.
++            "777777777777777777777",
++            "init_top_pgt",
++            "__START_KERNEL_map",
++            ".Lfoo",
++            "_bar9",
++        ] {
++            assert!(
++                is_label_like(symbol),
++                "{symbol} is not a numeric literal and must stay label-like"
++            );
++        }
 +
-+    fn instruction(mnemonic: &str, operand: Operand) -> Instruction {
-+        Instruction {
-+            prefix: None,
-+            mnemonic: mnemonic.to_owned(),
-+            operands: vec![operand],
-+            nf: false,
-+            force_evex: false,
-+            force_rex2: false,
-+            dfv: 0,
++        // Anything outside the label charset is never label-like, whether or
++        // not the evaluator could parse it.
++        for rejected in ["", "-5", "1+2", "(8)", " 5", "5 ", "1 << 5", "'A'"] {
++            assert!(
++                !is_label_like(rejected),
++                "{rejected:?} is outside the label charset"
++            );
 +        }
 +    }
 +
-+    fn immediate(value: i64) -> Operand {
-+        Operand::Immediate(ImmediateValue::Integer(value))
-+    }
-+
-+    fn reg(name: &str) -> Operand {
-+        Operand::Register(Register {
-+            name: name.to_owned(),
-+            mask: None,
-+            zeroing: false,
-+            sae: false,
-+            rounding: None,
-+        })
-+    }
-+
++    /// The allocation-free literal recognizer must agree with the shared
++    /// evaluator on every input `is_label_like` can actually reach.  Exhaustive
++    /// over a charset that covers each decision the recognizer makes: radix
++    /// prefixes (case-insensitive), valid and invalid digits per radix, the
++    /// octal-vs-decimal selection on a leading zero, suffix stripping, and the
++    /// charset-only separators.
 +    #[test]
-+    fn unsuffixed_stack_immediates_follow_code16_default() {
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.code16 = true;
-+        encoder.encode(&instruction("push", immediate(0))).unwrap();
-+        assert_eq!(encoder.bytes, [0x6a, 0x00]);
-+
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.code16 = true;
-+        encoder.encode(&instruction("pop", reg("ax"))).unwrap();
-+        assert_eq!(encoder.bytes, [0x58]);
-+    }
-+
-+    #[test]
-+    fn code16gcc_unsuffixed_stack_ops_remain_32_bit() {
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.code16 = true;
-+        encoder.code16gcc = true;
-+        encoder.encode(&instruction("push", immediate(0))).unwrap();
-+        assert_eq!(encoder.bytes, [0x66, 0x6a, 0x00]);
-+    }
-+
-+    #[test]
-+    fn segment_register_stack_ops_match_gas() {
-+        // .code32: `push %ds` = 1e, `pop %es` = 07 (binutils: no prefix).
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.encode(&instruction("push", reg("ds"))).unwrap();
-+        assert_eq!(encoder.bytes, [0x1e]);
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.encode(&instruction("pop", reg("es"))).unwrap();
-+        assert_eq!(encoder.bytes, [0x07]);
-+        // .code32: the two-byte fs/gs forms.
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.encode(&instruction("push", reg("fs"))).unwrap();
-+        assert_eq!(encoder.bytes, [0x0f, 0xa0]);
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.encode(&instruction("pop", reg("gs"))).unwrap();
-+        assert_eq!(encoder.bytes, [0x0f, 0xa9]);
-+
-+        // .code16gcc: the unsuffixed 32-bit default adds the inert 0x66
-+        // that binutils 2.44 emits for `push %ds` (66 1e) in this mode.
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.code16 = true;
-+        encoder.code16gcc = true;
-+        encoder.encode(&instruction("push", reg("ds"))).unwrap();
-+        assert_eq!(encoder.bytes, [0x66, 0x1e]);
-+
-+        // .code16 unsuffixed: no prefix (encode_push16's own segment arms).
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.code16 = true;
-+        encoder.encode(&instruction("push", reg("ds"))).unwrap();
-+        assert_eq!(encoder.bytes, [0x1e]);
-+        // .code16 explicit `pushl %ds`: GAS assembles 66 1e here too.
-+        let mut encoder = InstructionEncoder::new();
-+        encoder.code16 = true;
-+        encoder.encode(&instruction("pushl", reg("ds"))).unwrap();
-+        assert_eq!(encoder.bytes, [0x66, 0x1e]);
-+    }
-+}
-diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
-index 8e115682..5ad387f7 100644
---- a/src/backend/x86/assembler/parser.rs
-+++ b/src/backend/x86/assembler/parser.rs
-@@ -2196,6 +2196,14 @@ fn is_label_like(s: &str) -> bool {
-     if s.is_empty() {
-         return false;
-     }
-+    // Hex constants contain alphabetic digits (`0xffffffff...`) and would
-+    // otherwise be mistaken for a label by the symbol-difference probe.  In
-+    // particular, the kernel's `init_top_pgt - __START_KERNEL_map` must be
-+    // parsed as SymbolPlusOffset so it receives an absolute R_X86_64_32S
-+    // relocation, not a PC-relative R_X86_64_PC32 relocation.
-+    if parse_integer_expr(s).is_ok() {
-+        return false;
-+    }
-     let first = s.as_bytes()[0];
-     if !(first.is_ascii_alphabetic() || first == b'_' || first == b'.' || first.is_ascii_digit()) {
-         return false;
-@@ -4297,6 +4305,19 @@ mod tests {
-         }
-     }
- 
-+    #[test]
-+    fn test_hex_constant_is_not_symbol_difference_rhs() {
-+        let operand = parse_immediate_operand("init_top_pgt - 0xffffffff80000000")
-+            .expect("immediate expression should parse");
-+        match operand {
-+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, addend)) => {
-+                assert_eq!(sym, "init_top_pgt");
-+                assert_eq!(addend, 0x8000_0000);
++    fn test_bare_integer_literal_matches_shared_evaluator() {
++        const ALPHABET: &[u8] = b"01789xXbBfeulz._";
++        const MAX_LEN: usize = 4;
++        let mut buf = [0u8; MAX_LEN];
++        let mut checked = 0usize;
++        for len in 1..=MAX_LEN {
++            let radix = ALPHABET.len();
++            for n in 0..radix.pow(len as u32) {
++                let mut v = n;
++                for slot in buf[..len].iter_mut() {
++                    *slot = ALPHABET[v % radix];
++                    v /= radix;
++                }
++                let candidate = std::str::from_utf8(&buf[..len]).unwrap();
++                assert_eq!(
++                    is_bare_integer_literal(candidate.as_bytes()),
++                    parse_integer_expr(candidate).is_ok(),
++                    "literal recognizer disagrees with the shared evaluator on {candidate:?}"
++                );
++                checked += 1;
 +            }
-+            other => panic!("hex constant was misparsed as a symbol difference: {other:?}"),
++        }
++        assert!(checked > 60_000, "corpus too small: {checked}");
++    }
++
++    /// Width boundaries the exhaustive corpus above cannot reach: the widest
++    /// value each radix accepts and the first one it rejects.
++    #[test]
++    fn test_bare_integer_literal_width_boundaries() {
++        let cases: &[(&str, bool)] = &[
++            ("0xffffffffffffffff", true),    // 16 hex digits = u64::MAX
++            ("0x10000000000000000", false),  // 17 hex digits
++            ("0x0000000000000000001", true), // leading zeros do not count
++            (
++                "0b111111111111111111111111111111111111111111111111111111111111111",
++                true,
++            ), // 63 bits
++            (
++                "0b1000000000000000000000000000000000000000000000000000000000000000",
++                false,
++            ), // 64 bits
++            ("0777777777777777777777", true), // i64::MAX in octal
++            ("01000000000000000000000", false), // 2^63 in octal
++            ("18446744073709551615", true),  // u64::MAX in decimal
++            ("18446744073709551616", false), // u64::MAX + 1
++            ("9223372036854775807", true),   // i64::MAX, via the u64 retry
++        ];
++        for (candidate, expected) in cases {
++            assert_eq!(
++                is_bare_integer_literal(candidate.as_bytes()),
++                *expected,
++                "width boundary {candidate:?}"
++            );
++            assert_eq!(
++                is_bare_integer_literal(candidate.as_bytes()),
++                parse_integer_expr(candidate).is_ok(),
++                "evaluator parity on {candidate:?}"
++            );
 +        }
 +    }
 +
      #[test]
      fn test_parse_simple() {
          let asm = r#"
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 0277a7ab..5dd1070b 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -7195,15 +7195,29 @@ impl ArchCodegen for X86Codegen {
-             // fused mul-add consumed the ZONE POINTER as the index).
-             for inst in &ir_shadow {
-                 let Some(dest) = inst.dest() else { continue };
--                if self.reg_assignments.contains_key(&dest.0)
--                    && !self.home_clobbered.contains(&dest.0)
--                {
--                    // Pre-colored dest: the window wrote it into its home
--                    // (fresh_ra_for_isel passes exactly the not-clobbered
--                    // homed values) — a normal definition. Mark fresh so
-+                if !self.reg_assignments.contains_key(&dest.0) {
-+                    continue;
-+                }
-+                // Typed calls are emitted with their return move explicitly
-+                // targeted at the allocator's home register (try_lower_call_
-+                // typed builds CallRetMove from reg_assignments).  That home
-+                // may already be marked clobbered by an earlier instruction
-+                // in the same function; using home_clobbered as the sole
-+                // "was this pre-colored?" test would then leave the freshly
-+                // returned value falsely stale.  A call result is a new
-+                // definition, so it re-establishes its home unconditionally.
-+                let typed_call_home_def = matches!(
-+                    inst,
-+                    crate::ir::reexports::Instruction::Call { info, .. }
-+                        | crate::ir::reexports::Instruction::CallIndirect { info, .. }
-+                        if info.dest.as_ref().is_some_and(|d| d.0 == dest.0)
-+                );
-+                if typed_call_home_def || !self.home_clobbered.contains(&dest.0) {
-+                    // Pre-colored destination (or a typed call return): the
-+                    // window wrote the value into its home. Mark it fresh so
-                     // later consumers may read the home.
-                     self.note_home_written(dest.0);
--                } else if self.reg_assignments.contains_key(&dest.0) {
-+                } else {
-                     // Not pre-colored: the window's result went to scratch
-                     // and/or a slot; the home holds whatever preceded it.
-                     self.home_fresh.remove(&dest.0);
 diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 2575b871..cb45ae7b 100644
+index cb45ae7b..dbcc3e63 100644
 --- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 +++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-@@ -3427,24 +3427,70 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
+@@ -3341,37 +3341,47 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
+                     if j < len {
+                         let line_j = infos[j].trimmed(store.get(j));
+ 
+-                        // Sub-pattern G1: movq (%rcx), %rax → movq (%<src>), %rax
+-                        if line_j == "movq (%rcx), %rax" {
++                        // All three sub-patterns fold a `mov`-family use of
++                        // (%rcx), and each used to rebuild the same successor
++                        // index and re-run the same liveness walk — up to
++                        // three scans of one region per candidate.  That walk
++                        // is the dominant cost of this pass: every line it
++                        // visits can pay a full-width-write test, an implicit
++                        // operand classification and a read-modify-write test.
++                        // The guard below is exactly the union of the
++                        // three sub-pattern guards (both `movq (%rcx), %rax`
++                        // and `movsd (%rcx), %xmmN` start with "mov"), so the
++                        // answer is computed at most once per candidate and
++                        // never for a line no fold could use.
++                        let rcx_dead_after_deref = if line_j.starts_with("mov") {
+                             let mut k = j + 1;
+                             while k < len && infos[k].is_nop() {
+                                 k += 1;
+                             }
+-                            if !rcx_is_live_at(store, infos, k, len) {
+-                                let new = format!("    movq (%{}), %rax", src_reg);
+-                                mark_nop(&mut infos[i]);
+-                                replace_line(store, &mut infos[j], j, new);
+-                                changed = true;
+-                                i = j + 1;
+-                                continue;
+-                            }
++                            !rcx_is_live_at(store, infos, k, len)
++                        } else {
++                            false
++                        };
++
++                        // Sub-pattern G1: movq (%rcx), %rax → movq (%<src>), %rax
++                        if rcx_dead_after_deref && line_j == "movq (%rcx), %rax" {
++                            let new = format!("    movq (%{}), %rax", src_reg);
++                            mark_nop(&mut infos[i]);
++                            replace_line(store, &mut infos[j], j, new);
++                            changed = true;
++                            i = j + 1;
++                            continue;
+                         }
+ 
+                         // Sub-pattern G2: movsd (%rcx), %xmmN → movsd (%<src>), %xmmN
+-                        if line_j.starts_with("movsd (%rcx), %xmm") {
++                        if rcx_dead_after_deref && line_j.starts_with("movsd (%rcx), %xmm") {
+                             let xmm_dest = &line_j[14..]; // after "movsd (%rcx), " → "%xmmN"
+-                            let mut k = j + 1;
+-                            while k < len && infos[k].is_nop() {
+-                                k += 1;
+-                            }
+-                            if !rcx_is_live_at(store, infos, k, len) {
+-                                let new = format!("    movsd (%{}), {}", src_reg, xmm_dest);
+-                                mark_nop(&mut infos[i]);
+-                                replace_line(store, &mut infos[j], j, new);
+-                                changed = true;
+-                                i = j + 1;
+-                                continue;
+-                            }
++                            let new = format!("    movsd (%{}), {}", src_reg, xmm_dest);
++                            mark_nop(&mut infos[i]);
++                            replace_line(store, &mut infos[j], j, new);
++                            changed = true;
++                            i = j + 1;
++                            continue;
+                         }
+ 
+                         // Sub-pattern G3: a pointer copy feeding a store:
+@@ -3388,31 +3398,25 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
+                         // deliberately excluded: replacing only the base
+                         // register there would need a different parser and
+                         // could change the effective address.
+-                        if line_j.starts_with("mov") {
++                        if rcx_dead_after_deref {
+                             let Some((source, destination)) = line_j.rsplit_once(',') else {
+                                 i += 1;
+                                 continue;
+                             };
+                             if destination.trim() == "(%rcx)" && !source.contains("%rcx") {
+-                                let mut k = j + 1;
+-                                while k < len && infos[k].is_nop() {
+-                                    k += 1;
+-                                }
+-                                if !rcx_is_live_at(store, infos, k, len) {
+-                                    let replacement =
+-                                        line_j.replacen("(%rcx)", &format!("(%{})", src_reg), 1);
+-                                    if replacement != line_j && !replacement.contains("%rcx") {
+-                                        mark_nop(&mut infos[i]);
+-                                        replace_line(
+-                                            store,
+-                                            &mut infos[j],
+-                                            j,
+-                                            format!("    {}", replacement),
+-                                        );
+-                                        changed = true;
+-                                        i = j + 1;
+-                                        continue;
+-                                    }
++                                let replacement =
++                                    line_j.replacen("(%rcx)", &format!("(%{})", src_reg), 1);
++                                if replacement != line_j && !replacement.contains("%rcx") {
++                                    mark_nop(&mut infos[i]);
++                                    replace_line(
++                                        store,
++                                        &mut infos[j],
++                                        j,
++                                        format!("    {}", replacement),
++                                    );
++                                    changed = true;
++                                    i = j + 1;
++                                    continue;
+                                 }
+                             }
+                         }
+@@ -3426,6 +3430,9 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
+     changed
  }
  
++/// Family bitmask for `%rcx` (see `scan_register_refs`: family 1).
++const RCX_FAMILY_MASK: u16 = 1 << 1;
++
  fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {
--    if at >= len {
--        return false;
--    }
--    match infos[at].kind {
--        // LoadRbp loads into a GP reg — doesn't use %rcx as address
--        LineKind::LoadRbp { .. } => false,
--        LineKind::Other { dest_reg: 1 } => {
--            // rcx is the destination. "movq <src>, %rcx" is a pure write if src ≠ %rcx.
--            let t = infos[at].trimmed(store.get(at));
--            if t.starts_with("movq ") && t.ends_with(", %rcx") {
--                let src = &t[5..t.len() - 6];
--                src.contains("%rcx")
--            } else {
--                t.contains("%rcx")
--            }
-+    // This is a liveness query for the value copied into %rcx, not merely a
-+    // query about the first instruction after the dereference.  The old
-+    // one-line lookahead was unsound when another peephole pass folded a later
-+    // reload into `movq %rcx, %rax`: the address-copy pass removed the defining
-+    // `movq %src, %rcx`, but left that later use reading the incoming (and
-+    // unrelated) %rcx value.  That interaction corrupted stack-constructed
-+    // structs in the kernel scheduler.
+     // This is a liveness query for the value copied into %rcx, not merely a
+     // query about the first instruction after the dereference.  The old
+@@ -3439,15 +3446,22 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize)
+     // conservative barrier because another predecessor may observe the old
+     // value.  A plain write to %rcx kills the old value; every other mention is
+     // a use (including %ecx/%cx/%cl, as represented by reg_refs).
+-    let rcx_mask = 1u16 << 1;
 +    //
-+    // Scan the remainder of the straight-line region.  A branch/label is a
-+    // conservative barrier because another predecessor may observe the old
-+    // value.  A plain write to %rcx kills the old value; every other mention is
-+    // a use (including %ecx/%cx/%cl, as represented by reg_refs).
-+    let rcx_mask = 1u16 << 1;
-+    let mut i = at;
-+    while i < len {
-+        if infos[i].is_nop() {
++    // The walk is ordered cheapest-and-most-selective first.  The nop flag, the
++    // barrier kind and the pre-scanned `reg_refs` bitmask are all cached in
++    // `LineInfo`, so most lines are rejected without reading any text; and of
++    // the lines that do mention the family, the common case is a USE, which the
++    // single-pass source-operand scan settles before the full-width-write,
++    // implicit-operand and read-modify-write tests are paid for at all.
+     let mut i = at;
+     while i < len {
+-        if infos[i].is_nop() {
++        let info = &infos[i];
++        if info.is_nop() {
+             i += 1;
+             continue;
+         }
+         if matches!(
+-            infos[i].kind,
++            info.kind,
+             LineKind::Label
+                 | LineKind::Jmp
+                 | LineKind::JmpIndirect
+@@ -3456,9 +3470,7 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize)
+         ) {
+             return true;
+         }
+-
+-        let t = infos[i].trimmed(store.get(i));
+-        if infos[i].reg_refs & rcx_mask == 0 {
++        if info.reg_refs & RCX_FAMILY_MASK == 0 {
+             i += 1;
+             continue;
+         }
+@@ -3476,15 +3488,23 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize)
+         //     value through the address even though the destination is the
+         //     full-width family.
+         // Every other family mention is a use.
+-        let dest_token = t.rsplit(',').next().unwrap_or(t).trim();
+-        let head = &t[..t.len() - dest_token.len()];
+-        let killed = writes_family_full(&infos[i], &t, 1)
+-            && implicit_read_refs(t.as_bytes()) & rcx_mask == 0
+-            && !is_read_modify_write(&t)
+-            && !(head.contains("%rcx")
+-                || head.contains("%ecx")
+-                || head.contains("%cx")
+-                || head.contains("%cl"));
++        //
++        // The source operand is split once, on the last comma.  Deriving it as
++        // "everything but the last `dest_token.len()` bytes" instead — where
++        // `dest_token` is the *trimmed* tail — silently shifts the boundary
++        // whenever the line carries trailing whitespace or a stray `\r`,
++        // because `LineStore::get` returns the raw slice: with four or more
++        // trailing blanks the window reaches back into the destination itself
++        // and a genuine kill is reported as a use.
++        let t = info.trimmed(store.get(i));
++        let source = match t.rsplit_once(',') {
++            Some((source, _dest)) => source,
++            None => "",
++        };
++        let killed = !mentions_rcx_family(source)
++            && !is_read_modify_write(t)
++            && writes_family_full(info, t, 1)
++            && implicit_read_refs(t.as_bytes()) & RCX_FAMILY_MASK == 0;
+         if killed {
+             return false;
+         }
+@@ -3493,6 +3513,81 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize)
+     false
+ }
+ 
++/// True when `operand` mentions any register of the `%rcx` family
++/// (`%rcx`, `%ecx`, `%cx`, `%cl`).
++///
++/// One left-to-right scan anchored on `%` instead of four independent substring
++/// searches.  This runs per candidate line of the liveness walk above, where
++/// the operands are short and the four searches re-walked the same bytes; it is
++/// also the walk's first and most selective test, so it must be the cheapest.
++fn mentions_rcx_family(operand: &str) -> bool {
++    let bytes = operand.as_bytes();
++    let mut i = 0;
++    while i < bytes.len() {
++        if bytes[i] != b'%' {
 +            i += 1;
 +            continue;
-         }
--        _ => infos[at].trimmed(store.get(at)).contains("%rcx"),
++        }
++        // %rcx / %ecx spell the family with a width prefix, %cx / %cl without.
 +        if matches!(
-+            infos[i].kind,
-+            LineKind::Label
-+                | LineKind::Jmp
-+                | LineKind::JmpIndirect
-+                | LineKind::CondJmp
-+                | LineKind::Call
++            &bytes[i + 1..],
++            [b'r' | b'e', b'c', b'x', ..] | [b'c', b'x' | b'l', ..]
 +        ) {
 +            return true;
 +        }
-+
-+        let t = infos[i].trimmed(store.get(i));
-+        if infos[i].reg_refs & rcx_mask == 0 {
-+            i += 1;
-+            continue;
-+        }
-+
-+        // A kill must be an EXACT full-width, unconditional redefinition of
-+        // the family — the shared acceptance-grade predicates, not a
-+        // mnemonic-prefix heuristic:
-+        //   * sub-width destinations (`movw %ax, %cx`, `sete %cl`) leave the
-+        //     surviving bits of the copied 64-bit value observable;
-+        //   * `cmovcc` keeps the old destination when the condition is
-+        //     false, i.e. reads it (`is_read_modify_write`);
-+        //   * implicit readers (`rep movsq`'s count, `cpuid`'s subleaf)
-+        //     observe it (`implicit_read_refs`);
-+        //   * a source-side mention (`movq 8(%rcx), %rcx`) reads the old
-+        //     value through the address even though the destination is the
-+        //     full-width family.
-+        // Every other family mention is a use.
-+        let dest_token = t.rsplit(',').next().unwrap_or(t).trim();
-+        let head = &t[..t.len() - dest_token.len()];
-+        let killed = writes_family_full(&infos[i], &t, 1)
-+            && implicit_read_refs(t.as_bytes()) & rcx_mask == 0
-+            && !is_read_modify_write(&t)
-+            && !(head.contains("%rcx")
-+                || head.contains("%ecx")
-+                || head.contains("%cx")
-+                || head.contains("%cl"));
-+        if killed {
-+            return false;
-+        }
-+        return true;
-     }
++        i += 1;
++    }
 +    false
- }
- 
++}
++
++#[cfg(test)]
++mod mentions_rcx_family_tests {
++    use super::mentions_rcx_family;
++
++    #[test]
++    fn matches_exactly_the_rcx_family_spellings() {
++        for hit in [
++            "%rcx",
++            "%ecx",
++            "%cx",
++            "%cl",
++            "movq %rcx",
++            "-8(%rcx)",
++            "%eax,%rcx",
++            "(%ecx,%rdx,4)",
++            "%cl,",
++            "%%rcx",
++        ] {
++            assert!(mentions_rcx_family(hit), "{hit} mentions the %rcx family");
++        }
++        // Neighbours a coarser `%c` search would over-match, and look-alikes
++        // that do not name the family at all.
++        for miss in [
++            "",
++            "%rax",
++            "%eax",
++            "%ax",
++            "%ah",
++            "%al",
++            "%ch",
++            "%rdx",
++            "%rbx",
++            "%rsi",
++            "%rdi",
++            "%r8",
++            "%xmm1",
++            "movq %rax, %rdx",
++            "%rc",
++            "%r",
++            "%c",
++            "rcx",
++            "%rrcx",
++        ] {
++            assert!(!mentions_rcx_family(miss), "{miss} does not mention %rcx");
++        }
++    }
++}
++
  // ── Movq + extension/truncation fusion ───────────────────────────────────────
+ //
+ // Fuses `movq %REG, %rax` followed by a cast instruction into a single
 diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index 00e5d9fb..fa6c6bbc 100644
+index fa6c6bbc..f988b458 100644
 --- a/src/backend/x86/codegen/peephole/passes/mod.rs
 +++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -2006,6 +2006,148 @@ mod tests {
-         assert!(result.contains("(%rcx)"), "{result}");
+@@ -2148,6 +2148,33 @@ mod tests {
+         );
      }
  
 +    #[test]
-+    fn test_rcx_address_copy_preserves_later_reused_source() {
-+        // The first load uses %rcx as a temporary address register.  The
-+        // later identical stack load can be folded to `movq %rcx, %rax` by
-+        // reuse_redundant_loads, so the defining copy must not be removed just
-+        // because the immediate dereference does not read %rcx afterwards.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movq -8(%rbp), %rcx\n",
-+            "    movq (%rcx), %rax\n",
-+            "    movq %rax, -16(%rbp)\n",
-+            "    movq -8(%rbp), %rax\n",
-+            "    movq %rax, -24(%rbp)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("movq -8(%rbp), %rcx"),
-+            "the address-copy definition was removed before its later use: {result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_rcx_address_copy_register_source_with_later_use() {
-+        // The register-source spelling of the same contract — and the exact
-+        // shape the matcher fires on (`movq %<gpr>, %rcx`): a later reload
-+        // use of %rcx after the dereference must keep the defining copy.
-+        // The one-instruction lookahead this pass used to have answered
-+        // "dead" here by only inspecting the first following line.
++    fn test_rcx_address_copy_full_kill_ignores_trailing_whitespace() {
++        // `LineStore::get` hands back the RAW line slice, so trailing blanks
++        // from an externally supplied .s survive into the trimmed view.  The
++        // kill test must therefore split the source operand on the last comma
++        // rather than by cutting `dest_token.len()` bytes off the end of a
++        // *trimmed* tail: with four or more trailing blanks that arithmetic
++        // walks the boundary back into the destination itself, the source side
++        // then appears to mention %rcx, and a genuine full-width kill is
++        // reported as a use.
 +        let asm = concat!(
 +            "f:\n",
 +            "    movq %rdi, %rcx\n",
 +            "    movq (%rcx), %rax\n",
-+            "    movq %rax, -16(%rbp)\n",
-+            "    movq %rcx, %rax\n",
-+            "    movq %rax, -24(%rbp)\n",
-+            "    ret\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("movq %rdi, %rcx"),
-+            "the address copy was removed before its later %rcx use: {result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_rcx_address_copy_cmov_is_not_a_kill() {
-+        // cmovCC conditionally PRESERVES the old destination (it is a
-+        // read-modify-write of %rcx), so the copied value stays observable
-+        // through it even though the destination token is the full family.
-+        let asm = concat!(
-+            "f:\n",
-+            "    movq %rdi, %rcx\n",
-+            "    movq (%rcx), %rax\n",
-+            "    cmovz %rbx, %rcx\n",
-+            "    movq %rcx, -16(%rbp)\n",
-+            "    ret\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("movq %rdi, %rcx"),
-+            "cmov was treated as a full kill of %rcx: {result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_rcx_address_copy_setcc_is_not_a_kill() {
-+        // `sete %cl` redefines only the low byte: the surviving upper bits
-+        // of the copied 64-bit value stay observable for the later shift.
-+        let asm = concat!(
-+            "f:\n",
-+            "    movq %rdi, %rcx\n",
-+            "    movq (%rcx), %rax\n",
-+            "    sete %cl\n",
-+            "    shrq $8, %rcx\n",
-+            "    movq %rcx, -16(%rbp)\n",
-+            "    ret\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("movq %rdi, %rcx"),
-+            "setCC %cl was treated as a full kill of the %rcx family: {result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_rcx_address_copy_movw_is_not_a_kill() {
-+        // A word-granular destination redefines only the low 16 bits; the
-+        // upper 48 bits of the copied value survive to the later store.
-+        let asm = concat!(
-+            "f:\n",
-+            "    movq %rdi, %rcx\n",
-+            "    movq (%rcx), %rax\n",
-+            "    movw %ax, %cx\n",
-+            "    movq %rcx, -16(%rbp)\n",
-+            "    ret\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            result.contains("movq %rdi, %rcx"),
-+            "movw to %cx was treated as a full kill of the %rcx family: {result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn test_rcx_address_copy_full_kill_still_eliminates() {
-+        // Positive control: a genuine full-width unconditional redefinition
-+        // (`movq %rbx, %rcx`) kills the value, so the copy is eliminated
-+        // and the dereference reads through the original source register.
-+        let asm = concat!(
-+            "f:\n",
-+            "    movq %rdi, %rcx\n",
-+            "    movq (%rcx), %rax\n",
-+            "    movq %rbx, %rcx\n",
++            "    movq %rbx, %rcx    \n",
 +            "    movq %rcx, -16(%rbp)\n",
 +            "    ret\n",
 +            ".size f, .-f\n",
@@ -827,392 +909,149 @@ index 00e5d9fb..fa6c6bbc 100644
 +        let result = peephole_optimize(asm);
 +        assert!(
 +            result.contains("movq (%rdi), %rax"),
-+            "the dereference was not folded through the source register: {result}"
-+        );
-+        assert!(
-+            !result.contains("movq %rdi, %rcx"),
-+            "the dead address copy was not eliminated: {result}"
++            "trailing whitespace on the kill suppressed the fold: {result}"
 +        );
 +    }
 +
      #[test]
      fn test_stack_top_store_consumed_by_ret_survives_dse() {
          let asm = concat!(
-diff --git a/src/ir/lowering/lvalue.rs b/src/ir/lowering/lvalue.rs
-index 5501ce1d..0631f21e 100644
---- a/src/ir/lowering/lvalue.rs
-+++ b/src/ir/lowering/lvalue.rs
-@@ -965,7 +965,35 @@ impl Lowerer {
-     /// Check if the result of an array subscript is still a sub-array (not a scalar).
-     /// For int a[2][3]: a[i] results in a sub-array (int[3]), a[i][j] is a scalar.
-     pub(super) fn subscript_result_is_array(&self, expr: &Expr) -> bool {
--        if let Expr::ArraySubscript(base, _, _) = expr {
-+        if let Expr::ArraySubscript(base, _index, _) = expr {
-+            // A pointer-to-array subscript keeps the array type.  This is
-+            // distinct from an ordinary pointer subscript: for
-+            // `cpumask_var_t *p` where `cpumask_var_t` is `struct cpumask[1]`,
-+            // `p[i]` is an array lvalue whose address is `p + i`, not a
-+            // loaded pointer stored in its first word.  The old fallback
-+            // consulted the expression's already-decayed type and missed
-+            // this case, emitting a 32-bit load followed by `->bits`.
-+            let result_is_array = |ctype: Option<CType>| {
-+                ctype.is_some_and(|ctype| match ctype {
-+                    CType::Array(element, _) | CType::Pointer(element, _) => {
-+                        matches!(*element, CType::Array(_, _))
-+                    }
-+                    _ => false,
-+                })
-+            };
-+            let member_base_is_array = match base.as_ref() {
-+                Expr::MemberAccess(owner, field, _) => {
-+                    result_is_array(self.resolve_field_ctype(owner, field, false))
-+                }
-+                Expr::PointerMemberAccess(owner, field, _) => {
-+                    result_is_array(self.resolve_field_ctype(owner, field, true))
-+                }
-+                _ => false,
-+            };
-+            if result_is_array(self.get_expr_ctype(base)) || member_base_is_array {
-+                return true;
-+            }
-+
-             let root_name = self.get_array_root_name_from_base(base);
-             let depth = self.count_subscript_depth(base) + 1; // +1 for this subscript
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 75adbfcf..f45c9998 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -37,6 +37,42 @@ use crate::ir::reexports::{
+     Value,
+ };
  
-diff --git a/src/ir/lowering/structs.rs b/src/ir/lowering/structs.rs
-index 470a23b6..2b3e8685 100644
---- a/src/ir/lowering/structs.rs
-+++ b/src/ir/lowering/structs.rs
-@@ -1262,6 +1262,40 @@ impl Lowerer {
-                 // Try inner expression
-                 self.get_pointed_struct_layout(inner)
-             }
-+            Expr::ArraySubscript(base, _index, _) => {
-+                // A pointer-to-array subscript yields an array lvalue.  When
-+                // that lvalue is immediately used with `->`, its element
-+                // struct layout must be recovered without loading the first
-+                // word of the array as though it were a pointer.
-+                if let Some(ctype) = self.get_expr_ctype(expr) {
-+                    match ctype {
-+                        CType::Array(element, _) => {
-+                            if let Some(layout) = self.struct_layout_from_ctype(&element) {
-+                                return Some(layout);
-+                            }
-+                        }
-+                        CType::Struct(_) | CType::Union(_) => {
-+                            if let Some(layout) = self.struct_layout_from_ctype(&ctype) {
-+                                return Some(layout);
-+                            }
-+                        }
-+                        _ => {}
-+                    }
-+                }
-+                // Preserve the array-of-pointers case (pp[i]->field), then
-+                // use the value-layout resolver for other array expressions.
-+                if let Some(CType::Array(element, _) | CType::Pointer(element, _)) =
-+                    self.get_expr_ctype(base).as_ref()
-+                {
-+                    if let CType::Pointer(pointee, _) = element.as_ref() {
-+                        if let Some(layout) = self.struct_layout_from_ctype(pointee) {
-+                            return Some(layout);
-+                        }
-+                    }
-+                }
-+                self.get_layout_for_expr(expr)
-+                    .or_else(|| self.get_pointed_struct_layout(base))
-+            }
-             Expr::AddressOf(inner, _) => {
-                 // &expr - result is a pointer to expr's type
-                 self.get_layout_for_expr(inner)
-@@ -1284,18 +1318,6 @@ impl Lowerer {
-                 // Fallback: propagate through inner
-                 self.get_pointed_struct_layout(inner)
-             }
--            Expr::ArraySubscript(base, _, _) => {
--                // pp[i] where pp is an array of struct pointers
--                if let Some(CType::Array(elem, _) | CType::Pointer(elem, _)) =
--                    self.get_expr_ctype(base).as_ref()
--                {
--                    if let CType::Pointer(pointee, _) = elem.as_ref() {
--                        return self.struct_layout_from_ctype(pointee);
--                    }
--                }
--                // Fallback: try base directly
--                self.get_pointed_struct_layout(base)
--            }
-             Expr::FunctionCall(func, _, _) => {
-                 self.resolve_func_call_struct_layout(func, expr, true)
-             }
-diff --git a/src/passes/aggregate_copy_forward.rs b/src/passes/aggregate_copy_forward.rs
-index 923f3353..b2b75e55 100644
---- a/src/passes/aggregate_copy_forward.rs
-+++ b/src/passes/aggregate_copy_forward.rs
-@@ -608,9 +608,15 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
-                 );
-             }
-             let block = &mut func.blocks[bi];
-+            // Source spans are optional metadata and must be parallel to the
-+            // instruction list before they can be reordered.  Kernel builds
-+            // can reach this hoist with a partially populated span vector;
-+            // moving the IR is still valid, but indexing that vector would
-+            // turn a recoverable metadata mismatch into a compiler ICE.
-+            let spans_parallel = block.source_spans.len() == block.instructions.len();
-             let inst = block.instructions.remove(gep_idx);
-             block.instructions.insert(insert_at, inst);
--            if !block.source_spans.is_empty() {
-+            if spans_parallel {
-                 let span = block.source_spans.remove(gep_idx);
-                 block.source_spans.insert(insert_at, span);
-             }
-@@ -831,9 +837,11 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
-     let mut removals: Vec<(usize, usize)> = copies.values().map(|(b, i, _)| (*b, *i)).collect();
-     removals.sort_unstable_by(|a, b| b.cmp(a));
-     for (bi, ii) in removals {
--        func.blocks[bi].instructions.remove(ii);
--        if !func.blocks[bi].source_spans.is_empty() {
--            func.blocks[bi].source_spans.remove(ii);
-+        let block = &mut func.blocks[bi];
-+        let spans_parallel = block.source_spans.len() == block.instructions.len();
-+        block.instructions.remove(ii);
-+        if spans_parallel {
-+            block.source_spans.remove(ii);
-         }
-         changes += 1;
-     }
-@@ -1268,6 +1276,66 @@ mod tests {
-         );
-     }
++thread_local! {
++    /// Whether Pass B (two-block guard-free unrolling) runs at all — the
++    /// documented `CCC_NO_TWO_BLOCK_UNROLL` kill switch that every A/B
++    /// differential in the harness speaks.
++    ///
++    /// Resolved ONCE by the driver and then read from per-thread state, the
++    /// same contract the vectorizer's ISA gates use (`set_x86_simd_isa`).  It
++    /// used to be read out of the process environment inside `unroll_loops`;
++    /// because `std::env::set_var` is process-global, the kill-switch test
++    /// toggled it underneath every test running in parallel on the other
++    /// threads of the same test binary, and those tests observed the wrong
++    /// value.  Measured on the `two_block_unroll` group: 11 failing runs in
++    /// 150 (~7%), the symptom being
++    /// `two_block_unroll_profitability_positive_control` seeing the switch ON
++    /// and the unroller declining a loop it must unroll.  This is the same
++    /// defect `LoopInvertConfig` was introduced to remove from `loop_invert`;
++    /// configuration a caller can supply belongs in a parameter or in
++    /// per-thread state, never in ambient global state.
++    ///
++    /// Defaults to enabled, which is exactly the environment-unset default, so
++    /// an entry point that never went through `run_passes` (unit tests) behaves
++    /// as it did before the switch existed.
++    static TWO_BLOCK_UNROLL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
++}
++
++/// Record whether Pass B may run.  Called by `run_passes` before any unroll
++/// entry point runs on this thread.
++pub(crate) fn set_two_block_unroll_enabled(enabled: bool) {
++    TWO_BLOCK_UNROLL_ENABLED.with(|cell| cell.set(enabled));
++}
++
++#[inline]
++fn two_block_unroll_enabled() -> bool {
++    TWO_BLOCK_UNROLL_ENABLED.with(|cell| cell.get())
++}
++
+ /// Maximum number of body-work blocks (body excluding header and latch) for
+ /// a loop to be eligible. Prevents excessive code size growth.
+ const MAX_UNROLL_BODY_BLOCKS: usize = 12; // increased for hot loops via PGO
+@@ -249,8 +285,10 @@ pub(crate) fn unroll_loops(func: &mut IrFunction, phase: UnrollPhase) -> usize {
+     // budget, or the `count` cap stops it — every step is a legal
+     // guard-free unroll of a smaller constant trip.
+     // CCC_NO_TWO_BLOCK_UNROLL is the standard per-transform kill switch
+-    // (every A/B differential in the harness speaks it).
+-    if phase == UnrollPhase::PostVec && std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err() {
++    // (every A/B differential in the harness speaks it).  It is resolved once
++    // by the driver into per-thread state — see `TWO_BLOCK_UNROLL_ENABLED` —
++    // so this hot path never reads the process environment.
++    if phase == UnrollPhase::PostVec && two_block_unroll_enabled() {
+         loop {
+             let cfg = CfgAnalysis::build(func);
+             let raw = loop_analysis::find_natural_loops(
+@@ -4811,11 +4849,14 @@ mod tests {
  
-+    #[test]
-+    fn hoist_with_partial_source_spans_does_not_panic() {
-+        // Some lowering paths attach only a subset of source spans.  The
-+        // aggregate-copy hoist must still be able to move the pure address
-+        // computation without indexing that non-parallel metadata vector.
-+        let mut func = IrFunction::new("partial_spans".into(), IrType::I32, vec![], false);
-+        func.next_value_id = 3;
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![
-+                Instruction::Alloca {
-+                    dest: Value(0),
-+                    ty: IrType::I32,
-+                    size: 4,
-+                    align: 4,
-+                    volatile: false,
-+                    semantic_volatile: false,
-+                },
-+                Instruction::Alloca {
-+                    dest: Value(1),
-+                    ty: IrType::I32,
-+                    size: 4,
-+                    align: 4,
-+                    volatile: false,
-+                    semantic_volatile: false,
-+                },
-+                Instruction::Store {
-+                    volatile: false,
-+                    val: Operand::Const(IrConst::I32(7)),
-+                    ptr: Value(0),
-+                    ty: IrType::I32,
-+                    seg_override: AddressSpace::Default,
-+                },
-+                Instruction::GetElementPtr {
-+                    dest: Value(2),
-+                    base: Value(1),
-+                    offset: Operand::Const(IrConst::I64(0)),
-+                    ty: IrType::I32,
-+                },
-+                Instruction::Memcpy {
-+                    dest: Value(2),
-+                    src: Value(0),
-+                    size: 4,
-+                },
-+            ],
-+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
-+            // Deliberately not one-to-one with instructions: this is the
-+            // shape observed in the kernel's execmem_init_missing function.
-+            source_spans: vec![crate::common::source::Span::dummy()],
-+        });
-+
-+        assert_eq!(forward_store_only_temporaries(&mut func), 1);
-+        assert_eq!(func.blocks[0].instructions.len(), 5);
-+        assert_eq!(func.blocks[0].source_spans.len(), 1);
-+        assert!(matches!(
-+            func.blocks[0].instructions[2],
-+            Instruction::GetElementPtr { dest: Value(2), .. }
-+        ));
-+    }
-+
      #[test]
-     fn preserves_snapshot_when_copy_source_is_overwritten() {
-         let mut func = IrFunction::new("snapshot".into(), IrType::I32, vec![], false);
-diff --git a/src/passes/vec_arx.rs b/src/passes/vec_arx.rs
-index 419303fc..5d663c27 100644
---- a/src/passes/vec_arx.rs
-+++ b/src/passes/vec_arx.rs
-@@ -639,6 +639,15 @@ impl Emitter {
- /// Public entry: transform one function. Returns the number of scalar ARX
- /// ops vectorized (0 = no change).
- pub fn vec_arx_function(func: &mut IrFunction) -> usize {
-+    // ISA gate: this entry runs in Phase 2b, before the main vectorizer's
-+    // `vectorize_with_analysis` gate, yet it emits the same XMM-shaped Vec*
-+    // intrinsics (VecLoadI32x4, VecShufdI32x4, ...).  A `-mno-sse` /
-+    // `-mgeneral-regs-only` TU (kernel: CR4.OSFXSR=0) must keep every loop
-+    // scalar — the x86 backend rightly rejects an XMM instruction there.
-+    // Mirrors the gate the const-trip map entry gained for the same reason.
-+    if !crate::passes::vectorize::x86_simd_available_pub() {
-+        return 0;
-+    }
-     let cfg = CfgAnalysis::build(func);
-     let dom = DominanceChecker::new(cfg.num_blocks, &cfg.idom);
-     let loops =
+     fn two_block_unroll_declines_when_killed() {
+-        // CCC_NO_TWO_BLOCK_UNROLL must leave the loop rolled.
+-        unsafe { std::env::set_var("CCC_NO_TWO_BLOCK_UNROLL", "1") };
++        // CCC_NO_TWO_BLOCK_UNROLL must leave the loop rolled.  The switch is
++        // per-thread state rather than the process environment, so this test
++        // cannot race the sibling `two_block_unroll_*` tests that run on the
++        // other threads of the same test binary and expect Pass B enabled.
++        set_two_block_unroll_enabled(false);
+         let mut func = make_two_block_iv_back_loop(64, true);
+         let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+-        unsafe { std::env::remove_var("CCC_NO_TWO_BLOCK_UNROLL") };
++        set_two_block_unroll_enabled(true);
+         assert_eq!(n, 0, "kill switch must disable Pass B");
+         // The loop is intact: latch still branches to the header.
+         assert!(matches!(
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index c4014ec9..19ea0f33 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -938,6 +938,12 @@ pub(crate) fn run_passes(
+     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
+     // 128-bit SSE2 instead of disabling vectorization outright.
+     vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41);
++    // Pass B (two-block guard-free unroll) kill switch, resolved once here for
++    // the same reason as the ISA gates above: the unroller is a hot path and
++    // must not read the process environment per call, and per-thread state
++    // keeps the kill-switch unit test from racing its siblings (see
++    // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
++    loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
+     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
+     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
+     // ignores this.
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 62c1a875..c0c29ccc 100644
+index 0567a0d4..710eb92c 100644
 --- a/src/passes/vectorize.rs
 +++ b/src/passes/vectorize.rs
-@@ -23166,6 +23166,15 @@ pub(crate) fn vectorize_const_trip_map_loops(
-     if std::env::var("CCC_NO_MAP_VEC").is_ok() {
-         return 0;
-     }
-+    // This entry runs before the main vectorizer and therefore needs its own
-+    // ISA gate.  It emits the same Vec* intrinsics, but the caller's generic
-+    // `vectorize_with_analysis` gate is not reached here.  In particular,
-+    // `-mno-sse` kernel TUs must keep fixed-trip aggregate-copy loops scalar;
-+    // otherwise this early map path can leave a VecLoadI32x4 that the x86
-+    // backend quite correctly rejects as an XMM instruction.
+@@ -23163,6 +23163,23 @@ pub(crate) fn vectorize_const_trip_map_loops(
+     func: &mut IrFunction,
+     fp_contract: FpContract,
+ ) -> usize {
++    // ISA gate FIRST.  This entry runs before the main vectorizer and
++    // therefore needs its own gate: it emits the same Vec* intrinsics, but the
++    // caller's generic `vectorize_with_analysis` gate is not reached here.  In
++    // particular, `-mno-sse` kernel TUs must keep fixed-trip aggregate-copy
++    // loops scalar; otherwise this early map path can leave a VecLoadI32x4
++    // that the x86 backend quite correctly rejects as an XMM instruction.
++    //
++    // It is also the cheapest guard in this function — a thread-local read —
++    // so it must not sit behind the two whole-function IR walks and the
++    // environment lookup below.  A gated TU (the kernel's `-mno-sse
++    // -mgeneral-regs-only` contract) otherwise pays a DynAlloca scan, a
++    // volatile-access scan and an `env::var` allocation for every function in
++    // the module to reach a test that was already decided before the pass ran.
++    // All four guards are pure `return 0`, so the ordering is semantic-free.
 +    if !x86_simd_available() {
 +        return 0;
 +    }
+     // Same scoped legality gates as the main vectorizer: a DynAlloca breaks
+     // the transform's fixed-address assumptions, volatile accesses are
+     // observable and must keep their scalar width/order.
+@@ -23180,15 +23197,6 @@ pub(crate) fn vectorize_const_trip_map_loops(
+     if std::env::var("CCC_NO_MAP_VEC").is_ok() {
+         return 0;
+     }
+-    // This entry runs before the main vectorizer and therefore needs its own
+-    // ISA gate.  It emits the same Vec* intrinsics, but the caller's generic
+-    // `vectorize_with_analysis` gate is not reached here.  In particular,
+-    // `-mno-sse` kernel TUs must keep fixed-trip aggregate-copy loops scalar;
+-    // otherwise this early map path can leave a VecLoadI32x4 that the x86
+-    // backend quite correctly rejects as an XMM instruction.
+-    if !x86_simd_available() {
+-        return 0;
+-    }
      // Same diamond pre-conversion as the main vectorizer (see there).
      crate::passes::if_convert::if_convert_function(func);
      let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-diff --git a/tests/regression/check_vectorize_isa_gate.sh b/tests/regression/check_vectorize_isa_gate.sh
-index 405b5e18..ea2ce07b 100644
---- a/tests/regression/check_vectorize_isa_gate.sh
-+++ b/tests/regression/check_vectorize_isa_gate.sh
-@@ -77,6 +77,24 @@ check_eq "kernel ISA flags: SIMD register refs" "$(count_simd $tmp/kernel-isa.s)
- check_eq "kernel ISA flags at -O3: SIMD register refs" \
-     "$(count_simd $tmp/kernel-isa-o3.s)" 0
- 
-+# The Phase-2b memory-form ARX vectorizer (`vec_arx`) runs BEFORE the main
-+# vectorizer's ISA gate yet emits XMM-shaped intrinsics on the u32[16]
-+# ChaCha slot domain.  Before its own gate it turned a kernel TU into a
-+# hard backend rejection ("offending instruction: `movdqu (%rax), %xmm2'").
-+# Both the array spelling (benchmark chacha20_block.c) and the phi spelling
-+# (regression vec_arx_scalar_spelling.c) must stay scalar and compile.
-+for arx in "$repo/tests/regression/vec_arx_scalar_spelling.c" \
-+           "$repo/tests/benchmark/programs/chacha20_block.c"; do
-+    name=$(basename "$arx" .c)
-+    "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$arx" -o "$tmp/arx-$name.s"
-+    check_eq "kernel ISA flags: ARX $name xmm refs" \
-+        "$(count_simd "$tmp/arx-$name.s")" 0
-+done
-+"$ccc" -O3 "${KERNEL_ISA[@]}" -S "$repo/tests/benchmark/programs/chacha20_block.c" \
-+    -o "$tmp/arx-chacha-o3.s"
-+check_eq "kernel ISA flags at -O3: ARX chacha20_block xmm refs" \
-+    "$(count_simd "$tmp/arx-chacha-o3.s")" 0
-+
- # ---- 4. FMA3 gate ----------------------------------------------------------
- "$ccc" -O2 -S "$fmasrc" -o "$tmp/fma-default.s"
- check_gt0 "default fmaf folds to vfmadd" "$(count_vfmadd $tmp/fma-default.s)"
-@@ -84,8 +102,18 @@ for flag in -mno-fma -mno-avx; do
-     "$ccc" -O2 "$flag" -S "$fmasrc" -o "$tmp/fma.s"
-     check_eq "$flag: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
- done
--"$ccc" -O2 "${KERNEL_ISA[@]}" -S "$fmasrc" -o "$tmp/fma.s"
--check_eq "kernel ISA flags: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
-+# The kernel's no-SSE contract also rejects live scalar FP: x86-64 LCCC has
-+# no x87 lowering, and silently accepting this TU would be worse than a clear
-+# diagnostic.  Keep the FMA gate assertion separate from that diagnostic.
-+if "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$fmasrc" -o "$tmp/fma.s" \
-+    >"$tmp/kernel-fma.out" 2>"$tmp/kernel-fma.err"; then
-+    echo "FAIL: kernel ISA flags accepted a live scalar-FP FMA TU" >&2
-+    fail=1
-+elif ! grep -q "floating-point operation requires SSE" "$tmp/kernel-fma.err"; then
-+    echo "FAIL: kernel ISA FMA diagnostic changed or disappeared" >&2
-+    cat "$tmp/kernel-fma.err" >&2
-+    fail=1
-+fi
- 
- # ---- 5. `-msse` after `-mno-sse` re-enables (kernel CC_FLAGS_FPU) ----------
- # arch/x86/Makefile appends -msse to CC_FLAGS_FPU for FPU-using TUs, after the
-diff --git a/tests/regression/pointer_to_array_member_subscript.c b/tests/regression/pointer_to_array_member_subscript.c
-new file mode 100644
-index 00000000..16672934
---- /dev/null
-+++ b/tests/regression/pointer_to_array_member_subscript.c
-@@ -0,0 +1,35 @@
-+// Regression: a subscript of a pointer to a one-element array typedef is
-+// still an array lvalue.  It must decay to the address of the selected
-+// element for the following -> access, rather than loading the first word of
-+// the array as if it were a struct pointer.
-+struct mask {
-+    unsigned long bits[1];
-+};
-+
-+typedef struct mask mask_var[1];
-+
-+struct pod {
-+    mask_var *pod_cpus;
-+    int *cpu_pod;
-+};
-+
-+static volatile unsigned long observed;
-+
-+__attribute__((noinline))
-+static void consume(unsigned long *p) {
-+    observed = p[0];
-+}
-+
-+__attribute__((noinline))
-+static void read_selected(struct pod *pt, int i) {
-+    consume(pt->pod_cpus[pt->cpu_pod[i]]->bits);
-+}
-+
-+int main(void) {
-+    struct mask masks[3] = {{{11}}, {{22}}, {{33}}};
-+    int order[3] = {2, 0, 1};
-+    struct pod p = {(mask_var *)masks, order};
-+
-+    read_selected(&p, 1);
-+    return observed != 11;
-+}
-diff --git a/tests/regression/vectorize_isa_gate.c b/tests/regression/vectorize_isa_gate.c
-index be9491cf..1c6f50ef 100644
---- a/tests/regression/vectorize_isa_gate.c
-+++ b/tests/regression/vectorize_isa_gate.c
-@@ -49,6 +49,20 @@ __attribute__((noinline)) long dot_ll(const long *a, const long *b, int n)
-     return acc;
- }
- 
-+/* Fixed-trip aggregate copies take the early constant-map vectorizer path,
-+ * before the ordinary loop vectorizer.  Keep this kernel-shaped case here so
-+ * -mno-sse gates both entry points, not just the later general loop path. */
-+static const unsigned int fixed_src[12] = {
-+    0x10203040u, 0x50607080u, 0x90a0b0c0u, 0xd0e0f000u,
-+    11u, 22u, 33u, 44u, 55u, 66u, 77u, 88u,
-+};
-+
-+__attribute__((noinline)) void fixed_copy(unsigned int *d)
-+{
-+    for (int i = 0; i < 12; i++)
-+        d[i] = fixed_src[i];
-+}
-+
- int main(void)
- {
-     static int d[N], m[N], s[N];
-@@ -82,6 +96,13 @@ int main(void)
-     if (dot_ll(va, vb, N) != want_dot)
-         fail++;
- 
-+    unsigned int fixed_dst[12] = {0};
-+    fixed_copy(fixed_dst);
-+    for (int i = 0; i < 12; i++) {
-+        if (fixed_dst[i] != fixed_src[i])
-+            fail++;
-+    }
-+
-     /* A second pass with a different length exercises the scalar remainder /
-      * peel path that the vector transforms add. */
-     for (int i = 0; i < N; i++)
