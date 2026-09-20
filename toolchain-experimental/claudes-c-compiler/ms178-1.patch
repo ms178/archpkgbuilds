@@ -1,5 +1,5 @@
 diff --git a/engineering/FOLLOWUP-2026-09-19E-vector-copy-elimination.md b/engineering/FOLLOWUP-2026-09-19E-vector-copy-elimination.md
-index 4a3682b..9d69f2a 100644
+index 4a3682b3..9d69f2a5 100644
 --- a/engineering/FOLLOWUP-2026-09-19E-vector-copy-elimination.md
 +++ b/engineering/FOLLOWUP-2026-09-19E-vector-copy-elimination.md
 @@ -1,17 +1,18 @@
@@ -153,11 +153,472 @@ index 4a3682b..9d69f2a 100644
 +scripts/ci_local.sh                                    # every gate
  cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
  ```
+diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
+index 5100c81e..734d73b6 100644
+--- a/src/backend/arm/codegen/emit.rs
++++ b/src/backend/arm/codegen/emit.rs
+@@ -2859,6 +2859,28 @@ impl ArchCodegen for ArmCodegen {
+             self.emit_int_fused_mul_sub_impl(mul_lhs, mul_rhs, acc, sub_dest, ty);
+         }
+     }
++    fn emit_fused_fma(
++        &mut self,
++        mul_lhs: &Operand,
++        mul_rhs: &Operand,
++        acc: &Operand,
++        dest: &Value,
++        ty: IrType,
++        negate_product: bool,
++        negate_addend: bool,
++    ) {
++        debug_assert!(matches!(ty, IrType::F32 | IrType::F64));
++        debug_assert!(negate_product || negate_addend);
++        self.emit_fused_fma_signed_impl(
++            mul_lhs,
++            mul_rhs,
++            acc,
++            dest,
++            ty,
++            negate_product,
++            negate_addend,
++        );
++    }
+     fn state(&mut self) -> &mut CodegenState {
+         &mut self.state
+     }
+diff --git a/src/backend/arm/codegen/float_ops.rs b/src/backend/arm/codegen/float_ops.rs
+index 4afb0234..e4a8dbd5 100644
+--- a/src/backend/arm/codegen/float_ops.rs
++++ b/src/backend/arm/codegen/float_ops.rs
+@@ -174,6 +174,51 @@ impl ArmCodegen {
+         self.store_float_reg(sub_dest, ty, &output);
+     }
+ 
++    /// The four-way signed FMA hook.  AArch64's spelling inverts the x86
++    /// roles: `sub` negates the PRODUCT (Rd = Ra - Rn*Rm) and the `n` prefix
++    /// negates the ADDEND, so — with (negate_product, negate_addend) flags —
++    ///   (+,+) fmadd · (+,-) fnmsub (Rd = Rn*Rm - Ra) ·
++    ///   (-,+) fmsub  (Rd = Ra - Rn*Rm) · (-,-) fnmadd (Rd = -(Rn*Rm) - Ra)
++    /// each mapping verified against GCC's aarch64 contraction of the six
++    /// negation source shapes under -ffp-contract=fast.
++    pub(super) fn emit_fused_fma_signed_impl(
++        &mut self,
++        mul_lhs: &Operand,
++        mul_rhs: &Operand,
++        acc: &Operand,
++        dest: &Value,
++        ty: IrType,
++        negate_product: bool,
++        negate_addend: bool,
++    ) {
++        let (r0, r1, r2) = if ty == IrType::F32 {
++            ("s0", "s1", "s2")
++        } else {
++            ("d0", "d1", "d2")
++        };
++        let acc_reg = self.float_operand_reg(acc, ty, r2);
++        let lhs_reg = self.float_operand_reg(mul_lhs, ty, r0);
++        let rhs_reg = self.float_operand_reg(mul_rhs, ty, r1);
++        let output = self
++            .reg_assignments
++            .get(&dest.0)
++            .copied()
++            .filter(|r| is_arm_fp_phys(*r))
++            .map(|r| arm_fp_name(r, ty))
++            .unwrap_or_else(|| r0.to_string());
++        let mnemonic = match (negate_product, negate_addend) {
++            (false, false) => "fmadd",
++            (false, true) => "fnmsub",
++            (true, false) => "fmsub",
++            (true, true) => "fnmadd",
++        };
++        self.state.emit_fmt(format_args!(
++            "    {} {}, {}, {}, {}",
++            mnemonic, output, lhs_reg, rhs_reg, acc_reg
++        ));
++        self.store_float_reg(dest, ty, &output);
++    }
++
+     pub(super) fn emit_float_binop_impl(
+         &mut self,
+         dest: &Value,
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index a0f6934f..6a1840f3 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -2775,6 +2775,22 @@ fn detect_conditional_increment_selects(
+ }
+ 
+ /// Mul whose single use is a nearby Add. Map: mul_idx → add_idx.
++/// One recorded mul→(add/sub) fusion.
++///
++/// The negation fields carry the sign algebra: a `Neg` wrapping the product
++/// (`-(a*b) ± c`, shape 1) and/or a `Neg` wrapping the partner's result
++/// (`-(a*b ± c)`, shape 2) flips the fused family, which the driver
++/// materialises through `emit_fused_fma`.  Both Neg instructions are consumed
++/// by the fusion and skipped at emission time, exactly like the partner.
++#[derive(Clone, Copy)]
++struct MulAddFusion {
++    partner_idx: usize,
++    neg_product_idx: Option<usize>,
++    neg_result_idx: Option<usize>,
++    negate_product: bool,
++    negate_addend: bool,
++}
++
+ fn detect_mul_add_fusions(
+     block: &BasicBlock,
+     use_counts: &[u32],
+@@ -2789,10 +2805,12 @@ fn detect_mul_add_fusions(
+     // in `accs`: fusing `acc -= a*b` puts the multiply on the loop-carried
+     // serial dependency chain (fmsub latency > fsub latency), a measured
+     // 13% regression on nbody. Such Subs stay split so the multiply issues
+-    // independently of the chain.
++    // independently of the chain.  Every NEGATED family is gated the same
++    // way: `acc += -(a*b)` lowers to Add(Neg(mul), acc) and is the same
++    // program as `acc -= a*b`, so it must not slip past the calibration.
+     fuse_float_sub: Option<&FxHashSet<u32>>,
+-) -> FxHashMap<usize, usize> {
+-    let mut fusion_map: FxHashMap<usize, usize> = FxHashMap::default();
++) -> FxHashMap<usize, MulAddFusion> {
++    let mut fusion_map: FxHashMap<usize, MulAddFusion> = FxHashMap::default();
+     // `a*b + c*d` must not fuse the first mul with an add whose other
+     // operand is a not-yet-executed mul.
+     let mut claimed_adds: FxHashSet<usize> = FxHashSet::default();
+@@ -2826,6 +2844,11 @@ fn detect_mul_add_fusions(
+         let mut add_ty_r = None;
+         let mut skipped_defs: [u32; 6] = [u32::MAX; 6];
+         let mut skipped_count = 0usize;
++        // Shape 1: `-(a*b) ± c`.  The product-side value the partner must
++        // consume starts as the mul's own dest and becomes the Neg's dest
++        // once a single-use Neg wrapped it.
++        let mut neg_product_idx = None;
++        let mut product_val = mul_dest.0;
+         let max_scan = (idx + 6).min(block.instructions.len());
+         for scan in (idx + 1)..max_scan {
+             match &block.instructions[scan] {
+@@ -2835,6 +2858,22 @@ fn detect_mul_add_fusions(
+                         skipped_count += 1;
+                     }
+                 }
++                // `-(a*b) ± c`: a single-use Neg on the product flips the
++                // product's sign; the fused instruction reads the mul's
++                // ORIGINAL operands, so the Neg itself becomes dead.
++                Instruction::UnaryOp {
++                    dest,
++                    op: crate::ir::reexports::IrUnaryOp::Neg,
++                    src,
++                    ..
++                } if mul_ty.is_float()
++                    && neg_product_idx.is_none()
++                    && matches!(src, Operand::Value(v) if v.0 == mul_dest.0)
++                    && use_counts.get(dest.0 as usize).copied().unwrap_or(0) == 1 =>
++                {
++                    neg_product_idx = Some(scan);
++                    product_val = dest.0;
++                }
+                 Instruction::BinOp {
+                     op: IrBinOp::Add,
+                     lhs,
+@@ -2901,8 +2940,8 @@ fn detect_mul_add_fusions(
+         if claimed_adds.contains(&next_idx) {
+             continue;
+         }
+-        let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
+-        let mul_is_rhs = matches!(add_rhs, Operand::Value(v) if v.0 == mul_dest.0);
++        let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == product_val);
++        let mul_is_rhs = matches!(add_rhs, Operand::Value(v) if v.0 == product_val);
+         if !mul_is_lhs && !mul_is_rhs {
+             continue;
+         }
+@@ -2910,6 +2949,59 @@ fn detect_mul_add_fusions(
+         if defined_between(add_lhs) || defined_between(add_rhs) || mul_ty != add_ty {
+             continue;
+         }
++        // The partner op decides the base family: Add -> +(product) + acc;
++        // Sub with the product on the left -> +(product) - acc; Sub with it
++        // on the right -> acc - product = -(product) + acc.
++        let partner_op = match &block.instructions[next_idx] {
++            Instruction::BinOp { op, .. } => *op,
++            _ => continue,
++        };
++        let mut negate_product = neg_product_idx.is_some();
++        let mut negate_addend = false;
++        match partner_op {
++            IrBinOp::Add => {}
++            IrBinOp::Sub => {
++                if mul_is_lhs {
++                    negate_addend = true;
++                } else {
++                    negate_product = !negate_product;
++                }
++            }
++            _ => continue,
++        }
++        // Shape 2: `-(a*b ± c)` — a single-use Neg directly on the partner's
++        // result.  Folding it is exactly value-preserving GIVEN the fusion
++        // (IEEE negation is a sign flip and every supported rounding mode
++        // satisfies round(-x) = -round(x) for the fused vs split question
++        // the contract governs), so it adds no contraction of its own; the
++        // pair gate below therefore stays (mul_tag, partner_tag), the same
++        // one the plain fusion answers to.  The fused instruction writes
++        // the NEG's destination; the partner's dest dies with it.
++        let mut neg_result_idx = None;
++        if mul_ty.is_float() {
++            // The trailing Neg must directly follow the partner: allowing
++            // instructions between it and the partner would need the same
++            // deferred-read clash analysis the gap fusion carries.
++            if let Some(Instruction::UnaryOp {
++                op: crate::ir::reexports::IrUnaryOp::Neg,
++                src: neg_src,
++                ..
++            }) = block.instructions.get(next_idx + 1)
++            {
++                let partner_dest = match &block.instructions[next_idx] {
++                    Instruction::BinOp { dest, .. } => dest.0,
++                    _ => u32::MAX,
++                };
++                if matches!(neg_src, Operand::Value(v) if v.0 == partner_dest)
++                    && use_counts.get(partner_dest as usize).copied().unwrap_or(0) == 1
++                {
++                    // Flip both signs: -(p ± a) = (-p) ∓ a.
++                    negate_product = !negate_product;
++                    negate_addend = !negate_addend;
++                    neg_result_idx = Some(next_idx + 1);
++                }
++            }
++        }
+         // OP-36: FP contraction is pair-gated. `fast` fuses freely; `on`
+         // requires the mul and the add to share one statement-root tag
+         // (same source expression); untagged values (pass-generated,
+@@ -2922,8 +3014,37 @@ fn detect_mul_add_fusions(
+                 continue;
+             }
+         }
++        // Negated families carry the Sub-fusion discipline: the kill switch
++        // applies, and neither the partner's nor the folded Neg's
++        // destination may be a loop-carried accumulator (`acc += -(a*b)`
++        // is `acc -= a*b` in source terms; the nbody calibration rules it).
++        let negated = neg_product_idx.is_some() || neg_result_idx.is_some();
++        if negated {
++            let Some(accs) = fuse_float_sub else {
++                continue;
++            };
++            let partner_dest = block.instructions[next_idx].dest().map(|d| d.0);
++            let final_dest = match neg_result_idx {
++                Some(n) => block.instructions[n].dest().map(|d| d.0),
++                None => None,
++            };
++            if partner_dest.is_some_and(|d| accs.contains(&d))
++                || final_dest.is_some_and(|d| accs.contains(&d))
++            {
++                continue;
++            }
++        }
+         claimed_adds.insert(next_idx);
+-        fusion_map.insert(idx, next_idx);
++        fusion_map.insert(
++            idx,
++            MulAddFusion {
++                partner_idx: next_idx,
++                neg_product_idx,
++                neg_result_idx,
++                negate_product,
++                negate_addend,
++            },
++        );
+     }
+     fusion_map
+ }
+@@ -4844,7 +4965,7 @@ fn generate_function(
+                 ty,
+             } = inst
+             {
+-                if let Some(&add_i) = mul_add_fusions.get(&idx) {
++                if let Some(fusion) = mul_add_fusions.get(&idx) {
+                     // Float always fuses (native fmadd/fmsub). Integer fuses
+                     // when the temp is slot-homed, or unconditionally on
+                     // targets where madd/msub cost the same as the mul
+@@ -4859,29 +4980,93 @@ fn generate_function(
+                             lhs: add_lhs,
+                             rhs: add_rhs,
+                             ty: add_ty,
+-                        }) = block.instructions.get(add_i)
++                        }) = block.instructions.get(fusion.partner_idx)
+                         {
+-                            let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
+-                            let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+-                            cg.flush_machinst();
+-                            match partner_op {
+-                                IrBinOp::Add => {
++                            let has_neg_shape =
++                                fusion.neg_product_idx.is_some() || fusion.neg_result_idx.is_some();
++                            if !has_neg_shape {
++                                let mul_is_lhs =
++                                    matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
++                                let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
++                                cg.flush_machinst();
++                                match partner_op {
++                                    IrBinOp::Add => {
++                                        cg.emit_fused_mul_add(
++                                            dest, lhs, rhs, acc_op, add_dest, *add_ty,
++                                        );
++                                    }
++                                    IrBinOp::Sub => {
++                                        // Detector only records float Subs when the
++                                        // backend advertised supports_fused_float_mul_sub.
++                                        // mul_is_lhs selects fnmsub (product - acc)
++                                        // vs fmsub (acc - product).
++                                        cg.emit_fused_mul_sub(
++                                            dest, lhs, rhs, acc_op, add_dest, *add_ty, mul_is_lhs,
++                                        );
++                                    }
++                                    _ => unreachable!("mul fusion partner must be Add or Sub"),
++                                }
++                                fused_add_skip.insert(fusion.partner_idx);
++                            } else {
++                                // A negated shape rides this fusion: the
++                                // product the partner consumed is the
++                                // shape-1 Neg's dest, and the FINAL
++                                // destination is the trailing shape-2 Neg's
++                                // dest when one was folded (the partner's
++                                // dest dies with it).
++                                let product_val = match fusion.neg_product_idx {
++                                    Some(n) => match block.instructions[n].dest() {
++                                        Some(d) => d.0,
++                                        None => u32::MAX,
++                                    },
++                                    None => dest.0,
++                                };
++                                let prod_is_lhs =
++                                    matches!(add_lhs, Operand::Value(v) if v.0 == product_val);
++                                let acc_op = if prod_is_lhs { add_rhs } else { add_lhs };
++                                let final_dest: Value = match fusion.neg_result_idx {
++                                    Some(n) => block.instructions[n]
++                                        .dest()
++                                        .expect("shape-2 Neg carries a dest"),
++                                    None => *add_dest,
++                                };
++                                cg.flush_machinst();
++                                if fusion.negate_product || fusion.negate_addend {
++                                    // A signed family (`-(a*b) ± c`, `c - a*b`
++                                    // via shape 1, `-(a*b ± c)`): one FMA,
++                                    // signs chosen by the two flags.
++                                    cg.emit_fused_fma(
++                                        lhs,
++                                        rhs,
++                                        acc_op,
++                                        &final_dest,
++                                        *add_ty,
++                                        fusion.negate_product,
++                                        fusion.negate_addend,
++                                    );
++                                } else {
++                                    // Double negation folded back to the plain
++                                    // family (`c - -(a*b)`, `-( -(a*b) - c)`):
++                                    // exactly `a*b + acc`, so the plain fmadd
++                                    // hook serves it -- emit_fused_fma's
++                                    // contract reserves it for negated flags.
+                                     cg.emit_fused_mul_add(
+-                                        dest, lhs, rhs, acc_op, add_dest, *add_ty,
++                                        dest,
++                                        lhs,
++                                        rhs,
++                                        acc_op,
++                                        &final_dest,
++                                        *add_ty,
+                                     );
+                                 }
+-                                IrBinOp::Sub => {
+-                                    // Detector only records float Subs when the
+-                                    // backend advertised supports_fused_float_mul_sub.
+-                                    // mul_is_lhs selects fnmsub (product - acc)
+-                                    // vs fmsub (acc - product).
+-                                    cg.emit_fused_mul_sub(
+-                                        dest, lhs, rhs, acc_op, add_dest, *add_ty, mul_is_lhs,
+-                                    );
++                                fused_add_skip.insert(fusion.partner_idx);
++                                if let Some(n) = fusion.neg_product_idx {
++                                    fused_add_skip.insert(n);
++                                }
++                                if let Some(n) = fusion.neg_result_idx {
++                                    fused_add_skip.insert(n);
+                                 }
+-                                _ => unreachable!("mul fusion partner must be Add or Sub"),
+                             }
+-                            fused_add_skip.insert(add_i);
+                             cg.state().current_program_point += 1;
+                             continue;
+                         }
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index c872540b..5f53a151 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -727,8 +727,8 @@ pub trait ArchCodegen {
+     }
+ 
+     /// Emit a fused multiply-subtract.
+-    /// `mul_is_lhs == false`: sub_dest = acc - (mul_lhs * mul_rhs)  [fmsub]
+-    /// `mul_is_lhs == true` : sub_dest = (mul_lhs * mul_rhs) - acc  [fnmsub]
++    /// `mul_is_lhs == false`: sub_dest = acc - (mul_lhs * mul_rhs)  [x86 vfnmadd / a64 fmsub]
++    /// `mul_is_lhs == true` : sub_dest = (mul_lhs * mul_rhs) - acc  [x86 vfmsub / a64 fnmsub]
+     ///
+     /// Only called when supports_fused_float_mul_sub() returned true and the
+     /// type is F32/F64; there is deliberately NO default mul+sub fallback —
+@@ -748,6 +748,36 @@ pub trait ArchCodegen {
+         unreachable!("emit_fused_mul_sub called on a backend that does not support it");
+     }
+ 
++    /// Emit any of the four signed fused multiply-add families with a single
++    /// rounding: `dest = ±(mul_lhs * mul_rhs) ± acc`, the two signs chosen by
++    /// `negate_product` and `negate_addend`.
++    ///
++    /// This is the complete sign algebra behind the negation contraction
++    /// shapes — `-(a*b) - c`, `-(a*b) + c`, `-(a*b + c)`, `-(c - a*b)` — all
++    /// of which GCC contracts to one instruction under `-ffp-contract=fast`:
++    /// * x86:   `vfmadd` (+,+) · `vfmsub` (+,-) · `vfnmadd` (-,+) · `vfnmsub` (-,-)
++    ///   (`n` negates the product, `sub` subtracts the addend);
++    /// * aarch64: `fmadd` (+,+) · `fnmsub` (+,-) · `fmsub` (-,+) · `fnmadd` (-,-)
++    ///   (the roles swap: `sub` negates the product, `n` the addend).
++    ///
++    /// The plain (+,+) family keeps going through [`Self::emit_fused_mul_add`];
++    /// this hook is only invoked with a negated flag set, and has NO default
++    /// (same policy as [`Self::emit_fused_mul_sub`]): the detector records
++    /// negated shapes only after `supports_fused_float_mul_sub()`, and a
++    /// backend advertising the sub families carries all four spellings.
++    fn emit_fused_fma(
++        &mut self,
++        _mul_lhs: &Operand,
++        _mul_rhs: &Operand,
++        _acc: &Operand,
++        _dest: &Value,
++        _ty: IrType,
++        _negate_product: bool,
++        _negate_addend: bool,
++    ) {
++        unreachable!("emit_fused_fma called on a backend that does not support it");
++    }
++
+     /// Whether the target can encode `other & ~value` directly.
+     fn supports_and_not(&self) -> bool {
+         false
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index e5264513..b928b775 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -8112,6 +8112,7 @@ impl ArchCodegen for X86Codegen {
+         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
+         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
+         fn emit_fused_mul_add(&mut self, mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand, acc: &Operand, add_dest: &Value, ty: IrType) => emit_fused_mul_add_impl;
++        fn emit_fused_fma(&mut self, mul_lhs: &Operand, mul_rhs: &Operand, acc: &Operand, dest: &Value, ty: IrType, negate_product: bool, negate_addend: bool) => emit_fused_fma_impl;
+         fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) => emit_copy_i128_impl;
+         // comparison
+         fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) => emit_f128_cmp_impl;
 diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
-index 7090604..d65bc57 100644
+index 5235bd9b..a5976fbf 100644
 --- a/src/backend/x86/codegen/float_ops.rs
 +++ b/src/backend/x86/codegen/float_ops.rs
-@@ -1106,6 +1106,20 @@ impl X86Codegen {
+@@ -1160,6 +1160,20 @@ impl X86Codegen {
              }
              return;
          }
@@ -175,10 +636,10 @@ index 7090604..d65bc57 100644
 +                return;
 +            }
 +        }
-         // Integer dest-only two-operand ABM/BMI: popcnt/lzcnt/tzcnt write dest
-         // without reading it. Emit `mnem %src, %dest` (or `%src, %eax` when dest
-         // is the accumulator / return) so we never stage through `movq %src, %rax`
-@@ -1181,6 +1195,68 @@ impl X86Codegen {
+         if !self.lzcnt_enabled {
+             let leading = match op {
+                 IrUnaryOp::ClzNonZero => Some(true),
+@@ -1248,6 +1262,68 @@ impl X86Codegen {
          crate::backend::traits::emit_unaryop_default(self, dest, op, src, ty);
      }
  
@@ -247,12 +708,87 @@ index 7090604..d65bc57 100644
      /// Load an FP operand directly into an XMM register, using the constant pool
  
      /// for FP literal constants instead of going through a GPR. Value operands
+@@ -1477,13 +1553,68 @@ impl X86Codegen {
+         ty: IrType,
+         mul_is_lhs: bool,
+     ) {
+-        let fma = match (mul_is_lhs, matches!(ty, IrType::F64)) {
+-            (true, true) => "vfmsub231sd",
+-            (true, false) => "vfmsub231ss",
+-            (false, true) => "vfnmadd231sd",
+-            (false, false) => "vfnmadd231ss",
++        // `acc - product` negates the product; `product - acc` negates the
++        // addend.  Both flags false is the plain fmadd.
++        self.emit_scalar_fma_signed(mul_lhs, mul_rhs, acc, sub_dest, ty, !mul_is_lhs, mul_is_lhs);
++    }
++
++    /// Any of the four signed FMA3 families in one rounding:
++    /// `dest = ±(lhs*rhs) ± acc`, the signs chosen by the two flags.  The
++    /// x86 naming composes exactly: `n` negates the PRODUCT and `sub`
++    /// subtracts the ADDEND, so
++    /// `(false,false) vfmadd · (false,true) vfmsub · (true,false) vfnmadd ·
++    /// (true,true) vfnmsub` — the complete sign algebra behind the source
++    /// shapes `-(a*b) - c`, `-(a*b) + c`, `-(a*b + c)` and `-(c - a*b)`,
++    /// which GCC contracts to one instruction each under
++    /// `-ffp-contract=fast` (oracle-verified; the same algebra covers
++    /// AArch64 with the `sub`/`n` roles swapped — there `sub` negates the
++    /// product and `n` the addend: fmadd·fnmsub·fmsub·fnmadd).
++    pub(super) fn emit_scalar_fma_signed(
++        &mut self,
++        mul_lhs: &Operand,
++        mul_rhs: &Operand,
++        acc: &Operand,
++        dest: &Value,
++        ty: IrType,
++        negate_product: bool,
++        negate_addend: bool,
++    ) {
++        let fma = match (negate_product, negate_addend, matches!(ty, IrType::F64)) {
++            (false, false, true) => "vfmadd231sd",
++            (false, false, false) => "vfmadd231ss",
++            (false, true, true) => "vfmsub231sd",
++            (false, true, false) => "vfmsub231ss",
++            (true, false, true) => "vfnmadd231sd",
++            (true, false, false) => "vfnmadd231ss",
++            (true, true, true) => "vfnmsub231sd",
++            (true, true, false) => "vfnmsub231ss",
+         };
+-        self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, sub_dest, ty);
++        self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, dest, ty);
++    }
++
++    /// The four-way signed FMA hook (`emit_fused_fma` on the trait): any
++    /// negated family routes here; the plain family keeps its own path.
++    pub(super) fn emit_fused_fma_impl(
++        &mut self,
++        mul_lhs: &Operand,
++        mul_rhs: &Operand,
++        acc: &Operand,
++        dest: &Value,
++        ty: IrType,
++        negate_product: bool,
++        negate_addend: bool,
++    ) {
++        debug_assert!(matches!(ty, IrType::F32 | IrType::F64));
++        debug_assert!(negate_product || negate_addend);
++        self.emit_scalar_fma_signed(
++            mul_lhs,
++            mul_rhs,
++            acc,
++            dest,
++            ty,
++            negate_product,
++            negate_addend,
++        );
+     }
+ 
+     fn emit_scalar_fma231_with(
 diff --git a/src/backend/x86/codegen/peephole/passes/fma_forms.rs b/src/backend/x86/codegen/peephole/passes/fma_forms.rs
 new file mode 100644
-index 0000000..79ebf98
+index 00000000..c914b45a
 --- /dev/null
 +++ b/src/backend/x86/codegen/peephole/passes/fma_forms.rs
-@@ -0,0 +1,567 @@
+@@ -0,0 +1,634 @@
 +//! The algebra of scalar FMA3 encodings: roles versus forms.
 +//!
 +//! Every scalar FMA computes `±(m₁ × m₂) ± a` over three values and rounds
@@ -270,8 +806,13 @@ index 0000000..79ebf98
 +//! their signs to the same two roles in every form, so a change of form never
 +//! changes the arithmetic: multiplication is commutative and bitwise exact in
 +//! IEEE-754, and the FMA rounds once whichever operand order it was encoded
-+//! with.  What a change of form DOES change is two things the surrounding code
-+//! cares about:
++//! with.  (One deliberate exception sits outside this module's contract: when
++//! a NaN is PRODUCED, the payload — and its sign — may depend on operand
++//! position, which is implementation-defined in IEEE-754; two forms may
++//! therefore return bitwise-different NaNs while agreeing on NaN-ness and on
++//! every real-valued result.  The regression gate compares with a
++//! payload-insensitive predicate for exactly this reason.)  What a change of
++//! form DOES change is two things the surrounding code cares about:
 +//!
 +//! * **which register receives the result** — the destination is always one of
 +//!   the three role registers, and each form makes a different role the
@@ -528,13 +1069,16 @@ index 0000000..79ebf98
 +    /// when no single instruction can: `dst` must be one of the role
 +    /// registers, and at most one role may be a memory reference.
 +    ///
-+    /// When `dst` is the addend the form is 231; when it is a multiplicand the
-+    /// other multiplicand and the addend share operands 0 and 1, and the memory
-+    /// operand — if there is one — decides which goes where.  With two
-+    /// registers either form is legal and `prefer` breaks the tie, so that an
-+    /// instruction re-encoded without a change of destination keeps its text;
-+    /// failing a usable preference, 213 is chosen, which is the form Clang and
-+    /// ICX emit for `__builtin_fma(a, b, c)`.
++    /// When `dst` is the addend the form is 231 — unless `dst` names a
++    /// multiplicand as well (`x * x + a` with the result in x), where the
++    /// multiplicand forms are equally legal and `prefer` decides.  When it is
++    /// only a multiplicand the other multiplicand and the addend share
++    /// operands 0 and 1, and the memory operand — if there is one — decides
++    /// which goes where.  With two registers either form is legal and
++    /// `prefer` breaks the tie, so that an instruction re-encoded without a
++    /// change of destination keeps its text; failing a usable preference, 213
++    /// is chosen, which is the form Clang and ICX emit for
++    /// `__builtin_fma(a, b, c)`.
 +    pub(super) fn encode(&self, dst: u8, prefer: FmaForm) -> Option<ScalarFma<'a>> {
 +        let n_mem = [self.mult[0], self.mult[1], self.addend]
 +            .iter()
@@ -556,7 +1100,23 @@ index 0000000..79ebf98
 +            // Operand 1 is Intel src2, operand 0 is src3: `mult` was built in
 +            // that order, and the memory operand can only be src3.
 +            let (m2, m3) = (self.mult[0], self.mult[1]);
-+            if is_memory(m2) {
++            // The destination may name a multiplicand as well (`x * x + a`
++            // with the result in x): 231 is one legal encoding, and so is
++            // whichever multiplicand form `prefer` names.  Honouring the
++            // preference keeps the promise that an unchanged destination
++            // reproduces the original text even in that aliased corner.
++            let dst_in_mult = xmm_reg(m2) == Some(dst) || xmm_reg(m3) == Some(dst);
++            if dst_in_mult && matches!(prefer, FmaForm::F132 | FmaForm::F213) {
++                let other = if xmm_reg(m2) == Some(dst) { m3 } else { m2 };
++                // The addend is the destination register here, so it can
++                // never be the memory operand; `other` can, and 213 reads
++                // its operand 1, so a memory multiplicand forces 132.
++                if prefer == FmaForm::F213 && !is_memory(other) {
++                    (FmaForm::F213, self.addend, other)
++                } else {
++                    (FmaForm::F132, other, self.addend)
++                }
++            } else if is_memory(m2) {
 +                (FmaForm::F231, m2, m3)
 +            } else {
 +                (FmaForm::F231, m3, m2)
@@ -711,63 +1271,106 @@ index 0000000..79ebf98
 +    }
 +
 +    /// The exhaustive oracle: for every family, form, width, choice of which
-+    /// role register becomes the destination, and placement of a memory
-+    /// operand, the re-encoding must (1) exist exactly when the ISA has one,
-+    /// (2) compute the same roles, (3) write the requested register, (4) keep
-+    /// any memory operand at operand 0, and (5) parse back to itself.
++    /// role register becomes the destination, placement of a memory operand,
++    /// AND aliasing pattern among the register operands, the re-encoding must
++    /// (1) exist exactly when the ISA has one, (2) compute the same roles,
++    /// (3) write the requested register, (4) keep any memory operand at
++    /// operand 0, (5) parse back to itself, and (6) reproduce the original
++    /// text when the destination is unchanged.
++    ///
++    /// Aliasing is not decoration: `mentions()` counts multiplicity, and
++    /// `x * x + a` with the result in x takes the tie branch of `encode()`
++    /// that distinct registers never reach.  The patterns cover every way
++    /// the three operand slots can share a register; with a memory operand
++    /// at operand 0 only the register slots can alias.
 +    #[test]
 +    fn encode_preserves_roles_for_every_form_destination_and_memory_placement() {
++        // (r0, r1, r2) register numbers for the operand slots, with a memory
++        // operand replacing r0 in the `mem` variants.  `distinct` is the
++        // historical pattern; the rest alias.
++        const DISTINCT: [u8; 3] = [1, 2, 3];
++        const OP0_EQ_OP1: [u8; 3] = [1, 1, 3];
++        const OP1_EQ_DST: [u8; 3] = [1, 2, 2];
++        const OP0_EQ_DST: [u8; 3] = [1, 2, 1];
++        const ALL_EQ: [u8; 3] = [1, 1, 1];
 +        let mut checked = 0usize;
++        let mut aliased_checked = 0usize;
 +        for f in FAMILIES {
 +            for form in FORMS {
 +                for w in WIDTHS {
-+                    // Memory in role slot 0/1/2 of the ORIGINAL line's
-+                    // operand 0, or none.
-+                    for mem_at_op0 in [false, true] {
-+                        let op0 = if mem_at_op0 { "16(%rdi)" } else { "%xmm1" };
-+                        let line = format!(
-+                            "{}{}{} {op0}, %xmm2, %xmm3",
-+                            f.as_str(),
-+                            form.as_str(),
-+                            w.as_str()
-+                        );
-+                        let fma = parse_scalar_fma(&line).unwrap();
-+                        let roles = fma.roles();
-+                        for dst in 0u8..16 {
-+                            let got = roles.encode(dst, form);
-+                            let dst_is_role = roles.mentions(dst) > 0;
-+                            assert_eq!(got.is_some(), dst_is_role, "{line} -> xmm{dst}: {got:?}");
-+                            let Some(enc) = got else { continue };
-+                            checked += 1;
-+                            assert_eq!(enc.dst(), dst, "{line} -> {}", enc.render());
-+                            assert_eq!(
-+                                canonical(&enc.roles()),
-+                                canonical(&roles),
-+                                "{line} -> {}",
-+                                enc.render()
++                    for (pattern, aliased) in [
++                        (DISTINCT, false),
++                        (OP0_EQ_OP1, true),
++                        (OP1_EQ_DST, true),
++                        (OP0_EQ_DST, true),
++                        (ALL_EQ, true),
++                    ] {
++                        let [r0, r1, r2] = pattern;
++                        // Memory in the original line's operand 0 (the only
++                        // slot with an r/m encoding), or none.
++                        for op0 in ["16(%rdi)", "%xmm1"] {
++                            let op0 = if op0 == "%xmm1" {
++                                format!("%xmm{r0}")
++                            } else {
++                                op0.to_string()
++                            };
++                            let line = format!(
++                                "{}{}{} {op0}, %xmm{r1}, %xmm{r2}",
++                                f.as_str(),
++                                form.as_str(),
++                                w.as_str()
 +                            );
-+                            assert!(
-+                                !is_memory(enc.ops[1]) && !is_memory(enc.ops[2]),
-+                                "{}",
-+                                enc.render()
-+                            );
-+                            let rendered = enc.render();
-+                            let back = parse_scalar_fma(&rendered).expect("re-encoded line parses");
-+                            assert_eq!(back.render(), rendered);
-+                            // Re-encoding without changing the destination
-+                            // reproduces the original text exactly.
-+                            if dst == fma.dst() {
-+                                assert_eq!(enc.render(), line);
++                            let fma = parse_scalar_fma(&line).unwrap();
++                            let roles = fma.roles();
++                            for dst in 0u8..16 {
++                                let got = roles.encode(dst, form);
++                                let dst_is_role = roles.mentions(dst) > 0;
++                                assert_eq!(
++                                    got.is_some(),
++                                    dst_is_role,
++                                    "{line} -> xmm{dst}: {got:?}"
++                                );
++                                let Some(enc) = got else { continue };
++                                checked += 1;
++                                if aliased {
++                                    aliased_checked += 1;
++                                }
++                                assert_eq!(enc.dst(), dst, "{line} -> {}", enc.render());
++                                assert_eq!(
++                                    canonical(&enc.roles()),
++                                    canonical(&roles),
++                                    "{line} -> {}",
++                                    enc.render()
++                                );
++                                assert!(
++                                    !is_memory(enc.ops[1]) && !is_memory(enc.ops[2]),
++                                    "{}",
++                                    enc.render()
++                                );
++                                let rendered = enc.render();
++                                let back =
++                                    parse_scalar_fma(&rendered).expect("re-encoded line parses");
++                                assert_eq!(back.render(), rendered);
++                                // Re-encoding without changing the destination
++                                // reproduces the original text exactly -- in
++                                // every pattern, including the aliased corner
++                                // where the destination is addend and
++                                // multiplicand at once.
++                                if dst == fma.dst() {
++                                    assert_eq!(enc.render(), line, "aliased pattern {pattern:?}");
++                                }
 +                            }
 +                        }
 +                    }
 +                }
 +            }
 +        }
-+        // 4 families × 3 forms × 2 widths × 2 memory placements × the number
-+        // of distinct role registers (3 with a register operand 0, 2 with
-+        // memory there).
-+        assert_eq!(checked, 4 * 3 * 2 * (3 + 2));
++        // 4 families × 3 forms × 2 widths × 18 re-encodings each.  Per
++        // family/form/width the dst count is: distinct 3+2 (register vs
++        // memory operand 0), op0==op1 2+2, op1==dst 2+1, op0==dst 2+2,
++        // all-equal 1+1.  216 total, 156 of them over aliased operands.
++        assert_eq!(checked, 4 * 3 * 2 * (3 + 2 + 2 + 2 + 2 + 1 + 2 + 2 + 1 + 1));
++        assert_eq!(aliased_checked, 4 * 3 * 2 * (2 + 2 + 2 + 1 + 2 + 2 + 1 + 1));
 +    }
 +
 +    #[test]
@@ -820,11 +1423,24 @@ index 0000000..79ebf98
 +        );
 +    }
 +}
+diff --git a/src/backend/x86/codegen/peephole/passes/fp_liveness.rs b/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
+index a7c54dfe..ff25e92b 100644
+--- a/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
++++ b/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
+@@ -5,7 +5,7 @@
+ //!
+ //! [`super::liveness::FileLiveness`] answers "is GP register F read on any
+ //! path from here?" with a real backward dataflow over the function's CFG.
+-//! The scalar-FP folds (`fold_fp_register_loads`, `fold_fma_memory_src2`,
++//! The scalar-FP folds (`fold_fp_register_loads`, `fold_fma_memory_operand`,
+ //! `fold_scalar_fp_memory_into_vex_op`, `eliminate_fp_spill_around_load`,
+ //! `fold_ptr_deref_through_stack`, `promote_loop_invariant_fp_load`, the
+ //! `eliminate_fp_xmm_roundtrips` patterns …) had no such oracle: every one of
 diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 66adb9f..69856f9 100644
+index c4ab590f..b391f44e 100644
 --- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 +++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-@@ -6156,8 +6156,30 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
+@@ -6460,8 +6460,42 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
  }
  
  /// Remove vector register self-moves (`vmovdqu %ymm0, %ymm0`, `movaps %xmm1,
@@ -851,21 +1467,33 @@ index 66adb9f..69856f9 100644
 +///   (its scalar and 256-bit domains are separated by `vzeroupper`).
 +///
 +/// Not here: `vmovsd %a, %a` two-operand (that is a load/store spelling in
-+/// AT&T and never register-to-register), `vmovq`/`vmovd` with a GPR (not a
-+/// vector self-move), and any line with a memory operand — the `split_once`
-+/// on the comma would otherwise pair an address with a register.
++/// AT&T and never register-to-register), `vmovq`/`vmovd` in ANY spelling, and
++/// any line with a memory operand — the `split_once` on the comma would
++/// otherwise pair an address with a register.
++///
++/// `vmovq`/`vmovd` register-to-register are not no-ops and do not belong in a
++/// text-level deletion list at all (measured on hardware, see
++/// `self_moves_that_zero_upper_bits_must_survive`): `vmovq %xmm1, %xmm1`
++/// (VEX.128.F3.0F 7E) and its legacy twin ZERO bits 127:64 — a later `movapd`
++/// read of the register observes the difference, and the `vzeroupper`
++/// invariant only covers the half ABOVE the register, not the upper half of
++/// the `%xmm` itself.  `vmovd %xmm1, %xmm1` has no VEX encoding at all (GAS
++/// silently picks an EVEX one that faults without AVX-512) and its
++/// zero-extends-into-127:32 semantics would be wrong to delete anyway.  A
++/// deliberate zeroing self-move is code, not noise; if a producer of such a
++/// line ever shows up, it needs a liveness-gated cleanup, not this pass.
  pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
      let len = store.len();
      let mut changed = false;
-@@ -6170,21 +6192,41 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
+@@ -6474,21 +6508,39 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
              .strip_prefix("vmovdqu ")
              .or_else(|| t.strip_prefix("vmovdqa "))
              .or_else(|| t.strip_prefix("vmovupd "))
 +            .or_else(|| t.strip_prefix("vmovups "))
 +            .or_else(|| t.strip_prefix("vmovapd "))
              .or_else(|| t.strip_prefix("vmovaps "))
-             .or_else(|| t.strip_prefix("vmovd "))
-             .or_else(|| t.strip_prefix("vmovq "))
+-            .or_else(|| t.strip_prefix("vmovd "))
+-            .or_else(|| t.strip_prefix("vmovq "))
 +            .or_else(|| t.strip_prefix("vmovsd "))
 +            .or_else(|| t.strip_prefix("vmovss "))
              .or_else(|| t.strip_prefix("movdqu "))
@@ -904,7 +1532,7 @@ index 66adb9f..69856f9 100644
          }
      }
      changed
-@@ -8118,4 +8160,60 @@ mod broadcast_fold_tests {
+@@ -8422,4 +8474,98 @@ mod broadcast_fold_tests {
              out.join("\n")
          );
      }
@@ -964,9 +1592,47 @@ index 66adb9f..69856f9 100644
 +            );
 +        }
 +    }
++
++    /// `vmovq`/`vmovd` register self-moves are NOT no-ops and must survive.
++    ///
++    /// Measured on hardware (Zen 4, AVX2): `vmovq %xmm1, %xmm1` encodes as
++    /// VEX.128.F3.0F 7E and ZEROES bits 127:64 of the register (same for the
++    /// legacy `movq` twin); `vmovd %xmm1, %xmm1` has no VEX encoding (GAS
++    /// picks an EVEX one that faults without AVX-512) and would zero bits
++    /// 127:32.  A later full-width read of the register — exactly the
++    /// `movapd` in the fixture below — observes the difference, and the
++    /// vzeroupper invariant this pass's other deletions rely on covers only
++    /// the half ABOVE the register, never the upper half of the `%xmm`
++    /// itself.  Deleting the line would silently un-zero live bits.
++    #[test]
++    fn self_moves_that_zero_upper_bits_must_survive() {
++        use super::super::super::types::classify_line;
++        use crate::backend::peephole_common::LineStore;
++        let run = |asm: &str| -> Vec<String> {
++            let mut store = LineStore::new(asm.to_string());
++            let mut infos: Vec<_> = (0..store.len())
++                .map(|i| classify_line(store.get(i)))
++                .collect();
++            super::eliminate_vector_self_moves(&mut store, &mut infos);
++            (0..store.len())
++                .filter(|&i| !infos[i].is_nop())
++                .map(|i| store.get(i).trim().to_string())
++                .filter(|t| !t.is_empty())
++                .collect()
++        };
++        for zeroing in ["vmovq %xmm1, %xmm1", "vmovd %xmm1, %xmm1"] {
++            let out = run(&format!("    {zeroing}\n    movapd %xmm1, %xmm5\n"));
++            assert_eq!(
++                out,
++                vec![zeroing.to_string(), "movapd %xmm1, %xmm5".to_string()],
++                "a zeroing self-move is code, not noise:\n{}",
++                out.join("\n")
++            );
++        }
++    }
  }
 diff --git a/src/backend/x86/codegen/peephole/passes/memory_fold.rs b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
-index 4d0754b..3392587 100644
+index 4d0754b1..0c4fd039 100644
 --- a/src/backend/x86/codegen/peephole/passes/memory_fold.rs
 +++ b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
 @@ -17,6 +17,7 @@
@@ -1015,18 +1681,20 @@ index 4d0754b..3392587 100644
  ///
  /// Liveness proof, deliberately stronger than the block-local scan used by
  /// `fold_scalar_fp_memory_into_vex_op`: from the load line to the end of the
-@@ -2033,10 +2045,6 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
+@@ -2032,11 +2044,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
+ /// (the load redefines the register), so a home reused across loop iterations
  /// stays foldable for the later load.  Being function-wide, the proof is
  /// immune to cross-block reads that a block-local scan cannot see.
- pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+-pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 -    /// FMA3 231 forms: dest = dest OP (src2 * src1); src2 is the rm slot and
 -    /// therefore the only memory-legal operand position.
 -    const FMA231: &[&str] = &["vfmadd231", "vfmsub231", "vfnmadd231", "vfnmsub231"];
 -
++pub(super) fn fold_fma_memory_operand(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
      /// Parse an exact `%xmmN` operand token into N.
      fn xmm_num(op: &str) -> Option<u32> {
          let d = op.strip_prefix("%xmm")?;
-@@ -2094,21 +2102,36 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
+@@ -2094,21 +2102,47 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
              continue;
          }
          let lj = infos[j].trimmed(store.get(j));
@@ -1060,6 +1728,17 @@ index 4d0754b..3392587 100644
 +            i += 1;
 +            continue;
 +        }
++        // The VEX-encoded scalar FMA this pass folds addresses at most
++        // %xmm15: %xmm16 and above need EVEX, which parse_scalar_fma
++        // refuses.  Refuse the fold at the register-number level as well,
++        // so that a future parser extension cannot silently produce a
++        // fold whose re-encoding has no VEX form -- the rejection must not
++        // live only in mentions()==0 as a side effect of the parser's
++        // current reach.
++        if n >= 16 {
++            i += 1;
++            continue;
++        }
 +        let Ok(n8) = u8::try_from(n) else {
 +            i += 1;
 +            continue;
@@ -1072,7 +1751,7 @@ index 4d0754b..3392587 100644
              i += 1;
              continue;
          }
-@@ -2116,26 +2139,24 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
+@@ -2116,26 +2150,24 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
          // ── liveness: the loaded register must be dead after the FMA on
          //    every path (CFG-aware; a loop-top reader through the back edge,
          //    a call reading it as an FP argument, or a merge-form
@@ -1110,7 +1789,67 @@ index 4d0754b..3392587 100644
          lv.refresh_at(store, infos, i);
          changed = true;
          i = j + 1;
-@@ -3091,7 +3112,11 @@ mod fma_mem_fold_tests {
+@@ -2482,7 +2514,7 @@ fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
+ ///
+ /// Soundness: the loaded register must be mentioned exactly twice between
+ /// the load and the end of the function (the load itself and the FMA), the
+-/// same last-mention proof as [`fold_fma_memory_src2`]; the three lines
++/// same last-mention proof as [`fold_fma_memory_operand`]; the three lines
+ /// must be adjacent (NOPs aside) so no label makes the FMA reachable
+ /// without the zeroing; and neither the zero nor the destination may be
+ /// the loaded register.  The zeroing itself is preserved — %xmm0 is
+@@ -2567,7 +2599,7 @@ pub(super) fn fold_zero_addend_fma213_to_132(
+ 
+         // ── liveness: the FMA must be the LAST reader of the loaded value
+         //    (%xmmB) on every path — CFG-aware dataflow, same contract as
+-        //    fold_fma_memory_src2. ─────────────────────────────────────────
++        //    fold_fma_memory_operand. ─────────────────────────────────────────
+         if !lv.xmm_dead_after(store, infos, k, b, &[i, k]) {
+             i += 1;
+             continue;
+@@ -2971,14 +3003,14 @@ mod fold_load_copy_relay_tests {
+ #[cfg(test)]
+ mod fma_mem_fold_tests {
+     use super::super::super::types::classify_line;
+-    use super::fold_fma_memory_src2;
++    use super::fold_fma_memory_operand;
+     use crate::backend::peephole_common::LineStore;
+ 
+     fn run(asm: &str) -> (bool, Vec<String>) {
+         let mut store = LineStore::new(asm.to_string());
+         let n = store.len();
+         let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+-        let changed = fold_fma_memory_src2(&mut store, &mut infos);
++        let changed = fold_fma_memory_operand(&mut store, &mut infos);
+         let out: Vec<String> = (0..store.len())
+             .filter(|i| !infos[*i].is_nop())
+             .map(|i| store.get(i).trim().to_string())
+@@ -3007,6 +3039,24 @@ mod fma_mem_fold_tests {
+         assert!(!changed, "later reader must veto the fold");
+     }
+ 
++    /// %xmm16 and above have no VEX encoding, so a load into them must
++    /// never fold — even if every other precondition holds.  The rejection
++    /// is deliberate (audit F4): leaving it to `mentions() == 0` as a side
++    /// effect of the parser's reach would let a future EVEX-aware parser
++    /// silently emit an unencodable re-write.
++    #[test]
++    fn refuses_xmm16_and_above() {
++        let (changed, out) = run("    movsd 32(%rsi), %xmm16\n\
++             \x20   vfmadd231sd %xmm16, %xmm10, %xmm2\n");
++        assert!(
++            !changed,
++            "xmm16 has no VEX encoding; the fold must be refused"
++        );
++        assert_eq!(out.len(), 2, "both lines must survive verbatim: {out:?}");
++        assert_eq!(out[0], "movsd 32(%rsi), %xmm16");
++        assert_eq!(out[1], "vfmadd231sd %xmm16, %xmm10, %xmm2");
++    }
++
+     /// A later FULL overwrite of the loaded register kills the loaded
+     /// value, so the fold is sound: everything past the overwrite uses
+     /// the new value.  This is the register-reuse shape real allocators
+@@ -3091,7 +3141,11 @@ mod fma_mem_fold_tests {
      }
  
      /// Mentions BEFORE the load are irrelevant (the load redefines the
@@ -1123,7 +1862,7 @@ index 4d0754b..3392587 100644
      #[test]
      fn folds_reused_home_when_later_use_is_last() {
          let (changed, out) = run("    movsd (%rsi), %xmm5\n\
-@@ -3099,15 +3124,15 @@ mod fma_mem_fold_tests {
+@@ -3099,15 +3153,15 @@ mod fma_mem_fold_tests {
               \x20   movsd 56(%rsi), %xmm5\n\
               \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
               \x20   ret\n");
@@ -1148,7 +1887,7 @@ index 4d0754b..3392587 100644
          );
      }
  
-@@ -3165,13 +3190,55 @@ mod fma_mem_fold_tests {
+@@ -3165,13 +3219,55 @@ mod fma_mem_fold_tests {
          assert!(!changed, "ss load must not fold into sd fma");
      }
  
@@ -1210,7 +1949,7 @@ index 4d0754b..3392587 100644
  
      /// A label between the load and the FMA means the FMA is reachable
 diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index 2f3075b..b8a455d 100644
+index 2f3075b7..beffc931 100644
 --- a/src/backend/x86/codegen/peephole/passes/mod.rs
 +++ b/src/backend/x86/codegen/peephole/passes/mod.rs
 @@ -30,6 +30,7 @@ mod dead_code;
@@ -1221,14 +1960,32 @@ index 2f3075b..b8a455d 100644
  mod fp_liveness;
  mod frame_compact;
  mod helpers;
-@@ -1045,6 +1046,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+@@ -740,12 +741,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+                 changed |= c;
+             }
+         }
+-        // Fold a single-use scalar FP load into an adjacent FMA3-231 memory
+-        // src2 slot (dot-product inner shape; function-wide liveness proof).
++        // Fold a single-use scalar FP load into an adjacent scalar FMA's
++        // memory operand — any role the form algebra can put there (the
++        // dot-product src2 shape is just the most common one).
+         if !sk("fma_mem_fold") {
+             {
+-                let c = memory_fold::fold_fma_memory_src2(&mut store, &mut infos);
+-                trace("fold_fma_memory_src2", pass_count, c, &store, &infos);
++                let c = memory_fold::fold_fma_memory_operand(&mut store, &mut infos);
++                trace("fold_fma_memory_operand", pass_count, c, &store, &infos);
+                 changed |= c;
+             }
+         }
+@@ -1045,6 +1047,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                  changed |= c;
              }
          }
 +        if !sk("vector_copy_retarget") {
 +            {
-+                let c = vector_copy::retarget_vex_scalar_result(&mut store, &mut infos);
-+                trace("retarget_vex_scalar_result", pass_count, c, &store, &infos);
++                let c = vector_copy::retarget_vex_result(&mut store, &mut infos);
++                trace("retarget_vex_result", pass_count, c, &store, &infos);
 +                changed |= c;
 +            }
 +        }
@@ -1236,7 +1993,7 @@ index 2f3075b..b8a455d 100644
              {
                  let c = vector_copy::coalesce_vector_brackets(&mut store, &mut infos);
 diff --git a/src/backend/x86/codegen/peephole/passes/vector_copy.rs b/src/backend/x86/codegen/peephole/passes/vector_copy.rs
-index 5b71e3e..0695545 100644
+index 5b71e3e6..089b01ed 100644
 --- a/src/backend/x86/codegen/peephole/passes/vector_copy.rs
 +++ b/src/backend/x86/codegen/peephole/passes/vector_copy.rs
 @@ -43,7 +43,7 @@
@@ -1261,9 +2018,9 @@ index 5b71e3e..0695545 100644
 +//!   register the destination — the algebra lives in [`super::fma_forms`])
 +//!   puts the result where the copy-out wanted it, which is what
 +//!   `__builtin_fma` and `a * b + c` need to reach one instruction.
-+//! * [`retarget_vex_scalar_result`] — a VEX scalar producer whose result is
-+//!   only copied elsewhere writes that register directly; unlike an FMA its
-+//!   destination is a plain output.
++//! * [`retarget_vex_result`] — a VEX producer (scalar `ss`/`sd` or packed
++//!   `ps`/`pd`) whose result is only copied elsewhere writes that register
++//!   directly; unlike an FMA its destination is a plain output.
  //! * [`coalesce_vector_brackets`] — the copy-in / ops / copy-out bracket above.
  //!   The temporary is private to the bracket, so the destination family is
  //!   renamed to the source family and both copies disappear.
@@ -1311,7 +2068,7 @@ index 5b71e3e..0695545 100644
  /// The next line that is neither a nop nor blank, or `None` if a barrier or the
  /// end of the function comes first. "Adjacent" in this pass means exactly that.
  fn next_real(store: &LineStore, infos: &[LineInfo], from: usize, fend: usize) -> Option<usize> {
-@@ -804,213 +771,429 @@ fn next_real(store: &LineStore, infos: &[LineInfo], from: usize, fend: usize) ->
+@@ -804,213 +771,437 @@ fn next_real(store: &LineStore, infos: &[LineInfo], from: usize, fend: usize) ->
      None
  }
  
@@ -1375,16 +2132,7 @@ index 5b71e3e..0695545 100644
 -/// `vfmadd213sd`; the left-hand side is three instructions.
 +/// Each right-hand side is GCC 16.2's exact text; Clang 23.1 and ICX emit the
 +/// 213 spelling of the same instruction.
- ///
--/// This is the one bracket [`coalesce_vector_brackets`] cannot handle, and the
--/// reason is the destination: every FMA form reads its own destination as the
--/// accumulator, so the destination is not a plain output that can be retargeted
--/// onto the value's home register — retargeting it would change which value is
--/// added. What CAN be done is to rotate the encoding so that the register which
--/// must hold the result plays a role it can legally play. The bracket's three
--/// values are two multiplicands and an addend, and the result register `D` is
--/// always one of the instruction's three operands in this shape, so exactly one
--/// rotation writes it directly:
++///
 +/// [`coalesce_vector_brackets`] cannot serve these because every FMA form
 +/// reads its destination as one of its three roles: the destination is not a
 +/// plain output that can be renamed onto the value's home.  What CAN be
@@ -1395,11 +2143,20 @@ index 5b71e3e..0695545 100644
 +/// directly, and the copies that shuffled values into the form's fixed
 +/// positions are not needed.
  ///
+-/// This is the one bracket [`coalesce_vector_brackets`] cannot handle, and the
+-/// reason is the destination: every FMA form reads its own destination as the
+-/// accumulator, so the destination is not a plain output that can be retargeted
+-/// onto the value's home register — retargeting it would change which value is
+-/// added. What CAN be done is to rotate the encoding so that the register which
+-/// must hold the result plays a role it can legally play. The bracket's three
+-/// values are two multiplicands and an addend, and the result register `D` is
+-/// always one of the instruction's three operands in this shape, so exactly one
+-/// rotation writes it directly:
++/// # The rule
+ ///
 -/// * `D` is the addend's register — keep 231, move the destination onto it.
 -/// * `D` is either multiplicand — take 213, whose destination is a multiplicand
 -///   and whose `src2` is the addend.
-+/// # The rule
-+///
 +/// Take the run of register-to-register vector copies immediately before the
 +/// FMA whose destinations feed it (directly, or through another copy of the
 +/// run), and the scalar copy of the result immediately after it, if there is
@@ -1440,14 +2197,18 @@ index 5b71e3e..0695545 100644
 +///   `ret` and `call`, and answers "live" for a function it cannot analyse.
 +///   Readers *before* the run need no rule: they ran before it.
 +/// * **The result register's upper bits are its own.**  A scalar FMA writes
-+///   only its destination's low lane.  Originally the destination's upper
-+///   bits came from the last thing that wrote it: a legacy element-width
-+///   copy preserves them, a `movapd` or a VEX copy replaces them.  Unless the
-+///   last copy into the result register was preserving, the rewrite may
-+///   change those bits, so it is allowed only when no line of the function
-+///   outside the rewritten bracket reads that register wider than the
-+///   element.  The copy-out itself must be a legacy element-width copy for
-+///   the same reason, seen from the other side.
++///   only its destination's low lane — measured on hardware: all three forms
++///   leave bits 127:64 of the destination XMM unchanged, unlike the VEX
++///   scalar arithmetic family, whose upper half comes from its first source.
++///   Originally the destination's upper bits came from the last thing that
++///   wrote it: a legacy element-width copy preserves them, a `movapd` or a
++///   VEX copy replaces them.  Unless EVERY copy of the run that wrote the
++///   result register was preserving — an earlier replacing copy followed by
++///   a later preserving one leaves its own bits, which the last copy alone
++///   would hide — the rewrite may change those bits, so it is allowed only
++///   when no line of the function outside the rewritten bracket reads that
++///   register wider than the element.  The copy-out itself must be a legacy
++///   element-width copy for the same reason, seen from the other side.
 +/// * **Memory operands travel with their role.**  The encoder puts a memory
 +///   role at operand 0 in whichever form allows it and reports that no form
 +///   can when the role that must be memory is the destination, or when two
@@ -1608,12 +2369,16 @@ index 5b71e3e..0695545 100644
 -            i += 1;
 +
 +        // The result register's upper bits: unchanged by the rewrite only if
-+        // the last copy that wrote it was a legacy element-width merge.
-+        // Otherwise no line of the function outside the bracket may read it
-+        // wider than the element.
-+        let last_write_into_d = run.iter().rev().find(|(_, c)| c.dst == d).map(|(_, c)| *c);
-+        let upper_preserved =
-+            last_write_into_d.is_none_or(|c| !c.zeroes_above && c.width == elem_bits);
++        // every copy the run wrote into it was a legacy element-width merge.
++        // The LAST copy alone is not enough: an earlier non-preserving write
++        // (a `vmovsd` that zeroes, a `movapd` that replaces) followed by a
++        // later preserving one leaves the register's upper bits at the value
++        // the earlier copy left, and deleting the whole run would restore the
++        // pre-bracket bits instead.  `None` in the run means no copy wrote it,
++        // which is the `is_none_or` fast path.
++        let upper_preserved = run
++            .iter()
++            .all(|(_, c)| c.dst != d || (!c.zeroes_above && c.width == elem_bits));
 +        if !upper_preserved {
 +            let wide_reader = (fstart..fend).any(|n| {
 +                !owned.contains(&n)
@@ -1706,7 +2471,7 @@ index 5b71e3e..0695545 100644
 +///   [`FpLiveness`]: the rewrite stops writing it.
 +/// * The two lines are adjacent up to nops, in one basic block, neither is
 +///   pinned, and every register operand is spelled `%xmm`.
-+pub(super) fn retarget_vex_scalar_result(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 +    let len = store.len();
 +    let mut changed = false;
 +    let mut fp: Option<FpLiveness> = None;
@@ -1894,7 +2659,7 @@ index 5b71e3e..0695545 100644
      }
      changed
  }
-@@ -1289,14 +1472,26 @@ mod tests {
+@@ -1289,14 +1480,26 @@ mod tests {
              "    movsd %xmm0, %xmm2\n    vaddsd %xmm0, %xmm2, %xmm2\n    movsd %xmm2, %xmm0\n    ret\n",
          );
          let out = insns(&run(&asm));
@@ -1927,7 +2692,7 @@ index 5b71e3e..0695545 100644
          );
      }
  
-@@ -1357,20 +1552,32 @@ mod tests {
+@@ -1357,20 +1560,32 @@ mod tests {
              "the temporary still has a use outside the bracket: {out:?}"
          );
          // And a temporary read BEFORE the bracket is equally disqualifying for
@@ -1971,7 +2736,59 @@ index 5b71e3e..0695545 100644
          );
      }
  
-@@ -1738,16 +1945,78 @@ mod tests {
+@@ -1624,6 +1839,51 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn a_non_preserving_earlier_copy_into_the_result_register_blocks_the_rewrite() {
++        // The run [save d, clobber d's upper bits, restore d] leaves the
++        // result register's upper bits at ZERO in the original code: the
++        // `vmovsd %xmm8, %xmm2` zeroes them and the later preserving
++        // `movsd %xmm6, %xmm2` keeps that zero.  Deleting the whole run —
++        // which is what the re-encode does — would restore the register's
++        // pre-bracket bits instead, and the `vaddpd` below reads all 128 of
++        // them.  The rewrite must be refused; checking only the LAST copy
++        // into the result register (both older versions of this rule)
++        // reported "preserving" and shipped the bit change.
++        let got = fma_only(
++            "    movsd %xmm2, %xmm6\n    vmovsd %xmm8, %xmm2\n    movsd %xmm6, %xmm2\n    vfmadd231sd %xmm1, %xmm2, %xmm3\n    movsd %xmm3, %xmm2\n    vaddpd %xmm2, %xmm10, %xmm11\n    ret\n",
++        );
++        assert_eq!(
++            got,
++            vec![
++                "movsd %xmm2, %xmm6",
++                "vmovsd %xmm8, %xmm2",
++                "movsd %xmm6, %xmm2",
++                "vfmadd231sd %xmm1, %xmm2, %xmm3",
++                "movsd %xmm3, %xmm2",
++                "vaddpd %xmm2, %xmm10, %xmm11",
++                "ret",
++            ],
++            "an earlier zeroing copy into the result register is a wide-bit \
++             change the last copy alone cannot speak for:\n{got:?}"
++        );
++        // Control: drop the zeroing copy and the same bracket rewrites —
++        // the save/restore pair leaves the register's upper bits exactly as
++        // they were, so the re-encode is bit-identical and MUST fire.
++        let got = fma_only(
++            "    movsd %xmm2, %xmm6\n    movsd %xmm6, %xmm2\n    vfmadd231sd %xmm1, %xmm2, %xmm3\n    movsd %xmm3, %xmm2\n    vaddpd %xmm2, %xmm10, %xmm11\n    ret\n",
++        );
++        assert_eq!(
++            got,
++            vec![
++                "vfmadd213sd %xmm3, %xmm1, %xmm2",
++                "vaddpd %xmm2, %xmm10, %xmm11",
++                "ret",
++            ],
++            "a purely preserving run keeps the rewrite:\n{got:?}"
++        );
++    }
++
+     #[test]
+     fn all_four_fma_families_rotate_the_same_way() {
+         // The sign structure travels with the roles, so one rotation serves all
+@@ -1738,18 +1998,80 @@ mod tests {
      }
  
      #[test]
@@ -2034,9 +2851,9 @@ index 5b71e3e..0695545 100644
 +            insns(&run(&asm)),
 +            vec!["vfmadd132sd %xmm1, %xmm2, %xmm0", "ret"],
 +            "five instructions to one, GCC's exact text"
-+        );
-+    }
-+
+         );
+     }
+ 
 +    #[test]
 +    fn fma_bracket_with_a_memory_multiplicand_keeps_it_at_operand_zero() {
 +        // The memory role travels with the re-encoding: the result register is
@@ -2050,12 +2867,14 @@ index 5b71e3e..0695545 100644
 +        // 231 with the memory operand already in place.
 +        let got = fma_only(
 +            "    vmovsd %xmm2, %xmm2, %xmm5\n    vfmadd231sd (%rdi), %xmm0, %xmm5\n    movsd %xmm5, %xmm2\n    ret\n",
-         );
++        );
 +        assert_eq!(got, vec!["vfmadd231sd (%rdi), %xmm0, %xmm2", "ret"]);
-     }
- 
++    }
++
      #[test]
-@@ -1774,6 +2043,188 @@ mod tests {
+     fn fma_reassociation_accepts_a_copy_in_wider_than_the_element() {
+         // The converse is sound and common: widening runs first, so a `movsd`
+@@ -1774,6 +2096,188 @@ mod tests {
          );
      }
  
@@ -2160,7 +2979,7 @@ index 5b71e3e..0695545 100644
 +        let mut infos: Vec<LineInfo> = (0..store.len())
 +            .map(|i| classify_line(store.get(i)))
 +            .collect();
-+        retarget_vex_scalar_result(&mut store, &mut infos);
++        retarget_vex_result(&mut store, &mut infos);
 +        (0..store.len())
 +            .filter(|&i| !infos[i].is_nop())
 +            .map(|i| store.get(i).trim().to_string())
@@ -2245,7 +3064,7 @@ index 5b71e3e..0695545 100644
      fn builtin_fma_reaches_the_single_instruction_the_oracles_emit() {
          // End to end, through the whole peephole: this is the shape the archived
 diff --git a/tests/regression/check_vector_copy_elimination.sh b/tests/regression/check_vector_copy_elimination.sh
-index 6b43c9b..424e16b 100644
+index 6b43c9ba..09ce32dd 100644
 --- a/tests/regression/check_vector_copy_elimination.sh
 +++ b/tests/regression/check_vector_copy_elimination.sh
 @@ -96,8 +96,13 @@ double mul2(double a, double b) { double t = a; t *= b; return t; }
@@ -2294,7 +3113,7 @@ index 6b43c9b..424e16b 100644
  
  # copysign is three bit operations, which is Clang's answer and one better than
  # GCC's four.  The two copies that used to sit in front of the bit ops are what
-@@ -144,20 +173,23 @@ else
+@@ -144,20 +173,24 @@ else
      printf '%s\n' "$cs" | note
  fi
  
@@ -2323,12 +3142,13 @@ index 6b43c9b..424e16b 100644
 +if [[ "$ch" -eq 4 ]]; then
 +    ok "chain is three instructions plus ret (gcc parity)"
 +else
-+    bad "chain should be three instructions plus ret, got $((ch - 1)):"; fnbody "$work/shapes.s" chain | note
++    bad "chain should be three instructions plus ret, got $ch lines:"
++    fnbody "$work/shapes.s" chain | note
 +fi
  
  # ── B. runtime equality with GCC over kernels built for the legality rules ────
  if [[ -z "$ORACLE" ]]; then
-@@ -371,14 +403,275 @@ EOF
+@@ -371,14 +404,344 @@ EOF
          # zeroed upper bits a 128-bit read genuinely needs (refusing them is
          # correct), and the rest are the FMA form-selection cases that belong to
          # instruction selection.  The ratchet is here so neither grows silently.
@@ -2366,6 +3186,9 @@ index 6b43c9b..424e16b 100644
 +    # them and every encoding gets its turn.
 +    cat > "$work/fma_algebra.c" <<'EOF_ALGEBRA'
 +    #include <stdio.h>
++    #include <math.h>
++    #include <string.h>
++    #include <stdint.h>
 +    #define NI __attribute__((noinline))
 +    /* ── builtins: pinned semantics, compared against the oracle ── */
 +    NI static double b_madd(double a, double b, double c) { return __builtin_fma(a, b, c); }
@@ -2402,31 +3225,76 @@ index 6b43c9b..424e16b 100644
 +    NI static double sq_add(double x, double c) { return x * x + c; }
 +    NI static double self_add(double x, double c) { return x * c + x; }
 +    NI static double self_add2(double x, double c) { return c * x + x; }
++    /* negation shapes: the four sign families plus the two double
++     * negations that fold back to plain fmadd.  Each is ONE instruction
++     * under -ffp-contract=fast -- GCC contracts all six this way (measured
++     * on the local oracle; the vfnmsub half was unreachable in lccc before
++     * the signed-FMA hook: the Neg survived as a separate vxorpd). */
++    NI static double neg_prod_sub(double a, double b, double c) { return -(a * b) - c; }
++    NI static double neg_prod_add(double a, double b, double c) { return -(a * b) + c; }
++    NI static double neg_sum(double a, double b, double c) { return -(a * b + c); }
++    NI static double neg_diff(double a, double b, double c) { return -(a * b - c); }
++    NI static double sub_neg_prod(double a, double b, double c) { return c - -(a * b); }
++    NI static double neg_neg_sub(double a, double b, double c) { return -(-(a * b) - c); }
 +    /* float */
 +    NI static float maddf_a(float a, float b, float c) { return a * b + c; }
 +    NI static float maddf_m(float a, const float *p, float c) { return *p * a + c; }
 +    NI static float nmaddf_c(float a, float b, float c) { return a - b * c; }
++    NI static float neg_prod_subf(float a, float b, float c) { return -(a * b) - c; }
++    NI static float neg_sumf(float a, float b, float c) { return -(a * b + c); }
 +    static int mismatches = 0;
++    /* Exact-bit comparison with one documented freedom: a NaN RESULT may
++     * carry any payload and sign (implementation-defined in IEEE 754;
++     * hardware fma and libm's software fma exercise the choice
++     * differently, and operand position in the instruction decides which
++     * input's payload propagates).  Two NaNs therefore compare equal.
++     * Everything else -- including the SIGN OF ZERO, which a role-swapped
++     * or wrongly-negated family flips -- must match bit for bit. */
 +    static void same(const char *name, double got, double want) {
-+        if (got != want) { mismatches++; printf("MISMATCH %s %.17g != %.17g\n", name, got, want); }
++        uint64_t g, w;
++        memcpy(&g, &got, sizeof g);
++        memcpy(&w, &want, sizeof w);
++        if (g != w && !(got != got && want != want)) {
++            mismatches++;
++            printf("MISMATCH %s %.17g != %.17g\n", name, got, want);
++        }
++    }
++    /* Print helper for the oracle-compared lines: finite numbers,
++     * infinities and signed zeros print exactly (their bits are
++     * IEEE-pinned); NaN canonicalizes to one spelling so payload and sign
++     * differences -- the implementation-defined freedom above -- do not
++     * read as disagreements between two correct compilers. */
++    static const char *canon(char *buf, double v) {
++        if (v != v) return "nan";
++        sprintf(buf, "%.17g", v);
++        return buf;
 +    }
 +    int main(void) {
++        /* The finite core keeps products that need 106 bits (a fused and a
++         * split evaluation differ); the boundary tail (zeros, infinities,
++         * overflow, subnormals, both NaN signs) exercises the paths where
++         * FMA semantics are edge-defined rather than merely rounded. */
 +        static const double xs[] = {
 +            1.0000000000000002, -3.0000000000000004, 0.30000000000000004, -7.000000000000001,
-+            1e16, -1e-16, 4503599627370497.0, -0.1, 2.5, -1234567.891
++            1e16, -1e-16, 4503599627370497.0, -0.1, 2.5, -1234567.891,
++            0.0, -0.0, INFINITY, -INFINITY, 1e308, 1e-308, NAN, -NAN
 +        };
 +        static const float fs[] = { 1.00000012f, -3.0000002f, 0.3f, -7.0000005f, 1e8f, -1e-8f,
-+                                    16777217.0f, -0.1f, 2.5f, -1234.5678f };
++                                    16777217.0f, -0.1f, 2.5f, -1234.5678f,
++                                    0.0f, -0.0f, INFINITY, -INFINITY, 1e30f, 1e-30f, NAN, -NAN };
 +        const int n = (int)(sizeof xs / sizeof *xs);
 +        double acc = 0.0;
 +        for (int i = 0; i < n; i++) {
 +            double a = xs[i], b = xs[(i + 3) % n], c = xs[(i + 7) % n], d = xs[(i + 1) % n];
 +            float fa = fs[i], fb = fs[(i + 3) % n], fc = fs[(i + 7) % n];
-+            /* oracle-compared */
-+            printf("%d %.17g %.17g %.17g %.17g %.17g %.17g %.9g %.9g %.17g %.17g\n", i,
-+                   b_madd(a, b, c), b_msub(a, b, c), b_nmadd(a, b, c), b_nmsub(a, b, c),
-+                   b_madd_p(a, b, &c), b_madd_pm(a, &b, c), (double)b_maddf(fa, fb, fc),
-+                   (double)b_maddf_pm(fa, &fb, fc), b_chain(a, b, c, d), b_reuse(a, b, c));
++            char b1[40], b2[40], b3[40], b4[40], b5[40], b6[40], b7[40], b8[40], b9[40], b10[40];
++            /* oracle-compared (NaN-spelling canonicalized) */
++            printf("%d %s %s %s %s %s %s %s %s %s %s\n", i,
++                   canon(b1, b_madd(a, b, c)), canon(b2, b_msub(a, b, c)),
++                   canon(b3, b_nmadd(a, b, c)), canon(b4, b_nmsub(a, b, c)),
++                   canon(b5, b_madd_p(a, b, &c)), canon(b6, b_madd_pm(a, &b, c)),
++                   canon(b7, (double)b_maddf(fa, fb, fc)), canon(b8, (double)b_maddf_pm(fa, &fb, fc)),
++                   canon(b9, b_chain(a, b, c, d)), canon(b10, b_reuse(a, b, c)));
 +            /* self-compared: the contracted kernel must equal its builtin */
 +            same("madd_a", madd_a(a, b, c), b_madd(a, b, c));
 +            same("msub_a", msub_a(a, b, c), b_msub(a, b, c));
@@ -2443,9 +3311,21 @@ index 6b43c9b..424e16b 100644
 +            same("maddf_a", (double)maddf_a(fa, fb, fc), (double)b_maddf(fa, fb, fc));
 +            same("maddf_m", (double)maddf_m(fa, &fb, fc), (double)b_maddf(fb, fa, fc));
 +            same("nmaddf_c", (double)nmaddf_c(fa, fb, fc), (double)__builtin_fmaf(-fb, fc, fa));
++            /* the sign algebra: each source shape equals its signed
++             * builtin twin, including the two double negations that land
++             * on the plain family */
++            same("neg_prod_sub", neg_prod_sub(a, b, c), b_nmsub(a, b, c));
++            same("neg_prod_add", neg_prod_add(a, b, c), b_nmadd(a, b, c));
++            same("neg_sum", neg_sum(a, b, c), -b_madd(a, b, c));
++            same("neg_diff", neg_diff(a, b, c), -b_msub(a, b, c));
++            same("sub_neg_prod", sub_neg_prod(a, b, c), b_madd(a, b, c));
++            same("neg_neg_sub", neg_neg_sub(a, b, c), b_madd(a, b, c));
++            same("neg_prod_subf", (double)neg_prod_subf(fa, fb, fc), (double)__builtin_fmaf(-fa, fb, -fc));
++            same("neg_sumf", (double)neg_sumf(fa, fb, fc), (double)-__builtin_fmaf(fa, fb, fc));
 +            acc += madd_a(a, b, c) + madd_c(a, b, c) + sq_add(a, c);
 +        }
-+        printf("%.17g\n", b_dot(xs, xs + 1, n - 1));
++        char b1[40];
++        printf("%s\n", canon(b1, b_dot(xs, xs + 1, n - 1)));
 +        printf("contracted kernels: %d mismatches\n", mismatches);
 +        (void)acc;
 +        return mismatches != 0;
@@ -2471,7 +3351,7 @@ index 6b43c9b..424e16b 100644
 +            bad "builtin FMA output differs from $ORACLE:"
 +            diff "$work/fa.lccc" "$work/fa.oracle" | head -10 | note
 +        else
-+            ok "FMA algebra kernel bit-exact vs $ORACLE on $(grep -c . "$work/fa.lccc") lines; 15 contracted kernels equal their builtin twins"
++            ok "FMA algebra kernel bit-exact vs $ORACLE on $(grep -c . "$work/fa.lccc") lines; 23 contracted kernels equal their builtin twins"
 +        fi
 +        # Anti-vacuity, per encoding: all three forms, a memory operand at
 +        # operand 0 of a non-231 form, and all four sign families must appear,
@@ -2482,19 +3362,28 @@ index 6b43c9b..424e16b 100644
 +        n231=$(grep -cE '^[[:space:]]*vf(n?m(add|sub))231(sd|ss)' "$work/fma_algebra.s" || true)
 +        nmem_non231=$(grep -cE '^[[:space:]]*vf(n?m(add|sub))(132|213)(sd|ss)[[:space:]]+[^%$]' "$work/fma_algebra.s" || true)
 +        nfam=$(grep -oE '^[[:space:]]*vf(n?m(add|sub))' "$work/fma_algebra.s" | sed 's/^[[:space:]]*//' | sort -u | wc -l)
-+        if [[ "$n132" -gt 0 && "$n213" -gt 0 && "$n231" -gt 0 && "$nmem_non231" -gt 0 && "$nfam" -ge 3 ]]; then
++        # All FOUR sign families must materialize: vfmadd, vfmsub, vfnmadd
++        # AND vfnmsub.  The fourth was structurally unreachable before the
++        # signed-FMA hook (`-(a*b) - c` kept its vxorpd), so `>= 3` would let
++        # a regression that loses vfnmsub pass vacuously.
++        if [[ "$n132" -gt 0 && "$n213" -gt 0 && "$n231" -gt 0 && "$nmem_non231" -gt 0 && "$nfam" -eq 4 ]]; then
 +            ok "the algebra kernel exercises the encodings: $n132 x 132, $n213 x 213, $n231 x 231, $nmem_non231 memory operands on non-231 forms, $nfam sign families"
 +        else
 +            bad "the algebra kernel does not exercise every encoding (132=$n132 213=$n213 231=$n231 mem-on-non-231=$nmem_non231 families=$nfam)"
 +        fi
 +        # Straight-line kernels that must be ONE instruction plus ret -- GCC's
-+        # count.  The builtin sign variants (`fma(-a, b, -c)`) are not in this
-+        # list: the negations are separate `vxorpd`s today and their fusion
-+        # into vfnmadd/vfnmsub is the open item in FOLLOWUP-2026-09-19E.
++        # count.  The negation source shapes are held to the same bar: GCC
++        # contracts all six to a single instruction, and so does the
++        # signed-FMA hook.  The BUILTIN sign variants (`fma(-a, b, -c)`) are
++        # still not in this list: their operand negations are separate
++        # `vxorpd`s (absorbing them needs const-pool visibility in the
++        # peephole -- the open item in FOLLOWUP-2026-09-19E).
 +        one_insn_ok=1
 +        for fn in b_madd b_madd_p b_madd_pm b_maddf b_maddf_pm \
 +                  madd_a msub_a nmadd_a madd_c msub_c nmadd_c madd_m1 madd_m2 madd_ma \
-+                  sq_add self_add self_add2 maddf_a maddf_m nmaddf_c; do
++                  sq_add self_add self_add2 maddf_a maddf_m nmaddf_c \
++                  neg_prod_sub neg_prod_add neg_sum neg_diff sub_neg_prod neg_neg_sub \
++                  neg_prod_subf neg_sumf; do
 +            n=$(fnbody "$work/fma_algebra.s" "$fn" | wc -l)
 +            if [[ "$n" -ne 2 ]]; then
 +                one_insn_ok=0
@@ -2503,7 +3392,7 @@ index 6b43c9b..424e16b 100644
 +            fi
 +        done
 +        if [[ "$one_insn_ok" -eq 1 ]]; then
-+            ok "all 20 straight-line FMA kernels are exactly one instruction plus ret (gcc parity)"
++            ok "all 28 straight-line FMA kernels are exactly one instruction plus ret (gcc parity, sign families included)"
 +        fi
 +    fi
 +
@@ -2607,7 +3496,7 @@ index 6b43c9b..424e16b 100644
      # AVX-512: the fp liveness oracle treats a writemask destination as a
      # partial write and %zmm as an alias of %xmm.  Only meaningful on a host
      # that has the instructions.
-@@ -424,13 +717,13 @@ fi
+@@ -424,13 +787,13 @@ fi
  declare -A BUDGET=(
      [chacha20_block]=258
      [double_reduction]=135
