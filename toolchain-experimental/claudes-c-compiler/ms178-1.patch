@@ -120,6 +120,174 @@ index 00000000..8e89ad63
 +blocks). The squashed upstream merge (fb8c8b9d) carries the full
 +resolution; `git diff origin/main pr570-merge` is empty (tree-exact
 +confirmation of complete absorption).
+diff --git a/engineering/FOLLOWUP-2026-09-21-madd-vlfold-revival.md b/engineering/FOLLOWUP-2026-09-21-madd-vlfold-revival.md
+new file mode 100644
+index 00000000..4ed6232d
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-21-madd-vlfold-revival.md
+@@ -0,0 +1,162 @@
++# Follow-up: PR #572 audit adjudication — the madd memory-fold revival
++
++Session: 2026-09-21 (PR #572 follow-up, third of the FMA series)
++Base: `d4b60ff0` (PR #572 merge) → 6 commits, all validated on this tree.
++
++## The Review AI's audit, adjudicated
++
++**F1 (VDEFER/VLFOLD asymmetry for the packed signed families) — AGREE on
++the finding, DISAGREE on the mechanism and the fix.** The audit proposed a
++one-line gate extension (`memfold_consumer_madd_256` += Signed) with the
++claim that "nothing else needs changing". Deep-diving the code proved both
++halves of that claim wrong:
++
++* The map-FMA VLFOLD arm has been **entirely dead since 60f3cd17** (the v6
++  safety-net tightening): `emit_intrinsic_impl`'s width-matched consumer
++  set (`memfold_consumer_256/128`) never admitted the madd family, so every
++  elided load was materialised as "unexpected consumer" *before*
++  `emit_avx_map_fma`'s VLFOLD arm could run — for the PLAIN family too.
++  Verified empirically: `[VLFOLD-EMIT] elide load %60` followed by
++  `materialising %60 (unexpected consumer)`. The same gap dead-pathed the
++  128-bit BB-SLP acc-fold in `emit_vec_fma_128`.
++* `compute_vector_memfold_homed_ok` excluded the madd family, so the
++  COMMON shape (the RA homes every map intermediate — both stream loads
++  carry register homes) never elided even with the gate fixed.
++* `is_vec_ssa_producer` lacked the Signed variants (their results could
++  not defer).
++* The audit's own acceptance criterion ("new assertion green") is
++  unachievable with the proposed fix: the revived fold would have
++  materialised at the safety net before reaching the emitter.
++
++What the audit got right, verified independently: `memfold_consumer_madd_256`
++missing the Signed variants, and the emitter-side sign-correctness of the
++132→213/231 re-encode (re-derived from the SDM's digit convention; see the
++form-semantics note below).
++
++**F2 (string-based family re-encode) — AGREE.** Replaced with the closed
++8-entry × 2-target table, `unreachable!` on anything else, unit-tested in
++both directions.
++
++**F3 (mnemonic-table duplication) — AGREE on the dedupe** (extracted
++`x86_common::fma231_mnemonic`; both backends route through it; output
++byte-identical). **DISAGREE on the sweep-comment nit:** the audit read
++`dce::sweep_block`'s live-slice guard (which aborts) as its spans handling
++(which *clears* on length mismatch — exactly what the peel does). The
++comment was accurate; it now preempts the conflation explicitly.
++
++## The miscompile the audit's testing would have walked past
++
++Adjudicating F1 empirically (compiling the proposed test shape) surfaced a
++**P0 predating PR #572**: the BB-SLP `Fma` pack's op table matched only
++`(negate, ty)`, so a width-4 F64 (or width-8 F32) pack — `r[i] = x[i]*s +
++z[i]` over four doubles — lowered through the 128-bit `VecFmaF64x2`
++family: half the lanes computed, the store's upper half publishing the
++multiplier pack raw. `r[2], r[3]` came out as `0 0` where GCC computes
++`31.5 42` (and the 8-float twin broke lanes 4..7 identically). Every
++existing packed-FMA test shape was 128-bit, so no differential had ever
++exercised the wide packs. Fixed with width-exact op selection routing the
++256-bit packs through the affine-map madd families (`VecMaddF{64x4,32x8}`
++/ their `Signed(true, false)` spellings for `acc − a·b`), whose
++[input, scale, bias] contract the pack's [a, b, acc] args already satisfy
++exactly. New gate section D3 pins all four widths by runtime equality
++against the reference compiler plus register-width shape assertions.
++
++## The FMA3 form semantics, CPU-verified
++
++The revival forced a re-derivation of the 132/213/231 operand roles, and
++the CPU settled a session-long ambiguity: canonical AT&T
++`(src3/r/m, src2/vvvv, dst)` and
++
++* **132**: `dst = dst × src3 + src2` — r/m is the SECOND MULTIPLICAND,
++  VVVV the ADDEND.
++* **213**: `dst = src2 × dst + src3` — r/m is the ADDEND.
++* **231**: `dst = src2 × src3 + dst` — r/m is the second multiplier, dst
++  the accumulator.
++
++(Verified with distinct A/B/C operands through GCC-assembled inline asm:
++`vfmadd132pd C_mem, B, A` computes A×C+B, not A×B+C.) Consequences:
++
++* `emit_vec_fma_128`'s acc-fold — spelled `vfmadd132 %S2, MEM_acc, %dst`
++  — had its multiplier/addend roles inverted, and had **never been
++  assembled**: it was born after the v6 safety net, dead its whole life.
++  It now emits the canonical 213 form (`vfmadd213 MEM_acc, %S2, %dst`),
++  the one form whose r/m slot is the addend.
++* The assembler's "gas-style middle-memory" arms (W=1 since the scalar-FMA
++  era, W=0 added then removed during this session) accepted a spelling GAS
++  itself rejects (`operand size mismatch`) with a guessed role assignment
++  — exactly the mechanism that let the never-tested acc-fold silently
++  encode the wrong instruction instead of failing loudly. Both arms are
++  gone; an operand-order mistake must now fail assembly.
++
++## The revival (commit d601984c)
++
++Safety net admits the madd (width 32) and packed-FMA (width 16) families at
++their exact widths; the Signed variants join `memfold_consumer_madd_256`,
++`is_vec_ssa_producer`, and (with the emitter audit) the homed-ok set.
++`emit_avx_map_fma_inner` now follows the audited binary-emitter discipline
++(`emit_avx_binary_256_inner`): memfold-aware `home()` (the live fold's
++phantom RA home is never reported), a memfold-aware fast path and
++`operand_reg_source`, and a 2XX arm resolving each operand via its RA home,
++its deferred-store scratch (consumed in place), or a staged load. The
++result computes into the DYING operand's register when the new
++`vector_dying_values` analysis proves it dead: single total use, same block
++as the def, live-regs claim on that home. That last conjunct is what the
++loop-invariant broadcast fails — one STATIC use site, read by every
++iteration, claimed only in the preheader — and it is why a plain
++use-count is unsound for loops. The IR matcher gains the madd/fma128
++alias-free gates (`fma(x,x,c)` shapes keep the ordinary path: one fold
++cannot serve memory and register roles at once).
++
++### Result
++
++Saxpy-shaped loops (`r[i] = __builtin_fma(±x[i], s, c[i])`, the SLP
++contraction, f32 and f64, all four sign families) — all bit-exact vs GCC:
++
++```asm
++.LBB8:
++    vmovupd (%rsi,%r9), %ymm8
++    vfnmadd213pd (%rdx,%r9), %ymm3, %ymm8
++    vmovupd %ymm8, (%r8,%r9)
++```
++
++5 instructions → 3 per iteration, GCC's exact body, with the FMA result
++computed straight into the streamed input's dying register (the
++destructive-form reuse). All six packed D2 kernels now fold a load into
++the FMA memory operand (new ratchet: 6 sites). The 128-bit SLP acc-fold
++computes bit-exact at both widths for the first time ever.
++
++## Gate repairs (commit 00478f70)
++
++Two gates failed at the upstream tip (identical at the PR #572 parent —
++pre-existing staleness, not regressions): `affine_map` pinned the
++uncontracted `vmulpd`+`vaddpd` spelling against C99-legal default
++contraction (GCC's own default behavior) and "no %ymm anywhere" against
++the runtime versioning design (verified bit-exact vs scalar semantics and
++GCC for shifts 0..200); `reduction_vecreg` pinned the pre-VLFOLD `%ymm0`
++stream spelling against the memory-folded in-place accumulator. Both now
++pin the current design with real controls (a new `-ffp-contract=off`
++compile that must retain the separate mul/add; the runtime distance
++guard's exact prologue).
++
++## Residuals
++
++* The aliased-operand shapes (`fma(x, x, c)`, `fma(x, s, s)` and the
++  128-bit twins) keep the ordinary (correct, one-load-slower) path — the
++  alias-free gate. Folding one of them would need the fold to serve two
++  operand roles at once.
++* The SSE-forced map path does not contract `a*x + b` (no 128-bit map
++  madd family); GCC contracts under FMA3-capable `-march` at 128 bits.
++  A future `VecMaddF64x2`-class family would close it.
++* The 213-form dst preference when the streamed operand is neither dying
++  nor held stages one `vmovdqa` (4 instructions, not 3) — only reachable
++  when the streamed multiplicand is multi-use, which the map bodies'
++  single-use loads make rare.
++
++## Validation
++
++cargo 3071/3071 · vector gate 46/46 (D3 width battery + memory-fold
++ratchets) · all nine vector-family codegen gates OK · corpus 723 PASS /
++0 real failures / 0 AB-differential (3 i686 build failures are
++missing-multilib on this host, identical at the upstream tip) ·
++rustfmt + clippy clean · `ci_local --fast` (see the session log for the
++final tally).
 diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
 index b3d547b8..1eb95ba7 100644
 --- a/src/backend/arm/codegen/intrinsics.rs
@@ -167,7 +335,7 @@ index b3d547b8..1eb95ba7 100644
              | IntrinsicOp::VecMinI32x8
              | IntrinsicOp::VecMulF32x8
 diff --git a/src/backend/i686/codegen/intrinsics.rs b/src/backend/i686/codegen/intrinsics.rs
-index 64c445bc..a5749fc6 100644
+index 64c445bc..b5c0d062 100644
 --- a/src/backend/i686/codegen/intrinsics.rs
 +++ b/src/backend/i686/codegen/intrinsics.rs
 @@ -404,8 +404,23 @@ impl I686Codegen {
@@ -196,7 +364,7 @@ index 64c445bc..a5749fc6 100644
                  if is_f64 {
                      self.emit_f64_scalar_bits_to_xmm(&args[2], "xmm0");
                      self.emit_f64_scalar_bits_to_xmm(&args[0], "xmm1");
-@@ -415,11 +430,17 @@ impl I686Codegen {
+@@ -415,11 +430,8 @@ impl I686Codegen {
                      self.emit_f32_scalar_bits_to_xmm(&args[0], "xmm1");
                      self.emit_f32_scalar_bits_to_xmm(&args[1], "xmm2");
                  }
@@ -205,16 +373,7 @@ index 64c445bc..a5749fc6 100644
 -                } else {
 -                    self.state.emit("    vfmadd231ss %xmm2, %xmm1, %xmm0");
 -                }
-+                let fma = match (np, na, is_f64) {
-+                    (false, false, true) => "vfmadd231sd",
-+                    (false, false, false) => "vfmadd231ss",
-+                    (false, true, true) => "vfmsub231sd",
-+                    (false, true, false) => "vfmsub231ss",
-+                    (true, false, true) => "vfnmadd231sd",
-+                    (true, false, false) => "vfnmadd231ss",
-+                    (true, true, true) => "vfnmsub231sd",
-+                    (true, true, false) => "vfnmsub231ss",
-+                };
++                let fma = crate::backend::x86_common::fma231_mnemonic(np, na, is_f64);
 +                emit!(self.state, "    {} %xmm2, %xmm1, %xmm0", fma);
                  self.state.reg_cache.invalidate_acc();
                  if let Some(d) = dest {
@@ -342,11 +501,514 @@ index e5a6ca4f..31fc2a06 100644
              IntrinsicOp::CopysignF64 => {
                  // native fsgnj.d: |rs1| with rs2's sign bit.
                  self.operand_to_t0(&args[0]);
+diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
+index 3ae12e0d..40072fba 100644
+--- a/src/backend/stack_layout/copy_coalescing.rs
++++ b/src/backend/stack_layout/copy_coalescing.rs
+@@ -1850,6 +1850,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+             | O::VecAddF64x4
+             | O::VecFmaF64x4
+             | O::VecMaddF64x4
++            | O::VecMaddF64x4Signed(..)
+             | O::VecAddI32x4
+             | O::VecAddI32x8
+             | O::VecMulI32x8
+@@ -1859,6 +1860,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+             | O::VecAddF32x8
+             | O::VecFmaF32x8
+             | O::VecMaddF32x8
++            | O::VecMaddF32x8Signed(..)
+             | O::VecAddF32x4
+             | O::VecMulF64x2
+             | O::VecMulF64x4
+@@ -2154,10 +2156,22 @@ pub(crate) fn is_memfold_vec_load_128(op: &crate::ir::intrinsics::IntrinsicOp) -
+ /// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
+ /// the bias folds through the 213 form (`vfmadd213ps mem, %scale, %ymm0` =
+ /// scale*input + mem) and the input through the 231 form
+-/// (`vfmadd231ps mem, %scale, %ymm0` = scale*mem + bias).
++/// (`vfmadd231ps mem, %scale, %ymm0` = scale*mem + bias).  The SIGNED
++/// families (`VecMaddF{64x4,32x8}Signed(np, na)` — the builtin-semantics
++/// `MapExpr::Fma` lowering) fold EXACTLY like the plain one: the FMA3
++/// sign structure attaches to the algebraic terms (±product ±addend),
++/// not the operand slots, so the 132→213/231 re-encode preserves every
++/// family's semantics (re-derived against the SDM for all four).
++/// Positions 0/1/2 of BOTH spellings are foldable (the multiplicands
++/// commute; the emitter picks the form and keeps the register-homed
++/// operand — typically the loop-invariant broadcast — as the VEX
++/// register source).
+ pub(crate) fn memfold_consumer_madd_256(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+     use crate::ir::intrinsics::IntrinsicOp as O;
+-    matches!(op, O::VecMaddF64x4 | O::VecMaddF32x8)
++    matches!(
++        op,
++        O::VecMaddF64x4 | O::VecMaddF32x8 | O::VecMaddF64x4Signed(..) | O::VecMaddF32x8Signed(..)
++    )
+ }
+ 
+ /// Three-operand vector consumers (packed FP compare / lane-mask select)
+@@ -2388,24 +2402,29 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
+ /// emitted by `emit_avx_binary_256`.
+ ///
+ /// This is the subset for which eliding a REGISTER-HOMED load is provably
+-/// safe.  The general set below only guarantees "some adjacent consumer folds
+-/// this"; several of those consumers (the FMA/madd family in particular)
+-/// resolve their operands through their own ad-hoc lookups in
+-/// `reg_assignments`, which for an elided value names a register that was
+-/// never written.  `emit_avx_binary_256_inner` instead consults
+-/// `pending_vec_memfold` as its FIRST action and either emits the folded
+-/// three-operand form or routes the operand through the memfold-aware
+-/// loaders, so it is safe for both homed and un-homed elisions.
++/// safe.  The general set below only guarantees "some adjacent consumer
++/// folds this"; a consumer that is not in THIS set resolves its operands
++/// through raw `reg_assignments` lookups, which for an elided value name a
++/// register that was never written.  `emit_avx_binary_256_inner` instead
++/// consults `pending_vec_memfold` as its FIRST action and either emits the
++/// folded three-operand form or routes the operand through the
++/// memfold-aware loaders, so it is safe for both homed and un-homed
++/// elisions.  `emit_avx_map_fma` (the madd family, plain and Signed) and
++/// `emit_vec_fma_128` (the BB-SLP packed FMA/FMS) join it after the same
++/// audit: every operand-resolution path in both emitters now either
++/// consumes the fold (the 2XX memory-operand arm / the acc_fold 132 arm)
++/// or routes through `memfold_operand`/`avx_load_arg_to`/`sse_load_arg`,
++/// which re-issue the elided load instead of reading its phantom home.
+ ///
+ /// Keeping this a separate, smaller set is deliberate: it turns "every
+ /// operand resolver in the backend must be memfold-aware" -- an unbounded
+ /// proof obligation that has now failed twice -- into "these consumers are
+ /// audited", which is checkable and stays checkable as emitters are added.
+ /// The 128-bit packed FMA/FMS consumers (BB-SLP contraction): the
+-/// ACCUMULATOR position (args[2]) folds as the 132-form memory operand
+-/// (`v{f,n}madd132{ps,pd} %b, MEM_acc, %a_dst`). The multiplicand
+-/// positions never fold — the emitter's 132 form puts memory in the
+-/// addend slot only.
++/// ACCUMULATOR position (args[2]) folds as the 213-form memory operand
++/// (`v{f,n}madd213{ps,pd} MEM_acc, %b, %a_dst` — 213 is the one FMA3
++/// form whose r/m slot is the ADDEND). The multiplicand positions never
++/// fold — the 132/231 forms put a MULTIPLICAND in r/m.
+ pub(crate) fn memfold_consumer_fma_128(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+     use crate::ir::intrinsics::IntrinsicOp as O;
+     matches!(
+@@ -2431,13 +2450,22 @@ pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u3
+             else {
+                 continue;
+             };
+-            // Only the audited memfold-first emitters; the madd/FMA variants
+-            // are excluded on purpose (see the doc comment). The immediate
+-            // SHIFT families are NOT admitted: their VEX encodings are
++            // Only the audited memfold-first emitters. The madd family
++            // (plain AND Signed — `emit_avx_map_fma` handles both with
++            // the same operand-resolution code) is now among them: every
++            // resolution path in that emitter is memfold-aware (the
++            // VLFOLD arm consumes the fold as the 2XX memory operand or
++            // declines; the fast path gates on the fold not naming its
++            // register sources; the fallback's `operand_reg_source`
++            // reports an elided value as unhomed and every load/re-issue
++            // routes through the memfold-aware `avx_load_arg_to` or the
++            // `memfold_operand` memory source). The immediate SHIFT
++            // families are NOT admitted: their VEX encodings are
+             // register-only (see memfold_consumer_unary_imm_NEVER).
+             if memfold_consumer_256(op).is_none()
+                 && memfold_consumer_128(op).is_none()
+                 && !memfold_consumer_fma_128(op)
++                && !memfold_consumer_madd_256(op)
+             {
+                 continue;
+             }
+@@ -2550,21 +2578,47 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
+                 if cargs.len() != 3 {
+                     continue;
+                 }
+-                let (Operand::Value(_a), Operand::Value(b), Operand::Value(acc)) =
++                let (Operand::Value(av), Operand::Value(b), Operand::Value(acc)) =
+                     (&cargs[0], &cargs[1], &cargs[2])
+                 else {
+                     continue;
+                 };
++                // ALIAS-FREE REQUIREMENT (see the madd arm): the acc
++                // folds; a and b must stay independently resolvable —
++                // `r = x*s + x` contracts to args [a=x, b=s, acc=x] where
++                // the acc IS the a multiplicand as a value (the SLP pack
++                // CSE maps both to the same load pack). Without the
++                // distinctness gate the acc_fold emitter would resolve
++                // the aliased `a` through the never-written home.
++                if av.0 == b.0 || av.0 == acc.0 || b.0 == acc.0 {
++                    continue;
++                }
+                 (false, false, b, acc)
+             } else if madd {
+                 if cargs.len() != 3 {
+                     continue;
+                 }
+-                let (Operand::Value(a0), Operand::Value(_), Operand::Value(a2)) =
++                let (Operand::Value(a0), Operand::Value(a1v), Operand::Value(a2)) =
+                     (&cargs[0], &cargs[1], &cargs[2])
+                 else {
+                     continue;
+                 };
++                // ALIAS-FREE REQUIREMENT (the madd twin of the binary
++                // table's a0 != a1 gate, extended to all three
++                // positions): the fold names exactly ONE operand; the
++                // other two references must stay independently
++                // resolvable (register home, deferred scratch, slot, or
++                // the fold's own memory role). With an aliased pair —
++                // fma(x, x, c) or fma(x, s, s) — the elided value would
++                // have to serve two roles at once (memory operand AND
++                // register/slot source), and no consumer path can
++                // honour both: the first resolution consumes the fold,
++                // the second then reads either the never-written RA home
++                // or the never-written slot. Aliased shapes keep the
++                // (correct, merely slower) ordinary load path.
++                if a0.0 == a2.0 || a1v.0 == a0.0 || a1v.0 == a2.0 {
++                    continue;
++                }
+                 (true, true, a0, a2)
+             } else {
+                 let Some((commutative, wide)) = memfold_consumer_256(cop)
+@@ -2629,6 +2683,92 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
+ 
+ /// Defer a vector home-slot store when every def is consumed once from the
+ /// last-store peephole by a cache-aware intrinsic in the same block.
++/// Values whose EXACTLY ONE use is in the same block as their definition —
++/// the destructive-form dst-homing set for the FMA memory-fold emitters.
++///
++/// Soundness: a value in this set may have its register home OVERWRITTEN by
++/// a consumer that computes its result in place (the madd VLFOLD arm's
++/// `<fam213/231> MEM, %src2, %dst` with dst = the dying operand's home).
++/// A static use-count of one is NOT sufficient for that on its own: a
++/// loop-invariant broadcast has exactly one use SITE (the loop body's madd)
++/// but is read by every dynamic iteration, so overwriting its home after the
++/// first iteration poisons the rest. The block-local definition is the
++/// missing half — when the def and the single use share a block, any dynamic
++/// re-reach of the use must re-execute the def first (the def strictly
++/// precedes the use in the same basic block), so the home is always
++/// re-written before it is re-read. Values with any second reference of any
++/// kind (non-intrinsic operand, value ref, terminator, a second intrinsic
++/// argument) are excluded by the census; so are cross-block single uses
++/// (defined in A, used in B — conservative, and the rare straight-line case
++/// merely keeps the scratch-staging spelling).
++pub(super) fn compute_vector_dying_values(func: &IrFunction) -> FxHashSet<u32> {
++    // Exact total-use census over every reference kind. A value needs
++    // exactly one use, period — the census counts intrinsic arguments,
++    // non-intrinsic instruction operands, explicit value references and
++    // terminator operands alike, so any aliasing read disqualifies.
++    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut use_block: FxHashMap<u32, usize> = FxHashMap::default();
++    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
++    let mut multi_block_def: FxHashSet<u32> = FxHashSet::default();
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for inst in &block.instructions {
++            // Definition sites: intrinsic SSA dests (loads, broadcasts,
++            // arithmetic — the vector values the emitters home).
++            match inst {
++                Instruction::Intrinsic { dest: Some(d), .. } => {
++                    if def_block.insert(d.0, bi).is_some() {
++                        multi_block_def.insert(d.0);
++                    }
++                }
++                Instruction::BinOp { dest, .. }
++                | Instruction::UnaryOp { dest, .. }
++                | Instruction::Cast { dest, .. } => {
++                    if def_block.insert(dest.0, bi).is_some() {
++                        multi_block_def.insert(dest.0);
++                    }
++                }
++                _ => {}
++            }
++            // Use sites: every operand of every instruction, in the
++            // instruction's block.
++            for_each_operand_in_instruction(inst, |op| {
++                if let Operand::Value(v) = op {
++                    *use_count.entry(v.0).or_default() += 1;
++                    use_block.insert(v.0, bi);
++                }
++            });
++            for_each_value_use_in_instruction(inst, |v| {
++                *use_count.entry(v.0).or_default() += 1;
++                use_block.insert(v.0, bi);
++            });
++        }
++        for_each_operand_in_terminator(&block.terminator, |op| {
++            if let Operand::Value(v) = op {
++                *use_count.entry(v.0).or_default() += 1;
++                use_block.insert(v.0, bi);
++            }
++        });
++    }
++    let mut result = FxHashSet::default();
++    for (&v, &n) in &use_count {
++        if n != 1 {
++            continue;
++        }
++        // A use without a recorded def site is a parameter or an
++        // undefined reference — its "home" is not a local def's product.
++        let Some(&db) = def_block.get(&v) else {
++            continue;
++        };
++        if multi_block_def.contains(&v) {
++            continue;
++        }
++        if use_block.get(&v) == Some(&db) {
++            result.insert(v);
++        }
++    }
++    result
++}
++
+ pub(super) fn compute_vector_defer_values(
+     func: &IrFunction,
+     memfold_values: &FxHashSet<u32>,
+diff --git a/src/backend/stack_layout/mod.rs b/src/backend/stack_layout/mod.rs
+index 5cca4d48..0d05ed13 100644
+--- a/src/backend/stack_layout/mod.rs
++++ b/src/backend/stack_layout/mod.rs
+@@ -126,6 +126,15 @@ struct StackLayoutContext {
+     /// operand in their adjacent consumer (`compute_vector_memfold_values`).
+     vector_memfold_values: FxHashSet<u32>,
+     vector_memfold_homed_ok: FxHashSet<u32>,
++    /// VLFOLD dst-homing: values whose EXACTLY ONE use is in the same block
++    /// as their definition (`compute_vector_dying_values`) — the emitter may
++    /// compute a destructive-form result into such an operand's register
++    /// home, because no dynamic execution can read the home afterwards (the
++    /// def re-executes before any re-reach of the use). This is what
++    /// distinguishes a loop's streamed input (defined in the body, dies at
++    /// the FMA) from the loop-invariant broadcast (one STATIC use site but
++    /// read by every iteration — its home must survive the loop).
++    vector_dying_values: FxHashSet<u32>,
+     x87_defer_values: FxHashSet<u32>,
+     /// Values that appear as incoming operands in Phi instructions.
+     /// These must NOT be classified as block-local (Tier 3) because phi
+@@ -365,6 +374,7 @@ pub fn calculate_stack_space_common(
+     state.vector_defer_values = ctx.vector_defer_values.clone();
+     state.vector_memfold_values = ctx.vector_memfold_values.clone();
+     state.vector_memfold_homed_ok = ctx.vector_memfold_homed_ok.clone();
++    state.vector_dying_values = ctx.vector_dying_values.clone();
+     // i686 x87 top-of-stack deferral: F64 binop results consumed exactly once
+     // by the adjacent F64 binop (the x87 twin of the vector deferral above;
+     // backends that never set x87_pending ignore it).
+@@ -723,6 +733,7 @@ fn build_layout_context(
+     // transparent between a deferred def and its consumer.
+     let vector_memfold_values = copy_coalescing::compute_vector_memfold_values(func);
+     let vector_memfold_homed_ok = copy_coalescing::compute_vector_memfold_homed_ok(func);
++    let vector_dying_values = copy_coalescing::compute_vector_dying_values(func);
+     let vector_defer_values =
+         copy_coalescing::compute_vector_defer_values(func, &vector_memfold_values);
+     let x87_defer_values = copy_coalescing::compute_x87_defer_values(func);
+@@ -865,6 +876,7 @@ fn build_layout_context(
+         vector_defer_values,
+         vector_memfold_values,
+         vector_memfold_homed_ok,
++        vector_dying_values,
+         x87_defer_values,
+         phi_incoming_values,
+         memcpy_value_sizes,
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index 64798427..33d16f5c 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -227,6 +227,14 @@ pub struct CodegenState {
+     /// elided when the load's destination carries a register home; see
+     /// `compute_vector_memfold_homed_ok`.
+     pub vector_memfold_homed_ok: FxHashSet<u32>,
++    /// Values with EXACTLY ONE use, that use in the same block as their
++    /// definition (`compute_vector_dying_values`): a destructive-form
++    /// emitter may compute its result into such an operand's register home
++    /// — no dynamic execution can read the home afterwards, because the
++    /// definition re-executes before any re-reach of the use. The
++    /// loop-invariant broadcast is the counter-example this set excludes:
++    /// one STATIC use site, read by every iteration.
++    pub vector_dying_values: FxHashSet<u32>,
+     /// The elided load awaiting its consumer. Consumed as a memory operand
+     /// by the audited memfold-first emitters, or re-issued as a real load by
+     /// the memfold-aware loaders; the safety net in `emit_intrinsic_impl`
+@@ -594,6 +602,7 @@ impl CodegenState {
+             vector_defer_values: FxHashSet::default(),
+             vector_memfold_values: FxHashSet::default(),
+             vector_memfold_homed_ok: FxHashSet::default(),
++            vector_dying_values: FxHashSet::default(),
+             pending_vec_memfold: None,
+             pending_vec_store: None,
+             x87_pending: None,
+diff --git a/src/backend/x86/assembler/encoder/avx.rs b/src/backend/x86/assembler/encoder/avx.rs
+index e2641783..b1916760 100644
+--- a/src/backend/x86/assembler/encoder/avx.rs
++++ b/src/backend/x86/assembler/encoder/avx.rs
+@@ -1538,20 +1538,17 @@ impl super::InstructionEncoder {
+                 self.bytes.push(opcode);
+                 self.encode_modrm_mem(dst_num, mem)
+             }
+-            // Gas-style AT&T sometimes writes `vfmadd231sd %xmm, mem, %xmm`
+-            // (src1, src2/mem, dest). Map to the canonical (mem, vvvv, dst) form
+-            // when the middle operand is memory.
+-            (Operand::Register(src1), Operand::Memory(mem), Operand::Register(dst)) => {
+-                let vvvv_num = reg_num(&src1.name).ok_or("bad register")?;
+-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+-                let r = needs_vex_ext(&dst.name);
+-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+-                let vvvv_enc = vvvv_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+-                self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp);
+-                self.bytes.push(opcode);
+-                self.encode_modrm_mem(dst_num, mem)
+-            }
++            // NOTE: no (reg, mem, dst) "middle-memory" arm. GAS itself
++            // rejects that spelling ("operand size mismatch"), and the one
++            // producer this tree ever had (the `emit_vec_fma_128` acc-fold,
++            // spelled `vfmadd132 %S2, MEM_acc, %dst`) was dead code from
++            // the day it was written — the v6 safety net materialised every
++            // fold before that emitter ran — so its inverted
++            // multiplier/addend roles were never executed. It now emits the
++            // canonical 213 form (`MEM_acc` first). An operand-order
++            // mistake in a future emitter must fail the assembly loudly,
++            // not silently encode a different instruction than the source
++            // spelled.
+             _ => Err("unsupported FMA3 3-op operands".to_string()),
+         }
+     }
+@@ -1593,20 +1590,17 @@ impl super::InstructionEncoder {
+                 self.bytes.push(opcode);
+                 self.encode_modrm_mem(dst_num, mem)
+             }
+-            // Gas-style AT&T sometimes writes `vfmadd231sd %xmm, mem, %xmm`
+-            // (src1, src2/mem, dest). Map to the canonical (mem, vvvv, dst) form
+-            // when the middle operand is memory.
+-            (Operand::Register(src1), Operand::Memory(mem), Operand::Register(dst)) => {
+-                let vvvv_num = reg_num(&src1.name).ok_or("bad register")?;
+-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+-                let r = needs_vex_ext(&dst.name);
+-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+-                let vvvv_enc = vvvv_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+-                self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp);
+-                self.bytes.push(opcode);
+-                self.encode_modrm_mem(dst_num, mem)
+-            }
++            // NOTE: no (reg, mem, dst) "middle-memory" arm. GAS itself
++            // rejects that spelling ("operand size mismatch"), and the one
++            // producer this tree ever had (the `emit_vec_fma_128` acc-fold,
++            // spelled `vfmadd132 %S2, MEM_acc, %dst`) was dead code from
++            // the day it was written — the v6 safety net materialised every
++            // fold before that emitter ran — so its inverted
++            // multiplier/addend roles were never executed. It now emits the
++            // canonical 213 form (`MEM_acc` first). An operand-order
++            // mistake in a future emitter must fail the assembly loudly,
++            // not silently encode a different instruction than the source
++            // spelled.
+             _ => Err("unsupported FMA3 3-op operands".to_string()),
+         }
+     }
+diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
+index a5976fbf..ed4e995b 100644
+--- a/src/backend/x86/codegen/float_ops.rs
++++ b/src/backend/x86/codegen/float_ops.rs
+@@ -1579,16 +1579,11 @@ impl X86Codegen {
+         negate_product: bool,
+         negate_addend: bool,
+     ) {
+-        let fma = match (negate_product, negate_addend, matches!(ty, IrType::F64)) {
+-            (false, false, true) => "vfmadd231sd",
+-            (false, false, false) => "vfmadd231ss",
+-            (false, true, true) => "vfmsub231sd",
+-            (false, true, false) => "vfmsub231ss",
+-            (true, false, true) => "vfnmadd231sd",
+-            (true, false, false) => "vfnmadd231ss",
+-            (true, true, true) => "vfnmsub231sd",
+-            (true, true, false) => "vfnmsub231ss",
+-        };
++        let fma = crate::backend::x86_common::fma231_mnemonic(
++            negate_product,
++            negate_addend,
++            matches!(ty, IrType::F64),
++        );
+         self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, dest, ty);
+     }
+ 
 diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index 039c2540..aa345eed 100644
+index 039c2540..31ec046b 100644
 --- a/src/backend/x86/codegen/intrinsics.rs
 +++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -1992,6 +1992,33 @@ impl X86Codegen {
+@@ -1276,6 +1276,18 @@ impl X86Codegen {
+     }
+ 
+     pub(super) fn avx_store_dest(&mut self, dest_ptr: &Value) {
++        self.avx_store_dest_from(dest_ptr, "ymm0");
++    }
++
++    /// `avx_store_dest` with an explicit source register: the 256-bit
++    /// result-homing discipline (RA home copy / slot store / deferred
++    /// pending store) applied to a value that lives in `src` rather than
++    /// `%ymm0` — e.g. the madd VLFOLD arm's 2XX form, which computes the
++    /// result into the streamed operand's own (dying) register. Every
++    /// downstream consumer of the pending/last-store machinery is
++    /// register-name-generic, so the deferral and register-cache
++    /// behaviour is identical to the %ymm0 spelling.
++    fn avx_store_dest_from(&mut self, dest_ptr: &Value, src: &'static str) {
+         // 256-bit store paths read the full YMM register; the earlier load
+         // already dirtied it, but mark defensively (a broadcast-only body
+         // could reach here through a register-copy path).
+@@ -1283,9 +1295,9 @@ impl X86Codegen {
+         if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
+             if is_xmm_reg(reg) {
+                 let name = phys_reg_name_256(reg);
+-                if name != "ymm0" {
++                if name != src {
+                     self.state
+-                        .emit_fmt(format_args!("    vmovdqa %ymm0, %{}", name));
++                        .emit_fmt(format_args!("    vmovdqa %{}, %{}", src, name));
+                 }
+                 self.state.vec_claim_live_reg(dest_ptr.0, name);
+                 self.state.vec_last_store_val = Some(dest_ptr.0);
+@@ -1305,27 +1317,31 @@ impl X86Codegen {
+         if let Some(addr) = self.state.resolve_slot_addr(dest_ptr.0) {
+             if let SlotAddr::Direct(slot) = addr {
+                 if !deferred {
+-                    self.state
+-                        .emit_fmt(format_args!("    vmovdqu %ymm0, {}", self.slot_ref(slot.0)));
++                    self.state.emit_fmt(format_args!(
++                        "    vmovdqu %{}, {}",
++                        src,
++                        self.slot_ref(slot.0)
++                    ));
+                 } else {
+-                    self.state.pending_vec_store = Some((dest_ptr.0, "ymm0", true));
++                    self.state.pending_vec_store = Some((dest_ptr.0, src, true));
+                 }
+                 self.state.vec_last_store_slot = Some(slot.0);
+                 self.state.vec_last_store_val = Some(dest_ptr.0);
+                 self.state.vec_last_store_reg = true;
+-                self.state.vec_last_store_reg_name = Some("ymm0");
++                self.state.vec_last_store_reg_name = Some(src);
+                 return;
+             }
+         }
+         if !deferred {
+             self.value_to_reg(dest_ptr, "rax");
+-            self.state.emit("    vmovdqu %ymm0, (%rax)");
++            self.state
++                .emit_fmt(format_args!("    vmovdqu %{}, (%rax)", src));
+         } else {
+-            self.state.pending_vec_store = Some((dest_ptr.0, "ymm0", true));
++            self.state.pending_vec_store = Some((dest_ptr.0, src, true));
+         }
+         self.state.vec_last_store_val = Some(dest_ptr.0);
+         self.state.vec_last_store_reg = true;
+-        self.state.vec_last_store_reg_name = Some("ymm0");
++        self.state.vec_last_store_reg_name = Some(src);
+     }
+ 
+     /// Memory operand for a vector arg, unless the value is still provably in a
+@@ -1671,9 +1687,9 @@ impl X86Codegen {
+             // memfold_consumer_128), so a pending fold before one is always
+             // materialised.
+             let width_matches = if pf.width == 16 {
+-                cc::memfold_consumer_128(op).is_some()
++                cc::memfold_consumer_128(op).is_some() || cc::memfold_consumer_fma_128(op)
+             } else {
+-                cc::memfold_consumer_256(op).is_some()
++                cc::memfold_consumer_256(op).is_some() || cc::memfold_consumer_madd_256(op)
+             };
+             let consumes = args
+                 .iter()
+@@ -1992,6 +2008,33 @@ impl X86Codegen {
              IntrinsicOp::FmaScalarF32 => {
                  self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F32);
              }
@@ -380,7 +1042,7 @@ index 039c2540..aa345eed 100644
              IntrinsicOp::RoundScalarF64(imm) => {
                  self.emit_fp_scalar_round(dest, &args[0], IrType::F64, *imm);
              }
-@@ -6154,6 +6181,35 @@ impl X86Codegen {
+@@ -6154,6 +6197,35 @@ impl X86Codegen {
                      self.emit_avx_map_fma(d, args, "vfmadd132pd");
                  }
              }
@@ -416,6 +1078,537 @@ index 039c2540..aa345eed 100644
              IntrinsicOp::VecFmaF64x2
              | IntrinsicOp::VecFnmaF64x2
              | IntrinsicOp::VecFmaF32x4
+@@ -7501,56 +7573,289 @@ impl X86Codegen {
+         }
+     }
+ 
++    /// Re-encode a 132-family FMA mnemonic to its 213/231 sibling.
++    ///
++    /// The three FMA3 forms differ only in operand POSITION — the sign
++    /// structure (±product ±addend) attaches to the algebraic terms, not
++    /// the operand slots — so every family mnemonic has exact siblings
++    /// that compute the same value with the memory operand in a different
++    /// role (213: the addend; 231: a multiplicand). This is the complete,
++    /// CLOSED mapping over the eight family mnemonics the map-FMA emitter
++    /// accepts: an unknown string fails loudly instead of silently
++    /// passing through. (The `str::replace("132", …)` this replaces was
++    /// correct for all eight spellings but a silent no-op for any future
++    /// mnemonic lacking a "132" infix — the wrong answer for a
++    /// correctness-critical re-encoding.)
++    fn fma_form_reencode(mnemonic: &str, to_231: bool) -> &'static str {
++        match mnemonic {
++            "vfmadd132pd" => {
++                if to_231 {
++                    "vfmadd231pd"
++                } else {
++                    "vfmadd213pd"
++                }
++            }
++            "vfmadd132ps" => {
++                if to_231 {
++                    "vfmadd231ps"
++                } else {
++                    "vfmadd213ps"
++                }
++            }
++            "vfmsub132pd" => {
++                if to_231 {
++                    "vfmsub231pd"
++                } else {
++                    "vfmsub213pd"
++                }
++            }
++            "vfmsub132ps" => {
++                if to_231 {
++                    "vfmsub231ps"
++                } else {
++                    "vfmsub213ps"
++                }
++            }
++            "vfnmadd132pd" => {
++                if to_231 {
++                    "vfnmadd231pd"
++                } else {
++                    "vfnmadd213pd"
++                }
++            }
++            "vfnmadd132ps" => {
++                if to_231 {
++                    "vfnmadd231ps"
++                } else {
++                    "vfnmadd213ps"
++                }
++            }
++            "vfnmsub132pd" => {
++                if to_231 {
++                    "vfnmsub231pd"
++                } else {
++                    "vfnmsub213pd"
++                }
++            }
++            "vfnmsub132ps" => {
++                if to_231 {
++                    "vfnmsub231ps"
++                } else {
++                    "vfnmsub213ps"
++                }
++            }
++            other => unreachable!("not a 132-family FMA mnemonic: {other}"),
++        }
++    }
++
+     fn emit_avx_map_fma_inner(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
+         assert!(args.len() == 3, "{} expects input, scale, bias", mnemonic);
+-        // VLFOLD forms (ICX saxpy shape). With the scale in an XMM home:
+-        //   bias elided : input streams in %ymm0 → `vfmadd213 mem, %s, %ymm0`
+-        //                 (= s*input + mem)
+-        //   input elided: bias  streams in %ymm0 → `vfmadd231 mem, %s, %ymm0`
+-        //                 (= s*mem + bias)
++        // VLFOLD forms (ICX saxpy shape): one of the three operands is an
++        // elided single-use load and the FMA takes its SOURCE memory
++        // operand directly, exactly like the audited binary emitter
++        // (`emit_avx_binary_256_inner`). The Intel form algebra, with the
++        // sign structure attached to the algebraic TERMS (invariant under
++        // the operand permutation, re-derived against the SDM for all
++        // four families — the 132-family mnemonic re-encodes exactly):
++        //   fold = addend      (213): `<fam213> MEM, %src2, %dst` where
++        //                         dst holds a MULTIPLICAND (the streamed
++        //                         input), src2 the other multiplicand
++        //                         (typically the homed broadcast), MEM
++        //                         the folded bias.
++        //   fold = multiplicand (231): `<fam231> MEM, %src2, %dst` where
++        //                         dst holds the ADDEND (the streamed
++        //                         bias), src2 the other multiplicand,
++        //                         MEM the folded input.
++        // Operand resolution mirrors the binary arm: a register source is
++        // the operand's RA home or the scratch register holding its
++        // DEFERRED store (consumed in place — the pending store never
++        // fires; 256-bit pendings only, a 128-bit-named register would
++        // splice a mixed-width operand into a YMM instruction). The
++        // destination takes the dst-operand's OWN home (free: the
++        // single-use operand dies at this instruction — the classic
++        // destructive-form register reuse), its deferred scratch, or a
++        // load into a free scratch register.
++        //
++        // RESOLUTION IS MANDATORY (the binary arm's rule): when a fold
++        // names one of this op's operands — guaranteed by the
++        // emit_intrinsic_impl safety net — this arm either CONSUMES the
++        // fold or falls through, and every ordinary path below re-issues
++        // or materialises it. A pending fold is never left dangling past
++        // this intrinsic, so no later fast path can read the phantom
++        // register the allocator reserved for the elided value.
+         if let (Some(pf), Operand::Value(m0), Operand::Value(m1), Operand::Value(bias)) = (
+             self.state.pending_vec_memfold.clone(),
+             &args[0],
+             &args[1],
+             &args[2],
+         ) {
+-            let (pv, mem) = (pf.val, pf.mem);
+-            // The multiplicands commute: whichever of args[0]/args[1] has an
+-            // XMM home (the loop-invariant broadcast) is the register source,
+-            // the other one is the streamed element vector.
+-            let home = |this: &Self, v: &Value| {
++            let (pv, mem) = (pf.val, pf.mem.clone());
++            // Memfold-aware home: the live fold's value has no
++            // materialised register — the RA reserved one but the elided
++            // load never wrote it. Reporting that register here is how a
++            // consumer silently reads garbage (the v6 clamp class).
++            let home = |this: &Self, v: &Value| -> Option<PhysReg> {
++                if v.0 == pv {
++                    return None;
++                }
+                 this.reg_assignments
+                     .get(&v.0)
+                     .copied()
+                     .filter(|r| is_xmm_reg(*r))
+             };
+-            let (scale_reg, streamed_mul) = match (home(self, m0), home(self, m1)) {
+-                (Some(r), None) => (Some(r), Some((m1, &args[1]))),
+-                (None, Some(r)) => (Some(r), Some((m0, &args[0]))),
+-                _ => (None, None),
++            // The scratch register holding an operand's DEFERRED store,
++            // if that single-use store is still pending.
++            let held = |this: &Self, v: &Value| -> Option<&'static str> {
++                this.state
++                    .pending_vec_store
++                    .filter(|(p, _, wide)| *p == v.0 && *wide)
++                    .map(|(_, r, _)| r)
+             };
+-            if let (Some(scale_reg), Some((streamed, streamed_arg))) = (scale_reg, streamed_mul) {
+-                let form = if bias.0 == pv {
+-                    Some((mnemonic.replace("132", "213"), streamed_arg))
+-                } else if streamed.0 == pv {
+-                    Some((mnemonic.replace("132", "231"), &args[2]))
+-                } else {
+-                    None
+-                };
+-                if let Some((form, streamed)) = form {
+-                    self.avx_load_arg(streamed);
+-                    self.state.emit_fmt(format_args!(
+-                        "    {} {}, %{}, %ymm0",
+-                        form,
+-                        mem,
+-                        phys_reg_name_256(scale_reg)
+-                    ));
+-                    self.state.pending_vec_memfold = None;
+-                    self.state.vec_last_store_reg = false;
+-                    self.avx_store_dest(dest);
++            // Shared tail: emit `<fam> MEM, %src2, %dst` with the full
++            // result bookkeeping. `dst` must already hold the dst-operand
++            // (dying home / deferred scratch / staged load).
++            //
++            // DST-HOMING SOUNDNESS: an operand's register home may serve as
++            // dst ONLY when the operand provably dies at this instruction —
++            // `vector_dying_values` (single use, same block as the def)
++            // plus a live-regs claim on that home in THIS block (the
++            // claim map is reset at block boundaries, which is what
++            // excludes the loop-invariant broadcast: one static use site,
++            // read by every iteration, claimed only in the preheader).
++            // Any other home is read-only (src2) or stays untouched.
++            let dying_home = |this: &Self, v: &Value, home: PhysReg| -> bool {
++                let name = phys_reg_name_256(home);
++                this.state.vector_dying_values.contains(&v.0)
++                    && this.state.vec_live_regs.get(&v.0).copied() == Some(name)
++            };
++            let mut emit_2xx = |this: &mut Self,
++                                form: &'static str,
++                                src2: String,
++                                dst: &'static str,
++                                consumed_pending: bool| {
++                if consumed_pending {
++                    // The held operand's store never fires: its only use
++                    // is this instruction (the VDEFER single-use window).
++                    this.state.pending_vec_store = None;
++                }
++                this.state.dirty_upper_ymm = true;
++                this.state
++                    .emit_fmt(format_args!("    {} {}, {}, %{}", form, mem, src2, dst));
++                this.state.pending_vec_memfold = None;
++                // The result now owns dst's bank: every OTHER value's
++                // claim on it (the dying dst-operand's, in particular)
++                // just ended.
++                this.state.vec_evict_bank_except(dst, dest.0);
++                this.state.vec_last_store_reg = false;
++                this.avx_store_dest_from(dest, dst);
++            };
++            // 213: the fold is the addend. Both multiplicands must be
++            // free of the fold (an aliased multiplicand would have to be
++            // the memory operand AND a register source at once; the
++            // matcher's alias-free gate makes this unreachable, the check
++            // stays defensive).
++            if bias.0 == pv && m0.0 != pv && m1.0 != pv {
++                // Two orders (the multiplicands commute). PREFERENCE: an
++                // order whose dst-operand dies in its home (zero staging,
++                // the GCC/ICX saxpy shape) beats one that merely resolves
++                // src2 and stages the dst-operand through a scratch — so
++                // every order is checked for a dying-home dst BEFORE any
++                // staging fallback is taken.
++                let mut staged: Option<(String, bool, &Operand)> = None;
++                for (d_op, s_op, d_arg) in [(m0, m1, &args[0]), (m1, m0, &args[1])] {
++                    let src2 = home(self, s_op)
++                        .map(|r| format!("%{}", phys_reg_name_256(r)))
++                        .or_else(|| held(self, s_op).map(|h| format!("%{h}")));
++                    let Some(src2) = src2 else {
++                        continue;
++                    };
++                    let consumed = held(self, s_op).is_some();
++                    if let Some(dr) = home(self, d_op).filter(|&r| dying_home(self, d_op, r)) {
++                        let dst = phys_reg_name_256(dr);
++                        emit_2xx(
++                            self,
++                            Self::fma_form_reencode(mnemonic, false),
++                            src2,
++                            dst,
++                            consumed,
++                        );
++                        return;
++                    }
++                    if let Some(h) = held(self, d_op) {
++                        emit_2xx(
++                            self,
++                            Self::fma_form_reencode(mnemonic, false),
++                            src2,
++                            h,
++                            consumed,
++                        );
++                        return;
++                    }
++                    staged = staged.or(Some((src2, consumed, d_arg)));
++                }
++                if let Some((src2, consumed, d_arg)) = staged {
++                    // Stage the dst-operand into the scratch the src2 is
++                    // NOT using (avx_load_arg_to flushes any unrelated
++                    // pending store itself and evicts stale bank claims).
++                    let scratch: &'static str = if src2 == "%ymm0" { "ymm1" } else { "ymm0" };
++                    self.avx_load_arg_to(d_arg, scratch);
++                    emit_2xx(
++                        self,
++                        Self::fma_form_reencode(mnemonic, false),
++                        src2,
++                        scratch,
++                        consumed,
++                    );
++                    return;
++                }
++            }
++            // 231: the fold is a multiplicand. The addend streams in dst;
++            // src2 is the OTHER multiplicand (which must not itself be
++            // the fold — see above).
++            if (m0.0 == pv || m1.0 == pv) && bias.0 != pv {
++                let other = if m0.0 == pv { m1 } else { m0 };
++                let src2 = home(self, other)
++                    .map(|r| format!("%{}", phys_reg_name_256(r)))
++                    .or_else(|| held(self, other).map(|h| format!("%{h}")));
++                if let Some(src2) = src2 {
++                    let consumed = held(self, other).is_some();
++                    if let Some(dr) = home(self, bias).filter(|&r| dying_home(self, bias, r)) {
++                        let dst = phys_reg_name_256(dr);
++                        emit_2xx(
++                            self,
++                            Self::fma_form_reencode(mnemonic, true),
++                            src2,
++                            dst,
++                            consumed,
++                        );
++                        return;
++                    }
++                    if let Some(h) = held(self, bias) {
++                        emit_2xx(
++                            self,
++                            Self::fma_form_reencode(mnemonic, true),
++                            src2,
++                            h,
++                            consumed,
++                        );
++                        return;
++                    }
++                    let scratch: &'static str = if src2 == "%ymm0" { "ymm1" } else { "ymm0" };
++                    self.avx_load_arg_to(&args[2], scratch);
++                    emit_2xx(
++                        self,
++                        Self::fma_form_reencode(mnemonic, true),
++                        src2,
++                        scratch,
++                        consumed,
++                    );
+                     return;
+                 }
+             }
++            // No 2XX form applied (the fold aliases operands across
++            // roles, or no register source resolved): fall through to the
++            // hardened ordinary paths, which re-issue or materialise the
++            // fold — the RESOLUTION IS MANDATORY rule above.
+         }
+         if let (Operand::Value(input), Operand::Value(scale), Operand::Value(bias)) =
+             (&args[0], &args[1], &args[2])
+@@ -7558,16 +7863,29 @@ impl X86Codegen {
+             let input_held = self.state.vec_last_store_reg
+                 && self.state.vec_last_store_val == Some(input.0)
+                 && self.state.vec_last_store_reg_name == Some("ymm0");
++            // Memfold-aware sources (see the VLFOLD arm's `home`): an
++            // elided scale/bias has no materialised register, and the
++            // fast path must not read the phantom home. An elided input
++            // is excluded by `input_held` itself (an elided load never
++            // stores, so no last-store entry can name it).
++            let live_fold = |this: &Self, v: &Value| -> bool {
++                this.state
++                    .pending_vec_memfold
++                    .as_ref()
++                    .is_some_and(|pf| pf.val == v.0)
++            };
+             let scale_reg = self
+                 .reg_assignments
+                 .get(&scale.0)
+                 .copied()
+-                .filter(|r| is_xmm_reg(*r));
++                .filter(|r| is_xmm_reg(*r))
++                .filter(|_| !live_fold(self, scale));
+             let bias_reg = self
+                 .reg_assignments
+                 .get(&bias.0)
+                 .copied()
+-                .filter(|r| is_xmm_reg(*r));
++                .filter(|r| is_xmm_reg(*r))
++                .filter(|_| !live_fold(self, bias));
+             if let (true, Some(scale_reg), Some(bias_reg)) = (input_held, scale_reg, bias_reg) {
+                 self.state.emit_fmt(format_args!(
+                     "    {} %{}, %{}, %ymm0",
+@@ -7596,6 +7914,17 @@ impl X86Codegen {
+             let Operand::Value(v) = arg else {
+                 return None;
+             };
++            // Memfold-aware (LOAD-BEARING, mirrors `vec_home_256`): a value
++            // whose load was elided into `pending_vec_memfold` has no
++            // materialised contents — the register the allocator reserved
++            // for it was never written. Reporting that register as a
++            // source is how a consumer silently reads garbage; returning
++            // None routes the operand through `avx_load_arg_to` (which
++            // re-issues the load) or the `memfold_operand` memory source
++            // in the (None, None) arm below.
++            if this.memfold_operand(arg).is_some() {
++                return None;
++            }
+             if let Some(&reg) = this.reg_assignments.get(&v.0) {
+                 if is_xmm_reg(reg) {
+                     return Some(format!("%{}", phys_reg_name_256(reg)));
+@@ -7929,13 +8258,18 @@ impl X86Codegen {
+         // ── Register-alias discipline ────────────────────────────────
+         // Three operands (a, b, acc) are live at the FMA and any of them
+         // may be the register the allocator REUSED for the dest (each
+-        // dies at the instruction). The two Intel forms:
+-        //   231: D = ±(S1·S2) + D   — D must hold the ACCUMULATOR.
+-        //   132: D = ±(D·S2) + S1   — D must hold one MULTIPLICAND.
++        // dies at the instruction). The Intel forms — canonical AT&T
++        // spelling (src3/r/m, src2/vvvv, dst), semantics CPU-verified:
++        //   132: D = D × src3 + src2 — r/m is the SECOND MULTIPLICAND,
++        //        VVVV the ADDEND. D must hold one MULTIPLICAND.
++        //   213: D = src2 × D + src3 — r/m is the ADDEND, VVVV the first
++        //        multiplier. D must hold one MULTIPLICAND.
++        //   231: D = src2 × src3 + D — r/m is the second multiplier, D
++        //        the ADDEND (the accumulator).
+         // The alias of dst with a/b/acc selects the form; the product
+-        // commutes, so 132's S2 is whichever multiplicand dst does NOT
+-        // hold. Multiple aliases are impossible (a, b, acc are mutually
+-        // distinct live values).
++        // commutes, so the multiplier register is whichever multiplicand
++        // dst does NOT hold. Multiple aliases are impossible (a, b, acc
++        // are mutually distinct live values).
+         //
+         // Resolve the multiplicands first (homed: their register; unhomed:
+         // staged into %xmm1/%xmm2). The resolution NAMES let the alias
+@@ -7944,8 +8278,15 @@ impl X86Codegen {
+         let a_src = self.vex128_source(&args[0], "xmm2");
+ 
+         if let Some(mem) = acc_fold {
+-            // 132 with the accumulator folded as the memory operand:
+-            // `v{f,n}madd132{ps,pd} %S2, MEM_acc, %dst`, dst holding a
++            // 213 with the accumulator folded as the memory operand — the
++            // ONE form whose r/m slot is the ADDEND (132/231 put a
++            // MULTIPLICAND in r/m). Spelling this as a 132 with the
++            // memory in the middle operand slot computed a·acc + b — the
++            // multiplier/addend roles inverted — and had never been
++            // assembled before: the v6 safety-net tightening dead-pathed
++            // this arm for its whole life, so no test ever executed it.
++            // Canonical AT&T: `v{f,n}madd213{ps,pd} MEM_acc, %S2, %dst`
++            // computes S2 × dst + MEM_acc = a·b + acc, dst holding a
+             // multiplicand (loaded into dst when it holds neither).
+             if a_src == dst && b_src == dst {
+                 // Impossible (distinct live values share no register);
+@@ -7957,8 +8298,8 @@ impl X86Codegen {
+                 // resolved to its own register/scratch).
+                 self.sse_load_arg(&args[0], dst_static);
+                 self.state.emit_fmt(format_args!(
+-                    "    {}132{} {}, {}, {}",
+-                    mn, ps, b_src, mem, dst
++                    "    {}213{} {}, {}, {}",
++                    mn, ps, mem, b_src, dst
+                 ));
+             } else {
+                 let s2 = if a_src == dst {
+@@ -7967,7 +8308,7 @@ impl X86Codegen {
+                     a_src.clone()
+                 };
+                 self.state
+-                    .emit_fmt(format_args!("    {}132{} {}, {}, {}", mn, ps, s2, mem, dst));
++                    .emit_fmt(format_args!("    {}213{} {}, {}, {}", mn, ps, mem, s2, dst));
+             }
+             self.state.pending_vec_memfold = None;
+         } else {
+@@ -9913,3 +10254,59 @@ impl X86Codegen {
+         self.state.gep_base_offset.get(&val_id).copied()
+     }
+ }
++
++/// The closed 132→{213,231} family table (`fma_form_reencode`): every
++/// mnemonic the map-FMA emitter can be dispatched with has both siblings,
++/// and the re-encode preserves lane width and sign family exactly. A
++/// mnemonic added to the dispatch tables without extending this match
++/// fails the exhaustive test below (and the emitter's `unreachable!`).
++#[cfg(test)]
++mod fma_form_reencode_tests {
++    use super::X86Codegen;
++
++    #[test]
++    fn every_family_mnemonic_has_both_siblings() {
++        // (132, 213, 231) × {pd, ps} × {vfmadd, vfmsub, vfnmadd, vfnmsub}
++        let families = ["vfmadd", "vfmsub", "vfnmadd", "vfnmsub"];
++        let widths = ["pd", "ps"];
++        for f in families {
++            for w in widths {
++                let m132 = format!("{f}132{w}");
++                let m213 = format!("{f}213{w}");
++                let m231 = format!("{f}231{w}");
++                assert_eq!(
++                    X86Codegen::fma_form_reencode(&m132, false),
++                    m213,
++                    "213 sibling of {m132}"
++                );
++                assert_eq!(
++                    X86Codegen::fma_form_reencode(&m132, true),
++                    m231,
++                    "231 sibling of {m132}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn non_132_inputs_are_rejected_not_passthrough() {
++        // The whole point of the closed table: a mnemonic that is not a
++        // 132-family spelling must fail loudly (in tests) rather than
++        // silently round-trip (the `str::replace` behaviour). Both the
++        // already-re-encoded forms and foreign mnemonics are rejected.
++        let bad = [
++            "vfmadd213pd",
++            "vfmadd231ps",
++            "vpaddd",
++            "vmovupd",
++            "vfmadd132sd",
++            "",
++        ];
++        for m in bad {
++            let r213 = std::panic::catch_unwind(|| X86Codegen::fma_form_reencode(m, false));
++            let r231 = std::panic::catch_unwind(|| X86Codegen::fma_form_reencode(m, true));
++            assert!(r213.is_err(), "{m} must not re-encode to 213");
++            assert!(r231.is_err(), "{m} must not re-encode to 231");
++        }
++    }
++}
+diff --git a/src/backend/x86_common.rs b/src/backend/x86_common.rs
+index 8d7e4b1f..d4cadd95 100644
+--- a/src/backend/x86_common.rs
++++ b/src/backend/x86_common.rs
+@@ -474,3 +474,30 @@ pub(crate) fn emit_operand_common(
+     // Not handled: %a modifier, or register operand needing arch-specific formatting
+     false
+ }
++
++/// The 231-family scalar FMA mnemonic for the sign algebra
++/// `dest = (np ? -1 : 1) * (lhs * rhs) + (na ? -1 : 1) * acc`.
++///
++/// The x86 naming composes exactly: `n` negates the PRODUCT, `sub`
++/// subtracts the ADDEND, so
++/// `(false,false) vfmadd · (false,true) vfmsub · (true,false) vfnmadd ·
++/// (true,true) vfnmsub`, each with the 231 form number and an `sd`/`ss`
++/// suffix by lane width. Both the x86-64 and i686 backends lower the
++/// four signed FMA3 families through this one table (the i686 arm used
++/// to inline its own copy — three sites drifted in step only by luck).
++pub(crate) fn fma231_mnemonic(
++    negate_product: bool,
++    negate_addend: bool,
++    is_f64: bool,
++) -> &'static str {
++    match (negate_product, negate_addend, is_f64) {
++        (false, false, true) => "vfmadd231sd",
++        (false, false, false) => "vfmadd231ss",
++        (false, true, true) => "vfmsub231sd",
++        (false, true, false) => "vfmsub231ss",
++        (true, false, true) => "vfnmadd231sd",
++        (true, false, false) => "vfnmadd231ss",
++        (true, true, true) => "vfnmsub231sd",
++        (true, true, false) => "vfnmsub231ss",
++    }
++}
 diff --git a/src/ir/instruction.rs b/src/ir/instruction.rs
 index 8747b9c7..fad246ec 100644
 --- a/src/ir/instruction.rs
@@ -539,10 +1732,10 @@ index 6002af05..d7d977e3 100644
              "VecFmaF32x4" => IntrinsicOp::VecFmaF32x4,
 diff --git a/src/passes/fma_neg_peel.rs b/src/passes/fma_neg_peel.rs
 new file mode 100644
-index 00000000..64343a1c
+index 00000000..64f7401b
 --- /dev/null
 +++ b/src/passes/fma_neg_peel.rs
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,666 @@
 +//! Peel operand negations into the scalar FMA family selection.
 +//!
 +//! `__builtin_fma(-a, b, -c)` reaches the backend as two `Neg` instructions
@@ -818,7 +2011,12 @@ index 00000000..64343a1c
 +    // what single-use certified), so removal is dead-code elimination with
 +    // the parallel source_spans discipline (see dce::sweep_block). The keep
 +    // decision is computed once into a bitmap so instructions and spans walk
-+    // the SAME positional filter.
++    // the SAME positional filter. (dce's own "refuse to sweep" guard is
++    // about its EXTERNAL live-flag slice desynchronising — a caller bug it
++    // fails closed on; the spans discipline both passes share is the
++    // clear-on-length-mismatch below, which restores the documented
++    // "empty spans == no debug info" invariant instead of leaving a stale
++    // vector that would desynchronise later debug emission.)
 +    let mut removed = 0usize;
 +    for block in &mut func.blocks {
 +        if !block.instructions.iter().any(|inst| {
@@ -1280,6 +2478,55 @@ index cd09ac6a..07c7a40f 100644
      HAS_FMA3.load(std::sync::atomic::Ordering::Relaxed)
  }
  
+diff --git a/src/passes/slp_vectorizer.rs b/src/passes/slp_vectorizer.rs
+index f08a4957..caf85052 100644
+--- a/src/passes/slp_vectorizer.rs
++++ b/src/passes/slp_vectorizer.rs
+@@ -5210,14 +5210,37 @@ fn apply_plan(
+             PackKind::Forward { .. } => continue,
+             PackKind::Fma { negate, acc, a, b } => Instruction::Intrinsic {
+                 dest: Some(dest),
+-                op: match (negate, cand.ty) {
+-                    (false, IrType::F64) => IntrinsicOp::VecFmaF64x2,
+-                    (true, IrType::F64) => IntrinsicOp::VecFnmaF64x2,
+-                    (false, IrType::F32) => IntrinsicOp::VecFmaF32x4,
+-                    (true, IrType::F32) => IntrinsicOp::VecFnmaF32x4,
++                // WIDTH-EXACT op selection. The pack's lane count must
++                // match the intrinsic's register width: a width-4 F64
++                // (or width-8 F32) pack lowered through the 128-bit
++                // VecFma/VecFnma family computes only HALF the lanes and
++                // leaves the store's upper half reading the multiplier
++                // pack raw — a silent miscompile (caught by the 4×F64
++                // slp_fma4 kernel: r[2], r[3] came out as raw x[2], x[3]
++                // that no differential had ever exercised, because every
++                // existing packed-FMA test shape was 128-bit). The 256-bit
++                // families are the affine-map madds: args
++                // [a, b, acc] = [input, scale, bias] exactly matches
++                // `emit_avx_map_fma`'s [input, scale, bias] contract (b
++                // is the builder's UNIFORM splat side), and the negated
++                // spelling `acc − a·b` is the Signed(np, na) algebra the
++                // negation peel already defined — VecMaddF64x4Signed(
++                // true, false) = −(a·b) + acc. Rounding parity holds for
++                // both widths: one fused mul-add per lane, the same
++                // single rounding the scalar gap-fused contraction takes.
++                op: match (*negate, cand.ty, cand.width) {
++                    (false, IrType::F64, 2) => IntrinsicOp::VecFmaF64x2,
++                    (true, IrType::F64, 2) => IntrinsicOp::VecFnmaF64x2,
++                    (false, IrType::F64, 4) => IntrinsicOp::VecMaddF64x4,
++                    (true, IrType::F64, 4) => IntrinsicOp::VecMaddF64x4Signed(true, false),
++                    (false, IrType::F32, 4) => IntrinsicOp::VecFmaF32x4,
++                    (true, IrType::F32, 4) => IntrinsicOp::VecFnmaF32x4,
++                    (false, IrType::F32, 8) => IntrinsicOp::VecMaddF32x8,
++                    (true, IrType::F32, 8) => IntrinsicOp::VecMaddF32x8Signed(true, false),
+                     // The pack builder only creates Fma packs for F64/F32
+-                    // lanes (the contraction's type gate).
+-                    _ => unreachable!("Fma pack with non-FP lane type"),
++                    // lanes at the family widths `family_for` admits
++                    // (F64: 2 and 4-under-AVX2; F32: 4 and 8-under-AVX2).
++                    _ => unreachable!("Fma pack with unsupported lane type/width"),
+                 },
+                 dest_ptr: None,
+                 args: vec![
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
 index b4182c42..db5e7923 100644
 --- a/src/passes/vectorize.rs
@@ -1952,8 +3199,146 @@ index b4182c42..db5e7923 100644
                  MapExpr::BinOp(_, l, r) | MapExpr::MinMax { l, r, .. } => {
                      !is_mask(l) && !is_mask(r) && walk(l) && walk(r)
                  }
+diff --git a/tests/regression/check_affine_map_vectorization_codegen.sh b/tests/regression/check_affine_map_vectorization_codegen.sh
+index 9dacb694..8624db76 100644
+--- a/tests/regression/check_affine_map_vectorization_codegen.sh
++++ b/tests/regression/check_affine_map_vectorization_codegen.sh
+@@ -16,14 +16,16 @@ LCCC_FORCE_MAP_SSE=1 "$CCC" "${flags[@]}" -S \
+     "$dir/affine_map_vectorization.c" -o "$tmp/sse.s"
+ "$CCC" "${flags[@]}" -ffast-math -ffp-contract=fast -S \
+     "$dir/affine_map_vectorization.c" -o "$tmp/fast.s"
++"$CCC" "${flags[@]}" -ffp-contract=off -S \
++    "$dir/affine_map_vectorization.c" -o "$tmp/strict.s"
+ 
+ python3 - "$tmp/default.s" "$tmp/disabled.s" "$tmp/stack-broadcast.s" \
+-    "$tmp/sse.s" "$tmp/fast.s" <<'PY'
++    "$tmp/sse.s" "$tmp/fast.s" "$tmp/strict.s" <<'PY'
+ import re
+ import sys
+ 
+ texts = [open(path, encoding="utf-8").read() for path in sys.argv[1:]]
+-default, disabled, stack_broadcast, sse, fast = texts
++default, disabled, stack_broadcast, sse, fast, strict = texts
+ 
+ 
+ def body(text, name):
+@@ -37,10 +39,15 @@ required = {
+     "copy_f64": (r"vmovupd",),
+     "scale_f32": (r"vmovups", r"vmulps"),
+     "add_f32": (r"vmovups", r"vaddps"),
+-    "affine_f64": (r"vmovupd", r"vmulpd", r"vaddpd"),
++    # The affine/in-place bodies CONTRACT at this gate's -O3 default
++    # (-ffp-contract=on): the mul+add pair is one fused instruction —
++    # exactly GCC's default too.  (The SSE control below pins the
++    # UNcontracted 128-bit path.)
++    "affine_f64": (r"vmovupd", r"vfmadd[0-9]*pd"),
+     "affine_i32": (r"vpmulld", r"vpaddd"),
+-    "affine_i64_iv": (r"vmovups", r"vmulps", r"vaddps"),
+-    "in_place_f64": (r"vmovupd", r"vmulpd", r"vaddpd"),
++    # f32 affine over an i64 induction: contracted like its f64 twin.
++    "affine_i64_iv": (r"vmovups", r"vfmadd[0-9]*ps"),
++    "in_place_f64": (r"vmovupd", r"vfmadd[0-9]*pd"),
+ }
+ for name, patterns in required.items():
+     current = body(default, name)
+@@ -52,25 +59,43 @@ for name, patterns in required.items():
+     if "%ymm" in body(disabled, name):
+         raise SystemExit(f"{name}: CCC_NO_MAP_VEC did not restore scalar code")
+ 
+-# The non-restrict shifted dependence must not be widened.
++# The non-restrict shifted dependence is versioned at RUNTIME, exactly
++# like GCC's own loop versioning: the vector body is guarded by a
++# base-distance check (`dst - src` bytes vs the vector width + 1, the
++# `subq/subq $8/cmpq $17/jb` prologue) that falls back to the scalar
++# loop for every overlapping or near-overlapping call. Verified
++# bit-exact against scalar semantics AND GCC -O3 for shifts 0..200
++# (forward, backward, and crossing the vector width). The old check
++# ("no %ymm anywhere in the body") predated runtime versioning and
++# rejected the guarded design wholesale.
+ if "%ymm" in body(default, "shifted_overlap_f64"):
+-    raise SystemExit("shifted_overlap_f64: unsafe overlapping loop was vectorized")
++    if not re.search(
++        r"subq\s+%\w+,\s*%r\w+\n\s*subq\s+\$8,\s*%r\w+\n\s*cmpq\s+\$17,\s*%r\w+\n\s*jb\s",
++        body(default, "shifted_overlap_f64"),
++    ):
++        raise SystemExit(
++            "shifted_overlap_f64: vector body lacks the runtime distance guard"
++        )
+ 
+ # Loop-invariant broadcasts stay in assigned YMM families and are consumed
+ # directly by three-operand arithmetic.  No dead result-home spill may remain
+-# on the packed backedge.
++# on the packed backedge.  (The contracted body reads the scale as the FMA's
++# register source — memory-folded or all-register — and stages the bias from
++# its home at most once; a broadcast reloaded from stack memory would show as
++# a vmovup[sd] with a (%rsp/%rbp) operand, which the spill check rejects.)
+ affine = body(default, "affine_f64")
+-if not re.search(r"vmulpd\s+%ymm\d+,\s*%ymm0,\s*%ymm0", affine):
++if not re.search(r"vfmadd[0-9]*pd\s+.*%ymm(?:[2-9]|1[0-5])", affine):
+     raise SystemExit("affine_f64: scale broadcast is not consumed directly")
+-if not re.search(r"vaddpd\s+%ymm\d+,\s*%ymm0,\s*%ymm0", affine):
+-    raise SystemExit("affine_f64: bias broadcast is not consumed directly")
+ if re.search(r"vmovdqu\s+%ymm0,\s*-?\d+\(%(?:r|e)(?:sp|bp)\)", affine):
+     raise SystemExit("affine_f64: packed result still has a dead stack spill")
++if re.search(r"vmovup[ds]\s+-?\d+\(%(?:r|e)(?:sp|bp)\),\s*%ymm", affine):
++    raise SystemExit("affine_f64: broadcast reloaded from a stack slot")
+ 
+ # The scoped register-allocation kill switch must retain the mature stack-home
+ # path, proving the direct-register assertion above is not a vacuous matcher.
++# (With the contraction on, the stack-homed scale is the FMA's memory source.)
+ stack_affine = body(stack_broadcast, "affine_f64")
+-if not re.search(r"vmulpd\s+-?\d+\(%(?:r|e)(?:sp|bp)\)", stack_affine):
++if not re.search(r"vfmadd[0-9]*pd\s+-?\d+\(%(?:r|e)(?:sp|bp)\)", stack_affine):
+     raise SystemExit("affine_f64: CCC_NO_MAP_VECREG control lacks stack broadcast")
+ 
+ # Width selection is type-aware: the diagnostic 128-bit path uses two doubles,
+@@ -82,13 +107,20 @@ for pattern in (r"movupd", r"mulpd", r"addpd"):
+ if "%ymm" in sse_affine:
+     raise SystemExit("affine_f64 SSE path unexpectedly used YMM registers")
+ 
+-# Fast contraction removes the separate packed multiply/add while strict mode
+-# retains source-operation boundaries.
++# Fast contraction removes the separate packed multiply/add while the
++# contract-OFF control retains source-operation boundaries. (The default
++# -O3 compile sits at C99's -ffp-contract=on, where within-expression
++# contraction is legal — and is exactly what GCC's default does; the old
++# "strict path contracted without permission" check contradicted the
++# C99 default and predated the madd contraction.)
+ fast_affine = body(fast, "affine_f64")
+-if not re.search(r"vfmadd132pd\s+%ymm\d+,\s*%ymm\d+,\s*%ymm0", fast_affine):
++if not re.search(r"vfmadd[0-9]*pd", fast_affine):
+     raise SystemExit("affine_f64 fast path lacks direct packed FMA")
+ if re.search(r"vmulpd|vaddpd", fast_affine):
+     raise SystemExit("affine_f64 fast path retained separate packed mul/add")
+-if "vfmadd132pd" in affine:
+-    raise SystemExit("affine_f64 strict path contracted without permission")
++strict_affine = body(strict, "affine_f64")
++if re.search(r"vfmadd[0-9]*pd", strict_affine):
++    raise SystemExit("affine_f64 contract-off path contracted anyway")
++if not (re.search(r"vmulpd", strict_affine) and re.search(r"vaddpd", strict_affine)):
++    raise SystemExit("affine_f64 contract-off path lost the separate mul/add")
+ PY
+diff --git a/tests/regression/check_reduction_vecreg_codegen.sh b/tests/regression/check_reduction_vecreg_codegen.sh
+index 8447297f..a6eec57f 100644
+--- a/tests/regression/check_reduction_vecreg_codegen.sh
++++ b/tests/regression/check_reduction_vecreg_codegen.sh
+@@ -35,8 +35,13 @@ for name, mnemonic in {
+ }.items():
+     current = body(new, name)
+     disabled = body(old, name)
++    # In-place accumulator update: the accumulator register appears as
++    # BOTH the last source and the destination. The streamed input is
++    # memory-folded into the first operand since the VLFOLD work
++    # (`vaddps (%rdi,%r9), %ymm2, %ymm2` — one instruction where the
++    # pre-fold spelling loaded the stream into %ymm0 first).
+     direct = re.search(
+-        rf"{mnemonic} %ymm0, %(ymm(?:[2-9]|1[0-5])), %\1", current
++        rf"{mnemonic} .*, %(ymm(?:[2-9]|1[0-5])), %\1", current
+     )
+     if not direct:
+         raise SystemExit(f"{name}: vector accumulator is not updated in place")
 diff --git a/tests/regression/check_vector_copy_elimination.sh b/tests/regression/check_vector_copy_elimination.sh
-index 09ce32dd..370bc2f1 100644
+index 09ce32dd..012d299e 100644
 --- a/tests/regression/check_vector_copy_elimination.sh
 +++ b/tests/regression/check_vector_copy_elimination.sh
 @@ -444,6 +444,20 @@ EOF
@@ -2029,7 +3414,7 @@ index 09ce32dd..370bc2f1 100644
              n=$(fnbody "$work/fma_algebra.s" "$fn" | wc -l)
              if [[ "$n" -ne 2 ]]; then
                  one_insn_ok=0
-@@ -641,7 +665,117 @@ EOF_ALGEBRA
+@@ -641,7 +665,230 @@ EOF_ALGEBRA
              fi
          done
          if [[ "$one_insn_ok" -eq 1 ]]; then
@@ -2136,6 +3521,22 @@ index 09ce32dd..370bc2f1 100644
 +        want_packed 'vfmsub[0-9]*pd'  'vfmsub..pd (addend-negated loop)'
 +        want_packed 'vfmadd[0-9]*pd'  'vfmadd..pd (plain loop)'
 +        want_packed 'vfnmsub[0-9]*ps' 'vfnmsub..ps (f32 loop)'
++        # MEMORY-FORM ratchet (the madd VLFOLD revival): every one of the
++        # six packed loops must FOLD one streamed load into the FMA's
++        # memory operand (`vf..231pd (%rsi,%r10), ...` — ICX/GCC's saxpy
++        # body: one streamed load, one folded memory source, one store).
++        # The whole madd memory-fold path — VLFOLD-IR marking, the
++        # emit_intrinsic_impl safety-net consumer set, the homed-ok
++        # admission, the deferred-store cache-awareness — was dead from
++        # the v6 safety-net tightening until this was revived; a single
++        # broken gate anywhere in that chain drops these to zero and
++        # costs one load + one staging copy per iteration per kernel.
++        n_memfma=$(grep -cE '^[[:space:]]*vf(n?m)(add|sub)[0-9]*p[ds][[:space:]]+\(' "$work/fp.s" || true)
++        if [[ "$n_memfma" -ge 6 ]]; then
++            ok "packed loops fold a streamed load into the FMA memory operand ($n_memfma sites, one per kernel)"
++        else
++            bad "packed-loop memory-fold regression: only $n_memfma of 6 kernels fold a load into the FMA memory operand"
++        fi
 +        # The contract asymmetry: the builtin loop vectorizes with the
 +        # contract OFF (C99 semantics), while the mul+add contraction does
 +        # not -- pinning the one deliberate difference.
@@ -2145,6 +3546,103 @@ index 09ce32dd..370bc2f1 100644
 +            ok "-ffp-contract=off still vectorizes the builtin loop ($nco packed sites)"
 +        else
 +            bad "-ffp-contract=off lost the builtin packed FMA — the contract gate leaked into MapExpr::Fma"
++        fi
++    fi
++
++    # ── D3. SLP packed-FMA contraction at EVERY family width ────────────────
++    # The BB-SLP Fma pack (`r[i] = x[i]*s + z[i]`, uniform s) must lower to
++    # an intrinsic whose REGISTER WIDTH matches the pack's lane count.  The
++    # width-blind op table lowered a width-4 F64 (or width-8 F32) pack
++    # through the 128-bit VecFma/VecFnma family: half the lanes computed,
++    # the store's upper half reading the multiplier pack raw — a silent
++    # miscompile no differential had ever exercised (every existing
++    # packed-FMA test shape was 128-bit).  Pin all four widths by RUNTIME
++    # equality against the reference compiler (the assertion that actually
++    # catches the class) plus a register-width shape check per family (the
++    # documentation of intent: 256-bit packs take the ymm madd families,
++    # 128-bit packs keep the xmm Fma families).
++    cat > "$work/fma_slp_width.c" <<'EOF_SLW'
++    #include <stdio.h>
++    #define NI __attribute__((noinline))
++    NI void slp_fma4(const double * __restrict x, const double * __restrict z,
++                     double s, double * __restrict r) {
++        r[0] = x[0]*s + z[0]; r[1] = x[1]*s + z[1];
++        r[2] = x[2]*s + z[2]; r[3] = x[3]*s + z[3];
++    }
++    NI void slp_fms4(const double * __restrict x, const double * __restrict z,
++                     double s, double * __restrict r) {
++        r[0] = z[0] - x[0]*s; r[1] = z[1] - x[1]*s;
++        r[2] = z[2] - x[2]*s; r[3] = z[3] - x[3]*s;
++    }
++    NI void slp_fma2(const double * __restrict x, const double * __restrict z,
++                     double s, double * __restrict r) {
++        r[0] = x[0]*s + z[0]; r[1] = x[1]*s + z[1];
++    }
++    NI void slp_fma8(const float * __restrict x, const float * __restrict z,
++                     float s, float * __restrict r) {
++        r[0] = x[0]*s + z[0]; r[1] = x[1]*s + z[1]; r[2] = x[2]*s + z[2]; r[3] = x[3]*s + z[3];
++        r[4] = x[4]*s + z[4]; r[5] = x[5]*s + z[5]; r[6] = x[6]*s + z[6]; r[7] = x[7]*s + z[7];
++    }
++    NI void slp_fma4f(const float * __restrict x, const float * __restrict z,
++                      float s, float * __restrict r) {
++        r[0] = x[0]*s + z[0]; r[1] = x[1]*s + z[1]; r[2] = x[2]*s + z[2]; r[3] = x[3]*s + z[3];
++    }
++    int main(void) {
++        double xd[8], zd[8], rd[8];
++        float xf[8], zf[8], rf[8];
++        for (int i = 0; i < 8; i++) {
++            xd[i] = 0.25 * (i + 1) - 3.0; zd[i] = 7.0 - 0.5 * i;
++            xf[i] = 0.25f * (i + 1) - 3.0f; zf[i] = 7.0f - 0.5f * i;
++        }
++        slp_fma4(xd, zd, 0.375, rd);  for (int i = 0; i < 4; i++) printf("%.17g\n", rd[i]);
++        slp_fms4(xd, zd, 0.375, rd);  for (int i = 0; i < 4; i++) printf("%.17g\n", rd[i]);
++        slp_fma2(xd, zd, 0.375, rd);  for (int i = 0; i < 2; i++) printf("%.17g\n", rd[i]);
++        slp_fma8(xf, zf, 0.375f, rf); for (int i = 0; i < 8; i++) printf("%.9g\n", (double)rf[i]);
++        slp_fma4f(xf, zf, 0.375f, rf); for (int i = 0; i < 4; i++) printf("%.9g\n", (double)rf[i]);
++        return 0;
++    }
++EOF_SLW
++    "$LCCC" "${FLAGS[@]}" -ffp-contract=fast -o "$work/slw.lccc" "$work/fma_slp_width.c" 2>/dev/null \
++        && "$LCCC" "${FLAGS[@]}" -ffp-contract=fast -S -o "$work/slw.s" "$work/fma_slp_width.c" 2>/dev/null \
++        && "$ORACLE" -O2 -march=x86-64-v3 -ffp-contract=fast -o "$work/slw.oracle" "$work/fma_slp_width.c" 2>/dev/null
++    if [[ $? -ne 0 ]]; then
++        bad "fma_slp_width.c did not build with both compilers"
++    else
++        "$work/slw.lccc" > "$work/slw.lccc.out" 2>&1; rc_l=$?
++        "$work/slw.oracle" > "$work/slw.oracle.out" 2>&1; rc_o=$?
++        if [[ $rc_l -ne 0 || $rc_o -ne 0 ]]; then
++            bad "SLP width kernels run failed (lccc=$rc_l oracle=$rc_o)"
++        elif ! diff -q "$work/slw.lccc.out" "$work/slw.oracle.out" >/dev/null; then
++            bad "SLP width kernels output differs from $ORACLE:"
++            diff "$work/slw.lccc.out" "$work/slw.oracle.out" | head -6 | note
++        else
++            ok "SLP packed-FMA contraction bit-exact at every family width (4x/2x F64, 8x/4x F32, add and sub) vs $ORACLE"
++        fi
++        # Register-width shape: the 256-bit packs take the YMM madd
++        # families, the 128-bit packs keep the XMM Fma families.  The
++        # width shows in ANY register operand (the src2 and dst slots
++        # are always registers; the first operand may be a folded memory
++        # operand, whose consumer form the memory-fold revival produces).
++        # Exact counts would couple this gate to unrelated emitter
++        # staging choices.
++        fma_lines_pd=$(grep -E '^[[:space:]]*vf(n?m)(add|sub)[0-9]*pd' "$work/slw.s" || true)
++        fma_lines_ps=$(grep -E '^[[:space:]]*vf(n?m)(add|sub)[0-9]*ps' "$work/slw.s" || true)
++        # (An empty grep result must count as zero, not as one blank
++        # non-matching line — hence the emptiness guards.)
++        n_ymm_pd=0; n_xmm_pd=0
++        if [[ -n "$fma_lines_pd" ]]; then
++            n_ymm_pd=$(grep -c '%ymm' <<<"$fma_lines_pd" || true)
++            n_xmm_pd=$(grep -vc '%ymm' <<<"$fma_lines_pd" || true)
++        fi
++        n_ymm_ps=0; n_xmm_ps=0
++        if [[ -n "$fma_lines_ps" ]]; then
++            n_ymm_ps=$(grep -c '%ymm' <<<"$fma_lines_ps" || true)
++            n_xmm_ps=$(grep -vc '%ymm' <<<"$fma_lines_ps" || true)
++        fi
++        if [[ "$n_ymm_pd" -ge 2 && "$n_ymm_ps" -ge 1 && "$n_xmm_pd" -ge 1 && "$n_xmm_ps" -ge 1 ]]; then
++            ok "SLP FMA width shapes pinned ($n_ymm_pd ymm-pd, $n_xmm_pd xmm-pd, $n_ymm_ps ymm-ps, $n_xmm_ps xmm-ps sites)"
++        else
++            bad "SLP FMA width regression: ymm-pd=$n_ymm_pd xmm-pd=$n_xmm_pd ymm-ps=$n_ymm_ps xmm-ps=$n_xmm_ps — a width-4/8 pack lost its 256-bit family (or a 128-bit pack lost its xmm family)"
          fi
      fi
  
