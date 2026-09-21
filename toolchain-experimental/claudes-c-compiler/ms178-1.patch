@@ -1,758 +1,560 @@
-diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 4cf683da..e0dc95e5 100644
---- a/.github/workflows/ci.yml
-+++ b/.github/workflows/ci.yml
-@@ -334,6 +334,23 @@ jobs:
-           CCC: target/fastbuild/lccc
-         run: bash tests/regression/check_vector_copy_elimination.sh
+From 21819bbbbdfe35d6a171739767762745e1640ce9 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Mon, 21 Sep 2026 18:44:50 +0000
+Subject: [PATCH 1/3] vecpromote: hoist Allocas above the intrinsics that use
+ them
+
+Promoting a vector temp rewrites the producer's dest_ptr to point
+directly at the copy destination's slot, but that slot's Alloca can sit
+BELOW the producer in the block: the inliner appends callee parameter
+allocas after the caller's setup, which is exactly where the vector
+producers live. The rewrite then leaves a textual use-before-def
+(SetEpi32 reading an Alloca defined two instructions later). Benign for
+codegen, which treats allocas as position-independent frame slots, but
+a violation of the IR contract the verifier enforces and that every
+instruction-ordering pass is entitled to rely on -- and the armed
+regression corpus fails on it as soon as anything verifies after the
+late pipeline.
+
+Alloca reads no operand, so moving it earlier within its own block is
+always semantics-preserving. Hoist every Alloca to the block head
+(relative order preserved, spans kept in lockstep) right after the
+promotion's batched removals, which covers any future producer shape
+instead of patching this one site.
+---
+ src/passes/vector_temp_promotion.rs | 62 +++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+
+diff --git a/src/passes/vector_temp_promotion.rs b/src/passes/vector_temp_promotion.rs
+index 6de37551..836efcf0 100644
+--- a/src/passes/vector_temp_promotion.rs
++++ b/src/passes/vector_temp_promotion.rs
+@@ -668,6 +668,67 @@ fn destination_unobserved_between(
+     true
+ }
  
-+      # Cross-PR interaction red-team (session 574): the per-feature gates
-+      # pin each PR's own contract; this one pins the INTERACTIONS between
-+      # the last ten merged PRs — FMA families through copy brackets, calls
-+      # and branches; fma under if-conversion; the shared-negation phi
-+      # diamond (multi-use peel); constant-table promotion under aliasing;
-+      # guarded clz/ctz over promoted arrays; wide SLP FMA packs; the
-+      # AVX1+FMA target class (-mno-avx2 keeps VEX.128 and the families);
-+      # and the uncontracted SSE2 baseline. Bit-exact against the reference
-+      # compiler at matched march (sign of zero and infinities included —
-+      # that is what pins the family selection), with only canonical NaN
-+      # patterns normalised (C11 6.5p8 latitude; double-NaN propagation
-+      # order is operand-placement dependent).
-+      - name: Verify cross-PR interaction red-team contracts
-+        env:
-+          CCC: target/fastbuild/lccc
-+        run: bash tests/regression/check_cross_pr_redteam.sh
++/// Hoist every `Alloca` to the head of its block, preserving relative order.
++///
++/// A promotion rewrites a producer's `dest_ptr` to point directly at the
++/// copy destination's slot, but that slot's `Alloca` can sit BELOW the
++/// producer in the block — the inliner appends callee parameter allocas
++/// after the caller's setup, and the caller's setup is exactly where the
++/// vector producers live. The rewrite then leaves a textual use-before-def
++/// (benign for codegen, which treats allocas as position-independent frame
++/// slots, but a violation of the IR contract the verifier enforces and
++/// that every instruction-ordering pass is entitled to rely on). `Alloca`
++/// reads no operand, so moving it earlier within its own block is always
++/// semantics-preserving; hoisting the whole class at once also covers any
++/// future producer shape instead of patching this one site.
++fn hoist_block_allocas(block: &mut BasicBlock) {
++    // Fast path: the lowering emits allocas clustered at the head, so most
++    // blocks have nothing below the first non-alloca. `skip_while` eats the
++    // head cluster; `any` then finds a late alloca iff one exists.
++    let late_alloca = block
++        .instructions
++        .iter()
++        .skip_while(|inst| matches!(inst, Instruction::Alloca { .. }))
++        .any(|inst| matches!(inst, Instruction::Alloca { .. }));
++    if !late_alloca {
++        return;
++    }
++    let is_alloca: Vec<bool> = block
++        .instructions
++        .iter()
++        .map(|inst| matches!(inst, Instruction::Alloca { .. }))
++        .collect();
++    let mut hoisted = Vec::with_capacity(block.instructions.len());
++    let mut rest = Vec::with_capacity(block.instructions.len());
++    for inst in std::mem::take(&mut block.instructions) {
++        if matches!(inst, Instruction::Alloca { .. }) {
++            hoisted.push(inst);
++        } else {
++            rest.push(inst);
++        }
++    }
++    block.instructions = hoisted;
++    block.instructions.extend(rest);
++    // Same positional filter for the spans (the shared discipline: in
++    // lockstep when parallel, cleared when stale).
++    if block.source_spans.len() == is_alloca.len() {
++        let mut hoisted_spans = Vec::with_capacity(is_alloca.len());
++        let mut rest_spans = Vec::with_capacity(is_alloca.len());
++        for (keep_alloca, span) in is_alloca
++            .into_iter()
++            .zip(std::mem::take(&mut block.source_spans))
++        {
++            if keep_alloca {
++                hoisted_spans.push(span);
++            } else {
++                rest_spans.push(span);
++            }
++        }
++        block.source_spans = hoisted_spans;
++        block.source_spans.extend(rest_spans);
++    }
++}
 +
-       # Peephole phi-diamond preinitialisation safety: the hoisted incoming
-       # may only be a register, immediate, or plain stack slot — a user-memory
-       # source made `c ? *p : *q` dereference a NULL p on the path that never
-diff --git a/engineering/FOLLOWUP-2026-09-22-pr574-ten-pr-audit.md b/engineering/FOLLOWUP-2026-09-22-pr574-ten-pr-audit.md
-new file mode 100644
-index 00000000..83528815
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-22-pr574-ten-pr-audit.md
-@@ -0,0 +1,216 @@
-+# The ten-PR red-team audit (session 574)
-+
-+Session: 2026-09-22 · base `a8baa17d` (PR #573 merge — the madd VLFOLD
-+revival, tree-exact absorption of the session-572 delivery verified by
-+empty diff against the delivery branch).
-+
-+Scope: the last ten merged PRs — #557, #559, #560, #563, #566, #567,
-+#569, #571, #572, #573 — audited AS A STACK: every per-PR gate re-run,
-+plus a fresh cross-PR interaction battery built for this audit
-+(`tests/regression/cross_pr_redteam{,2}.c` + the gate), four-oracle
-+surveys where a gap appeared, and code-level reads of the riskiest hunks
-+(copy deletion legality, ISA ceilings, peel grammars, NaN propagation).
-+
-+## Method
-+
-+The per-PR gates pin each PR's own contract; an audit that only re-runs
-+them re-proves nothing about INTERACTIONS. The battery stresses the
-+cross-products: FMA families × copy brackets × if-conversion ×
-+constant-array promotion × NonZero guards × wide SLP packs × the
-+AVX1+FMA target class × the SSE2 baseline — every FP edge value
-+(±0, ±inf, NaN, extremes) with bit-exact comparison against GCC at
-+matched march (the sign of zero and of infinities included: that is
-+what pins the FMA family selection). Canonical NaN patterns are
-+normalised on both sides under the C11 6.5p8 latitude — after this
-+session's fix, ZERO rows differ for any other reason.
-+
-+## Verdicts
-+
-+### #573 (madd VLFOLD revival + the P0 width fix) — AGREE, with one
-+### residual now measured
-+
-+The revival itself is sound and the destructive-form dst-homing
-+(`vector_dying_values`: single total use + same-block def + live-regs
-+claim) is the right analysis — a plain use count is unsound for the
-+loop-invariant broadcast, and the live-regs conjunct is exactly what
-+excludes it. The P0 (width-4 F64 / width-8 F32 packs lowering through
-+128-bit families) was the audit's own find at delivery and the width
-+routing is correct. **Residual, now measured with the four oracles: the
-+phi-diamond shared-negation shape** (one `-b`/`-c` read by two fma
-+sites) stayed materialised — lccc 22 instructions vs gcc 10, clang 12,
-+icx 12 (icc 25 with ten spills). Root cause was in the #572 peel
-+grammar (below), fixed this session.
-+
-+### #572 (FMA operand-negation peel) — AGREE on the design, DISAGREE
-+### on one grammar rule (fixed)
-+
-+The IR-layer peel over peephole/generation alternatives is the
-+architecturally right choice — dominance soundness by construction, the
-+regalloc sees true live ranges, every backend gains the families
-+through one intrinsic arm. The CPU-verified 132/213/231 table and the
-+"round(−x) = −round(x)" value proof stand. **The single-use rule was
-+wrong** — and my own rule, delivered two sessions ago: it rejected every
-+multi-use Neg, so the shared-operand shapes (the phi diamond; GCC
-+contracts them) kept `vxorpd`+`vxorpd`+plain `vfmadd`, and
-+`fma(-a,-a,c)` (GCC folds it) was left alone as "a pathological
-+spelling". Fixed with the absorbability fixpoint: a Neg peels iff every
-+read of it disappears with the rewrite (fma argument slots all peel it;
-+chain-internal reads by other absorbed Negs) — computed as poison
-+propagation backward through chain links. The discipline that replaces
-+the old conservatism: the NaN-sign latitude the absorption takes (the
-+hardware propagates a source NaN's sign UNNEGATED through the negated
-+families — CPU-verified this session in every 132/213/231 source role,
-+which is why GCC's contracted forms and lccc's now agree bit-for-bit)
-+is only taken when the materialisation actually dies; a Neg with a
-+surviving reader keeps its exact materialised semantics and no site
-+peels it. Result: the phi shape is GCC's two `vfnmsub231sd`, the
-+edge-value matrix is bit-identical, and `fma(-a,-a,c)` cancels to the
-+plain family exactly like GCC.
-+
-+### #571 (FMA form algebra, packed contraction) — AGREE
-+
-+The rounding-parity bug it fixed (the scalar path contracts
-+`acc±a·b`, so a packed mulpd+addpd paid a third rounding the scalar
-+never takes) was real and the fix is the right one; the
-+register-alias discipline over the three dying operands is validated by
-+the differential. The map/SLP split (MapExpr::Fma for loops, PackKind::Fma
-+for stores) is a clean two-entry surface for the same algebra. No new
-+findings; the battery's H section re-pins all four widths bit-exactly.
-+
-+### #569 (range-check fusion, peephole, NonZero, kernel boot) — AGREE
-+
-+The two miscompiles it fixed (NonZero guard-select collapse speculating
-+BSR/BSF garbage above its proof; the phi-diamond hoist faulting loads
-+across branches) were verified live at delivery, and today's battery
-+adds independent coverage: the guarded clz/ctz over promoted constant
-+arrays (E section, values 0 and 1 in the table) and hoist shapes in the
-+phi-FMA composition are bit-exact. The regalloc delta is two lines
-+(i686 scratch hazards for the NonZero bitcount ops) — consistent with
-+the audited NonZero work. The range-fusion domain corners measured
-+here: empty domain, point domain, INT_MIN, unsigned OR-wrap, FP NaN
-+non-fusion, reversed operands — all bit-exact vs GCC. The parity
-+checker's execution semantics (PyYAML run-body extraction) survived its
-+negative controls and now guards 48 commands.
-+
-+### #567 (vector copy elimination + EVEX aliasing) — AGREE
-+
-+The core is the best-engineered peephole in the tree: copy forms carry
-+their upper-bit semantics (`movsd` legacy preserves, `vmovsd` VEX
-+zeroes — the widen rule's soundness precondition), compare-class
-+instructions answer "no vector write" for their last operand, the
-+three-operand merge reads its middle operand's upper lane, and
-+`parse_vec_copy` declines exactly the forms whose lane algebra it
-+cannot state. Its gate (46/46 today) covers every legality rule with
-+runtime differentials. **Residual, measured this session:** the copy
-+elimination is block-local, so the phi-diamond's entry staging
-+(`movsd %xmm1, %xmm3` family) survives across the branch — that plus
-+the destructive-form dst preference for multi-use accumulators is the
-+remaining 10-instruction gap on the phi shape (lccc 20 vs gcc 10 after
-+this session's family fix). Designed follow-up: cross-block bracket
-+coalescing.
-+
-+### #566 (range_fold hardening, constant-array promotion) — AGREE
-+
-+The domain-ordered emptiness and no-overflow spans were re-derived at
-+the pr568 adjudication and the battery adds the aliasing corner: a
-+const table written through a cast-away-const pointer is OBSERVED by
-+the promoted form (bit-exact vs GCC). The red-team regression battery
-+it shipped is the reason the empty/point/wrap corners were already
-+covered.
-+
-+### #563 (whitespace-invariant peephole store, ISA-gated vectorizer,
-+### hoisted env knobs) — AGREE
-+
-+The whitespace invariance was the right fix for a matcher that silently
-+depended on emitter spacing; the ISA gate closed the kernel-TU #UD
-+class; the env hoisting killed eight environ scans per function. The
-+gate re-ran green today, including at -O3.
-+
-+### #560 (docs + evidence refresh) — AGREE
-+
-+310 files but 128,890 of the insertions are evidence artifacts (oracle
-+asm dumps, manifests); the claims it refreshed are the ones the oracle
-+surveys re-derive. Spot-checked the performance tables against today's
-+oracle numbers: no contradiction.
-+
-+### #559 (relocation addends, branch relax, kernel codegen) — AGREE
-+
-+The i686 asmdiff corpus (21/21 objects, byte-exact vs GAS) re-verified
-+at the pr568 session stands; the corpus re-ran green today (723 PASS /
-+3 known-env i686 multilib / 0 AB-diff).
-+
-+### #557 (codegen hardening: .code16 routing, hex-constant labels, rcx
-+### liveness, typed-call homes) — AGREE (it is this tree's most-audited
-+### PR; the fixes folded into it were verified with negative controls
-+### at delivery and the realmode corpus re-runs green)
-+
-+## The two defects this audit found (both fixed, both gated)
-+
-+1. **The multi-use peel rejection** (root cause in #572's grammar,
-+   measured via #573's residual): fixed with the absorbability
-+   fixpoint; `fma(-a,-a,c)` now cancels like GCC; the phi shape went
-+   from `vxorpd+vxorpd+vfmadd+vfmadd` to two `vfnmsub231sd`; the full
-+   edge matrix is bit-identical to GCC at matched march.
-+2. **`-mno-avx2` killed the VEX encoding, not the 256-bit class**: the
-+   flag set `avx_explicitly_disabled`, so `x86_isa().avx` went false
-+   and `normalized()`'s `fma && avx` declined the FMA fold —
-+   `fma(-a,b,-c)` at `-mno-avx2 -mfma` compiled to two `xorpd` and a
-+   libm call where GCC emits one `vfnmsub132sd`. Fixed with a dedicated
-+   `avx2_explicitly_disabled` consulted only for the `ymm` bit; the
-+   AVX1+FMA target class (GCC's `-march=corei7-avx` relatives) now
-+   keeps every VEX.128 form. The ISA matrix is pinned in
-+   `check_vectorize_isa_gate.sh` §4b and the value contract in the new
-+   cross-PR gate.
-+
-+## Design divergences adjudicated (no code change — upstream's call)
-+
-+* **The absent-`-march` default is x86-64-v3** (documented in
-+  `pipeline.rs`): every other compiler defaults to the generic baseline.
-+  This is a portability trap for any build system that compiles with
-+  bare `lccc -O2` — my own first battery run fell into it (the NaN
-+  rows "differed" only because lccc was emitting FMA3 the baseline gcc
-+  run could not). It is deliberate, documented, and `-march=x86-64`
-+  restores GCC-exact behavior; the audit flags the risk, not a defect.
-+  Worth considering upstream: a one-line note in `--help` output, since
-+  the divergence is otherwise invisible until deployment.
-+* **`ymm` is one bit for both AVX1 256-bit FP and AVX2 integer**: lccc
-+  cannot express "AVX1 exactly" (`-mavx -mno-avx2` keeps VEX.128 but
-+  drops 256-bit FP loads/stores too). Conservative and sound; GCC
-+  distinguishes. A future split (ymm_fp vs ymm_int) would close it.
-+
-+## Residuals, priority-ordered
-+
-+1. **Cross-block copy coalescing + the destructive-form dst preference
-+   for multi-use accumulators** (the phi shape's remaining 10-insn gap,
-+   2.0x → 1.0x): the entry staging survives because the #567 machinery
-+   is block-local, and each fma stages its own accumulator copy when
-+   the accumulator is multi-use. Design: extend bracket coalescing
-+   across single-predecessor chains; teach the 213/231 dst choice to
-+   prefer the register that needs no staging (GCC's b→xmm3 move is the
-+   model — ONE staging copy for the whole diamond).
-+2. **The map (loop) side of the multi-use peel**: `parse_fma_arg` still
-+   requires the loop-local count == 1, so two map-FMA nodes sharing one
-+   `-x[i]` parse the negation as a broadcast. Same absorbability
-+   discipline applies (all loop-uses are fma-arg reads), but the
-+   cross-parse coordination needs the loop-body whitelist argument
-+   first.
-+3. `-march=x86-64-v2 -mfma` declines the families (normalized():
-+   fma requires avx, and v2 has no avx): GCC enables FMA there (the
-+   user vouches for the target). Conservative-decline is sound; a
-+   `fma implies vex` rule in the ceiling would match GCC.
-+4. The staging-`movsd` discipline generally (the fresh-temporary
-+   routing) — the #567 follow-up list stands.
-+
-+## Verification (this session, at the fixes)
-+
-+* New cross-PR gate: 4 build configurations × 2 batteries, bit-exact vs
-+  GCC (canonical NaN normalisation only) — PASS.
-+* ISA gate (extended §4b): PASS. Vector-copy gate 46/46. Adler gate
-+  PASS. Env hygiene, parity (48 commands) PASS.
-+* Regression corpus: 723 PASS / 3 known-env i686 multilib / 17 skip,
-+  AB-diff 0. Benchmark output oracle: 204/204.
-+* cargo test: the peel's 16/16 (11 pre-existing incl. the flipped
-+  two-position pin + 5 new multi-use/chain/cross-block/external-reader
-+  tests).
-+* Oracle: phi_fma 22 → 20 insns (gcc 10, clang/icx 12) — the family
-+  selection is now GCC-exact; the remainder is the staging residual #1.
-diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index 98a8e56f..992ea947 100755
---- a/scripts/ci_local.sh
-+++ b/scripts/ci_local.sh
-@@ -381,6 +381,15 @@ gate "boot-size-measurement" fast \
- gate "vector-copy-elimination" fast \
-     bash tests/regression/check_vector_copy_elimination.sh
+ /// Remove instruction indices while maintaining BasicBlock's parallel source
+ /// span table.  The input is normalized here so callers can cheaply append
+ /// removals from independent rewrites.
+@@ -850,6 +911,7 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
  
-+# Cross-PR interaction red-team: FMA families x copy brackets x
-+# if-conversion x constant promotion x NonZero x the AVX1+FMA target
-+# class, bit-exact vs the reference compiler at matched march (canonical
-+# NaN patterns normalised per the C11 latitude). Found and pins two real
-+# defects the per-PR gates could not see (the multi-use negation peel
-+# and the -mno-avx2 VEX.128 ceiling).
-+gate "cross-pr-redteam" fast \
-+    bash tests/regression/check_cross_pr_redteam.sh
-+
- # Process-global state hygiene.  Four invariants, each grep-checkable, each one
- # a defect this tree actually had: tests mutated the environment behind five
- # deferred-audit markers whose premise (single-threaded access) cargo's test
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 22a214b1..0eb66589 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -1057,7 +1057,16 @@ impl Driver {
-                 "-mharden-sls=none" => {}
-                 "-mno-avx2" => {
-                     self.enable_avx2 = false;
--                    self.avx_explicitly_disabled = true;
-+                    // AVX2 is the 256-bit integer class — a strict subset
-+                    // of the VEX encoding. Denying it removes `ymm` code
-+                    // but NOT the VEX.128 world: `-march=x86-64-v3
-+                    // -mno-avx2` (the AVX1+FMA target class, GCC's
-+                    // `-march=corei7-avx` relatives) keeps `vmovsd`,
-+                    // `vaddsd` and every scalar FMA family. Killing
-+                    // `avx` here (the pre-fix behavior) made `-mno-avx2
-+                    // -mfma` decline the FMA fold entirely: two `xorpd`
-+                    // and a libm call where GCC emits one `vfnmsub132sd`.
-+                    self.avx2_explicitly_disabled = true;
-                     self.enable_avxvnni = false;
-                     self.enable_avxvnniint8 = false;
-                     self.enable_avxvnniint16 = false;
-@@ -1198,6 +1207,7 @@ impl Driver {
-                     self.sse_explicitly_disabled = false;
-                     self.sse41_explicitly_disabled = false;
-                     self.avx_explicitly_disabled = false;
-+                    self.avx2_explicitly_disabled = false;
-                     self.enable_x86_avx2_profile();
-                 }
-                 "-mavx" => {
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index d15ea4ba..a9f5d955 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -168,13 +168,26 @@ pub struct Driver {
-     /// profiles must not re-enable SSE after that: GCC keeps the disable
-     /// (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
-     pub(super) sse_explicitly_disabled: bool,
--    /// Set by `-mno-avx`/`-mno-avx2`/`-mno-sse4.x`: the TU explicitly forbade
--    /// 256-bit VEX code. Distinct from `enable_avx2` (which records what was
--    /// explicitly *requested* and drives `__AVX2__`): LCCC's x86-64
--    /// code-generation baseline is x86-64-v3, so AVX2 is legal by default and
-+    /// Set by `-mno-avx`/`-mno-sse4.x`/`-mno-sse`: the TU explicitly forbade
-+    /// the VEX encoding itself (every VEX form, 128-bit included).
-+    /// Distinct from `enable_avx` (which records what was explicitly
-+    /// *requested* and drives `__AVX__`): LCCC's x86-64 code-generation
-+    /// baseline is x86-64-v3, so AVX (the VEX world) is legal by default and
-     /// only an explicit denial removes it. Without this distinction a
--    /// default-flag build would silently lose every 256-bit transform.
-+    /// default-flag build would silently lose every VEX transform.
-+    /// `-mno-avx2` does NOT set this — AVX2 is the 256-bit integer class,
-+    /// a strict subset of what the VEX encoding buys: VEX.128 forms
-+    /// (`vmovsd`, `vaddsd`, `vfmadd231sd`, …) require only AVX, and
-+    /// `-march=x86-64-v3 -mno-avx2` (the AVX1+FMA target class) must keep
-+    /// them, exactly like GCC. That denial is [`Self::avx2_explicitly_disabled`].
-     pub(super) avx_explicitly_disabled: bool,
-+    /// Set by `-mno-avx2`: the 256-bit class (AVX2 integer ops and every
-+    /// `ymm` use) is forbidden while the VEX.128 world stays legal. The
-+    /// absent-`-march` ceiling is v3 (ymm on), so this — not
-+    /// [`Self::avx_explicitly_disabled`] — is what removes 256-bit code
-+    /// under the default baseline; an explicit `-march=` already folds the
-+    /// denial into `enable_avx2`.
-+    pub(super) avx2_explicitly_disabled: bool,
-     /// Set by `-mno-fma` (and by any AVX/SSE denial, since `vfmadd*` is
-     /// VEX-encoded and requires AVX): `vfmadd*` must not be emitted.
-     pub(super) fma_explicitly_disabled: bool,
-@@ -470,6 +483,7 @@ impl Driver {
-             no_sse: false,
-             sse_explicitly_disabled: false,
-             avx_explicitly_disabled: false,
-+            avx2_explicitly_disabled: false,
-             fma_explicitly_disabled: false,
-             sse41_explicitly_disabled: false,
-             x86_march_explicit: false,
-@@ -2497,7 +2511,11 @@ impl Driver {
-             simd: true,
-             sse41: ceiling.sse41 && !self.sse41_explicitly_disabled,
-             avx: ceiling.avx && !self.avx_explicitly_disabled,
--            ymm: ceiling.ymm && !self.avx_explicitly_disabled,
-+            // The 256-bit class dies on EITHER an AVX denial (no VEX at
-+            // all) or an AVX2 denial (VEX.128 stays; `-mno-avx2` is the
-+            // AVX1+FMA target class, where GCC keeps every VEX.128 form
-+            // including the scalar FMA families).
-+            ymm: ceiling.ymm && !self.avx_explicitly_disabled && !self.avx2_explicitly_disabled,
-             fma: ceiling.fma && !self.fma_explicitly_disabled,
-         }
-         .normalized()
+     for (block, removed) in func.blocks.iter_mut().zip(&mut removals) {
+         remove_instructions(block, removed);
++        hoist_block_allocas(block);
+     }
+     applied
+ }
+-- 
+2.47.3
+
+
+From 5917edd6e5ed156ca22c3ddfe53dda50ef56f0d4 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Mon, 21 Sep 2026 18:45:11 +0000
+Subject: [PATCH 2/3] fma: the absorbability fixpoint is a reader closure, not
+ a poison walk
+
+The multi-use rule shipped with badness propagating from a Neg's SOURCE
+to its reader -- the exact inverse of the invariant the same change
+documented. A Neg read by an fma argument slot AND by a Neg that
+survives the sweep stayed 'absorbable', was rewritten at the site and
+deleted, and the surviving link kept naming it: valid C of the shape
+  double t = -x, u = -t;
+  double r = __builtin_fma(t, b, c);
+  return r + u;
+ICEs at -O1 and above (x86 codegen: value has no register, stack slot,
+Copy, or GlobalAddr definition). The front-end emits bare Negs with no
+neg-of-neg fold and the peel is the last IR transform, so nothing
+between lowering and codegen repairs or reports it.
+
+Flipping the poison edge is necessary but not sufficient: a surviving
+reader that no fma chain reaches is never poisoned and still orphans
+its source. The rule that is sound in every direction is the GREATEST
+FIXPOINT over the reader closure and the site reachability together:
+a Neg may be deleted iff (i) none of its reads is non-peeling, (ii)
+every reader of it is deleted with it, and (iii) some fma-argument
+slot reaches it through deleted Negs. (ii) and (iii) are mutually
+recursive -- dropping a Neg pins its source and shortens every chain
+that descended through it -- so iterate removals to stability. The
+computation is O(N+E) per round over a precomputed reader adjacency;
+at most one productive round per Neg. tools/ir_shape_check.py
+enumerates the chain shape space and keeps both failure modes (the
+shipped direction, the one-line repair) pinned as negative controls:
+738/4545 and 90/4545 unsafe there, 0 for the closure -- which also
+folds MORE than the shipped rule (1752 vs 1722 shapes), because the
+source-poisoned direction over-pinned chains whose inner link alone
+was external. The pinned-inner shape now compiles to one sign mask
+and vfnmadd reading the materialised inner, the reference compiler's
+exact form.
+
+The peel now also absorbs Negs off already-Signed FmaScalar sites: the
+families compose by XOR (Signed(np, na) absorbing one more Neg on a
+product slot is Signed(np^1, na)) and a full cancel normalises to the
+plain spelling. This makes the FmaArg classification TRUE -- every
+read classified as a peelable argument slot really does disappear with
+the rewrite -- instead of coincidentally conservative: the vectorizer's
+scalar remainder mirror emits Signed sites whose args can be Neg
+values, sound today only because the vector main lanes pin the Neg
+(VecMadd reads classify as Other), and the planned map-side multi-use
+peel removes exactly that pin.
+
+The sweep's precondition is now self-enforcing: an unconditional
+assert re-derives, from the ACTUAL decision set, that no absorbed Neg
+has a non-peeling read and that every reader of one is absorbed with
+it (unconditional rather than debug_assert because the fastbuild/test
+profile compiles debug-assertions out, and this is a release-miscompile
+class that should fail loud, per the house discipline). Both peel call
+sites (-O1 tier and the -O2+ Phase 11f tail) now run verify_after_pass:
+the peel is the last IR transform and nothing downstream re-checks the
+module, so a malformed rewrite here was invisible to CCC_VERIFY_IR.
+
+Unit tests 16 -> 21: the shipped defect's own shape (the site must
+read the INNER link for the shape to discriminate), the dead-outer-
+reader control, the pinned-inner fold, and the two already-Signed XOR
+compositions; all 16 prior expectations unchanged.
+---
+ src/passes/fma_neg_peel.rs | 419 +++++++++++++++++++++++++++++++------
+ src/passes/mod.rs          |  29 ++-
+ tools/ir_shape_check.py    |  50 ++++-
+ 3 files changed, 420 insertions(+), 78 deletions(-)
+
 diff --git a/src/passes/fma_neg_peel.rs b/src/passes/fma_neg_peel.rs
-index 64f7401b..7f3077d7 100644
+index 7f3077d7..053fe07e 100644
 --- a/src/passes/fma_neg_peel.rs
 +++ b/src/passes/fma_neg_peel.rs
-@@ -32,15 +32,25 @@
- //!
- //! # Rules
- //!
--//! * A `Neg` is absorbable only when its destination has EXACTLY ONE use —
--//!   the fma argument being rewritten (the MulAddFusion discipline). A Neg
--//!   read anywhere else stays materialised. Residual: `fma(-a, -a, c)` (the
--//!   SAME negated value in two argument positions) has use count 2 and is
--//!   left alone; GCC folds it, the shape is a pathological spelling.
-+//! * A `Neg` is absorbable when EVERY use of it disappears with the
-+//!   rewrite: an argument read of a width-matching `FmaScalar` intrinsic
-+//!   (every such site peels it — see the fixpoint below), or the source
-+//!   read of another absorbable `Neg` (chain-internal). A Neg read by
-+//!   anything else (an add, a store, a phi, a terminator) stays
-+//!   materialised. This is the MULTI-USE rule: `fma(-a, b, -c)` twice
-+//!   over one shared `-a`/`-c` (the phi-diamond shape) peels BOTH sites —
-+//!   GCC contracts the two-use case (two `vfnmsub` where we used to keep
-+//!   two `vxorpd` + two `vfmadd`), and `fma(-a, -a, c)` cancels to the
-+//!   plain family exactly like GCC. The discipline is: the NaN-sign
-+//!   latitude the family absorption takes (the hardware propagates a
-+//!   source NaN's sign UNNEGATED through the negated families — CPU-
-+//!   verified, see `hw_nan` in the session record) is only taken when the
-+//!   materialisation actually dies; a Neg that survives for other readers
-+//!   keeps its exact materialised semantics.
- //! * Only float `Neg` of the matching width (F32 for `FmaScalarF32`, F64 for
- //!   `FmaScalarF64`); an integer `Neg` is never touched.
- //! * Chained negations peel transitively (`fma(-(-a), b, c)` → plain
--//!   `fma(a, b, c)`), each level under the same single-use rule.
-+//!   `fma(a, b, c)`), each level under the same absorbability rule.
+@@ -54,6 +54,16 @@
  //! * Two product-side negations cancel: the instruction stays the PLAIN
  //!   intrinsic with the peeled operands (no degenerate `Signed(false,false)`
  //!   is ever created).
-@@ -53,6 +63,16 @@
++//! * Sites that are ALREADY `FmaScalar*Signed` peel too: the signed
++//!   families compose by XOR (`Signed(np, na)` absorbing one more Neg on a
++//!   product slot is `Signed(np^1, na)`), so a site the vectorizer's
++//!   scalar remainder mirror already signed can still shed a materialised
++//!   Neg, and a double peel that cancels normalises back to the plain
++//!   spelling. This is what makes the `FmaArg` classification TRUE — every
++//!   read classified as a peelable argument slot really does disappear
++//!   with the rewrite — instead of coincidentally conservative (the
++//!   vector main lanes pin the Neg today only because `VecMadd*` reads
++//!   classify as `Other`).
+ //! * NOT contract-gated: `__builtin_fma` carries C99 single-rounding
+ //!   semantics regardless of `-ffp-contract`, and the peel changes no
+ //!   arithmetic, only the spelling of an already-fused operation.
+@@ -63,15 +73,29 @@
  //!   above — GCC keeps the negations materialised at -O0 and so do we.
  //! * Kill switches: `CCC_NO_FMA_NEG_PEEL=1`, `CCC_DISABLE_PASSES=fmanegpeel`.
  //!
-+//! The absorbability fixpoint: a Neg whose only readers are fma argument
-+//! slots is peelable only if those sites actually peel it, and a site peels
-+//! a position only if the Neg there is absorbable — a mutual recursion
-+//! whose GREATEST fixpoint is what we want (peel everything that can
-+//! consistently peel). Computed as poison propagation: a Neg with any
-+//! non-fma reader is bad, and badness flows backward through chain reads
-+//! (a materialised outer Neg keeps its read of the inner Neg alive), so
-+//! the fixpoint is reached by iterating the backward step to stability —
-+//! at most one round per chain link, trivially bounded.
-+//!
+-//! The absorbability fixpoint: a Neg whose only readers are fma argument
+-//! slots is peelable only if those sites actually peel it, and a site peels
+-//! a position only if the Neg there is absorbable — a mutual recursion
+-//! whose GREATEST fixpoint is what we want (peel everything that can
+-//! consistently peel). Computed as poison propagation: a Neg with any
+-//! non-fma reader is bad, and badness flows backward through chain reads
+-//! (a materialised outer Neg keeps its read of the inner Neg alive), so
+-//! the fixpoint is reached by iterating the backward step to stability —
+-//! at most one round per chain link, trivially bounded.
++//! The absorbability fixpoint: a Neg may be DELETED iff
++//!   (i)   none of its reads is non-peeling (an add, a store, a phi, a
++//!         terminator, a width-mismatched slot — a read that survives every
++//!         rewrite pins the materialisation),
++//!   (ii)  every reader of it (every Neg whose `src` is this Neg) is deleted
++//!         with it — a surviving outer Neg keeps its read of the inner Neg
++//!         alive, so the inner one must stay materialised too, and
++//!   (iii) some fma-argument slot reaches it by descending `src` links
++//!         through deleted Negs — otherwise no site substitutes its read.
++//! (ii) and (iii) are mutually recursive — dropping a Neg pins its source
++//! (the dropped Neg is now a surviving reader of it) and shortens every
++//! chain that descended through it — so the answer is the GREATEST
++//! fixpoint: start from every peeling-read-only Neg and remove the ones
++//! that violate (ii) or (iii) until stable. The edge directions are
++//! load-bearing in BOTH directions at once: propagating badness from a
++//! Neg's SOURCE (the direction this pass first shipped with) deletes the
++//! inner link of a chain whose outer link survives — a dangling use that
++//! reached codegen as an ICE; and propagating only from readers (the
++//! one-line repair) still deletes a Neg whose surviving reader no fma
++//! chain reaches. The reader closure and the site reachability must be
++//! computed TOGETHER; tools/ir_shape_check.py enumerates the chain shape
++//! space (4545 deduplicated shapes up to three Negs) and keeps both
++//! failure modes pinned as negative controls.
+ //!
  //! The pass is a no-op unless the target lowers the signed families —
  //! the same `has_fma3` signal that admits the fma libcall fold (x86-64 with
- //! FMA3, i686 with -mfma, AArch64; all three ISAs carry all four family
-@@ -104,50 +124,40 @@ struct Peel {
+@@ -118,8 +142,12 @@ struct Peel {
+     inst: usize,
+     /// Replacement operands (pre-negation sources).
+     args: Vec<Operand>,
+-    negate_product: bool,
+-    negate_addend: bool,
++    /// The replacement intrinsic: the site's own family with every
++    /// absorbed sign flip folded in (plain seeds start from (false,
++    /// false); Signed seeds XOR into their existing flags). A full cancel
++    /// lands on the PLAIN spelling — no degenerate `Signed(false, false)`
++    /// is ever created.
++    op: IntrinsicOp,
+     /// Value ids of the absorbed Neg destinations (deleted in the sweep).
      absorbed: Vec<u32>,
  }
- 
--fn peel_function(func: &mut IrFunction) -> usize {
--    // ---- Pass 1 (shared, immutable): use counts and float-Neg sites. ----
--    // Uses are counted over instructions AND terminators (the uniform
--    // liveness discipline) so a Neg feeding a terminator can never be
--    // misjudged as single-use.
--    let mut max_id: u32 = 0;
--    for block in &func.blocks {
--        for inst in &block.instructions {
--            if let Some(dest) = inst.dest() {
--                max_id = max_id.max(dest.0);
--            }
--            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
--                if let Operand::Value(v) = op {
--                    max_id = max_id.max(v.0);
--                }
--            });
--            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
--                max_id = max_id.max(v.0);
--            });
--        }
--        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
--            if let Operand::Value(v) = op {
--                max_id = max_id.max(v.0);
--            }
--        });
-+/// How one read of a float `Neg` interacts with the peel.
-+///
-+/// * `FmaArg` — an argument read of a width-matching, 3-arg `FmaScalar`
-+///   intrinsic: the use disappears iff the site peels it, which it will
-+///   for every absorbable Neg its chains walk through.
-+/// * `NegSrc` — the source read of another float `Neg` (a chain link):
-+///   the use disappears iff that outer Neg is itself absorbed.
-+/// * `Other` — anything else (a plain FP op, a store, a phi, a terminator,
-+///   a width-mismatched fma): the use survives every rewrite, pinning the
-+///   materialisation.
-+#[derive(Clone, Copy, PartialEq, Eq)]
-+enum NegUseKind {
-+    FmaArg,
-+    NegSrc,
-+    Other,
-+}
-+
-+fn fma_arg_width(op: &IntrinsicOp) -> Option<IrType> {
-+    match op {
-+        IntrinsicOp::FmaScalarF32 | IntrinsicOp::FmaScalarF32Signed(..) => Some(IrType::F32),
-+        IntrinsicOp::FmaScalarF64 | IntrinsicOp::FmaScalarF64Signed(..) => Some(IrType::F64),
-+        _ => None,
+@@ -254,47 +282,97 @@ fn peel_function(func: &mut IrFunction) -> usize {
+         }
      }
--    let mut uses = vec![0u32; max_id as usize + 1];
--    let count_use = |id: u32, uses: &mut [u32]| {
--        if (id as usize) < uses.len() {
--            uses[id as usize] += 1;
--        }
--    };
-+}
-+
-+fn peel_function(func: &mut IrFunction) -> usize {
-+    // ---- Pass 1: locate every float-Neg site. ----
-     // (block, index) of every float Neg, keyed by destination value id.
-+    // The per-use classification below is what decides absorbability; the
-+    // old use-COUNT fast path is subsumed by it (a single fma-arg read is
-+    // the trivial all-uses-absorbable case).
-     let mut float_negs: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
-     for (bi, block) in func.blocks.iter().enumerate() {
-         for (ii, inst) in block.instructions.iter().enumerate() {
--            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
--                if let Operand::Value(v) = op {
--                    count_use(v.0, &mut uses);
--                }
--            });
--            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
--                count_use(v.0, &mut uses);
--            });
-             if let Instruction::UnaryOp {
-                 dest,
-                 op: crate::ir::reexports::IrUnaryOp::Neg,
-@@ -160,12 +170,131 @@ fn peel_function(func: &mut IrFunction) -> usize {
+ 
+-    // ---- Pass 1c: the absorbability fixpoint (poison propagation). ----
+-    // A Neg is absorbable iff every read is an fma argument (peeled) or
+-    // the source read of an ABSORBABLE Neg. Compute the greatest fixpoint
+-    // by poisoning: start with every Neg whose reads include an `Other`,
+-    // then propagate badness backward through chain reads (a materialised
+-    // outer Neg keeps its read of the inner Neg alive) until stable.
+-    let mut bad: FxHashSet<u32> = FxHashSet::default();
+-    for (&vid, kinds) in &neg_use_kinds {
+-        if kinds.iter().any(|k| *k == NegUseKind::Other) {
+-            bad.insert(vid);
++    // ---- Pass 1c: the absorbability fixpoint (greatest fixpoint). ----
++    // A Neg may be deleted iff
++    //   (i)   none of its reads is `Other` (a read that survives every
++    //         rewrite pins the materialisation),
++    //   (ii)  every reader of it — every Neg whose `src` is this Neg — is
++    //         deleted with it (a surviving outer Neg keeps its read of the
++    //         inner Neg alive), and
++    //   (iii) some fma-argument slot reaches it by descending `src` links
++    //         through deleted Negs (otherwise no site substitutes the
++    //         read; a Neg nothing absorbs is DCE's business, not ours).
++    // (ii) and (iii) are mutually recursive: dropping a Neg pins its source
++    // (the dropped Neg is now a surviving reader of it) and shortens every
++    // chain that descended through it. Compute the GREATEST fixpoint:
++    // start from every `Other`-free Neg and remove the members that
++    // violate (ii) or (iii) until stable. The loop terminates because the
++    // set only shrinks (at most one productive round per Neg). The edge
++    // directions are load-bearing in both directions at once: poisoning a
++    // Neg from its SOURCE (the direction this pass first shipped with)
++    // deletes the inner link of a chain whose outer link survives — a
++    // dangling use; and poisoning only from readers (the one-line repair)
++    // still deletes a Neg whose surviving reader no fma chain reaches. The
++    // reader closure (ii) and the site reachability (iii) must be computed
++    // TOGETHER; tools/ir_shape_check.py enumerates the chain shape space
++    // and keeps both failure modes pinned as negative controls.
++    let mut absorbable: FxHashSet<u32> = neg_use_kinds
++        .iter()
++        .filter(|(_, kinds)| !kinds.iter().any(|k| *k == NegUseKind::Other))
++        .map(|(&vid, _)| vid)
++        .collect();
++    // Reader adjacency, built once: src Neg id -> every Neg reading it.
++    // (A Neg with NO read at all has no `neg_use_kinds` entry, so it never
++    // enters `absorbable`: dead code is DCE's business, and excluding it
++    // also pins its source through (ii) — the conservative and correct
++    // outcome, since the peel must not strand a reader it never rewrote.)
++    let mut readers: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
++    for (&vid, &(nb, ni)) in &float_negs {
++        if let Instruction::UnaryOp {
++            src: Operand::Value(s),
++            ..
++        } = &func.blocks[nb].instructions[ni]
++        {
++            if float_negs.contains_key(&s.0) {
++                readers.entry(s.0).or_default().push(vid);
++            }
+         }
+     }
++    // Seeds for (iii): every Neg an fma-argument slot reads (the
++    // classification already rejected width mismatches as `Other`).
++    let fma_arg_reads: Vec<u32> = neg_use_kinds
++        .iter()
++        .filter(|(_, kinds)| kinds.iter().any(|k| *k == NegUseKind::FmaArg))
++        .map(|(&vid, _)| vid)
++        .collect();
+     loop {
+-        let mut grew = false;
+-        for (&vid, &(nb, ni)) in &float_negs {
+-            if bad.contains(&vid) {
++        // (iii): the Negs the sites actually rewrite through, given the
++        // current delete set — from each seed, descend `src` links while
++        // the Neg stays deleted. This is exactly the walk Pass 2 performs.
++        let mut reached: FxHashSet<u32> = FxHashSet::default();
++        let mut stack = fma_arg_reads.clone();
++        while let Some(vid) = stack.pop() {
++            if !absorbable.contains(&vid) || !reached.insert(vid) {
+                 continue;
+             }
+-            let src_id = match &func.blocks[nb].instructions[ni] {
+-                Instruction::UnaryOp { src, .. } => match src {
+-                    Operand::Value(v) => Some(v.0),
+-                    _ => None,
+-                },
+-                _ => None,
+-            };
+-            if let Some(s) = src_id {
+-                if float_negs.contains_key(&s) && bad.contains(&s) {
+-                    bad.insert(vid);
+-                    grew = true;
++            if let Some(&(nb, ni)) = float_negs.get(&vid) {
++                if let Instruction::UnaryOp {
++                    src: Operand::Value(s),
++                    ..
++                } = &func.blocks[nb].instructions[ni]
++                {
++                    if float_negs.contains_key(&s.0) {
++                        stack.push(s.0);
++                    }
                  }
              }
          }
--        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
--            if let Operand::Value(v) = op {
--                count_use(v.0, &mut uses);
-+    }
-+
-+    // ---- Pass 1b: classify every read of every float Neg. ----
-+    // The classification drives the multi-use absorbability rule: a Neg
-+    // may be folded into family flags only when ALL its readers vanish
-+    // with the rewrite. Width mismatches (mistyped IR the SSA typing
-+    // should have prevented) classify as `Other` — the defensive reject.
-+    let mut neg_use_kinds: FxHashMap<u32, Vec<NegUseKind>> =
-+        FxHashMap::with_capacity_and_hasher(float_negs.len(), Default::default());
-+    let neg_ty = |vid: u32| -> Option<IrType> {
-+        float_negs
-+            .get(&vid)
-+            .and_then(|&(nb, ni)| match &func.blocks[nb].instructions[ni] {
-+                Instruction::UnaryOp { ty, .. } => Some(*ty),
-+                _ => None,
-+            })
-+    };
-+    {
-+        let mut classify_use = |vid: u32, kind: NegUseKind| {
-+            neg_use_kinds.entry(vid).or_default().push(kind);
-+        };
-+        let classify_inst = |inst: &Instruction, classify_use: &mut dyn FnMut(u32, NegUseKind)| {
-+            // The kind this instruction imparts to every float-Neg value
-+            // it reads (either as an Operand or as a bare Value use).
-+            let kind = match inst {
-+                Instruction::Intrinsic { op, args, .. }
-+                    if args.len() == 3 && fma_arg_width(op).is_some() =>
-+                {
-+                    // Width check per-Neg below (the arg positions share
-+                    // the site's width; the Neg's own ty decides).
-+                    NegUseKind::FmaArg
-+                }
-+                Instruction::UnaryOp {
-+                    op: crate::ir::reexports::IrUnaryOp::Neg,
-+                    ty,
-+                    ..
-+                } if matches!(ty, IrType::F32 | IrType::F64) => NegUseKind::NegSrc,
-+                _ => NegUseKind::Other,
-+            };
-+            let fma_width = match inst {
-+                Instruction::Intrinsic { op, args, .. } if args.len() == 3 => fma_arg_width(op),
-+                _ => None,
-+            };
-+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
-+                if let Operand::Value(v) = op {
-+                    if let Some(nt) = neg_ty(v.0) {
-+                        let k = match kind {
-+                            NegUseKind::FmaArg => match fma_width {
-+                                Some(w) if w == nt => NegUseKind::FmaArg,
-+                                // Width-mismatched fma slot (mistyped IR):
-+                                // the defensive reject, same as the peel's
-+                                // own type discipline.
-+                                _ => NegUseKind::Other,
-+                            },
-+                            // A chain link's width is fixed by the Neg's own
-+                            // typing; NegSrc and Other pass through.
-+                            other => other,
-+                        };
-+                        classify_use(v.0, k);
-+                    }
-+                }
-+            });
-+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
-+                if let Some(_nt) = neg_ty(v.0) {
-+                    // Intrinsic dest_ptr and pointer-ish uses: a float Neg
-+                    // can only appear here in mistyped IR; pin it.
-+                    classify_use(v.0, NegUseKind::Other);
-+                }
-+            });
-+        };
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                classify_inst(inst, &mut classify_use);
-             }
--        });
-+            crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
-+                if let Operand::Value(v) = op {
-+                    if neg_ty(v.0).is_some() {
-+                        classify_use(v.0, NegUseKind::Other);
-+                    }
-+                }
-+            });
-+        }
-+    }
-+
-+    // ---- Pass 1c: the absorbability fixpoint (poison propagation). ----
-+    // A Neg is absorbable iff every read is an fma argument (peeled) or
-+    // the source read of an ABSORBABLE Neg. Compute the greatest fixpoint
-+    // by poisoning: start with every Neg whose reads include an `Other`,
-+    // then propagate badness backward through chain reads (a materialised
-+    // outer Neg keeps its read of the inner Neg alive) until stable.
-+    let mut bad: FxHashSet<u32> = FxHashSet::default();
-+    for (&vid, kinds) in &neg_use_kinds {
-+        if kinds.iter().any(|k| *k == NegUseKind::Other) {
-+            bad.insert(vid);
-+        }
-+    }
-+    loop {
-+        let mut grew = false;
-+        for (&vid, &(nb, ni)) in &float_negs {
-+            if bad.contains(&vid) {
-+                continue;
-+            }
-+            let src_id = match &func.blocks[nb].instructions[ni] {
-+                Instruction::UnaryOp { src, .. } => match src {
-+                    Operand::Value(v) => Some(v.0),
-+                    _ => None,
-+                },
-+                _ => None,
-+            };
-+            if let Some(s) = src_id {
-+                if float_negs.contains_key(&s) && bad.contains(&s) {
-+                    bad.insert(vid);
-+                    grew = true;
-+                }
+-        if !grew {
++        let mut drop: Vec<u32> = Vec::new();
++        for &vid in &absorbable {
++            let stranded_reader = readers
++                .get(&vid)
++                .is_some_and(|rs| rs.iter().any(|r| !absorbable.contains(r)));
++            if !reached.contains(&vid) || stranded_reader {
++                drop.push(vid);
 +            }
 +        }
-+        if !grew {
-+            break;
++        if drop.is_empty() {
+             break;
+         }
++        for vid in drop {
++            absorbable.remove(&vid);
 +        }
      }
-+    let absorbable: FxHashSet<u32> = float_negs
-+        .keys()
-+        .copied()
-+        .filter(|id| !bad.contains(id))
-+        .collect();
+-    let absorbable: FxHashSet<u32> = float_negs
+-        .keys()
+-        .copied()
+-        .filter(|id| !bad.contains(id))
+-        .collect();
  
      // ---- Pass 2 (decisions, still immutable): peel each fma site. ----
      let mut decisions: Vec<Peel> = Vec::new();
-@@ -187,7 +316,7 @@ fn peel_function(func: &mut IrFunction) -> usize {
-             let mut negate_product = false;
-             let mut negate_addend = false;
+@@ -303,9 +381,17 @@ fn peel_function(func: &mut IrFunction) -> usize {
+             let Instruction::Intrinsic { op, args, .. } = inst else {
+                 continue;
+             };
+-            let expected_ty = match op {
+-                IntrinsicOp::FmaScalarF32 => IrType::F32,
+-                IntrinsicOp::FmaScalarF64 => IrType::F64,
++            // Both the plain and the already-Signed spellings peel: the
++            // families compose by XOR, so a site the vectorizer's scalar
++            // remainder mirror already signed can still shed a materialised
++            // Neg, and a double peel that cancels normalises back to plain.
++            // This is what makes the `FmaArg` classification true — every
++            // read so classified really does disappear with the rewrite.
++            let (expected_ty, mut negate_product, mut negate_addend) = match op {
++                IntrinsicOp::FmaScalarF32 => (IrType::F32, false, false),
++                IntrinsicOp::FmaScalarF64 => (IrType::F64, false, false),
++                IntrinsicOp::FmaScalarF32Signed(np, na) => (IrType::F32, *np, *na),
++                IntrinsicOp::FmaScalarF64Signed(np, na) => (IrType::F64, *np, *na),
+                 _ => continue,
+             };
+             if args.len() != 3 {
+@@ -313,8 +399,6 @@ fn peel_function(func: &mut IrFunction) -> usize {
+             }
+             let mut absorbed: Vec<u32> = Vec::new();
+             let mut new_args = Vec::with_capacity(3);
+-            let mut negate_product = false;
+-            let mut negate_addend = false;
              for (pos, arg) in args.iter().enumerate() {
--                // Peel the (possibly chained) single-use Negs off this
-+                // Peel the (possibly chained) absorbable Negs off this
+                 // Peel the (possibly chained) absorbable Negs off this
                  // operand. Each level flips the position's sign flag; the
-                 // loop terminates because each step moves to a strictly
-                 // earlier definition (SSA defs are acyclic).
-@@ -200,10 +329,13 @@ fn peel_function(func: &mut IrFunction) -> usize {
-                     let Some(&(nb, ni)) = float_negs.get(&vid) else {
-                         break;
-                     };
--                    // Single-use: the ONLY reader may be this very argument
--                    // slot. A Neg referenced twice (another fma argument,
--                    // another instruction, a terminator) stays materialised.
--                    if uses.get(vid as usize).copied().unwrap_or(0) != 1 {
-+                    // Absorbability: every read of this Neg disappears with
-+                    // the rewrite (fma argument slots that all peel it, plus
-+                    // chain-internal reads by other absorbed Negs). A Neg
-+                    // with any other reader stays materialised — peeling it
-+                    // here would change its NaN-sign semantics without
-+                    // deleting the vxorpd.
-+                    if !absorbable.contains(&vid) {
-                         break;
+@@ -354,6 +438,13 @@ fn peel_function(func: &mut IrFunction) -> usize {
+                         0 | 1 => negate_product = !negate_product,
+                         _ => negate_addend = !negate_addend,
                      }
-                     // Type discipline: the Neg must be the float negation of
-@@ -540,20 +672,189 @@ mod tests {
++                    // Recorded outermost-first (the walk descends outer →
++                    // inner). Deletion does not care about the order, but
++                    // any future refinement that RETARGETS a surviving
++                    // reader must process this list deepest-first —
++                    // retargeting an outer reader first would hand it the
++                    // not-yet-rewritten inner chain and reintroduce a
++                    // use-before-def.
+                     absorbed.push(vid);
+                 }
+                 new_args.push(current);
+@@ -361,12 +452,24 @@ fn peel_function(func: &mut IrFunction) -> usize {
+             if absorbed.is_empty() {
+                 continue;
+             }
++            // The site's family with every absorbed flip folded in; a full
++            // cancel lands on the plain spelling (the doc rule: no
++            // degenerate Signed(false, false) is ever created).
++            let new_op = match expected_ty {
++                IrType::F32 => match (negate_product, negate_addend) {
++                    (false, false) => IntrinsicOp::FmaScalarF32,
++                    (np, na) => IntrinsicOp::FmaScalarF32Signed(np, na),
++                },
++                _ => match (negate_product, negate_addend) {
++                    (false, false) => IntrinsicOp::FmaScalarF64,
++                    (np, na) => IntrinsicOp::FmaScalarF64Signed(np, na),
++                },
++            };
+             decisions.push(Peel {
+                 block: bi,
+                 inst: ii,
+                 args: new_args,
+-                negate_product,
+-                negate_addend,
++                op: new_op,
+                 absorbed,
+             });
+         }
+@@ -385,24 +488,43 @@ fn peel_function(func: &mut IrFunction) -> usize {
+             func.blocks[dec.block].instructions.get_mut(dec.inst)
+         {
+             *args = dec.args.clone();
+-            if dec.negate_product || dec.negate_addend {
+-                *op = match op {
+-                    IntrinsicOp::FmaScalarF32 => {
+-                        IntrinsicOp::FmaScalarF32Signed(dec.negate_product, dec.negate_addend)
+-                    }
+-                    IntrinsicOp::FmaScalarF64 => {
+-                        IntrinsicOp::FmaScalarF64Signed(dec.negate_product, dec.negate_addend)
+-                    }
+-                    // The decision pass only records plain FmaScalar sites;
+-                    // another decision cannot have touched this instruction
+-                    // (distinct sites, applied once).
+-                    other => unreachable!("peel decision on non-FmaScalar intrinsic {other:?}"),
+-                };
+-            }
++            *op = dec.op;
++        }
++    }
++    // The precondition the sweep relies on, made self-enforcing: the sweep
++    // deletes by value id with no residual-use check, so the decision pass
++    // must guarantee that every read of every absorbed Neg disappears with
++    // the rewrite. Pass 1c's fixpoint certifies it for the classification;
++    // this re-derives it from the ACTUAL decision set (one pass over the
++    // reader adjacency) so that a future edit desynchronising Pass 1c from
++    // Pass 2's walk — or introducing a new site kind that reads Negs
++    // without peeling them — fails here, in the test suite, instead of
++    // shipping a dangling use to codegen. Unconditional (not a
++    // debug_assert!) for two reasons: the fastbuild/test profile compiles
++    // with debug-assertions off, so a debug_assert would never fire in the
++    // very builds that run the regression suites; and this is a
++    // release-miscompile class — the house discipline for those is to
++    // panic loudly (see the VecRotl/VecShufd immediate guards), which is
++    // exactly how the chain defect surfaced: an ICE on `value has no
++    // register, stack slot, Copy, or GlobalAddr definition`.
++    for &id in &absorbed_ids {
++        let kinds = neg_use_kinds
++            .get(&id)
++            .expect("an absorbed Neg must have a use classification");
++        assert!(
++            !kinds.iter().any(|k| *k == NegUseKind::Other),
++            "fma_neg_peel: absorbed v{id} still has a non-peeling read"
++        );
++        for &r in readers.get(&id).into_iter().flatten() {
++            assert!(
++                absorbed_ids.contains(&r),
++                "fma_neg_peel: absorbed v{id} is still read by surviving v{r}"
++            );
+         }
+     }
+-    // Sweep: every absorbed Neg's destination has no remaining use (that is
+-    // what single-use certified), so removal is dead-code elimination with
++    // Sweep: every absorbed Neg's destination has no remaining use — the
++    // fixpoint certified it and the assert above re-derived it from the
++    // actual decision set — so removal is dead-code elimination with
+     // the parallel source_spans discipline (see dce::sweep_block). The keep
+     // decision is computed once into a bitmap so instructions and spans walk
+     // the SAME positional filter. (dce's own "refuse to sweep" guard is
+@@ -919,6 +1041,175 @@ mod tests {
+         assert_eq!(m.functions[0].blocks[0].instructions.len(), 2);
      }
  
-     #[test]
--    fn same_value_in_two_positions_is_not_absorbed() {
--        // fma(n, n, c) with n = -a: use count 2 -> residual, untouched.
-+    fn same_value_in_two_positions_cancels_to_plain() {
-+        // fma(n, n, c) with n = -a: both product positions read the SAME
-+        // Neg, both uses are absorbable fma argument slots, the two flips
-+        // cancel -> plain fma(a, a, c), the Neg dies. GCC folds the same
-+        // spelling; the old single-use grammar left it materialised.
-         let mut m = module(
-             vec![neg(1, 0, IrType::F64), fma(2, v(1), v(1), v(4), true)],
-             5,
-         );
-+        assert_eq!(peel(&mut m), 1);
-+        match sole_inst(&m) {
-+            Instruction::Intrinsic { op, args, .. } => {
-+                assert_eq!(*op, IntrinsicOp::FmaScalarF64);
-+                assert_eq!(args, &vec![v(0), v(0), v(4)]);
-+            }
-+            other => panic!("expected intrinsic, got {other:?}"),
-+        }
-+    }
-+
 +    #[test]
-+    fn shared_negation_across_two_fma_sites_peels_both() {
-+        // The phi-diamond shape (the session's headline): one -a and one -c
-+        // shared by TWO fma sites. All four reads are absorbable argument
-+        // slots, so both sites peel and BOTH Negs die — GCC's two
-+        // vfnmsub, not two vxorpd + two vfmadd.
-+        let mut m = module(
-+            vec![
-+                neg(1, 0, IrType::F64),
-+                neg(5, 4, IrType::F64),
-+                fma(2, v(1), v(3), v(5), true),
-+                fma(6, v(1), v(7), v(5), true),
-+                Instruction::BinOp {
-+                    dest: crate::ir::reexports::Value(8),
-+                    op: crate::ir::reexports::IrBinOp::Add,
-+                    lhs: v(2),
-+                    rhs: v(6),
-+                    ty: IrType::F64,
-+                },
-+            ],
-+            9,
-+        );
-+        // The helper returns v(2); extend the return to the sum so both
-+        // fma results stay live.
-+        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(8)));
-+        assert_eq!(peel(&mut m), 2);
-+        let insts = &m.functions[0].blocks[0].instructions;
-+        assert_eq!(insts.len(), 3);
-+        for (i, want) in [(0, (true, true)), (1, (true, true))] {
-+            match &insts[i] {
-+                Instruction::Intrinsic { op, args, .. } => {
-+                    assert_eq!(
-+                        *op,
-+                        IntrinsicOp::FmaScalarF64Signed(want.0, want.1),
-+                        "site {i}"
-+                    );
-+                    // Both sites read the PRE-negation sources.
-+                    assert!(args.contains(&v(0)), "site {i} must read a");
-+                    assert!(args.contains(&v(4)), "site {i} must read c");
-+                    assert!(!args.contains(&v(1)) && !args.contains(&v(5)));
-+                }
-+                other => panic!("expected intrinsic, got {other:?}"),
-+            }
-+        }
-+    }
-+
-+    #[test]
-+    fn shared_negation_with_external_reader_stays_materialised() {
-+        // -a read by two fma sites AND a trailing add: the add survives
-+        // every rewrite, so the Neg keeps its exact materialised
-+        // semantics and NO site peels (the discipline: the NaN-sign
-+        // latitude is only taken when the vxorpd actually dies).
++    fn chained_negation_with_surviving_outer_reader_is_never_deleted() {
++        // The chain defect this pass shipped with, as a shape: the fma site
++        // reads the INNER Neg; the OUTER Neg is read by an add. The outer
++        // must stay materialised (the add pins it), and its surviving read
++        // of the inner pins the INNER too — deleting the inner underneath
++        // the outer's feet is a dangling use, which reached codegen as an
++        // ICE before the fixpoint was corrected. Note the direction: the
++        // site must read the INNER link for this to be the defect shape
++        // (a site reading the outer is the safe mirror, pinned directly).
++        //   t = -x; u = -t; r = fma(t, b, c); return r + u;
 +        let reader = Instruction::BinOp {
 +            dest: crate::ir::reexports::Value(6),
 +            op: crate::ir::reexports::IrBinOp::Add,
-+            lhs: v(1),
-+            rhs: v(3),
++            lhs: v(2),
++            rhs: v(5),
 +            ty: IrType::F64,
 +        };
 +        let mut m = module(
 +            vec![
-+                neg(1, 0, IrType::F64),
-+                fma(2, v(1), v(3), v(4), true),
-+                fma(7, v(1), v(3), v(4), true),
-+                reader,
++                neg(1, 0, IrType::F64),         // t = -x
++                neg(5, 1, IrType::F64),         // u = -t (reads t)
++                fma(2, v(1), v(3), v(4), true), // r = fma(t, b, c) — INNER
++                reader,                         // r + u — the Other read of u
 +            ],
-+            8,
++            7,
 +        );
 +        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(6)));
-         assert_eq!(peel(&mut m), 0);
--        match &m.functions[0].blocks[0].instructions[1] {
++        assert_eq!(peel(&mut m), 0);
 +        let insts = &m.functions[0].blocks[0].instructions;
 +        assert_eq!(insts.len(), 4);
-+        match &insts[1] {
-             Instruction::Intrinsic { op, args, .. } => {
-                 assert_eq!(*op, IntrinsicOp::FmaScalarF64);
--                assert_eq!(args, &vec![v(1), v(1), v(4)]);
++        // Both Negs still present and the intrinsic stays PLAIN reading the
++        // materialised t: no latitude is taken on a mask that survives.
++        assert!(matches!(insts[0], Instruction::UnaryOp { dest, .. } if dest.0 == 1));
++        assert!(matches!(insts[1], Instruction::UnaryOp { dest, .. } if dest.0 == 5));
++        match &insts[2] {
++            Instruction::Intrinsic { op, args, .. } => {
++                assert_eq!(*op, IntrinsicOp::FmaScalarF64);
 +                assert_eq!(args, &vec![v(1), v(3), v(4)]);
 +            }
 +            other => panic!("expected intrinsic, got {other:?}"),
@@ -760,798 +562,776 @@ index 64f7401b..7f3077d7 100644
 +    }
 +
 +    #[test]
-+    fn cross_block_negation_dominating_both_sites_peels() {
-+        // The Neg lives in the entry block, the fma in a dominated block:
-+        // the rewrite substitutes the Neg's SOURCE, whose definition
-+        // dominates the Neg, which dominates the use — transitivity is
-+        // the whole soundness argument, and it is block-agnostic.
-+        let mut func = IrFunction::new(
-+            "t".to_string(),
-+            IrType::F64,
-+            vec![IrParam {
-+                ty: IrType::F64,
-+                noalias: false,
-+                struct_size: None,
-+                struct_align: None,
-+                param_align: None,
-+                struct_eightbyte_classes: Vec::new(),
-+                is_f128_sse: false,
-+                riscv_float_class: None,
-+            }],
-+            false,
-+        );
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![neg(1, 0, IrType::F64)],
-+            terminator: Terminator::Branch(BlockId(1)),
-+            source_spans: vec![],
-+        });
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(1),
-+            instructions: vec![fma(2, v(1), v(3), v(4), true)],
-+            terminator: Terminator::Return(Some(v(2))),
-+            source_spans: vec![],
-+        });
-+        func.next_value_id = 5;
-+        let mut module = IrModule::new();
-+        module.functions.push(func);
-+        assert_eq!(peel(&mut module), 1);
-+        match &module.functions[0].blocks[1].instructions[0] {
-+            Instruction::Intrinsic { op, args, .. } => {
-+                assert_eq!(*op, IntrinsicOp::FmaScalarF64Signed(true, false));
-+                assert_eq!(args, &vec![v(0), v(3), v(4)]);
-             }
-             other => panic!("expected intrinsic, got {other:?}"),
-         }
-+        assert!(module.functions[0].blocks[0].instructions.is_empty());
-+    }
-+
-+    #[test]
-+    fn chained_shared_negation_peels_transitively_at_both_sites() {
-+        // Two sites read the same DOUBLE negation: the outer Neg's two
-+        // reads are fma slots, the inner Neg's only read is the outer
-+        // chain link — all absorbable, everything collapses.
++    fn chained_negation_with_dead_outer_reader_stays_put() {
++        // The second negative control from the shape enumeration: the outer
++        // Neg is read by NOTHING (DCE would normally have removed it before
++        // the peel — construct the IR directly). The peel must still not
++        // delete the inner link underneath it: deletion requires every
++        // reader to be deleted too, and a reader no fma chain reaches is
++        // never deleted. Dead code is DCE's business, not the peel's.
 +        let mut m = module(
 +            vec![
 +                neg(1, 0, IrType::F64),
-+                neg(5, 1, IrType::F64),
-+                fma(2, v(5), v(3), v(4), true),
-+                fma(6, v(5), v(3), v(4), true),
-+                Instruction::BinOp {
-+                    dest: crate::ir::reexports::Value(8),
-+                    op: crate::ir::reexports::IrBinOp::Add,
-+                    lhs: v(2),
-+                    rhs: v(6),
-+                    ty: IrType::F64,
-+                },
++                neg(5, 1, IrType::F64),         // read by nothing
++                fma(2, v(1), v(3), v(4), true), // reads the INNER
 +            ],
-+            9,
++            6,
 +        );
-+        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(8)));
-+        assert_eq!(peel(&mut m), 2);
++        assert_eq!(peel(&mut m), 0);
 +        let insts = &m.functions[0].blocks[0].instructions;
 +        assert_eq!(insts.len(), 3);
-+        for i in 0..2 {
-+            match &insts[i] {
-+                Instruction::Intrinsic { op, args, .. } => {
-+                    // (-(-a)) at a product slot: two flips -> plain family,
-+                    // reading a directly.
-+                    assert_eq!(*op, IntrinsicOp::FmaScalarF64, "site {i}");
-+                    assert_eq!(args, &vec![v(0), v(3), v(4)], "site {i}");
-+                }
-+                other => panic!("expected intrinsic, got {other:?}"),
++        assert!(matches!(insts[0], Instruction::UnaryOp { dest, .. } if dest.0 == 1));
++        assert!(matches!(insts[1], Instruction::UnaryOp { dest, .. } if dest.0 == 5));
++    }
++
++    #[test]
++    fn outer_neg_peels_when_the_inner_neg_is_pinned() {
++        // The fold the source-poisoned rule missed: the INNER Neg is pinned
++        // by an external add, the site reads the OUTER Neg. The outer's
++        // only read is the site, so its sign-mask dies and the latitude is
++        // available; the site peels exactly one level and reads the
++        // materialised inner:
++        //   t = -x; r = fma(-t, b, c); return r + t;
++        // compiles to vxorpd + vfnmadd + vaddsd — one sign mask, not two —
++        // bit-exact against GCC (verified on the metal in the session
++        // record; the landed rule kept both masks).
++        let reader = Instruction::BinOp {
++            dest: crate::ir::reexports::Value(6),
++            op: crate::ir::reexports::IrBinOp::Add,
++            lhs: v(2),
++            rhs: v(1),
++            ty: IrType::F64,
++        };
++        let mut m = module(
++            vec![
++                neg(1, 0, IrType::F64),         // t = -x, pinned by the add
++                neg(5, 1, IrType::F64),         // -t, read only by the site
++                fma(2, v(5), v(3), v(4), true), // r = fma(-t, b, c) — OUTER
++                reader,
++            ],
++            7,
++        );
++        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(6)));
++        assert_eq!(peel(&mut m), 1);
++        let insts = &m.functions[0].blocks[0].instructions;
++        assert_eq!(insts.len(), 3);
++        // The inner Neg stays materialised; the site now reads it with the
++        // product negated (the dying OUTER mask carried the sign).
++        assert!(matches!(insts[0], Instruction::UnaryOp { dest, .. } if dest.0 == 1));
++        match &insts[1] {
++            Instruction::Intrinsic { op, args, .. } => {
++                assert_eq!(*op, IntrinsicOp::FmaScalarF64Signed(true, false));
++                assert_eq!(args, &vec![v(1), v(3), v(4)]);
 +            }
++            other => panic!("expected intrinsic, got {other:?}"),
 +        }
++    }
++
++    #[test]
++    fn already_signed_site_peels_and_normalises_to_plain() {
++        // The XOR composition: a site the vectorizer's scalar remainder
++        // mirror already signed peels too. Signed(true, false) absorbing
++        // the Neg on its multiplier slot flips the product flag back — the
++        // full cancel NORMALISES to the plain spelling (no degenerate
++        // Signed(false, false) is ever created). This is what makes the
++        // FmaArg classification true rather than coincidentally
++        // conservative — the read really does disappear.
++        let mut m = module(
++            vec![
++                neg(1, 0, IrType::F64),
++                Instruction::Intrinsic {
++                    dest: Some(crate::ir::reexports::Value(2)),
++                    op: IntrinsicOp::FmaScalarF64Signed(true, false),
++                    dest_ptr: None,
++                    args: vec![v(1), v(3), v(4)],
++                },
++            ],
++            5,
++        );
++        assert_eq!(peel(&mut m), 1);
++        match sole_inst(&m) {
++            Instruction::Intrinsic { op, args, .. } => {
++                assert_eq!(*op, IntrinsicOp::FmaScalarF64);
++                assert_eq!(args, &vec![v(0), v(3), v(4)]);
++            }
++            other => panic!("expected intrinsic, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn already_signed_site_peels_by_xor_into_addend() {
++        // The same composition on the addend slot, where the flags do NOT
++        // cancel: Signed(true, false) absorbing the addend Neg XORs to
++        // Signed(true, true) — the vfnmsub family — reading the
++        // pre-negation addend.
++        let mut m = module(
++            vec![
++                neg(1, 4, IrType::F64),
++                Instruction::Intrinsic {
++                    dest: Some(crate::ir::reexports::Value(2)),
++                    op: IntrinsicOp::FmaScalarF64Signed(true, false),
++                    dest_ptr: None,
++                    args: vec![v(3), v(5), v(1)],
++                },
++            ],
++            6,
++        );
++        assert_eq!(peel(&mut m), 1);
++        match sole_inst(&m) {
++            Instruction::Intrinsic { op, args, .. } => {
++                assert_eq!(*op, IntrinsicOp::FmaScalarF64Signed(true, true));
++                assert_eq!(args, &vec![v(3), v(5), v(4)]);
++            }
++            other => panic!("expected intrinsic, got {other:?}"),
++        }
++    }
++
+     #[test]
+     fn source_spans_stay_aligned() {
+         // Two Negs + fma with spans: the sweep must keep spans parallel.
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index d9964eee..1d497827 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1157,9 +1157,14 @@ pub(crate) fn run_passes(
+         // FMA operand-negation peel (same call as the -O2+ tail; see Phase
+         // 11f there). GCC folds fma(-a,b,-c) to one vfnmsub at -O1, so the
+         // tier that already folds the fma libcall to the intrinsic gets the
+-        // sign algebra too.
++        // sign algebra too. The verify hook matters here for the same
++        // reason it does at the -O2+ tail: this is the LAST IR transform,
++        // and nothing downstream would otherwise re-check the module — a
++        // malformed peel was invisible to CCC_VERIFY_IR exactly once
++        // already (the deleted-under-a-surviving-reader chain).
+         if !pass_disabled(&disabled, "fmanegpeel") && fma_neg_peel_enabled {
+             fma_neg_peel::run(module);
++            verify::verify_after_pass(module, "fmanegpeel");
+         }
+         resolve_asm::resolve_inline_asm_symbols(module);
+         if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
+@@ -2643,16 +2648,22 @@ pub(crate) fn run_passes(
+     // vectorizer (their SLP matchers must not see the Signed variants) and
+     // in phi-SSA form (the rewrite's soundness argument is dominance, and
+     // eliminate_phis still runs after us in the driver). Absorbs the
+-    // single-use Neg instructions feeding a plain FmaScalarF{32,64} into
+-    // the signed families — `__builtin_fma(-a, b, -c)` becomes ONE
+-    // vfnmsub instead of vxorpd + vxorpd + vfmadd (GCC parity at -O1 and
+-    // above; GCC keeps the negations materialised at -O0 and so do we).
+-    // Gated on the same has_fma3 signal as the fma libcall fold, so
+-    // targets without the families never see the variant. Kill switches:
+-    // CCC_NO_FMA_NEG_PEEL=1 / CCC_DISABLE_PASSES=fmanegpeel (both resolved
+-    // once above, with the other pass switches).
++    // operand Negations feeding a FmaScalarF{32,64} site (plain or already
++    // Signed — the flags compose by XOR) into the signed families:
++    // `__builtin_fma(-a, b, -c)` becomes ONE vfnmsub instead of vxorpd +
++    // vxorpd + vfmadd (GCC parity at -O1 and above; GCC keeps the negations
++    // materialised at -O0 and so do we). Gated on the same has_fma3 signal
++    // as the fma libcall fold, so targets without the families never see
++    // the variant. Kill switches: CCC_NO_FMA_NEG_PEEL=1 /
++    // CCC_DISABLE_PASSES=fmanegpeel (both resolved once above, with the
++    // other pass switches). The verify hook is load-bearing: the peel is
++    // the last IR transform in this tier too, so without it a malformed
++    // rewrite here is invisible to CCC_VERIFY_IR (that is exactly how the
++    // chain defect — a Neg deleted under a surviving reader — reached
++    // codegen as an ICE instead of failing the armed regression gates).
+     if !pass_disabled(&disabled, "fmanegpeel") && fma_neg_peel_enabled {
+         fma_neg_peel::run(module);
++        verify::verify_after_pass(module, "fmanegpeel");
      }
  
-     #[test]
-diff --git a/tests/regression/check_cross_pr_redteam.sh b/tests/regression/check_cross_pr_redteam.sh
-new file mode 100644
-index 00000000..10881ae4
---- /dev/null
-+++ b/tests/regression/check_cross_pr_redteam.sh
-@@ -0,0 +1,159 @@
-+#!/usr/bin/env bash
-+# Cross-PR interaction red-team gate (session 574).
-+#
-+# WHY THIS EXISTS
-+# ---------------
-+# The per-feature gates pin each landed PR's own contract; nothing pinned
-+# the INTERACTIONS between them. This battery was built to red-team the
-+# last ten merged PRs as a stack (#557..#573) and it found two real
-+# defects the per-PR gates could not see:
-+#
-+#   * the FMA operand-negation peel rejected every multi-use Neg, so the
-+#     shared-negation shapes (one -b/-c read by two fma sites — the
-+#     phi-diamond body) kept two vxorpd + two vfmadd where GCC contracts
-+#     to two vfnmsub (fixed with the absorbability fixpoint);
-+#   * -mno-avx2 killed the entire VEX encoding (not just the 256-bit
-+#     class), declining the FMA fold into xorpd+xorpd+libm at the
-+#     AVX1+FMA target class (fixed with the dedicated avx2 denial).
-+#
-+# Both fixes are pinned here end-to-end: the battery's output is compared
-+# bit-exactly against GCC at matched march, in four configurations
-+# (default, -O3, the AVX1-class target, and the SSE2-no-FMA baseline),
-+# across every FP edge value (±0, ±inf, NaN, extremes) — the sign of
-+# zero and the sign of infinities included, which is what pins the FMA
-+# family selection. NaN SIGNS are compared under the documented latitude:
-+# a result NaN's sign is implementation-defined (C11 6.5p8 / Annex F),
-+# and with TWO NaN operands meeting, which NaN the hardware propagates
-+# depends on the compiler's operand placement — so canonical NaN bit
-+# patterns are normalised to a token on both sides before the diff.
-+# Everything else is bit-exact or the gate fails.
-+#
-+# Sections (cross_pr_redteam.c):
-+#   A  FMA families through copy brackets, calls and branches (#567 x
-+#      #571-#573)
-+#   B  FMA under if-conversion / select arms (#569 x #571)
-+#   C  the phi-diamond: shared negations across two fma sites — the
-+#      multi-use peel headline (#572)
-+#   D  FMA weighted dot over a .rodata table (#566 x #572)
-+#   E  guarded clz/ctz over promoted constant arrays (#569 x #566)
-+#   F  aliased-operand fma (the documented ordinary-path residual)
-+#   G  multi-use negation grammar corners (integer Neg, two-use shapes)
-+#   H  wide SLP FMA packs at all four widths (#572's P0 fix pinned)
-+#   J  in-place accumulator streams through the peephole store (#563)
-+#   K  everything stacked: range fusion + selects + brackets + packs
-+# cross_pr_redteam2.c adds the range-fusion domain corners (empty/point/
-+# INT_MIN domains, unsigned OR wrap, FP-NaN non-fusion), constant-array
-+# promotion under aliasing, copy-elim x peel interaction with calls, and
-+# the eight-accumulator regalloc pressure web.
-+#
-+# Usage:
-+#   tests/regression/check_cross_pr_redteam.sh
-+# Environment:
-+#   LCCC            compiler to test (default: target/fastbuild/lccc)
-+#   CCC_ORACLE_CC   reference compiler (default: cc, gcc or clang)
-+set -u -o pipefail
+     if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
+diff --git a/tools/ir_shape_check.py b/tools/ir_shape_check.py
+index 6c528d37..4a966482 100644
+--- a/tools/ir_shape_check.py
++++ b/tools/ir_shape_check.py
+@@ -296,13 +296,19 @@ def enumerate_shapes(max_negs: int):
+ # the correction may not change any existing expectation. `landed` is asserted too --
+ # the two agree on all existing tests, which is exactly why the gap went unnoticed.
+ 
+-RUST_TESTS_TOTAL = 16
+-# 14 tests assert on a fold pattern; `source_spans_stay_aligned` asserts on span
++RUST_TESTS_TOTAL = 21
++# 17 tests assert on a fold pattern; `source_spans_stay_aligned` asserts on span
+ # bookkeeping for a shape that is itself covered by the last fixture, and
+ # `gate_off_is_a_no_op` exercises the capability gate, which has no IR shape.
+-SHAPE_MODELLABLE_TESTS = 14
++# The two already-signed-site tests exercise a dimension this model does not
++# carry (the site's own family flags -- the XOR composition), not a shape.
++SHAPE_MODELLABLE_TESTS = 17
+ NOT_SHAPE_MODELLABLE = (
+     "gate_off_is_a_no_op (capability flag, no IR shape)",
++    "already_signed_site_peels_and_normalises_to_plain (site-kind dimension, "
++    "not a shape)",
++    "already_signed_site_peels_by_xor_into_addend (site-kind dimension, "
++    "not a shape)",
+ )
+ 
+ 
+@@ -312,6 +318,17 @@ class Fixture:
+     shape: Shape
+     expected: int
+     note: str
++    # Discriminating fixtures (added with the fixpoint correction) pin the
++    # shapes where the landed rule and the specified rule DISAGREE: the
++    # Rust test asserts `expected`, which only the specified rule meets.
++    # `landed_expected` records what the landed rule did there -- the wrong
++    # answer for the two unsound shapes (it deleted a Neg under a surviving
++    # reader), the missed fold for the third -- so the fixture doubles as
++    # the historical record of the defect. Non-discriminating fixtures
++    # (every test that predates the correction) keep the original contract:
++    # the landed rule must reproduce them too, which is why the gap went
++    # unnoticed -- the two rules agree on all of them.
++    landed_expected: int | None = None
+ 
+ 
+ FIXTURES: tuple[Fixture, ...] = (
+@@ -360,6 +377,27 @@ FIXTURES: tuple[Fixture, ...] = (
+     Fixture("source_spans_stay_aligned (shape half)",
+             Shape(((1, 0), (5, 4)), ((1, 1), (5, 1))), 2,
+             "the same shape as both_sides_negated; spans must stay parallel"),
++    # The three chain-shape tests added with the fixpoint correction
++    # (PR #574 follow-up). The first is the shipped defect's own shape --
++    # the fma site reads the INNER link while the OUTER has a surviving
++    # non-peeling read; the landed rule deletes the inner underneath the
++    # outer (16.24% of this space), the one-line reader-side flip still
++    # misses the dead-reader variant, only the closure is safe.
++    Fixture("chained_negation_with_surviving_outer_reader_is_never_deleted",
++            Shape(((1, 0), (2, 1)), ((1, 1),), ((2, 1),)), 0,
++            "the shipped defect: fma reads the inner, the outer has an "
++            "external reader -- BOTH stay materialised",
++            landed_expected=1),
++    Fixture("chained_negation_with_dead_outer_reader_stays_put",
++            Shape(((1, 0), (2, 1)), ((1, 1),)), 0,
++            "the one-line repair's miss: the dead outer link still pins "
++            "the inner; dead code is DCE's business",
++            landed_expected=1),
++    Fixture("outer_neg_peels_when_the_inner_neg_is_pinned",
++            Shape(((1, 0), (2, 1)), ((2, 1),), ((1, 1),)), 1,
++            "the fold the source-poisoned rule missed: the pinned inner "
++            "keeps its mask, the outer peels into the family",
++            landed_expected=0),
+ )
+ 
+ # --------------------------------------------------------------------------- #
+@@ -465,10 +503,12 @@ def check_fixtures(quiet: bool) -> tuple[bool, list[dict]]:
+     for f in FIXTURES:
+         spec = len(rule_closure(f.shape))
+         landed = len(rule_landed(f.shape))
+-        good = spec == f.expected and landed == f.expected
++        want_landed = f.landed_expected if f.landed_expected is not None else f.expected
++        good = spec == f.expected and landed == want_landed
+         ok &= good
+         rows.append({"name": f.name, "expected": f.expected, "closure": spec,
+-                     "landed": landed, "ok": good, "note": f.note})
++                     "landed": landed, "landed_expected": want_landed,
++                     "ok": good, "note": f.note})
+         if not quiet:
+             mark = "ok " if good else "BAD"
+             print(f"  [{mark}] {f.name:56s} expected {f.expected} | "
+-- 
+2.47.3
+
+
+From db19dbd0104ed0ef26a0489c4650864f2a1d0182 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Mon, 21 Sep 2026 18:45:23 +0000
+Subject: [PATCH 3/3] tests+docs: the chain-shape gates and the fixpoint
+ follow-up record
+
+The cross-PR batteries gain the three chain shapes end-to-end: the
+defect's own (fma reads the inner negation, the outer survives for the
+add -- nothing peels, bit-exact vs the reference compiler which also
+materialises both links), the pinned-inner fold (one sign mask and a
+vfnmadd reading the materialised inner), and the full-chain cancel to
+the plain family. The ISA gate pins their asm exactly at both
+-mno-avx2 spellings: chain_live keeps exactly two sign masks and takes
+no sign latitude; chain_pin keeps one mask and folds to one vfnmadd;
+shared_neg keeps zero masks and two vfnmsub. The shared-negation xorpd
+pin was vacuous for every 4b target (\bxorpd\b can never match the VEX
+spelling vxorpd -- no word boundary between v and x); it now matches
+both spellings and the counts are re-verified by hand.
+
+The batteries carry matched-arch .flags for the general suite's raw
+oracle: they are contraction-sensitive by design (their sections pin
+FMA family selection and the negation peel, and the default baseline
+here contracts where the reference compiler's own default keeps the
+libm call and double-rounds a*b+c), so the well-posed oracle is the
+matched arch -- bit-exact raw, including NaN signs. The documented
+C11 6.5p8 NaN-sign latitude is additionally canonicalised at print
+time inside the batteries, for the consumers that compare across
+baselines (the dedicated gate's SSE2 config). Input echoes and
+promoted-table loads stay raw.
+
+fma_isa_gate.c gains the two chain functions before shared_neg (the
+per-function sed ranges stay disjoint) with the defect story in the
+comments. The audit record gains defect 0 (the fixpoint direction,
+the post-merge review's finding, adjudicated and extended with the
+Signed-site closure), the git-verified test-count decomposition, and
+the follow-up session's validation record.
+---
+ .../FOLLOWUP-2026-09-22-pr574-ten-pr-audit.md | 104 ++++++++++++++++-
+ tests/regression/check_vectorize_isa_gate.sh  |  26 ++++-
+ tests/regression/cross_pr_redteam.c           | 109 +++++++++++++-----
+ tests/regression/cross_pr_redteam.flags       |   1 +
+ tests/regression/cross_pr_redteam2.c          |  13 ++-
+ tests/regression/cross_pr_redteam2.flags      |   1 +
+ tests/regression/fma_isa_gate.c               |  26 +++++
+ 7 files changed, 243 insertions(+), 37 deletions(-)
+ create mode 100644 tests/regression/cross_pr_redteam.flags
+ create mode 100644 tests/regression/cross_pr_redteam2.flags
+
+diff --git a/engineering/FOLLOWUP-2026-09-22-pr574-ten-pr-audit.md b/engineering/FOLLOWUP-2026-09-22-pr574-ten-pr-audit.md
+index 83528815..1c9011d9 100644
+--- a/engineering/FOLLOWUP-2026-09-22-pr574-ten-pr-audit.md
++++ b/engineering/FOLLOWUP-2026-09-22-pr574-ten-pr-audit.md
+@@ -144,13 +144,47 @@ at the pr568 session stands; the corpus re-ran green today (723 PASS /
+ ### PR; the fixes folded into it were verified with negative controls
+ ### at delivery and the realmode corpus re-runs green)
+ 
+-## The two defects this audit found (both fixed, both gated)
++## The defects this record covers (all fixed, all gated)
 +
-+repo=$(cd "$(dirname "$0")/../.." && pwd)
-+CCC=${LCCC:-$repo/target/fastbuild/lccc}
-+if [ -x "$CCC" ]; then CCC=$(cd "$(dirname "$CCC")" && pwd)/$(basename "$CCC"); fi
-+ORACLE=${CCC_ORACLE_CC:-}
-+if [ -z "$ORACLE" ]; then
-+    for c in cc gcc clang; do
-+        if command -v "$c" >/dev/null 2>&1; then ORACLE=$c; break; fi
-+    done
-+fi
-+if [ -z "$ORACLE" ]; then
-+    echo "cross-pr-redteam: no reference compiler (cc/gcc/clang) found" >&2
-+    exit 2
-+fi
++0. **The fixpoint's poison direction (found by the post-merge review,
++   PR #574 follow-up)**: the multi-use rule shipped with badness
++   propagating from a Neg's SOURCE to its reader — the exact inverse of
++   the invariant the same patch documented. A Neg read by an fma site
++   AND by a surviving outer Neg was classified absorbable, rewritten,
++   and deleted while the outer link still named it: a live ICE on
++   `t=-x; u=-t; r=fma(t,b,c); return r+u` at -O1/-O2/-O3 (x86 codegen:
++   `value has no register, stack slot, Copy, or GlobalAddr definition`),
++   invisible to the armed corpus because nothing verified after the
++   peel (it was the last IR transform). The one-line edge flip the
++   review note proposed is NOT sufficient (its own model enumeration:
++   90/4545 shapes still unsafe — a surviving reader that no fma chain
++   reaches); the correct rule is the GREATEST FIXPOINT over the reader
++   closure and the fma-reachability TOGETHER (model: 0/4545 unsafe,
++   0/162009 at width 4; and it folds MORE than the shipped rule —
++   1752 vs 1722 shapes — because the source-poisoned direction also
++   over-pinned chains whose inner link alone was external). Fix landed
++   with: the closure fixpoint (`tools/ir_shape_check.py` keeps both
++   failure modes pinned as negative controls); a self-enforcing
++   pre-sweep assert on the ACTUAL decision set; `verify_after_pass`
++   wired after the peel at both call sites; the peel extended to
++   already-Signed sites (families compose by XOR, full cancel
++   normalises to plain) so every `FmaArg`-classified read truly
++   disappears — the classification is true by construction, not by the
++   coincidence of `VecMadd*` reads pinning the Neg; 5 new unit tests
++   (16 → 21); the chain shapes in the batteries + the ISA-gate asm
++   pins. The verify wiring immediately caught a SECOND latent
++   malformation: `vector_temp_promote` leaves `Alloca` defs below the
++   intrinsics that use them as `dest_ptr` (inlined-callee param slots
++   positioned after the caller's producers) — benign for codegen but
++   an IR-contract violation; fixed with a block-head alloca hoist
++   (Alloca reads no operand, so the move is semantics-preserving).
+ 
+ 1. **The multi-use peel rejection** (root cause in #572's grammar,
+    measured via #573's residual): fixed with the absorbability
+    fixpoint; `fma(-a,-a,c)` now cancels like GCC; the phi shape went
+    from `vxorpd+vxorpd+vfmadd+vfmadd` to two `vfnmsub231sd`; the full
+-   edge matrix is bit-identical to GCC at matched march.
++   edge matrix is bit-identical to GCC at matched march. (The fixpoint's
++   own direction bug is defect 0 above.)
+ 2. **`-mno-avx2` killed the VEX encoding, not the 256-bit class**: the
+    flag set `avx_explicitly_disabled`, so `x86_isa().avx` went false
+    and `normalized()`'s `fma && avx` declined the FMA fold —
+@@ -209,8 +243,68 @@ at the pr568 session stands; the corpus re-ran green today (723 PASS /
+   PASS. Env hygiene, parity (48 commands) PASS.
+ * Regression corpus: 723 PASS / 3 known-env i686 multilib / 17 skip,
+   AB-diff 0. Benchmark output oracle: 204/204.
+-* cargo test: the peel's 16/16 (11 pre-existing incl. the flipped
+-  two-position pin + 5 new multi-use/chain/cross-block/external-reader
+-  tests).
++* cargo test: the peel's 21/21 — 12 pre-fix tests carried over, of
++  which the two-position pin was REWRITTEN in place
++  (`same_value_in_two_positions_is_not_absorbed` → `..._cancels_to_plain`),
++  plus 4 new multi-use/chain/cross-block/external-reader tests and (with
++  the fixpoint correction) 5 more: the shipped defect's shape, the
++  dead-outer-reader control, the pinned-inner fold, and the two
++  already-Signed-site XOR compositions.
+ * Oracle: phi_fma 22 → 20 insns (gcc 10, clang/icx 12) — the family
+   selection is now GCC-exact; the remainder is the staging residual #1.
 +
-+td=$(mktemp -d)
-+trap 'rm -rf "$td"' EXIT
-+fail=0
-+n_cfg=0
++## Post-merge follow-up (2026-09-23, the fixpoint correction)
 +
-+# Normalise canonical NaN encodings on both sides of the comparison:
-+# quiet double NaN 7ff8/fff8..0, quiet float NaN 7fc/ffc..0. Payloads
-+# beyond the quiet bit cannot occur here (all inputs are canonical).
-+normalise() {
-+    sed -E 's/\b(7|f)ff8[0-9a-f]{12}\b/NAN64/g; s/\b(7|f)fc[0-9a-f]{6}\b/NAN32/g' "$1"
-+}
++The post-merge review correctly flagged the multi-use fixpoint's poison
++direction (defect 0 above). Adjudication summary, with every claim
++re-verified against the tree and empirically:
 +
-+run_cfg() { # run_cfg <label> <lccc-flags...>
-+    local label=$1; shift
-+    local src out
-+    n_cfg=$((n_cfg + 1))
-+    for src in cross_pr_redteam.c cross_pr_redteam2.c; do
-+        out=$td/${label}-$(basename "$src" .c)
-+        if ! "$CCC" "$@" -o "$out.bin" "$repo/tests/regression/$src" -lm 2>"$out.cerr"; then
-+            echo "FAIL: $label $src did not compile" >&2
-+            cat "$out.cerr" >&2
-+            fail=1
-+            continue
-+        fi
-+        if ! "$out.bin" > "$out.lccc" 2>&1; then
-+            echo "FAIL: $label $src exited non-zero" >&2
-+            fail=1
-+        fi
-+    done
-+}
++* CONFIRMED live: the chain shape ICEs the shipped compiler at
++  -O1/-O2/-O3 (x86 emit guard); the IR dump shows the deleted inner Neg
++  under the surviving outer read. -O0 is unaffected (GCC-matched gate).
++* CONFIRMED: the review's own one-line remedy is insufficient — its
++  harness (landed here as tools/ir_shape_check.py, 4545 shapes at width
++  3, 162009 at width 4) reproduces 738/4545 unsafe for the shipped rule,
++  90/4545 for the edge flip, 0 for the reader-closure fixpoint.
++* DEVIATED from the review's work order where it was wrong: its STEP 4a
++  and 4c test sketches are the SAFE MIRRORS of the defect shapes (the
++  site reading the OUTER link), which pass on the shipped rule too —
++  false greens. The landed tests use the discriminating shapes (site
++  reads the INNER link; pinned-inner fold). The review's "5 added" test
++  count was also wrong (git: 4 added + 1 rewritten); the doc
++  parenthetical is now the git-verified decomposition.
++* EXTENDED beyond the work order: the peel now also absorbs Negs off
++  already-Signed FmaScalar sites (XOR composition, cancel normalises to
++  plain). Rationale: the FmaArg classification claimed Signed-site reads
++  disappear, but Pass 2 never rewrote Signed sites — sound today only
++  because the vector main lanes pin the Neg (VecMadd reads classify as
++  Other). The audit's residual #2 (the map-side multi-use peel) removes
++  exactly that pin; the class is closed by making the classification
++  true instead of coincidentally conservative.
++* The new verify hooks (both peel call sites) caught a second latent
++  IR-contract violation on their first armed corpus run:
++  vector_temp_promote rewrites producer dest_ptrs to slots whose Alloca
++  sits below them (inlined-callee param slots after the caller's
++  producers). Fixed with a block-head Alloca hoist (no operands, no
++  semantics change; spans in lockstep).
++* Suite integration gaps closed: the batteries now carry matched-arch
++  .flags (the suite's raw oracle was comparing lccc's default-v3
++  contractions against the reference compiler's default no-FMA
++  double-rounding — the C11 6.5p8 latitude, bit-visible in phi_fma's
++  1-ulp rows and bracket_signed's NaN signs; the matched oracle is
++  bit-exact RAW, NaN normalisation kept at print time for the
++  dedicated gate's cross-baseline configs), and the ISA gate's
++  shared-negation xorpd pin was vacuous for VEX (`\bxorpd\b` can never
++  match `vxorpd` — no word boundary between v and x) — now `v?xorpd`,
++  with the counts re-verified by hand.
 +
-+cmp_cfg() { # cmp_cfg <label> <oracle-flags...>
-+    local label=$1; shift
-+    local src ref out
-+    for src in cross_pr_redteam.c cross_pr_redteam2.c; do
-+        ref=$td/${label}-$(basename "$src" .c).ref
-+        out=$td/${label}-$(basename "$src" .c)
-+        if ! "$ORACLE" -O2 "$@" -o "$td/ref.bin" "$repo/tests/regression/$src" -lm 2>/dev/null; then
-+            echo "FAIL: oracle could not compile $src ($*)" >&2
-+            fail=1
-+            continue
-+        fi
-+        if ! "$td/ref.bin" > "$ref" 2>&1; then
-+            echo "FAIL: oracle binary of $src exited non-zero" >&2
-+            fail=1
-+            continue
-+        fi
-+        if ! diff <(normalise "$ref") <(normalise "$out.lccc") > "$out.diff"; then
-+            echo "FAIL: $label $src differs from the oracle:" >&2
-+            head -20 "$out.diff" >&2
-+            fail=1
-+        fi
-+    done
-+}
-+
-+# ---- 1. matched v3: the mainline contract (families, packs, brackets) ------
-+run_cfg v3 -O2 -march=x86-64-v3
-+cmp_cfg v3 -march=x86-64-v3
-+
-+# ---- 2. -O3 on top: unrolling + the full pipeline over the same shapes ----
-+run_cfg O3 -O3 -march=x86-64-v3
-+cmp_cfg O3 -march=x86-64-v3
-+
-+# ---- 3. the AVX1+FMA target class: VEX.128 stays, 256-bit goes ------------
-+# (the -mno-avx2 fix: the scalar FMA families must stay inline here)
-+run_cfg avx1 -O2 -march=x86-64-v3 -mno-avx2
-+cmp_cfg avx1 -march=x86-64-v3 -mno-avx2
-+# ymm denial is pinned by check_vectorize_isa_gate.sh; here pin that the
-+# AVX1-class build keeps the negated FMA families (no libm fallback):
-+"$CCC" -O2 -march=x86-64-v3 -mno-avx2 -S "$repo/tests/regression/cross_pr_redteam.c" \
-+    -o "$td/avx1.s" 2>/dev/null
-+if [ "$(grep -cE '\bvfn(madd|sub)[0-9]*p?s[dd]?\b' "$td/avx1.s" || true)" -eq 0 ]; then
-+    echo "FAIL: AVX1-class target lost the negated FMA families" >&2
-+    fail=1
-+fi
-+if [ "$(grep -c 'fma@PLT' "$td/avx1.s" || true)" -ne 0 ]; then
-+    echo "FAIL: AVX1-class target regressed to the fma libcall" >&2
-+    fail=1
-+fi
-+
-+# ---- 4. the SSE2 baseline (no FMA at all): pure uncontracted parity -------
-+run_cfg base -O2 -march=x86-64
-+cmp_cfg base -march=x86-64
-+
-+if [ "$fail" -eq 0 ]; then
-+    echo "cross-PR red-team gate: PASS ($n_cfg build configurations, 4 oracle comparisons x 2 batteries)"
-+else
-+    echo "cross-PR red-team gate: FAIL" >&2
-+fi
-+exit $fail
++Validation at the follow-up tip: cargo 3080/0; peel 21/21; harness
++fixtures ok + closure 0 unsafe (both widths) + controls ok; corpus 725
++PASS / 3 known-env i686 / 17 skip / AB-diff 0 with CCC_VERIFY_IR=abort
++armed; cross-PR gate 4x2 bit-exact; ISA gate with the new chain pins
++(chain_live: exactly 2 sign masks, 0 negated families; chain_pin: 1
++mask + 1 vfnmadd; shared_neg: 0 masks + 2 vfnmsub); ci_local --fast
++55/0/4; rustfmt + clippy (lib/tests/bins) clean; CCC_VERIFY_IR=abort
++matrix 30/30 (batteries + chain repro, -O1/-O2/-O3, with/without
++-mno-avx2 -mfma); the live repro computes GCC's exact -5 at every
++optimisation level.
 diff --git a/tests/regression/check_vectorize_isa_gate.sh b/tests/regression/check_vectorize_isa_gate.sh
-index c9c9182c..4fbf9c68 100644
+index 4fbf9c68..e5852325 100644
 --- a/tests/regression/check_vectorize_isa_gate.sh
 +++ b/tests/regression/check_vectorize_isa_gate.sh
-@@ -110,10 +110,43 @@ check_eq "kernel ISA flags at -O3: ARX chacha20_block xmm refs" \
- # ---- 4. FMA3 gate ----------------------------------------------------------
- "$ccc" -O2 -S "$fmasrc" -o "$tmp/fma-default.s"
- check_gt0 "default fmaf folds to vfmadd" "$(count_vfmadd $tmp/fma-default.s)"
--for flag in -mno-fma -mno-avx; do
-+for flag in -mno-fma -mno-avx -march=x86-64-v2; do
-     "$ccc" -O2 "$flag" -S "$fmasrc" -o "$tmp/fma.s"
-     check_eq "$flag: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
+@@ -137,15 +137,39 @@ for flag in "-mno-avx2" "-march=x86-64-v3 -mno-avx2"; do
+     # The multi-use negation shape: both fma sites fold, the xorpd bracket
+     # dies with them. (lccc emits no .size directives; the function range
+     # ends at the next column-0 label, which is `main:` in this corpus.)
++    # NOTE the regex: `\bxorpd\b` can never match the VEX spelling `vxorpd`
++    # (no word boundary between v and x), and every 4b target is VEX, so
++    # the pin must be `v?xorpd` to see anything at all.
+     check_eq "$flag: shared-negation shape leaves no sign-mask xorpd" \
+         "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
+-          | grep -cE '\bxorpd\b' || true)" 0
++          | grep -cE '\bv?xorpd\b' || true)" 0
+     check_gt0 "$flag: shared-negation shape folds (two vfnmsub present)" \
+         "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
+           | grep -cE '\bvfnmsub[0-9]*p?sd\b' || true)"
+     check_eq "$flag: shared-negation shape is exactly two vfnmsub" \
+         "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
+           | grep -cE '\bvfnmsub[0-9]*p?sd\b' || true)" 2
++    # The chain shapes (the fixpoint correction). chain_live: the fma reads
++    # the INNER negation while the OUTER survives for the add -- both links
++    # materialise (exactly two sign masks) and NO latitude is taken (the
++    # family stays plain: zero negated families). The source-poisoned rule
++    # deleted the inner link under the outer's surviving read -- an ICE.
++    check_eq "$flag: live-outer chain keeps exactly two sign masks" \
++        "$(sed -n '/^chain_live:/,/^chain_pin:/p' "$tmp/fma-$lbl.s" \
++          | grep -cE '\bv?xorpd\b' || true)" 2
++    check_eq "$flag: live-outer chain takes no sign latitude (no vfnm*)" \
++        "$(sed -n '/^chain_live:/,/^chain_pin:/p' "$tmp/fma-$lbl.s" \
++          | grep -cE '\bvfnm(add|sub)[0-9]*p?sd\b' || true)" 0
++    # chain_pin: the INNER negation is pinned by the add, the site reads
++    # the OUTER -- which peels into the family reading the materialised
++    # inner: ONE sign mask and one vfnmadd (GCC's exact shape; the
++    # source-poisoned rule kept both masks).
++    check_eq "$flag: pinned-inner chain keeps exactly one sign mask" \
++        "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
++          | grep -cE '\bv?xorpd\b' || true)" 1
++    check_eq "$flag: pinned-inner chain folds to one vfnmadd" \
++        "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
++          | grep -cE '\bvfnmadd[0-9]*p?sd\b' || true)" 1
  done
-+# ---- 4b. -mno-avx2: the AVX1+FMA target class -------------------------------
-+# AVX2 is the 256-bit integer class, a strict SUBSET of the VEX encoding:
-+# `-mno-avx2` must remove ymm code but keep the VEX.128 world — including
-+# every scalar FMA family (plain AND signed). The pre-fix ISA ceiling killed
-+# `avx` on this flag, so `fma(-a,b,-c)` at `-mno-avx2` was two `xorpd` and a
-+# libm call where GCC emits one `vfnmsub132sd`; the plain family declined
-+# the same way. Both spellings of the target (default baseline minus AVX2,
-+# and an explicit v3 profile minus AVX2) are pinned, plus the ymm denial.
-+count_fma_family() {
-+    grep -cE '\bv(fm|fnm)(add|sub)[0-9]*p?s[sd]?\b|\bv(fm|fnm)(add|sub)' "$1" || true
-+}
-+for flag in "-mno-avx2" "-march=x86-64-v3 -mno-avx2"; do
-+    lbl=$(echo "$flag" | tr -d ' =-')
-+    "$ccc" -O2 $flag -S "$fmasrc" -o "$tmp/fma-$lbl.s"
-+    check_gt0 "$flag: scalar FMA families stay inline" \
-+        "$(count_fma_family $tmp/fma-$lbl.s)"
-+    check_gt0 "$flag: the negated families (vfnmsub et al) stay inline" \
-+        "$(grep -cE '\bvfnm(add|sub)[0-9]*p?s[dd]?\b' "$tmp/fma-$lbl.s" || true)"
-+    check_eq "$flag: no libm fma call" "$(grep -c 'fma@PLT' "$tmp/fma-$lbl.s" || true)" 0
-+    check_eq "$flag: no 256-bit code" "$(count_ymm "$tmp/fma-$lbl.s")" 0
-+    # The multi-use negation shape: both fma sites fold, the xorpd bracket
-+    # dies with them. (lccc emits no .size directives; the function range
-+    # ends at the next column-0 label, which is `main:` in this corpus.)
-+    check_eq "$flag: shared-negation shape leaves no sign-mask xorpd" \
-+        "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
-+          | grep -cE '\bxorpd\b' || true)" 0
-+    check_gt0 "$flag: shared-negation shape folds (two vfnmsub present)" \
-+        "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
-+          | grep -cE '\bvfnmsub[0-9]*p?sd\b' || true)"
-+    check_eq "$flag: shared-negation shape is exactly two vfnmsub" \
-+        "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
-+          | grep -cE '\bvfnmsub[0-9]*p?sd\b' || true)" 2
-+done
  # The kernel's no-SSE contract also rejects live scalar FP: x86-64 LCCC has
  # no x87 lowering, and silently accepting this TU would be worse than a clear
- # diagnostic.  Keep the FMA gate assertion separate from that diagnostic.
 diff --git a/tests/regression/cross_pr_redteam.c b/tests/regression/cross_pr_redteam.c
-new file mode 100644
-index 00000000..c9c83f08
---- /dev/null
+index c9c83f08..015a9f98 100644
+--- a/tests/regression/cross_pr_redteam.c
 +++ b/tests/regression/cross_pr_redteam.c
-@@ -0,0 +1,293 @@
-+/* Cross-PR interaction red-team battery (session 574).
-+ *
-+ * Every shape here stresses an interaction BETWEEN the feature areas of the
-+ * last ten merged PRs, not the features in isolation (the per-PR gates
-+ * already do that).  The runtime contract is bit-exact against GCC for
-+ * everything that contains __builtin_fma (both compilers contract by
-+ * default and fma is uniquely correctly-rounded, so contracted-vs-
-+ * contracted is bit-identical by definition) and against
-+ * gcc -ffp-contract=off for the shapes lccc deliberately leaves
-+ * uncontracted (the documented residuals).
-+ */
-+#include <math.h>
-+#include <stdio.h>
-+#include <stdint.h>
-+#include <string.h>
-+
-+static const double wtbl[8] = { 1.5, -2.25, 3.125, -4.0625, 5.03125,
-+                                -6.015625, 7.0078125, -8.00390625 };
-+static const uint32_t itbl[8] = { 0u, 1u, 0xFFFFFFFFu, 0x80000000u,
-+                                  0x0000FFFFu, 0xFFFF0000u, 0xA5A5A5A5u,
-+                                  0x5A5A5A5Au };
-+
-+/* ---- 1. FMA x vector-copy-elimination: temporaries in copy brackets,
-+ *         a call inside the bracket, all four families. ---- */
-+static double bracket_plain(double a, double b, double c) {
-+    double t = a;                       /* copy-in bracket */
-+    double r = __builtin_fma(t, b, c);  /* plain family */
-+    double u = r;                       /* copy-out bracket */
-+    volatile double sink = u;           /* a use */
-+    return u + sink - sink;
+@@ -112,7 +112,8 @@ static void alias_loop(const double *x, double *r, int n) {
+     for (int i = 0; i < n; i++) r[i] = __builtin_fma(x[i], x[i], x[i]);
+ }
+ 
+-/* ---- 7. FMA multi-use negation (peel grammar: single-use only) ---- */
++/* ---- 7. FMA multi-use negation (peel grammar: the absorbability
++ *         fixpoint) ---- */
+ static double neg_twouse(double a, double b, double c) {
+     double n = -a;
+     double r1 = __builtin_fma(n, b, c);
+@@ -123,6 +124,34 @@ static double neg_int_reject(int a, double b, double c) {
+     /* integer Neg in the product position must NOT peel */
+     return __builtin_fma((double)(-a), b, c);
+ }
++static double neg_chain_live_outer(double x, double b, double c) {
++    /* The chain defect's own shape: the fma reads the INNER negation while
++     * the OUTER negation survives for the add. NEITHER may peel (the outer
++     * is pinned by the add; the inner is the outer's operand) -- the
++     * source-poisoned rule deleted the inner underneath the outer's
++     * surviving read and reached codegen as an ICE. Bit-exact vs gcc,
++     * which materialises both links for this shape too. */
++    double t = -x;
++    double u = -t;
++    double r = __builtin_fma(t, b, c);
++    return r + u;
 +}
-+static double bracket_signed(double a, double b, double c) {
-+    double t = -a;
-+    double r = __builtin_fma(t, b, -c); /* vfnmsub family */
-+    double u = r;
-+    if (u > 1e300) { printf("!"); }     /* branch inside bracket */
-+    return u;
++static double neg_chain_pinned_inner(double x, double b, double c) {
++    /* The fold the source-poisoned rule missed: the INNER negation is
++     * pinned by the add, the site reads the OUTER. The outer peels into
++     * the family reading the materialised inner -- one sign mask, not two
++     * (vfnmadd + vxorpd + vaddsd, GCC's exact shape). */
++    double t = -x;
++    double r = __builtin_fma(-t, b, c);
++    return r + t;
 +}
-+static double bracket_call(double a, double b, double c) {
-+    double t = a;
-+    double m = __builtin_fma(t, b, c);
-+    double u = sqrt(m);                 /* call inside the bracket */
-+    double v = __builtin_fma(u, b, c);  /* family again after the call */
-+    return v;
++static double neg_chain_full(double x, double b, double c) {
++    /* Both links die: the site peels the whole chain and lands on the
++     * PLAIN family reading x (two flips cancel). */
++    double t = -x;
++    double u = -t;
++    return __builtin_fma(u, b, c);
 +}
-+
-+/* ---- 2. FMA x if-conversion / range-fusion: select arms over FMA. ---- */
-+static double sel_fma(double a, double b, double c, int k) {
-+    /* The compare feeds the select; both arms contract. */
-+    return k > 0 ? __builtin_fma(a, b, c) : __builtin_fma(a, -b, -c);
+ 
+ /* ---- 8. Wide SLP FMA packs (the P0 width fix: F64x4 / F32x8 must go
+  *         through the 256-bit families) mixed with Forward splats. ---- */
+@@ -185,6 +214,25 @@ static int same(double a, double b) {
+     if (isnan(a) && isnan(b)) return 1;
+     return fbits(a) == fbits(b);
+ }
++/* Print-time canonical-NaN normalisation (the C11 6.5p8 latitude, the
++ * same one the dedicated gate normalises in its diff): when an fma
++ * operand is NaN, WHICH NaN the operation propagates -- and with which
++ * sign -- is implementation-defined. The default baseline here differs
++ * on purpose from the reference compiler's (house v3 default contracts
++ * __builtin_fma into the hardware family, which propagates a source
++ * NaN's sign UNNEGATED, CPU-verified; the reference compiler at its own
++ * default keeps the libm call, which propagates the first NaN operand's
++ * sign). Both are conforming, so the printed oracle canonicalises every
++ * NaN on BOTH sides; every other bit -- including -0.0 signs -- stays
++ * bit-exact, and the asm pins in check_cross_pr_redteam.sh fix the exact
++ * family selection. */
++static uint64_t nbits(double d) {
++    return isnan(d) ? 0x7ff8000000000000ULL : fbits(d);
 +}
-+static double sel_fma_acc(double a, double b, double c, int k) {
-+    double acc = c;
-+    if (k & 1) acc = __builtin_fma(a, b, acc);
-+    if (k & 2) acc = __builtin_fma(-a, b, acc);
-+    return acc;
++static uint32_t nbits32(float f) {
++    uint32_t u; memcpy(&u, &f, 4);
++    return isnan(f) ? 0x7fc00000u : u;
 +}
-+
-+/* ---- 3. FMA x phi-diamond hoisting: hoistable register inits + fma
-+ *         arms on both sides. ---- */
-+static double phi_fma(double a, double b, double c, int k) {
-+    double hi = 1.5;                    /* hoistable immediate init */
-+    double lo = a;                      /* hoistable register init */
-+    if (k) { hi = __builtin_fma(hi, b, c); lo = __builtin_fma(lo, b, c); }
-+    else   { hi = __builtin_fma(hi, -b, -c); lo = __builtin_fma(lo, -b, -c); }
-+    return hi * 3.0 + lo;
-+}
-+
-+/* ---- 4. FMA x constant-array promotion: weighted dot with the table
-+ *         in .rodata (the promotion pass must not break the contraction
-+ *         or the values). ---- */
-+static double const_dot(const double *x, int n) {
-+    double s = 0.0;
-+    for (int i = 0; i < n && i < 8; i++)
-+        s = __builtin_fma(wtbl[i], x[i], s);
-+    return s;
-+}
-+static double const_dot_map(const double *x, double *r, double bias, int n) {
-+    double s = 0.0;
-+    for (int i = 0; i < n && i < 8; i++) {
-+        r[i] = __builtin_fma(wtbl[i], x[i], bias);   /* map family */
-+        s += r[i];
-+    }
-+    return s;
-+}
-+
-+/* ---- 5. NonZero x constant-array promotion: guarded clz/ctz over the
-+ *         promoted table (the guard-select collapse must still reject
-+ *         the NonZero variants — values 0 and 1 are in the table). ---- */
-+static uint32_t nz_scan(uint32_t k) {
-+    uint32_t acc = 0;
-+    for (int i = 0; i < 8; i++) {
-+        uint32_t v = itbl[i] ^ k;
-+        if (v) acc += (uint32_t)__builtin_clz(v);
-+    }
-+    return acc;
-+}
-+static uint32_t nz_ctz(uint32_t k) {
-+    uint32_t acc = 0;
-+    for (int i = 0; i < 8; i++) {
-+        uint32_t v = itbl[i] + k;
-+        acc += v ? (uint32_t)__builtin_ctz(v) : 32u;
-+    }
-+    return acc;
-+}
-+
-+/* ---- 6. FMA aliased operands (documented residual: ordinary path;
-+ *         must be CORRECT — bit-exact vs gcc since both contract). ---- */
-+static double alias_xx(double x, double c) { return __builtin_fma(x, x, c); }
-+static double alias_ss(double x, double s) { return __builtin_fma(x, s, s); }
-+static void alias_loop(const double *x, double *r, int n) {
-+    for (int i = 0; i < n; i++) r[i] = __builtin_fma(x[i], x[i], x[i]);
-+}
-+
-+/* ---- 7. FMA multi-use negation (peel grammar: single-use only) ---- */
-+static double neg_twouse(double a, double b, double c) {
-+    double n = -a;
-+    double r1 = __builtin_fma(n, b, c);
-+    double r2 = __builtin_fma(n, b, -c);
-+    return r1 - r2;
-+}
-+static double neg_int_reject(int a, double b, double c) {
-+    /* integer Neg in the product position must NOT peel */
-+    return __builtin_fma((double)(-a), b, c);
-+}
-+
-+/* ---- 8. Wide SLP FMA packs (the P0 width fix: F64x4 / F32x8 must go
-+ *         through the 256-bit families) mixed with Forward splats. ---- */
-+static void wide_f64(const double *a, const double *b, double s,
-+                     double *r) {
-+    double t0 = __builtin_fma(a[0], s, b[0]);
-+    double t1 = __builtin_fma(a[1], s, b[1]);
-+    double t2 = __builtin_fma(a[2], s, b[2]);
-+    double t3 = __builtin_fma(a[3], s, b[3]);
-+    r[0] = t0; r[1] = t1; r[2] = t2; r[3] = t3;
-+}
-+static void wide_f32(const float *a, const float *b, float s, float *r) {
-+    float t0 = __builtin_fmaf(a[0], s, b[0]);
-+    float t1 = __builtin_fmaf(a[1], s, b[1]);
-+    float t2 = __builtin_fmaf(a[2], s, b[2]);
-+    float t3 = __builtin_fmaf(a[3], s, b[3]);
-+    float t4 = __builtin_fmaf(a[4], s, b[4]);
-+    float t5 = __builtin_fmaf(a[5], s, b[5]);
-+    float t6 = __builtin_fmaf(a[6], s, b[6]);
-+    float t7 = __builtin_fmaf(a[7], s, b[7]);
-+    r[0]=t0; r[1]=t1; r[2]=t2; r[3]=t3; r[4]=t4; r[5]=t5; r[6]=t6; r[7]=t7;
-+}
-+static void wide_signed_f64(const double *a, const double *b, double s,
-+                            double *r) {
-+    r[0] = __builtin_fma(-a[0], s, -b[0]);
-+    r[1] = __builtin_fma(-a[1], s, -b[1]);
-+    r[2] = __builtin_fma(-a[2], s, -b[2]);
-+    r[3] = __builtin_fma(-a[3], s, -b[3]);
-+}
-+
-+/* ---- 9. FMA x peephole store machinery: stores that need the
-+ *         whitespace-invariant matcher (operand spacing varies with the
-+ *         emitter path taken). ---- */
-+static void store_mix(double * restrict r, const double * restrict a,
-+                      double s, int n) {
-+    for (int i = 0; i < n; i++)
-+        r[i] = __builtin_fma(a[i], s, r[i]);   /* in-place acc stream */
-+}
-+
-+/* ---- 10. Everything stacked: range fusion + select + copy brackets +
-+ *          wide packs + table promotion in one function. ---- */
-+static double kitchen(const double *x, double *r, double bias, int n,
-+                      int k) {
-+    double acc = bias;
-+    for (int i = 0; i < n; i++) {
-+        double w = (i & 4) ? wtbl[i & 7] : -wtbl[i & 7];
-+        double v = k > 0 ? __builtin_fma(w, x[i], bias)
-+                         : __builtin_fma(-w, x[i], -bias);
-+        r[i] = v;
-+        acc += v;
-+    }
-+    return acc;
-+}
-+
-+/* ---------------- driver ---------------- */
-+static uint64_t fbits(double d) {
-+    uint64_t u; memcpy(&u, &d, 8); return u;
-+}
-+static int same(double a, double b) {
-+    if (isnan(a) && isnan(b)) return 1;
-+    return fbits(a) == fbits(b);
-+}
-+
-+int main(void) {
-+    static const double xs[] = { 0.0, -0.0, 1.0, -1.0, 0.5, INFINITY,
-+                                 -INFINITY, NAN, 1e308, 1e-308, 3.14159,
-+                                 -2.71828, 65536.0, 1e-300, -1e300, 42.0 };
-+    static const float  fs[] = { 0.0f, -0.0f, 1.0f, -1.0f, 0.5f, INFINITY,
-+                                 -INFINITY, NAN, 1e30f, 1e-30f, 3.14f };
-+    enum { NX = (int)(sizeof xs / sizeof xs[0]),
-+           NF = (int)(sizeof fs / sizeof fs[0]) };
-+    double r8[8], xbuf[700], big[256];
-+    int fails = 0;
-+
-+    /* 1 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 3)
-+        for (int m = 0; m < NX; m += 5) {
-+            double g1 = bracket_plain(xs[i], xs[j], xs[m]);
-+            double g2 = bracket_signed(xs[i], xs[j], xs[m]);
-+            double g3 = bracket_call(xs[i], fabs(xs[j]) + 1, xs[m]);
-+            printf("A %d %d %d %016llx %016llx %016llx\n", i, j, m,
-+                   (unsigned long long)fbits(g1),
-+                   (unsigned long long)fbits(g2),
-+                   (unsigned long long)fbits(g3));
-+        }
-+    /* 2 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 3)
-+        for (int m = 0; m < NX; m += 5) for (int k = 0; k < 4; k++) {
-+            double g1 = sel_fma(xs[i], xs[j], xs[m], k);
-+            double g2 = sel_fma_acc(xs[i], xs[j], xs[m], k);
-+            printf("B %d %d %d %d %016llx %016llx\n", i, j, m, k,
-+                   (unsigned long long)fbits(g1),
-+                   (unsigned long long)fbits(g2));
-+        }
-+    /* 3 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 7)
-+        for (int m = 0; m < NX; m += 3) for (int k = 0; k < 2; k++) {
-+            double g = phi_fma(xs[i], xs[j], xs[m], k);
-+            printf("C %d %d %d %d %016llx\n", i, j, m, k,
-+                   (unsigned long long)fbits(g));
-+        }
-+    /* 4 */ for (int n = 0; n <= 8; n++) {
-+        for (int i = 0; i < 8; i++) xbuf[i] = xs[(i * 3) % NX];
-+        double g1 = const_dot(xbuf, n);
-+        double g2 = const_dot_map(xbuf, r8, xs[5], n);
-+        printf("D %d %016llx %016llx\n", n,
-+               (unsigned long long)fbits(g1),
-+               (unsigned long long)fbits(g2));
-+        for (int i = 0; i < n && i < 8; i++)
-+            printf("d %d %016llx\n", i, (unsigned long long)fbits(r8[i]));
-+    }
-+    /* 5 */ for (uint32_t k = 0; k < 8; k++)
-+        printf("E %u %u %u\n", k, nz_scan(k), nz_ctz(k));
-+    /* 6 */ for (int i = 0; i < NX; i++) {
-+        double g1 = alias_xx(xs[i], xs[(i * 5) % NX]);
-+        double g2 = alias_ss(xs[i], xs[(i * 7) % NX]);
-+        printf("F %d %016llx %016llx\n", i,
-+               (unsigned long long)fbits(g1),
-+               (unsigned long long)fbits(g2));
-+    }
-+    for (int n = 0; n < 64; n += 7) {
-+        for (int i = 0; i < n; i++) xbuf[i] = xs[i % NX];
-+        alias_loop(xbuf, big, n);
-+        for (int i = 0; i < n; i++)
-+            printf("f %d %d %016llx\n", n, i,
-+                   (unsigned long long)fbits(big[i]));
-+    }
-+    /* 7 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 3)
-+        for (int m = 0; m < NX; m += 5) {
-+            double g1 = neg_twouse(xs[i], xs[j], xs[m]);
-+            double g2 = neg_int_reject((int)(i - 8), xs[j], xs[m]);
-+            printf("G %d %d %d %016llx %016llx\n", i, j, m,
-+                   (unsigned long long)fbits(g1),
-+                   (unsigned long long)fbits(g2));
-+        }
-+    /* 8 */ for (int i = 0; i + 7 < NX; i += 2) {
-+        double ad[4], bd[4]; float af[8], bf[8];
-+        for (int t = 0; t < 4; t++) { ad[t] = xs[i + t]; bd[t] = xs[i + t + 1]; }
-+        for (int t = 0; t < 8; t++) { af[t] = fs[(i + t) % NF]; bf[t] = fs[(i + t + 3) % NF]; }
-+        wide_f64(ad, bd, xs[4], r8);
-+        printf("H %d %016llx %016llx %016llx %016llx\n", i,
-+               (unsigned long long)fbits(r8[0]), (unsigned long long)fbits(r8[1]),
-+               (unsigned long long)fbits(r8[2]), (unsigned long long)fbits(r8[3]));
-+        wide_signed_f64(ad, bd, xs[6], r8);
-+        printf("h %d %016llx %016llx %016llx %016llx\n", i,
-+               (unsigned long long)fbits(r8[0]), (unsigned long long)fbits(r8[1]),
-+               (unsigned long long)fbits(r8[2]), (unsigned long long)fbits(r8[3]));
-+        float rf[8]; wide_f32(af, bf, fs[5], rf);
-+        printf("I %d %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
-+               *(uint32_t *)&rf[0], *(uint32_t *)&rf[1],
-+               *(uint32_t *)&rf[2], *(uint32_t *)&rf[3],
-+               *(uint32_t *)&rf[4], *(uint32_t *)&rf[5],
-+               *(uint32_t *)&rf[6], *(uint32_t *)&rf[7]);
-+    }
-+    /* 9 */ for (int n = 0; n < 128; n += 13) {
-+        for (int i = 0; i < n; i++) xbuf[i] = (i & 1) ? xs[i % NX] : -xs[i % NX];
-+        store_mix(xbuf, xbuf, xs[2], n);
-+        for (int i = 0; i < n; i += 5)
-+            printf("J %d %d %016llx\n", n, i, (unsigned long long)fbits(xbuf[i]));
-+    }
-+    /* 10 */ for (int n = 0; n < 200; n += 17) for (int k = 0; k < 2; k++) {
-+        for (int i = 0; i < n; i++) xbuf[i] = xs[i % NX];
-+        double g = kitchen(xbuf, big, xs[3], n, k);
-+        printf("K %d %d %016llx\n", n, k, (unsigned long long)fbits(g));
-+        for (int i = 0; i < n && i < 8; i++)
-+            printf("k %d %d %016llx\n", n, i, (unsigned long long)fbits(big[i]));
-+    }
-+    printf("FAILS %d\n", fails);
-+    (void)same; (void)fails;
-+    return 0;
-+}
-diff --git a/tests/regression/cross_pr_redteam2.c b/tests/regression/cross_pr_redteam2.c
+ 
+ int main(void) {
+     static const double xs[] = { 0.0, -0.0, 1.0, -1.0, 0.5, INFINITY,
+@@ -203,33 +251,33 @@ int main(void) {
+             double g2 = bracket_signed(xs[i], xs[j], xs[m]);
+             double g3 = bracket_call(xs[i], fabs(xs[j]) + 1, xs[m]);
+             printf("A %d %d %d %016llx %016llx %016llx\n", i, j, m,
+-                   (unsigned long long)fbits(g1),
+-                   (unsigned long long)fbits(g2),
+-                   (unsigned long long)fbits(g3));
++                   (unsigned long long)nbits(g1),
++                   (unsigned long long)nbits(g2),
++                   (unsigned long long)nbits(g3));
+         }
+     /* 2 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 3)
+         for (int m = 0; m < NX; m += 5) for (int k = 0; k < 4; k++) {
+             double g1 = sel_fma(xs[i], xs[j], xs[m], k);
+             double g2 = sel_fma_acc(xs[i], xs[j], xs[m], k);
+             printf("B %d %d %d %d %016llx %016llx\n", i, j, m, k,
+-                   (unsigned long long)fbits(g1),
+-                   (unsigned long long)fbits(g2));
++                   (unsigned long long)nbits(g1),
++                   (unsigned long long)nbits(g2));
+         }
+     /* 3 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 7)
+         for (int m = 0; m < NX; m += 3) for (int k = 0; k < 2; k++) {
+             double g = phi_fma(xs[i], xs[j], xs[m], k);
+             printf("C %d %d %d %d %016llx\n", i, j, m, k,
+-                   (unsigned long long)fbits(g));
++                   (unsigned long long)nbits(g));
+         }
+     /* 4 */ for (int n = 0; n <= 8; n++) {
+         for (int i = 0; i < 8; i++) xbuf[i] = xs[(i * 3) % NX];
+         double g1 = const_dot(xbuf, n);
+         double g2 = const_dot_map(xbuf, r8, xs[5], n);
+         printf("D %d %016llx %016llx\n", n,
+-               (unsigned long long)fbits(g1),
+-               (unsigned long long)fbits(g2));
++               (unsigned long long)nbits(g1),
++               (unsigned long long)nbits(g2));
+         for (int i = 0; i < n && i < 8; i++)
+-            printf("d %d %016llx\n", i, (unsigned long long)fbits(r8[i]));
++            printf("d %d %016llx\n", i, (unsigned long long)nbits(r8[i]));
+     }
+     /* 5 */ for (uint32_t k = 0; k < 8; k++)
+         printf("E %u %u %u\n", k, nz_scan(k), nz_ctz(k));
+@@ -237,23 +285,30 @@ int main(void) {
+         double g1 = alias_xx(xs[i], xs[(i * 5) % NX]);
+         double g2 = alias_ss(xs[i], xs[(i * 7) % NX]);
+         printf("F %d %016llx %016llx\n", i,
+-               (unsigned long long)fbits(g1),
+-               (unsigned long long)fbits(g2));
++               (unsigned long long)nbits(g1),
++               (unsigned long long)nbits(g2));
+     }
+     for (int n = 0; n < 64; n += 7) {
+         for (int i = 0; i < n; i++) xbuf[i] = xs[i % NX];
+         alias_loop(xbuf, big, n);
+         for (int i = 0; i < n; i++)
+             printf("f %d %d %016llx\n", n, i,
+-                   (unsigned long long)fbits(big[i]));
++                   (unsigned long long)nbits(big[i]));
+     }
+     /* 7 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 3)
+         for (int m = 0; m < NX; m += 5) {
+             double g1 = neg_twouse(xs[i], xs[j], xs[m]);
+             double g2 = neg_int_reject((int)(i - 8), xs[j], xs[m]);
+-            printf("G %d %d %d %016llx %016llx\n", i, j, m,
+-                   (unsigned long long)fbits(g1),
+-                   (unsigned long long)fbits(g2));
++            double g3 = neg_chain_live_outer(xs[i], xs[j], xs[m]);
++            double g4 = neg_chain_pinned_inner(xs[i], xs[j], xs[m]);
++            double g5 = neg_chain_full(xs[i], xs[j], xs[m]);
++            printf("G %d %d %d %016llx %016llx %016llx %016llx %016llx\n",
++                   i, j, m,
++                   (unsigned long long)nbits(g1),
++                   (unsigned long long)nbits(g2),
++                   (unsigned long long)nbits(g3),
++                   (unsigned long long)nbits(g4),
++                   (unsigned long long)nbits(g5));
+         }
+     /* 8 */ for (int i = 0; i + 7 < NX; i += 2) {
+         double ad[4], bd[4]; float af[8], bf[8];
+@@ -261,31 +316,31 @@ int main(void) {
+         for (int t = 0; t < 8; t++) { af[t] = fs[(i + t) % NF]; bf[t] = fs[(i + t + 3) % NF]; }
+         wide_f64(ad, bd, xs[4], r8);
+         printf("H %d %016llx %016llx %016llx %016llx\n", i,
+-               (unsigned long long)fbits(r8[0]), (unsigned long long)fbits(r8[1]),
+-               (unsigned long long)fbits(r8[2]), (unsigned long long)fbits(r8[3]));
++               (unsigned long long)nbits(r8[0]), (unsigned long long)nbits(r8[1]),
++               (unsigned long long)nbits(r8[2]), (unsigned long long)nbits(r8[3]));
+         wide_signed_f64(ad, bd, xs[6], r8);
+         printf("h %d %016llx %016llx %016llx %016llx\n", i,
+-               (unsigned long long)fbits(r8[0]), (unsigned long long)fbits(r8[1]),
+-               (unsigned long long)fbits(r8[2]), (unsigned long long)fbits(r8[3]));
++               (unsigned long long)nbits(r8[0]), (unsigned long long)nbits(r8[1]),
++               (unsigned long long)nbits(r8[2]), (unsigned long long)nbits(r8[3]));
+         float rf[8]; wide_f32(af, bf, fs[5], rf);
+         printf("I %d %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
+-               *(uint32_t *)&rf[0], *(uint32_t *)&rf[1],
+-               *(uint32_t *)&rf[2], *(uint32_t *)&rf[3],
+-               *(uint32_t *)&rf[4], *(uint32_t *)&rf[5],
+-               *(uint32_t *)&rf[6], *(uint32_t *)&rf[7]);
++               nbits32(rf[0]), nbits32(rf[1]),
++               nbits32(rf[2]), nbits32(rf[3]),
++               nbits32(rf[4]), nbits32(rf[5]),
++               nbits32(rf[6]), nbits32(rf[7]));
+     }
+     /* 9 */ for (int n = 0; n < 128; n += 13) {
+         for (int i = 0; i < n; i++) xbuf[i] = (i & 1) ? xs[i % NX] : -xs[i % NX];
+         store_mix(xbuf, xbuf, xs[2], n);
+         for (int i = 0; i < n; i += 5)
+-            printf("J %d %d %016llx\n", n, i, (unsigned long long)fbits(xbuf[i]));
++            printf("J %d %d %016llx\n", n, i, (unsigned long long)nbits(xbuf[i]));
+     }
+     /* 10 */ for (int n = 0; n < 200; n += 17) for (int k = 0; k < 2; k++) {
+         for (int i = 0; i < n; i++) xbuf[i] = xs[i % NX];
+         double g = kitchen(xbuf, big, xs[3], n, k);
+-        printf("K %d %d %016llx\n", n, k, (unsigned long long)fbits(g));
++        printf("K %d %d %016llx\n", n, k, (unsigned long long)nbits(g));
+         for (int i = 0; i < n && i < 8; i++)
+-            printf("k %d %d %016llx\n", n, i, (unsigned long long)fbits(big[i]));
++            printf("k %d %d %016llx\n", n, i, (unsigned long long)nbits(big[i]));
+     }
+     printf("FAILS %d\n", fails);
+     (void)same; (void)fails;
+diff --git a/tests/regression/cross_pr_redteam.flags b/tests/regression/cross_pr_redteam.flags
 new file mode 100644
-index 00000000..3979a9c6
+index 00000000..3d35a907
 --- /dev/null
++++ b/tests/regression/cross_pr_redteam.flags
+@@ -0,0 +1 @@
++-march=x86-64-v3
+diff --git a/tests/regression/cross_pr_redteam2.c b/tests/regression/cross_pr_redteam2.c
+index 3979a9c6..b6b03331 100644
+--- a/tests/regression/cross_pr_redteam2.c
 +++ b/tests/regression/cross_pr_redteam2.c
-@@ -0,0 +1,156 @@
-+/* PR-area adversarial battery 2 (session 574): range-check fusion (#569),
-+ * constant-array promotion (#566), vector copy elimination (#567) x the
-+ * new multi-use FMA peel, and register-pressure shapes (#569 regalloc).
-+ * Runtime contract: bit-exact against GCC -O2 -march=x86-64-v3. */
-+#include <math.h>
-+#include <stdio.h>
-+#include <stdint.h>
-+#include <string.h>
-+
-+/* ---- 1. range fusion corners (integer; the fused domain check) ---- */
-+static int rf_int(int x) {
-+    if (x >= -3 && x <= 7) return 1;
-+    return 0;
-+}
-+static int rf_empty(int x) {          /* lo > hi: empty domain */
-+    if (x >= 7 && x <= -3) return 1;
-+    return 0;
-+}
-+static int rf_point(int x) {          /* lo == hi */
-+    if (x >= 5 && x <= 5) return 1;
-+    return 0;
-+}
-+static int rf_int_min(int x) {        /* INT_MIN corner */
-+    if (x >= (-2147483647 - 1) && x <= 0) return 1;
-+    return 0;
-+}
-+static int rf_or(unsigned x) {        /* disjunction shape */
-+    if (x < 10 || x > 100) return 1;
-+    return 0;
-+}
-+static unsigned rf_or_wrap(void) {    /* u > 0xFFFFFF00 || u < 0x10 */
-+    unsigned acc = 0;
-+    for (unsigned u = 0xFFFFFFF0u; u != 0x20; u += 3)
-+        if (u > 0xFFFFFF00u || u < 0x10u) acc++;
-+    return acc;
-+}
-+
-+/* ---- 2. FP range shapes: must NOT break NaN semantics ---- */
-+static int rf_fp(double d) {
-+    if (d >= 0.0 && d <= 1.0) return 1;   /* NaN: both false -> 0 */
-+    return 0;
-+}
-+static int rf_fp_nan_branch(double d) {
-+    if (d > 0.0 && d < 1.0) return 2;     /* NaN: 0 */
-+    if (d >= 0.0 && d <= 1.0) return 1;
-+    return 0;
-+}
-+static int rf_fp_reversed(double d) {     /* reversed operands */
-+    if (0.0 <= d && 1.0 >= d) return 1;
-+    return 0;
-+}
-+
-+/* ---- 3. constant-array promotion x aliasing ---- */
-+static const int itab[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
-+static const double dtab[6] = { 0.5, 1.25, 2.125, 4.0625, 8.03125, 16.015625 };
-+static int promo_alias(int *p, unsigned k) {
-+    /* The table is const, but p may alias it in the caller's world (cast
-+     * away const). The promoted form must observe the WRITE. */
-+    int s = 0;
-+    for (int i = 0; i < 8; i++) s += itab[i];
-+    *p = 999;
-+    for (int i = 0; i < 8; i++) s += itab[(k + (unsigned)i) & 7u];
-+    return s;
-+}
-+static double promo_dtab(unsigned k) {
-+    double s = 0.0;
-+    for (int i = 0; i < 6; i++)
-+        s = __builtin_fma(dtab[i], (double)(int)((k >> i) & 1u), s);
-+    return s;
-+}
-+
-+/* ---- 4. copy-elim x multi-use FMA peel interaction: the fma results
-+ *         through copy brackets, packed reads, and a call. ---- */
-+static double ce_fma(double a, double b, double c) {
-+    double t = a;                             /* copy-in */
-+    double r1 = __builtin_fma(-t, b, -c);     /* multi-use -t? single here */
-+    double u = __builtin_fma(-a, b, -c);      /* second site sharing -a/-c
-+                                                 spelling at the source level */
-+    double v = r1;                            /* copy-out */
-+    if (v < -1e300) printf("!");
-+    return v + u;
-+}
-+static double ce_fma_call(double a, double b, double c) {
-+    double r = __builtin_fma(-a, b, -c);
-+    double s = sqrt(fabs(r));                 /* call inside the bracket */
-+    return __builtin_fma(-s, b, -c);
-+}
-+
-+/* ---- 5. regalloc pressure: many live FMA accumulators (web stress) ---- */
-+static double pressure_fma(const double *x, const double *y, int n) {
-+    double a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
-+    for (int i = 0; i < n; i++) {
-+        a0 = __builtin_fma(x[i],   y[i], a0);
-+        a1 = __builtin_fma(-x[i],  y[i], a1);
-+        a2 = __builtin_fma(x[i],  -y[i], a2);
-+        a3 = __builtin_fma(-x[i], -y[i], a3);
-+        a4 = __builtin_fma(x[i+8], y[i], a4);
-+        a5 = __builtin_fma(-x[i+8],y[i], a5);
-+        a6 = __builtin_fma(x[i+8],-y[i], a6);
-+        a7 = __builtin_fma(-x[i+8],-y[i], a7);
-+    }
-+    return (((a0*3+a1*5)+a2*7)+a3*11)+(((a4*13+a5*17)+a6*19)+a7*23);
-+}
-+
-+/* ---- 6. mixed-width pressure: f32 and f64 fma webs in one function ---- */
-+static double mixed_width(const float *xf, const double *xd, int n) {
-+    float  f0 = 0.f, f1 = 0.f;
-+    double d0 = 0.0, d1 = 0.0;
-+    for (int i = 0; i < n; i++) {
-+        f0 = __builtin_fmaf(-xf[i], xf[i+n], f0);
-+        f1 = __builtin_fmaf(xf[i], -xf[i+n], f1);
-+        d0 = __builtin_fma(-xd[i], xd[i+n], d0);
-+        d1 = __builtin_fma(xd[i], -xd[i+n], d1);
-+    }
-+    return (double)(f0 - f1) + (d0 - d1);
-+}
-+
-+/* ---------------- driver ---------------- */
-+static uint64_t fbits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
-+int main(void) {
-+    static const int iv[] = { -2147483647-1, -2147483647, -8, -3, -2, -1, 0,
-+                              1, 4, 5, 6, 7, 8, 100, 2147483647 };
-+    static const double dv[] = { -1.0, -0.0, 0.0, 0.5, 0.999, 1.0, 1.001,
-+                                 INFINITY, -INFINITY, NAN, -NAN, 1e308,
-+                                 1e-308, 3.5 };
-+    static const float fv[] = { -1.0f, 0.0f, 0.5f, 1.0f, 2.5f, -0.5f, 1e30f,
-+                                -1e30f, NAN };
-+    double xbuf[512], ybuf[512]; float xfbuf[512];
-+    for (int i = 0; i < 512; i++) {
-+        xbuf[i] = dv[i % 14] * (i & 1 ? -1.0 : 1.0);
-+        ybuf[i] = dv[(i * 5) % 14];
-+        xfbuf[i] = fv[i % 9];
-+    }
-+    for (int i = 0; i < 15; i++)
-+        printf("R %d %d %d %d %d\n", iv[i], rf_int(iv[i]), rf_empty(iv[i]),
-+               rf_point(iv[i]), rf_int_min(iv[i]));
-+    for (unsigned u = 0; u < 200; u += 17)
-+        printf("O %u %d\n", u, rf_or(u));
-+    printf("W %u\n", rf_or_wrap());
-+    for (int i = 0; i < 14; i++)
-+        printf("F %d %d %d %d %016llx\n", i, rf_fp(dv[i]),
-+               rf_fp_nan_branch(dv[i]), rf_fp_reversed(dv[i]),
-+               (unsigned long long)fbits(dv[i]));
-+    { int q = 0; printf("P %d\n", promo_alias(&q, 5)); }
-+    for (unsigned k = 0; k < 16; k++)
-+        printf("Q %u %016llx\n", k, (unsigned long long)fbits(promo_dtab(k)));
-+    for (int i = 0; i < 14; i++) for (int j = 0; j < 14; j += 3)
-+        printf("C %d %d %016llx %016llx\n", i, j,
-+               (unsigned long long)fbits(ce_fma(dv[i], dv[j], dv[(i+3)%14])),
-+               (unsigned long long)fbits(ce_fma_call(dv[i], fabs(dv[j]) + 1.0, dv[(i+5)%14])));
-+    for (int n = 0; n <= 128; n += 16)
-+        printf("S %d %016llx\n", n, (unsigned long long)fbits(pressure_fma(xbuf, ybuf, n)));
-+    for (int n = 0; n <= 128; n += 32)
-+        printf("M %d %016llx\n", n, (unsigned long long)fbits(mixed_width(xfbuf, xbuf, n)));
-+    return 0;
-+}
+@@ -117,6 +117,11 @@ static double mixed_width(const float *xf, const double *xd, int n) {
+ 
+ /* ---------------- driver ---------------- */
+ static uint64_t fbits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
++/* Print-time canonical-NaN normalisation (the C11 6.5p8 latitude; see
++ * cross_pr_redteam.c for the full rationale and the dedicated gate that
++ * pins the family selection in the asm). Computed fma results canonicalise
++ * on both sides; input echoes and promoted-table loads stay raw. */
++static uint64_t nbits(double d) { return isnan(d) ? 0x7ff8000000000000ULL : fbits(d); }
+ int main(void) {
+     static const int iv[] = { -2147483647-1, -2147483647, -8, -3, -2, -1, 0,
+                               1, 4, 5, 6, 7, 8, 100, 2147483647 };
+@@ -146,11 +151,11 @@ int main(void) {
+         printf("Q %u %016llx\n", k, (unsigned long long)fbits(promo_dtab(k)));
+     for (int i = 0; i < 14; i++) for (int j = 0; j < 14; j += 3)
+         printf("C %d %d %016llx %016llx\n", i, j,
+-               (unsigned long long)fbits(ce_fma(dv[i], dv[j], dv[(i+3)%14])),
+-               (unsigned long long)fbits(ce_fma_call(dv[i], fabs(dv[j]) + 1.0, dv[(i+5)%14])));
++               (unsigned long long)nbits(ce_fma(dv[i], dv[j], dv[(i+3)%14])),
++               (unsigned long long)nbits(ce_fma_call(dv[i], fabs(dv[j]) + 1.0, dv[(i+5)%14])));
+     for (int n = 0; n <= 128; n += 16)
+-        printf("S %d %016llx\n", n, (unsigned long long)fbits(pressure_fma(xbuf, ybuf, n)));
++        printf("S %d %016llx\n", n, (unsigned long long)nbits(pressure_fma(xbuf, ybuf, n)));
+     for (int n = 0; n <= 128; n += 32)
+-        printf("M %d %016llx\n", n, (unsigned long long)fbits(mixed_width(xfbuf, xbuf, n)));
++        printf("M %d %016llx\n", n, (unsigned long long)nbits(mixed_width(xfbuf, xbuf, n)));
+     return 0;
+ }
+diff --git a/tests/regression/cross_pr_redteam2.flags b/tests/regression/cross_pr_redteam2.flags
+new file mode 100644
+index 00000000..3d35a907
+--- /dev/null
++++ b/tests/regression/cross_pr_redteam2.flags
+@@ -0,0 +1 @@
++-march=x86-64-v3
 diff --git a/tests/regression/fma_isa_gate.c b/tests/regression/fma_isa_gate.c
-index a4b31d82..25ed5a46 100644
+index 25ed5a46..7bdda9e2 100644
 --- a/tests/regression/fma_isa_gate.c
 +++ b/tests/regression/fma_isa_gate.c
-@@ -17,6 +17,30 @@ float fused(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
- 
- double fused_d(double a, double b, double c) { return __builtin_fma(a, b, c); }
+@@ -30,6 +30,32 @@ double signed_np(double a, double b, double c) { return __builtin_fma(-a, b, c);
+ double signed_na(double a, double b, double c) { return __builtin_fma(a, b, -c); }
+ double signed_np_na(double a, double b, double c) { return __builtin_fma(-a, b, -c); }
  
 +/*
-+ * The four signed families (the operand-negation spellings the IR peel
-+ * folds into the family flags). Pinned at the AVX1-class target
-+ * (-mno-avx2): AVX2 is the 256-bit integer class, a strict subset of the
-+ * VEX encoding, so denying it must remove ymm code but keep every VEX.128
-+ * family — vfnmadd/vfmsub/vfnmsub included, exactly like GCC's
-+ * -march=x86-64-v3 -mno-avx2. The pre-fix ISA ceiling killed `avx` on
-+ * this flag, and these spelled xorpd + xorpd + a libm call.
++ * The chain shapes (the absorbability-fixpoint correction): a Neg may only
++ * die when every reader of it dies with it. `chain_live` is the shape the
++ * source-poisoned rule miscompiled -- the fma reads the INNER negation
++ * while the OUTER survives for the add, so BOTH must stay materialised
++ * (two sign masks, the plain family; no latitude is taken). Its asm pin:
++ * exactly two sign masks and no negated family. `chain_pin` is the fold
++ * that rule missed -- the INNER negation is pinned, the site reads the
++ * OUTER, which peels into the family reading the materialised inner:
++ * ONE sign mask and one vfnmadd, GCC's exact shape. Both live BEFORE
++ * shared_neg so the per-function sed ranges below stay disjoint.
 + */
-+double signed_np(double a, double b, double c) { return __builtin_fma(-a, b, c); }
-+double signed_na(double a, double b, double c) { return __builtin_fma(a, b, -c); }
-+double signed_np_na(double a, double b, double c) { return __builtin_fma(-a, b, -c); }
-+
-+/*
-+ * The shared-negation phi shape (one -b/-c read by TWO fma sites): the
-+ * multi-use absorbability rule must peel both sites at the AVX1-class
-+ * target too — two vfnmsub, no surviving xorpd bracket.
-+ */
-+double shared_neg(double a, double b, double c) {
-+    double hi = __builtin_fma(1.5, -b, -c);
-+    double lo = __builtin_fma(a, -b, -c);
-+    return hi * 3.0 + lo;
++double chain_live(double x, double b, double c)
++{
++    double t = -x;
++    double u = -t;
++    double r = __builtin_fma(t, b, c);
++    return r + u;
++}
++double chain_pin(double x, double b, double c)
++{
++    double t = -x;
++    double r = __builtin_fma(-t, b, c);
++    return r + t;
 +}
 +
  /*
-  * Semantics pin, so the test also builds and runs under
-  * scripts/run_regression_suite.sh (which links and A/B-compares every
+  * The shared-negation phi shape (one -b/-c read by TWO fma sites): the
+  * multi-use absorbability rule must peel both sites at the AVX1-class
+-- 
+2.47.3
+
