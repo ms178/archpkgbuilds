@@ -1,709 +1,1009 @@
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 6a1840f3..cf2551a4 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -4532,9 +4532,30 @@ fn generate_function(
-             cg.state().vec_last_store_slot = None;
-             cg.state().vec_last_store_val = None;
-             cg.state().vec_last_store_reg = false;
-+            cg.state().vec_last_store_reg_name = None;
-             cg.state().sse_last_store_slot = None;
-             cg.state().sse_last_store_val = None;
-             cg.state().sse_last_store_reg = false;
-+            cg.state().sse_last_store_reg_name = None;
-+            // vec_live_regs claims are BLOCK-LOCAL by contract ("vec_live_regs
-+            // only tracks within a block; reg_assignments is the source of
-+            // truth at block boundaries") — nothing enforced it. A claim
-+            // recorded by the final emission of the textually-previous block
-+            // survived into this one, and at a JOIN (multiple incoming edges)
-+            // the claim only holds on the fall-through edge: the chorba_sse41
-+            // miscompile — block 13's `vpxor` claimed its result v109 into
-+            // xmm0 (sse_commit_dest_direct), block 14 (also entered via `jne`
-+            // from block 12, where xmm0 holds an unrelated Loaddqu) elided
-+            // v109's reload and consumed the stale xmm0. Claims are only
-+            // sound along straight-line fall-through, but even a
-+            // single-predecessor block's textual predecessor can differ from
-+            // its CFG predecessor (then/else layout: the then-arm's claims
-+            // leak into the else-arm), so the map is cleared at EVERY label.
-+            // Cross-block elision remains available through reg_assignments
-+            // (RA-managed, liveness-correct) and pending_vec_memfold (a
-+            // re-issued slot load, kept defined by the pending_vec_store
-+            // flush above).
-+            cg.state().vec_live_regs.clear();
-             // Tight-loop marker: the structural audit in
-             // passes::loop_align qualified this header; the integrated
-             // assembler measures the exact encoded body span during its
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 7632e40f..91a60000 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -3140,6 +3140,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-             .collect();
-         for (idx, dests) in &config.folded_index_uses {
-             let mut new_end: Option<u32> = None;
-+            // Diagnostic (LCCC_DEBUG_SIB_CLASH): trace the folded-index
-+            // interval extension end-to-end — per-link required spans, the
-+            // post-extension segments, and the returned liveness — so an
-+            // extension that silently no-ops (the zlib-ng deflateHeaders
-+            // wrong-piece stretch) is visible without a debugger.
-+            let dbg_ext = std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some();
-             // Real-liveness ranges the operand must survive: one per
-             // consumer. dest.start is the GEP, but a peeled index's last
-             // IR use is typically a widening Cast / scale BEFORE the GEP
-@@ -3181,11 +3187,45 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                         };
-                         if req_s < e {
-                             required.push((req_s, e));
-+                            // LOOP-WRAP PROTECTION. Linear [def..use] spans
-+                            // assume the emitted access executes after the
-+                            // def on every path that reaches it. A loop
-+                            // back-edge invalidates that: re-entering the
-+                            // body after the def re-executes the folded
-+                            // access on the NEXT iteration, by which time
-+                            // any sibling that "linearly" started after the
-+                            // index's segment may legally own the register
-+                            // (select/cmov chains materialise mid-loop).
-+                            // zstd_opt lvl16: v2579 home %ebp, def @60003,
-+                            // fold `(%r11,%rbp,4)` @60125, back-edge
-+                            // `jae 60060` re-enters after the def; rival
-+                            // v2911 (linearly disjoint, segs (694,743) vs
-+                            // (630,683)) steals %ebp via `cmovne %r13d,
-+                            // %ebp` @601d9 → garbage index on iteration 2.
-+                            // Require the WHOLE innermost loop cycle that
-+                            // contains the access so no sibling claim can
-+                            // exist anywhere inside the emitted iteration.
-+                            let mut best: Option<(u32, u32)> = None;
-+                            for &(h, l) in &liveness.loop_extents {
-+                                if h <= e && e <= l && best.map_or(true, |(bh, bl)| l - h < bl - bh)
-+                                {
-+                                    best = Some((h, l));
-+                                }
-+                            }
-+                            if let Some((h, l)) = best {
-+                                required.push((h, l));
-+                            }
-                         }
-                     }
-                 }
-             }
-             if let Some(e) = new_end {
-+                if dbg_ext {
-+                    eprintln!(
-+                        "[sib-clash-ext] fn={} idx=v{idx} dests={dests:?} new_end={e} required={required:?}",
-+                        func.name
-+                    );
-+                }
-                 for iv in &mut liveness.intervals {
-                     if iv.value_id == *idx && iv.end < e {
-                         iv.end = e;
-@@ -3226,10 +3266,63 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                         insert_segment_union(&mut merged, &required);
-                         pieces = merged;
-                     } else {
--                        // Historical tail stretch (single-def shapes).
--                        if let Some(last) = pieces.last_mut() {
--                            if last.1 < e {
--                                last.1 = e;
-+                        // Single-def shapes. The historical tail stretch
-+                        // extended only the LAST piece — a silent NO-OP for
-+                        // multi-segment values, whose consumer access sits
-+                        // after a NON-last piece's end (the hole between the
-+                        // pieces is exactly where the allocator then placed
-+                        // another value, e.g. the folded access's own base).
-+                        // zlib-ng deflateHeaders `put_byte`: the U32 index
-+                        // `s->pending` had segments [(136,146),(606,619)],
-+                        // required (146,149); the last-piece stretch left the
-+                        // hole open, the base `s->pending_buf` [(147,149)]
-+                        // got the index's register, and ensure_sib_index_form
-+                        // zero-extended the index IN PLACE over the freshly
-+                        // reloaded base → `mov %r10b,(%rdi,%rdi,1)` with
-+                        // rdi = base = index (store through a wild address).
-+                        //
-+                        // Extend instead the piece the access actually
-+                        // follows: the piece containing the required span's
-+                        // start (the last IR-visible read position), or the
-+                        // piece ending latest at or before it. Like the
-+                        // historical stretch, a piece END only ever grows —
-+                        // no span is invented, no first/last live-unit anchor
-+                        // moves (the union-merge anchor effects that required
-+                        // gating the merge to multi-def latches do not apply:
-+                        // the global max end is untouched whenever any later
-+                        // piece exists, and grows exactly to the access when
-+                        // the stretched piece IS the last one).
-+                        for &(req_s, req_e) in &required {
-+                            let containing = pieces.iter_mut().find(|piece| {
-+                                let (ss, ee) = **piece;
-+                                ss <= req_s && req_s < ee
-+                            });
-+                            if let Some(piece) = containing {
-+                                if piece.1 < req_e {
-+                                    piece.1 = req_e;
-+                                }
-+                                continue;
-+                            }
-+                            let preceding = pieces
-+                                .iter_mut()
-+                                .filter(|piece| piece.1 <= req_s)
-+                                .max_by_key(|piece| piece.1);
-+                            if let Some(piece) = preceding {
-+                                if piece.1 < req_e {
-+                                    piece.1 = req_e;
-+                                }
-+                            }
-+                        }
-+                        // Historical behaviour for the common single-piece
-+                        // shape: make sure the envelope target `e` is
-+                        // honoured even when `required` came out empty
-+                        // (covering-segment case where the piece already
-+                        // contains dest.start).
-+                        if required.is_empty() {
-+                            if let Some(last) = pieces.last_mut() {
-+                                if last.1 < e {
-+                                    last.1 = e;
-+                                }
-                             }
-                         }
-                         pieces.sort_unstable();
-@@ -3247,11 +3340,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                 // Values without segment data keep the fat-envelope
-                 // extension above (fail-closed: the scan and the verifier
-                 // both fall back to the envelope for them).
-+            } else if dbg_ext {
-+                eprintln!(
-+                    "[sib-clash-ext] fn={} idx=v{idx} dests={dests:?} new_end=NONE (no consumer bound found)",
-+                    func.name
-+                );
-             }
-         }
-         liveness
-             .segments
-             .sort_unstable_by_key(|segment| (segment.start, segment.value_id, segment.end));
-+        if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
-+            for (idx, _) in &config.folded_index_uses {
-+                let segs: Vec<(u32, u32)> = liveness
-+                    .segments
-+                    .iter()
-+                    .filter(|s| s.value_id == *idx)
-+                    .map(|s| (s.start, s.end))
-+                    .collect();
-+                eprintln!(
-+                    "[sib-clash-ext] fn={} post-ext v{idx} segments={segs:?}",
-+                    func.name
-+                );
-+            }
-+        }
-     }
-     let iv_map = interval_map(&liveness);
-     let call_points = &liveness.call_points;
-@@ -5797,6 +5909,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-     accumulator_assignments.retain(|a| !assignments.contains_key(&a.value_id));
-     verify_accumulator_assignments(func, &accumulator_assignments);
- 
-+    if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
-+        for (idx, _) in &config.folded_index_uses {
-+            let segs: Vec<(u32, u32)> = liveness
-+                .segments
-+                .iter()
-+                .filter(|s| s.value_id == *idx)
-+                .map(|s| (s.start, s.end))
-+                .collect();
-+            eprintln!(
-+                "[sib-clash-ext] fn={} at-return v{idx} segments={segs:?}",
-+                func.name
-+            );
-+        }
-+    }
+diff --git a/.gitignore b/.gitignore
+index 8ebf447..5fc5c80 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -106,3 +106,6 @@ zlib-ng-validation/
+ /scripts/qemu_icount_plugin/*.so
+ ms178-1.patch
+ tool-results/
 +
-     RegAllocResult {
-         assignments,
-         accumulator_assignments,
-diff --git a/src/backend/state.rs b/src/backend/state.rs
-index 33d16f5c..2e7cff8c 100644
---- a/src/backend/state.rs
-+++ b/src/backend/state.rs
-@@ -1120,6 +1120,20 @@ impl CodegenState {
-         if self.local_symbols.contains(name) {
-             return false;
-         }
-+        // Weak symbols need GOT indirection in EVERY code model (mirrors
-+        // needs_got_aarch64): a weak undefined symbol resolves to zero at
-+        // runtime and a weak defined one may be overridden at static-link
-+        // time. A direct rip-relative LEA emits R_X86_64_PC32, which the
-+        // system linker rejects for undefined weaks in PIE links
-+        // ("relocation R_X86_64_PC32 against undefined symbol ... can not
-+        // be used when making a PIE object" — lib/common/zstd_trace.h's
-+        // ZSTD_trace_compress_begin address compare inside lccc-built
-+        // libzstd.a). @GOTPCREL assembles in non-PIE, PIE and shared links
-+        // alike, and the linker fills the GOT entry with the final address
-+        // (overriding definition or zero) — always semantically correct.
-+        if self.weak_extern_symbols.contains(name) {
-+            return true;
-+        }
-         if self.pie_mode {
-             // RA-01 kill switch restores the old fully-GOT default so workload
-             // A/B runs isolate direct-global rematerialisation exactly.
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index b928b775..7dd575c6 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -6490,8 +6490,23 @@ impl ArchCodegen for X86Codegen {
-         // (regression glibc_gottpoff, second read returned 42).  The text
-         // path (emit_tls_global_addr_impl) selects the right TLS model, so
-         // keep TLS addresses off the fast path.
-+        //
-+        // Same contract for GOT-indirected and absolute symbols: LeaSym
-+        // hardcodes `leaq sym(%rip)` (R_X86_64_PC32), which the system
-+        // linker rejects for UNDEFINED WEAK symbols in PIE links
-+        // ("relocation R_X86_64_PC32 against undefined symbol
-+        // ZSTD_trace_compress_begin can not be used when making a PIE
-+        // object" — lccc-built libzstd.a linked by the distro gcc driver).
-+        // needs_got_for_addr already returns true for weak symbols in every
-+        // code model and for PIC/PIE externals; absolute_symbols need the
-+        // `movq $sym` immediate form. The text emitters
-+        // (emit_global_addr_impl / emit_global_addr_into_reg) own that
-+        // decision — route through them.
-         if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
--            if self.state.tls_symbols.contains(name) {
-+            if self.state.tls_symbols.contains(name)
-+                || self.state.needs_got_for_addr(name)
-+                || self.state.absolute_symbols.contains(name)
-+            {
-                 return false;
-             }
-         }
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index 31ec046b..690b950d 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -188,6 +188,12 @@ impl X86Codegen {
-             if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                 if is_xmm_reg(reg) {
-                     let name = phys_reg_name(reg);
-+                    if std::env::var_os("LCCC_DEBUG_VEC_MERGE").is_some() {
-+                        eprintln!(
-+                            "[vec-merge] fn={} v{} homed {} loaded into {}",
-+                            self.state.current_func_name, v.0, name, xmm
-+                        );
-+                    }
-                     // A pending deferred store to this value flowed through
-                     // the register; anything else must be flushed before we
-                     // potentially clobber xmm0/xmm1 scratch.
-@@ -209,6 +215,16 @@ impl X86Codegen {
-             }
-             // CCC_ENABLE_VECREG: value provably in its allocated XMM register.
-             if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
-+                if std::env::var_os("LCCC_DEBUG_VEC_MERGE").is_some() {
-+                    eprintln!(
-+                        "[vec-merge] fn={} v{} vec-live {} (want {}) -> {}",
-+                        self.state.current_func_name,
-+                        v.0,
-+                        held,
-+                        xmm,
-+                        if held == xmm { "ELIDE" } else { "copy" }
-+                    );
-+                }
-                 if held != xmm {
-                     self.state
-                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
-@@ -227,6 +243,16 @@ impl X86Codegen {
-             // provably untouched whenever this fires.
-             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0) {
-                 let held = self.state.sse_last_store_reg_name.unwrap_or("xmm0");
-+                if std::env::var_os("LCCC_DEBUG_VEC_MERGE").is_some() {
-+                    eprintln!(
-+                        "[vec-merge] fn={} v{} last-store {} (want {}) -> {}",
-+                        self.state.current_func_name,
-+                        v.0,
-+                        held,
-+                        xmm,
-+                        if held == xmm { "ELIDE" } else { "copy" }
-+                    );
-+                }
-                 if held != xmm {
-                     self.state
-                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
-diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index f244eb44..bad2b6e9 100644
---- a/src/backend/x86/codegen/memory.rs
-+++ b/src/backend/x86/codegen/memory.rs
-@@ -2252,6 +2252,28 @@ impl X86Codegen {
-         {
-             return false;
-         }
-+        // SIB soundness gate — see emit_store_indexed_impl for the full
-+        // rationale. base==index in one SIB operand computes base + 2*index
-+        // and the in-place index extension clobbers the base; refuse the
-+        // fold and let the staging path rematerialise both operands.
-+        {
-+            let Some(&x) = self.reg_assignments.get(&index.0) else {
-+                return false;
-+            };
-+            if b == x {
-+                if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
-+                    eprintln!(
-+                        "[sib-clash] load v{} (base) and v{} (index) share home {} — refusing SIB fold (shift {}, disp {})",
-+                        base.0,
-+                        index.0,
-+                        phys_reg_name(b),
-+                        shift,
-+                        disp
-+                    );
-+                }
-+                return false;
-+            }
-+        }
-         if !self.ensure_sib_index_form(index) {
-             return false;
-         }
-@@ -2283,24 +2305,49 @@ impl X86Codegen {
-             }
-             return false;
-         };
--        if is_xmm_reg(b)
--            || self
--                .reg_assignments
--                .get(&index.0)
--                .copied()
--                .is_none_or(is_xmm_reg)
--        {
-+        let Some(&x) = self.reg_assignments.get(&index.0) else {
-+            return false;
-+        };
-+        if is_xmm_reg(b) || is_xmm_reg(x) {
-+            return false;
-+        }
-+        // SIB soundness gate: x86 has no meaningful base==index encoding —
-+        // `mem(%r, %r, 1)` computes base + 2*index. If the allocator handed
-+        // the base and the index the SAME physical register while both are
-+        // live at this access, splicing them into one SIB operand not only
-+        // computes a wild address, the in-place `ensure_sib_index_form`
-+        // extension of the index would also destroy the just-consumed base.
-+        // Refusing the fold falls back to the staging path, which
-+        // rematerialises both operands independently (always correct).
-+        // This gate has caught a real zlib-ng deflateHeaders miscompile
-+        // (`put_byte` → `mov %r10b,(%rdi,%rdi,1)` with rdi holding the
-+        // freshly-reloaded `s->pending_buf`): treat any firing as an RA
-+        // interference bug and make it visible.
-+        if b == x {
-+            if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
-+                eprintln!(
-+                    "[sib-clash] fn={} store v{} (base, {:?}) and v{} (index, {:?}) share home {} — refusing SIB fold (shift {}, disp {})",
-+                    self.state.current_func_name,
-+                    base.0,
-+                    self.value_types.get(&base.0),
-+                    index.0,
-+                    self.value_types.get(&index.0),
-+                    phys_reg_name(b),
-+                    shift,
-+                    disp
-+                );
-+                for (label, v) in [("base", base.0), ("index", index.0)] {
-+                    if let Some(segs) = self.value_live_segments.get(&v) {
-+                        eprintln!("[sib-clash]   {label} v{v} segments: {segs:?}");
++# A/B compiler binaries and scratch build outputs (large, machine-specific)
++work/
+diff --git a/engineering/FOLLOWUP-2026-09-22-narrow-call-result-slot-coalescing.md b/engineering/FOLLOWUP-2026-09-22-narrow-call-result-slot-coalescing.md
+new file mode 100644
+index 0000000..ddfb998
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-22-narrow-call-result-slot-coalescing.md
+@@ -0,0 +1,217 @@
++# Follow-up: a narrow call result must not share a stack slot with a wide phi
++
++Date: 2026-09-22 (session 59)
++Base: `1ff53e8` (`ms178/lccc` main, level with `origin/main`: 0 behind / 0 ahead).
++
++A real miscompile, found by differential-testing an ACPICA function extracted
++from Linux 6.18, root-caused to the CFG copy coalescer, and fixed with a
++two-line soundness gate that changes codegen in exactly one place across the
++whole regression corpus.
++
++---
++
++## 1. Symptom
++
++`tests/regression/acpica_name_string_outparam.c` is a self-contained
++extraction of `acpi_ex_get_name_string()` / `acpi_ex_name_segment()` /
++`acpi_ex_allocate_name_string()` from `drivers/acpi/acpica/exnames.c` v6.18,
++plus verbatim upstream stubs (`acpi_ut_valid_name_char` is copied from
++`utascii.c:60`, not approximated), a bump allocator, address-free trace
++counters, and 16 AML name cases. It is compared byte-for-byte against a GCC
++oracle by `scripts/run_regression_suite.sh`.
++
++With lccc at `-O1`/`-O2`/`-O3` the three **field-type** cases
++(`ACPI_TYPE_LOCAL_REGION_FIELD` / `_BANK_FIELD` / `_INDEX_FIELD`) failed:
++
++```
++field-region           FAIL: length 2, want 4
++```
++
++`out_name_string` was correct (`FLD0`); `out_name_length` was wrong. `-O0` and
++`-Os` were clean. The same binary was **non-deterministic across processes**
++(7/8 runs failing at `-O1`, 6/8 at `-O2`) yet **fully deterministic under
++`setarch -R`** — the signature of a read of uninitialized stack.
++
++## 2. Why the obvious suspects were all innocent
++
++Each of these was checked and each was *correct*; the list is recorded because
++every one of them is a plausible-sounding wrong answer:
++
++* **IR, at every stage.** `CCC_DUMP_EACH_PASS=1` shows the length computation
++  as `Sub(Load(alloca_v9), ParamRef(v5))` from `cleanup-copyprop1` all the way
++  to the pre-codegen dump. No middle-end pass ever broke it.
++* **The callee.** An instrumented build proved `acpi_ex_name_segment` advanced
++  its out-parameter by exactly 4 (`in=0x405daf out=0x405db3 idx=4`) and stored
++  it through the address the caller passed (`p_addr == p_slot`).
++* **The caller's reads.** `caller_get_and_free` reloads both out-parameters
++  from its stack slots (`movq 24(%rsp),%r11`, `movl 16(%rsp),%r10d`).
++* **Argument passing.** `%rsi` is never re-materialized before the call, but
++  nothing clobbers it between entry and the call, so the value is right.
++* **Control flow.** The trace counters match the GCC oracle exactly
++  (`trace=10366 exit=92883 alloc=16 free=16 arena_used=179`), so the same
++  blocks ran the same number of times.
++* **The assembler.** `objdump -d` of the failing binary matches the `.s`
++  instruction for instruction.
++
++Two traps worth naming:
++
++* **Byte-identical binaries behaved differently.** `/tmp/single_lcccld` and
++  `/tmp/copy_one` had the same md5 and different exit codes. The difference
++  was the length of `argv[0]`, which shifts the initial stack — i.e. proof of
++  an uninitialized read, not of a compiler that changes its mind.
++* **Probes that touch memory "fixed" it.** Every `volatile` probe around the
++  call made the failure disappear. Only non-`volatile` global probes
++  (`p_val`, `q_len`, `s_in`) preserved the bug and produced usable data.
++
++## 3. Root cause
++
++Bisection with the compiler's own kill switches:
++
++| switch | result |
++|---|---|
++| `CCC_DISABLE_PASSES=redundantloads` / `load_forward` | passes (red herring: changes IR shape) |
++| `CCC_NO_SLOT_COALESCE=1` | passes |
++| `CCC_NO_CFG_COPY_COALESCE=1` | **passes** |
++| `CCC_SLOT_COALESCE_DROP=40,155` (one pair) | **passes** |
++| dropping any other coalesced pair | still fails |
++
++The pair is `v40`, the `u32` result of `call acpi_ex_name_segment`, and `v155`,
++the `status` phi — which the type map widens to `I64` because one incoming is
++`Const(I64(2))` (`AE_NO_MEMORY`). The whole codegen difference:
++
++```asm
++ call acpi_ex_name_segment          call acpi_ex_name_segment
++-movl %eax, 56(%rsp)                +movl %eax, %r11d      ; 4-byte result
++ jmp .LBB53                         +movq %r11, 56(%rsp)   ; full-width store
++                                    jmp .LBB53
++```
++
++`.LBB53` reloads with `movq 56(%rsp), %r11` — **8 bytes out of a slot whose
++low 4 bytes were just written**. The upper half is whatever the frame held,
++which is exactly the ASLR/`argv[0]` sensitivity observed.
++
++This is the same class as the ZSTD corruption documented at
++`slot_assignment.rs:1240`. That fix ("width unification") rests on a stated
++premise:
++
++> the dest then stores through `movq` into the root's 8-byte slot, so every
++> access to the shared slot is 8 bytes wide and no stale upper half can
++> survive.
++
++**A call result violates the premise.** Its spill comes straight out of the
++ABI return register at the *call's* return width, and the SysV ABI leaves the
++upper half of `%rax` undefined after a sub-8-byte return — unlike a 32-bit ALU
++result, which is zero-extended into the full register. So the premise holds
++only for ALU-produced narrow values, not for values arriving from an ABI
++register.
++
++### 3.1 Correction: what the width guard actually does
++
++An earlier revision of this document claimed the guard "saw both members as
++non-small". That was an unverified inference and it is wrong. Reading
++`resolve_copy_aliases` directly:
++
++* The 4→8 unification removes `dest_id` from `small_slot_values`, after which
++  `is_small_slot(dest)` is false and `store_rax_to` does emit the widening
++  `movq`. **When the unification happens, the spill is correctly widened** —
++  that half of the mechanism is self-consistent.
++* The width guard below it reads `small_slot_values` *after* that rewrite, so
++  `contains(&dest) != contains(&root)` is false by construction and the guard
++  can only ever fire in the 8→4 direction. It is dead in the 4→8 direction.
++  That much is true.
++* The failing case is therefore **not** a 4→8 unification. It is one where no
++  unification happened at all: the call result kept its own 4-byte slot (hence
++  `movl %eax, 56(%rsp)`) while a consumer reloaded that slot with `movq`.
++
++**Making the dead guard live is not the fix — it is a regression.** Vetoing the
++4→8 direction (snapshot both classes, refuse when the producer is an
++ABI-register producer) was implemented and measured: it reproduces the correct
++`-O1`/`-O2`/`-O3`/`-Os` assembly, but **segfaults 3/3 at `-O0`**, where the
++pristine and shipped compilers are 0/3. The unification is load-bearing — the
++phi still reads the value at 8 bytes, so refusing to share the slot leaves a
++4-byte slot being read as 8. The guard's deadness in that direction is a
++consequence of the intended behaviour, not the defect. Reverted; the shipped
++compiler is byte-identical to the pre-change one (md5
++`fed60cde22dc1858bd9adec089bf62bc`).
++
++### 3.2 Also retracted: the peephole-phase hypothesis
++
++An intermediate hypothesis placed the defect in peephole phase 1, because
++`CCC_NO_PEEPHOLE_PHASE1=1` makes the reproducer pass. That is wrong too: with
++phase 1 disabled the listing *still* contains the narrow store followed by a
++wide reload (`movl %eax, 80(%rsp)` / `movq 80(%rsp), %r11`) — only at a
++different slot, in a different frame (`subq $128` instead of
++`pushq %rbp; subq $104`). Phase 1 perturbs layout and register numbering until
++the stale bytes happen to be benign; it does not introduce the store. The
++defect is entirely in the backend's slot classification and spill width.
++
++## 4. Fix
++
++`src/backend/stack_layout/copy_coalescing.rs`,
++`collect_unsound_coalesce_ids()`: a call destination whose return type is a
++sub-8-byte GPR scalar is now excluded from copy coalescing, alongside the
++existing inline-asm exclusion.
++
++Scoped as narrowly as the defect allows:
++
++* **Pointer/64-bit returns keep coalescing** — they are already spilled with
++  `movq`, so they fill the slot. That is the common case (every allocator
++  call), so the restriction costs nothing there.
++* Floats are already outside the coalescer's `scalar_type` class.
++
++## 5. Validation
++
++| check | result |
++|---|---|
++| reproducer, `-O0/-O1/-O2/-O3/-Os`, 5 runs each incl. a second `argv[0]` | 0 failures, `ALL-OK` at every level |
++| `scripts/run_regression_suite.sh` | **PASS=729 FAIL=3 SKIP=17, AB-diff failures: 0** |
++| codegen A/B, `tests/benchmark/**` + `tests/bench` (88 files, `-O2 -march=x86-64-v3`) | instructions 11577 → 11577 (**+0**), stack refs 750 → 750 (**+0**), 0 files changed |
++| codegen A/B, `tests/regression/*.c` (739 files compiled) | instructions 156315 → 156317 (**+2, +0.0013%**), stack refs 22176 → 22176 (**+0**), **1 file changed** |
++
++The single changed file is the reproducer itself, and the change is the
++`movl`+`movq` pair above. The fix is surgical: it alters codegen only where
++the bug was, at a cost of one instruction.
++
++The 3 failures are pre-existing environment gaps, not regressions: the host
++has no 32-bit libc headers (`/usr/include/bits/libc-header-start.h` is absent,
++only the `x86_64-linux-gnu` multiarch variant exists) and no `qemu-i386`, so
++every `-m32` test fails at *build* time.
++
++## 6. Suite hardening
++
++`run_regression_suite.sh` already runs an A/B differential against
++`CCC_NO_SMALL_SLOTS=1`, which is the width-partition invariant this bug
++violated — but it did not fire, because the mismatch was introduced by
++*coalescing* two values into one slot, not by small-slot assignment. The new
++regression test closes that hole from the test side: it is a plain
++differential test whose GCC comparison fails loudly on the old compiler.
++
++## 7. Open items
++
++* The `movq` reload of a value whose type is 4 bytes is still emitted
++  elsewhere; it is only *safe* while every writer of that slot is full width.
++  Making the reload width follow the value type would remove the invariant
++  this fix defends, and is worth doing as a separate change with its own A/B.
++* The kernel build/boot gate could not be re-run this session
++  (`boot gate: SKIP (KERNEL_DIR not set or tree not prepared)`).
++
++## 8. Adjudication of the external review
++
++An external review of this patch was assessed by re-deriving each claim from
++the code and from measurements, not by accepting it. Verdicts:
++
++| Claim | Verdict | Evidence |
++|---|---|---|
++| The width guard is dead in the 4→8 direction | **Correct** | `resolve_copy_aliases` reads `small_slot_values` after removing `dest_id`, so the comparison is false by construction. |
++| Vetoing 4→8 is the right fix | **Refuted** | Implemented and measured: `-O0` segfaults 3/3 (pristine 0/3). The unification is load-bearing. See §3.1. |
++| The fix does not cover a narrow **signed** result | **Incorrect** | `scalar_type` includes `I8`/`I16`/`I32`, and the condition is `scalar_type(ty) && ty.size() <= 4`, so signed narrow returns are already excluded. |
++| `ParamRef` producers form a residual hole | **Plausible, unproven** | The `resolve_copy_aliases` comment states the zero-extension premise for ALU results only; an incoming argument register is defined only at the argument's width. No corpus test triggers it. Left open (§7). |
++| `mixed_width_slots.py` is orphaned and should gate CI | **Half correct** | It is orphaned — and it was also *dead*: it matched only `(-?\d+)\(%rbp\)` while lccc emits `%rsp`-relative slots at `-O1` and above, so it could never report anything. Fixed. But it reports **510 mixed-width slots across 132 files** on the currently-green suite, so it cannot be a hard CI gate. It ships as an audit tool with an opt-in `--gate`. |
++| The regression test is argv[0]-sensitive | **Correct** | 10/10 fail at a fixed argv[0]; flipping to argv[0] length ~40 makes it pass (lengths ~1/5/20/80 still fail). Under the real runner it is red on the pre-fix compiler (`FAILED (3 failures)`) and green on the fixed one, so it currently gates correctly — but the sensitivity is real and should be pinned. |
++| The document's guard claim was unverified | **Correct** | Rewritten in §3.1. |
++| The defect is a peephole-phase transform | **Refuted** | §3.2. |
++
++Net: the review's most valuable contribution was noticing the guard's deadness
++and the orphaned auditor. Its two proposed remedies — veto the 4→8 direction,
++and gate CI on the auditor — are both measurably wrong, and adopting either
++would have shipped a segfault or a permanently-red gate.
+diff --git a/scripts/mixed_width_slots.py b/scripts/mixed_width_slots.py
+index 9bba3c5..4da8162 100755
+--- a/scripts/mixed_width_slots.py
++++ b/scripts/mixed_width_slots.py
+@@ -29,7 +29,15 @@ WMAP = {"movb": 1, "movw": 2, "movl": 4, "movq": 8,
+         "shll": 4, "shlq": 8, "testl": 4, "testq": 8}
+ 
+ 
+-def audit(path: str) -> int:
++# Slots are addressed relative to whichever pointer the frame uses: `%rbp`
++# when a frame pointer is kept (-O0, -Og, and any frame that needs one) and
++# `%rsp` when it is omitted (-O1 and above, which is where the small-slot
++# machinery is active). Matching only one of them silently reports an empty
++# audit on every -O2 listing.
++SLOT_RE = re.compile(r"(-?\d+)\(%r(?:bp|sp)\)")
++
++
++def audit(path: str, verbose: bool = True) -> int:
+     cur_fn = None
+     fn_slots = {}
+     for line in open(path):
+@@ -44,24 +52,37 @@ def audit(path: str) -> int:
+         w = WMAP.get(mnem)
+         if w is None:
+             continue
+-        for off in re.findall(r"(-?\d+)\(%rbp\)", rest):
++        for off in SLOT_RE.findall(rest):
+             fn_slots.setdefault(cur_fn, {}).setdefault(int(off), set()).add((w, mnem))
+     total = 0
+     for fn, slots in fn_slots.items():
+         mixed = {o: ws for o, ws in slots.items() if len({w for w, _ in ws}) > 1}
+         if mixed:
+             total += len(mixed)
+-            print(f"{path}: {fn}:")
+-            for o in sorted(mixed):
+-                print(f"  {o}(%rbp): {sorted(mixed[o])}")
++            if verbose:
++                print(f"{path}: {fn}:")
++                for o in sorted(mixed):
++                    print(f"  {o}(%%rbp/%%rsp): {sorted(mixed[o])}")
+     return total
+ 
+ 
+ def main() -> None:
++    args = [a for a in sys.argv[1:]]
++    gate = False
++    if "--gate" in args:
++        # CI mode: exit non-zero when any mixed-width slot is found, so the
++        # check can actually fail a build instead of only ever printing.
++        gate = True
++        args.remove("--gate")
++    quiet = "--quiet" in args
++    if quiet:
++        args.remove("--quiet")
+     grand = 0
+-    for p in sys.argv[1:]:
+-        grand += audit(p)
++    for p in args:
++        grand += audit(p, verbose=not quiet)
+     print(f"mixed-width slots (per function): {grand}")
++    if gate and grand:
++        sys.exit(1)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
+index 40072fb..da6df6d 100644
+--- a/src/backend/stack_layout/copy_coalescing.rs
++++ b/src/backend/stack_layout/copy_coalescing.rs
+@@ -10,6 +10,10 @@
+ //! Weights use the same `10^depth` loop scale as RA so inner-loop copies
+ //! win ties against cold ones. CFG matches `liveness.rs` (terminators +
+ //! asm-goto). Safe degradation is extra slots, never a wrong merge.
++//!
++//! Values that cannot honour the shared slot's width are excluded up front
++//! (see [`collect_unsound_coalesce_ids`]): inline-asm operands, and narrow
++//! call results, whose spill width is pinned to the ABI return register.
+ 
+ use std::sync::OnceLock;
+ 
+@@ -167,6 +171,42 @@ fn collect_unsound_coalesce_ids(func: &IrFunction) -> FxHashSet<u32> {
+     let mut ids = FxHashSet::default();
+     for block in &func.blocks {
+         for inst in &block.instructions {
++            // CALL RESULTS MUST NOT SHARE A STACK SLOT.
++            //
++            // The width-class unification in `slot_assignment::resolve_copy_aliases`
++            // lets a narrow web member store through `movq` into its wide root's
++            // 8-byte slot, on the documented premise that "every access to the
++            // shared slot is 8 bytes wide and no stale upper half can survive".
++            // A call's return value breaks that premise: it is spilled straight
++            // out of the ABI return register at the *call's* return width, so a
++            // `u32`-returning call emits `movl %eax, slot` no matter how wide the
++            // shared slot is.  The upper half keeps whatever the slot held before,
++            // and the root's 8-byte `movq` reload then reads it.
++            //
++            // tests/regression/acpica_name_string_outparam.c caught exactly this:
++            // `acpi_ex_name_segment`'s `u32` status (v40) was coalesced with the
++            // `status` phi (v155, wide because its `Const(I64(2))` incoming types
++            // it I64), giving
++            //     call acpi_ex_name_segment ; movl %eax,56(%rsp)   <- 4-byte store
++            //     ...                       ; movq 56(%rsp),%r11   <- 8-byte reload
++            // so the caller read uninitialized frame bytes above the status and
++            // `acpi_ex_get_name_string` reported a garbage `out_name_length`.
++            // The value is not widenable at the spill site, so refuse the merge;
++            // the cost is one extra slot per coalesced call result.
++            //
++            // Only a NARROW return is affected. A pointer/64-bit result is
++            // already spilled with `movq`, so it fills the whole slot and can
++            // keep coalescing; that is the common case (every allocator call),
++            // so the restriction costs nothing there.
++            if let Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } = inst {
++                if let Some(dest) = info.dest {
++                    // `scalar_type` is the GPR class the coalescer works in;
++                    // within it, only a sub-8-byte return is spilled narrow.
++                    if scalar_type(info.return_type) && info.return_type.size() <= 4 {
++                        ids.insert(dest.0);
 +                    }
 +                }
 +            }
-             return false;
-         }
-         if !self.ensure_sib_index_form(index) {
-             return false;
-         }
--        let mem = Self::sib_mem64(
--            phys_reg_name(b),
--            phys_reg_name(self.reg_assignments[&index.0]),
--            shift,
--            disp,
--        );
-+        let mem = Self::sib_mem64(phys_reg_name(b), phys_reg_name(x), shift, disp);
-         self.emit_store_indexed_common(val, index, shift, ty, mem)
-     }
- 
-@@ -2333,6 +2380,12 @@ impl X86Codegen {
-         if is_xmm_reg(x) {
-             return false;
-         }
-+        // PIC staging soundness (checked BEFORE the in-place extension so a
-+        // refused fold has zero side effects): the %rcx leaq staging below
-+        // would overwrite an index homed in %rcx.
-+        if self.state.pic_mode && phys_reg_name(x) == "rcx" {
-+            return false;
-+        }
-         if !self.ensure_sib_index_form(index) {
-             return false;
-         }
-@@ -2374,6 +2427,11 @@ impl X86Codegen {
-         if is_xmm_reg(x) {
-             return false;
-         }
-+        // PIC staging soundness — mirror of emit_load_indexed_sym_impl: the
-+        // %rcx leaq staging must not overwrite an index homed in %rcx.
-+        if self.state.pic_mode && phys_reg_name(x) == "rcx" {
-+            return false;
-+        }
-         if !self.ensure_sib_index_form(index) {
-             return false;
-         }
-diff --git a/src/frontend/preprocessor/macro_defs.rs b/src/frontend/preprocessor/macro_defs.rs
-index 34940a73..9b10b8b2 100644
---- a/src/frontend/preprocessor/macro_defs.rs
-+++ b/src/frontend/preprocessor/macro_defs.rs
-@@ -52,6 +52,9 @@ fn would_paste_tokens(last: u8, first: u8) -> bool {
-         (b'/', b'*') | (b'/', b'/') => true,
-         // . followed by digit (e.g., prevent "1." + "5" pasting weirdly)
-         (b'.', b'0'..=b'9') => true,
-+        // digit followed by '.' (e.g., "1" from a macro + "." from source
-+        // would re-lex as the pp-number "1." instead of two tokens)
-+        (a, b'.') if a.is_ascii_digit() => true,
-         // Identifier/number continuation: letter/digit/_ followed by letter/digit/_
-         (a, b) if is_ident_cont_byte(a) && is_ident_cont_byte(b) => true,
-         _ => false,
-@@ -92,6 +95,27 @@ const BLUE_PAINT_MARKER: u8 = 0x01;
- const PASTE_PROTECT_START: u8 = 0x02;
- const PASTE_PROTECT_END: u8 = 0x03;
- 
-+/// Token-boundary marker emitted where macro replacement output abuts
-+/// surrounding tokens with no intervening whitespace (C11 §6.10.3.4).
-+///
-+/// Rescanning operates on *preprocessing tokens*, not on the spelling text:
-+/// replacement tokens and source tokens never merge into a new token merely
-+/// because their spellings are adjacent (e.g. `#define MAJOR 1` followed by
-+/// the body `MAJOR.MINOR` yields the three tokens `1`, `.`, `MINOR`, and
-+/// `MINOR` is still macro-expandable — it is NOT part of a pp-number
-+/// `1.MINOR`). A plain string-based expander cannot see that boundary, which
-+/// previously made `expand_identifier`'s pp-number continuation check swallow
-+/// identifiers across expansion boundaries and broke glibc/zstd-style
-+/// version stringification (`ZSTD_EXPAND_AND_QUOTE(ZSTD_LIB_VERSION)` ->
-+/// "1.ZSTD_VERSION_MINOR. 0" instead of "1.6.0").
-+///
-+/// The barrier marks "token boundary, no whitespace". Consumers:
-+/// - `stringify_arg` drops it (adjacent tokens stringify without a space),
-+/// - `expand_line_reuse` converts it to a real space only where the two
-+///   neighbours would otherwise paste into one token (matches gcc -E output).
-+/// Uses 0x04 to avoid collision with the other marker bytes.
-+const EXPANSION_BARRIER: u8 = 0x04;
+             if let Instruction::InlineAsm { outputs, .. } = inst {
+                 for (_, v, _) in outputs {
+                     ids.insert(v.0);
+diff --git a/tests/regression/acpica_name_string_outparam.c b/tests/regression/acpica_name_string_outparam.c
+new file mode 100644
+index 0000000..7de0624
+--- /dev/null
++++ b/tests/regression/acpica_name_string_outparam.c
+@@ -0,0 +1,646 @@
++/* ACPICA name-string out-parameter: the store to *out_name_string must not be
++ * dropped on any path that returns AE_OK.
++ *
++ * Provenance: a Linux 6.18.52-cachymod kernel built entirely with LCCC booted
++ * in QEMU and, on the ACPI error path provoked by SeaBIOS' DSDT, warned:
++ *
++ *   WARNING: CPU: 1 PID: 1 at free_large_kmalloc+0x99/0x190
++ *    kfree+0xb6/0x370
++ *    acpi_ds_create_operand+0x26c/0x580
++ *   page dumped because: Not a kmalloc allocation   (pfn:0x173b, refcount:1)
++ *
++ * Captured live over the QEMU gdbstub (scripts/qemu_gdbstub_probe.py), the
++ * pointer handed to kfree() was 0xffffffff8173b8c6 — the instruction after
++ * `call acpi_ut_track_stack_ptr` inside acpi_ut_trace_ptr, i.e. a *return
++ * address* read off the stack, not a pointer anyone allocated.
++ *
++ * The chain is fully pinned down:
++ *   acpi_ds_create_operand()   passes  lea -0x38(%rbp),%rdx  as out_name_string
++ *                              frees    mov -0x38(%rbp),%r9; mov %r9,%rdi; kfree
++ *                              -> store target and load source agree (correct)
++ *   status check               mov %eax,%r14d; test %r14d,%r14d; je  (correct,
++ *                              so the free is not on a failure path)
++ *   acpi_ex_get_name_string()  success epilogue is
++ *                              mov -0x40(%rbp),%rcx; mov %r13,(%rcx)
++ *   -> the only way the caller sees garbage on an AE_OK return is a lost or
++ *      misdirected store of the allocated name_string.
++ *
++ * This test reproduces that contract in isolation. Three things make it a
++ * faithful reproduction rather than a plausible-looking one:
++ *
++ *  1. The functions are extracted verbatim from drivers/acpi/acpica/exnames.c
++ *     (v6.18), including the `while (num_segments && (status = ...))` shape
++ *     and the `acpi_ut_valid_name_char(c, 0)` position-0 quirk that makes '_'
++ *     an invalid segment character.
++ *  2. The kernel config has CONFIG_ACPI_DEBUG=y, so ACPI_FUNCTION_TRACE*,
++ *     ACPI_DEBUG_PRINT, ACPI_ERROR and return_PTR/return_ACPI_STATUS are NOT
++ *     no-ops — they are real calls, and the garbage that leaked was literally
++ *     a trace function's return address. The stubs here are therefore
++ *     __attribute__((noinline)) real calls with side effects, not macros that
++ *     vanish.
++ *  3. The caller mirrors acpi_ds_create_operand: an *uninitialized* `char
++ *     *name_string`, a status check, then an unconditional free.
++ *
++ * Detection is exact rather than probabilistic: acpi_os_allocate() hands out
++ * from a private arena, so after an AE_OK return the out-parameter is either
++ * an arena pointer (contract honoured) or it is not (store lost). The string
++ * contents and consumed length are checked too, so a store of the *wrong*
++ * value fails as well.
++ *
++ * Expected: identical output from LCCC and GCC, every case "ok". */
 +
- /// Strip all blue-paint markers from a string.
- /// Used when substituting arguments into ## token paste operations,
- /// since the pasted result is a new token that should be rescanned
-@@ -301,28 +325,94 @@ impl MacroTable {
-         // - 0x01 (BLUE_PAINT_MARKER): prevents re-expansion per C11 §6.10.3.4
-         // - 0x02/0x03 (PASTE_PROTECT_START/END): should already be consumed by
-         //   substitute_params, but strip defensively in case any leak through.
-+        // - 0x04 (EXPANSION_BARRIER): a token boundary with no whitespace.
-+        //   For final SPELLING output it becomes a space only where the two
-+        //   neighbours would otherwise re-lex as a single token (matching the
-+        //   traditional paste-guard behaviour); everywhere else it vanishes,
-+        //   so the spelling keeps the whitespace-free form that C11
-+        //   §6.10.3.2 stringification and the pp-number continuation check
-+        //   downstream rely on.
-+        let has_barrier = result.as_bytes().iter().any(|&b| b == EXPANSION_BARRIER);
-         if result
-             .as_bytes()
-             .iter()
-             .any(|&b| b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END)
-         {
--            result.replace(
-+            let stripped = result.replace(
-                 [
-                     BLUE_PAINT_MARKER as char,
-                     PASTE_PROTECT_START as char,
-                     PASTE_PROTECT_END as char,
-                 ],
-                 "",
--            )
-+            );
-+            return if has_barrier {
-+                Self::resolve_barriers(&stripped)
-+            } else {
-+                stripped
-+            };
-+        }
-+        if has_barrier {
-+            Self::resolve_barriers(&result)
-         } else {
-             result
-         }
-     }
- 
--    /// Append `expanded` text to `result`, inserting spaces as needed to prevent
--    /// accidental token pasting between the end of `result` and the start/end
--    /// of `expanded`, and between the end of `expanded` and `next_byte` (the
--    /// next byte in the source after the expansion site).
-+    /// Replace EXPANSION_BARRIER markers in final output: a barrier becomes a
-+    /// real space exactly when its two neighbours would paste into one token;
-+    /// otherwise it is dropped (pure token boundary, no whitespace).
-+    /// Operates on raw bytes (barriers are single ASCII control bytes, and the
-+    /// surrounding text — e.g. UTF-8 string literal contents — must be copied
-+    /// through byte-exact).
-+    fn resolve_barriers(s: &str) -> String {
-+        let bytes = s.as_bytes();
-+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-+        let mut i = 0;
-+        while i < bytes.len() {
-+            let b = bytes[i];
-+            if b != EXPANSION_BARRIER {
-+                out.push(b);
-+                i += 1;
-+                continue;
-+            }
-+            let prev = out.last().copied();
-+            // Find the next non-barrier byte (defensive: doubled barriers).
-+            let mut j = i + 1;
-+            while j < bytes.len() && bytes[j] == EXPANSION_BARRIER {
-+                j += 1;
-+            }
-+            let next = if j < bytes.len() {
-+                Some(bytes[j])
-+            } else {
-+                None
-+            };
-+            if let (Some(p), Some(n)) = (prev, next) {
-+                if would_paste_tokens(p, n) || (is_ident_cont_byte(p) && is_ident_cont_byte(n)) {
-+                    out.push(b' ');
-+                }
-+            }
-+            // A barrier at the very edge of the line carries no paste risk;
-+            // drop it.
-+            i = j;
-+        }
-+        // The text (barriers included) is pure ASCII-safe bytes — 0x04 is a
-+        // valid one-byte UTF-8 sequence — so this cannot fail.
-+        String::from_utf8(out)
-+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
-+    }
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
 +
-+    /// Append `expanded` text to `result`, inserting token-boundary barriers as
-+    /// needed to prevent accidental token pasting between the end of `result`
-+    /// and the start/end of `expanded`, and between the end of `expanded` and
-+    /// `next_byte` (the next byte in the source after the expansion site).
-+    ///
-+    /// The barrier is an invisible EXPANSION_BARRIER marker rather than a
-+    /// literal space: adjacent replacement tokens stringify WITHOUT whitespace
-+    /// (C11 §6.10.3.2 — the spelling records only whitespace that existed in
-+    /// the token sequence), while `expand_line_reuse` turns the barrier back
-+    /// into a space for final output exactly where the neighbours would
-+    /// otherwise re-lex as a single token.
-     fn append_with_paste_guard(result: &mut String, expanded: &str, next_byte: Option<u8>) {
-         if expanded.is_empty() {
-             return;
-@@ -334,7 +424,7 @@ impl MacroTable {
-             if would_paste_tokens(last, first)
-                 || (is_ident_cont_byte(last) && is_ident_cont_byte(first))
-             {
--                result.push(' ');
-+                result.push(EXPANSION_BARRIER as char);
-             }
-         }
-         result.push_str(expanded);
-@@ -342,7 +432,7 @@ impl MacroTable {
-         if let Some(next) = next_byte {
-             let last_expanded = expanded.as_bytes()[expanded.len() - 1];
-             if would_paste_tokens(last_expanded, next) {
--                result.push(' ');
-+                result.push(EXPANSION_BARRIER as char);
-             }
-         }
-     }
-@@ -1615,6 +1705,17 @@ fn stringify_arg(arg: &str) -> String {
-             continue;
-         }
- 
-+        // Skip EXPANSION_BARRIER markers (token boundaries with no whitespace
-+        // introduced where macro replacement output abuts other tokens —
-+        // §6.10.3.2 records only whitespace that exists in the token
-+        // sequence, and adjacent replacement tokens stringify without a
-+        // space). Without this, `EQ(V)` with V expanding to `1.MINOR.RELEASE`
-+        // would stringify as "1. MINOR. RELEASE" instead of "1.6.0".
-+        if bytes[i] == EXPANSION_BARRIER {
-+            i += 1;
-+            continue;
-+        }
++typedef unsigned char u8;
++typedef unsigned int u32;
++typedef unsigned int acpi_status;
++typedef unsigned int acpi_object_type;
 +
-         // Collapse whitespace sequences to a single space
-         if bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' {
-             if !result.is_empty() {
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index db5e7923..a50523f4 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -4915,6 +4915,34 @@ fn cond_store_no_escaping_uses(
- /// Fail-closed: any shape deviation (extra side effects, a second load, a
- /// different skip target, volatile access, non-integer compares the flip
- /// table does not cover) leaves the loop untouched.
-+///
-+/// S04c guard (`cond_store_phi_incoming_safe`): the rewrite deletes every
-+/// computation in the guard chain and the store block. A header phi whose
-+/// back edge takes its value from one of those blocks is a loop-carried
-+/// recurrence — `if (b[i]=='\n') { b[i]=0; lineCount++; }` in
-+/// UTIL_processLines — that the select-store silently drops, which zeroed
-+/// the line count and broke zstd's `--filelist`. The map transform's own
-+/// contract allows no loop-carried value except the induction variable, so
-+/// such shapes must not be rewritten at all.
-+fn cond_store_phi_incoming_safe(func: &IrFunction, rewritten_blocks: &[usize]) -> bool {
-+    let rewritten_labels: FxHashSet<BlockId> = rewritten_blocks
-+        .iter()
-+        .map(|&bi| func.blocks[bi].label)
-+        .collect();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::Phi { incoming, .. } = inst {
-+                for (_op, label) in incoming {
-+                    if rewritten_labels.contains(label) {
-+                        return false;
-+                    }
-+                }
-+            }
-+        }
-+    }
-+    true
++/* AML encoding constants (amlcode.h). */
++#define AML_ROOT_PREFIX          0x5C	/* '\' */
++#define AML_PARENT_PREFIX        0x5E	/* '^' */
++#define AML_DUAL_NAME_PREFIX     0x2E
++#define AML_MULTI_NAME_PREFIX    0x2F
++#define ACPI_NAMESEG_SIZE        4
++#define ACPI_UINT32_MAX          ((u32)0xFFFFFFFF)
++#define FALSE                    0
++#define TRUE                     1
++
++/* Status codes: only the AE_OK == 0 / ACPI_FAILURE(a) == (a) relationship is
++ * load-bearing here, so the AML-specific numbers need not match acexcep.h. */
++#define AE_OK                    ((acpi_status)0x0000)
++#define AE_ERROR                 ((acpi_status)0x0001)
++#define AE_NO_MEMORY             ((acpi_status)0x0002)
++#define AE_AML_BAD_NAME          ((acpi_status)0x3006)
++#define AE_CTRL_PENDING          ((acpi_status)0x2005)
++#define ACPI_SUCCESS(a)          (!(a))
++#define ACPI_FAILURE(a)          (a)
++
++/* Object types; only the three field types take the first branch. */
++#define ACPI_TYPE_ANY            0x00
++#define ACPI_TYPE_LOCAL_REGION_FIELD 0x10
++#define ACPI_TYPE_LOCAL_BANK_FIELD   0x11
++#define ACPI_TYPE_LOCAL_INDEX_FIELD  0x12
++
++/* ------------------------------------------------------------------ *
++ * Trace / error / allocation stubs.
++ *
++ * noinline + external side effect: in the kernel these are real calls
++ * (acpi_ut_trace_ptr, acpi_debug_print, acpi_ut_status_exit, ...) and the
++ * leaked value was one of their return addresses. If the compiler folded them
++ * away the reproduction would not exercise the same register pressure or the
++ * same call boundaries, and the defect would hide.
++ * ------------------------------------------------------------------ */
++
++static volatile unsigned long trace_calls;
++static volatile unsigned long exit_calls;
++static volatile unsigned long alloc_calls;
++static volatile unsigned long free_calls;
++
++/* Counters must stay address-free: the suite compares stdout byte for byte
++ * against the GCC oracle and against a second LCCC configuration, so folding a
++ * pointer value in would make the output ASLR-dependent and the comparison
++ * meaningless. Only the (stable) function-name tag and status are mixed in. */
++__attribute__((noinline)) static void acpi_ut_trace_ptr(const char *fn,
++							const void *ptr)
++{
++	(void)ptr;
++	trace_calls += (unsigned long)fn[0] + (unsigned long)fn[1];
 +}
 +
- fn rewrite_conditional_store(
-     func: &mut IrFunction,
-     loop_info: &loop_analysis::NaturalLoop,
-@@ -5237,6 +5265,24 @@ fn rewrite_conditional_store(
-         return false;
-     }
- 
-+    if !same_address {
-+        return false;
-+    }
++__attribute__((noinline)) static void acpi_ut_trace(const char *fn)
++{
++	trace_calls += (unsigned long)fn[0];
++}
 +
-+    // S04c fail-closed: chain blocks + the store block are about to be
-+    // deleted; refuse when a phi takes its incoming from any of them (a
-+    // loop-carried recurrence the select-store would silently drop).
-+    {
-+        let mut rewritten: Vec<usize> = chain.iter().map(|&(b, _)| b).collect();
-+        rewritten.push(store_block);
-+        if !cond_store_phi_incoming_safe(func, &rewritten) {
-+            set_reject("conditional store feeds a loop-carried phi");
-+            if debug {
-+                eprintln!("[VEC-COND] bail: phi incoming from rewritten block");
-+            }
-+            return false;
-+        }
-+    }
-     // ── Rewrite ──────────────────────────────────────────────────────────
-     // Move the store block's value computation into the first chain
-     // block, re-point the store at the load's address, and select the
-@@ -5862,6 +5908,20 @@ fn rewrite_folded_cond_store(
-         negated
-     };
- 
-+    if !same_address {
-+        return false;
-+    }
++__attribute__((noinline)) static void acpi_ut_status_exit(const char *fn,
++							  acpi_status st)
++{
++	exit_calls += (unsigned long)st + (unsigned long)fn[0];
++}
 +
-+    // S04c fail-closed: the guard header + store block are about to be
-+    // rewritten; refuse when a phi takes its incoming from either (a
-+    // loop-carried recurrence the select-store would silently drop).
-+    if !cond_store_phi_incoming_safe(func, &[header_idx, store_block]) {
-+        set_reject("conditional store feeds a loop-carried phi");
-+        if debug {
-+            eprintln!("[VEC-COND] bail: phi incoming from rewritten block (folded)");
-+        }
-+        return false;
-+    }
-     // ── Rewrite ──────────────────────────────────────────────────────────
-     // The store block's computation, minus the store itself and the
-     // store's address GEP (the new store reuses the load's address),
++__attribute__((noinline)) static void acpi_ut_ptr_exit(const char *fn,
++						       const void *ptr)
++{
++	(void)ptr;
++	exit_calls += (unsigned long)fn[0] + (unsigned long)fn[1];
++}
++
++/* Variadic, like the real acpi_debug_print / acpi_ut_error. */
++__attribute__((noinline)) static void acpi_debug_print(const char *fmt, ...)
++{
++	trace_calls += (unsigned long)fmt[0];
++}
++
++__attribute__((noinline)) static void acpi_ut_error(const char *fmt, ...)
++{
++	trace_calls += (unsigned long)fmt[0] + 1u;
++}
++
++#define ACPI_FUNCTION_TRACE(a)            acpi_ut_trace(#a)
++#define ACPI_FUNCTION_TRACE_PTR(a, b)     acpi_ut_trace_ptr(#a, (const void *)(b))
++#define return_ACPI_STATUS(s) \
++	do { acpi_ut_status_exit(__func__, (s)); return (s); } while (0)
++#define return_PTR(p) \
++	do { acpi_ut_ptr_exit(__func__, (const void *)(p)); return (p); } while (0)
++#define ACPI_DEBUG_PRINT(a)               acpi_debug_print a
++#define ACPI_ERROR(a)                     acpi_ut_error a
++#define AE_INFO                           __func__, __LINE__
++
++/* ------------------------------------------------------------------ *
++ * Arena allocator: makes "is this the pointer we allocated?" exact.
++ * ------------------------------------------------------------------ */
++
++#define ARENA_BYTES 65536
++static char arena[ARENA_BYTES];
++static size_t arena_used;
++static unsigned long arena_live;
++
++static int arena_owns(const void *p)
++{
++	return p >= (const void *)arena &&
++	       p < (const void *)(arena + ARENA_BYTES);
++}
++
++__attribute__((noinline)) static void *acpi_os_allocate(size_t size)
++{
++	void *p;
++
++	alloc_calls++;
++	if (size == 0 || arena_used + size + 8 > ARENA_BYTES)
++		return NULL;
++	arena_used += (8 - (arena_used & 7)) & 7;	/* align to 8 */
++	p = arena + arena_used;
++	arena_used += size;
++	arena_live++;
++	memset(p, 0xA5, size);	/* poison: an unwritten buffer is visible */
++	return p;
++}
++
++__attribute__((noinline)) static void acpi_os_free(void *p)
++{
++	free_calls++;
++	/* Freeing a non-arena pointer is exactly the kernel's WARN. */
++	if (!arena_owns(p)) {
++		printf("FREE-OF-FOREIGN-POINTER\n");
++		exit(3);
++	}
++	arena_live--;
++}
++
++#define ACPI_ALLOCATE(s)          acpi_os_allocate((size_t)(s))
++#define ACPI_FREE(p)              acpi_os_free((void *)(p))
++#define ACPI_CAST_PTR(t, p)       ((t *)(void *)(p))
++
++/* Verbatim from drivers/acpi/acpica/utascii.c:60 — note it accepts '_'
++ * unconditionally and does NOT accept lower case, and that '!' is allowed only
++ * in the last position. acpi_ex_name_segment always calls it with position 0,
++ * so the '!' arm is dead there, but it is kept for fidelity: getting this
++ * predicate wrong silently changes which AML inputs take the failure paths,
++ * which is the whole point of the test. */
++__attribute__((noinline)) static u8 acpi_ut_valid_name_char(char character,
++							    u32 position)
++{
++	if (!((character >= 'A' && character <= 'Z') ||
++	      (character >= '0' && character <= '9') || (character == '_'))) {
++
++		/* Allow a '!' in the last position */
++
++		if (character == '!' && position == 3) {
++			return (TRUE);
++		}
++
++		return (FALSE);
++	}
++
++	return (TRUE);
++}
++
++/* ================= extracted verbatim from exnames.c ================= */
++
++static char *acpi_ex_allocate_name_string(u32 prefix_count, u32 num_name_segs)
++{
++	char *temp_ptr;
++	char *name_string;
++	u32 size_needed;
++
++	ACPI_FUNCTION_TRACE(ex_allocate_name_string);
++
++	if (prefix_count == ACPI_UINT32_MAX) {
++
++		/* Special case for root */
++
++		size_needed = 1 + (ACPI_NAMESEG_SIZE * num_name_segs) + 2 + 1;
++	} else {
++		size_needed =
++		    prefix_count + (ACPI_NAMESEG_SIZE * num_name_segs) + 2 + 1;
++	}
++
++	name_string = ACPI_ALLOCATE(size_needed);
++	if (!name_string) {
++		ACPI_ERROR((AE_INFO, "Could not allocate size %u", size_needed));
++		return_PTR(NULL);
++	}
++
++	temp_ptr = name_string;
++
++	if (prefix_count == ACPI_UINT32_MAX) {
++		*temp_ptr++ = AML_ROOT_PREFIX;
++	} else {
++		while (prefix_count--) {
++			*temp_ptr++ = AML_PARENT_PREFIX;
++		}
++	}
++
++	if (num_name_segs > 2) {
++		*temp_ptr++ = AML_MULTI_NAME_PREFIX;
++		*temp_ptr++ = (char)num_name_segs;
++	} else if (2 == num_name_segs) {
++		*temp_ptr++ = AML_DUAL_NAME_PREFIX;
++	}
++
++	*temp_ptr = 0;
++
++	return_PTR(name_string);
++}
++
++static acpi_status acpi_ex_name_segment(u8 ** in_aml_address, char *name_string)
++{
++	char *aml_address = (void *)*in_aml_address;
++	acpi_status status = AE_OK;
++	u32 index;
++	char char_buf[5];
++
++	ACPI_FUNCTION_TRACE(ex_name_segment);
++
++	char_buf[0] = *aml_address;
++
++	if ('0' <= char_buf[0] && char_buf[0] <= '9') {
++		ACPI_ERROR((AE_INFO, "Invalid leading digit: %c", char_buf[0]));
++		return_ACPI_STATUS(AE_CTRL_PENDING);
++	}
++
++	for (index = 0;
++	     (index < ACPI_NAMESEG_SIZE)
++	     && (acpi_ut_valid_name_char(*aml_address, 0)); index++) {
++		char_buf[index] = *aml_address++;
++	}
++
++	if (index == 4) {
++
++		char_buf[4] = '\0';
++
++		if (name_string) {
++			ACPI_DEBUG_PRINT(("Appending NameSeg %s\n", char_buf));
++			strcat(name_string, char_buf);
++		} else {
++			ACPI_DEBUG_PRINT(("No Name string - %s\n", char_buf));
++		}
++	} else if (index == 0) {
++		ACPI_DEBUG_PRINT(("Leading character is not alpha: %02Xh\n",
++				  char_buf[0]));
++		status = AE_CTRL_PENDING;
++	} else {
++		status = AE_AML_BAD_NAME;
++		ACPI_ERROR((AE_INFO, "Bad character 0x%02x in name, at %p",
++			    *aml_address, aml_address));
++	}
++
++	*in_aml_address = ACPI_CAST_PTR(u8, aml_address);
++	return_ACPI_STATUS(status);
++}
++
++acpi_status
++acpi_ex_get_name_string(acpi_object_type data_type,
++			u8 * in_aml_address,
++			char **out_name_string, u32 * out_name_length)
++{
++	acpi_status status = AE_OK;
++	u8 *aml_address = in_aml_address;
++	char *name_string = NULL;
++	u32 num_segments;
++	u32 prefix_count = 0;
++	u8 has_prefix = FALSE;
++
++	ACPI_FUNCTION_TRACE_PTR(ex_get_name_string, aml_address);
++
++	if (ACPI_TYPE_LOCAL_REGION_FIELD == data_type ||
++	    ACPI_TYPE_LOCAL_BANK_FIELD == data_type ||
++	    ACPI_TYPE_LOCAL_INDEX_FIELD == data_type) {
++
++		name_string = acpi_ex_allocate_name_string(0, 1);
++		if (!name_string) {
++			status = AE_NO_MEMORY;
++		} else {
++			status =
++			    acpi_ex_name_segment(&aml_address, name_string);
++		}
++	} else {
++		switch (*aml_address) {
++		case AML_ROOT_PREFIX:
++
++			ACPI_DEBUG_PRINT(("RootPrefix(\\) at %p\n", aml_address));
++
++			aml_address++;
++			prefix_count = ACPI_UINT32_MAX;
++			has_prefix = TRUE;
++			break;
++
++		case AML_PARENT_PREFIX:
++
++			do {
++				ACPI_DEBUG_PRINT(("ParentPrefix (^) at %p\n",
++						  aml_address));
++
++				aml_address++;
++				prefix_count++;
++
++			} while (*aml_address == AML_PARENT_PREFIX);
++
++			has_prefix = TRUE;
++			break;
++
++		default:
++			break;
++		}
++
++		switch (*aml_address) {
++		case AML_DUAL_NAME_PREFIX:
++
++			ACPI_DEBUG_PRINT(("DualNamePrefix at %p\n", aml_address));
++
++			aml_address++;
++			name_string =
++			    acpi_ex_allocate_name_string(prefix_count, 2);
++			if (!name_string) {
++				status = AE_NO_MEMORY;
++				break;
++			}
++
++			has_prefix = TRUE;
++
++			status =
++			    acpi_ex_name_segment(&aml_address, name_string);
++			if (ACPI_SUCCESS(status)) {
++				status =
++				    acpi_ex_name_segment(&aml_address,
++							 name_string);
++			}
++			break;
++
++		case AML_MULTI_NAME_PREFIX:
++
++			ACPI_DEBUG_PRINT(("MultiNamePrefix at %p\n", aml_address));
++
++			aml_address++;
++			num_segments = *aml_address;
++
++			name_string =
++			    acpi_ex_allocate_name_string(prefix_count,
++							 num_segments);
++			if (!name_string) {
++				status = AE_NO_MEMORY;
++				break;
++			}
++
++			aml_address++;
++			has_prefix = TRUE;
++
++			while (num_segments &&
++			       (status =
++				acpi_ex_name_segment(&aml_address,
++						     name_string)) == AE_OK) {
++				num_segments--;
++			}
++
++			break;
++
++		case 0:
++
++			if (prefix_count == ACPI_UINT32_MAX) {
++				ACPI_DEBUG_PRINT(("NameSeg is \"\\\" followed by NULL\n"));
++			}
++
++			aml_address++;
++			name_string =
++			    acpi_ex_allocate_name_string(prefix_count, 0);
++			if (!name_string) {
++				status = AE_NO_MEMORY;
++				break;
++			}
++
++			break;
++
++		default:
++
++			name_string =
++			    acpi_ex_allocate_name_string(prefix_count, 1);
++			if (!name_string) {
++				status = AE_NO_MEMORY;
++				break;
++			}
++
++			status =
++			    acpi_ex_name_segment(&aml_address, name_string);
++			break;
++		}
++	}
++
++	if (AE_CTRL_PENDING == status && has_prefix) {
++
++		ACPI_ERROR((AE_INFO, "Malformed Name at %p", name_string));
++		status = AE_AML_BAD_NAME;
++	}
++
++	if (ACPI_FAILURE(status)) {
++		if (name_string) {
++			ACPI_FREE(name_string);
++		}
++		return_ACPI_STATUS(status);
++	}
++
++	*out_name_string = name_string;
++	*out_name_length = (u32) (aml_address - in_aml_address);
++
++	return_ACPI_STATUS(status);
++}
++
++/* ===================== end of extracted code ===================== */
++
++/* The ACPICA name string embeds raw prefix bytes (0x2F/0x2E/segment count),
++ * so print it escaped: the oracle comparison is on stdout, and non-printable
++ * bytes there make a diff unreadable. */
++static char shown[128];
++
++static const char *show(const char *s)
++{
++	size_t o = 0;
++	size_t i;
++
++	for (i = 0; s[i] && o < sizeof(shown) - 5; i++) {
++		unsigned char c = (unsigned char)s[i];
++
++		if (c >= 0x20 && c < 0x7f && c != '\\') {
++			shown[o++] = (char)c;
++		} else {
++			o += (size_t)snprintf(shown + o, sizeof(shown) - o,
++					      "\\\\x%02x", c);
++		}
++	}
++	shown[o] = 0;
++	return shown;
++}
++
++/* The caller, shaped like acpi_ds_create_operand: uninitialized local, status
++ * check, then an unconditional ACPI_FREE. noinline so the callee is a real
++ * call with a real out-parameter, as in the kernel. */
++__attribute__((noinline))
++static int caller_get_and_free(acpi_object_type data_type, u8 *aml,
++			       const char *want, u32 want_len, const char *tag)
++{
++	char *name_string;	/* deliberately uninitialized, as in ACPICA */
++	u32 name_length;
++	acpi_status status;
++
++	status = acpi_ex_get_name_string(data_type, aml, &name_string,
++					 &name_length);
++
++	if (ACPI_FAILURE(status)) {
++		/* Failure paths must not hand back a pointer at all. */
++		printf("%-22s status=%08x (failure, as expected)\n", tag,
++		       status);
++		return 0;
++	}
++
++	if (!name_string) {
++		printf("%-22s FAIL: AE_OK but out_name_string is NULL\n", tag);
++		return 1;
++	}
++	if (!arena_owns(name_string)) {
++		printf("%-22s FAIL: AE_OK but out_name_string is not an arena "
++		       "pointer (store lost)\n", tag);
++		return 1;
++	}
++	if (name_length != want_len) {
++		printf("%-22s FAIL: length %u, want %u\n", tag, name_length,
++		       want_len);
++		return 1;
++	}
++	if (strcmp(name_string, want) != 0) {
++		printf("%-22s FAIL: name %s, want %s\n", tag,
++		       show(name_string), show(want));
++		return 1;
++	}
++
++	ACPI_FREE(name_string);
++	printf("%-22s ok status=0 len=%u name=%s\n", tag, name_length,
++	       show(want));
++	return 0;
++}
++
++/* Multi-segment path, the one the kernel took for \_SB.PCI0.PRES._INI */
++static u8 aml_root_multi3[] = {
++	AML_ROOT_PREFIX, AML_MULTI_NAME_PREFIX, 3,
++	'_', 'S', 'B', '_',
++	'P', 'C', 'I', '0',
++	'P', 'R', 'E', 'S',
++	0
++};
++static u8 aml_root_multi4[] = {
++	AML_ROOT_PREFIX, AML_MULTI_NAME_PREFIX, 4,
++	'_', 'S', 'B', '_',
++	'P', 'C', 'I', '0',
++	'P', 'R', 'E', 'S',
++	'_', 'I', 'N', 'I',
++	0
++};
++static u8 aml_root_dual[] = {
++	AML_ROOT_PREFIX, AML_DUAL_NAME_PREFIX,
++	'_', 'S', 'B', '_',
++	'P', 'C', 'I', '0',
++	0
++};
++static u8 aml_parent3_multi2[] = {
++	AML_PARENT_PREFIX, AML_PARENT_PREFIX, AML_PARENT_PREFIX,
++	AML_MULTI_NAME_PREFIX, 2,
++	'A', 'B', 'C', 'D',
++	'E', 'F', 'G', 'H',
++	0
++};
++static u8 aml_dual_noprefix[] = {
++	AML_DUAL_NAME_PREFIX,
++	'A', 'B', 'C', 'D',
++	'E', 'F', 'G', 'H',
++	0
++};
++static u8 aml_plain_segment[] = { 'D', 'E', 'V', 'C', 0 };
++static u8 aml_null_name[] = { 0 };
++static u8 aml_root_null[] = { AML_ROOT_PREFIX, 0 };
++static u8 aml_field_name[] = { 'F', 'L', 'D', '0', 0 };
++/* Failure paths: these must return non-zero and free nothing to the caller. */
++static u8 aml_short_segment[] = { 'A', 'B', 0 };
++static u8 aml_leading_digit[] = { '9', 'A', 'B', 'C', 0 };
++static u8 aml_root_leading_digit[] = { AML_ROOT_PREFIX, '9', 'A', 'B', 'C', 0 };
++static u8 aml_parent_no_segment[] = { AML_PARENT_PREFIX, AML_PARENT_PREFIX, 0 };
++static u8 aml_multi_bad_tail[] = {
++	AML_MULTI_NAME_PREFIX, 2,
++	'A', 'B', 'C', 'D',
++	'X', 'Y', 0			/* second segment too short */
++};
++
++int main(void)
++{
++	int fails = 0;
++
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_root_multi3,
++				     "\\" "/\x03" "_SB_PCI0PRES", 15, "root+multi3");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_root_multi4,
++				     "\\" "/\x04" "_SB_PCI0PRES_INI", 19, "root+multi4");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_root_dual,
++				     "\\" "\x2e" "_SB_PCI0", 10, "root+dual");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_parent3_multi2,
++				     "^^^" "\x2e" "ABCDEFGH", 13, "parent3+multi2");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_dual_noprefix,
++				     "\x2e" "ABCDEFGH", 9, "dual-noprefix");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_plain_segment,
++				     "DEVC", 4, "plain-segment");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_null_name,
++				     "", 1, "null-name");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_root_null,
++				     "\\", 2, "root-null");
++	/* Field types take the first branch and disallow prefixes. */
++	fails += caller_get_and_free(ACPI_TYPE_LOCAL_REGION_FIELD, aml_field_name,
++				     "FLD0", 4, "field-region");
++	fails += caller_get_and_free(ACPI_TYPE_LOCAL_BANK_FIELD, aml_field_name,
++				     "FLD0", 4, "field-bank");
++	fails += caller_get_and_free(ACPI_TYPE_LOCAL_INDEX_FIELD, aml_field_name,
++				     "FLD0", 4, "field-index");
++	/* Failure paths. */
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_short_segment,
++				     "", 0, "short-segment");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_leading_digit,
++				     "", 0, "leading-digit");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_root_leading_digit,
++				     "", 0, "root+leading-digit");
++	/* ^^ followed by the null name: `case 0` still allocates, so this is a
++	 * success returning "^^" — not a failure, despite the trailing prefix. */
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_parent_no_segment,
++				     "^^", 3, "parent+null-name");
++	fails += caller_get_and_free(ACPI_TYPE_ANY, aml_multi_bad_tail,
++				     "", 0, "multi-bad-tail");
++
++	/* Every successful case freed exactly what it allocated. */
++	if (arena_live != 0) {
++		printf("FAIL: %lu arena block(s) leaked\n", arena_live);
++		fails++;
++	}
++
++	printf("trace=%lu exit=%lu alloc=%lu free=%lu arena_used=%u\n",
++	       trace_calls, exit_calls, alloc_calls, free_calls,
++	       (unsigned)arena_used);
++	printf("%s (%d failure%s)\n", fails ? "FAILED" : "ALL-OK", fails,
++	       fails == 1 ? "" : "s");
++	return fails ? 1 : 0;
++}
