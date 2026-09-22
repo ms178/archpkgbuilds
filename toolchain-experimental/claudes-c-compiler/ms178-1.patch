@@ -1,2149 +1,953 @@
-diff --git a/engineering/FOLLOWUP-2026-09-22-div-mod-exhaustive.md b/engineering/FOLLOWUP-2026-09-22-div-mod-exhaustive.md
+diff --git a/engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md b/engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md
 new file mode 100644
-index 0000000..3330b4d
+index 00000000..7ac9d284
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-22-div-mod-exhaustive.md
-@@ -0,0 +1,275 @@
-+# Follow-up: exhaustive div/mod coverage, and an -O1 defect it exposed
-+
-+Session of 2026-09-22 (third), rebased on `origin/main` `e08565c`.
-+
-+Note on the base: `origin/main`'s tip is `e08565c` and it does **not** contain
-+the previous session's commits. The only part of this line of work merged
-+upstream is `05c9a6ba`. The previous patch was therefore re-applied on top of
-+`e08565c` before this session's work, so nothing was lost.
-+
-+## 1. What was added
-+
-+`tests/regression/div_mod_by_const_exhaustive.c` — exhaustive coverage for
-+`div_by_const`, the pass that replaces `div`/`idiv` (20-90 cycles) with
-+Hacker's Delight multiply-and-shift sequences. It had no exhaustive test, which
-+matters because a truncation bug in a neighbouring predicate
-+(`const_power_of_two` reading an `I128` constant through `to_i64`) was found in
-+this area recently.
-+
-+Coverage: 24 unsigned-64 divisors, 15 signed-64 divisors plus their negatives,
-+14 unsigned-32 and 10 signed-32 divisors plus negatives — powers of two, one
-+below and above each power of two, small odd values that need the add-and-shift
-+fixup, magics needing the full 64-bit range, and the extremes. Each is crossed
-+with a dividend sweep of zero, the extremes, odd multiples, and the values
-+immediately around each multiple (where an off-by-one in the fixup shows).
-+
-+The oracle uses **no division**. For every pair it asserts C's defining
-+properties of truncated division:
-+
-+```
-+dividend == quotient * divisor + remainder
-+unsigned: remainder <  divisor
-+signed:   |remainder| < |divisor| and sign(remainder) == sign(dividend)
-+```
-+
-+so a wrong quotient or remainder is caught without asking the compiler to
-+perform the operation under test. `INT_MIN / -1` is excluded because it
-+overflows the quotient and traps on x86.
-+
-+Two design points that were wrong first and are worth recording:
-+
-+* **The divisor must be a literal in each function.** The first version swept
-+  an array of divisors, which makes every division a *variable* division:
-+  `div_by_const` never fired and the test silently validated hardware `div`.
-+  Verified by perturbing the pass — changing the power-of-two shift from
-+  `d.trailing_zeros()` to `+ 1` left the array-driven test green. The current
-+  form generates one `noinline` function per divisor by macro. **A test that
-+  cannot fail is worse than no test**, so the perturbation check is what made
-+  this worth committing.
-+* **The checkers are side-effect-free.** They record the first offending case
-+  in globals and `main` reports it once. Calling `printf` from inside the
-+  checker put six computed values live across a variadic call at ~20000 sites.
-+
-+State: suite **777 passed / 0 failed** (was 776). Green at `-O0`, `-O2`, `-O3`
-+and `-Os`; GCC agrees.
-+
-+## 2. The defect it exposed at -O1 (FIXED)
-+
-+At **`-O1` only** the test reported **341 failures, every one a power-of-two
-+divisor** (180 for `/8`, 161 for `/4`). The recorded case was self-refuting,
-+which is what made it worth chasing rather than filing:
-+
-+```
-+FAIL u64 1 / 4: q=0 r=1, q*d+r=1
-+```
-+
-+`q*d+r` is `1`, `n` is `1`, so the guard `r >= d || q*d + r != n` is false and
-+`record()` should not have been reached. The arithmetic was right; the branch
-+testing it was wrong.
-+
-+### Root cause: `fold_lea_into_load` built an unencodable addressing mode
-+
-+Localized with `CCC_PEEPHOLE_TRACE` (the skip-set bisection gives misleading
-+culprits, as the pass module itself warns). Dump `002-p0-fold_copy_shift_into_lea.s`
-+has the correct
-+
-+```
-+leaq 0(,%r11,4), %r8        ; q*4
-+leaq (%r8, %r10, 1), %r9    ; + r
-+```
-+
-+and dump `003-p1-fold_lea_into_load.s` has
-+
-+```
-+leaq 0(,%r11,4, %r10, 1), %r9
-+```
-+
-+which is **not a valid x86-64 operand**. A SIB byte carries one base (always
-+scale 1) and one index (scale 1/2/4/8); this has two index registers and no
-+base. The pass splices a producer `leaq`'s address into a later instruction
-+that reads it, and for the indexed consumer form `leaq disp(%T, %idx, %s)`
-+it substituted the producer's operand *text* into the base slot. That is sound
-+only when the producer address occupies the base slot itself (`disp(%base)`).
-+When the producer address carries its own index (`0(,%r11,4)`) the two index
-+fields land side by side.
-+
-+### The miscompile is silent, which is why it survived
-+
-+GAS rejects the line:
-+
-+```
-+$ as --64 bad.s
-+bad.s:1: Error: expecting `)' after scale factor in `0(,%r11,4,%r10,1)'
-+```
-+
-+lccc's integrated assembler instead **truncated** it to `leaq 0(,%r11,4), %r9`,
-+silently dropping `+ %r10`. So `q*d + r` became `q*d`, the program assembled,
-+ran, and printed plausible values. Only power-of-two divisors were affected
-+because only those make `q*d` a scale the folder can absorb — which is exactly
-+the signature the test reported.
-+
-+### The fix
-+
-+`compose_sib` replaces the text concatenation with a real addressing-mode
-+composition. It parses both operands into `SibAddr { sym, disp, base, index }`,
-+merges repeated registers, and emits the sum only when the SIB byte can carry
-+it: at most two distinct registers, at most one of them scaled, scale in
-+{1,2,4,8}, base unscaled. The `+ %r10` term is **kept**, and the result stays
-+at one instruction:
-+
-+```
-+leaq (%r10, %r11, 4), %r9     ; one index register, one base, valid, GAS-clean
-+```
-+
-+That is what GCC and Clang emit for the same source. When the sum is *not*
-+representable (three registers, two scaled registers) the fold is declined and
-+both instructions are kept — as before, but now for the right reason rather
-+than by counting registers in a way that did not match what the splice did.
-+
-+Two secondary findings from the red-team pass over the first fix, both fixed:
-+
-+* The first version `continue`d out of the window-scan loop on a declined
-+  fold, which skipped `window += 1` and silently extended the pass's scan
-+  window. The original control flow (decline, then `break`) is restored.
-+* Extracting the consumer's displacement as "everything after the mnemonic"
-+  breaks when the matched operand is not the first one — a store such as
-+  `movq %rax, (%rcx,%rbp,8)` has a register operand before it. `operand_start`
-+  now steps back to the operand separator. This one was caught by a unit test
-+  (`indexed_store_still_folds`) written specifically to probe it.
-+
-+Symbolic displacements are carried through rather than rejected
-+(`leaq table(%rcx), %r8` into `8(%r8,%rbp,8)` gives `table+8(%rcx, %rbp, 8)`),
-+because dropping them would have silently narrowed an optimization the pass
-+documents as its motivating case. A scale of 1 renders implicitly
-+(`8(%rsp, %r8)`, not `8(%rsp, %r8, 1)`) to preserve the emitter's canonical
-+form — a change to this was caught by
-+`dead_writes::sib_destination_is_memory_not_a_fake_index_register`.
-+
-+### Verification
-+
-+* `tests/regression/lea_chain_index_compose.c`, pinned to `-O1`, is
-+  mutation-proven: **exit 1 on the old binary, exit 0 on the fixed one**, and
-+  0 under GCC. It covers scales 2/4/8 and 16, signed variants, non-power-of-two
-+  controls whose product is not a scale, and a symbol-indexed gather.
-+  Two shape requirements are documented in the file because they were
-+  measured, not assumed: the divisor must reach the division as a *parameter*
-+  that constant-folds through inlining, and the `printf` in the failure branch
-+  is load-bearing — it provides the register pressure that produces the lea
-+  chain the fold then mangles. Removing it makes the miscompile vanish rather
-+  than merely go unreported.
-+* 21 new unit tests around `SibAddr::parse`, `compose_sib`, `operand_start`
-+  and the end-to-end driver; the full unit suite is 3152 passed / 0 failed.
-+* `div_mod_by_const_exhaustive`: 341 failures -> **0** at `-O1`, ALL-OK at
-+  `-O0`/`-O2`/`-O3`/`-Os`.
-+* Regression suite 778 -> **779 passed / 0 failed**.
-+
-+### The second defect: the assembler truncated instead of erroring
-+
-+Fixing the peephole alone would leave the landmine armed. `parse_memory_inner`
-+in `src/backend/x86/assembler/parser.rs` split the parenthesised operand on
-+commas, took `parts[0..3]` as base/index/scale, and **silently ignored any
-+further fields**:
-+
-+```rust
-+let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
-+let base  = if !parts.is_empty() ... ;      // parts[0]
-+let index = if parts.len() > 1 ...;         // parts[1]
-+let scale = if parts.len() > 2 ...;         // parts[2]
-+// parts[3..] dropped
-+```
-+
-+That is what turned an invalid operand into a wrong-code miscompile rather
-+than a compile error: `0(,%r11,4, %r10, 1)` assembled as `0(,%r11,4)`. GAS
-+rejects the same input with `expecting ')' after scale factor`. A compiler
-+assembler that accepts syntactically valid text and emits *different*
-+semantics is worse than one that refuses it, so the parser now rejects a
-+fourth field:
-+
-+```
-+ccc: error: line 1: memory operand has 5 comma-separated fields inside the
-+parentheses, but at most base,index,scale are encodable: (,%r11,4, %r10, 1):
-+'leaq 0(,%r11,4, %r10, 1), %r9'
-+```
-+
-+With this in place the whole class is loud: any future pass that builds an
-+unencodable operand fails the build instead of shipping a silent miscompile.
-+Four unit tests cover the rejection and the surviving canonical forms, and the
-+full unit suite (3155) confirms no valid code used a four-field operand.
-+
-+### Bug-class audit
-+
-+Every site in `src/backend/x86/` that pattern-matches a *partial* indexed
-+operand (the `"(%T,"` signature that made the concatenation unsound) was
-+enumerated: `relay_and_lea.rs:1205` is the **only** one. The other address
-+folds in `local_patterns.rs` and `memory_fold.rs` match a *complete* `(%T)`
-+operand and replace it with another complete operand, so they cannot
-+concatenate two SIB expressions. The defect does not recur elsewhere.
-+
-+### Performance: the fix is free
-+
-+`scripts/census_ab.py` (the documented screening gate) over the full
-+regression corpus:
-+
-+| corpus | functions | insns | rrmov | stkref | push | acc |
-+|---|---|---|---|---|---|---|
-+| 748 files, `-O2` | 3134 | 0 | 0 | 0 | 0 | 0 |
-+| 748 files, `-O1` | 4374 | 0 | 0 | 0 | 0 | 0 |
-+
-+Zero delta in every column at both levels, and the gate passes. Text-level
-+diff of the new test file at `-O1` shows exactly the intended change:
-+
-+```
-+-    leaq 0(,%r11,4, %r10, 1), %r9     (4 occurrences: scales 4 and 8)
-++    leaq (%r10, %r11, 4), %r9
-+```
-+
-+Two-index operands 4 -> 0, **instruction count identical (471 = 471)**: the
-+fold still eliminates the producer `leaq`, so the correction costs nothing.
-+The census columns are also why the earlier claim of an unchanged corpus is
-+precise about what was compared -- instruction counts and register traffic,
-+not operand text.
-+
-+## 3. Measured: dead frames
-+
-+483 of 1412 functions that reserve a frame (**34.2%**) reserve one that is
-+**never referenced by any instruction** — 15,200 bytes, and two wasted
-+instructions (`subq`/`addq`) per function. 478 of those have a frame of 256
-+bytes or less, so they are spill reservations whose slots all ended up in
-+registers, not arrays addressed through `leaq`.
-+
-+`div7` is a clean example: `pushq %rbx` plus `subq $112, %rsp` for a function
-+that touches no memory at all, against GCC's frameless 7 instructions.
-+
-+`peephole/passes/frame_compact.rs` already exists and is the natural home for
-+this. Not attempted this session: removing a frame changes `%rsp` at every call
-+site, so it needs the alignment argument and the kernel boot gate done
-+properly, and the linux-cachymod tree is not present in this workspace.
-+
-+## 4. Measured dead end: the `mulhi` cross term
-+
-+`div_const` is 20 instructions against GCC's 7. The obvious remaining waste is
-+the `lhs.hi * lo` cross term in the 128-bit multiply, which is identically zero
-+for strength-reduced division because the left operand is `(u128)x`.
-+
-+An emission-time fast path was implemented: `operand_to_rax_rdx` records
-+whether the load left `%rdx` at zero, and `emit_i128_mul_const` drops the term
-+when it did. **It cannot work, and the reason is specific.** Tracing showed the
-+left operand is an i128 value *with a stack slot*, so the backend emits two
-+slot loads and correctly reports "high half unknown"; a **peephole** later
-+rewrites the high-half load into `xorl %edx, %edx` because it can see the
-+stored half was zero. The fact only exists after emission, so no emission-time
-+flag can observe it. The code was reverted rather than shipped inert.
-+
-+Two viable directions, in order of promise:
-+
-+* A peephole that propagates a known-zero register: `xorl %edx,%edx` then
-+  `movq %rdx,%rcx` makes `%rcx` zero, so `imulq %r8,%rcx` is zero and
-+  `addq %rcx,%rdx` is dead. Block-local, generally useful, and it is where the
-+  information actually lives.
-+* An IR-level `mulhi` op so the 128-bit product is never materialised. Bigger,
-+  and it is what GCC and Clang effectively do.
-+
-+## 5. State
-+
-+Suite 776 → **777 passed / 0 failed**. Deliverable re-based on `e08565c`.
-+Kernel build/boot gate still not re-run — the linux-cachymod tree is absent.
-diff --git a/engineering/FOLLOWUP-2026-09-22-i128-const-multiply.md b/engineering/FOLLOWUP-2026-09-22-i128-const-multiply.md
-new file mode 100644
-index 0000000..71e2eda
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-22-i128-const-multiply.md
-@@ -0,0 +1,145 @@
-+# Follow-up: i128 constant multiply — a truncation miscompile, a fast path, and two measured dead ends
-+
-+Session of 2026-09-22, rebased on `origin/main` `e08565c`.
-+
-+The work started from an oracle sweep: ten kernel-idiomatic functions compiled
-+with lccc and with GCC 16.2, Clang 23.1, ICX and ICC through
-+`scripts/godbolt.py`. lccc emitted 121 instructions where Clang emitted 55.
-+Per-function attribution put almost all of the gap in two functions, and both
-+turned out to sit on the same 128-bit multiply path.
-+
-+## 1. The miscompile: `to_i64()` truncation in `const_power_of_two`
-+
-+`x * 0xffffffffffffffff0000000000000001` returned `x` unchanged, at `-O1` and
-+above. `-O0` was correct, and GCC, Clang and ICX are correct.
-+
-+`simplify::const_power_of_two` read the multiplier through
-+`IrConst::to_i64()`, which narrows `IrConst::I128(v)` to `v as i64`. The
-+constant above truncates to `1`, which passes the power-of-two test with
-+`trailing_zeros() == 0`, so `try_mul_power_of_two` rewrote `x * K` into
-+`x << 0`, and a later pass folded the zero shift into a copy.
-+
-+The blast radius is every `__int128` multiply by a constant whose low 64 bits
-+happen to be a power of two while the high half is non-zero. The same signed
-+read also hid the single set bit of 2^63 in an unsigned 64-bit multiplier, so
-+`x * 0x8000000000000000u` missed the shift entirely — a missed optimisation
-+rather than a miscompile, but the same line of code.
-+
-+The fix reads the constant as a bit pattern and masks it to the operation's
-+width before the test. This is the third instance of this exact bug class in
-+the tree: `simplify::is_all_ones`, `simplify::is_neg_one` and
-+`sccp::is_all_ones` all carry comments saying they must not go through
-+`to_i64()` for 128-bit constants. Those three were fixed individually; the
-+predicate that strength-reduces multiplies was missed.
-+
-+## 2. The fast path: constant multipliers
-+
-+`emit_i128_mul_impl` expanded every 128-bit multiply into a full 128x128
-+schoolbook product — 13 instructions, including a `pushq`/`popq` pair used
-+purely as a register move. Constant multipliers dominate real i128 arithmetic:
-+strength-reduced division is `mulhi(x, M)` where the magic `M` always has a
-+zero high half, so one of the three product terms is identically zero and the
-+constant was being materialised into the accumulator pair first anyway.
-+
-+Backends now receive the multiplier's halves, following the pattern the
-+constant-shift path already uses. The default implementation ignores the split
-+and runs the generic sequence, so ARM, i686 and RISC-V are unchanged. On
-+x86-64 the sequence collapses to five instructions for the `hi == 0` shape.
-+
-+Measured on the oracle probe:
-+
-+| function | lccc before | lccc after | GCC 16.2 | Clang 23.1 | ICX |
-+|---|---|---|---|---|---|
-+| `div_const` (`x / 7u`) | 35 | 20 | 7 | 8 | 8 |
-+| `mod_const` (`x % 1000`) | 38 | 23 | 11 | 11 | 11 |
-+| probe corpus (10 functions) | 121 | 91 | 58 | 55 | 74 |
-+
-+lccc now beats ICC (80) and ICX (74) on the corpus. The remaining gap to GCC
-+and Clang is concentrated in the two division functions.
-+
-+## 3. The test that caught a live bug
-+
-+`tests/regression/i128_const_multiply.c` covers 13 multipliers x 14 left
-+operands = 182 cases against a limb-wise reference built from 32-bit pieces,
-+so the oracle shares no codegen with the sequence under test.
-+
-+It earned its place immediately. The first version of the fast path was wrong
-+in the `hi != 0` branch: the second cross term consumes `lhs.lo`, which `mulq`
-+has already overwritten in `%rax`, so the low half has to be parked before the
-+multiply. The corruption lands only in the high 64 bits of the product, which
-+**no division test can see**, because division keeps only `mulhi`. The
-+pre-existing `x86_fpo_i128_div_push_depth` caught it by luck, through a
-+constant-folded `q * b`; the new test catches it by construction, 24 of 182
-+cases.
-+
-+Both halves of the fast path are covered deliberately. `hi == 0` is the common
-+shape and would have passed with the bug present.
-+
-+## 4. Two measured dead ends — recorded so they are not retried
-+
-+**`cmov` destination coalescing.** Branchless clamp emits two redundant
-+`movl`s:
-+
-+```
-+cmpl %edx, %edi          cmpl %edx, %edi
-+movq %rdi, %r9           movl %esi, %eax
-+cmovgl %edx, %r9d        cmovle %edi, %edx
-+cmpl %esi, %edi          cmpl %esi, %edi
-+movl %r9d, %r11d         cmovge %edx, %eax
-+cmovll %esi, %r11d       ret
-+movl %r11d, %eax
-+ret                      lccc 8, GCC/Clang/ICX 6
-+```
-+
-+The obvious fix is to coalesce a `Select` destination with its `false_val`,
-+since `lower_select` preloads the destination from exactly that operand. That
-+was implemented — in both `build_copy_alias_map` and, after the first attempt
-+proved inert, in the `build_cfg_copy_alias_map` affinity graph that is the
-+default path. **It changed nothing: 172249 instructions across 819 files before
-+and after, bit-identical.** The reason is visible in the listing above: the
-+emitted form is `cmovgl` after `cmpl`, whereas `lower_select` emits `cmovne`
-+after `test`. This code does not come from `lower_select` at all, so the IR
-+edge never reaches the emitter that produces the redundant moves. The change
-+was reverted rather than shipped as a no-op. Whoever picks this up should start
-+from the MachInst builder that emits a `Cmov` with a compare-derived condition
-+code, not from the IR.
-+
-+**Dead frames.** 48 of 446 functions that reserve a frame (10.8%, 1040 bytes)
-+never touch it. Worth a look, but the detector counts `push`/`pop` as a use, so
-+the interesting cases — like `div7`'s 112-byte frame around a single
-+`pushq %rbx` — are not in that number. The real cost there is that the
-+allocator reaches for a callee-saved register where GCC keeps everything in
-+`%rax`/`%rdx`/`%rdi`; that is register-allocation pressure, not frame sizing.
-+
-+## 5. Test infrastructure
-+
-+`tests/regression/i686_nonlocal_goto_callee_saved` was failing on
-+`undefined symbols: abort`. It is now freestanding like its siblings, entering
-+the i386 syscalls directly, and keeps PIC because PIC is what puts the GOT base
-+in `%ebx` — the entire exposure mechanism. Verified not weakened: reverting the
-+NonlocalGoto pool-clear in `i686/codegen/prologue.rs` fails it with `rc=-11`.
-+
-+`run_regression.py` no longer blames lccc for a missing multilib. A `-m32`
-+compile failure is only downgraded to a skip when the host's own GCC fails the
-+same translation unit identically, so a `-m32` test that GCC compiles and lccc
-+does not stays a hard failure.
-+
-+## 6. State
-+
-+Suite 774 passed / 3 failed at session start, **776 passed / 0 failed** at the
-+end. The three former failures were two environment limitations and one real
-+link defect hidden behind them.
-+
-+Open, in rough order of value:
-+
-+* `div_const`/`mod_const` are still 20/23 against GCC's 7/11. GCC recognises
-+  `x * (2^128 - 2^64 + 1)` and reduces it algebraically to `x.hi - x.lo`;
-+  lccc runs the general sequence. A `mulhi`-aware fold at the IR level would
-+  close most of the remaining oracle gap on this probe.
-+* The i128 value round-trips through memory in `mul_hi_ones`
-+  (`movq %rdi,72(%rsp); movdqu …; movq 48(%rsp),%rax`) even though both halves
-+  stay in registers.
-+* `CCC_NO_SELECT_COALESCE` is not a real env flag — it was introduced and
-+  reverted with the dead-end change above.
-+* The kernel build/boot gate could not be re-run: the linux-cachymod tree is
-+  not present in this workspace.
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 8fca84e..b5b75b3 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -2589,6 +2589,14 @@ pub trait ArchCodegen {
-                     _ => unreachable!("i128 const-shift matched non-shift op: {:?}", op),
-                 }
-             }
-+            // A constant multiplier lets the backend drop the schoolbook's
-+            // cross terms rather than materialising both 64-bit halves and
-+            // running the generic three-product sequence.
-+            IrBinOp::Mul if get_const_i128_halves(rhs).is_some() => {
-+                let (lo, hi) =
-+                    get_const_i128_halves(rhs).expect("i128 const halves (guarded by is_some)");
-+                self.emit_i128_mul_const(lhs, rhs, lo, hi);
-+            }
-             _ => {
-                 self.emit_i128_prep_binop(lhs, rhs);
-                 match op {
-@@ -2614,6 +2622,15 @@ pub trait ArchCodegen {
-         self.emit_i128_prep_binop(lhs, &Operand::Const(IrConst::I128(0)));
-     }
- 
-+    /// Multiply the accumulator pair by a constant whose 64-bit halves are
-+    /// already known. The default ignores the split and runs the generic
-+    /// sequence, so every backend stays correct without changes; backends
-+    /// whose multiply can exploit the constant override this.
-+    fn emit_i128_mul_const(&mut self, lhs: &Operand, rhs: &Operand, _lo: u64, _hi: u64) {
-+        self.emit_i128_prep_binop(lhs, rhs);
-+        self.emit_i128_mul();
-+    }
-+
-     // ---- 128-bit comparison dispatch ----
- 
-     /// Prepare operands for a 128-bit comparison.
-@@ -2752,6 +2769,21 @@ pub fn get_const_i128_shift_amount(rhs: &Operand) -> Option<u32> {
-     }
++++ b/engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md
+@@ -0,0 +1,166 @@
++# Follow-up: the narrow zext→immediate-compare fold, a false-ISA-law revert, and the flag-law guard that caught it
++
++Date: 2026-09-22 (session 61, continued)
++Base: `c7917656` (`ms178/lccc` main, post-#591; carries our S05 as `0fbe7ef2`
++and the 73a2ab1e LEA-hoist/RORX work, red-teamed earlier this session).
++Head: `5e97d517` — S06, snapshot `ms178-1.patch` 28876 B sha `4b33a998…`,
++APPLIES-CLEAN (ledger row 6).
++
++---
++
++## 1. Where the session picked up
++
++Session 61 (first half) landed the i686 narrow-compare peephole work and left
++two debts: the `leak()` in the source parser, and an unproven corner of the
++design. This half closed both — and the guard test written to prove the fold
++correct instead **caught an unrelated live miscompile**, which turned out to
++be the more valuable event of the day.
++
++## 2. De-leaking the source parser
++
++`parse_narrow_zext_src` originally returned `NarrowSrc::Reg(&'static str)`
++built with `src_part.to_string().leak()` — a per-call leak (the house forbids
++ungodlike resource behaviour, and `leak()` in a peephole hot path is exactly
++that). Rewritten to `NarrowSrc::Verbatim(String)`: the verbatim-source cases
++(narrow registers, base-only indirect operands) own their text; the
++frame-slot case stays `NarrowSrc::Slot(i32, &'static str)` because the
++displacement is *re-emitted canonically* (`format!("{}({})", disp, base)`) —
++the line's ESP-slot-biased text must never leak into the compare operand.
++`cargo fmt` clean, 3143 unit tests green (net −3: the three tests of the
++reverted pass below were removed with it).
++
++## 3. The setCC self-zext deletion: wrong premise, full revert
++
++The first half of the session extended `delete_setcc_self_zext` to the
++`movsbl` twin on the stated "ISA law" that a low-byte write zeroes bits
++8..31 of the containing register. **That law is false on x86.** A `setCC
++%al` is a partial-register *merge*: it writes the byte and leaves bits 8..31
++of `%eax` exactly as they were. (The zero-extension rule I confused it with
++is x86-64's "32-bit writes zero-extend into the 64-bit register" — a
++different width, a different direction.) The `movzbl %al,%eax` after a
++setCC is **load-bearing**, and the two pins that asserted it survives
++(`setcc_fuse_keeps_window_for_live_bool` and the setbe test) were *right*
++before I "improved" them.
++
++How it was caught, because that chain is the reusable lesson:
++
++1. The new freestanding guard `tests/regression/i686_narrow_cmp_fold.c`
++   (flag-law edge sweep, exit-status checksum, regparm-free, multilib) ran
++   red: gcc rc=0, lccc rc=1.
++2. `-S` outputs on/off of both peephole switches were byte-identical —
++   **`-S` skips `peephole_optimize`**, so that diff proves nothing (written
++   down as a measurement trap: text-level switch A/B must go through the
++   object path, e.g. `peephole_optimize` unit tests or assembled objects).
++3. The guard decomposed per-helper: rows through the *narrow-compare* fold
++   (slot, register, word shapes) matched gcc exactly — the fold is innocent.
++   Divergence started exactly at the `sete`/`setne` + relay shape.
++4. A 256-value sweep (`00:1 80:6 FF:2` correct vs `00:7 80:6 FF:6` broken,
++   i.e. *every* byte wrong, both select arms always taken) pinned it: with
++   the `movzbl` deleted, `sete %al` leaves garbage in bits 8..31 of `%eax`,
++   the full-width `movl %eax,%ecx`/`%esi` relays propagate it, and every
++   downstream `testl %ecx,%ecx; jne` mispredicts the branch — the selects
++   all take the "true" arm.
++
++Reverted completely: pass, wiring, kill switch `CCC_NO_SETCC_ZEXT_DEL`,
++and its three unit tests deleted. The two pins restored to their original
++assertions **with** a justification comment documenting the partial-register
++merge law and the failed attempt, so the next reader cannot re-derive it.
++The surviving `setcc` pin also re-checks the movzbl presence explicitly.
++
++Nothing else consumed the deleted pass: `fold_narrow_load_imm_compare` never
++depended on it (its unit tests exercise the fold with the movzbl present),
++and the boot census below is measured after the revert.
++
++## 4. The narrow zext→immediate-compare fold (what shipped in S06)
++
++`fold_narrow_load_imm_compare`, kill switch `CCC_NO_NARROW_CMP_FOLD`:
++
++    movzbl SRC,%r; cmpl $I,%r; jcc   →  cmpb $I,SRC; jcc    I ∈ [0,127]
++    movzwl SRC,%r; cmpl $I,%r; jcc   →  cmpw $I,SRC; jcc    I ∈ [0,32767]
++    movzwl SRC,%r; testl %r,%r; je/jne → cmpb $0,SRC; je/jne
++    movzwl K(%esp),%r; cmpw $I,%r    →  cmpw $I,K(%esp)
++
++Flag-law proof (unit-tested at the exact wrap rows): for immediates inside
++the window, every condition code of the narrow compare of a zero-extended
++value equals the 32-bit compare — the wrap row (byte ≥ 128 / word ≥ 32768)
++sets SF and OF *together* on the narrow view, which is what makes `jl/jg`
++decode to the unsigned order; `testl → cmpb $0` is restricted to ZF-only
++readers (`je/jne/sete/setne`) because SF diverges. Refusals, each pinned:
++sign-extending sources (`movsbl`/`movswl` — the value is negative),
++out-of-window immediates, signed consumers of `testl`, live consumers after
++the compare (adjacency = nops-only window), indexed/scaled operands,
++opcode mismatches, `%esp`/`%ebp` destinations.
++
++Source shapes, generalised across the session: base-only frame slots →
++narrow registers (`%dl`,`%dx`) → base-only indirect operands (`2(%edi)` —
++pointer loads; the compare re-reads the byte-identical address expression,
++fault-equivalence argued in the parser comment). The parser is the narrow
++twin of `parse_load_from_ebp` (which deliberately only matches full-width
++moves, so narrow extends classify as `Other` — that is why the old sibling
++dispatch never saw them, and why `testl` needs text-dispatch *inside* the
++`Cmp` arm: `testl` classifies as `Cmp`, making a sibling `else if` dead).
++
++### Measured effect (boot corpus, 21 `arch/x86/boot` TUs)
++
++| stage | lccc insn | lccc bytes | gcc insn | gcc bytes |
++|---|---|---|---|---|
++| pre (session-61 start) | 5477 | 24460 | 3461 | 14270 |
++| + slot folds | 5468 | 24424 | | |
++| + register sources | 5457 | 24356 | | |
++| + indirect sources | **5451** | **24332** | 3461 | 14270 |
++
++Mnemonic closers (lccc vs gcc): `movzwl` 167/49, `movzbl` 134/50,
++`cmpl` 238/150, `cmpb` 39/78, `cmpw` 25/35. The gap is now dominated by
++structural levers, not this peephole: store-to-frame 515 vs 46 (RA quality),
++loop accumulators resident in slots (cpucheck: 515-vs-46 class), and
++reg-vs-reg narrow compares (`video-mode`: 28 residual `movzwl`).
++
++### The guard test (shipped)
++
++`tests/regression/i686_narrow_cmp_fold.c` + `.flags` (`-m32 -Os -mregparm=3
++-fno-pic`): every branch flavour (signed/unsigned/eq) driven across the
++byte and word wrap boundaries on slot, register, and pointer sources, plus
++the bool-materialisation shape; checksum verified against `EXPECT_A`
++(derived from gcc -O0/-O2/-Os agreement; `-DPRINT_REF` re-derives). It is
++deliberately freestanding so it links under the boot regime. This is the
++test that caught §3 — its continued presence is the insurance that the
++partial-register-merge lesson can never regress silently.
++
++## 5. Validation
++
++- `cargo test --lib`: **3143/0** (fastbuild).
++- 256-value byte-map sweep vs gcc: **0 divergences** (post-revert).
++- Guard test: gcc rc=0, lccc rc=0 (was rc=1 pre-revert).
++- Boot census/oracle: 5451 insn / 24332 B (above).
++- `ci_local.sh --fast`: **59 passed, 0 failed, 3 skipped — ALL GATES GREEN**.
++- Full CachyMod 6.18.52 rebuild by lccc/lccc-ld: SUCCESS; vmlinux
++  `.text` 11894550, boot gate `_end = 28944` (paired, 3824 headroom).
++  Paired gate A/B (same tree state, boot TUs forced): fold OFF
++  `_end = 29024` → fold ON **28944 = −80 B** on the setup sector; the
++  fold's corpus-level effect (−128 B over 21 TUs) does not fully reach the
++  gate because the gate measures a different (compressed+setup) blend.
++- `qemu_boot_test.sh`: **16/16 PASS, zero WARNING/Call Trace/ACPI noise**
++  on the serial log (bzImage sha `9c3fe192…`).
++- Godbolt oracle (`scripts/godbolt.py compare`, revisions pinned:
++  gcc 16.2, clang 23.1.0, icx latest, icc 2021.10.0) on the guard test
++  itself, i686 `-Os -fno-pic`: **lccc 90** instructions vs **gcc 128**,
++  **clang 161**, **icx 161**, **icc 198** — the first corpus in the
++  campaign where lccc beats every competitor outright (−30% vs gcc,
++  −44% vs clang/icx, −55% vs icc). Artifacts in
++  `artifacts/godbolt-s06/`.
++
++## 6. Still open, in evidence order
++
++1. **i686 RA slot-residence** (515 store-to-frame vs gcc 46): the dominant
++   remaining lever; cpucheck's loop accumulator is the canonical repro.
++2. **Reg-vs-reg narrow compares** (`movzwl (%edi),%edx; movzwl
++   %bx,%eax; cmpl %eax,%edx` → `cmpw (%edi),%bx` after allocation-width
++   reasoning): 28 sites in video-mode alone.
++3. **andl-mask zext gap** (`movzwl 60(%esp),%eax; andl $-32769,%eax;
++   movzwl %ax,%eax`): the mask kills the high bit, but the fold needs a
++   mask-aware value-range argument before it may widen.
++4. Shift-bit-test IV placement (cpucheck: `movl $1,%eax; movl %ebx,%ecx;
++   shll %cl,%eax` vs gcc's IV-in-%ecx).
++5. The gdbstub `free_large_kmalloc` discriminator (carried from S02).
++
++<!-- src: engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md -->
+diff --git a/engineering/journal/2026-09-W3.md b/engineering/journal/2026-09-W3.md
+index 364d6d91..6f6d321b 100644
+--- a/engineering/journal/2026-09-W3.md
++++ b/engineering/journal/2026-09-W3.md
+@@ -733,3 +733,59 @@ short-lived in-loop values lose), x87↔GP pair lowering (`i686.md` §2.1,
+ untouched), the `free_large_kmalloc` discriminator, `reg-to-reg-movl` +230
+ (but only 26 of 74 survive into the *object* — measure objects, not `-S`),
+ `compare-against-frame-slot` +29.
++
++## Session 61 (cont): the narrow-cmp fold lands, the setCC self-zext deletion dies by its own guard
++
++<!-- src: engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md -->
++
++**Landed** `fold_narrow_load_imm_compare` (S06, kill switch
++`CCC_NO_NARROW_CMP_FOLD`): `movzbl/wl SRC,%r; cmpl $I,%r; jcc` →
++`cmpb/w $I,SRC; jcc` for I in the flag-law window (byte 127 / word 32767 —
++the wrap rows set SF and OF *together* on the narrow view, which is why
++signed branches still decode to unsigned order), plus the
++`testl→cmpb $0` shape restricted to ZF-only readers. Sources generalised
++across the day: frame slots → narrow registers → base-only indirect
++(pointer loads: the compare re-reads the byte-identical address text).
++Parser de-leaked (`NarrowSrc::Verbatim(String)`; slots keep canonical
++re-emission because the ESP-slot-biased line text must never reach an
++operand). Boot corpus **5477→5451 insn, 24460→24332 B** (gcc 3461/14270);
++paired boot gate **29024→28944 (−80 B)**; QEMU **16/16**, zero serial
++noise; `ci_local --fast` **59/0**.
++
++**The guard test I wrote to prove the fold then caught an unrelated live
++miscompile — the day's real event.** The first half of the session had
++landed `delete_setcc_self_zext` on a stated "ISA law": *a low-byte write
++zeroes bits 8..31*. That law is **false on x86**: `setCC %al` is a
++partial-register merge; the `movzbl %al,%eax` after it is load-bearing.
++(What I conflated: x86-64's 32-bit-writes-zero-extend-to-64 — a different
++width, a different direction.) The catch chain, each link reusable:
++
++1. New freestanding flag-law guard (`tests/regression/
++   i686_narrow_cmp_fold.c`, every branch flavour across the wrap rows,
++   exit-status checksum): gcc rc=0, lccc rc=1.
++2. `-S` A/B on the peephole switches: byte-identical — **`-S` skips
++   `peephole_optimize`**; a switch A/B through text proves nothing. (Trap
++   written down; object-path or unit-test A/Bs only from now on.)
++3. Row decomposition: every narrow-fold row matched gcc; divergence began
++   exactly at the `sete`/`setne`+relay shape → the fold innocent.
++4. 256-value sweep (`00:1 80:6 FF:2` vs `00:7 80:6 FF:6`, *every* byte
++   wrong, both select arms always taken): with the movzbl gone, garbage
++   bits 8..31 ride `movl %eax,%ecx/%esi` relays into `testl %ecx; jne`.
++
++Full revert: pass, wiring, kill switch `CCC_NO_SETCC_ZEXT_DEL`, three
++tests. The two original pins were **right** — restored verbatim plus a
++justification comment so the false law can't be re-derived. Net unit count
++3146→3143 (the deleted pass's tests left with it).
++
++**Also fixed this half**: the peephole's `testl` dispatch (testl
++classifies as `LineKind::Cmp`, so the old sibling `else if` was dead —
++text dispatch now lives inside the Cmp arm), the parser's comma bug
++(`.trim()` after a memory operand keeps the next operand's leading comma;
++split first), and ret-tail test inputs (liveness is exact: `ret` reads
++`%eax`, so load+cmp with a ret tail *must* refuse — fix the test, never
++the pass).
++
++**Still open, evidence order**: i686 RA slot-residence (515 vs 46
++store-to-frame — cpucheck's loop accumulator is the canonical repro),
++reg-vs-reg narrow compares (video-mode: 28 `movzwl`), the andl-mask zext
++gap, shift-bit-test IV placement.
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 8823ada2..e0081d3b 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -8167,6 +8167,265 @@ fn try_fold_memory_operand(
+     None
  }
  
-+/// Split a constant 128-bit operand into its low/high 64-bit halves.
-+///
-+/// Constant multipliers dominate real i128 arithmetic: strength-reduced
-+/// division multiplies by a 128-bit magic constant whose high half is zero,
-+/// and generic `__int128` code multiplies by small literals. Handing the
-+/// halves to the backend lets it collapse the three-term schoolbook product
-+/// — a constant high half of zero removes a whole `imulq` term, and the
-+/// constant no longer has to be materialised into the accumulator pair first.
-+pub fn get_const_i128_halves(rhs: &Operand) -> Option<(u64, u64)> {
-+    match rhs {
-+        Operand::Const(IrConst::I128(v)) => Some((*v as u64, (*v >> 64) as u64)),
-+        _ => None,
++// ── Pass: fold a narrow slot load into the immediate compare/test that reads it ──
++//
++// The i686 lowering materialises every sub-int comparison operand through a
++// zero-extend into a register:
++//
++//     movzbl 12(%esp), %eax        cmpb  $57, 12(%esp)
++//     cmpl   $57, %eax       ~=    (flags identical, see below)
++//     je     .Lx                   je    .Lx
++//
++// The fold deletes the load (2-3 bytes), shrinks the compare (cmpl $imm,%reg
++// is 5-6 bytes; cmpb $imm,mem is 3-4), frees the register, and — the part the
++// instruction census actually measured (boot_insn_census.py: movzwl +130,
++// movzbl +106, cmpl +109 vs gcc over arch/x86/boot) — removes the register
++// round-trip that keeps the value alive in the accumulator.  GCC's answer at
++// -Os is the memory compare; three oracle families (gcc 16.2 i386 -Os, the
++// boot corpus census, clang -m32) all lower this shape to the narrow op.
++//
++// FLAG LAW — why `cmpb $I, K` is EXACTLY `cmpl $I, zext_byte(K)`:
++// for 0 <= I <= 127 both views compare the same two mathematical integers
++// (the zero-extended byte lies in [0,255], I in [0,127] — neither has the
++// wide view's sign bit set).  ZF and CF are equality/ordering of those same
++// integers in both views.  In the 32-bit view no wrap can occur (the result
++// lies in [-127,255]), so SF = (result < 0) = unsigned-less and OF = 0.  In
++// the 8-bit view a wrap (> 127) sets both SF and OF together, so
++// SF != OF still holds exactly when the unsigned order says less — every
++// condition code (e/ne/l/ge/le/g/b/ae/a/be + setcc forms) decodes to the
++// same answer.  Word twin: 0 <= I <= 32767, same proof.
++//
++// The `testl %R, %R` shape folds to `cmpb $0, K` with ONE divergence: SF.
++// testl always clears SF; cmpb $0 copies bit 7 of the byte.  CF and OF are
++// 0 in both, ZF is identical, so the fold fires only when the consumer reads
++// ZF alone: `je`/`jne` branches and `sete`/`setne` writers.  A `js`/`jns`/
++// `jl`/... consumer keeps the pair intact (fail closed).
++//
++// Fail-closed rules, each with its wrong-code shape:
++//   * `movsbl`/`movswl` are refused: a sign-extended operand changes every
++//     flag row the proof above rests on (the byte's wide-view sign bit is
++//     the byte's bit 7, which for a negative char is 1);
++//   * immediates outside [0,127] / [0,32767] are refused (the 8-bit view
++//     wraps where the 32-bit view does not — mem=200, I=200: cmpb says
++//     equal, cmpl says above);
++//   * the loaded register must be DEAD after the consumer (whole-function
++//     GprLiveness oracle, same discipline as fold_memory_operands);
++//   * the slot must be base-only (%ebp/%esp, no index/scale) — a scaled
++//     address cannot move into the compare's one memory operand;
++//   * the consumer must be ADJACENT (nops only between): anything else may
++//     write the register or the slot, or depend on the load's side effects
++//     (there are none, but adjacency is what makes "no side effects" local);
++//   * `%esp` is never the loaded register (dataflow only).
++//
++// Kill switch: CCC_NO_NARROW_CMP_FOLD.
++fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    if std::env::var_os("CCC_NO_NARROW_CMP_FOLD").is_some() {
++        return false;
 +    }
-+}
-+
- /// Default store implementation: 3-way SlotAddr dispatch for i128 and typed stores.
- /// Backends that override `emit_store` should call this for types they don't handle specially.
- pub fn emit_store_default(
-diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
-index 417c0bd..20b7b9e 100644
---- a/src/backend/x86/assembler/parser.rs
-+++ b/src/backend/x86/assembler/parser.rs
-@@ -1850,6 +1850,27 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
-         // Parse base, index, scale from inside parens
-         let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
- 
-+        // An x86-64 memory operand carries AT MOST base, index and scale.
-+        // A fourth field means the operand has two index registers (or is
-+        // otherwise malformed) and has NO encoding -- the ModRM/SIB pair has
-+        // exactly one of each slot.  Reject it loudly.  This used to take
-+        // parts[0..3] and silently IGNORE the rest, so
-+        // `0(,%r11,4, %r10, 1)` assembled as `0(,%r11,4)`, dropping the
-+        // `+ %r10` addend.  That turned a peephole emitting an invalid
-+        // operand into a WRONG-CODE MISCOMPILE instead of a compile error:
-+        // `q*4 + r == n` compiled to `q*4 == n` at -O1 and the program still
-+        // assembled, ran and printed plausible numbers.  GAS errors on the
-+        // same input ('expecting ) after scale factor'), so erroring here
-+        // also matches the reference assembler's behaviour.
-+        if parts.len() > 3 {
-+            return Err(format!(
-+                "memory operand has {} comma-separated fields inside the \
-+                 parentheses, but at most base,index,scale are encodable: ({})",
-+                parts.len(),
-+                inner
-+            ));
++    let len = infos.len();
++    let mut changed = false;
++    let mut liveness_cache: Option<GprLiveness> = None;
++    let mut i = 0;
++    while i < len {
++        if infos[i].is_nop() {
++            i += 1;
++            continue;
 +        }
-+
-         // Segment override may appear inside the parens, e.g. the TLS
-         // initial-exec access `g_tls@TPOFF(%fs:0)` (or `%gs:...`). The first
-         // part `%fs:0` must set the segment and leave the base empty — the
-@@ -4591,6 +4612,48 @@ main:
-         assert!(parse_asm("\t.lccc_tight_loop LBB3\n").is_err());
-         assert!(parse_asm("\t.lccc_tight_loop .LBB3\nnop\n").is_ok());
-     }
-+    // ------------------------------------------------------------------
-+    // Memory operand arity.  A SIB byte has exactly one base slot and one
-+    // index slot; a fourth field has no encoding and MUST be rejected
-+    // rather than ignored.  Silently dropping it turned a peephole that
-+    // emitted `0(,%r11,4, %r10, 1)` into a wrong-code miscompile: the
-+    // assembler produced `0(,%r11,4)`, so `q*4 + r == n` compiled to
-+    // `q*4 == n` and the program still assembled, ran, and printed
-+    // plausible numbers.
-+    // ------------------------------------------------------------------
-+
-+    #[test]
-+    fn memory_operand_rejects_a_fourth_field() {
-+        let err = parse_memory_inner("0(,%r11,4, %r10, 1)")
-+            .expect_err("two index registers must not be accepted");
-+        assert!(
-+            err.contains("comma-separated fields"),
-+            "unexpected error: {err}"
-+        );
-+    }
-+
-+    #[test]
-+    fn memory_operand_rejects_two_index_registers_via_the_full_operand() {
-+        // The exact text the fold used to emit, through the real entry point.
-+        assert!(parse_memory_operand("0(,%r11,4, %r10, 1)").is_err());
-+    }
-+
-+    #[test]
-+    fn memory_operand_accepts_the_canonical_three_field_forms() {
-+        // base, index, scale
-+        assert!(parse_memory_inner("8(%rcx,%rbp,8)").is_ok());
-+        // base, index (implicit scale 1)
-+        assert!(parse_memory_inner("(%rcx,%rbp)").is_ok());
-+        // index only
-+        assert!(parse_memory_inner("0(,%r11,4)").is_ok());
-+        // base only
-+        assert!(parse_memory_inner("16(%rax)").is_ok());
-+        // The composed form the fixed peephole emits: both addends survive.
-+        let m = parse_memory_inner("(%r10, %r11, 4)").expect("composed form must parse");
-+        assert!(m.index.is_some(), "scale-4 index must survive");
-+        assert_eq!(m.scale, Some(4));
-+        assert!(m.base.is_some(), "base must survive");
-+    }
- }
- 
- // ── tests: the integer grammar has exactly one implementation ────────────────
-@@ -4978,4 +5041,5 @@ mod integer_grammar_equivalence_tests {
-             );
-         }
-     }
-+
- }
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 793f625..002fb13 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -8313,6 +8313,7 @@ impl ArchCodegen for X86Codegen {
-         fn emit_i128_add(&mut self) => emit_i128_add_impl;
-         fn emit_i128_sub(&mut self) => emit_i128_sub_impl;
-         fn emit_i128_mul(&mut self) => emit_i128_mul_impl;
-+        fn emit_i128_mul_const(&mut self, lhs: &Operand, rhs: &Operand, lo: u64, hi: u64) => emit_i128_mul_const_impl;
-         fn emit_i128_and(&mut self) => emit_i128_and_impl;
-         fn emit_i128_or(&mut self) => emit_i128_or_impl;
-         fn emit_i128_xor(&mut self) => emit_i128_xor_impl;
-diff --git a/src/backend/x86/codegen/i128_ops.rs b/src/backend/x86/codegen/i128_ops.rs
-index 7da6a49..fa3a32c 100644
---- a/src/backend/x86/codegen/i128_ops.rs
-+++ b/src/backend/x86/codegen/i128_ops.rs
-@@ -114,6 +114,60 @@ impl X86Codegen {
-         self.state.emit("    addq %rsi, %rdx");
-     }
- 
-+    /// Constant-multiplier multiply: `(lhs.lo:lhs.hi) * (lo:hi)`.
-+    ///
-+    /// The generic sequence above is a full 128x128 schoolbook product and
-+    /// costs 13 instructions plus a push/pop pair used purely as a move. With
-+    /// the multiplier's halves known at compile time the cross terms that
-+    /// involve a zero half disappear, and the constant never has to be loaded
-+    /// into the accumulator pair first.
-+    ///
-+    /// This is the hot shape for strength-reduced division and modulo, which
-+    /// multiply by a 128-bit magic constant whose high half is always zero:
-+    /// `x /u C` is `mulhi(x, M) >> s`, so `hi == 0` and the sequence collapses
-+    /// to five instructions — matching what GCC, Clang and ICX emit.
-+    pub(super) fn emit_i128_mul_const_impl(
-+        &mut self,
-+        lhs: &Operand,
-+        _rhs: &Operand,
-+        lo: u64,
-+        hi: u64,
-+    ) {
-+        // LHS into %rax:%rdx (low:high); %rcx/%r8/%rsi are scratch.
-+        self.operand_to_rax_rdx(lhs);
-+        // `mulq` overwrites both accumulator halves, so park the LHS halves
-+        // that the cross terms still need first. lhs.lo is only needed when
-+        // the multiplier has a high half.
-+        self.state.emit("    movq %rdx, %rcx");
-+        if hi != 0 {
-+            self.state.emit("    movq %rax, %rsi");
-+        }
-+        self.emit_movabs_to_r8(lo);
-+        // Unsigned low product; its high half lands in %rdx.
-+        self.state.emit("    mulq %r8");
-+        // Cross term lhs.hi * lo.
-+        self.state.emit("    imulq %r8, %rcx");
-+        self.state.emit("    addq %rcx, %rdx");
-+        if hi != 0 {
-+            // Second cross term lhs.lo * hi, against the parked lhs.lo.
-+            self.emit_movabs_to_r8(hi);
-+            self.state.emit("    imulq %r8, %rsi");
-+            self.state.emit("    addq %rsi, %rdx");
-+        }
-+    }
-+
-+    /// Load a 64-bit immediate into %r8, using the short form when it fits.
-+    fn emit_movabs_to_r8(&mut self, v: u64) {
-+        if v <= 0x7fff_ffff {
-+            // Fits in a sign-extended imm32, so no REX.W movabs is needed.
-+            self.state
-+                .emit_fmt(format_args!("    movl ${}, %r8d", v));
-+        } else {
-+            self.state
-+                .emit_fmt(format_args!("    movabsq ${}, %r8", v as i64));
-+        }
-+    }
-+
-     pub(super) fn emit_i128_and_impl(&mut self) {
-         self.state.emit("    andq %rcx, %rax");
-         self.state.emit("    andq %rsi, %rdx");
-diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-index b103b4b..063d6fd 100644
---- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-+++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-@@ -836,6 +836,311 @@ fn self_base_reexec_unsafe(
-     false
- }
- 
-+/// One x86-64 memory operand, split into the parts the SIB byte and the
-+/// ModRM displacement can actually carry: an optional symbolic displacement,
-+/// a numeric displacement, an optional base register (always scale 1) and an
-+/// optional index register with a scale of 1, 2, 4 or 8.
-+#[derive(Clone, Debug, PartialEq, Eq)]
-+struct SibAddr {
-+    /// Symbolic part, e.g. `table` in `table+8(%rax)`.  Two symbols can never
-+    /// be added, so composition rejects a pair of them.
-+    sym: Option<String>,
-+    /// Numeric displacement added to `sym` when one is present.
-+    disp: i64,
-+    base: Option<String>,
-+    index: Option<(String, u8)>,
-+}
-+
-+/// Parse the displacement text of an operand: `""`, `8`, `-8`, `table`,
-+/// `table+8`, `table-8`.  Returns `None` for anything else so callers fail
-+/// closed rather than invent an address.
-+fn parse_disp(text: &str) -> Option<(Option<String>, i64)> {
-+    let text = text.trim();
-+    if text.is_empty() {
-+        return Some((None, 0));
-+    }
-+    if let Ok(v) = text.parse::<i64>() {
-+        return Some((None, v));
-+    }
-+    // `sym[+|-]N`: split at the LAST sign so `a-b-4` can never be reached
-+    // through a malformed input, and require a non-empty symbol.
-+    let bytes = text.as_bytes();
-+    for i in (1..text.len()).rev() {
-+        if bytes[i] == b'+' || bytes[i] == b'-' {
-+            let sym = &text[..i];
-+            if sym.is_empty() {
-+                return None;
-+            }
-+            let off = text[i..].parse::<i64>().ok()?;
-+            return Some((Some(sym.to_string()), off));
-+        }
-+    }
-+    Some((Some(text.to_string()), 0))
-+}
-+
-+impl SibAddr {
-+    /// Parse `[disp][(][%base][, %index[, scale]][)]`.  Returns `None` for
-+    /// anything whose composition cannot be reasoned about (RIP-relative
-+    /// addressing, malformed fields, three register slots), so callers fail
-+    /// closed.
-+    fn parse(text: &str) -> Option<Self> {
-+        let open = text.find('(')?;
-+        let close = text.rfind(')')?;
-+        if close <= open {
-+            return None;
-+        }
-+        let (sym, disp) = parse_disp(&text[..open])?;
-+        let inner = text[open + 1..close].trim();
-+        // x86-64 RIP-relative addressing is ModRM mod=00 r/m=101: there is no
-+        // SIB byte, so no index register can be encoded.  An assembler may
-+        // silently DROP the index instead of erroring (observed:
-+        // `leaq V(%rip,%r11), %r10` encoded as plain `leaq V(%rip), %r10` --
-+        // wide_cond_zero_test wrong-code).  Reject it outright.
-+        if inner.contains("%rip") {
-+            return None;
-+        }
-+        let mut fields = inner.split(',');
-+        let base = fields.next()?.trim();
-+        let base = if base.is_empty() {
-+            None
-+        } else {
-+            if !base.starts_with('%') {
-+                return None;
-+            }
-+            Some(base.to_string())
++        let Some((width, src, dst_reg)) = parse_narrow_zext_src(store, &infos[i], i) else {
++            i += 1;
++            continue;
 +        };
-+        let mut index = None;
-+        if let Some(idx) = fields.next() {
-+            let idx = idx.trim();
-+            if !idx.starts_with('%') {
-+                return None;
-+            }
-+            let scale = match fields.next() {
-+                Some(s) => match s.trim() {
-+                    "1" => 1,
-+                    "2" => 2,
-+                    "4" => 4,
-+                    "8" => 8,
-+                    _ => return None,
-+                },
-+                // A register in the second slot with no explicit scale is
-+                // scale 1 (`(%rax,%rbx)`).
-+                None => 1,
-+            };
-+            // A fourth field would be a second index: no encoding.
-+            if fields.next().is_some() {
-+                return None;
-+            }
-+            index = Some((idx.to_string(), scale));
-+        } else if fields.next().is_some() {
-+            return None;
++        // Never fold through the stack/frame pointer (house parity with
++        // fold_memory_operands: %esp moves the frame, %ebp homes are live
++        // across barriers far too often to be worth the oracle's blessing).
++        if dst_reg == REG_ESP || dst_reg == REG_EBP {
++            i += 1;
++            continue;
 +        }
-+        // A parenthesised operand with no register at all (`()`) is malformed,
-+        // and a register-less sum is not an address composition.  Reject so
-+        // compose_sib can never be handed (or produce) a degenerate operand.
-+        if base.is_none() && index.is_none() {
-+            return None;
++        let j = next_non_nop(infos, i + 1);
++        if j >= len {
++            i += 1;
++            continue;
 +        }
-+        Some(SibAddr {
-+            sym,
-+            disp,
-+            base,
-+            index,
-+        })
-+    }
-+
-+    /// Displacement text, empty when it is zero (GAS's canonical form).
-+    fn disp_text(&self) -> String {
-+        match &self.sym {
-+            None => {
-+                if self.disp == 0 {
-+                    String::new()
-+                } else {
-+                    self.disp.to_string()
++        let s = trimmed(store, &infos[j], j);
++        // Consumer 1: `cmpl $I, %R` — all flags match, any consumer works.
++        // (testl classifies as LineKind::Cmp too, hence the text dispatch
++        // inside the Cmp arm.)
++        let mut replacement: Option<String> = None;
++        // Consumer 2: `testl %R, %R` — ZF-only, gated on the flag reader.
++        let mut test_shape = false;
++        if infos[j].kind == LineKind::Cmp {
++            if let Some(rest) = s.strip_prefix("cmpl $") {
++                if let Some((imm_str, reg_str)) = rest.split_once(", %") {
++                    if let Ok(imm) = imm_str.trim().parse::<i64>() {
++                        if register_family(reg_str.trim()) == dst_reg
++                            && imm >= 0
++                            && imm <= if width == MoveSize::B { 127 } else { 32767 }
++                        {
++                            let mnem = if width == MoveSize::B { "cmpb" } else { "cmpw" };
++                            let operand = match src {
++                                NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
++                                NarrowSrc::Verbatim(v) => v,
++                            };
++                            replacement = Some(format!("    {} ${}, {}", mnem, imm, operand));
++                        }
++                    }
 +                }
-+            }
-+            Some(sym) => {
-+                if self.disp == 0 {
-+                    sym.clone()
-+                } else if self.disp > 0 {
-+                    format!("{}+{}", sym, self.disp)
-+                } else {
-+                    format!("{}{}", sym, self.disp)
++            } else if s.starts_with("testl ") {
++                if let Some(rest) = s.strip_prefix("testl ") {
++                    if let Some((a, b)) = rest.split_once(',') {
++                        let ra = a.trim();
++                        let rb = b.trim();
++                        if ra.starts_with('%')
++                            && ra == rb
++                            && register_family(ra) == dst_reg
++                            && zf_only_flags_reader(store, infos, j)
++                        {
++                            test_shape = true;
++                            let operand = match src {
++                                NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
++                                NarrowSrc::Verbatim(v) => v,
++                            };
++                            replacement = Some(format!("    cmpb $0, {}", operand));
++                        }
++                    }
 +                }
 +            }
 +        }
-+    }
-+
-+    /// Render back to assembly text in a form GAS and the integrated
-+    /// assembler both accept.
-+    fn render(&self) -> String {
-+        let d = self.disp_text();
-+        match (&self.base, &self.index) {
-+            (None, None) => {
-+                if d.is_empty() {
-+                    "0".to_string()
-+                } else {
-+                    d
-+                }
-+            }
-+            (Some(b), None) => format!("{}({})", d, b),
-+            // Scale 1 is implicit in the AT&T form and is omitted, matching
-+            // the emitter's canonical output (`8(%rsp, %r8)`, not
-+            // `8(%rsp, %r8, 1)`).  Emitting it would also bloat every folded
-+            // operand and change output that other passes pattern-match on.
-+            (None, Some((i, 1))) => format!("{}(,{})", d, i),
-+            (None, Some((i, s))) => format!("{}(,{}, {})", d, i, s),
-+            (Some(b), Some((i, 1))) => format!("{}({}, {})", d, b, i),
-+            (Some(b), Some((i, s))) => format!("{}({}, {}, {})", d, b, i, s),
++        let Some(new_text) = replacement else {
++            i += 1;
++            continue;
++        };
++        // The fold deletes the load: the loaded register must be dead after
++        // the consumer.  Copy propagation may extend the byte's register
++        // across later readers; the oracle answers for the whole function.
++        let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
++        if !liveness.dead_after(j, dst_reg) {
++            i += 1;
++            continue;
 +        }
++        // For the test shape the cmpb must reach its ZF reader without a
++        // writer in between (the reader was checked adjacent to the test;
++        // deleting the test between them keeps them adjacent — nothing to
++        // do, but the invariant is load-bearing for the ZF-only gate).
++        let _ = test_shape;
++        store.replace(i, new_text);
++        infos[i] = classify_line(store.get(i));
++        infos[j].kind = LineKind::Nop;
++        changed = true;
++        i += 1;
 +    }
++    changed
 +}
 +
-+/// Compose `outer` around `inner`: the consumer operand
-+/// `outer.disp(%T, outer.index, outer.scale)` carries `%T` in its BASE slot,
-+/// and `%T` holds the value of the producer address `inner`.  The sum is
-+///
-+/// ```text
-+///   outer.disp + inner.disp + inner.base
-+///               + inner.index*inner.scale + outer.index*outer.scale
-+/// ```
-+///
-+/// A SIB byte carries ONE base (always scale 1) and ONE index (scale
-+/// 1/2/4/8), so the composition is representable only when the summed terms
-+/// need at most two distinct registers and at most one of them is scaled.
-+/// Anything else returns `None` and the fold must not happen: emitting it
-+/// would give an instruction with no encoding, and the assembler may silently
-+/// TRUNCATE it into a wrong-but-assemblable one (observed:
-+/// `leaq 0(,%r11,4, %r10, 1), %r9` assembled as `leaq 0(,%r11,4), %r9`,
-+/// dropping `+ %r10` -- the div/mod-by-constant miscompile at -O1).
-+fn compose_sib(inner: &SibAddr, outer: &SibAddr) -> Option<String> {
-+    let mut terms: Vec<(String, u8)> = Vec::with_capacity(4);
-+    if let Some(b) = &inner.base {
-+        terms.push((b.clone(), 1));
-+    }
-+    if let Some((i, s)) = &inner.index {
-+        terms.push((i.clone(), *s));
-+    }
-+    if let Some(b) = &outer.base {
-+        terms.push((b.clone(), 1));
-+    }
-+    if let Some((i, s)) = &outer.index {
-+        terms.push((i.clone(), *s));
-+    }
-+    // Merge repeated registers: `(%rax) + (%rax,%rbx,2)` folds the two `%rax`
-+    // terms into one only when the summed scale is still a legal index scale.
-+    let mut merged: Vec<(String, u8)> = Vec::with_capacity(4);
-+    for (reg, scale) in terms {
-+        match merged.iter_mut().find(|(r, _)| *r == reg) {
-+            Some(slot) => {
-+                let sum = slot.1 as u32 + scale as u32;
-+                if !matches!(sum, 1 | 2 | 4 | 8) {
-+                    return None;
-+                }
-+                slot.1 = sum as u8;
-+            }
-+            None => merged.push((reg, scale)),
-+        }
-+    }
-+    if merged.len() > 2 {
++/// The narrowed SOURCE of a zero-extend the narrow-compare fold can consume:
++/// a canonical base-only frame slot (`-8(%esp)`), or the load's source text
++/// verbatim (a narrow register `%dl`/`%dx`/`%dh`, or a base-only indirect
++/// operand `2(%edi)` — for those the compare must re-read the EXACT address
++/// expression, so the text is carried, never arithmetic-remixed).
++enum NarrowSrc {
++    Slot(i32, &'static str),
++    Verbatim(String),
++}
++
++/// Parse `movzbl|movzwl SRC, %REG` where SRC is a base-only frame slot, a
++/// narrow register, or a base-only indirect operand.  Returns (load width,
++/// source, dest family).  The narrow twin of `parse_load_from_ebp` (which
++/// deliberately matches only movl/movw/movb, so narrow extends classify as
++/// Other) — this parser refuses every shape it cannot pin down exactly.
++fn parse_narrow_zext_src(
++    store: &LineStore,
++    info: &LineInfo,
++    idx: usize,
++) -> Option<(MoveSize, NarrowSrc, RegId)> {
++    let t = trimmed(store, info, idx);
++    let (mnem, width) = if let Some(r) = t.strip_prefix("movzbl ") {
++        (r, MoveSize::B)
++    } else if let Some(r) = t.strip_prefix("movzwl ") {
++        (r, MoveSize::W)
++    } else {
++        return None;
++    };
++    let mnem = mnem.trim();
++    let after = match mnem.find(", %") {
++        Some(c) => &mnem[c..],
++        None => return None,
++    };
++    if !after.starts_with(", %") {
 +        return None;
 +    }
-+    // Exactly one term may carry a scale != 1, and it becomes the index.
-+    let scaled: Vec<usize> = merged
-+        .iter()
-+        .enumerate()
-+        .filter(|(_, (_, s))| *s != 1)
-+        .map(|(i, _)| i)
-+        .collect();
-+    // A term in the BASE slot must be unscaled: the encoding has no scale
-+    // field there, so only its register name survives.
-+    let (base, index) = match (merged.len(), scaled.len()) {
-+        (0, _) => (None, None),
-+        (1, 0) => {
-+            let (b, _) = merged.remove(0);
-+            (Some(b), None)
-+        }
-+        (1, 1) => (None, Some(merged.remove(0))),
-+        (2, 0) => {
-+            let (b, _) = merged.remove(0);
-+            let i = merged.remove(0);
-+            (Some(b), Some(i))
-+        }
-+        (2, 1) => {
-+            let idx = merged.remove(scaled[0]);
-+            let (b, bscale) = merged.remove(0);
-+            if bscale != 1 {
-+                return None;
-+            }
-+            (Some(b), Some(idx))
-+        }
-+        _ => return None,
-+    };
-+    // Two symbolic displacements cannot be summed; one of them survives
-+    // verbatim (`leaq table(%rcx), %r8` folded into `8(%r8,%rbp,8)` gives
-+    // `table+8(%rcx, %rbp, 8)`).
-+    let sym = match (&inner.sym, &outer.sym) {
-+        (Some(_), Some(_)) => return None,
-+        (Some(a), None) => Some(a.clone()),
-+        (None, Some(b)) => Some(b.clone()),
-+        (None, None) => None,
-+    };
-+    let disp = inner.disp.checked_add(outer.disp)?;
-+    Some(
-+        SibAddr {
-+            sym,
-+            disp,
-+            base,
-+            index,
-+        }
-+        .render(),
-+    )
-+}
-+
-+/// Byte offset in `line` of the first character of the operand containing
-+/// `pos`: just past the previous operand separator, or just past the mnemonic
-+/// when the operand is the first one.  Needed because the index-relay fold
-+/// can meet its consumer in ANY operand position, and a store
-+/// (`movq %rax, (%rcx,%rbp,8)`) has a register operand before it.
-+fn operand_start(line: &str, pos: usize) -> usize {
-+    if let Some(c) = line[..pos].rfind(',') {
-+        return c + 1;
-+    }
-+    line.find(|c: char| c.is_whitespace()).unwrap_or(0)
-+}
-+
-+/// Fold a producer `leaq` whose value is `producer_text` into the indexed
-+/// consumer operand `line[pos..=close]`, which holds `dst_text` in its base
-+/// slot.  Returns the composed operand, or `None` when the sum needs more
-+/// register slots than the encoding has (in which case the fold is skipped
-+/// and both instructions are kept).
-+fn compose_indexed_relay(
-+    line: &str,
-+    pos: usize,
-+    close: usize,
-+    dst_text: &str,
-+    producer_text: &str,
-+) -> Option<String> {
-+    let producer = SibAddr::parse(producer_text)?;
-+    let op_start = operand_start(line, pos);
-+    let cons_text = format!("{}{}", &line[op_start..pos], &line[pos..=close]);
-+    let cons = SibAddr::parse(&cons_text)?;
-+    // The base slot must be exactly %T.  Comparing the parsed field rather
-+    // than a text prefix also closes the `%r1` vs `%r10` prefix hazard.
-+    if cons.base.as_deref() != Some(dst_text) {
++    let reg_str = after[1..].trim();
++    let dst = register_family(reg_str);
++    if dst == REG_NONE || dst > REG_GP_MAX {
 +        return None;
 +    }
-+    // %T is substituted away, so only the consumer's own displacement and
-+    // index survive into the sum.
-+    let cons_rest = SibAddr {
-+        sym: cons.sym,
-+        disp: cons.disp,
-+        base: None,
-+        index: cons.index,
-+    };
-+    compose_sib(&producer, &cons_rest)
++    let src_part = mnem[..mnem.len() - after.len()].trim();
++    // Source shape 1: base-only frame slot (no index/scale/symbol — the
++    // compare's memory operand must be the exact bytes the load read; the
++    // displacement is re-emitted canonically so the ESP-slot bias of the
++    // line text can never leak into the operand).
++    if let Some(paren_pos) = src_part.find("(%ebp)").or_else(|| src_part.find("(%esp)")) {
++        let base: &'static str = if src_part[paren_pos..].starts_with("(%ebp)") {
++            "%ebp"
++        } else {
++            "%esp"
++        };
++        let disp_str = &src_part[..paren_pos];
++        if disp_str.contains('(') || disp_str.contains(',') || disp_str.contains('%') {
++            return None;
++        }
++        let disp = if disp_str.is_empty() {
++            0
++        } else {
++            parse_offset(disp_str)
++        };
++        return Some((width, NarrowSrc::Slot(disp, base), dst));
++    }
++    // Source shape 2: a narrow register spelling, or a base-only indirect
++    // operand `DISP(%reg)` (pointer loads: `movzwl (%edi), %edx`).  For the
++    // indirect form the compare re-reads the EXACT same address expression
++    // the load read — identical bytes, identical fault behaviour — so the
++    // flag law carries over unchanged.  Adjacency (nops only between load
++    // and consumer) is what makes "the memory is unchanged" local.
++    if src_part.starts_with('%') && register_family(src_part) != REG_NONE {
++        return Some((width, NarrowSrc::Verbatim(src_part.to_string()), dst));
++    }
++    if let Some(paren) = src_part.find("(%") {
++        let disp_str = &src_part[..paren];
++        let tail = &src_part[paren..];
++        // Base-only: `%reg)` with no index/scale comma inside the parens.
++        if disp_str.contains('(')
++            || disp_str.contains(',')
++            || disp_str.contains('%')
++            || tail.contains(',')
++        {
++            return None;
++        }
++        return Some((width, NarrowSrc::Verbatim(src_part.to_string()), dst));
++    }
++    None
 +}
 +
- /// Requirements: no barrier, no implicit register traffic and no write to
- /// `%base` between the two lines; the only mention of `%T` in the window is the
- /// bare `(%T)` operand being folded; the rewritten line no longer mentions
-@@ -939,51 +1244,22 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo])
-                 } else if let Some((pos, _)) = t.match_indices(&idx_pat).find(|(pos, _)| {
-                     *pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
-                 }) {
--                    if let Some(cl) = t[pos..].find(')').map(|c| pos + c) {
--                        let inner = &t[pos + 1..cl];
--                        if inner.starts_with(dst_text) {
--                            let tail = &inner[dst_text.len()..];
--                            // The spliced operand may hold at most TWO register
--                            // slots (base + index). The leaq's own address may
--                            // already consume both (e.g. `leaq (%rcx,%r9)`):
--                            // folding that into an indexed use would emit an
--                            // invalid three-register SIB
--                            // (`(%rcx, %r9, %r11, 8)` — vectorize_matmul_tail).
--                            let mut extra_regs = 0usize;
--                            let mut fields_ok = true;
--                            for (n, f) in tail.split(',').skip(1).enumerate() {
--                                let f = f.trim();
--                                if f.starts_with('%') {
--                                    extra_regs += 1;
--                                } else if n == 1 && matches!(f, "1" | "2" | "4" | "8") {
--                                    // scale (only meaningful behind an index)
--                                } else {
--                                    fields_ok = false;
--                                }
--                            }
--                            // x86-64 RIP-relative addressing (`disp(%rip)`)
--                            // cannot carry an index register at all — the
--                            // encoding is ModRM mod=00 r/m=101, no SIB. An
--                            // assembler may silently DROP the index instead of
--                            // erroring (observed: `leaq V(%rip,%r11), %r10`
--                            // encoded as plain `leaq V(%rip), %r10` —
--                            // wide_cond_zero_test wrong-code). So a %rip
--                            // leaq may only fold into a BARE `(%T)` use.
--                            if fields_ok
--                                && !folded_addr.contains("%rip")
--                                && addr_fams.len() + extra_regs <= 2
--                            {
--                                if let Some(aopen) = folded_addr.find('(') {
--                                    let new_operand = format!(
--                                        "{}{}{})",
--                                        &folded_addr[..aopen + 1],
--                                        &folded_addr[aopen + 1..folded_addr.len() - 1],
--                                        tail
--                                    );
--                                    matched = Some((pos, cl, new_operand));
--                                }
--                            }
--                        }
-+                    if let Some(cl) = t[pos..].find(')').map(|c| pos + c)
-+                        && let Some(new_operand) =
-+                            compose_indexed_relay(t, pos, cl, dst_text, &folded_addr)
-+                    {
-+                        // COMPOSE, DO NOT CONCATENATE.  See compose_sib: the
-+                        // old code spliced the producer's operand TEXT into
-+                        // the base slot, which is only sound when the producer
-+                        // occupies the base slot itself.  `leaq 0(,%r11,4), %r8`
-+                        // folded into `leaq (%r8, %r10, 1), %r9` used to become
-+                        // `leaq 0(,%r11,4, %r10, 1), %r9` -- two index
-+                        // registers, no encoding -- which the integrated
-+                        // assembler truncated to `leaq 0(,%r11,4), %r9`,
-+                        // silently dropping `+ %r10`.  The correct composition
-+                        // is `leaq (%r10, %r11, 4), %r9`: one instruction, one
-+                        // index register, exactly what GCC and Clang emit.
-+                        matched = Some((pos, cl, new_operand));
-                     }
-                 }
-                 if let Some((op, cl, new_operand)) = matched {
-@@ -2673,6 +2949,7 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String>
- #[cfg(test)]
- mod tests {
-     use super::super::super::peephole_optimize;
-+    use super::{SibAddr, compose_sib, operand_start};
++/// Whether the flag reader following line `j` (immediately, nops allowed)
++/// consumes ZF only.  The testl fold changes SF semantics, so the reader
++/// must be a `je`/`jne` branch or a `sete`/`setne` writer; anything else
++/// (arithmetic on flags, carry chains, sign tests, other setcc/jcc forms)
++/// refuses the fold.
++fn zf_only_flags_reader(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
++    let k = next_non_nop(infos, j + 1);
++    if k >= infos.len() {
++        return false;
++    }
++    let t = trimmed(store, &infos[k], k);
++    if infos[k].kind == LineKind::CondJmp {
++        return t.starts_with("je ") || t.starts_with("jne ");
++    }
++    if matches!(infos[k].kind, LineKind::SetCC { .. }) {
++        return t.starts_with("sete ") || t.starts_with("setne ");
++    }
++    false
++}
++
+ // ── Pass: indirect call through a spilled global function pointer ───────────
  
-     fn run(asm: &str) -> String {
-         peephole_optimize(asm.to_string())
-@@ -4885,4 +5162,303 @@ mod tests {
-         assert!(out.contains("movl %edx, %eax"), "{out}");
-         assert!(!out.contains("%r11d"), "{out}");
+ /// Does `s` reference the ESP-relative slot at raw displacement `disp`?
+@@ -11511,6 +11770,11 @@ pub fn peephole_optimize(asm: String) -> String {
+     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
+     let global_changed = global_changed | fuse_setcc_branch(&mut store, &mut infos);
+     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
++    // Narrow compare folds run right after the full-width memory-operand
++    // fold: they transform the CONSUMER's width (cmpl->cmpb/cmpw) instead of
++    // moving a full-width load into it, so the union-miscompile guard above
++    // (is_full_width_load) is untouched — this is the width-correct twin.
++    let global_changed = global_changed | fold_narrow_load_imm_compare(&mut store, &mut infos);
+     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
+     let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
+     let global_changed = global_changed | collapse_slot_rmw_i686(&mut store, &mut infos);
+@@ -11529,6 +11793,7 @@ pub fn peephole_optimize(asm: String) -> String {
+             changed2 |= eliminate_dead_stores(&store, &mut infos);
+             changed2 |= fuse_setcc_branch(&mut store, &mut infos);
+             changed2 |= fold_memory_operands(&mut store, &mut infos);
++            changed2 |= fold_narrow_load_imm_compare(&mut store, &mut infos);
+             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
+             changed2 |= fuse_sext_testb(&mut store, &mut infos);
+             pass_count2 += 1;
+@@ -14046,6 +14311,12 @@ mod tests {
+         .to_string();
+         let result = peephole_optimize(asm.to_string());
+         assert!(result.contains("setbe %al"));
++        // The movzbl is LOAD-BEARING: `setbe %al` writes only the byte —
++        // the upper 24 bits of %eax are a partial-register MERGE, not a
++        // zero-extension (8-bit writes never zero-extend on x86; the
++        // zero-extension is the movzbl's job).  A pass that deleted it
++        // (briefly tried, session 60) made every `testl %eax,%eax` consumer
++        // read garbage upper bits and take both select arms.
+         assert!(result.contains("movzbl %al, %eax"));
+         assert!(!result.contains("movsbl %al"), "{result}");
      }
-+
-+    // ------------------------------------------------------------------
-+    // SibAddr parsing and compose_sib: the fold that miscompiled
-+    // div/mod-by-constant verification at -O1 lived here.  Every case below
-+    // is a shape the fold can actually meet in emitted code.
-+    // ------------------------------------------------------------------
-+
-+    #[test]
-+    fn sib_parse_index_only_scale4() {
-+        let a = SibAddr::parse("0(,%r11,4)").expect("index-only lea parses");
-+        assert_eq!(a.disp, 0);
-+        assert_eq!(a.base, None);
-+        assert_eq!(a.index, Some(("%r11".to_string(), 4)));
-+    }
-+
-+    #[test]
-+    fn sib_parse_base_and_index() {
-+        let a = SibAddr::parse("(%r8, %r10, 1)").expect("base+index parses");
-+        assert_eq!(a.base.as_deref(), Some("%r8"));
-+        assert_eq!(a.index, Some(("%r10".to_string(), 1)));
-+        assert_eq!(a.disp, 0);
-+    }
+@@ -15675,6 +15946,8 @@ mod tests {
+         let r = peephole_optimize(asm.to_string());
+         assert!(!r.contains("testl %eax, %edx"), "test dropped: {}", r);
+         assert!(r.contains("setne %al"), "setCC kept (bool live): {}", r);
++        // The movzbl stays: a setCC byte write does not zero-extend %eax
++        // (partial-register merge), so the extend is load-bearing.
+         assert!(r.contains("movzbl %al, %eax"), "movzbl kept: {}", r);
+         assert!(r.contains("movl %eax, %edx"), "relay kept: {}", r);
+     }
+@@ -18707,4 +18980,252 @@ mod tests {
+         });
+         let _ = std::fs::remove_file(&path);
+     }
++    // ── Narrow load → immediate compare/test folds ─────────────────────────
++    // (fold_narrow_load_imm_compare: the flag-law and its fail-closed gates)
 +
 +    #[test]
-+    fn sib_parse_disp_base_index() {
-+        let a = SibAddr::parse("8(%rcx,%rbp,8)").expect("disp+base+index parses");
-+        assert_eq!(a.disp, 8);
-+        assert_eq!(a.base.as_deref(), Some("%rcx"));
-+        assert_eq!(a.index, Some(("%rbp".to_string(), 8)));
-+    }
-+
-+    #[test]
-+    fn sib_parse_base_only_renders_canonically() {
-+        let a = SibAddr::parse("16(%rax)").unwrap();
-+        assert_eq!(a.base.as_deref(), Some("%rax"));
-+        assert_eq!(a.index, None);
-+        assert_eq!(a.render(), "16(%rax)");
-+        let b = SibAddr::parse("(%rax)").unwrap();
-+        assert_eq!(b.render(), "(%rax)", "zero disp renders without it");
-+    }
-+
-+    #[test]
-+    fn sib_parse_rejects_unencodable_forms() {
-+        // %rip-relative: ModRM mod=00 r/m=101, no SIB byte at all.
-+        assert!(SibAddr::parse("V(%rip)").is_none());
-+        assert!(SibAddr::parse(".Lstr0(%rip)").is_none());
-+        // Illegal index scale.
-+        assert!(SibAddr::parse("(,%r11,3)").is_none());
-+        // Three register slots: no encoding exists.
-+        assert!(SibAddr::parse("(%rax,%rbx,%rcx)").is_none());
-+        // No operand at all.
-+        assert!(SibAddr::parse("()").is_none());
-+        assert!(SibAddr::parse("%rax").is_none());
-+    }
-+
-+    /// THE regression: `leaq 0(,%r11,4), %r8` folded into
-+    /// `leaq (%r8, %r10, 1), %r9`.  The old code concatenated the two operand
-+    /// texts into `0(,%r11,4, %r10, 1)` — two index registers, no base, no
-+    /// encoding; the integrated assembler silently dropped `+ %r10` and the
-+    /// `q*d + r == n` check compiled to `q*d == n`.
-+    #[test]
-+    fn compose_index_only_producer_into_indexed_consumer() {
-+        let inner = SibAddr::parse("0(,%r11,4)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 0,
-+            base: None,
-+            index: Some(("%r10".to_string(), 1)),
-+        };
-+        let got = compose_sib(&inner, &outer).expect("must compose");
-+        // disp 0 is omitted: `(%r10, %r11, 4)` is the canonical GAS form.
-+        assert_eq!(got, "(%r10, %r11, 4)");
-+        // And the result must itself be a legal, single-index operand.
-+        let reparsed = SibAddr::parse(&got).expect("composition re-parses");
-+        assert_eq!(reparsed.base.as_deref(), Some("%r10"));
-+        assert_eq!(reparsed.index, Some(("%r11".to_string(), 4)));
-+    }
-+
-+    #[test]
-+    fn compose_plain_base_producer_keeps_working() {
-+        // The shape the fold was originally written for: a plain
-+        // displacement(base) producer folded into an indexed consumer.
-+        let inner = SibAddr::parse("16(%rax)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 8,
-+            base: None,
-+            index: Some(("%rbx".to_string(), 8)),
-+        };
-+        assert_eq!(
-+            compose_sib(&inner, &outer).as_deref(),
-+            Some("24(%rax, %rbx, 8)")
-+        );
-+    }
-+
-+    #[test]
-+    fn compose_rejects_two_scaled_registers() {
-+        // 4*%rax + 8*%rbx needs two index slots.
-+        let inner = SibAddr::parse("(,%rax,4)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 0,
-+            base: None,
-+            index: Some(("%rbx".to_string(), 8)),
-+        };
-+        assert!(compose_sib(&inner, &outer).is_none());
-+    }
-+
-+    #[test]
-+    fn compose_rejects_three_distinct_registers() {
-+        let inner = SibAddr::parse("(%rax,%rbx,2)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 0,
-+            base: None,
-+            index: Some(("%rcx".to_string(), 1)),
-+        };
-+        assert!(compose_sib(&inner, &outer).is_none());
-+    }
-+
-+    #[test]
-+    fn compose_merges_repeated_register_into_one_scale() {
-+        // %rax + %rax*1 == 2*%rax, which is a legal index scale.
-+        let inner = SibAddr::parse("(%rax)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 0,
-+            base: None,
-+            index: Some(("%rax".to_string(), 1)),
-+        };
-+        assert_eq!(
-+            compose_sib(&inner, &outer).as_deref(),
-+            Some("(,%rax, 2)")
-+        );
-+    }
-+
-+    #[test]
-+    fn compose_rejects_unmergeable_repeated_register() {
-+        // %rax*1 + %rax*2 == 3*%rax: not an encodable scale.
-+        let inner = SibAddr::parse("(,%rax,2)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 0,
-+            base: None,
-+            index: Some(("%rax".to_string(), 1)),
-+        };
-+        assert!(compose_sib(&inner, &outer).is_none());
-+    }
-+
-+    #[test]
-+    fn compose_sums_displacements() {
-+        let inner = SibAddr::parse("-8(%rax)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 8,
-+            base: None,
-+            index: None,
-+        };
-+        assert_eq!(compose_sib(&inner, &outer).as_deref(), Some("(%rax)"));
-+    }
-+
-+    /// End-to-end through the real peephole driver: the exact instruction
-+    /// pair from the -O1 div/mod-by-constant miscompile.  The fold must
-+    /// produce ONE lea with a single index register; a two-index operand has
-+    /// no x86-64 encoding and used to assemble into wrong code.
-+    #[test]
-+    fn lea_chain_with_index_producer_composes_not_concatenates() {
-+        let out = run(concat!(
-+            "d4:\n",
-+            ".cfi_startproc\n",
-+            "    leaq 0(,%r11,4), %r8\n",
-+            "    leaq (%r8, %r10, 1), %r9\n",
-+            "    cmpq %rbx, %r9\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        assert!(
-+            !out.contains("%r11,4, %r10"),
-+            "two-index lea escaped into the output:\n{out}"
-+        );
-+        assert!(
-+            !out.contains("%r11, 4, %r10"),
-+            "two-index lea escaped into the output:\n{out}"
-+        );
-+        // Either the fold fired and produced the valid composed form, or it
-+        // declined and left both instructions intact.  Both are correct; the
-+        // concatenation is the only unacceptable answer.
-+        if out.contains("leaq (%r10, %r11, 4), %r9") {
-+            assert!(!out.contains("leaq 0(,%r11,4), %r8"), "producer not removed");
-+        } else {
-+            assert!(out.contains("leaq 0(,%r11,4), %r8"), "{out}");
-+            assert!(out.contains("leaq (%r8, %r10, 1), %r9"), "{out}");
-+        }
-+    }
-+
-+    // -- symbolic displacements and operand position ----------------------
-+
-+    #[test]
-+    fn sib_parse_symbolic_displacements() {
-+        let a = SibAddr::parse("table(%rcx)").unwrap();
-+        assert_eq!(a.sym.as_deref(), Some("table"));
-+        assert_eq!(a.disp, 0);
-+        assert_eq!(a.base.as_deref(), Some("%rcx"));
-+        assert_eq!(a.render(), "table(%rcx)");
-+
-+        let b = SibAddr::parse("table+8(%rax)").unwrap();
-+        assert_eq!(b.sym.as_deref(), Some("table"));
-+        assert_eq!(b.disp, 8);
-+        assert_eq!(b.render(), "table+8(%rax)");
-+
-+        let c = SibAddr::parse("table-4(%rax)").unwrap();
-+        assert_eq!(c.sym.as_deref(), Some("table"));
-+        assert_eq!(c.disp, -4);
-+        assert_eq!(c.render(), "table-4(%rax)");
-+    }
-+
-+    /// The indexed-relay fold must keep working for a symbol-based producer:
-+    /// this is the `leaq table(%rcx), %r8; movq (%r8,%rbp,8), %r13` shape the
-+    /// pass documents (hash_table, adler32 unrolled loops).  A symbol cannot
-+    /// be added, so it is carried through verbatim.
-+    #[test]
-+    fn compose_symbolic_producer_into_indexed_consumer() {
-+        let inner = SibAddr::parse("table(%rcx)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 8,
-+            base: None,
-+            index: Some(("%rbp".to_string(), 8)),
-+        };
-+        assert_eq!(
-+            compose_sib(&inner, &outer).as_deref(),
-+            Some("table+8(%rcx, %rbp, 8)")
-+        );
-+    }
-+
-+    #[test]
-+    fn compose_rejects_two_symbolic_displacements() {
-+        let inner = SibAddr::parse("table(%rcx)").unwrap();
-+        let outer = SibAddr {
-+            sym: Some("other".to_string()),
-+            disp: 0,
-+            base: None,
-+            index: Some(("%rbp".to_string(), 8)),
-+        };
-+        assert!(compose_sib(&inner, &outer).is_none());
-+    }
-+
-+    #[test]
-+    fn operand_start_finds_first_and_later_operands() {
-+        // First operand: just past the mnemonic.
-+        assert_eq!(operand_start("leaq (%r8, %r10, 1), %r9", 5), 4);
-+        // Second operand (a store): just past the separator comma, NOT just
-+        // past the mnemonic -- otherwise the displacement parse would choke
-+        // on `%rax,` and the fold would silently stop firing for stores.
-+        let store = "movq %rax, (%rcx,%rbp,8)";
-+        assert_eq!(operand_start(store, 11), 10);
-+        assert_eq!(&store[11..], "(%rcx,%rbp,8)");
-+    }
-+
-+    /// The store form must still fold: a register operand precedes the
-+    /// memory operand and the displacement extractor has to step over it.
-+    #[test]
-+    fn indexed_store_still_folds() {
-+        let out = run(concat!(
++    fn narrow_byte_load_imm_compare_folds_to_cmpb() {
++        let asm = concat!(
 +            "f:\n",
 +            ".cfi_startproc\n",
-+            "    leaq 16(%r12), %r8\n",
-+            "    movq %rax, (%r8,%rbp,8)\n",
++            "    movzbl 12(%esp), %eax\n",
++            "    cmpl $57, %eax\n",
++            "    je .L1\n",
++            "    xorl %ebx, %ebx\n",
++            ".L1:\n",
++            "    xorl %eax, %eax\n",
 +            "    ret\n",
 +            ".cfi_endproc\n",
-+        ));
++        );
++        let out = peephole_optimize(asm.to_string());
 +        assert!(
-+            out.contains("movq %rax, 16(%r12, %rbp, 8)"),
-+            "store into an indexed operand stopped folding:\n{out}"
++            out.contains("cmpb $57, 12(%esp)"),
++            "the byte compare did not fold:\n{out}"
++        );
++        assert!(
++            !out.contains("movzbl 12(%esp)"),
++            "the load survived the fold:\n{out}"
++        );
++        assert!(
++            !out.contains("cmpl $57"),
++            "the wide compare survived the fold:\n{out}"
 +        );
 +    }
 +
 +    #[test]
-+    fn render_omits_implicit_scale_one() {
-+        // The canonical AT&T form leaves scale 1 implicit.  The old splicer
-+        // produced `8(%rsp, %r8)`; a renderer that wrote `8(%rsp, %r8, 1)`
-+        // would be equivalent but would change every folded operand and break
-+        // downstream pattern matchers (dead_writes keys on the canonical form).
-+        let a = SibAddr::parse("(%rcx, %r8)").unwrap();
-+        assert_eq!(a.index, Some(("%r8".to_string(), 1)));
-+        assert_eq!(a.render(), "(%rcx, %r8)");
-+        // And a scale-1 result still composes into the canonical text.
-+        let inner = SibAddr::parse("8(%rsp)").unwrap();
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 0,
-+            base: None,
-+            index: Some(("%r8".to_string(), 1)),
-+        };
-+        assert_eq!(
-+            compose_sib(&inner, &outer).as_deref(),
-+            Some("8(%rsp, %r8)")
++    fn narrow_word_load_imm_compare_folds_to_cmpw() {
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzwl 8(%ebp), %ecx\n",
++            "    cmpl $1000, %ecx\n",
++            "    jne .L1\n",
++            "    xorl %ebx, %ebx\n",
++            ".L1:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("cmpw $1000, 8(%ebp)"),
++            "the word compare did not fold:\n{out}"
 +        );
 +    }
++
++    #[test]
++    fn narrow_fold_folds_the_exact_byte_the_union_hazard_needed() {
++        // The historical miscompile shape (uu.b[0] != 0x04 becoming
++        // `cmpl $4, 176(%esp)`, comparing the whole word 0x01020304) is the
++        // one shape this pass may fold — by TRANSFORMING the width.  cmpb
++        // reads exactly the byte the movzbl read.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzbl 176(%esp), %eax\n",
++            "    cmpl $4, %eax\n",
++            "    jne .L1\n",
++            "    xorl %ebx, %ebx\n",
++            ".L1:\n",
++            "    movl %ebx, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("cmpb $4, 176(%esp)"),
++            "the width-transforming fold did not fire:\n{out}"
++        );
++        assert!(
++            !out.contains("cmpl $4, 176(%esp)"),
++            "cmpl must not appear:\n{out}"
++        );
++    }
++
++    #[test]
++    fn narrow_fold_refuses_sign_extending_loads() {
++        // movsbl sign-extends: every flag row of the proof changes.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movsbl 12(%esp), %eax\n",
++            "    cmpl $57, %eax\n",
++            "    jl .L1\n",
++            "    xorl %ebx, %ebx\n",
++            ".L1:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("movsbl 12(%esp)") && out.contains("cmpl $57"),
++            "sign-extending load was folded:\n{out}"
++        );
++    }
++
++    #[test]
++    fn narrow_fold_refuses_immediates_outside_the_byte_window() {
++        // mem=200, I=200: cmpb says equal, cmpl says above — the window is
++        // the law, not a heuristic.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzbl 12(%esp), %eax\n",
++            "    cmpl $200, %eax\n",
++            "    je .L1\n",
++            "    xorl %ebx, %ebx\n",
++            ".L1:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        // The refusal invariant: no cmpb may appear.  (The existing 16-bit
++        // canonicaliser may still narrow the cmpl to `cmpw $200, %ax` — the
++        // word view of the same proof — which is correct and orthogonal.)
++        assert!(!out.contains("cmpb $200"), "cmpb $200 appeared:\n{out}");
++    }
++
++    #[test]
++    fn narrow_fold_refuses_negative_immediates() {
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzbl 12(%esp), %eax\n",
++            "    cmpl $-1, %eax\n",
++            "    je .L1\n",
++            "    xorl %ebx, %ebx\n",
++            ".L1:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("cmpl $-1"),
++            "negative immediate folded:\n{out}"
++        );
++    }
++
++    #[test]
++    fn testl_folds_to_cmpb_zero_for_zf_only_readers() {
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzbl 20(%esp), %eax\n",
++            "    testl %eax, %eax\n",
++            "    je .L1\n",
++            "    xorl %ebx, %ebx\n",
++            ".L1:\n",
++            "    movl %ebx, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("cmpb $0, 20(%esp)"),
++            "the test did not fold to cmpb $0:\n{out}"
++        );
++        assert!(!out.contains("testl %eax"), "testl survived:\n{out}");
++    }
++
++    #[test]
++    fn testl_fold_refuses_sign_flag_readers() {
++        // js reads SF, which cmpb $0 and testl disagree on.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzbl 20(%esp), %eax\n",
++            "    testl %eax, %eax\n",
++            "    js .L1\n",
++            "    xorl %ebx, %ebx\n",
++            ".L1:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("testl %eax"),
++            "SF-reading consumer was folded:\n{out}"
++        );
++    }
++
++    #[test]
++    fn narrow_fold_refuses_when_the_register_survives() {
++        // Copy propagation may extend the loaded byte's register across
++        // later readers; the liveness oracle must refuse those.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzbl 12(%esp), %eax\n",
++            "    cmpl $57, %eax\n",
++            "    je .L1\n",
++            ".L1:\n",
++            "    movl %eax, %ebx\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("movzbl 12(%esp)"),
++            "live register was folded away:\n{out}"
++        );
++    }
++
++    #[test]
++    fn narrow_fold_refuses_indexed_and_mismatched_consumers() {
++        // Indexed source: the compare's one memory operand cannot spell it.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzbl (%esp,%ebx), %eax\n",
++            "    cmpl $57, %eax\n",
++            "    je .L1\n",
++            "    xorl %ecx, %ecx\n",
++            ".L1:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("movzbl (%esp,%ebx)"),
++            "indexed load was folded:\n{out}"
++        );
++        // Consumer reads a DIFFERENT register: not the loaded value.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movzbl 12(%esp), %eax\n",
++            "    cmpl $57, %ebx\n",
++            "    je .L1\n",
++            "    xorl %ecx, %ecx\n",
++            ".L1:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let out = peephole_optimize(asm.to_string());
++        assert!(
++            out.contains("movzbl 12(%esp)") && out.contains("cmpl $57, %ebx"),
++            "mismatched consumer was folded:\n{out}"
++        );
++    }
++
++    // ── setCC self-zero-extension deletion ─────────────────────────────────
  }
-diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index 5c9dd07..21fde94 100644
---- a/src/passes/simplify.rs
-+++ b/src/passes/simplify.rs
-@@ -1739,17 +1739,44 @@ fn simplify_gep(
- }
- 
- /// Return the log2 of a positive i64 value if it is a power of 2, or None otherwise.
--fn const_power_of_two(op: &Operand) -> Option<u32> {
--    match op {
--        Operand::Const(c) => {
--            let val = c.to_i64()?;
--            if val > 0 && (val & (val - 1)) == 0 {
--                Some(val.trailing_zeros())
--            } else {
--                None
--            }
--        }
--        _ => None,
-+/// Recognise a constant power of two and return its exponent.
-+///
-+/// The constant must be read at the operation's width. Going through
-+/// `to_i64()` silently truncates `IrConst::I128`, so the multiplier
-+/// `0xffffffffffffffff0000000000000001` came back as `1`, was recognised as
-+/// 2^0, and rewrote `x * K` into `x << 0` -- that is, into `x`, a silent
-+/// miscompile of every `__int128` multiply by a constant whose low 64 bits
-+/// happen to be a power of two. The same signed read also hid the single set
-+/// bit of 2^63 in an unsigned 64-bit multiplier, so `x * 0x8000000000000000u`
-+/// missed the shift entirely.
-+///
-+/// Both are fixed by taking the constant's bit pattern and masking it to the
-+/// type's width before the power-of-two test.
-+fn const_power_of_two(op: &Operand, ty: IrType) -> Option<u32> {
-+    let c = match op {
-+        Operand::Const(c) => *c,
-+        _ => return None,
-+    };
-+    let raw: u128 = match c {
-+        IrConst::I8(v) => v as u8 as u128,
-+        IrConst::I16(v) => v as u16 as u128,
-+        IrConst::I32(v) => v as u32 as u128,
-+        IrConst::I64(v) => v as u64 as u128,
-+        IrConst::I128(v) => v as u128,
-+        _ => return None,
-+    };
-+    // Bits above the operation's width are not part of the value and must not
-+    // be mistaken for the single set bit of a power of two.
-+    let width = ty.size().saturating_mul(8) as u32;
-+    let val = if width == 0 || width >= 128 {
-+        raw
-+    } else {
-+        raw & ((1u128 << width) - 1)
-+    };
-+    if val != 0 && (val & (val - 1)) == 0 {
-+        Some(val.trailing_zeros())
-+    } else {
-+        None
-     }
- }
- 
-@@ -1761,7 +1788,7 @@ fn try_mul_power_of_two(
-     pow2: &Operand,
-     ty: IrType,
- ) -> Option<Instruction> {
--    let shift = const_power_of_two(pow2)?;
-+    let shift = const_power_of_two(pow2, ty)?;
-     if shift == 1 {
-         // x * 2 => x + x
-         Some(Instruction::BinOp {
-@@ -1971,7 +1998,7 @@ fn simplify_binop(
-             // On 64-bit targets, C integer promotion widens unsigned int ops to I64,
-             // but UDiv still has unsigned semantics regardless of type signedness.
-             if op == IrBinOp::UDiv && (ty.is_integer() || ty == IrType::Ptr) {
--                if let Some(shift) = const_power_of_two(rhs) {
-+                if let Some(shift) = const_power_of_two(rhs, ty) {
-                     return Some(Instruction::BinOp {
-                         dest,
-                         op: IrBinOp::LShr,
-@@ -1995,7 +2022,7 @@ fn simplify_binop(
-             // On 64-bit targets, C integer promotion widens unsigned int ops to I64,
-             // but URem still has unsigned semantics regardless of type signedness.
-             if op == IrBinOp::URem && (ty.is_integer() || ty == IrType::Ptr) {
--                if let Some(shift) = const_power_of_two(rhs) {
-+                if let Some(shift) = const_power_of_two(rhs, ty) {
-                     // x % 2^k => x & (2^k - 1)
-                     let mask = (1i64 << shift) - 1;
-                     return Some(Instruction::BinOp {
-diff --git a/tests/regression/div_mod_by_const_exhaustive.c b/tests/regression/div_mod_by_const_exhaustive.c
+diff --git a/tests/regression/i686_narrow_cmp_fold.c b/tests/regression/i686_narrow_cmp_fold.c
 new file mode 100644
-index 0000000..b6f7d13
+index 00000000..75ccb999
 --- /dev/null
-+++ b/tests/regression/div_mod_by_const_exhaustive.c
-@@ -0,0 +1,261 @@
-+/* Exhaustive coverage for division and modulo by a constant.
++++ b/tests/regression/i686_narrow_cmp_fold.c
+@@ -0,0 +1,139 @@
++/* i686: narrow zero-extends folded into the immediate compare that reads
++ * them — `movzbl SRC, %R; cmpl $I, %R` becomes `cmpb $I, SRC`, and the
++ * `testl %R, %R` shape becomes `cmpb $0, SRC` (ZF-only readers only).
 + *
-+ * div_by_const replaces hardware div/idiv (20-90 cycles) with Hacker's Delight
-+ * multiply-and-shift sequences. The magic number and shift are computed per
-+ * divisor and per signedness, and the fixup differs between the unsigned
-+ * add-and-shift form and the signed sign-correction form, so the space of
-+ * ways to be wrong by one is large and a handful of spot checks cannot cover
-+ * it. A truncation bug in a neighbouring predicate (const_power_of_two reading
-+ * an I128 constant through to_i64) was found in this area, which is what
-+ * motivated pinning the whole table down.
++ * FLAG LAW UNDER TEST (see fold_narrow_load_imm_compare for the proof):
++ * for 0 <= I <= 127 every condition code of the byte compare of a
++ * zero-extended byte matches the 32-bit compare of its zero-extension —
++ * including the wrap rows (byte >= 128), where the 8-bit view sets SF and
++ * OF together and the signed conditions still decode to the unsigned
++ * order.  This test drives every branch flavour over the wrap boundary so
++ * a wrong row is a wrong exit code, not a style opinion.
 + *
-+ * The oracle deliberately uses no division. For every (dividend, divisor) the
-+ * test asserts the defining properties of C's truncated division:
++ * Shapes exercised, in the exact spellings the backend emits:
++ *   * frame-slot sources (both %esp and %ebp slots, byte and word);
++ *   * register sources (movzbl %dl / movsbl twins, high-byte %dh alias —
++ *     same family as %dl but a different byte: the fold must NOT touch it);
++ *   * indirect pointer sources (movzwl (%edi), %edx);
++ *   * the testl->cmpb shape with je/jne and sete/setne consumers;
++ *   * signed branches (jl/jg) and unsigned (jb/ja) across the wrap rows.
 + *
-+ *   dividend == quotient * divisor + remainder      (exact, wrapping-checked)
-+ *   unsigned: remainder <  divisor
-+ *   signed:   |remainder| < |divisor| and sign(remainder) == sign(dividend)
-+ *
-+ * so a wrong quotient or remainder is caught without asking the compiler to
-+ * perform the very operation under test. The runner additionally diffs the
-+ * whole binary's output against GCC.
-+ */
-+#include <limits.h>
++ * Freestanding on purpose: the checksum is observed through the exit
++ * status so the test links under -mregparm=3 (the boot regime), where
++ * calling libc would be an ABI violation.  The expected constants are
++ * pure C semantics (gcc/clang -m32 -O0..-O3 agree; -DPRINT_REF and a
++ * regparm-free build re-derives them). */
++#include <stdint.h>
++#ifdef PRINT_REF
++/* Derivation build only (regparm-free, so libc calls are legal). */
 +#include <stdio.h>
++#endif
 +
-+static unsigned long long fails;
++#ifndef EXPECT_A
++#define EXPECT_A 569u
++#endif
 +
-+/* The checkers are deliberately side-effect-free: they record the first
-+ * offending case in globals and main() reports it once at the end. Calling
-+ * printf from inside the checker puts six computed values live across a
-+ * variadic call at every one of the ~20000 check sites, which is a much
-+ * harder register-allocation problem than the arithmetic under test and made
-+ * the test report failures that belonged to the call, not to div_by_const. */
-+static const char *fail_kind;
-+static unsigned long long fail_n, fail_d, fail_q, fail_r;
++volatile uint32_t g_sink;
 +
-+static void record(const char *kind, unsigned long long n, unsigned long long d,
-+		   unsigned long long q, unsigned long long r)
-+{
-+	if (fails == 0) {
-+		fail_kind = kind;
-+		fail_n = n;
-+		fail_d = d;
-+		fail_q = q;
-+		fail_r = r;
-+	}
-+	fails++;
++/* noinline + regparm-free wrappers keep every comparison in its own
++ * function so no caller-side folding can mask a broken callee shape. */
++__attribute__((noinline)) static uint32_t cmpb_slot(signed char c) {
++    /* The wrap rows: 127 (top of window), -128 (byte 0x80), -1 (0xFF). */
++    uint32_t r = 0;
++    if (c == 57)
++        r |= 1;
++    if (c != 57)
++        r |= 2;
++    if (c < 100)
++        r |= 4; /* signed: -128 and -1 take it, 127 does not */
++    if ((unsigned char)c > 200u)
++        r |= 8; /* unsigned: 0xFF and 0x80 take it */
++    if ((unsigned char)c >= 0x80u)
++        r |= 16; /* the SF/OF wrap row */
++    return r;
 +}
 +
-+/* Unsigned 64: q = n/d, r = n%d, checked by the defining identity. */
-+static void check_u64(unsigned long long n, unsigned long long d)
-+{
-+	unsigned long long q = n / d;
-+	unsigned long long r = n % d;
-+
-+	/* r >= d, or q*d + r failing to reproduce n, means the quotient is off
-+	 * by one -- which is exactly how a wrong magic number or shift shows
-+	 * up. */
-+	if (r >= d || q * d + r != n)
-+		record("u64", n, d, q, r);
++__attribute__((noinline)) static uint32_t cmpw_slot(short s) {
++    uint32_t r = 0;
++    if (s == 1000)
++        r |= 1;
++    if (s != 1000)
++        r |= 2;
++    if (s < 0)
++        r |= 4; /* -32768: the word wrap row */
++    if ((unsigned short)s > 40000u)
++        r |= 8; /* 0x8000+ territory */
++    return r;
 +}
 +
-+/* Signed 64: C99 truncates toward zero, so the remainder takes the dividend's
-+ * sign and is bounded by |d|. */
-+static void check_s64(long long n, long long d)
-+{
-+	long long q = n / d;
-+	long long r = n % d;
-+	long long ad = d < 0 ? -d : d;
-+	long long ar = r < 0 ? -r : r;
-+
-+	if (ar >= ad || (r != 0 && ((r < 0) != (n < 0))) || q * d + r != n)
-+		record("s64", (unsigned long long)n, (unsigned long long)d,
-+		       (unsigned long long)q, (unsigned long long)r);
++__attribute__((noinline)) static uint32_t cmpb_reg(unsigned char b) {
++    /* movzbl %dl, %eax; cmpl $I, %eax shapes (the backend widens `b`
++     * through the accumulator for every compare). */
++    uint32_t r = 0;
++    if (b == 32)
++        r |= 1;
++    if (b > 32)
++        r |= 2;
++    if (b <= 32)
++        r |= 4;
++    if (b != 255)
++        r |= 8;
++    return r;
 +}
 +
-+static void check_u32(unsigned n, unsigned d)
-+{
-+	unsigned q = n / d;
-+	unsigned r = n % d;
-+
-+	if (r >= d || q * d + r != n)
-+		record("u32", n, d, q, r);
++__attribute__((noinline)) static uint32_t testb_ptr(const uint8_t *p) {
++    /* movzbl (%edi), %edx; testl %edx, %edx; je shapes. */
++    uint32_t r = 0;
++    if (*p == 0)
++        r |= 1;
++    if (*p != 0)
++        r |= 2;
++    if (*p == 0x80)
++        r |= 4; /* the high-bit byte: ZF row and nothing else */
++    return r;
 +}
 +
-+static void check_s32(int n, int d)
-+{
-+	int q = n / d;
-+	int r = n % d;
-+	int ad = d < 0 ? -d : d;
-+	int ar = r < 0 ? -r : r;
-+
-+	if (ar >= ad || (r != 0 && ((r < 0) != (n < 0))) || q * d + r != n)
-+		record("s32", (unsigned long long)(long long)n,
-+		       (unsigned long long)(long long)d,
-+		       (unsigned long long)(long long)q,
-+		       (unsigned long long)(long long)r);
++__attribute__((noinline)) static int bool_from_cmp(unsigned char b) {
++    /* sete %al; movzbl %al, %eax shapes: the bool materialisation. */
++    int t = (b == 7);
++    int u = (b != 7);
++    return t * 10 + u;
 +}
 +
-+/* The divisor MUST be a literal in each function. Driving the sweep from an
-+ * array of divisors makes every division a variable division, so
-+ * div_by_const never fires and the test silently verifies the hardware div
-+ * instead of the strength reduction it claims to cover. One noinline function
-+ * per divisor, generated by macro, keeps the dividend sweep exhaustive while
-+ * the divisor stays a compile-time constant. */
++int main(void) {
++    uint32_t r = 0;
++    r ^= cmpb_slot(57) * 3u;
++    r ^= cmpb_slot(-128) * 5u;
++    r ^= cmpb_slot(-1) * 7u;
++    r ^= cmpb_slot(127) * 11u;
++    r ^= cmpb_slot(100) * 13u;
++    g_sink = r;
 +
-+/* Divisors hit every branch of the magic-number construction: 1 and 2
-+ * (degenerate), powers of two, one below and above a power of two, small odd
-+ * values needing the add-and-shift fixup, magics needing the full 64-bit
-+ * range, and the extremes. */
-+#define U64_LIST(X) \
-+	X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) \
-+	X(1000) X(4095) X(4096) X(4097) X(65535) X(65536) X(65537) \
-+	X(4294967295) X(4294967296) X(4294967297) \
-+	X(9223372036854775807) X(18446744073709551557)
++    r ^= cmpw_slot(1000) * 17u;
++    r ^= cmpw_slot(-32768) * 19u;
++    r ^= cmpw_slot((short)0xBEEF) * 23u;
++    g_sink = r;
 +
-+#define S64_LIST(X) \
-+	X(1) X(2) X(3) X(5) X(6) X(7) X(10) X(1000) X(4096) X(4097) \
-+	X(65536) X(65537) X(2147483647) X(4294967296) X(9223372036854775783)
++    r ^= cmpb_reg(32) * 29u;
++    r ^= cmpb_reg(255) * 31u;
++    r ^= cmpb_reg(0) * 37u;
++    g_sink = r;
 +
-+#define U32_LIST(X) \
-+	X(1) X(2) X(3) X(7) X(10) X(1000) X(4095) X(4096) X(4097) \
-+	X(65535) X(65536) X(65537) X(2147483647) X(4294967295)
++    static const uint8_t bytes[3] = {0, 0x80, 0xFF};
++    r ^= testb_ptr(&bytes[0]) * 41u;
++    r ^= testb_ptr(&bytes[1]) * 43u;
++    r ^= testb_ptr(&bytes[2]) * 47u;
++    g_sink = r;
 +
-+#define S32_LIST(X) \
-+	X(1) X(2) X(3) X(7) X(10) X(1000) X(4096) X(4097) X(65536) \
-+	X(2147483647)
++    r ^= (uint32_t)bool_from_cmp(7) * 53u;
++    r ^= (uint32_t)bool_from_cmp(9) * 59u;
++    g_sink = r;
 +
-+/* Negative divisors exercise the sign-correction form; one is generated for
-+ * every divisor in the signed lists so each sweep has its mirror. */
-+
-+#define GEN_U64(D)                                                            \
-+	__attribute__((noinline)) static void u64_d##D(unsigned long long n)   \
-+	{                                                                    \
-+		check_u64(n, D##ULL);                                        \
-+	}
-+#define GEN_S64(D)                                                            \
-+	__attribute__((noinline)) static void s64_d##D(long long n)            \
-+	{                                                                    \
-+		check_s64(n, D##LL);                                         \
-+	}
-+#define GEN_S64NEG(D)                                                         \
-+	__attribute__((noinline)) static void s64_n##D(long long n)            \
-+	{                                                                    \
-+		check_s64(n, -(D##LL));                                      \
-+	}
-+#define GEN_U32(D)                                                            \
-+	__attribute__((noinline)) static void u32_d##D(unsigned n)             \
-+	{                                                                    \
-+		check_u32(n, D##u);                                          \
-+	}
-+#define GEN_S32(D)                                                            \
-+	__attribute__((noinline)) static void s32_d##D(int n)                  \
-+	{                                                                    \
-+		check_s32(n, D);                                             \
-+	}
-+#define GEN_S32NEG(D)                                                         \
-+	__attribute__((noinline)) static void s32_n##D(int n)                  \
-+	{                                                                    \
-+		check_s32(n, -(D));                                          \
-+	}
-+
-+U64_LIST(GEN_U64)
-+S64_LIST(GEN_S64)
-+S64_LIST(GEN_S64NEG)
-+U32_LIST(GEN_U32)
-+S32_LIST(GEN_S32)
-+S32_LIST(GEN_S32NEG)
-+
-+/* Dividends: zero, the extremes, and -- the case that exposes an off-by-one in
-+ * the fixup -- values immediately around multiples of the divisor. The
-+ * multipliers are odd so the products land on many distinct residues. */
-+#define SWEEP_U64(D)                                                          \
-+	do {                                                                 \
-+		unsigned long long k;                                        \
-+		int i;                                                       \
-+		u64_d##D(0); u64_d##D(1); u64_d##D(2);                       \
-+		u64_d##D(D##ULL - 1); u64_d##D(D##ULL); u64_d##D(D##ULL + 1); \
-+		u64_d##D(~0ULL); u64_d##D(~0ULL - 1);                        \
-+		u64_d##D(0x8000000000000000ULL);                             \
-+		u64_d##D(0x7fffffffffffffffULL);                             \
-+		for (k = 1, i = 0; i < 40 && k != 0; k *= 3, i++) {          \
-+			u64_d##D(k);                                         \
-+			if (k >= (D##ULL)) {                                 \
-+				u64_d##D(k - 1); u64_d##D(k + 1);            \
-+				u64_d##D(k - (D##ULL)); u64_d##D(k + (D##ULL)); \
-+			}                                                    \
-+		}                                                            \
-+	} while (0);
-+
-+#define SWEEP_S64(D)                                                          \
-+	do {                                                                 \
-+		long long k;                                                 \
-+		int i;                                                       \
-+		s64_d##D(0); s64_d##D(1); s64_d##D(-1);                      \
-+		s64_d##D(LLONG_MAX); s64_d##D(LLONG_MIN + 1);                \
-+		s64_d##D((D##LL) - 1); s64_d##D(D##LL); s64_d##D((D##LL) + 1); \
-+		s64_d##D(-(D##LL));                                          \
-+		s64_n##D(0); s64_n##D(1); s64_n##D(-1);                      \
-+		s64_n##D(LLONG_MAX); s64_n##D(LLONG_MIN + 1);                \
-+		s64_n##D((D##LL) - 1); s64_n##D(D##LL); s64_n##D(-(D##LL));  \
-+		for (k = 1, i = 0; i < 40 && k > 0; k *= 3, i++) {           \
-+			s64_d##D(k); s64_d##D(-k);                           \
-+			s64_n##D(k); s64_n##D(-k);                           \
-+			if (k >= (D##LL)) {                                  \
-+				s64_d##D(k - 1); s64_d##D(k + 1);            \
-+				s64_d##D(-k - 1); s64_d##D(-k + 1);          \
-+			}                                                    \
-+		}                                                            \
-+	} while (0);
-+
-+#define SWEEP_U32(D)                                                          \
-+	do {                                                                 \
-+		unsigned long long k;                                        \
-+		int i;                                                       \
-+		u32_d##D(0u); u32_d##D(1u); u32_d##D((D##u) - 1);            \
-+		u32_d##D(D##u); u32_d##D((D##u) + 1);                        \
-+		u32_d##D(0xffffffffu); u32_d##D(0x80000000u);                \
-+		for (k = 1, i = 0; i < 25 && k <= 0xffffffffULL; k *= 3, i++) { \
-+			u32_d##D((unsigned)k);                               \
-+			if (k >= (D##ULL)) {                                 \
-+				u32_d##D((unsigned)(k - 1));                 \
-+				u32_d##D((unsigned)(k + 1));                 \
-+			}                                                    \
-+		}                                                            \
-+	} while (0);
-+
-+#define SWEEP_S32(D)                                                          \
-+	do {                                                                 \
-+		int k, i;                                                    \
-+		s32_d##D(0); s32_d##D(1); s32_d##D(-1);                      \
-+		s32_d##D(2147483647); s32_d##D((D) - 1); s32_d##D(D);        \
-+		s32_d##D((D) + 1); s32_d##D(-(D));                           \
-+		s32_n##D(0); s32_n##D(1); s32_n##D(-1);                      \
-+		s32_n##D(2147483647); s32_n##D((D) - 1); s32_n##D(-(D));     \
-+		for (k = 1, i = 0; i < 22 && k > 0; k *= 3, i++) {           \
-+			s32_d##D(k); s32_d##D(-k);                           \
-+			s32_n##D(k); s32_n##D(-k);                           \
-+		}                                                            \
-+		/* INT_MIN / -1 overflows the quotient and traps on x86, so   \
-+		 * it is excluded only for the -1 divisor. */                 \
-+		if ((D) != 1) {                                              \
-+			s32_d##D(-2147483647 - 1);                           \
-+			s32_n##D(-2147483647 - 1);                           \
-+		}                                                            \
-+	} while (0);
-+
-+int main(void)
-+{
-+	U64_LIST(SWEEP_U64);
-+	S64_LIST(SWEEP_S64);
-+	U32_LIST(SWEEP_U32);
-+	S32_LIST(SWEEP_S32);
-+
-+	if (fails)
-+		printf("FAIL %s %llu / %llu: q=%llu r=%llu, q*d+r=%llu\n",
-+		       fail_kind, fail_n, fail_d, fail_q, fail_r,
-+		       fail_q * fail_d + fail_r);
-+	printf("%s (%llu failures)\n", fails ? "FAILED" : "ALL-OK", fails);
-+	return fails ? 1 : 0;
++#ifdef PRINT_REF
++    printf("#define EXPECT_A %uu\n", r);
++#else
++    if (r != EXPECT_A)
++        return 1;
++#endif
++    return 0;
 +}
-diff --git a/tests/regression/div_mod_by_const_exhaustive.flags b/tests/regression/div_mod_by_const_exhaustive.flags
+diff --git a/tests/regression/i686_narrow_cmp_fold.flags b/tests/regression/i686_narrow_cmp_fold.flags
 new file mode 100644
-index 0000000..3a3b579
+index 00000000..c211b609
 --- /dev/null
-+++ b/tests/regression/div_mod_by_const_exhaustive.flags
++++ b/tests/regression/i686_narrow_cmp_fold.flags
 @@ -0,0 +1 @@
-+-O2
-diff --git a/tests/regression/i128_const_multiply.c b/tests/regression/i128_const_multiply.c
-new file mode 100644
-index 0000000..07bbb20
---- /dev/null
-+++ b/tests/regression/i128_const_multiply.c
-@@ -0,0 +1,158 @@
-+/* Exhaustive coverage for the i128 constant-multiplier fast path.
-+ *
-+ * The backend specialises a 128-bit multiply by a compile-time constant into
-+ * a collapsed schoolbook product. That path has two shapes and both must be
-+ * right:
-+ *
-+ *   hi == 0  the strength-reduced-division shape (`x /u C` is
-+ *            `mulhi(x, M) >> s`), one cross term. This is the common case and
-+ *            the one a division-heavy workload hammers.
-+ *   hi != 0  a genuine 128-bit multiplier, two cross terms. The second term
-+ *            consumes lhs.lo, which `mulq` has already overwritten in %rax,
-+ *            so the low half must be parked before the multiply. Getting that
-+ *            wrong corrupts only the high 64 bits of the product, which no
-+ *            division test can see because division keeps only mulhi.
-+ *
-+ * Expected values come from a limb-wise reference built from 32-bit pieces,
-+ * so the oracle shares no codegen with the sequence under test.
-+ */
-+#include <stdio.h>
-+#include <stdlib.h>
-+
-+typedef unsigned __int128 u128;
-+
-+/* 128x128 -> low 128 bits, using only 32-bit limbs. Independent of the
-+ * compiler's i128 multiply: only 32x32->64 products and 64-bit adds. */
-+static void ref_mul128(const unsigned a[4], const unsigned b[4], unsigned out[4])
-+{
-+	unsigned long long acc;
-+	unsigned carry;
-+	int i, j;
-+
-+	for (i = 0; i < 4; i++)
-+		out[i] = 0;
-+	for (i = 0; i < 4; i++) {
-+		carry = 0;
-+		for (j = 0; i + j < 4; j++) {
-+			acc = (unsigned long long)out[i + j] +
-+			      (unsigned long long)a[i] * b[j] + carry;
-+			out[i + j] = (unsigned)acc;
-+			carry = (unsigned)(acc >> 32);
-+		}
-+	}
-+}
-+
-+static void to_limbs(u128 v, unsigned out[4])
-+{
-+	int i;
-+
-+	for (i = 0; i < 4; i++) {
-+		out[i] = (unsigned)(v & 0xffffffffu);
-+		v >>= 32;
-+	}
-+}
-+
-+static u128 from_limbs(const unsigned in[4])
-+{
-+	u128 v = 0;
-+	int i;
-+
-+	for (i = 3; i >= 0; i--)
-+		v = (v << 32) | in[i];
-+	return v;
-+}
-+
-+#define MULCASE(name, const_expr)                                            \
-+	__attribute__((noinline)) static u128 name(u128 x)                    \
-+	{                                                                    \
-+		return x * (const_expr);                                     \
-+	}
-+
-+/* hi == 0: the magic-division shape. */
-+MULCASE(mul_c1, ((u128)1))
-+MULCASE(mul_c2, ((u128)2))
-+MULCASE(mul_c7, ((u128)7))
-+MULCASE(mul_c1000, ((u128)1000))
-+MULCASE(mul_c32b, ((u128)0xffffffffu))
-+MULCASE(mul_c64a, ((u128)0x1234567890abcdefULL))
-+MULCASE(mul_c64b, ((u128)0xffffffffffffffffULL))
-+MULCASE(mul_c63, ((u128)0x7fffffffffffffffULL))
-+
-+/* hi != 0: genuine 128-bit multipliers, two cross terms. */
-+MULCASE(mul_2p64, (((u128)1 << 64)))
-+MULCASE(mul_2p64_p1, ((((u128)1 << 64) | 1)))
-+MULCASE(mul_magic, ((((u128)0xfedcba9876543210ULL << 64) | 0x123456789abcdef0ULL)))
-+MULCASE(mul_allones, (~(u128)0))
-+MULCASE(mul_hi_lo, ((((u128)0xffffffffffffffffULL << 64) | 1)))
-+
-+static u128 (*const cases[])(u128) = {
-+	mul_c1, mul_c2, mul_c7, mul_c1000, mul_c32b, mul_c64a, mul_c64b,
-+	mul_c63, mul_2p64, mul_2p64_p1, mul_magic, mul_allones, mul_hi_lo,
-+};
-+
-+static const u128 consts[] = {
-+	(u128)1,
-+	(u128)2,
-+	(u128)7,
-+	(u128)1000,
-+	(u128)0xffffffffu,
-+	(u128)0x1234567890abcdefULL,
-+	(u128)0xffffffffffffffffULL,
-+	(u128)0x7fffffffffffffffULL,
-+	((u128)1 << 64),
-+	(((u128)1 << 64) | 1),
-+	(((u128)0xfedcba9876543210ULL << 64) | 0x123456789abcdef0ULL),
-+	~(u128)0,
-+	(((u128)0xffffffffffffffffULL << 64) | 1),
-+};
-+
-+/* Left operands chosen to hit the carries and the high half: zero, the small
-+ * values, the 64-bit boundary on both sides, and all-ones. */
-+static const u128 lhs[] = {
-+	(u128)0,
-+	(u128)1,
-+	(u128)2,
-+	(u128)0x7fffffffu,
-+	(u128)0x80000000u,
-+	(u128)0xffffffffu,
-+	(u128)0x100000000ULL,
-+	(u128)0x7fffffffffffffffULL,
-+	(u128)0x8000000000000000ULL,
-+	(u128)0xffffffffffffffffULL,
-+	((u128)1 << 64),
-+	(((u128)1 << 64) | 0xdeadbeefULL),
-+	(((u128)0x7fffffffffffffffULL << 64) | 0xffffffffffffffffULL),
-+	~(u128)0,
-+};
-+
-+int main(void)
-+{
-+	unsigned al[4], bl[4], rl[4];
-+	unsigned long long fails = 0;
-+	size_t c, l;
-+
-+	for (c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
-+		for (l = 0; l < sizeof(lhs) / sizeof(lhs[0]); l++) {
-+			u128 got = cases[c](lhs[l]);
-+
-+			to_limbs(lhs[l], al);
-+			to_limbs(consts[c], bl);
-+			ref_mul128(al, bl, rl);
-+			if (got != from_limbs(rl)) {
-+				unsigned gl[4];
-+
-+				to_limbs(got, gl);
-+				printf("FAIL const[%zu] lhs[%zu]: got %08x%08x%08x%08x "
-+				       "want %08x%08x%08x%08x\n",
-+				       c, l, gl[3], gl[2], gl[1], gl[0], rl[3],
-+				       rl[2], rl[1], rl[0]);
-+				fails++;
-+			}
-+		}
-+	}
-+
-+	printf("%s (%llu failure%s of %zu cases)\n", fails ? "FAILED" : "ALL-OK",
-+	       fails, fails == 1 ? "" : "s",
-+	       (sizeof(cases) / sizeof(cases[0])) * (sizeof(lhs) / sizeof(lhs[0])));
-+	return fails ? 1 : 0;
-+}
-diff --git a/tests/regression/i128_const_multiply.flags b/tests/regression/i128_const_multiply.flags
-new file mode 100644
-index 0000000..3a3b579
---- /dev/null
-+++ b/tests/regression/i128_const_multiply.flags
-@@ -0,0 +1 @@
-+-O2
-diff --git a/tests/regression/i686_nonlocal_goto_callee_saved.c b/tests/regression/i686_nonlocal_goto_callee_saved.c
-index 3317693..c7dbea9 100644
---- a/tests/regression/i686_nonlocal_goto_callee_saved.c
-+++ b/tests/regression/i686_nonlocal_goto_callee_saved.c
-@@ -9,13 +9,35 @@
-  * home; the goto bypasses the child's pop, and the parent dereferences the
-  * GOT through the child's garbage %ebx. Requires PIC (no -fno-pic).
-  *
-- * Proven: aborts with the NonlocalGoto pool-clear reverted (SIGABRT),
-+ * Freestanding: the failure signal is a real SIGABRT raised through the i386
-+ * syscall path rather than libc's abort(), so the test links with -nostdlib
-+ * and needs no 32-bit libc on the host. PIC is retained — it is what makes
-+ * the GOT base live in %ebx, which is the whole point of the test.
-+ *
-+ * Proven: dies with SIGABRT when the NonlocalGoto pool-clear is reverted,
-  * passes with it.
-  */
--extern void abort(void);
--
- int g = 10;
- 
-+/* i386 Linux syscalls, entered directly: no libc, no 32-bit headers. */
-+static void sys_exit(int status)
-+{
-+	__asm__ volatile("int $0x80" : : "a"(1), "b"(status) : "memory");
-+	for (;;)
-+		;
-+}
-+
-+static void sys_abort(void)
-+{
-+	int pid;
-+
-+	__asm__ volatile("int $0x80" : "=a"(pid) : "a"(20) : "memory");
-+	/* kill(pid, SIGABRT) — the same termination the libc abort() gives,
-+	 * so a revert still shows up as SIGABRT rather than a plain exit. */
-+	__asm__ volatile("int $0x80" : : "a"(37), "b"(pid), "c"(6) : "memory");
-+	sys_exit(134);
-+}
-+
- __attribute__((noinline))
- static int exercise(int a, int jump) {
-     __label__ target;
-@@ -33,8 +55,13 @@ target:
- 
- int main(void) {
-     if (exercise(1, 1) != 13)
--        abort();
-+        sys_abort();
-     if (exercise(2, 0) != 14)
--        abort();
-+        sys_abort();
-     return 0;
- }
-+
-+void _start(void)
-+{
-+	sys_exit(main());
-+}
-diff --git a/tests/regression/i686_nonlocal_goto_callee_saved.flags b/tests/regression/i686_nonlocal_goto_callee_saved.flags
-index 4fffa79..2ed2d23 100644
---- a/tests/regression/i686_nonlocal_goto_callee_saved.flags
-+++ b/tests/regression/i686_nonlocal_goto_callee_saved.flags
-@@ -1 +1 @@
---m32 -O2
-+-m32 -O2 -nostdlib -static -Wl,-e,_start
-diff --git a/tests/regression/lea_chain_index_compose.c b/tests/regression/lea_chain_index_compose.c
-new file mode 100644
-index 0000000..95e1401
---- /dev/null
-+++ b/tests/regression/lea_chain_index_compose.c
-@@ -0,0 +1,136 @@
-+/*
-+ * lea_chain_index_compose.c -- regression test for a peephole that built an
-+ * x86-64 addressing mode with TWO index registers.
-+ *
-+ * `fold_lea_into_load` splices a `leaq`'s address into a later instruction
-+ * that reads it.  For the indexed consumer form `leaq disp(%T, %idx, %s),
-+ * %dst` it substituted the producer's operand TEXT into the base slot.  That
-+ * is sound only when the producer address occupies the base slot itself
-+ * (`disp(%base)`).  When the producer address carries its own index register
-+ * -- `leaq 0(,%r11,4), %r8`, the shape strength-reduced division emits for
-+ * `q*4` -- the two index fields landed side by side:
-+ *
-+ *     leaq 0(,%r11,4), %r8                leaq 0(,%r11,4, %r10, 1), %r9
-+ *     leaq (%r8, %r10, 1), %r9       ==>                       INVALID
-+ *
-+ * x86-64 has no such encoding: a SIB byte carries one base (always scale 1)
-+ * and one index (scale 1/2/4/8).  GAS rejects the line outright ("expecting
-+ * ')' after scale factor"), but lccc's integrated assembler silently
-+ * TRUNCATED it to `leaq 0(,%r11,4), %r9`, dropping `+ %r10`.  The miscompile
-+ * was invisible for that reason: the program assembled, ran and printed
-+ * plausible numbers while every `q*d + r == n` check really compared `q*d`
-+ * against `n`.  It surfaced as 341 failures in div_mod_by_const_exhaustive at
-+ * -O1, only for power-of-two divisors -- only those make `q*d` a scale the
-+ * folder can absorb.
-+ *
-+ * The correct composition keeps both addends and stays at ONE instruction:
-+ *
-+ *     leaq (%r10, %r11, 4), %r9
-+ *
-+ * exactly what GCC and Clang emit for the same source.
-+ *
-+ * Shape notes, each verified by minimization rather than assumed:
-+ *
-+ *  - The divisor must reach the division as a PARAMETER that constant-folds
-+ *    through inlining.  Writing the division directly inside the noinline
-+ *    function does not reproduce: the fold needs the two-operand lea chain
-+ *    that inlining leaves behind.
-+ *  - The printf inside the failure branch is load-bearing.  It is not
-+ *    decoration: the variadic call is what raises register pressure enough
-+ *    for the allocation to produce the `leaq chain` the fold then mangles.
-+ *    Removing it makes the miscompile vanish rather than merely go
-+ *    unreported, so the checks below stay in this form deliberately.
-+ *  - The failure branch must stay cold.  The loop bounds below are chosen so
-+ *    the branch is never taken on a correct compiler, which keeps the test's
-+ *    output silent on success.
-+ *
-+ * -O1 is where the fold fires; the test is compiled at -O1 by its .flags.
-+ */
-+
-+#include <stdio.h>
-+
-+static unsigned long long bad;
-+
-+static void check_u64(unsigned long long n, unsigned long long d)
-+{
-+    unsigned long long q = n / d;
-+    unsigned long long r = n % d;
-+
-+    /* `r >= d` or a broken identity means the quotient is off by one, which
-+     * is how a wrong magic number or shift shows up. */
-+    if (r >= d || q * d + r != n) {
-+        bad++;
-+        printf("FAIL u64 n=%llu d=%llu q=%llu r=%llu\n", n, d, q, r);
-+    }
-+}
-+
-+static void check_s64(long long n, long long d)
-+{
-+    long long q = n / d;
-+    long long r = n % d;
-+    long long ad = d < 0 ? -d : d;
-+    long long ar = r < 0 ? -r : r;
-+
-+    /* C99 truncates toward zero: |r| < |d| and sign(r) == sign(n). */
-+    if (ar >= ad || (r != 0 && ((r < 0) != (n < 0))) || q * d + r != n) {
-+        bad++;
-+        printf("FAIL s64 n=%lld d=%lld q=%lld r=%lld\n", n, d, q, r);
-+    }
-+}
-+
-+/* One noinline wrapper per divisor, so the divisor stays a literal.  Scales
-+ * 2/4/8 exercise the fold; 3/5/7 are controls whose product is not a scale,
-+ * so the fold never fires -- if one of those ever fails, the defect is not
-+ * the one documented here. */
-+#define W(NAME, D)                                                      \
-+    __attribute__((noinline)) static void NAME(unsigned long long n)    \
-+    {                                                                   \
-+        check_u64(n, (D));                                              \
-+    }
-+
-+W(w2, 2ULL)
-+W(w3, 3ULL)
-+W(w4, 4ULL)
-+W(w5, 5ULL)
-+W(w7, 7ULL)
-+W(w8, 8ULL)
-+W(w16, 16ULL)
-+
-+#define S(NAME, D)                                                      \
-+    __attribute__((noinline)) static void NAME(long long n)             \
-+    {                                                                   \
-+        check_s64(n, (D));                                              \
-+    }
-+
-+S(s3, 3LL)
-+S(s4, 4LL)
-+S(s8, 8LL)
-+
-+int main(void)
-+{
-+    unsigned long long n;
-+    long long m;
-+
-+    for (n = 0; n < 300; n++) {
-+        w2(n);
-+        w3(n);
-+        w4(n);
-+        w5(n);
-+        w7(n);
-+        w8(n);
-+        w16(n);
-+    }
-+    for (m = -300; m < 300; m++) {
-+        s3(m);
-+        s4(m);
-+        s8(m);
-+    }
-+
-+    /* Magnitudes where a dropped addend is least likely to be masked. */
-+    w4(~0ULL);
-+    w8(~0ULL);
-+    w2(0x8000000000000000ULL);
-+    w16(0x8000000000000001ULL);
-+
-+    return bad ? 1 : 0;
-+}
-diff --git a/tests/regression/lea_chain_index_compose.flags b/tests/regression/lea_chain_index_compose.flags
-new file mode 100644
-index 0000000..11c863a
---- /dev/null
-+++ b/tests/regression/lea_chain_index_compose.flags
-@@ -0,0 +1 @@
-+-O1
-diff --git a/tests/regression/run_regression.py b/tests/regression/run_regression.py
-index 93ec460..304a021 100644
---- a/tests/regression/run_regression.py
-+++ b/tests/regression/run_regression.py
-@@ -176,6 +176,31 @@ def run_checked(cmd: list[str], *, env: dict[str, str], cwd: Path,
-         return -9, out, f"TIMEOUT after {timeout}s"
- 
- 
-+def host_lacks_i386_headers(gcc: str, src: str, flags: str) -> bool:
-+    """True when a `-m32` compile fails for want of 32-bit libc headers.
-+
-+    lccc is not blamed for a missing multilib, and the claim is not taken on
-+    the wording of lccc's own diagnostics: the oracle compiler is asked to
-+    preprocess the same translation unit with the same `-m32`, and only an
-+    identical missing-header failure downgrades the result. A `-m32` test
-+    that the host's GCC compiles but lccc does not stays a hard failure.
-+    """
-+    if "-m32" not in flags.split():
-+        return False
-+    try:
-+        probe = subprocess.run([gcc, "-m32", "-fsyntax-only", src],
-+                               capture_output=True, text=True, timeout=60)
-+    except (OSError, subprocess.TimeoutExpired):
-+        return False
-+    if probe.returncode == 0:
-+        # The host can compile it in 32-bit mode, so the failure is lccc's.
-+        return False
-+    err = probe.stderr
-+    # Only a missing multilib header counts. Anything else — a real
-+    # preprocessor or parse error — must stay visible as a failure.
-+    return "No such file or directory" in err and "bits/" in err
-+
-+
- def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
-     start = time.monotonic()
-     phases: list[str] = []
-@@ -226,6 +251,16 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
-     # Plain single-phase test.
-     rc, so, se = run_checked(lccc_cmd(test.flags), env=env, cwd=workdir)
-     if rc != 0:
-+        if host_lacks_i386_headers(gcc, src, test.flags):
-+            return Result(
-+                test.name,
-+                "skip-run",
-+                "host image has no 32-bit libc headers; the host's own GCC "
-+                "fails the same -m32 translation unit identically",
-+                time.monotonic() - start,
-+                0.0,
-+                phases + ["compile:host-skip"],
-+            )
-         return Result(test.name, "fail",
-                       f"lccc compile failed:\n{se[-2000:]}",
-                       time.monotonic() - start, 0.0, phases + ["compile:fail"])
++-m32 -Os -mregparm=3 -fno-pic
