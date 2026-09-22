@@ -1,1188 +1,2261 @@
-diff --git a/engineering/FOLLOWUP-2026-09-22-kernel-boot-and-i686-boot-size.md b/engineering/FOLLOWUP-2026-09-22-kernel-boot-and-i686-boot-size.md
-new file mode 100644
-index 0000000..cc4b841
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-22-kernel-boot-and-i686-boot-size.md
-@@ -0,0 +1,345 @@
-+# Follow-up: kernel boots clean on 6.18.52, and the i686 boot-size gap finally has a number and a name
-+
-+Date: 2026-09-22 (session 59)
-+Base: `2874963` (`ms178/lccc` main).
-+
-+The standing goal — "build the user's custom kernel with lccc and lccc-ld
-+alone and boot it in QEMU" — is met again on the current base, and this time
-+**the boot is completely clean**: zero `WARNING`, zero `Call Trace`, zero
-+ACPI errors. The `free_large_kmalloc` defect that session 58 left open did
-+not reproduce (§2). The second half of the session turned the i686 boot-size
-+gap from an anecdote into a measured, attributed number (§3), falsified one
-+proposed fix with a paired A/B (§4), and landed one real improvement (§5).
-+
-+---
-+
-+## 1. The milestone, with its evidence
-+
-+Host: 2 cores, 1.9 GiB RAM, single 25.8 GiB disk, 12 GiB `/swapfile`.
-+Kernel tree `/opt/kwork/linux-6.18.52`, linux-cachymod 6.18.52, all 28
-+CachyMod patches in PKGBUILD `source=` order, config =
-+`make allnoconfig` + `scripts/kernel-vm.fragment` + `olddefconfig`.
-+
-+`scripts/build_kernel_vm.sh`:
-+
-+* **`build: SUCCESS in 1798s`**, 1374 `# CC` lines, zero compiler errors,
-+  objtool accepted every object.
-+* `vmlinux` 20577712 B; `arch/x86/boot/bzImage` 5071872 B — every link
-+  (`setup.elf`, `compressed/vmlinux`, `vmlinux`) by **lccc-ld**.
-+* `size vmlinux` → text 11901398, data 3217216, bss 2228224.
-+* **`setup _end: 0x00007370 (29552 bytes, ok of 32768)`** — the 32 KiB gate
-+  passes with **3216 bytes** of headroom.
-+
-+`scripts/qemu_boot_test.sh` → **16/16 PASS, exit 0**, `reboot: Power down`
-+at guest time 1.524993 s. Banner:
-+
-+```
-+Linux version 6.18.52-2.1-cachymod (user@e2b.local) (lccc (a high performance
-+Claude's C Compiler fork, GCC-compatible) 14.2.0, GNU ld (LCCC built-in) 2.42)
-+#1 SMP PREEMPT Tue Sep 22 14:05:55 UTC 2026
-+```
-+
-+Severity scan of the 285-line serial log: `WARNING` 0, `Call Trace` 0,
-+`BUG:` 0, `Oops` 0, `UBSAN` 0, `KASAN` 0, `general protection` 0,
-+`invalid opcode` 0. Congestion list `reno bbr bic cubic westwood htcp`;
-+`CACHE_HOT_BUDDY` present in the sched features; `borescore-ok:` emitted;
-+2 CPUs online; both serial sentinels verbatim.
-+
-+---
-+
-+## 2. Session 58's open defect did not reproduce — and what that means
-+
-+Session 58 (`FOLLOWUP-2026-09-21-i686-operand-split-and-kernel-boot.md` §6)
-+left one runtime defect open: a `WARN_ON_ONCE` in `free_large_kmalloc`
-+reached from `acpi_ds_create_operand`'s `ACPI_FREE(name_string)` error path,
-+with the freed pointer proven to be a stale **return address** read off the
-+stack (`0xffffffff8173b8c6` = `acpi_ut_trace_ptr+54`).
-+
-+On this base and this config it is **absent**, and so is its trigger: the
-+log contains **zero** occurrences of `Failure resolving symbol`,
-+`Could not execute arguments`, `AE_AML` or `AE_BAD`. Session 58 recorded
-+that QEMU's SeaBIOS DSDT provoked that error path *every boot*. It did not
-+this time.
-+
-+Two candidate explanations, and the session did not separate them:
-+
-+1. **A codegen fix between `c160d11` and `2874963`** removed the lost
-+   initializer / lost allocation result that put a stale return address in
-+   `*out_name_string`. The window contains at least
-+   `05c9a6b Fix unsound coalescing of narrow call results into wide stack
-+   slots`, which is exactly the right shape of fix for "a stack slot held a
-+   value nobody stored there".
-+2. **The trigger moved.** The QEMU/SeaBIOS here is
-+   `1.16.3-debian-1.16.3-2`; a different DSDT would not provoke the
-+   `AE_AML_NAME_NOT_FOUND` path at all, and the latent defect would simply
-+   not be reached.
-+
-+**Do not close the item on this evidence.** A defect that is not *triggered*
-+is not a defect that is *fixed*. The cheap discriminator, for whoever picks
-+this up: run the session-58 gdbstub probe
-+(`scripts/qemu_gdbstub_probe.py`, break on `free_large_kmalloc`, filter on
-+the `object` argument) against this image. If the breakpoint never lands on
-+an in-image pointer, the path is not reached and explanation 2 holds; the
-+standalone `acpi_ex_get_name_string` reproducer is then still owed.
-+
-+---
-+
-+## 3. The i686 boot-size gap, measured and attributed
-+
-+`scripts/boot_size_oracle.sh` (both arms on the identical
-+`scripts/boot_flags.sh` command lines):
-+
-+| | `.text`-class bytes | `_end` | headroom |
-+|---|---:|---:|---:|
-+| lccc | 24968 | 31168 | 1600 |
-+| gcc 14.2 | 14270 | 22880 | 9888 |
-+| clang 19 | 15555 | 22768 | 10000 |
-+
-+lccc is **+10698 B vs gcc (+75 %)** and **+9413 B vs clang**. Worst objects:
-+`printf` +1597, `video` +1332, `string` +974, `cpucheck` +919,
-+`early_serial_console` +775, `cmdline` +767.
-+
-+**New tool: `scripts/boot_insn_census.py`.** The oracle says *how much*;
-+this says *what kind of instruction*. Over the 21 TUs both toolchains
-+compile:
-+
-+```
-+total instructions: lccc=5127  gcc=3183  delta=+1944 (+61.1%)
-+
-+mnemonic        lccc   gcc   delta
-+movl            1949   773   +1176      <- 60% of the entire surplus
-+leal             209    88    +121
-+jmp              264   144    +120
-+movzwl           154    45    +109
-+cmpl             245   144    +101
-+movzbl           137    46     +91
-+
-+structural defect-class counters      lccc   gcc  delta
-+store-to-frame-slot                    546    41   +505
-+load-from-frame-slot                   342    61   +281
-+reg-to-reg-movl                        443   213   +230
-+total-frame-bytes                     5116  2708  +2408
-+functions-with-frame                    70    30    +40
-+reg-to-reg-narrow-extend                99    30    +69
-+```
-+
-+The attribution is unambiguous: **gcc opens a frame in 30 of 67 functions,
-+lccc in 70 of 70, and lccc's frames total 2408 more bytes.** 505 extra
-+stores to frame slots and 281 extra loads back out of them. `movl` alone
-+accounts for +1176 instructions — roughly 4.1 KiB of the 10.7 KiB.
-+
-+Concrete shape (`arch/x86/boot/cpucheck.c`, `check_cpuflags`, 155 B vs
-+gcc's 70 B):
-+
-+```
-+movl req_flags(,%ebx,4), %eax      movl %eax, 4(%esp)     ; value -> slot
-+movl $cpu, %edx                    movl cpu+12(,%ebx,4), %eax
-+notl %eax                          movl %eax, %edx         ; copy, then
-+...                                                       ; not the SOURCE
-+movl 4(%esp), %eax                 andl %edx, %eax
-+movl %eax, 0(%esp)                 cmpl $0, 0(%esp)        ; compare memory
-+```
-+
-+Every intermediate has a frame slot *and* is staged through `%eax`. `LCCC_DBG_RA=1
-+LCCC_DBG_RA_FUNC=check_cpuflags` shows why: `values=22 assigned=10`, and the
-+12 unassigned include short-lived values marked **`elig=true`** (v10, v13,
-+v16, v21) — eligible for a register, given a slot anyway. With
-+`available_regs = {ebx, esi, edi, ebp}` (4) plus `%ecx`/`%edx` handed out
-+only where the scratch-hazard whitelist proves them clean, the pool is real
-+but the greedy start-point scan spends it on long-lived values first.
-+
-+This is `engineering/subsystems/i686.md` §2.2 ("Leaf-function prologue &
-+argument homing … ≈1.7× static cost vs GCC") and §5 item 1, now with a
-+corpus-wide number attached.
-+
-+---
-+
-+## 4. Falsified: relaxing the i686 accumulator no-home policy makes it *worse*
-+
-+`src/backend/i686/codegen/prologue.rs` denies a register home to every
-+"immediately-consumed" value, forcing it through `%eax`. The stated premise
-+is that a home would only add a `movl %R,%eax` relay. That premise is false
-+for the ops `try_emit_int_binop_direct` handles, which read a register-homed
-+operand **in place** — so the policy looked like the direct cause of the
-+slot round trips, and the obvious experiment was to lift it.
-+
-+It is now a switch, `CCC_NO_I686_ACCUM_NOHOME`
-+(`RaConfig::no_i686_accum_nohome`, mirroring the existing
-+`CCC_NO_X64_IMMED_NOHOME`), and the measurement says **keep the policy**:
-+
-+```
-+scripts/boot_ab_size.py --a <old> --b <new> --b-env CCC_NO_I686_ACCUM_NOHOME=1
-+  TOTAL  A=22111  B=22502   +391 bytes (+1.77%)   17 of 20 objects worse
-+```
-+
-+The homes cost more (extra callee-save push/pop pairs, and the direct path
-+does not in fact fire for most of them) than the round trips they replace.
-+The default stays ON; the switch stays in the tree so the next person does
-+not have to rebuild to re-derive this. **This is a do-not-retry.**
-+
-+---
-+
-+## 5. Landed: `fold_copy_narrow_ext_pairs` (i686 peephole)
-+
-+The census's `movzwl` +109 is 45 copies of one shape:
-+
-+```
-+movl   %ebx, %eax        ; 2 B — the copy
-+movzwl %ax, %eax         ; 3 B — the narrow type invariant
-+```
-+
-+`movzwl %bx, %eax` (3 B) is exactly equivalent: the `movl` wrote `%eax=%ebx`,
-+so the extension's source `%ax` held `%bx`, and the extension overwrites
-+`%eax` completely. New pass `fold_copy_narrow_ext_pairs` in
-+`src/backend/i686/codegen/peephole.rs`, covering all four narrow-extend
-+mnemonics (`movzbl`/`movsbl`/`movzwl`/`movswl`), wired in **before**
-+`eliminate_redundant_zext_i686` so the fused form becomes that state
-+machine's input shape rather than competing with it.
-+
-+Fail-closed rules, each with a concrete wrong-code shape behind it: the
-+source must be spelled as a 32-bit register (`%ah`/`%al` share a family, so
-+a family-only comparison would read the wrong byte); `%esp` excluded;
-+`narrow_reg_name` returning `None` refuses the rewrite (`%sil`/`%dil` are
-+64-bit only); a barrier or label between the lines kills the fold.
-+
-+Measured, both arms same tree, same command lines:
-+
-+| corpus | A (before) | B (after) | delta |
-+|---|---:|---:|---:|
-+| `arch/x86/boot`, 20 objs (object sum) | 22195 | 22091 | **−104 B (−0.47 %)**, 9 objects better, 0 worse |
-+| `arch/x86/boot` **gate**, paired | `_end` 28144 | `_end` 28048 | **−96 B**, headroom 4624 → 4720 |
-+| `tests/regression`, 742 srcs, `-Os` | 883363 | 883209 | **−154 B (−0.02 %)** |
-+| `tests/regression`, 742 srcs, `-O2` | 1042988 | 1042554 | **−434 B (−0.04 %)** |
-+
-+The in-suite boot gate agrees: `.text` 20335 → **20329**,
-+`pre-pecompat end 21525 ≤ 24576`. Three files improved by more than 20 B
-+(`video-mode` −39, `cmdline` −21, `string` −11); nothing regressed by more
-+than the `-O2` alignment noise documented in session 58 §4 (largest +48 B,
-+`bb_slp_v4.c`, against a corpus net of −434 B).
-+
-+### 5a. Measurement trap: the tree state moves the gate by 3 KiB, so a gate number is worthless unpaired
-+
-+The first "after" gate reading was `_end=28048` against the session's
-+opening reading of `_end=31168` — an apparent 3120-byte win from a 104-byte
-+peephole. It is not a win; the two readings are **different tree states**.
-+`build_kernel_vm.sh` leaves the tree with real generated headers (and a
-+different `.config`), and `build_kernel_boot.sh` then re-stubs `zoffset.h` /
-+`voffset.h` via `ensure_boot_offset_stubs`, which changes `header.S` and
-+whether `.pecompat` exists at all:
-+
-+| tree state | `.text` | `.inittext` | `.rodata` | `.pecompat` | `_end` |
-+|---|---:|---:|---:|---:|---:|
-+| before any kernel build | 22598 | 406 | 1387 | 9 | 31168 |
-+| after `build_kernel_vm.sh` | 20329 | 397 | 1328 | — | 28048 |
-+
-+Same compiler family, 3120 bytes apart. **A gate number is only meaningful
-+paired against the same tree state** — re-run both arms back to back
-+(`build_kernel_boot.sh` with `LCCC=`/`LCCC_LD=`/`OUT=` overridden per arm,
-+as the table above was produced), or use `scripts/boot_ab_size.py`, which
-+compiles both arms in one process and cannot see a stale header.
-+
-+**New tool: `scripts/boot_ab_size.py`** — paired LCCC-vs-LCCC A/B over the
-+boot corpus. `boot_size_oracle.sh` compares against a *reference compiler*,
-+whose 10.7 KiB gap swallows any 100-byte movement; this compares two lccc
-+binaries (or one binary under two environments) on the identical command
-+lines, which is the only way a codegen change of this size is visible at
-+all. Self-A/B (same binary both arms) returns `+0` on all 20 objects, so
-+the harness is deterministic.
-+
-+### 5b. The defect this pass shipped with, and the gate that now catches it
-+
-+The first version emitted `movzwl%bx, %eax` — `prefix.trim_end()` removed
-+the mnemonic's trailing space and the format string never put it back. **It
-+passed every text-level assertion**, including the new positive test,
-+because the peephole's own classifier files an unparseable line under its
-+`Other` catch-all. It was caught only by compiling the boot corpus: eight
-+translation units died with
-+`unhandled i686 instruction: movzwl%bx, [Register(...)]`.
-+
-+The lesson is the same one session 58 §6a recorded for the boot harness, in
-+a new place: **a check that inspects the producer's own output with the
-+producer's own vocabulary cannot detect output the consumer rejects.** The
-+fix is a third test, `folded_copy_extension_text_reaches_the_assembler_parseable`,
-+which routes `peephole_optimize`'s result through
-+`crate::backend::i686::assembler::assemble` — the actual next consumer.
-+Mutation-checked: re-introducing the missing space makes that test fail and
-+only that test.
-+
-+### 5c. An environment note that changes what the suite means
-+
-+`gcc-multilib` / `libc6-dev-i386` / `libc6-i386` / `lib32gcc-14-dev` were
-+absent, so every `-m32` regression test **skipped** — the vacuous-pass trap
-+`engineering/subsystems/i686.md` §"Host contract" warns about (PR #426's CI
-+head was exactly this). Installing them moved the suite from
-+**737/0/8 → 742/0/8**. Any i686 claim made on a host without multilib is
-+worth nothing; check `dpkg -l | grep libc6-dev-i386` before believing one.
-+
-+---
-+
-+## 5d. Bootstrap traps for the next session (the harness wipes everything)
-+
-+Verified on this host, in the order they bite:
-+
-+* **Size the swap file against the disk, not against ambition.** The disk
-+  here is a *single* 25.8 GiB `/dev/vda`; there is no second drive to move
-+  to. An 18 GiB `/swapfile` left ~5 GiB for the toolchain, the kernel tree
-+  and the build, and the very first `rustup` run died with
-+  `failed to extract package: No space left on device`. **12 GiB is the
-+  measured-good size**: swap is on, and ~5 GiB stays free for a full
-+  `bzImage` build (which peaks around 3.5 GiB of tree growth).
-+* **A sparse swap file does not work.** `swapon` refuses it outright —
-+  verified: `swapon: /tmp/holetest: skipping - it appears to have holes`,
-+  exit 255. `truncate -s` is not a way to get a big swap on a small disk;
-+  `fallocate`/`dd` is.
-+* **`/sbin` is not on `PATH`** in this image, so bare `swapon`/`mkswap` are
-+  "command not found" even as root. `scripts/ensure_swap.sh` already calls
-+  them by absolute path; ad-hoc shell work needs `PATH=$PATH:/usr/sbin:/sbin`.
-+* **`/tmp` is a 993 MiB tmpfs**, not disk. Anything large (rustup staging,
-+  kernel tarballs, A/B object trees) must live under `/home/user` or `/opt`.
-+* **Keep the ~55k-file kernel tree outside the workspace snapshot.** It is
-+  capped (~128 MiB / 10k files) and a truncated tree fails deep inside a
-+  build. `/opt/kwork/linux-6.18.52` +
-+  `PKG_ROOT=/opt/archpkgbuilds` is what this session used; the same tree on
-+  `/dev/root`, so it is a snapshot-scope decision, not a space one.
-+* **Install `gcc-multilib libc6-dev-i386 libc6-i386 lib32gcc-14-dev` before
-+  believing any i686 result** (§5c), and `zstd dwarves busybox-static`
-+  before starting a kernel build — `zstd` missing fails at
-+  `vmlinux.bin.zst` ~25 minutes in, and `busybox-static` is what
-+  `qemu_boot_test.sh` builds its initramfs from.
-+* Add `/swapfile none swap sw 0 0` to `/etc/fstab` so a re-created root
-+  filesystem does not need the swap re-derived by hand.
-+
-+## 6. Open items, in the order the evidence supports
-+
-+1. **i686 register-allocation quality is the boot-size gap.** Not a
-+   peephole problem: +505 slot stores, +281 slot loads, 70/70 functions with
-+   a frame vs gcc's 30/67, and `elig=true` values given slots anyway. The
-+   two candidate levers, in ascending risk: (a) make the greedy scan
-+   pressure/priority aware so short-lived in-loop values win over
-+   function-spanning ones; (b) shorten live ranges by emitting
-+   register-direct ALU more often, which needs the emitter to stop routing
-+   every operand through `%eax`. Do (a) first; it is contained in
-+   `regalloc.rs`. **Do not** retry the accumulator no-home relaxation (§4).
-+2. **x87 ↔ GP pair lowering** (`subsystems/i686.md` §2.1) remains the
-+   dominant *runtime* i686 item and is untouched by this session.
-+3. **The `free_large_kmalloc` question is not closed** (§2). Run the gdbstub
-+   probe against the current image before writing it off.
-+4. **`reg-to-reg-movl` +230** is the next census line after slotting. 205 of
-+   549 such moves in the `-S` output are dead on arrival by a straight-line
-+   scan, but only 26 of 74 survive into the *integrated* object — i.e. the
-+   existing `eliminate_dead_reg_moves` already removes most of them, and the
-+   `-S` count is not the available win. Measure on objects, not on `-S`
-+   (session 58 §4's rule, re-confirmed).
-+5. **`compare-against-frame-slot` +29** (`cmpl $imm, N(%esp)`): each is a
-+   reload that a register home would remove. Same root cause as 1.
-+
-+## 7. Gate status at the end of this session
-+
-+| gate | result |
-+|---|---|
-+| `cargo test --profile fastbuild --locked --lib` | **3111 passed, 0 failed, 7 ignored** (incl. the 3 new peephole guards) |
-+| `scripts/run_regression_suite.sh` | **PASS=742 FAIL=0 SKIP=8**, AB-diff 0 |
-+| boot gate (in-suite) | **PASS**, pre-pecompat end 21525 ≤ 24576, `.text` 20329 |
-+| `scripts/build_kernel_vm.sh` | **SUCCESS 1798 s**, bzImage 5071872 B |
-+| `scripts/qemu_boot_test.sh` | **16/16 PASS**, clean poweroff, no WARNING |
-+| `scripts/ci_local.sh --fast` | **57 passed, 0 failed, 3 skipped — ALL GATES GREEN** |
-diff --git a/engineering/journal/2026-09-W3.md b/engineering/journal/2026-09-W3.md
-index 4efd0fd..364d6d9 100644
---- a/engineering/journal/2026-09-W3.md
-+++ b/engineering/journal/2026-09-W3.md
-@@ -671,3 +671,65 @@ negate/select body (so `abs_i16`'s *runtime* is unchanged — the fix reaches
- BB-SLP, not the loop path); the redundant 72-byte frame and spill/reload in
- vectorized sub-word select bodies (~5 insns/kernel); `VecMaxU32x8`/
- `VecMinU32x8` via SSE4.1; `same_source` still `Copy`-blind.
-+
-+## 2026-09-22 — session 59: clean 6.18.52 boot, and the i686 boot-size gap gets a number
-+
-+<!-- src: engineering/FOLLOWUP-2026-09-22-kernel-boot-and-i686-boot-size.md -->
-+
-+**Kernel**: `build_kernel_vm.sh` on linux-cachymod-6.18.52 (28/28 patches) →
-+`SUCCESS in 1798s`, bzImage 5071872 B, `setup _end=29552` (gate ok), every
-+link by lccc-ld. `qemu_boot_test.sh` **16/16**, and — unlike session 58 —
-+the serial log has **zero** `WARNING`/`Call Trace`/ACPI errors. The
-+`free_large_kmalloc` warning session 58 left open did **not** reproduce, and
-+neither did its trigger (`Failure resolving symbol`, `AE_AML`); with
-+SeaBIOS `1.16.3-debian` here, "not triggered" is not "fixed" — the gdbstub
-+probe still owes an answer.
-+
-+**Measured the i686 boot-size gap instead of guessing at it.** New
-+`scripts/boot_insn_census.py`: over 21 `arch/x86/boot` TUs on identical
-+command lines lccc emits **5127 instructions vs gcc's 3183 (+61.1 %)**;
-+`movl` alone is +1176 of the +1944. The structural counters name the cause:
-+**546 store-to-frame-slot vs gcc's 41**, 342 vs 61 loads back, and **70 of
-+70 functions open a frame where gcc opens 30 of 67** (2408 more frame
-+bytes). `LCCC_DBG_RA` on `check_cpuflags` shows `values=22 assigned=10` with
-+short-lived values marked `elig=true` still given slots. This is
-+`subsystems/i686.md` §2.2 with a corpus-wide number on it.
-+
-+**Falsified** the obvious fix: the i686 "immediately-consumed values get no
-+home" policy (`prologue.rs`) looks like the cause of those round trips, and
-+its stated premise — a home only costs a `movl %R,%eax` relay — is false for
-+the ops `try_emit_int_binop_direct` reads in place. Made it a switch
-+(`CCC_NO_I686_ACCUM_NOHOME`) and measured: **+391 B on the boot corpus, 17
-+of 20 objects worse**. The policy stays; the switch stays so nobody
-+re-derives this. Do-not-retry.
-+
-+**Landed** `fold_copy_narrow_ext_pairs`: `movl %S,%D` + `movX{l,w}l
-+%D<narrow>,%D` → one `movX{l,w}l %S<narrow>,%D` (45 `movzwl %ax,%eax` sites
-+in the boot corpus alone). Boot object sum **−104 B**, gate `_end`
-+**28144 → 28048** paired, i686 regression corpus **−154 B (-Os)** /
-+**−434 B (-O2)**. Guarded by three tests, one of which routes the peephole's
-+output through `i686::assembler::assemble` — because the pass shipped
-+emitting `movzwl%bx` (a `trim_end`'d mnemonic with no space restored), which
-+**passed every text assertion** (the classifier files an unparseable line
-+under its `Other` catch-all) and only died when eight boot TUs were really
-+compiled. Mutation-checked: removing the space fails that test alone.
-+
-+**Two measurement traps, both now written down.** (1) The boot gate moves
-+**3120 B** between tree states (before vs after a full `build_kernel_vm.sh`,
-+via `ensure_boot_offset_stubs` re-stubbing `zoffset.h`/`voffset.h`, which
-+also decides whether `.pecompat` exists) — a gate number is worthless
-+unpaired. (2) `gcc-multilib`/`libc6-dev-i386` were absent, so every `-m32`
-+regression test **skipped**; installing them moved the suite
-+**737/0/8 → 742/0/8**. An i686 claim from a host without multilib is worth
-+nothing.
-+
-+**Validation**: `cargo test --lib` **3111/0/7**; `run_regression_suite.sh`
-+**742/0/8**, AB-diff 0; boot gate PASS (`.text` 20335 → 20329);
-+`ci_local.sh --fast` **57/0** after a `cargo fmt` fix on the new switch.
-+
-+**Still open, in evidence order**: i686 RA quality (the +505 slot stores —
-+greedy start-point scan spends the 4-register pool on long-lived values;
-+short-lived in-loop values lose), x87↔GP pair lowering (`i686.md` §2.1,
-+untouched), the `free_large_kmalloc` discriminator, `reg-to-reg-movl` +230
-+(but only 26 of 74 survive into the *object* — measure objects, not `-S`),
-+`compare-against-frame-slot` +29.
-diff --git a/engineering/subsystems/i686.md b/engineering/subsystems/i686.md
-index ff0a47d..c13b5ef 100644
---- a/engineering/subsystems/i686.md
-+++ b/engineering/subsystems/i686.md
-@@ -36,6 +36,22 @@ against `tests/asm-diff/i686/*.casefile` (`LCCC_GAS` pinned to GAS 2.47).
-    one-argument leaf pays `pushl %ebx; subl $8,%esp; …` — ≈1.7× static
-    cost vs GCC across the whole ALU census. Station F-1: stack-size +
-    callee-save selection + the accumulator-cache model interaction.
-+   **Now measured corpus-wide** (2026-09-22, `scripts/boot_insn_census.py`,
-+   21 `arch/x86/boot` TUs on identical command lines): lccc emits **5127
-+   instructions vs gcc's 3183 (+61.1 %)**; `movl` alone is +1176 of the
-+   +1944. Structural counters: **546 store-to-frame-slot vs gcc's 41**,
-+   342 vs 61 loads back, **70/70 functions open a frame where gcc opens
-+   30/67**, 2408 more frame bytes. `LCCC_DBG_RA` on `check_cpuflags`:
-+   `values=22 assigned=10` with short-lived values marked `elig=true`
-+   still given slots. Byte gap on the boot corpus: **+10698 B vs gcc,
-+   +9413 B vs clang**.
-+   **Do-not-retry**: relaxing the "immediately-consumed values get no
-+   home" policy (`prologue.rs`) — the obvious suspect, since its premise
-+   is false for the ops `try_emit_int_binop_direct` reads in place —
-+   measures **+391 B** on the boot corpus, 17 of 20 objects worse. The
-+   switch `CCC_NO_I686_ACCUM_NOHOME` exists so this need not be
-+   re-derived. The lever is the greedy start-point scan spending the
-+   4-register pool on long-lived values, not the no-home policy.
- 3. Constant-division remainder round-trips, div/rem pair recomputation,
-    and `imull $c`-for-everything are fixed (below); the *remaining* ALU
-    items are the audit's F-2…F-9 list.
-diff --git a/scripts/boot_ab_size.py b/scripts/boot_ab_size.py
-new file mode 100644
-index 0000000..88f6daa
---- /dev/null
-+++ b/scripts/boot_ab_size.py
-@@ -0,0 +1,144 @@
-+#!/usr/bin/env python3
-+"""boot_ab_size.py — paired A/B of two LCCC binaries over the x86 boot corpus.
-+
-+`boot_size_oracle.sh` compares LCCC against a *reference compiler*.  This
-+tool compares LCCC against LCCC: two binaries (or one binary under two
-+environments) compile the identical `arch/x86/boot` command lines from
-+`scripts/boot_flags.sh`, and the report is per-object executable-byte
-+deltas plus the aggregate and the resulting 32 KiB-gate headroom.
-+
-+That is the only way to attribute a code-size movement to a codegen change:
-+the oracle comparison always also contains the (large, unrelated) gap to the
-+reference, so a 300-byte win is invisible in it and a 300-byte regression
-+looks like noise.
-+
-+Scope, stated so the absolute numbers are not misread: this compiles the
-+C members of `LCCC_BOOT_C_FILES` only, not the four `.S` members, so its
-+TOTAL is not comparable to `boot_size_oracle.sh`'s (which counts all 23
-+objects).  Both arms always see the identical file set, so the DELTA — the
-+only thing this tool is for — is exact.  Self-A/B (the same binary in both
-+arms) returns +0 on every object.
-+
-+Both arms run in the same process, back to back, on the same tree, so a
-+delta cannot come from a stale generated header.
-+
-+Usage:
-+    scripts/boot_ab_size.py --a target/fastbuild/lccc --b target-ab/fastbuild/lccc
-+    scripts/boot_ab_size.py --a ... --b ... --b-env CCC_NO_I686_ACCUM_NOHOME=1
-+    scripts/boot_ab_size.py --a ... --b ... --opt -O2
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import os
-+import subprocess
-+import sys
-+from pathlib import Path
-+
-+HERE = Path(__file__).resolve().parent
-+
-+
-+def boot_flags(kernel: Path) -> tuple[list[str], list[str]]:
-+    out = subprocess.run(
-+        ["bash", "-c", f'. {HERE}/boot_flags.sh; printf "%s\\n" "$LCCC_BOOT_CFLAGS"; printf "%s\\n" "$LCCC_BOOT_CPPFLAGS"; printf "%s\\n" "${{LCCC_BOOT_C_FILES[*]}}"'],
-+        cwd=kernel, capture_output=True, text=True, check=True,
-+    ).stdout.splitlines()
-+    return out[0].split(), out[1].split(), out[2].split()
-+
-+
-+def code_bytes(obj: Path) -> int:
-+    """Executable bytes = the sections the boot linker script places as code.
-+
-+    Mirrors elf_sections.sh's lccc_elf_code_bytes: .text*, .bstext, .header,
-+    .entrytext, .inittext. `size -A` is used rather than readelf so the
-+    parser does not have to re-implement ELF.
-+    """
-+    out = subprocess.run(["size", "-A", str(obj)], capture_output=True, text=True).stdout
-+    total = 0
-+    for line in out.splitlines():
-+        parts = line.split()
-+        if len(parts) < 2:
-+            continue
-+        name = parts[0]
-+        if name.startswith(
-+            (".text", ".bstext", ".header", ".entrytext", ".inittext", ".pecompat", ".videocards")
-+        ):
-+            try:
-+                total += int(parts[1])
-+            except ValueError:
-+                pass
-+    return total
-+
-+
-+def compile_arm(cc: str, cflags: list[str], cppflags: list[str], files: list[str],
-+                kernel: Path, outdir: Path, env: dict[str, str]) -> dict[str, int]:
-+    outdir.mkdir(parents=True, exist_ok=True)
-+    e = dict(os.environ)
-+    e.update(env)
-+    res: dict[str, int] = {}
-+    for f in files:
-+        obj = outdir / f"{f}.o"
-+        cmd = [cc, *cppflags, *cflags, "-DSVGA_MODE=NORMAL_VGA", "-c",
-+               f"arch/x86/boot/{f}.c", "-o", str(obj)]
-+        p = subprocess.run(cmd, cwd=kernel, capture_output=True, text=True, env=e)
-+        if p.returncode != 0:
-+            print(f"  {f}: {cc} failed: {p.stderr.strip()[:200]}", file=sys.stderr)
-+            continue
-+        res[f] = code_bytes(obj)
-+    return res
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser()
-+    ap.add_argument("--kernel", default=os.environ.get("KERNEL_DIR", "/opt/kwork/linux-6.18.52"))
-+    ap.add_argument("--a", required=True, help="baseline lccc binary")
-+    ap.add_argument("--b", required=True, help="candidate lccc binary")
-+    ap.add_argument("--a-env", default="", help="KEY=V[,KEY=V] for arm A")
-+    ap.add_argument("--b-env", default="", help="KEY=V[,KEY=V] for arm B")
-+    ap.add_argument("--work", default="/tmp/boot-ab")
-+    a = ap.parse_args()
-+
-+    def envmap(s: str) -> dict[str, str]:
-+        d = {}
-+        for kv in filter(None, s.split(",")):
-+            k, _, v = kv.partition("=")
-+            d[k] = v
-+        return d
-+
-+    kernel = Path(a.kernel)
-+    # Resolve the compiler paths before cwd moves into the kernel tree.
-+    arm_a = str(Path(a.a).expanduser().resolve())
-+    arm_b = str(Path(a.b).expanduser().resolve())
-+    for p_ in (arm_a, arm_b):
-+        if not Path(p_).is_file():
-+            print(f"compiler not found: {p_}", file=sys.stderr)
-+            return 2
-+    cflags, cppflags, files = boot_flags(kernel)
-+    ra = compile_arm(arm_a, cflags, cppflags, files, kernel, Path(a.work) / "a", envmap(a.a_env))
-+    rb = compile_arm(arm_b, cflags, cppflags, files, kernel, Path(a.work) / "b", envmap(a.b_env))
-+    common = sorted(set(ra) & set(rb))
-+    if not common:
-+        print("no object compiled by both arms", file=sys.stderr)
-+        return 2
-+
-+    ta = sum(ra[k] for k in common)
-+    tb = sum(rb[k] for k in common)
-+    print(f"corpus: {len(common)} objects from {kernel}/arch/x86/boot")
-+    print(f"A: {arm_a} {a.a_env}")
-+    print(f"B: {arm_b} {a.b_env}")
-+    print(f"\n{'object':<24}{'A':>8}{'B':>8}{'delta':>8}")
-+    for k in sorted(common, key=lambda k: rb[k] - ra[k]):
-+        d = rb[k] - ra[k]
-+        mark = "  <-- better" if d < 0 else ("  <-- WORSE" if d > 0 else "")
-+        print(f"{k:<24}{ra[k]:>8}{rb[k]:>8}{d:>+8}{mark}")
-+    print(f"{'TOTAL':<24}{ta:>8}{tb:>8}{tb - ta:>+8}")
-+    pct = 100.0 * (tb - ta) / max(ta, 1)
-+    print(f"\naggregate: {tb - ta:+d} bytes ({pct:+.2f}%)")
-+    # The gate is on the LINKED image, not the object sum, but the sum is the
-+    # right early signal; report the implied headroom either way.
-+    print(f"implied setup headroom change: {-(tb - ta):+d} bytes")
-+    return 0
-+
-+
-+if __name__ == "__main__":
-+    raise SystemExit(main())
-diff --git a/scripts/boot_insn_census.py b/scripts/boot_insn_census.py
-new file mode 100644
-index 0000000..38f7fd6
---- /dev/null
-+++ b/scripts/boot_insn_census.py
-@@ -0,0 +1,265 @@
-+#!/usr/bin/env python3
-+"""boot_insn_census.py — where do the extra i686 boot-code bytes come from?
-+
-+`boot_size_oracle.sh` answers *how much* larger LCCC's `arch/x86/boot`
-+objects are than a reference compiler's (currently ~+10.7 KiB over 23
-+objects, i.e. the 32 KiB setup gate runs at 1.6 KiB of headroom instead of
-+~9.9 KiB).  It does not answer *what kind of instruction* the surplus is
-+made of, which is the only question that tells you which pass to change.
-+
-+This script compiles every boot translation unit with both toolchains using
-+the shared command lines from `scripts/boot_flags.sh` (so a delta is a
-+codegen delta and nothing else), strips the assembly of directives and
-+pseudo-ops, and reports:
-+
-+  * per-mnemonic counts for each toolchain, sorted by |delta|;
-+  * the size-class breakdown of the surplus (how many bytes each family
-+    could plausibly account for, using the i386 encoding lengths the
-+    emitter actually produces);
-+  * a set of structural counters that name whole *defect classes* rather
-+    than mnemonics: prologue pushes, frame size, parameter homing stores,
-+    reload-of-just-spilled, redundant sign/zero extension, `jmp` to the
-+    shared epilogue, and stack-slot references in compares.
-+
-+The structural counters are the point: "lccc emits 412 more `movl`" is not
-+actionable, "lccc spends 187 instructions storing register-passed
-+parameters into frame slots it then reloads" names a pass.
-+
-+Usage:
-+    scripts/boot_insn_census.py                     # gcc oracle
-+    scripts/boot_insn_census.py --oracle clang
-+    scripts/boot_insn_census.py --top 40 --show-classes
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import os
-+import re
-+import subprocess
-+import sys
-+from collections import Counter, defaultdict
-+from pathlib import Path
-+
-+HERE = Path(__file__).resolve().parent
-+REPO = HERE.parent
-+DEFAULT_KERNEL = os.environ.get("KERNEL_DIR", "/home/user/kernel-work/linux-6.18.52")
-+
-+# Sourced from boot_flags.sh rather than duplicated: the whole value of this
-+# tool is that both arms see the identical command line.
-+def boot_flags(kernel: Path) -> tuple[str, str]:
-+    sh = (
-+        f'. {HERE}/boot_flags.sh; '
-+        'printf "%s\\n" "$LCCC_BOOT_CFLAGS"; printf "%s\\n" "$LCCC_BOOT_CPPFLAGS"'
-+    )
-+    out = subprocess.run(
-+        ["bash", "-c", sh], cwd=kernel, capture_output=True, text=True, check=True
-+    ).stdout.splitlines()
-+    return out[0], out[1]
-+
-+
-+def cflags_for(oracle: str, base: str) -> str:
-+    """Mirror boot_flags.sh's lccc_boot_cflags_for for the oracle side."""
-+    if "clang" in os.path.basename(oracle):
-+        return base.replace("-mpreferred-stack-boundary=2", "-mstack-alignment=4") + " -Wno-gnu"
-+    return base
-+
-+
-+DIRECTIVE = re.compile(r"^\s*(\.|#|/\*|--|@)")
-+LABEL = re.compile(r"^\s*[.\w$][\w$.]*\s*:")
-+INSN = re.compile(r"^\s*([a-z][a-z0-9]*)\b(.*)$")
-+
-+
-+def parse_asm(path: Path) -> list[tuple[str, str]]:
-+    """Return [(mnemonic, operand-text)] for real instructions only."""
-+    insns: list[tuple[str, str]] = []
-+    in_app = False
-+    for raw in path.read_text(errors="replace").splitlines():
-+        line = raw.split("//")[0]
-+        s = line.strip()
-+        if s == "#APP":
-+            in_app = True
-+            continue
-+        if s == "#NO_APP":
-+            in_app = False
-+            continue
-+        if in_app:  # inline asm: belongs to the source, not to the backend
-+            continue
-+        if not s or DIRECTIVE.match(line) or LABEL.match(line):
-+            continue
-+        m = INSN.match(line)
-+        if not m:
-+            continue
-+        insns.append((m.group(1), m.group(2).strip()))
-+    return insns
-+
-+
-+def frame_sizes(insns: list[tuple[str, str]]) -> list[int]:
-+    """Every `subl $N,%esp` that opens a frame (heuristic: any esp adjust)."""
-+    out = []
-+    for mn, ops in insns:
-+        if mn in ("subl", "subw") and "%esp" in ops and "$" in ops:
-+            m = re.search(r"\$(-?\d+)", ops)
-+            if m:
-+                out.append(int(m.group(1)))
-+    return out
-+
-+
-+def structural(insns: list[tuple[str, str]]) -> dict[str, int]:
-+    """Defect-class counters. Each one names a pass, not a mnemonic."""
-+    c: dict[str, int] = defaultdict(int)
-+    prev: list[tuple[str, str]] = []
-+    for i, (mn, ops) in enumerate(insns):
-+        if mn in ("pushl", "pushw") and re.search(r"%e?bx|%e?si|%e?di|%e?bp", ops):
-+            c["prologue-callee-save-push"] += 1
-+        # `movl %reg, N(%esp)` — storing into a frame slot.
-+        if mn == "movl" and re.search(r",\s*-?\d+\(%esp\)\s*$", ops):
-+            c["store-to-frame-slot"] += 1
-+            # Reload of a value that was stored to the same slot within the
-+            # previous 6 instructions: the store existed only to be read back.
-+            slot = re.search(r"(-?\d+)\(%esp\)", ops)
-+            if slot:
-+                for pmn, pops in insns[max(0, i - 6) : i]:
-+                    if (
-+                        pmn == "movl"
-+                        and f"{slot.group(1)}(%esp)" in pops
-+                        and pops.strip().startswith(f"{slot.group(1)}(%esp)")
-+                    ):
-+                        c["store-then-reload-same-slot"] += 1
-+                        break
-+        if mn == "movl" and re.search(r"-?\d+\(%esp\),\s*%e", ops):
-+            c["load-from-frame-slot"] += 1
-+        # Redundant narrow widening right after a narrowing load/move.
-+        if mn in ("movsbl", "movzbl") and re.match(r"^%[a-d]l,", ops):
-+            c["reg-to-reg-narrow-extend"] += 1
-+        if mn == "movzwl" and re.match(r"^%[a-d]x,", ops):
-+            c["reg-to-reg-word-extend"] += 1
-+        # Compare that reads memory instead of a register.
-+        if mn in ("cmpl", "cmpw", "cmpb", "testl") and re.search(r"-?\d+\(%(esp|ebp)\)", ops):
-+            c["compare-against-frame-slot"] += 1
-+        # Register-to-register move: pure coalescing failure.
-+        if mn == "movl" and re.match(r"^%e[a-dsbd][xhlbp]*,\s*%e", ops):
-+            c["reg-to-reg-movl"] += 1
-+        if mn == "jmp" and "_epilogue_" in ops:
-+            c["jmp-to-shared-epilogue"] += 1
-+        if mn == "call" and "get_pc_thunk" in ops:
-+            c["pic-pc-thunk"] += 1
-+        # Instruction that only exists to widen/narrow the accumulator.
-+        if mn == "leal" and re.search(r"\(%e[a-d]x,%e[a-d]x", ops):
-+            c["lea-scaled-self"] += 1
-+        prev.append((mn, ops))
-+    frames = frame_sizes(insns)
-+    c["fn-count"] = sum(1 for mn, _ in insns if mn == "ret" or mn == "retw")
-+    c["total-frame-bytes"] = sum(frames)
-+    c["functions-with-frame"] = len(frames)
-+    return c
-+
-+
-+# Rough i386 encoding costs for the families that dominate the surplus, so a
-+# mnemonic delta can be read as a byte delta.  These are the lengths the
-+# emitter produces for the boot code's shapes (32-bit operand, ModRM+disp8/
-+# disp32, SIB where indexed) — deliberately conservative.
-+BYTES = {
-+    "movl": 3.5,
-+    "movzbl": 3.5,
-+    "movsbl": 3.5,
-+    "movzwl": 3.5,
-+    "pushl": 1.5,
-+    "popl": 1.5,
-+    "subl": 3.0,
-+    "addl": 3.0,
-+    "cmpl": 4.0,
-+    "jmp": 2.5,
-+    "je": 2.0,
-+    "jne": 2.0,
-+}
-+
-+
-+def compile_all(cc: str, cflags: str, cppflags: str, kernel: Path, out: Path) -> dict[str, Path]:
-+    out.mkdir(parents=True, exist_ok=True)
-+    res: dict[str, Path] = {}
-+    src = sorted((kernel / "arch/x86/boot").glob("*.c"))
-+    for s in src:
-+        dst = out / f"{s.stem}.s"
-+        cmd = [cc, *cflags.split(), *cppflags.split(), "-DSVGA_MODE=NORMAL_VGA", "-S", str(s), "-o", str(dst)]
-+        p = subprocess.run(cmd, cwd=kernel, capture_output=True, text=True)
-+        if p.returncode != 0 or not dst.exists():
-+            print(f"  skip {s.name}: {cc} failed", file=sys.stderr)
-+            continue
-+        res[s.stem] = dst
-+    return res
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser()
-+    ap.add_argument("--kernel", default=DEFAULT_KERNEL)
-+    ap.add_argument("--oracle", default="gcc")
-+    ap.add_argument("--lccc", default=str(REPO / "target/fastbuild/lccc"))
-+    ap.add_argument("--top", type=int, default=30)
-+    ap.add_argument("--work", default="/tmp/boot-census")
-+    ap.add_argument("--show-classes", action="store_true")
-+    a = ap.parse_args()
-+
-+    kernel = Path(a.kernel)
-+    if not kernel.is_dir():
-+        print(f"kernel tree missing: {kernel}", file=sys.stderr)
-+        return 2
-+    cflags, cppflags = boot_flags(kernel)
-+
-+    lccc_asm = compile_all(a.lccc, cflags, cppflags, kernel, Path(a.work) / "lccc")
-+    orc_asm = compile_all(a.oracle, cflags_for(a.oracle, cflags), cppflags, kernel, Path(a.work) / a.oracle)
-+    common = sorted(set(lccc_asm) & set(orc_asm))
-+    if not common:
-+        print("no translation unit compiled with both toolchains", file=sys.stderr)
-+        return 2
-+
-+    per_class: dict[str, dict[str, int]] = {}
-+    mn_total: dict[str, Counter] = {"lccc": Counter(), "oracle": Counter()}
-+    for name in common:
-+        li = parse_asm(lccc_asm[name])
-+        oi = parse_asm(orc_asm[name])
-+        per_class[name] = {
-+            "lccc": len(li),
-+            "oracle": len(oi),
-+        }
-+        mn_total["lccc"].update(m for m, _ in li)
-+        mn_total["oracle"].update(m for m, _ in oi)
-+
-+    print(f"corpus: {len(common)} translation units, {a.kernel}")
-+    print(f"lccc: {a.lccc}\noracle: {a.oracle} ({cflags_for(a.oracle, cflags)[:60]}...)")
-+    tl = sum(v["lccc"] for v in per_class.values())
-+    to = sum(v["oracle"] for v in per_class.values())
-+    print(f"\ntotal instructions: lccc={tl}  {a.oracle}={to}  delta={tl - to:+d} ({100.0 * (tl - to) / max(to, 1):+.1f}%)")
-+
-+    print(f"\n== worst translation units by instruction delta ==")
-+    print(f"{'TU':<24}{'lccc':>8}{a.oracle:>8}{'delta':>8}")
-+    for name, v in sorted(per_class.items(), key=lambda kv: kv[1]["oracle"] - kv[1]["lccc"])[:12]:
-+        print(f"{name:<24}{v['lccc']:>8}{v['oracle']:>8}{v['lccc'] - v['oracle']:>+8}")
-+
-+    print(f"\n== mnemonic deltas (top {a.top} by |delta|) ==")
-+    print(f"{'mnemonic':<16}{'lccc':>8}{a.oracle:>8}{'delta':>8}{'~bytes':>9}")
-+    deltas = {m: mn_total["lccc"][m] - mn_total["oracle"][m] for m in set(mn_total["lccc"]) | set(mn_total["oracle"])}
-+    est = 0.0
-+    for m, d in sorted(deltas.items(), key=lambda kv: -abs(kv[1]))[: a.top]:
-+        b = d * BYTES.get(m, 3.0)
-+        est += b
-+        print(f"{m:<16}{mn_total['lccc'][m]:>8}{mn_total['oracle'][m]:>8}{d:>+8}{b:>+9.0f}")
-+    print(f"{'(top-N estimate)':<16}{'':>24}{est:>+9.0f} bytes")
-+
-+    # Structural counters, summed over the corpus.
-+    sl: Counter = Counter()
-+    so: Counter = Counter()
-+    for name in common:
-+        sl.update(structural(parse_asm(lccc_asm[name])))
-+        so.update(structural(parse_asm(orc_asm[name])))
-+    print("\n== structural defect-class counters ==")
-+    print(f"{'class':<36}{'lccc':>8}{a.oracle:>8}{'delta':>8}")
-+    for k in sorted(set(sl) | set(so), key=lambda k: -(sl[k] - so[k])):
-+        if k in ("fn-count",):
-+            continue
-+        print(f"{k:<36}{sl[k]:>8}{so[k]:>8}{sl[k] - so[k]:>+8}")
-+    print(f"{'functions (ret count)':<36}{sl['fn-count']:>8}{so['fn-count']:>8}")
-+    return 0
-+
-+
-+if __name__ == "__main__":
-+    raise SystemExit(main())
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 5d282f9..c0b4bf6 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -11539,12 +11539,18 @@ pub fn peephole_optimize(asm: String) -> String {
-     // stores and moves by shortening def-use chains, so it runs before DSE
-     // and the liveness cleanup).
-     let pair_changed = fold_sext_zext_pairs(&mut store, &mut infos);
-+    // Fold `movl %S,%D` + `movX{l,w}l %D<narrow>,%D` into one extension of
-+    // %S.  Runs BEFORE the redundant-extension state machine: the fused
-+    // instruction is the machine's *input* shape (it establishes the
-+    // byte/word fact), and folding first means the machine can then delete
-+    // the extension entirely when the source fact already holds.
-+    let copy_ext_changed = fold_copy_narrow_ext_pairs(&mut store, &mut infos);
-     let zext_changed = eliminate_redundant_zext_i686(&mut store, &mut infos);
-     // Redundant SIGN-extension elimination runs right after: it turns
-     // `movsbl %al,%REG` into a `movl` copy or a no-op, which the cleanup
-     // loop below then propagates/deletes like any other move.
-     let sext_changed = eliminate_redundant_sign_ext_i686(&mut store, &mut infos);
--    if pair_changed || zext_changed || sext_changed {
-+    if pair_changed || copy_ext_changed || zext_changed || sext_changed {
-         let mut changed3 = true;
-         let mut pass_count3 = 0;
-         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
-@@ -11958,6 +11964,120 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo])
-     changed
- }
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 73b79721..72089b6c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -346,6 +346,34 @@ jobs:
+           CCC: target/fastbuild/lccc
+         run: bash tests/regression/check_vector_copy_elimination.sh
  
-+// ── Pass: fold a 32-bit copy into the narrow extension that follows it ──────
++      # Call-argument staging (PR #584's miscompile class): the FP liveness
++      # oracle's call model must never mark live SSE-argument staging dead.
++      # The chain that broke: the GP dead-write pass legitimately deletes the
++      # `movb $N, %al` census at non-variadic callees, the fallback window
++      # walk broke at the hazard-area release / stack-argument pushes / relay
++      # GP halves, and eliminate_dead_vector_copies deleted the staging (a
++      # 10-double call lost 7 of 8 register arguments). Pinned end to end:
++      # runtime equality with the reference compiler on volatile 8..12-ary
++      # f64/f32, mixed GP+SSE, SSE structs, negation compositions, indirect
++      # and in-loop calls; the `# LCCC_CALL_FP` authority-marker counts; the
++      # census lifecycle (deleted at prototyped callees, kept at variadic);
++      # and all eight registers staged in the 10-argument window.
++      - name: Verify call-argument staging contracts
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_call_arg_staging.sh
 +
-+/// One mnemonic of the narrow-extend family, with the source sub-register
-+/// width it reads.  `movsbl`/`movzbl` read the low BYTE, `movswl`/`movzwl`
-+/// the low WORD; all four write a full 32-bit destination.
-+const NARROW_EXT_TO_32: [(&str, MoveSize); 4] = [
-+    ("movzbl ", MoveSize::B),
-+    ("movsbl ", MoveSize::B),
-+    ("movzwl ", MoveSize::W),
-+    ("movswl ", MoveSize::W),
-+];
++      # Loop-invariant LEA hoisting (guarded/fall-through-entry loops) and
++      # the direct 3-operand RORX: two loop-body instruction-quality
++      # contracts from the worst-15 benchmark campaign. The K-table
++      # rematerialization inside the 64-round loop (sha256_transform at
++      # 1.20x gcc) and the staged `movq` before every `rorxl` (BMI2 RORX
++      # is non-destructive; a fresh register home is read in place).
++      - name: Verify LEA hoist and RORX contracts
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_lea_hoist_rorx.sh
 +
-+/// Fuse `movl %S,%D` followed by `movX{l,w}l %D<narrow>,%D` into the single
-+/// instruction `movX{l,w}l %S<narrow>,%D`.
-+///
-+/// Why this shape exists at all: the i686 backend materialises a sub-int
-+/// copy as a full 32-bit move and then re-establishes the narrow type's
-+/// invariant with an explicit extension, so a `u16` that is already in a
-+/// register costs
-+///
-+/// ```text
-+///     movl   %ebx, %eax        ; 2 bytes — the copy
-+///     movzwl %ax, %eax         ; 3 bytes — the type invariant
-+/// ```
-+///
-+/// where one instruction does both.  The fused form is exactly equivalent:
-+/// the `movl` wrote `%D = %S`, so the extension's source `%D<narrow>` held
-+/// `%S<narrow>`, and the extension overwrites `%D` completely.  Nothing
-+/// between the two lines can observe the intermediate value (adjacency),
-+/// and `%S` is untouched by both.
-+///
-+/// Measured on the 32 KiB x86 setup corpus (`arch/x86/boot`, the identical
-+/// command lines from `scripts/boot_flags.sh`): 45 `movzwl %ax,%eax` sites
-+/// alone, 109 more `movzwl` than GCC emits for the same 21 translation
-+/// units — see `scripts/boot_insn_census.py`.  Each fusion is 2 bytes.
-+///
-+/// Fail-closed rules, each of which has a concrete wrong-code shape behind
-+/// it:
-+///   * the source must be spelled as a 32-bit register.  `%ah` and `%al`
-+///     share a family, and `movzbl %al,%D` after `movl %ah,%D` would read a
-+///     different byte than the `movzbl %ah,%D` it replaces;
-+///   * `%esp` is never a dataflow register;
-+///   * the sub-register must exist on this target (`%sil`/`%dil` are 64-bit
-+///     only), which `narrow_reg_name` reports as `None`;
-+///   * a barrier or label between the lines kills the fold — the
-+///     intermediate value is then observable.
-+fn fold_copy_narrow_ext_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    let mut changed = false;
-+    let len = infos.len();
-+    let mut i = 0;
-+    while i + 1 < len {
-+        let LineKind::Move { dst, src } = infos[i].kind else {
-+            i += 1;
-+            continue;
-+        };
-+        if infos[i].is_nop() || dst == REG_ESP || src == REG_ESP || dst > REG_GP_MAX {
-+            i += 1;
-+            continue;
-+        }
-+        // Find the next real line; only nops (and debug locations) may sit
-+        // between the copy and the extension.
-+        let mut j = i + 1;
-+        while j < len && (infos[j].is_nop() || is_debug_location(store, infos, j)) {
-+            j += 1;
-+        }
-+        if j >= len || infos[j].is_barrier() {
-+            i += 1;
-+            continue;
-+        }
-+        let t = trimmed(store, &infos[j], j).to_string();
-+        let mut fused = false;
-+        for (prefix, width) in NARROW_EXT_TO_32 {
-+            let Some(rest) = t.strip_prefix(prefix) else {
-+                continue;
-+            };
-+            let Some((ext_src, ext_dst)) = split_operands_last_comma(rest) else {
-+                continue;
-+            };
-+            // The extension must re-extend the register the copy just wrote.
-+            if register_family(ext_dst) != dst {
-+                continue;
-+            }
-+            // ... from that register's own low sub-register.  Comparing the
-+            // TEXT (not the family) is what rules out the `%ah`/`%al`
-+            // mix-up; a memory source cannot be a self-extension at all.
-+            let Some(want) = narrow_reg_name(dst, width) else {
-+                continue;
-+            };
-+            if ext_src != want {
-+                continue;
-+            }
-+            let Some(s_narrow) = narrow_reg_name(src, width) else {
-+                continue;
-+            };
-+            store.replace(
-+                i,
-+                format!(
-+                    "    {} {}, {}",
-+                    prefix.trim_end(),
-+                    s_narrow,
-+                    reg32_name(dst)
-+                ),
-+            );
-+            infos[i] = classify_line(store.get(i));
-+            infos[j].kind = LineKind::Nop;
-+            changed = true;
-+            fused = true;
-+            break;
-+        }
-+        i = if fused { j + 1 } else { i + 1 };
-+    }
-+    changed
-+}
-+
- // ── Pass: redundant sign-extension elimination (i686) ────────────────────────
+       # Cross-PR interaction red-team (session 574): the per-feature gates
+       # pin each PR's own contract; this one pins the INTERACTIONS between
+       # the last ten merged PRs — FMA families through copy brackets, calls
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 531c3af6..8859afd5 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -403,6 +403,23 @@ gate "boot-size-measurement" fast \
+ gate "vector-copy-elimination" fast \
+     bash tests/regression/check_vector_copy_elimination.sh
  
- /// Track which GP register families provably hold sign-extended byte values
-@@ -18488,4 +18608,97 @@ mod tests {
-             "the index register inherited a byte fact it does not have:\n{out}"
-         );
++# Call-argument staging (PR #584's miscompile class): the FP liveness
++# oracle's call model must never mark live SSE-argument staging dead.
++# The census is legitimately dead-eliminated at non-variadic callees; the
++# `# LCCC_CALL_FP` authority marker and the hardened window walk carry the
++# read set past every rsp adjustment, stack-argument push and relay half.
++# Runtime differential on volatile 8..12-ary f64/f32, mixed GP+SSE, SSE
++# structs, negation compositions, indirect and in-loop calls, plus the
++# marker/census/staging-window shape pins.
++gate "call-arg-staging" fast \
++    bash tests/regression/check_call_arg_staging.sh
++
++# Loop-invariant LEA hoisting (guarded loops, pure-LEA insertion placement
++# before the alignment run) + direct 3-operand RORX (no movq staging into
++# the destination of a non-destructive BMI2 rotate).
++gate "lea-hoist-rorx" fast \
++    bash tests/regression/check_lea_hoist_rorx.sh
++
+ # Cross-PR interaction red-team: FMA families x copy brackets x
+ # if-conversion x constant promotion x NonZero x the AVX1+FMA target
+ # class, bit-exact vs the reference compiler at matched march (canonical
+diff --git a/src/backend/peephole_common.rs b/src/backend/peephole_common.rs
+index d950ab79..ea5de6b2 100644
+--- a/src/backend/peephole_common.rs
++++ b/src/backend/peephole_common.rs
+@@ -424,6 +424,30 @@ impl LineStore {
+         };
      }
+ 
++    /// Insert a new line at `idx`, shifting every later line's index up by
++    /// one.  The text lands in the replacements arena (a `REPLACED`-style
++    /// entry pointing at it), so no original-buffer surgery happens.
++    ///
++    /// Only for rare, structural rewrites (the loop-invariant LEA hoist
++    /// placing an instruction on a fall-through entry path): callers MUST
++    /// adjust every index they hold at or above `idx`, including loop
++    /// bounds discovered before the insertion.  O(len) in the entry splice.
++    pub(crate) fn insert_line(&mut self, idx: usize, text: String) {
++        let end = line_len_without_trailing_blanks(text.as_bytes());
++        let mut new_text = text;
++        new_text.truncate(end);
++        let rep_idx = self.replacements.len();
++        debug_assert!(rep_idx <= u32::MAX as usize);
++        self.replacements.push(new_text);
++        self.entries.insert(
++            idx,
++            LineEntry {
++                start: rep_idx as u32,
++                len: REPLACED,
++            },
++        );
++    }
 +
+     /// Concatenate kept lines, each followed by `\n`.
+     pub(crate) fn build_result(&self, skip: impl Fn(usize) -> bool) -> String {
+         let mut result = String::with_capacity(self.original.len());
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index 33d16f5c..7390889d 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -426,6 +426,23 @@ pub struct CodegenState {
+     /// gate shifted its register allocation).  6 = the conservative
+     /// default (i686, hand-written fragments, non-argument call paths).
+     pub call_gp_arg_count: usize,
++    /// Number of leading x86-64 SysV SSE argument registers the call being
++    /// emitted actually reads (0..=8).  Armed by the x86-64 register-argument
++    /// phase from the same authoritative `CallArgClass` classification and
++    /// published as `# LCCC_CALL_FP <n>` after the call text (the same
++    /// authority contract as `call_gp_arg_count`).  The FP liveness oracle's
++    /// fallback (no marker) reconstructs the set from the `movb $N, %al`
++    /// census or the staged-move window — but the census is DELETED by the
++    /// GP dead-write pass for non-variadic callees (legitimately: %al is
++    /// dead there), and the window walk is a heuristic; a call site that
++    /// stages FP arguments across a hazard-area release (`addq $K, %rsp`)
++    /// or a deep relay chain was modeled as reading NO xmm register, and
++    /// `eliminate_dead_vector_copies` deleted live argument staging
++    /// (found via PR #584's CI: a 10-double call lost 7 of 8 register
++    /// arguments).  `None` = the marker is not published (hand-written
++    /// fragments, raw `call` emissions, MachInst calls) and the oracle
++    /// falls back to the census/window heuristics; `Some(n)` is exact.
++    pub call_fp_arg_count: Option<usize>,
+     /// Patchable function entry: (total_nops, nops_before_entry).
+     /// When set, emits NOP padding around function entry points and records
+     /// them in __patchable_function_entries for runtime patching (ftrace).
+@@ -640,6 +657,7 @@ impl CodegenState {
+             call_is_variadic: false,
+             chain_call: false,
+             call_gp_arg_count: 6,
++            call_fp_arg_count: None,
+             patchable_function_entry: None,
+             mcount: None,
+             pending_classic_mcount_label: None,
+@@ -860,6 +878,7 @@ impl CodegenState {
+         self.chain_call = false;
+         self.call_is_variadic = false;
+         self.call_gp_arg_count = 6;
++        self.call_fp_arg_count = None;
+         self.value_locations.clear();
+         self.alloca_values.clear();
+         self.volatile_alloca_values.clear();
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index 5f53a151..1ab1c8ad 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -951,6 +951,12 @@ pub trait ArchCodegen {
+         // the PREVIOUS call's count — a stale low count would drop a real
+         // argument read from the liveness oracle's model.
+         self.state().call_gp_arg_count = 6;
++        // Same hygiene for the FP count marker: armed by the register-argument
++        // phase below, discharged by the call emission. `None` publishes no
++        // marker and the FP liveness oracle falls back to its census/window
++        // heuristics — a stale count would be worse (it would drop real SSE
++        // argument reads from the model and re-open the staging deletion).
++        self.state().call_fp_arg_count = None;
+ 
+         use super::call_abi::*;
+         let config = self.call_abi_config();
+diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
+index f3bcd418..e8b6992c 100644
+--- a/src/backend/x86/codegen/calls.rs
++++ b/src/backend/x86/codegen/calls.rs
+@@ -589,6 +589,31 @@ impl X86Codegen {
+         // home is an argument register already written by an earlier-staged
+         // argument, and pre-spill those values to a transient stack area
+         // BEFORE any staging write.  Symmetric for GPR argument registers.
++        //
++        // REGISTER-CLASS ARGS ONLY: a Stack-class argument's value was
++        // already consumed by `emit_call_stack_args_impl` (the driver runs
++        // the stack-argument pushes BEFORE this phase), so no register
++        // staging can clobber its read.  Pre-spilling it anyway (the old
++        // behavior) bought a dead `movsd %xmmN, K(%rsp)`, the `subq/addq`
++        // pair for a hazard area that protected nothing, and — worse — an
++        // `addq $K, %rsp` between the register staging and the `call` that
++        // the FP liveness oracle's fallback window used to break on (see
++        // `call_xmm_reads`): every ≥9-FP-argument call with a stack arg
++        // homed in a low xmm bank paid the churn (measured on the PR #584
++        // repro: f10 carried a 16-byte hazard area for one stack arg).
++        let arg_stages_into_reg = |cls: &CallArgClass| {
++            matches!(
++                cls,
++                CallArgClass::FloatReg { .. }
++                    | CallArgClass::IntReg { .. }
++                    | CallArgClass::StructSseReg { .. }
++                    | CallArgClass::F128SseReg { .. }
++                    | CallArgClass::StructMixedIntSseReg { .. }
++                    | CallArgClass::StructMixedSseIntReg { .. }
++                    | CallArgClass::I128RegPair { .. }
++                    | CallArgClass::StructByValReg { .. }
++            )
++        };
+         let mut written_xmm: [bool; 8] = [false; 8];
+         let mut written_gpr: [bool; 6] = [false; 6];
+         // (arg index, phys home, is_fp)
+@@ -596,27 +621,29 @@ impl X86Codegen {
+         for (i, arg) in args.iter().enumerate() {
+             if let Operand::Value(v) = arg {
+                 if let Some(&phys) = self.reg_assignments.get(&v.0) {
+-                    if super::emit::is_xmm_reg(phys) {
+-                        // Allocator XMM homes are PhysReg 20..33 = xmm2..xmm15.
+-                        let src_idx = phys.0 as i64 - 18;
+-                        if (0..=7).contains(&src_idx) && written_xmm[src_idx as usize] {
+-                            hazards.push((i, phys, true));
+-                        }
+-                    } else {
+-                        // Allocatable GPR homes that double as SysV arg regs:
+-                        // rdi=14→arg0, rsi=15→arg1, rdx=16→arg2, r8=12→arg4,
+-                        // r9=13→arg5 (rcx/rax are not allocatable homes).
+-                        let src_idx: Option<usize> = match phys.0 {
+-                            14 => Some(0),
+-                            15 => Some(1),
+-                            16 => Some(2),
+-                            12 => Some(4),
+-                            13 => Some(5),
+-                            _ => None,
+-                        };
+-                        if let Some(si) = src_idx {
+-                            if written_gpr[si] {
+-                                hazards.push((i, phys, false));
++                    if arg_stages_into_reg(&arg_classes[i]) {
++                        if super::emit::is_xmm_reg(phys) {
++                            // Allocator XMM homes are PhysReg 20..33 = xmm2..xmm15.
++                            let src_idx = phys.0 as i64 - 18;
++                            if (0..=7).contains(&src_idx) && written_xmm[src_idx as usize] {
++                                hazards.push((i, phys, true));
++                            }
++                        } else {
++                            // Allocatable GPR homes that double as SysV arg regs:
++                            // rdi=14→arg0, rsi=15→arg1, rdx=16→arg2, r8=12→arg4,
++                            // r9=13→arg5 (rcx/rax are not allocatable homes).
++                            let src_idx: Option<usize> = match phys.0 {
++                                14 => Some(0),
++                                15 => Some(1),
++                                16 => Some(2),
++                                12 => Some(4),
++                                13 => Some(5),
++                                _ => None,
++                            };
++                            if let Some(si) = src_idx {
++                                if written_gpr[si] {
++                                    hazards.push((i, phys, false));
++                                }
+                             }
+                         }
+                     }
+@@ -1082,6 +1109,21 @@ impl X86Codegen {
+             // `float_count > 0` arm above).
+             self.state.emit("    xorl %eax, %eax");
+         }
++        // Arm the FP-count authority marker: the exact number of leading
++        // SSE argument registers this call reads (every FloatReg/
++        // StructSseReg/F128/mixed-fp staging incremented `float_count`, the
++        // hazard-restore path included). The `movb $N, %al` census above
++        // carries the same number, but the GP dead-write pass legitimately
++        // deletes it for non-variadic callees (%al is dead there) — after
++        // which the FP liveness oracle's window heuristic is the only
++        // source left, and it under-collects across hazard-area releases
++        // and deep relay chains (PR #584: a 10-double call lost 7 of its 8
++        // register arguments to `eliminate_dead_vector_copies`). The
++        // marker is a comment: free to keep, exact, and immune to every
++        // value-shape pass. Emitted right after the call text by
++        // `emit_call_instruction_impl` (same discharge contract as
++        // `call_gp_arg_count`).
++        self.state.call_fp_arg_count = Some(float_count.min(8));
+         self.state.reg_cache.invalidate_all();
+         self.flush_pending_vec_store_impl();
+         self.state.invalidate_vec_peephole();
+@@ -1206,10 +1248,31 @@ impl X86Codegen {
+         // values may be proven dead across the call. This is what un-pins
+         // %r10 (the RA's most common scratch after rax/rcx/rdx) from every
+         // call in the text liveness oracles.
++        //
++        // ORDERING CONTRACT: the GP liveness oracle scans a TIGHT window
++        // (the two lines after the call text) for this marker, so it must
++        // stay in the same position the pre-FP-marker emission gave it —
++        // [call][VA?][CALL_ARGS][CHAIN?] with CHAIN at n+1/n+2. The
++        // LCCC_CALL_FP marker below is therefore emitted LAST.
+         if self.state.chain_call {
+             self.state.emit("    # LCCC_CHAIN_CALL");
+             self.state.chain_call = false;
+         }
++        // FP-argument count marker (the same authority contract as
++        // LCCC_CALL_ARGS above): the exact number of leading SSE argument
++        // registers this call reads, armed by `emit_call_reg_args_impl`
++        // from the authoritative classification. Consumed by the FP
++        // liveness oracle's `call_xmm_reads` BEFORE its census/window
++        // heuristics, so the argument staging can never be modeled dead
++        // once the `movb $N, %al` census is dead-eliminated. Absent marker
++        // (hand-written fragments, raw libcall emissions) keeps the
++        // heuristic path: fail-closed to the census first. Emitted LAST:
++        // every earlier marker's consumer scans a tight window measured
++        // from the call text, and this one's parser skips sibling markers.
++        if let Some(fp) = self.state.call_fp_arg_count {
++            self.state
++                .emit_fmt(format_args!("    # LCCC_CALL_FP {}", fp.min(8)));
++        }
+         self.state.reg_cache.invalidate_all();
+         self.flush_pending_vec_store_impl();
+         self.state.invalidate_vec_peephole();
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index b928b775..dc1cd934 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -4679,15 +4679,67 @@ impl X86Codegen {
+         let dest_typed = typed_phys_reg_name(dest_phys, ty);
+ 
+         if let Some(imm) = Self::const_as_imm32(rhs) {
+-            // Sub-word sources load with their typed form so the home stays
+-            // zero-extended; 32/64-bit sources keep the generic staging.
+-            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
+             // Reduce explicitly instead of leaning on the hardware mask: the
+             // emitted immediate then documents the real rotation, and a count
+             // of 0 (or any multiple of the width) folds away to the copy that
+             // already produced the value, rather than emitting a flag-writing
+             // no-op.
+             let amount = (imm as i64).rem_euclid(width);
++            // Direct 3-operand rorx: RORX is NON-DESTRUCTIVE (BMI2's whole
++            // point), so a lhs that is provably fresh in a register home can
++            // be read in place — no staging move into the destination first.
++            // sha256's sigma functions homed their inputs in callee-saved
++            // registers and staged `movq %r14, %rbp` before EVERY
++            // `rorxl $k, %ebp, %ebp` — three dead 64-bit moves per round,
++            // ~192 per transform call (measured on the benchmark corpus:
++            // sha256_transform at 1.20x gcc). The typed view is enough:
++            // `rorxl $k, %r14d, %ebp` reads the low 32 bits of the home and
++            // fully defines the destination (the write zero-extends into
++            // the upper half, which the sext32 normalization below then
++            // adjusts for signed results exactly as the staged form did).
++            if amount != 0
++                && self.bmi2_enabled
++                && super::isel::rorx_allowed()
++                && (width == 32 || width == 64)
++            {
++                let direct_src = match lhs {
++                    Operand::Value(v) => {
++                        // Home-freshness gate (operand_to_callee_reg's
++                        // discipline): only a register that provably still
++                        // holds the value may be read directly.
++                        self.reg_assignments
++                            .get(&v.0)
++                            .copied()
++                            .filter(|&r| !is_xmm_reg(r))
++                            .filter(|_| !self.home_clobbered.contains(&v.0))
++                    }
++                    _ => None,
++                };
++                if let Some(src) = direct_src {
++                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
++                    let ror_amount = match op {
++                        IrBinOp::RotateLeft => (width - amount) % width,
++                        IrBinOp::RotateRight => amount,
++                        _ => amount,
++                    };
++                    debug_assert!(ror_amount != 0);
++                    let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
++                    let src_typed = typed_phys_reg_name(src, ty);
++                    self.state.emit_fmt(format_args!(
++                        "    {} ${}, %{}, %{}",
++                        ror_mnem, ror_amount, src_typed, dest_typed
++                    ));
++                    if width == 32 {
++                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                    }
++                    self.state.reg_cache.invalidate_acc();
++                    self.note_inplace_compute(dest_phys, dest_value_id);
++                    return;
++                }
++            }
++            // Sub-word sources load with their typed form so the home stays
++            // zero-extended; 32/64-bit sources keep the generic staging.
++            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
+             if amount != 0 {
+                 if self.bmi2_enabled && super::isel::rorx_allowed() && (width == 32 || width == 64)
+                 {
+diff --git a/src/backend/x86/codegen/peephole/passes/fp_liveness.rs b/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
+index ff25e92b..c425fe74 100644
+--- a/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
++++ b/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
+@@ -625,7 +625,55 @@ fn is_plain_store(mn: &str) -> bool {
+ ///
+ /// Function-pointer calls through the retpoline thunks and PLT calls all
+ /// pass through the same census emitter.
++///
++/// ── THE ORDERING HOLE (PR #584) ──
++///
++/// The census is only "free to keep" at the ABI level; the GP dead-write
++/// pass is ENTITLED to delete `movb $N, %al` before a non-variadic callee
++/// (the accumulator is provably dead there, and deleting it is a real
++/// instruction-count win).  Once it does, this oracle's only source for
++/// the SSE-argument set is the staged-move window below — and that window
++/// walk used to BREAK on the first line that was not itself a staging
++/// move: the hazard-area release `addq $K, %rsp`, the stack-argument
++/// `pushq %rax`, and the GP half of every rax relay (`movq %xmmN, %rax`)
++/// all terminated the scan, so a call that staged its arguments across
++/// any of those was modeled as reading ZERO xmm registers — and
++/// `eliminate_dead_vector_copies` deleted the live argument staging (a
++/// 10-double call compiled with 7 of its 8 register arguments reading
++/// garbage).  Two fixes, layered:
++///
++/// 1. `# LCCC_CALL_FP <n>` (Phase 0 below): the codegen's authoritative
++///    count, published after the call text exactly like `# LCCC_CALL_ARGS`
++///    — a comment, immune to every value-shape pass.  Exact for every
++///    call that went through `emit_call_reg_args_impl`.
++/// 2. The window walk (Phase 2) now SKIPS register-file-transparent lines
++///    (rsp adjustments, pushes/pops) and the GP half of relay pairs, with
++///    a step budget that covers the full 8-register staging window.  This
++///    keeps the hand-emitted libcall sites sound too.
+ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize) -> u64 {
++    // Phase 0: the authority marker. `# LCCC_CALL_FP <n>` is published by
++    // `emit_call_instruction_impl` within a few lines after the call text
++    // (same discharge contract as `# LCCC_CALL_ARGS`); it survives every
++    // peephole pass because it is a comment. n = the exact number of
++    // leading SSE argument registers the callee reads (0..=8).
++    for k in n + 1..(n + 5).min(infos.len()) {
++        if infos[k].is_nop() {
++            continue;
++        }
++        let mk = infos[k].trimmed(store.get(k));
++        if let Some(rest) = mk.strip_prefix("# LCCC_CALL_FP ") {
++            if let Ok(v) = rest.trim().parse::<u32>() {
++                if v <= 8 {
++                    return (1u64 << v) - 1;
++                }
++            }
++            break; // illegible marker: fall through to the heuristics
++        }
++        if mk.starts_with('#') {
++            continue; // a sibling marker (LCCC_CALL_ARGS / VA / CHAIN)
++        }
++        break; // real code: no marker published for this call
++    }
+     // Calls whose census (if any) is NOT in the adjacent window: the inline
+     // retpoline (`call .Lrpl_inner_N` behind a `jmp`/label pair, census
+     // emitted before the `jmp`), the external thunks, and any indirect
+@@ -674,24 +722,66 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
+     // Phase 2: no census.  Indirect calls without one (`__builtin_apply`'s
+     // `call *%r11`, whose eight `movups` loads sit behind a label) stay
+     // conservative.  A direct call without a census is either GP-only or a
+-    // raw libcall site whose FP operand is staged by the plain XMM moves
+-    // IMMEDIATELY before it (`movq %rax, %xmm0` / `movd %eax, %xmm0` /
+-    // `movdqu (%rax), %xmm0`, at most two): collect the argument registers
+-    // those moves define and stop at the first line that is not such a move.
++    // site whose FP operands are staged by plain XMM moves in the window
++    // before it (`movq %rax, %xmm0` / `movd %eax, %xmm0` /
++    // `movdqu (%rax), %xmm0`): collect the argument registers those moves
++    // define and stop at the first line that is neither such a move nor
++    // REGISTER-FILE-TRANSPARENT.
++    //
++    // Transparent lines (skipped, consuming a step): rsp adjustments
++    // (`addq/subq $K, %rsp` — the hazard-area release, the stack-argument
++    // cleanup, alignment), `pushq`/`popq` (no xmm definition; `pushq %rax`
++    // is the stack-argument staging for an FP value read via rax), and the
++    // GP half of a rax relay (`movq/vmovq/movd/vmovd %xmmN, %rax` — reads
++    // an xmm, DEFINES a GP register, and is immediately followed below by
++    // its xmm-writing partner).  Skipping any of these can only EXTEND the
++    // walk and collect MORE registers — conservative-safe: the failure
++    // mode of the old break-on-first-foreign-line was the opposite
++    // (under-collection), and under-collection is what deleted live
++    // argument staging (PR #584).
++    //
++    // Step budget: 24 = the full SysV staging window (8 SSE argument
++    // registers, up to two lines per relay-staged argument) plus the
++    // transparent adjustments. Anything real that is not staging still
++    // breaks the walk — the contiguous-window soundness guard stands.
+     let mut written = 0u64;
+     let mut k = n;
+     let mut steps = 0;
+-    while k > start && steps < 4 {
++    while k > start && steps < 24 {
+         k -= 1;
+         if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Directive | LineKind::Empty) {
+             continue;
+         }
++        // Register-file-transparent lines are checked BEFORE the barrier
++        // test: `pushq`/`popq` ARE barriers (they adjust %rsp, which the
++        // slot-tracking passes must not see through) but they define and
++        // read no XMM register, so the call-reads walk crosses them.  A
++        // stack-argument `pushq %rax` sits between every >=9-FP-argument
++        // call's register staging and its `call`.
++        let tk = infos[k].trimmed(store.get(k));
++        let (mn, operands) = split_mnemonic(tk);
++        if mn == "pushq" || mn == "popq" || mn == "pushfq" || mn == "popfq" {
++            steps += 1;
++            continue;
++        }
++        // rsp adjustment with an immediate (`addq $16, %rsp` /
++        // `subq $8, %rsp`) — the hazard-area release, the stack-argument
++        // cleanup, alignment padding.  Also an %rsp-family barrier shape
++        // for the slot passes; XMM-transparent here.
++        if mn == "addq" || mn == "subq" {
++            let ops = operand_list(operands);
++            if ops.len() == 2
++                && ops[0].starts_with('$')
++                && (ops[1] == "%rsp" || ops[1] == "%rsp)" || ops[1] == "%esp")
++            {
++                steps += 1;
++                continue;
++            }
++        }
+         if infos[k].is_barrier() {
+             break;
+         }
+         steps += 1;
+-        let tk = infos[k].trimmed(store.get(k));
+-        let (mn, operands) = split_mnemonic(tk);
+         let staging = matches!(
+             mn,
+             "movq"
+@@ -719,7 +809,24 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
+         );
+         match dest_operand(operands).and_then(xmm_index) {
+             Some(d) if staging => written |= 1u64 << d,
+-            _ => break,
++            _ => {
++                // GP half of a relay pair: `movq %xmmN, %rax` — an xmm
++                // SOURCE with a GP destination. It defines no xmm register
++                // (nothing to collect) and its partner below was already
++                // collected; skipping it extends the walk to arguments
++                // staged further up. Only the exact xmm→GP move forms;
++                // anything else is real code and stops the scan.
++                let ops = operand_list(operands);
++                let relay_half = matches!(mn, "movq" | "vmovq" | "movd" | "vmovd")
++                    && dest_operand(operands).is_some_and(|d| xmm_index(d).is_none())
++                    && ops[..ops.len().saturating_sub(1)]
++                        .iter()
++                        .any(|s| s.starts_with("%xmm") || s.starts_with("%ymm"));
++                if relay_half {
++                    continue;
++                }
++                break;
++            }
+         }
+     }
+     written & CALL_READS
+@@ -1673,6 +1780,207 @@ mod tests {
+         }
+     }
+ 
++    /// ── The PR #584 bug class ──
++    ///
++    /// `eliminate_dead_pure_writes` legitimately deletes the `movb $N, %al`
++    /// census before a non-variadic callee (%al is dead there).  Once the
++    /// census is gone, the fallback window walk is the only source for the
++    /// SSE-argument set.  It used to BREAK on the first non-staging line —
++    /// the hazard-area release `addq $K, %rsp`, the stack-argument
++    /// `pushq %rax`, and the GP half of every rax relay all terminated the
++    /// scan — so the call was modeled as reading ZERO xmm registers and
++    /// `eliminate_dead_vector_copies` deleted the live argument staging
++    /// (a 10-double call lost 7 of its 8 register arguments to garbage).
++    /// The `# LCCC_CALL_FP <n>` authority marker fixes the general case;
++    /// the tests below pin every layer.
++
++    /// The authority marker is exact and immune to the census deletion:
++    /// no census anywhere, marker says 8 → all eight argument registers
++    /// read across the hazard-area release.
 +    #[test]
-+    fn copy_then_self_narrow_extension_fuses_into_one_extension_of_the_source() {
-+        // `movl %ebx,%eax; movzwl %ax,%eax` is one value moved and then
-+        // re-typed; `movzwl %bx,%eax` does both.  The boot corpus has 45 of
-+        // these for movzwl alone (scripts/boot_insn_census.py).
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movl %ebx, %eax\n",
-+            "    movzwl %ax, %eax\n",
-+            "    movl %eax, (%edx)\n",
-+            "    movl %ebx, (%ecx)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
++    fn call_fp_marker_is_authoritative_without_census() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm8, %xmm1\n\
++             \x20   movsd %xmm9, %xmm2\n\
++             \x20   movsd %xmm10, %xmm3\n\
++             \x20   movsd %xmm11, %xmm4\n\
++             \x20   movsd %xmm12, %xmm5\n\
++             \x20   movsd %xmm13, %xmm6\n\
++             \x20   movsd %xmm14, %xmm7\n\
++             \x20   movq %xmm7, %rax\n\
++             \x20   movq %rax, %xmm0\n\
++             \x20   addq $16, %rsp\n\
++             \x20   call f10@PLT\n\
++             \x20   # LCCC_CALL_ARGS 0\n\
++             \x20   # LCCC_CALL_FP 8\n",
 +        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("movzwl %bx, %eax"),
-+            "the copy/extension pair did not fuse:\n{out}"
++        for (probe, reg) in [
++            ("movsd %xmm8, %xmm1", 1),
++            ("movsd %xmm10, %xmm3", 3),
++            ("movsd %xmm14, %xmm7", 7),
++        ] {
++            let n = line_of(&store, probe);
++            assert_eq!(
++                lv.xmm_live_after(n, reg),
++                Some(true),
++                "{probe}: staged argument read (marker says 8)"
++            );
++        }
++    }
++
++    /// The marker sits among sibling markers (`VA`, `CALL_ARGS`, `CHAIN`)
++    /// and is skipped by their parsers; it must parse through them too.
++    /// The order matches `emit_call_instruction_impl`: CHAIN keeps its
++    /// tight-window position (the GP oracle scans n+1..n+3 for it) and
++    /// CALL_FP is emitted LAST — reordering them regresses nested
++    /// functions (the static-chain staging gets deleted; found via
++    /// nested_functions in the corpus).
++    #[test]
++    fn call_fp_marker_parses_through_sibling_markers() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm3, %xmm1\n\
++             \x20   call g@PLT\n\
++             \x20   # LCCC_VA_CALL\n\
++             \x20   # LCCC_CALL_ARGS 2\n\
++             \x20   # LCCC_CHAIN_CALL\n\
++             \x20   # LCCC_CALL_FP 2\n",
 +        );
-+        assert!(
-+            !out.contains("movl %ebx, %eax"),
-+            "the fused copy is still present:\n{out}"
++        let n = line_of(&store, "movsd %xmm3, %xmm1");
++        assert_eq!(lv.xmm_live_after(n, 1), Some(true));
++        assert_eq!(lv.xmm_live_after(n, 2), Some(false));
++        assert_eq!(lv.xmm_live_after(n, 3), Some(false));
++        assert_eq!(lv.xmm_live_after(n, 7), Some(false));
++    }
++
++    /// A zero-count marker models a GP-only call exactly (Phase 0 wins
++    /// over the census-less window heuristic even when xmm moves happen
++    /// to sit in the window for other reasons).
++    #[test]
++    fn call_fp_zero_marker_is_exact() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm3, %xmm1\n\
++             \x20   call g@PLT\n\
++             \x20   # LCCC_CALL_ARGS 1\n\
++             \x20   # LCCC_CALL_FP 0\n",
++        );
++        let n = line_of(&store, "movsd %xmm3, %xmm1");
++        assert_eq!(lv.xmm_live_after(n, 1), Some(false));
++    }
++
++    /// The hardened window walk (no marker, no census — the hand-emitted
++    /// libcall shape): rsp adjustments, pushes and relay GP-halves are
++    /// register-file-transparent; the staging collected through them all.
++    #[test]
++    fn window_walk_skips_transparent_lines_and_relay_halves() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm8, %xmm1\n\
++             \x20   movq %xmm9, %rax\n\
++             \x20   movq %rax, %xmm2\n\
++             \x20   movq %xmm2, %rax\n\
++             \x20   pushq %rax\n\
++             \x20   subq $8, %rsp\n\
++             \x20   movq %xmm15, %rax\n\
++             \x20   movq %rax, %xmm0\n\
++             \x20   addq $16, %rsp\n\
++             \x20   call raw_helper@PLT\n",
++        );
++        let n = line_of(&store, "movsd %xmm8, %xmm1");
++        assert_eq!(
++            lv.xmm_live_after(n, 1),
++            Some(true),
++            "staging survives the push/addq/window"
 +        );
 +        assert_eq!(
-+            out.matches("movzwl").count(),
-+            1,
-+            "expected exactly one extension after the fold:\n{out}"
++            lv.xmm_live_after(n, 9),
++            Some(true),
++            "the relay half below reads %xmm9"
++        );
++        let m = line_of(&store, "movq %rax, %xmm2");
++        assert_eq!(
++            lv.xmm_live_after(m, 2),
++            Some(true),
++            "relay-staged argument read through the relay GP half"
++        );
++        let k = line_of(&store, "movq %xmm9, %rax");
++        assert_eq!(
++            lv.xmm_live_after(k, 9),
++            Some(false),
++            "the relay half consumes its source"
 +        );
 +    }
 +
++    /// The window walk still STOPS at real code: a computation between
++    /// the staging and the call ends the collection, so the staging is
++    /// not modeled as a call argument.
 +    #[test]
-+    fn copy_then_extension_never_reads_the_high_byte_alias() {
-+        // SOUNDNESS for the fusion's "compare the operand TEXT, not the
-+        // family" rule.  `%ah` and `%al` are the same register family, so a
-+        // family-only comparison would rewrite
-+        //     movl %ebx,%eax ; movzbl %ah,%eax
-+        // into `movzbl %bl,%eax` -- a different byte, i.e. wrong code.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movl %ebx, %eax\n",
-+            "    movzbl %ah, %eax\n",
-+            "    movl %eax, (%edx)\n",
-+            "    movl %ebx, (%ecx)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
++    fn window_walk_still_stops_at_real_code() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm5, %xmm1\n\
++             \x20   vaddsd %xmm4, %xmm3, %xmm3\n\
++             \x20   call raw_helper@PLT\n",
 +        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("movzbl %ah, %eax"),
-+            "the high-byte extension was rewritten to a different byte:\n{out}"
++        let n = line_of(&store, "movsd %xmm5, %xmm1");
++        // The staging is separated from the call by a real instruction:
++        // the collection stopped at the vaddsd, so the call's read set is
++        // empty and the staged xmm1 is dead past its own definition.
++        assert_eq!(
++            lv.xmm_live_after(n, 1),
++            Some(false),
++            "staging behind real code is not a call argument"
 +        );
-+        assert!(
-+            !out.contains("movzbl %bl"),
-+            "the fold read the low byte where the source needs the high one:\n{out}"
-+        );
++        assert_eq!(lv.xmm_live_after(n, 5), Some(false));
 +    }
 +
++    /// Full-depth relay chain: eight arguments staged as rax relays with
++    /// a hazard-area release before the call — the exact f10 shape from
++    /// the PR #584 repro, without any marker or census.  Every staged
++    /// destination must be read by the call, and every relay source must
++    /// stay live until its own relay half.
 +    #[test]
-+    fn folded_copy_extension_text_reaches_the_assembler_parseable() {
-+        // REGRESSION GATE for a defect this pass shipped with: the fused line
-+        // was emitted as `movzwl%bx, %eax` (the mnemonic's trailing space was
-+        // trimmed and never restored).  The peephole's own classifier filed
-+        // it under the `Other` catch-all and every text-level assertion
-+        // passed, so only a real compile saw it -- eight boot translation
-+        // units died with "unhandled i686 instruction: movzwl%bx".
-+        //
-+        // A peephole test that only greps its own output cannot catch that
-+        // class, so this one routes the result through the actual i686
-+        // assembler, which is what the compiler does with it next.
-+        let asm = concat!(
-+            "    .text\n",
-+            "    .globl f\n",
-+            "f:\n",
-+            "    movl %ebx, %eax\n",
-+            "    movzwl %ax, %eax\n",
-+            "    movl %eax, (%edx)\n",
-+            "    ret\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("movzwl %bx, %eax"),
-+            "pair did not fuse:\n{out}"
-+        );
-+        let obj = std::env::temp_dir().join("lccc_fold_copy_ext_parseable.o");
-+        let path = obj.to_string_lossy().into_owned();
-+        crate::backend::i686::assembler::assemble(&out, &path).unwrap_or_else(|e| {
-+            panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
-+        });
-+        let _ = std::fs::remove_file(&path);
++    fn window_walk_covers_the_full_eight_argument_relay_chain() {
++        let mut body = String::new();
++        for d in 0..8u32 {
++            body.push_str(&format!(
++                "    movq %xmm{}, %rax\n    movq %rax, %xmm{}\n",
++                d + 7,
++                d
++            ));
++        }
++        body.push_str("    addq $16, %rsp\n    call f10@PLT\n");
++        let (store, _i, lv) = build(&body);
++        // (a) every staged destination is a call argument: live-out of its
++        // own staging line (the anti-deletion property the bug broke).
++        for d in 0..8u32 {
++            let probe = format!("movq %rax, %xmm{d}");
++            let n = line_of(&store, &probe);
++            assert_eq!(
++                lv.xmm_live_after(n, d),
++                Some(true),
++                "xmm{d} staged argument is read by the call"
++            );
++        }
++        // (b) chain integrity: each relay source stays live out of the
++        // PREVIOUS pair's staging line (its own relay half is next) and
++        // dies at the relay half itself.
++        for d in 1..8u32 {
++            let src = d + 7;
++            let staging_below = format!("movq %rax, %xmm{}", d - 1);
++            let n = line_of(&store, &staging_below);
++            assert_eq!(
++                lv.xmm_live_after(n, src),
++                Some(true),
++                "%xmm{src} live until its relay half"
++            );
++            let half = format!("movq %xmm{src}, %rax");
++            let h = line_of(&store, &half);
++            assert_eq!(
++                lv.xmm_live_after(h, src),
++                Some(false),
++                "the relay half consumes %xmm{src}"
++            );
++        }
 +    }
++
+     #[test]
+     fn reg_reg_movsd_merge_keeps_destination_live() {
+         let (store, _i, lv) = build(
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index b391f44e..e1c95fb8 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -4575,6 +4575,7 @@ fn loop_entry_is_unique(
+     header: usize,
+     latch: usize,
+     entry: usize,
++    fallthrough_ok: bool,
+ ) -> bool {
+     let (func_start, func_end) = function_range(store, infos, header).unwrap_or((0, store.len()));
+     let mut labels: Vec<&str> = Vec::new();
+@@ -4617,7 +4618,14 @@ fn loop_entry_is_unique(
+             _ => {}
+         }
+     }
+-    entries == 1
++    // A jmp-entry loop has exactly one outside edge (the preheader jump,
++    // exempted at `entry`).  A fall-through-entry loop (guarded shape)
++    // has ZERO jump edges — the single entry is the fall-through past the
++    // guard, which the placement scan verified ends in a control-flow
++    // boundary.  `fallthrough_ok` admits that shape; any jump edge into
++    // the loop still returns false above (a second entry bypasses the
++    // hoist placement).
++    entries == 1 || (fallthrough_ok && entries == 0)
  }
-diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index 911310a..cd819aa 100644
---- a/src/backend/i686/codegen/prologue.rs
-+++ b/src/backend/i686/codegen/prologue.rs
-@@ -368,18 +368,24 @@ impl I686Codegen {
+ 
+ // ── Loop-invariant GPR load hoisting ────────────────────────────────────────
+@@ -4670,8 +4678,11 @@ fn loop_entry_is_unique(
+ // Pinned candidates (volatile / address-taken slots, param-ABI reads) are
+ // never touched.
+ 
+-pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+-    let len = store.len();
++pub(super) fn hoist_loop_invariant_gpr_load(
++    store: &mut LineStore,
++    infos: &mut Vec<LineInfo>,
++) -> bool {
++    let mut len = store.len();
+     let mut changed = false;
+ 
+     let mut i = 0;
+@@ -4762,10 +4773,51 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+                 break;
+             }
+         }
+-        // Fall-through or multiple-entry: no dominating placement exists.
+-        let Some(entry) = entry_jmp else {
+-            i += 1;
+-            continue;
++        // Fall-through entry: a guarded loop (`guard: cmp; jcc exit; .p2align*;
++        // header:`) enters by falling through the guard's conditional.
++        // A LOAD cannot be placed there (it would execute even when the
++        // loop body runs zero times — a load may fault), but a PURE LEA
++        // can: it computes a constant address, touches no memory, writes
++        // no flags.  The insertion lands after the last control-flow
++        // boundary before the header's directive run, so the alignment
++        // directives stay adjacent to the header label (the loop's
++        // alignment is preserved exactly).
++        //
++        // `insert_entry` = Some(pos) selects insertion-at-pos placement
++        // (LEA candidates only); `None` keeps the jmp-replacement path.
++        let mut insert_entry: Option<usize> = None;
++        let entry = if let Some(e) = entry_jmp {
++            e
++        } else {
++            let mut q = header;
++            let mut place = None;
++            while q > func_start + 1 {
++                q -= 1;
++                if infos[q].is_nop()
++                    || matches!(infos[q].kind, LineKind::Directive | LineKind::Empty)
++                {
++                    continue; // the alignment/directive run before the label
++                }
++                // The first real instruction above the directive run must
++                // be a control-flow boundary: the LEA lands directly after
++                // it, before the directives.  A compute instruction there
++                // could be feeding flags into the loop body — bail (fail
++                // closed) rather than reason about cross-block flag
++                // liveness.
++                if matches!(
++                    infos[q].kind,
++                    LineKind::CondJmp | LineKind::Jmp | LineKind::Label
++                ) {
++                    place = Some(q + 1);
++                }
++                break;
++            }
++            let Some(place) = place else {
++                i += 1;
++                continue;
++            };
++            insert_entry = Some(place);
++            place
+         };
+ 
+         // Rules 1+3: single entry (no second edge into ANY loop label, no
+@@ -4789,7 +4841,10 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+                 _ => {}
+             }
+         }
+-        if has_ret || has_call || !loop_entry_is_unique(store, infos, header, i, entry) {
++        if has_ret
++            || has_call
++            || !loop_entry_is_unique(store, infos, header, i, entry, insert_entry.is_some())
++        {
+             i += 1;
+             continue;
+         }
+@@ -4811,100 +4866,44 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+         // Scan body for movq OFFSET(%rsp), %REG (or %rbp) candidates.
+         // Only hoist one load per loop per pass (to avoid interactions).
+         let mut hoisted_one = false;
+-        for pos in body_start + 1..i {
+-            if hoisted_one {
+-                break;
+-            }
+-            if infos[pos].is_nop() {
+-                continue;
+-            }
+ 
+-            // Match: movq OFFSET(%rsp), %REG or movq OFFSET(%rbp), %REG
+-            let t = infos[pos].trimmed(store.get(pos));
+-            if !t.starts_with("movq ") {
+-                continue;
+-            }
+-            // Pinned lines (volatile / address-taken slots, param-ABI
+-            // reads) are never hoisted.
+-            if infos[pos].pinned {
+-                continue;
+-            }
+-            // Parse: "movq SRC, %DST"
+-            let after_movq = &t[5..];
+-            let comma = match after_movq.find(", %") {
+-                Some(c) => c,
+-                None => continue,
+-            };
+-            let src_part = &after_movq[..comma];
+-            let dst_part = &after_movq[comma + 2..]; // includes %
+-
+-            // Source must be a stack slot
+-            let base: RegId = if src_part.ends_with("(%rsp)") {
+-                4
+-            } else if src_part.ends_with("(%rbp)") {
+-                5
+-            } else {
+-                continue;
+-            };
+-            // Destination must be a GP register — and never %rsp (family 4):
+-            // the backend never allocates it, and writing it moves every
+-            // rsp-relative address. (%rbp stays legal: under
+-            // -fomit-frame-pointer it is an ordinary callee-saved register,
+-            // and with a frame pointer the allocator never deals it.)
+-            let dst_family = register_family_fast(dst_part);
+-            if dst_family == REG_NONE || dst_family > REG_GP_MAX || dst_family == 4 {
+-                continue;
+-            }
+-            // Don't hoist into rax/rcx (accumulator) or rsp/rbp
+-            // Skip rax (primary accumulator), rsp, rbp (frame registers)
+-            if dst_family == 0 || dst_family == 4 || dst_family == 5 {
+-                continue;
+-            }
+-
+-            // Rule 2: the slot is stable and its base cannot move in
+-            // `[entry..=i]` (shared engine: XMM/RMW/string/atomic stores,
+-            // pointer stores, push/pop, rsp arithmetic, ...).
+-            let slot = parse_frame_slot(src_part, 8);
+-            if !frame_slot_stable_in_range(store, infos, entry, i, base, slot) {
+-                continue;
+-            }
+-
+-            // Rule 4: the destination is written nowhere else in
+-            // `[entry..=i]` — exact implicits plus an unknown-destination
+-            // fallback (the implicit-operand table yields `(0, 0)` for
+-            // unknown mnemonics).
+-            let mut reg_written_elsewhere = false;
+-            for chk in entry..=i {
+-                if chk == pos {
+-                    continue;
+-                } // skip the load itself
+-                if infos[chk].is_nop() {
++        // Shared register-safety rules for a hoist candidate at `pos`
++        // writing `dst_family` (Rules 4, 4b, 5 and 6 from the load path —
++        // they are about REGISTER lifetimes and apply identically to
++        // every pure candidate form):
++        //
++        //   Rule 4:  the destination is written nowhere else in
++        //            `[entry..=i]` (exact implicits plus the
++        //            unknown-destination fallback);
++        //   Rule 4b: no forward edge in `[header..pos)` jumps over the
++        //            candidate into `(pos..i]`;
++        //   Rule 5:  the old value is dead at the hoist point — no mention
++        //            (read) in `[entry..pos)`;
++        //   Rule 6:  the destination is not observed after the loop.
++        let reg_safe_for_hoist = |store: &LineStore,
++                                  infos: &[LineInfo],
++                                  entry: usize,
++                                  header: usize,
++                                  latch: usize,
++                                  func_end: usize,
++                                  len: usize,
++                                  pos: usize,
++                                  dst_family: RegId|
++         -> bool {
++            // Rule 4: written nowhere else.
++            for chk in entry..=latch {
++                if chk == pos || infos[chk].is_nop() {
+                     continue;
+                 }
+                 if matches!(infos[chk].kind, LineKind::Other { dest_reg }
+                     if dest_reg == REG_NONE)
+                     || writes_family(&infos[chk], infos[chk].trimmed(store.get(chk)), dst_family)
+                 {
+-                    reg_written_elsewhere = true;
+-                    break;
++                    return false;
                  }
              }
-             let _ = &ret_operands; // (ret_operands kept for the PIC-free path)
--            let skip = crate::backend::regalloc::analyze_accumulator_assignments_with_config(
--                func,
--                crate::backend::regalloc::AccumulatorPolicy {
--                    operand_order:
--                        crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
--                    return_consumes_accumulator: true,
--                },
--                &self.state.ra_config,
--            )
--            .into_iter()
--            .map(|a| a.value_id)
--            .collect::<crate::common::fx_hash::FxHashSet<_>>();
-+            // Kill switch for the whole policy (see RaConfig::no_i686_accum_nohome).
-+            let skip: crate::common::fx_hash::FxHashSet<u32> =
-+                if self.state.ra_config.no_i686_accum_nohome {
-+                    Default::default()
-+                } else {
-+                    crate::backend::regalloc::analyze_accumulator_assignments_with_config(
-+                    func,
-+                    crate::backend::regalloc::AccumulatorPolicy {
-+                        operand_order:
-+                            crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
-+                        return_consumes_accumulator: true,
-+                    },
-+                    &self.state.ra_config,
-+                )
-+                .into_iter()
-+                .map(|a| a.value_id)
-+                .collect()
+-            if reg_written_elsewhere {
+-                continue;
+-            }
+-
+-            // Rule 4b (skip-edge veto): no forward edge in `[header..pos)`
+-            // may jump over the candidate into `(pos..i]`. Such an edge
+-            // would let a use below `pos` read the pre-loop value while
+-            // the hoisted load overwrites it (a backend-valid
+-            // partial-redefinition shape: the skipped `dst` definition
+-            // normally forces a join copy that Rule 4 vetoes, but this
+-            // rule must not depend on that producer invariant).
+-            // Backward edges (target at/above the jump) cannot skip `pos`
+-            // and are exempt; indirect jumps and inline asm are already
+-            // vetoed function-wide by Rule 1.
+-            let mut skips_pos = false;
+-            'rule4b: for chk in header..pos {
++            // Rule 4b: skip-edge veto.
++            for chk in header..pos {
+                 if infos[chk].is_nop() {
+                     continue;
+                 }
+@@ -4915,9 +4914,6 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+                 let Some(tgt) = jt.split_whitespace().nth(1) else {
+                     continue;
+                 };
+-                // Locate the target label; an unresolvable target fails
+-                // closed (direct jumps always name a file-local label, so
+-                // this only fires on shapes the classifier misjudged).
+                 let tgt_label = format!("{tgt}:");
+                 let mut tgt_pos = None;
+                 for l in 0..len {
+@@ -4929,72 +4925,209 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+                     }
+                 }
+                 let Some(tp) = tgt_pos else {
+-                    skips_pos = true;
+-                    break;
++                    return false;
+                 };
+                 if tp <= chk {
+                     continue; // backward edge: cannot skip pos
+                 }
+-                if tp > pos && tp <= i {
+-                    skips_pos = true;
+-                    break 'rule4b;
++                if tp > pos && tp <= latch {
++                    return false;
+                 }
+             }
+-            if skips_pos {
+-                continue;
+-            }
+-
+-            // Rule 5: the old value is dead at the hoist point — any mention
+-            // in `[entry..pos)` is a read (rule 4 proved no writes there).
+-            // `reg_refs` is textual, so instructions with implicit register
+-            // operands additionally veto when the destination is in the
+-            // implicitly-readable range (`div`, shifts, `cpuid`, `syscall`,
+-            // ... only ever touch families below `%r12`).
++            // Rule 5: the old value is dead at the hoist point.
+             let dst_bit = 1u16 << dst_family;
+-            let mut old_value_observed = false;
+             for chk in entry..pos {
+                 if infos[chk].is_nop() {
+                     continue;
+                 }
+                 if infos[chk].reg_refs & dst_bit != 0 {
+-                    old_value_observed = true;
+-                    break;
++                    return false;
+                 }
+                 if dst_family < 12 && has_implicit_reg_usage(infos[chk].trimmed(store.get(chk))) {
+-                    old_value_observed = true;
+-                    break;
++                    return false;
+                 }
+             }
+-            if old_value_observed {
+-                continue;
+-            }
+-
+-            // Rule 6: the destination is not observed after the loop — no
+-            // mention past the back-edge (same implicit backstop; `ret`
+-            // reads `%rdx` for 128-bit returns). `pop %dst` restores are
+-            // pure kills, not reads, and are skipped.
+-            let mut observed_after_loop = false;
+-            for k in i + 1..func_end {
++            // Rule 6: not READ after the loop.  A full WRITE to the
++            // destination before any read is a pure kill — the hoisted
++            // value is dead from that point backward, so the scan stops
++            // there and the hoist is allowed (sha256's tail stages
++            // `movq %rsi, %rcx` right after the 64-round loop: rcx's
++            // loop value is never read, only overwritten).  `pop %dst`
++            // restores are kills too.  A read (or an implicit-usage line,
++            // or a 128-bit `ret` reading rdx) observes the value and
++            // vetoes.
++            for k in latch + 1..func_end {
+                 if infos[k].is_nop() {
+                     continue;
+                 }
+                 if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
+                     continue;
+                 }
++                let text_k = infos[k].trimmed(store.get(k));
++                let kills_it = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == REG_NONE)
++                    || writes_family(&infos[k], text_k, dst_family);
++                if kills_it {
++                    break; // a full definition: the hoisted value dies here
++                }
+                 if infos[k].reg_refs & dst_bit != 0 {
+-                    observed_after_loop = true;
+-                    break;
++                    return false;
+                 }
+                 if matches!(infos[k].kind, LineKind::Ret) && dst_family == 2 {
+-                    observed_after_loop = true;
+-                    break;
++                    return false;
+                 }
+-                if dst_family < 12 && has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
+-                    observed_after_loop = true;
+-                    break;
++                if dst_family < 12 && has_implicit_reg_usage(text_k) {
++                    return false;
++                }
++            }
++            true
++        };
++
++        for pos in body_start + 1..i {
++            if hoisted_one {
++                break;
++            }
++            if infos[pos].is_nop() {
++                continue;
++            }
++
++            // Match: movq OFFSET(%rsp), %REG or movq OFFSET(%rbp), %REG
++            let t = infos[pos].trimmed(store.get(pos));
++            if !t.starts_with("movq ") {
++                // Candidate class 2 — the rip-relative address
++                // materialization: `leaq SYM(%rip), %REG`.  Pure (an
++                // address computation, no memory read), so Rule 2 (slot
++                // stability) does not apply; every register rule does.
++                // This is the rematerialized global base that the array
++                // lowering re-emits per access — sha256's K-table inside
++                // the 64-round loop paid the LEA every round (measured:
++                // sha256_transform at 1.20x gcc; the load through it is
++                // `movl (%rcx, %r10, 4), %r15d`, so the base cannot fold
++                // into the memory operand — RIP-relative addressing
++                // takes no index register, the LEA is load-bearing and
++                // only hoisting removes it).
++                if !t.starts_with("leaq ") {
++                    continue;
++                }
++                if infos[pos].pinned {
++                    continue;
++                }
++                let after_lea = &t[5..];
++                let Some(comma) = after_lea.find(", %") else {
++                    continue;
 +                };
-             let extra: Vec<u32> = skip
-                 .iter()
-                 .copied()
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 7632e40..992fac9 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -226,6 +226,14 @@ pub(crate) struct RaConfig {
-     pub(crate) debug_vararg: bool,
-     /// `CCC_NO_X64_IMMED_NOHOME`: disable x86 immediate-consumer no-home policy (default: false).
-     pub(crate) no_x64_immed_nohome: bool,
-+    /// `CCC_NO_I686_ACCUM_NOHOME`: disable the i686 "immediately-consumed
-+    /// values get no home" policy (default: false).  The i686 twin of
-+    /// `CCC_NO_X64_IMMED_NOHOME`; it exists because the policy's premise —
-+    /// a register home only ever costs an extra `movl %R,%eax` relay — is
-+    /// false for the ops `try_emit_int_binop_direct` handles, which read a
-+    /// register-homed operand IN PLACE.  Keep it a switch: the boot corpus
-+    /// A/B in engineering/journal decides the default, not the theory.
-+    pub(crate) no_i686_accum_nohome: bool,
-     /// `CCC_X64_NOHOME_CLASSES`: selected no-home consumer classes (default: `ret,store,copy,cast,unary,binop`).
-     pub(crate) x64_nohome_classes: String,
-     /// `CCC_MI_MAX_LOOP_INSTS`: MachInst loop-size threshold
-@@ -362,6 +370,7 @@ impl RaConfig {
-             no_va_root_guard: present("CCC_NO_VA_ROOT_GUARD"),
-             debug_vararg: present("CCC_DEBUG_VARARG"),
-             no_x64_immed_nohome: present("CCC_NO_X64_IMMED_NOHOME"),
-+            no_i686_accum_nohome: present("CCC_NO_I686_ACCUM_NOHOME"),
-             x64_nohome_classes: text("CCC_X64_NOHOME_CLASSES")
-                 .unwrap_or_else(|| "ret,store,copy,cast,unary,binop".into()),
-             mi_max_loop_insts: number("CCC_MI_MAX_LOOP_INSTS", MI_MAX_LOOP_INSTS_DEFAULT),
-@@ -10928,6 +10937,7 @@ mod ra_config_tests {
-         switch!(no_va_root_guard, "CCC_NO_VA_ROOT_GUARD");
-         switch!(debug_vararg, "CCC_DEBUG_VARARG");
-         switch!(no_x64_immed_nohome, "CCC_NO_X64_IMMED_NOHOME");
-+        switch!(no_i686_accum_nohome, "CCC_NO_I686_ACCUM_NOHOME");
-         switch!(mi_all_classic, "CCC_MI_ALL_CLASSIC");
-         switch!(mi_force_loops, "CCC_MI_FORCE_LOOPS");
-         switch!(mi_debug, "CCC_MI_DEBUG");
++                let src_part = after_lea[..comma].trim();
++                let dst_part = after_lea[comma + 2..].trim();
++                // Exactly `SYM(%rip)` / `SYM+OFF(%rip)`: no base register,
++                // no index/scale — anything else reads a register and is
++                // not a constant.
++                if !src_part.ends_with("(%rip)") || src_part.contains(',') {
++                    continue;
++                }
++                let dst_family = register_family_fast(dst_part);
++                if dst_family == REG_NONE
++                    || dst_family > REG_GP_MAX
++                    || dst_family == 4
++                    || dst_family == 5
++                    || dst_family == 0
++                {
++                    continue;
+                 }
++                if !reg_safe_for_hoist(
++                    store, infos, entry, header, i, func_end, len, pos, dst_family,
++                ) {
++                    continue;
++                }
++                let lea_text = store.get(pos).to_string();
++                let lea_text = lea_text.trim_end().to_string();
++                match insert_entry {
++                    Some(ins) => {
++                        // Fall-through entry: INSERT the LEA after the
++                        // control-flow boundary, before the directive run.
++                        // The insertion shifts every line at or above `ins`
++                        // — adjust the backedge `i`, `len`, and the
++                        // candidate `pos` (always > ins: the candidate is
++                        // inside the loop, the insertion before its header).
++                        store.insert_line(ins, lea_text.clone());
++                        let new_info = classify_line(&lea_text);
++                        // Vec splice: the pass contract keeps
++                        // `infos.len() == store.len()` — both grew by
++                        // exactly one line.
++                        infos.insert(ins, new_info);
++                        i += 1;
++                        len += 1;
++                        mark_nop(&mut infos[pos + 1]);
++                    }
++                    None => {
++                        // Jmp entry: the LEA replaces the entry jump and
++                        // falls through into the header (the load path's
++                        // mechanics).
++                        replace_line(store, &mut infos[entry], entry, lea_text);
++                        mark_nop(&mut infos[pos]);
++                    }
++                }
++                changed = true;
++                hoisted_one = true;
++                continue;
+             }
+-            if observed_after_loop {
++            // Pinned lines (volatile / address-taken slots, param-ABI
++            // reads) are never hoisted.
++            if infos[pos].pinned {
++                continue;
++            }
++            // A LOAD may only take the jmp-replacement placement: on a
++            // fall-through (guarded) entry the hoisted load would execute
++            // even when the loop body runs zero times, and a load may
++            // fault.  Only the pure LEA candidate above may insert.
++            if insert_entry.is_some() {
++                continue;
++            }
++            // Parse: "movq SRC, %DST"
++            let after_movq = &t[5..];
++            let comma = match after_movq.find(", %") {
++                Some(c) => c,
++                None => continue,
++            };
++            let src_part = &after_movq[..comma];
++            let dst_part = &after_movq[comma + 2..]; // includes %
++
++            // Source must be a stack slot
++            let base: RegId = if src_part.ends_with("(%rsp)") {
++                4
++            } else if src_part.ends_with("(%rbp)") {
++                5
++            } else {
++                continue;
++            };
++            // Destination must be a GP register — and never %rsp (family 4):
++            // the backend never allocates it, and writing it moves every
++            // rsp-relative address. (%rbp stays legal: under
++            // -fomit-frame-pointer it is an ordinary callee-saved register,
++            // and with a frame pointer the allocator never deals it.)
++            let dst_family = register_family_fast(dst_part);
++            if dst_family == REG_NONE || dst_family > REG_GP_MAX || dst_family == 4 {
++                continue;
++            }
++            // Don't hoist into rax/rcx (accumulator) or rsp/rbp
++            // Skip rax (primary accumulator), rsp, rbp (frame registers)
++            if dst_family == 0 || dst_family == 4 || dst_family == 5 {
++                continue;
++            }
++
++            // Rule 2: the slot is stable and its base cannot move in
++            // `[entry..=i]` (shared engine: XMM/RMW/string/atomic stores,
++            // pointer stores, push/pop, rsp arithmetic, ...).
++            let slot = parse_frame_slot(src_part, 8);
++            if !frame_slot_stable_in_range(store, infos, entry, i, base, slot) {
++                continue;
++            }
++
++            // Rules 4, 4b, 5 and 6 — the shared register-safety
++            // closure (identical semantics to the original inline block:
++            // written-nowhere-else, skip-edge veto, old-value-dead,
++            // not-observed-after-loop).
++            if !reg_safe_for_hoist(
++                store, infos, entry, header, i, func_end, len, pos, dst_family,
++            ) {
+                 continue;
+             }
+ 
+diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
+index ab015c98..5c9dd072 100644
+--- a/src/passes/simplify.rs
++++ b/src/passes/simplify.rs
+@@ -770,7 +770,7 @@ struct BinOpDef {
+ /// Bisection helper for the preboot-ZSTD miscompile. `CCC_SIMPLIFY_SKIP` is a
+ /// comma-separated list of fold families to disable:
+ /// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`,
+-/// `negneg`.
++/// `negneg`, `addneg`.
+ fn simplify_skip(family: &str) -> bool {
+     static SKIP: std::sync::LazyLock<String> =
+         std::sync::LazyLock::new(|| std::env::var("CCC_SIMPLIFY_SKIP").unwrap_or_default());
+@@ -980,6 +980,13 @@ fn try_simplify(
+     )
+ }
+ 
++/// Test wrapper for the Neg-def-sensitive folds (neg-of-neg,
++/// add/sub-of-neg): threads the NegDef map with everything else empty.
++#[cfg(test)]
++fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<Instruction> {
++    try_simplify_with_types(inst, &[], &[], &[], &[], neg_defs, &[], &[], &[], &[], &[])
++}
++
+ /// Simplify a Cast instruction.
+ ///
+ /// Handles:
+@@ -1813,6 +1820,41 @@ fn simplify_binop(
+                     return Some(inst);
+                 }
+             }
++            // Floats: x + (neg y) => x - y, plus the commuted spelling —
++            // the four-oracle consensus (GCC 16.2, Clang 23.1, ICX and
++            // local GCC 14.2 all emit the mirrored op; oracle-checked on
++            // add_neg/sub_neg/chain_pin and the MULTI-USE shapes, where
++            // GCC folds just the same — fold-const carries no use
++            // analysis). Exact for every numeric input and both zeros
++            // (IEEE 754 defines sub as the addition of the negation, and
++            // the zero-sign table is symmetric); the qNaN sign of the
++            // result may differ when y's NaN is the propagated one — the
++            // C11 6.5p8 latitude. ADJUDICATION: the house rule "take the
++            // latitude only when the materialisation dies" was derived
++            // when lccc was the conservative outlier; with every oracle
++            // folding unconditionally, NOT folding is what diverges from
++            // the competition on NaN-sign rows. The fold therefore fires
++            // unconditionally, like the oracles — bit-parity with GCC
++            // requires taking the latitude GCC takes.
++            if is_float && !simplify_skip("addneg") {
++                if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
++                    return Some(Instruction::BinOp {
++                        dest,
++                        op: IrBinOp::Sub,
++                        lhs: *lhs,
++                        rhs: neg_src,
++                        ty,
++                    });
++                } else if let Some(neg_src) = get_neg_def(lhs, neg_defs) {
++                    return Some(Instruction::BinOp {
++                        dest,
++                        op: IrBinOp::Sub,
++                        lhs: *rhs,
++                        rhs: neg_src,
++                        ty,
++                    });
++                }
++            }
+         }
+         IrBinOp::Sub => {
+             if rhs_zero && (!is_float || is_positive_zero(rhs)) {
+@@ -1844,6 +1886,20 @@ fn simplify_binop(
+                     });
+                 }
+             }
++            // Floats: x - (neg y) => x + y — the same four-oracle
++            // consensus fold as the Add mirror above, unconditional for
++            // the same bit-parity reason (see the adjudication there).
++            if is_float && !simplify_skip("addneg") {
++                if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
++                    return Some(Instruction::BinOp {
++                        dest,
++                        op: IrBinOp::Add,
++                        lhs: *lhs,
++                        rhs: neg_src,
++                        ty,
++                    });
++                }
++            }
+         }
+         IrBinOp::Mul => {
+             if !is_float && (rhs_zero || lhs_zero) {
+@@ -4951,6 +5007,204 @@ mod tests {
+         assert!(try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).is_none());
+     }
+ 
++    // === Float add/sub-of-neg tests (the four-oracle consensus folds) ===
++
++    #[test]
++    fn float_add_of_neg_folds_to_sub() {
++        // x + (neg y) => x - y (GCC 16.2, Clang 23.1, ICX and local GCC
++        // 14.2 all emit the mirrored op — the four-oracle consensus).
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F64,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        match result {
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                lhs,
++                rhs,
++                ..
++            } => {
++                assert!(matches!(lhs, Operand::Value(v) if v.0 == 0));
++                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
++            }
++            _ => panic!("Expected Sub(V0, V1), got {:?}", result),
++        }
++    }
++
++    #[test]
++    fn float_add_of_neg_commuted_folds_to_sub() {
++        // (neg y) + x => x - y (Sub is non-commutative: the plain operand
++        // stays the minuend).
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(2)),
++            rhs: Operand::Value(Value(0)),
++            ty: IrType::F64,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        match result {
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                lhs,
++                rhs,
++                ..
++            } => {
++                assert!(
++                    matches!(lhs, Operand::Value(v) if v.0 == 0),
++                    "minuend must be the plain operand"
++                );
++                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
++            }
++            _ => panic!("Expected Sub(V0, V1), got {:?}", result),
++        }
++    }
++
++    #[test]
++    fn float_sub_of_neg_folds_to_add() {
++        // x - (neg y) => x + y for floats (the extension of the historical
++        // integer fold to the float domain, matching every oracle).
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Sub,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F64,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        match result {
++            Instruction::BinOp {
++                op: IrBinOp::Add,
++                lhs,
++                rhs,
++                ..
++            } => {
++                assert!(matches!(lhs, Operand::Value(v) if v.0 == 0));
++                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
++            }
++            _ => panic!("Expected Add(V0, V1), got {:?}", result),
++        }
++    }
++
++    #[test]
++    fn float_add_of_neg_f32_folds_to_sub() {
++        // The fold is width-agnostic (f32 mirror).
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F32,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        assert!(matches!(
++            result,
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn float_add_of_multi_use_neg_folds_too() {
++        // The MULTI-USE adjudication pin: every oracle folds the add even
++        // when the negation has other readers (gcc: `(x + t) + (x * t)`
++        // with t = -y emits vsubsd + vfnmadd132sd — the add folds, the
++        // product's negation rides the family). NOT folding here is what
++        // would diverge from the competition on NaN-sign rows.
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F64,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        assert!(matches!(
++            result,
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn int_sub_of_neg_still_folds() {
++        // Historical behaviour pin: the INTEGER fold is exact (ring
++        // identity) and keeps firing exactly as before.
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Sub,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::I32,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        assert!(matches!(
++            result,
++            Instruction::BinOp {
++                op: IrBinOp::Add,
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn float_add_of_non_neg_stays() {
++        // Discriminating control: no Neg def, no fold.
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F64,
++        };
++        assert!(try_simplify_neg(&inst, &[]).is_none());
++    }
++
++    #[test]
++    fn float_add_of_const_stays() {
++        // A constant operand has no def to look through.
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Const(IrConst::F64(1.5)),
++            ty: IrType::F64,
++        };
++        assert!(try_simplify_neg(&inst, &[]).is_none());
++    }
++
+     // === Subtract-of-negation tests ===
+ 
+     #[test]
+@@ -4984,7 +5238,17 @@ mod tests {
+ 
+     #[test]
+     fn test_sub_neg_float_not_simplified() {
+-        // Float x - (neg y) should NOT be simplified (IEEE 754 concerns)
++        // REWRITTEN (the four-oracle adjudication): float x - (neg y) now
++        // DOES fold to x + y. The historical "IEEE 754 concerns" pin was
++        // more conservative than every compiler in the competition set —
++        // GCC 16.2, Clang 23.1, ICX and local GCC 14.2 all emit the
++        // mirrored vaddsd for `x - (-y)` (oracle-verified). The fold is
++        // exact for every numeric input and both zeros (IEEE 754 defines
++        // sub as the addition of the negation); the qNaN-sign latitude is
++        // C11 6.5p8-sanctioned and, with every oracle taking it, NOT
++        // folding is what diverges. The dedicated coverage lives in
++        // float_sub_of_neg_folds_to_add; this pin keeps the historical
++        // name as the record of the flip.
+         let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+         neg_defs[2] = Some(NegDef {
+             src: Operand::Value(Value(1)),
+@@ -4996,8 +5260,14 @@ mod tests {
+             rhs: Operand::Value(Value(2)),
+             ty: IrType::F64,
+         };
+-        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]);
+-        assert!(result.is_none());
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        assert!(matches!(
++            result,
++            Instruction::BinOp {
++                op: IrBinOp::Add,
++                ..
++            }
++        ));
+     }
+ 
+     // === Unsigned comparison simplification tests ===
+diff --git a/tests/regression/check_call_arg_staging.sh b/tests/regression/check_call_arg_staging.sh
+new file mode 100755
+index 00000000..000b1346
+--- /dev/null
++++ b/tests/regression/check_call_arg_staging.sh
+@@ -0,0 +1,250 @@
++#!/usr/bin/env bash
++# Call-argument staging gate: every SSE argument a call makes reaches its
++# register, the authority marker says the truth, and the FP liveness oracle
++# cannot model a live staging as dead.
++#
++# WHY THIS EXISTS
++#
++# PR #584's CI found a miscompile class that every other gate missed: a call
++# with >= 9 FP arguments (register staging + stack pushes) compiled with 7 of
++# its 8 register arguments reading garbage.  The causal chain, established
++# with the peephole trace instrumentation:
++#
++#   1. `emit_call_reg_args_impl` stages FP arguments as rax relays and
++#      publishes the count as `movb $N, %al` (the census);
++#   2. `eliminate_dead_pure_writes` LEGITIMATELY deletes the census for a
++#      non-variadic callee (%al is dead there per the GP liveness oracle);
++#   3. `eliminate_fp_xmm_roundtrips` converts the innermost relay into a
++#      direct `movsd %xmmN, %xmmM` (also legitimate);
++#   4. `eliminate_dead_vector_copies` asks `call_xmm_reads` for the call's
++#      SSE read set; the census is gone, and the fallback window walk broke
++#      at the first line that was not itself a staging move — the
++#      hazard-area release `addq $K, %rsp`, the stack-argument `pushq %rax`,
++#      the GP half of every remaining relay — so the call was modeled as
++#      reading ZERO xmm registers and the live argument staging was deleted.
++#
++# The fix is layered: the codegen now publishes `# LCCC_CALL_FP <n>` after
++# the call text (the same authority contract as `# LCCC_CALL_ARGS`; a
++# comment, immune to every value-shape pass), and the window walk skips
++# register-file-transparent lines (rsp adjustments, pushes/pops, relay
++# GP-halves) with a step budget that covers the full 8-register staging
++# window.  The emitter also no longer pre-spills STACK-class arguments into
++# the hazard area (their value was already pushed by the stack-argument
++# phase, which the driver runs first).
++#
++# This gate pins all three layers end to end:
++#
++#   A. runtime equality with the reference compiler on argument shapes built
++#      to hit every layer: volatile local and global sources (the original
++#      repros), 8..12 arguments (every stack-argument arity), f32, mixed
++#      GP+FP, struct-by-SSE-register, FMA-negation compositions (the
++#      add-of-neg fold freeing a multi-use negation into the staging),
++#      register-hazard shapes (pre-spill + restore staging), indirect
++#      calls, and calls inside loops;
++#   B. the marker: present with the exact count for FP calls, absent for
++#      GP-only calls, the census deleted for prototyped callees (the
++#      instruction win) but KEPT for variadic ones (SysV 3.5.7 requires it);
++#   C. the staging survival: the 10-argument volatile call writes ALL EIGHT
++#      SSE argument registers in its staging window, and no FP argument is
++#      routed through a GPR sign mask.
++#
++# Usage:
++#   tests/regression/check_call_arg_staging.sh
++# Environment:
++#   LCCC            compiler to test (default: target/fastbuild/lccc)
++#   CCC_ORACLE_CC   reference compiler (default: cc, gcc or clang)
++set -uo pipefail
++
++repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++cd "$repo_root"
++
++LCCC=${LCCC:-target/fastbuild/lccc}
++[[ "$LCCC" == /* ]] || LCCC="$repo_root/$LCCC"
++[[ -x "$LCCC" ]] || { echo "FAIL: no compiler at $LCCC" >&2; exit 1; }
++ORACLE=${CCC_ORACLE_CC:-}
++if [[ -z "$ORACLE" ]]; then
++    for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { ORACLE=$c; break; }; done
++fi
++[[ -n "$ORACLE" ]] || { echo "FAIL: no reference compiler found" >&2; exit 1; }
++
++FLAGS=(-O2 -march=x86-64-v3)
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++pass=0; fail=0; skip=0
++note() { printf '  %s\n' "$*"; }
++ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
++bad()  { fail=$((fail+1)); printf 'FAIL %s\n' "$*"; }
++skipped() { skip=$((skip+1)); printf 'skip %s\n' "$*"; }
++
++# ── A. runtime differential: every staging shape, bit-exact ─────────────────
++cat > "$work/staging.c" <<'EOF_STAGING'
++#include <stdio.h>
++#include <math.h>
++#define NI __attribute__((noinline))
++
++/* The arities: 8 = exactly the SSE register file; 9..12 = 1..4 stack
++ * arguments (the push sequences that used to terminate the liveness
++ * window walk).  Sources are VOLATILE: every argument is re-read from
++ * memory, defeating constant propagation and forcing the full staging. */
++NI static double f8(double a,double b,double c,double d,double e,double f,double g,double h)
++{ return a+b+c+d+e+f+g+h; }
++NI static double f9(double a,double b,double c,double d,double e,double f,double g,double h,double i)
++{ return a+b+c+d+e+f+g+h+i; }
++NI static double f10(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j)
++{ return a+b+c+d+e+f+g+h+i+j; }
++NI static double f11(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j,double k)
++{ return a+b+c+d+e+f+g+h+i+j+k; }
++NI static double f12(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j,double k,double l)
++{ return a+b+c+d+e+f+g+h+i+j+k+l; }
++NI static float g8(float a,float b,float c,float d,float e,float f,float g,float h)
++{ return a+b+c+d+e+f+g+h; }
++NI static float g9(float a,float b,float c,float d,float e,float f,float g,float h,float i)
++{ return a+b+c+d+e+f+g+h+i; }
++NI static float g10(float a,float b,float c,float d,float e,float f,float g,float h,float i,float j)
++{ return a+b+c+d+e+f+g+h+i+j; }
++/* Mixed GP+SSE: the classification interleaves IntReg and FloatReg. */
++NI static double m10(int p,double a,int q,double b,int r,double c,int s,double d,double e)
++{ return p+a+q+b+r+c+s+d+e; }
++/* Two-double struct: SSE-classified by eightbyte (StructSseReg), two
++ * registers per argument, stack overflow at arity 5. */
++typedef struct { double x, y; } dd;
++NI static double s3(dd a, dd b, dd c) { return a.x+a.y+b.x+b.y+c.x+c.y; }
++NI static double s5(dd a, dd b, dd c, dd d, dd e)
++{ return a.x+a.y+b.x+b.y+c.x+c.y+d.x+d.y+e.x+e.y; }
++/* The FMA-negation composition: the add-of-neg fold frees the multi-use
++ * negation into the peel while the staging runs (the shape that found
++ * the original defect). */
++NI static double neg9(double a,double b,double c,double d,double e,double f,double g,double h,double i)
++{ return -a + -b + -c + -d + -e + -f + -g + -h + -i; }
++NI static double fma_neg(double a, double b, double c)
++{ double n = -a; return __builtin_fma(n, b, c) + n; }
++/* Indirect call: the conservative path (no marker heuristics apply). */
++NI static double (*fpi)(double,double,double,double,double,double,double,double,double);
++/* Calls in a loop: cross-iteration staging, the liveness must hold at
++ * every iteration boundary. */
++NI static double loop9(volatile double *src, int n) {
++    double acc = 0.0;
++    for (int i = 0; i < n; i++)
++        acc += f9(src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7], src[8]);
++    return acc;
++}
++NI static double mixld(double a, long double b, double c)
++{ return a + (double)b + c; }
++
++static double volsrc;
++volatile double varr[9];
++int main(int argc, char **argv) {
++    /* Opaque base: no constant folding of the argument values. */
++    double s = argc * 1.0 + 0.125;
++    volatile double vl = s;
++    for (int i = 0; i < 9; i++) varr[i] = s + i;
++    printf("%.17g %.17g %.17g %.17g %.17g\n",
++        f8(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7),
++        f9(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8),
++        f10(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8,vl+9),
++        f11(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8,vl+9,vl+10),
++        f12(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8,vl+9,vl+10,vl+11));
++    volsrc = s;
++    printf("%.9g %.9g %.9g\n",
++        g8((float)volsrc,(float)volsrc+1,(float)volsrc+2,(float)volsrc+3,
++           (float)volsrc+4,(float)volsrc+5,(float)volsrc+6,(float)volsrc+7),
++        g9((float)volsrc,(float)volsrc+1,(float)volsrc+2,(float)volsrc+3,
++           (float)volsrc+4,(float)volsrc+5,(float)volsrc+6,(float)volsrc+7,(float)volsrc+8),
++        g10((float)volsrc,(float)volsrc+1,(float)volsrc+2,(float)volsrc+3,
++            (float)volsrc+4,(float)volsrc+5,(float)volsrc+6,(float)volsrc+7,
++            (float)volsrc+8,(float)volsrc+9));
++    printf("%.17g\n", m10(argc, vl, argc+1, vl+1, argc+2, vl+2, argc+3, vl+3, vl+4));
++    dd A = { s, s+1 }, B = { s+2, s+3 }, C = { s+4, s+5 }, D = { s+6, s+7 }, E = { s+8, s+9 };
++    printf("%.17g %.17g\n", s3(A,B,C), s5(A,B,C,D,E));
++    printf("%.17g\n", neg9(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8));
++    printf("%.17g\n", fma_neg(vl, vl+1, vl+2));
++    fpi = f9;
++    printf("%.17g\n", fpi(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8));
++    printf("%.17g\n", loop9(varr, 3));
++    printf("%.17g\n", mixld(vl, (long double)vl + 0.5L, vl+1));
++    return 0;
++}
++EOF_STAGING
++
++if "$ORACLE" "${FLAGS[@]}" -o "$work/staging.oracle" "$work/staging.c" -lm 2>/dev/null; then
++    "$work/staging.oracle" > "$work/stg.oracle" 2>&1
++    stg_ok=1
++    for cf in "-O0" "-O1" "-O2" "-O2 -march=x86-64-v2" "-O2 -march=x86-64-v3" "-O3 -march=x86-64-v3" "-O2 -march=x86-64-v3 -ffp-contract=off"; do
++        # shellcheck disable=SC2086
++        if ! "$LCCC" $cf -o "$work/staging.lccc" "$work/staging.c" -lm 2>"$work/stg.err"; then
++            stg_ok=0; bad "staging.c did not compile with lccc at $cf:"; head -3 "$work/stg.err" | note; continue
++        fi
++        "$work/staging.lccc" > "$work/stg.lccc" 2>&1
++        if ! diff -q "$work/stg.lccc" "$work/stg.oracle" >/dev/null; then
++            stg_ok=0; bad "staging output differs from $ORACLE at $cf:"; diff "$work/stg.lccc" "$work/stg.oracle" | head -8 | note
++        fi
++    done
++    if [[ "$stg_ok" -eq 1 ]]; then
++        ok "call-argument staging bit-exact vs $ORACLE at 7 flag sets (volatile 8..12-ary f64/f32, mixed GP+SSE, SSE structs, neg compositions, indirect, loop, x87 mix)"
++    fi
++else
++    bad "reference compiler could not build staging.c"
++fi
++
++# ── B. the authority marker and the census lifecycle ────────────────────────
++"$LCCC" "${FLAGS[@]}" -S -o "$work/staging.s" "$work/staging.c" 2>/dev/null
++# Marker counts: every noinline 8-SSE-register call in the file publishes
++# CALL_FP 8 (f8..f12, g8..g10, neg9, the f9-in-loop site, the s5 struct
++# call, the indirect site — data-calibrated, >= 10 with margin for
++# devirtualisation), and the sub-8 arities are present with their exact
++# counts (m10's 5 doubles, mixld's 2, loop9's GP-only 0).
++n_fp8=$(grep -c '^    # LCCC_CALL_FP 8$' "$work/staging.s" || true)
++n_fp5=$(grep -c '^    # LCCC_CALL_FP 5$' "$work/staging.s" || true)
++n_fp2=$(grep -c '^    # LCCC_CALL_FP 2$' "$work/staging.s" || true)
++n_fp0=$(grep -c '^    # LCCC_CALL_FP 0$' "$work/staging.s" || true)
++if [[ "$n_fp8" -ge 10 && "$n_fp5" -ge 1 && "$n_fp2" -ge 1 && "$n_fp0" -ge 1 ]]; then
++    ok "# LCCC_CALL_FP published with exact counts (8 x$n_fp8 register-file calls, 5 x$n_fp5 mixed, 2 x$n_fp2 x87-mix, 0 x$n_fp0 GP-only)"
++else
++    bad "LCCC_CALL_FP marker counts wrong: fp8=$n_fp8 fp5=$n_fp5 fp2=$n_fp2 fp0=$n_fp0 (expected >=10, >=1, >=1, >=1)"
++fi
++# The census is DEAD-ELIMINATED for prototyped callees (the instruction win
++# that triggered the bug) and KEPT for variadic ones (SysV 3.5.7: printf
++# reads %al).  Both sides of the dead-write interaction are pinned.
++n_census=$(grep -cE '^[[:space:]]*movb \$[1-8], %al$' "$work/staging.s" || true)
++n_printf=$(grep -c 'call printf@PLT' "$work/staging.s" || true)
++if [[ "$n_census" -eq "$n_printf" ]]; then
++    ok "the movb census survives exactly at the $n_printf variadic call(s) and is dead-eliminated at every prototyped callee"
++else
++    bad "census lifecycle: $n_census movb vs $n_printf printf calls (the census must survive ONLY at variadic sites)"
++fi
++
++# ── C. staging survival: all eight registers written in the f10 window ──────
++# The original defect: f10's STAGING (in main, the caller) lost 7 of 8
++# register writes.  Extract the contiguous window above the f10 call in
++# main — everything after the last arithmetic line (vaddsd/vmulsd/vcvtsi*/
++# x87 constant synthesis) within 40 lines of the call — and require the
++# staging-class moves in it to write every SSE argument register.  The
++# call text is `call f10` (same-TU static callee: no PLT).
++window=$(grep -B40 -E 'call f10(@PLT)?$' "$work/staging.s" \
++    | awk '/vaddsd|vmulsd|vcvtsi|vxorpd|fnmadd|fmadd|fld|fst|movabsq/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }')
++staged=$(printf '%s\n' "$window" \
++    | grep -oE '^    (movq %rax, %xmm[0-7]|movsd %xmm[0-9]+, %xmm[0-7]|movsd? [^,]+, %xmm[0-7])$' \
++    | grep -oE '%xmm[0-7]$' | sort -u | wc -l)
++if [[ "$staged" -eq 8 ]]; then
++    ok "the 10-argument volatile call stages all 8 SSE argument registers (the exact shape the bug deleted)"
++else
++    bad "f10 staging window writes only $staged of 8 SSE argument registers"
++    printf '%s\n' "$window" | tail -25 | note
++fi
++# No FP argument routed through a GPR sign mask INSIDE the staging window
++# (the other face of a lost staging: the value rebuilt through movabsq).
++# Scoped to the window: x87 constant synthesis elsewhere in the file
++# legitimately stages sign/exponent bits through GP registers.
++n_gpr_mask=$(printf '%s\n' "$window" \
++    | grep -cE 'movabsq \$-9223372036854775808|xorl \$0x80000000, %eax' || true)
++if [[ "$n_gpr_mask" -eq 0 ]]; then
++    ok "no FP argument routed through a GPR sign mask in the staging window"
++else
++    bad "$n_gpr_mask GPR sign-mask materialisations inside the f10 staging window"
++fi
++
++echo
++echo "call-argument staging gate: PASS=$pass FAIL=$fail SKIP=$skip"
++[[ "$fail" -eq 0 ]] || exit 1
++exit 0
+diff --git a/tests/regression/check_lea_hoist_rorx.sh b/tests/regression/check_lea_hoist_rorx.sh
+new file mode 100755
+index 00000000..75ec7044
+--- /dev/null
++++ b/tests/regression/check_lea_hoist_rorx.sh
+@@ -0,0 +1,277 @@
++#!/usr/bin/env bash
++# Loop-invariant LEA hoisting + direct 3-operand RORX: two loop-body
++# instruction-quality contracts, each born from a worst-15 benchmark gap.
++#
++# WHY THIS EXISTS
++#
++# sha256_transform measured 1.20x slower than gcc, and the loop bodies
++# carried two classes of pure waste:
++#
++#   1. The rip-relative global-address rematerialization: the K-table load
++#      `leaq K(%rip), %rcx; movl (%rcx, %r10, 4), ...` paid the LEA EVERY
++#      round.  RIP-relative addressing takes no index register, so the base
++#      cannot fold into the memory operand — only hoisting removes it.  The
++#      IR-level LICM hoists GlobalAddrs when it can, but under register
++#      pressure the RA rematerializes them into the loop; the peephole-level
++#      hoist (hoist_loop_invariant_gpr_load's LEA candidate class) sees the
++#      FINAL addressing form and hoists only what actually materialized.
++#      A guarded (fall-through-entry) loop cannot use the load path's
++#      jmp-replacement placement (a LOAD would execute on zero-trip paths
++#      and may fault) — a PURE LEA may: the insertion lands after the
++#      guard's conditional, before the alignment directives, so the loop's
++#      .p2align stays adjacent to the header label exactly.
++#
++#   2. The RORX staging dance: BMI2 RORX is NON-DESTRUCTIVE (3-operand),
++#      but the rotate emitter staged its lhs into the destination with a
++#      full 64-bit `movq` first (`movq %r14, %rbp; rorxl $25, %ebp, %ebp`).
++#      A fresh register home can be read in place: `rorxl $25, %r14d, %ebp`
++#      — the typed view reads the low 32 bits and the write fully defines
++#      the destination.  sha256's sigma functions paid three dead moves per
++#      round.
++#
++# This gate pins: the hoisted LEA's placement (outside the loop, the
++# alignment directives still adjacent to the header), the zero-trip safety
++# (a guarded loop whose body never runs still computes its correct result),
++# the direct RORX form (no register-to-register `movq` immediately staging
++# a `rorxl`), and runtime equality with the reference compiler at both
++# BMI2 and baseline levels.
++#
++# Usage:
++#   tests/regression/check_lea_hoist_rorx.sh
++# Environment:
++#   LCCC            compiler to test (default: target/fastbuild/lccc)
++#   CCC_ORACLE_CC   reference compiler (default: cc, gcc or clang)
++set -uo pipefail
++
++repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++cd "$repo_root"
++
++LCCC=${LCCC:-target/fastbuild/lccc}
++[[ "$LCCC" == /* ]] || LCCC="$repo_root/$LCCC"
++[[ -x "$LCCC" ]] || { echo "FAIL: no compiler at $LCCC" >&2; exit 1; }
++ORACLE=${CCC_ORACLE_CC:-}
++if [[ -z "$ORACLE" ]]; then
++    for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { ORACLE=$c; break; }; done
++fi
++[[ -n "$ORACLE" ]] || { echo "FAIL: no reference compiler found" >&2; exit 1; }
++
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++pass=0; fail=0; skip=0
++note() { printf '  %s\n' "$*"; }
++ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
++bad()  { fail=$((fail+1)); printf 'FAIL %s\n' "$*"; }
++skipped() { skip=$((skip+1)); printf 'skip %s\n' "$*"; }
++
++# ── A. the K-table shape: LEA hoisted, alignment preserved ──────────────────
++cat > "$work/ktab.c" <<'EOF_K'
++#include <stdio.h>
++static const unsigned K[64] = {
++    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
++    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
++    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
++    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
++    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
++/* The guarded 64-round loop over a rip-relative table with a scaled-index
++ * load — the sha256 compression shape (fall-through entry, so the load
++ * path's jmp-replacement placement does not apply: only the pure LEA
++ * candidate may hoist). */
++unsigned rounds(unsigned x, unsigned n) {
++    unsigned s = 0;
++    for (unsigned i = 0; i < n; i++)
++        s += K[i & 63] + (x >> ((i & 7) + 1));
++    return s;
++}
++/* Zero-trip safety: the hoisted LEA sits after the guard's conditional;
++ * when the loop body never runs the result must be exactly the identity. */
++unsigned zero_trip(void) { return rounds(0xdeadbeef, 0); }
++int main(void) {
++    printf("%u %u\n", rounds(0x13572468u, 64 * 3), zero_trip());
++    return 0;
++}
++EOF_K
++
++"$LCCC" -O2 -march=x86-64-v3 -S -o "$work/ktab.s" "$work/ktab.c" 2>/dev/null
++# The hoisted LEA: outside the loop body.  Find the loop (the label whose
++# block contains the K load) and require no `leaq K(%rip)` inside it, and
++# exactly one before it in the function.
++# Extract each loop (label .. its backedge jump) by label matching,
++# and count leaq K inside.
++leaks=$(python3 - "$work/ktab.s" <<'EOF_PY'
++import re, sys
++lines = open(sys.argv[1]).read().splitlines()
++# find labels and jumps
++labels = {l.strip()[:-1]: i for i, l in enumerate(lines) if re.match(r'^\.L\w+:$', l)}
++loops = []
++for i, l in enumerate(lines):
++    m = re.match(r'^\s*j\w+\s+(\.L\w+)$', l)
++    if m and m.group(1) in labels and labels[m.group(1)] < i:
++        loops.append((labels[m.group(1)], i))
++bad = 0
++for start, end in loops:
++    for i in range(start, end + 1):
++        if re.match(r'^\s*leaq K\(%rip\)', lines[i]):
++            bad += 1
++print(bad)
++EOF_PY
++)
++total_lea=$(grep -cE '^\s*leaq K\(%rip\)' "$work/ktab.s" || true)
++if [[ "$leaks" -eq 0 && "$total_lea" -ge 1 ]]; then
++    ok "the K-table LEA is hoisted out of the loop ($total_lea materialisation, 0 inside loop bodies)"
++else
++    bad "K-table LEA hoisting: $leaks in-loop materialisations remain ($total_lea file-wide)"
++fi
++# Alignment preservation: the .p2align directives must still immediately
++# precede the loop's header label (the insertion placed the LEA BEFORE the
++# directive run, not between the directives and the label).
++align_ok=$(python3 - "$work/ktab.s" <<'EOF_PY'
++import re, sys
++lines = open(sys.argv[1]).read().splitlines()
++ok = True
++for i, l in enumerate(lines):
++    if re.match(r'^\.L\w+:$', l) and i > 0:
++        # the header of a loop (has a backedge somewhere below)
++        j = i + 1
++        # find a backedge to this label within 400 lines
++        lab = l.strip()[:-1]
++        has_backedge = any(
++            re.match(r'^\s*j\w+\s+' + re.escape(lab) + r'$', x) for x in lines[i:i+400]
++        )
++        if has_backedge and i > 1:
++            # the nearest preceding non-empty line must be .p2align or the LEA-after-guard shape
++            k = i - 1
++            while k >= 0 and not lines[k].strip():
++                k -= 1
++            prev = lines[k].strip()
++            if not (prev.startswith('.p2align')):
++                # acceptable: the hoisted LEA directly before the label when
++                # the loop had no alignment directives to begin with
++                if not prev.startswith('leaq'):
++                    ok = False
++print("1" if ok else "0")
++EOF_PY
++)
++if [[ "$align_ok" == "1" ]]; then
++    ok "loop alignment directives remain adjacent to header labels (the insertion placed the LEA before the directive run)"
++else
++    bad "an alignment directive was displaced from its header label"
++fi
++# Zero-trip + runtime equality at three flag sets.
++if "$ORACLE" -O2 -march=x86-64-v3 -o "$work/ktab.oracle" "$work/ktab.c" 2>/dev/null; then
++    "$work/ktab.oracle" > "$work/ktab.oracle.txt" 2>&1
++    okall=1
++    for cf in "-O2" "-O2 -march=x86-64-v3" "-O3 -march=x86-64-v3"; do
++        # shellcheck disable=SC2086
++        if ! "$LCCC" $cf -o "$work/ktab.lccc" "$work/ktab.c" 2>/dev/null; then
++            okall=0; bad "ktab.c did not compile at $cf"; continue
++        fi
++        "$work/ktab.lccc" > "$work/ktab.lccc.txt" 2>&1
++        diff -q "$work/ktab.lccc.txt" "$work/ktab.oracle.txt" >/dev/null \
++            || { okall=0; bad "ktab output differs from $ORACLE at $cf"; }
++    done
++    [[ "$okall" -eq 1 ]] && ok "K-table loop bit-exact vs $ORACLE at 3 flag sets (incl. the zero-trip identity)"
++else
++    bad "reference compiler could not build ktab.c"
++fi
++
++# ── B. the direct 3-operand RORX ────────────────────────────────────────────
++cat > "$work/rotx.c" <<'EOF_R'
++#include <stdio.h>
++unsigned rot_r(unsigned x) { return (x >> 11) | (x << 21); }
++unsigned rot_l(unsigned x) { return (x << 11) | (x >> 21); }
++unsigned chain(unsigned x) {
++    unsigned a = (x >> 6) | (x << 26);
++    unsigned b = (a >> 11) | (a << 21);
++    return (b >> 25) | (b << 7);
++}
++int main(void) { printf("%u %u %u\n", rot_r(0x12345678u), rot_l(0x9abcdef0u), chain(0x0f0f0f0fu)); return 0; }
++EOF_R
++"$LCCC" -O2 -march=x86-64-v3 -S -o "$work/rotx.s" "$work/rotx.c" 2>/dev/null
++# No `movq %rA, %rB` immediately staging a same-register `rorxl $k, %rBd, %rBd`.
++staged=$(python3 - "$work/rotx.s" <<'EOF_PY'
++import re, sys
++lines = [l.strip() for l in open(sys.argv[1]).read().splitlines()]
++bad = 0
++for i in range(len(lines) - 1):
++    m1 = re.match(r'^movq %(\w+), %(\w+)$', lines[i])
++    m2 = re.match(r'^rorx[lq] \$\d+, %(\w+), %(\w+)$', lines[i + 1])
++    if m1 and m2 and m1.group(2) == m2.group(1) == m2.group(2):
++        bad += 1
++print(bad)
++EOF_PY
++)
++nrorx=$(grep -cE '^\s*rorx[lq] ' "$work/rotx.s" || true)
++if [[ "$staged" -eq 0 && "$nrorx" -ge 4 ]]; then
++    ok "RORX reads fresh register homes directly ($nrorx three-operand forms, 0 staged movq+same-reg dances)"
++else
++    bad "RORX staging: $staged movq-staged forms remain ($nrorx rorx total)"
++fi
++if "$ORACLE" -O2 -march=x86-64-v3 -o "$work/rotx.oracle" "$work/rotx.c" 2>/dev/null; then
++    "$work/rotx.oracle" > "$work/rotx.oracle.txt" 2>&1
++    "$LCCC" -O2 -march=x86-64-v3 -o "$work/rotx.lccc" "$work/rotx.c" 2>/dev/null
++    "$work/rotx.lccc" > "$work/rotx.lccc.txt" 2>&1
++    if diff -q "$work/rotx.lccc.txt" "$work/rotx.oracle.txt" >/dev/null; then
++        ok "rotate idioms bit-exact vs $ORACLE"
++    else
++        bad "rotate idiom output differs from $ORACLE"
++    fi
++else
++    bad "reference compiler could not build rotx.c"
++fi
++
++# ── C. the guarded-loop insertion end to end: sha256's compression ─────────
++if [[ -f tests/benchmark/programs/sha256_transform.c ]]; then
++    "$LCCC" -O2 -march=x86-64-v3 -S -o "$work/sha.s" tests/benchmark/programs/sha256_transform.c 2>/dev/null
++    inloop=$(python3 - "$work/sha.s" <<'EOF_PY'
++import re, sys
++lines = open(sys.argv[1]).read().splitlines()
++labels = {l.strip()[:-1]: i for i, l in enumerate(lines) if re.match(r'^\.L\w+:$', l)}
++backedges = []
++for i, l in enumerate(lines):
++    m = re.match(r'^\s*j\w+\s+(\.L\w+)$', l)
++    if m and m.group(1) in labels and labels[m.group(1)] < i:
++        backedges.append((labels[m.group(1)], i))
++# Innermost loop around each K-indexed load must not re-materialise the
++# base (one-level-up placement inside an enclosing loop is legitimate).
++loads = [i for i, l in enumerate(lines) if re.match(r'^\s*movl?\s+\(%r\w+, %r\w+d\)', l)]
++bad = 0
++for li in loads:
++    inner = min(
++        ((s, e) for s, e in backedges if s <= li <= e),
++        key=lambda se: se[1] - se[0],
++        default=None,
++    )
++    if inner is None:
++        continue
++    for k in range(inner[0], inner[1] + 1):
++        if re.match(r'^\s*leaq K\(%rip\)', lines[k]):
++            bad += 1
++print(bad)
++EOF_PY
++    )
++    if [[ "$inloop" -eq 0 ]]; then
++        ok "sha256_transform's K-table LEA hoisted out of the 64-round loop"
++    else
++        bad "sha256_transform still materialises the K-table inside the loop ($inloop sites)"
++    fi
++    "$LCCC" -O2 -march=x86-64-v3 -o "$work/sha.lccc" tests/benchmark/programs/sha256_transform.c 2>/dev/null
++    "$ORACLE" -O2 -march=x86-64-v3 -o "$work/sha.oracle" tests/benchmark/programs/sha256_transform.c 2>/dev/null
++    "$work/sha.lccc" > "$work/sha.l.txt" 2>&1
++    "$work/sha.oracle" > "$work/sha.o.txt" 2>&1
++    if diff -q "$work/sha.l.txt" "$work/sha.o.txt" >/dev/null; then
++        ok "sha256_transform bit-exact vs $ORACLE with the hoist"
++    else
++        bad "sha256_transform output differs from $ORACLE"
++    fi
++else
++    skipped "no sha256_transform.c in the tree"
++fi
++
++echo
++echo "lea-hoist/rorx gate: PASS=$pass FAIL=$fail SKIP=$skip"
++[[ "$fail" -eq 0 ]] || exit 1
++exit 0
+diff --git a/tests/regression/check_vector_copy_elimination.sh b/tests/regression/check_vector_copy_elimination.sh
+index 012d299e..df5491f4 100644
+--- a/tests/regression/check_vector_copy_elimination.sh
++++ b/tests/regression/check_vector_copy_elimination.sh
+@@ -454,9 +454,14 @@ EOF
+     NI static double b_named(double a, double b, double c) { double na = -a, nc = -c; return __builtin_fma(na, b, nc); }
+     NI static double b_chainneg(double a, double b, double c) { return __builtin_fma(-(-a), b, c); }
+     NI static float b_nmsubf(float a, float b, float c) { return __builtin_fmaf(-a, b, -c); }
+-    /* negative control: the negation has a SECOND consumer (the return
+-     * reads n again), so the single-use discipline must keep it
+-     * materialised — exactly one vxorpd in the whole file below. */
++    /* composition control (ADVANCED with the add-of-neg fold): the
++     * negation still has a SECOND consumer (the return reads n again),
++     * but x + (neg y) => x - y folds the tail into a subtraction of a,
++     * the freed negation's last reader is the fma, and the peel absorbs
++     * it — ZERO vxorpd, vfnmadd + vsubsd, gcc's exact instruction pair
++     * (measured: gcc -O2 -march=x86-64-v3 emits vfnmadd132sd + vsubsd
++     * for this shape).  This pin is the fold's multi-use adjudication
++     * record: every oracle in the competition set folds unconditionally. */
+     NI static double b_shared_neg(double a, double b, double c) { double n = -a; return __builtin_fma(n, b, c) + n; }
+     NI static double b_madd_p(double a, double b, const double *p) { return __builtin_fma(a, b, *p); }
+     NI static double b_madd_pm(double a, const double *p, double c) { return __builtin_fma(*p, a, c); }
+@@ -667,20 +672,27 @@ EOF_ALGEBRA
+         if [[ "$one_insn_ok" -eq 1 ]]; then
+             ok "all 35 straight-line FMA kernels are exactly one instruction plus ret (gcc parity, builtin sign variants included)"
+         fi
+-        # Anti-vacuity for the operand-negation peel: the ONLY materialised
+-        # negation in any kernel body is the multi-use control's (its Neg
+-        # feeds the fma AND the return, so single-use discipline must keep
+-        # it).  main's reference computations also negate (-a, -b_madd) and
+-        # are outside the kernel bodies by construction.  A peel regression
+-        # grows the count; a wrongly eager peel that broke the control would
+-        # shrink it to 0.
+-        nxor=$(fnbody "$work/fma_algebra.s" b_shared_neg | grep -cE '^vxorp[ds][[:space:]]' || true)
+-        nxor_all=$(grep -cE '^[[:space:]]*vxorp[ds][[:space:]]' "$work/fma_algebra.s" || true)
+-        if [[ "$nxor" -eq 1 ]]; then
+-            ok "exactly one materialised negation survives in the kernels: the multi-use control (operand-negation peel anti-vacuity)"
++        # Anti-vacuity for the operand-negation peel + the add-of-neg
++        # fold, ADVANCED to the composed truth: b_shared_neg's negation
++        # has a second consumer (the return reads n again), and the fold
++        # x + (neg y) => x - y turns the tail into a subtraction of a —
++        # the freed negation dies into the fma, the peel absorbs it, and
++        # the kernel is gcc's exact pair: one vfnmadd-family instruction
++        # plus one vsubsd, ZERO materialised sign masks (gcc -O2 -march=
++        # x86-64-v3: vfnmadd132sd + vsubsd).  main's reference
++        # computations also negate (-a, -b_madd) and are outside the
++        # kernel bodies by construction.  A fold or peel regression
++        # grows the xor count back; a wrongly eager peel on the OTHER
++        # kernels breaks the 35-kernel one-instruction check above.
++        bsn_body=$(fnbody "$work/fma_algebra.s" b_shared_neg)
++        nxor=$(printf '%s\n' "$bsn_body" | grep -cE '^vxorp[ds][[:space:]]' || true)
++        nfnm=$(printf '%s\n' "$bsn_body" | grep -cE '^vfnmadd[0-9]*sd[[:space:]]' || true)
++        nsub=$(printf '%s\n' "$bsn_body" | grep -cE '^vsubsd[[:space:]]' || true)
++        if [[ "$nxor" -eq 0 && "$nfnm" -eq 1 && "$nsub" -eq 1 ]]; then
++            ok "b_shared_neg composes to gcc's exact pair (vfnmadd + vsubsd, zero sign masks — the add-of-neg fold frees the multi-use negation for the peel)"
+         else
+-            bad "b_shared_neg should keep exactly 1 vxorpd (multi-use control), found $nxor of $nxor_all file-wide — the operand-negation peel regressed or over-fired"
+-            fnbody "$work/fma_algebra.s" b_shared_neg | note
++            bad "b_shared_neg should be vfnmadd+vsubsd with 0 vxorpd (the fold/peel composition), found xor=$nxor vfnmadd=$nfnm vsubsd=$nsub"
++            printf '%s\n' "$bsn_body" | note
+         fi
+     fi
+ 
+@@ -976,14 +988,24 @@ EOF_NEGATE
+             ok "negation kernel bit-exact vs $ORACLE on $(grep -c . "$work/neg.oracle") lines at 7 flag sets (-O0..-O3, v2/v3, contract)"
+         fi
+         # Anti-vacuity: the v3 build must use the xor form and never the GPR
+-        # round trip for a scalar negate.
++        # round trip for a scalar negate.  ADVANCED to the post-fold truth:
++        # exactly 17 rip-mask xors — every remaining site is semantically
++        # REQUIRED (a returned negation, a negation read by a non-foldable
++        # consumer, or n_many's leading term).  The folds that got us here,
++        # each GCC-verified: n_twice (neg-of-neg) folds to NOTHING; n_many
++        # (-a + -b + ... + -i, 9 negations) folds to ONE vxorpd + 8 vsubsd
++        # — gcc's exact shape for the same source; n_mul_sub and nf_fma ride
++        # the signed-FMA families (vfnmsub, zero xors); n_a_mul's product
++        # negation is the known residual (gcc folds it; follow-up list).
++        # Any future fold that retires another negation advances this pin in
++        # the same commit — the house style for exact-shape pins.
+         "$LCCC" -O2 -march=x86-64-v3 -S -o "$work/negate.s" "$work/negate.c" 2>/dev/null
+         n_xor=$(grep -cE '^[[:space:]]*vxorp[sd] \.LCFP_[0-9]+\(%rip\)' "$work/negate.s" || true)
+         n_gpr=$(grep -cE 'movabsq \$-9223372036854775808|xorl \$0x80000000, %eax' "$work/negate.s" || true)
+-        if [[ "$n_xor" -ge 20 && "$n_gpr" -eq 0 ]]; then
+-            ok "every scalar negate is an XMM-domain xor ($n_xor sites, 0 GPR sign-mask round trips)"
++        if [[ "$n_xor" -eq 17 && "$n_gpr" -eq 0 ]]; then
++            ok "every scalar negate is an XMM-domain xor ($n_xor required sites, 0 GPR sign-mask round trips; n_twice folds to nothing, n_many to gcc's 1-vxor+8-vsub shape)"
+         else
+-            bad "negate lowering: $n_xor xor sites, $n_gpr GPR round trips (expected >= 20 and 0)"
++            bad "negate lowering: $n_xor xor sites, $n_gpr GPR round trips (expected exactly 17 and 0 — a fold retired a negation without advancing the pin, or the lowering regressed)"
+         fi
+     else
+         skipped "reference compiler could not build negate.c"
+diff --git a/tests/regression/check_vectorize_isa_gate.sh b/tests/regression/check_vectorize_isa_gate.sh
+index f0837f13..ddb1b756 100644
+--- a/tests/regression/check_vectorize_isa_gate.sh
++++ b/tests/regression/check_vectorize_isa_gate.sh
+@@ -169,17 +169,21 @@ for flag in "-mno-avx2" "-march=x86-64-v3 -mno-avx2"; do
+           | grep -cE '\bvfnm(add|sub)[0-9]*p?sd\b' || true)" 1
+     # chain_pin: the site reads the OUTER negation, the INNER is pinned by
+     # the add. The neg-of-neg fold rewrites the outer link (-t where
+-    # t = -x) to x directly, so the fma takes the PLAIN family reading x:
+-    # ONE sign mask (the pinned inner, still materialised for the add) and
+-    # one vfmadd (GCC's family; GCC goes one further with r + (-x) -> r - x,
+-    # dropping the mask entirely -- the float add-of-neg fold is a
+-    # designed follow-up, NaN-sign-latitude analysis required).
+-    check_eq "$flag: pinned-inner chain keeps exactly one sign mask" \
++    # t = -x) to x directly, so the fma takes the PLAIN family reading x;
++    # the float add-of-neg fold then rewrites the add (r + t) to r - x,
++    # which kills the pinned inner's last reader: ZERO sign masks, one
++    # vfmadd and one vsub -- GCC's exact instruction pair (oracle: gcc
++    # emits vfmadd132sd + vsubsd; the remaining delta is the staging
++    # move, the destructive-form dst-preference follow-up).
++    check_eq "$flag: pinned-inner chain needs no sign mask (both folds)" \
+         "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
+-          | grep -cE '\bv?xorpd\b' || true)" 1
++          | grep -cE '\bv?xorpd\b' || true)" 0
+     check_eq "$flag: pinned-inner chain folds to one plain vfmadd" \
+         "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
+           | grep -cE '\bvfmadd[0-9]*p?sd\b' || true)" 1
++    check_eq "$flag: pinned-inner chain's add is a subtraction (r - x)" \
++        "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
++          | grep -cE '\bvsubsd\b' || true)" 1
+ done
+ 
+ # ---- 4c. fma implies vex: the explicit -mfma target classes ---------------
+diff --git a/tests/regression/fma_isa_gate.c b/tests/regression/fma_isa_gate.c
+index 680f3ab0..b7242613 100644
+--- a/tests/regression/fma_isa_gate.c
++++ b/tests/regression/fma_isa_gate.c
+@@ -43,11 +43,11 @@ double signed_np_na(double a, double b, double c) { return __builtin_fma(-a, b,
+  * reader keeps both links -- stays pinned by the unit test
+  * chained_negation_with_surviving_outer_reader_is_never_deleted.)
+  * `chain_pin`: the INNER negation is pinned by the add, the site reads the
+- * OUTER -- which the fold rewrites to x directly, so the fma takes the
+- * PLAIN family: ONE sign mask (the pinned inner) and one vfmadd. GCC drops
+- * the mask too (r + (-x) -> r - x); that float add-of-neg fold is a
+- * designed follow-up. Both live BEFORE shared_neg so the per-function sed
+- * ranges below stay disjoint.
++ * OUTER -- which the neg-of-neg fold rewrites to x directly (PLAIN
++ * family), and the float add-of-neg fold then rewrites the add itself
++ * (r + t, t = -x) to r - x, killing the inner's last reader: ZERO sign
++ * masks, vfmadd + vsub -- GCC's exact pair. Both live BEFORE shared_neg
++ * so the per-function sed ranges below stay disjoint.
+  */
+ double chain_live(double x, double b, double c)
+ {
