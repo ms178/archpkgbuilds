@@ -1,953 +1,2028 @@
-diff --git a/engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md b/engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md
-new file mode 100644
-index 00000000..7ac9d284
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md
-@@ -0,0 +1,166 @@
-+# Follow-up: the narrow zext→immediate-compare fold, a false-ISA-law revert, and the flag-law guard that caught it
-+
-+Date: 2026-09-22 (session 61, continued)
-+Base: `c7917656` (`ms178/lccc` main, post-#591; carries our S05 as `0fbe7ef2`
-+and the 73a2ab1e LEA-hoist/RORX work, red-teamed earlier this session).
-+Head: `5e97d517` — S06, snapshot `ms178-1.patch` 28876 B sha `4b33a998…`,
-+APPLIES-CLEAN (ledger row 6).
-+
-+---
-+
-+## 1. Where the session picked up
-+
-+Session 61 (first half) landed the i686 narrow-compare peephole work and left
-+two debts: the `leak()` in the source parser, and an unproven corner of the
-+design. This half closed both — and the guard test written to prove the fold
-+correct instead **caught an unrelated live miscompile**, which turned out to
-+be the more valuable event of the day.
-+
-+## 2. De-leaking the source parser
-+
-+`parse_narrow_zext_src` originally returned `NarrowSrc::Reg(&'static str)`
-+built with `src_part.to_string().leak()` — a per-call leak (the house forbids
-+ungodlike resource behaviour, and `leak()` in a peephole hot path is exactly
-+that). Rewritten to `NarrowSrc::Verbatim(String)`: the verbatim-source cases
-+(narrow registers, base-only indirect operands) own their text; the
-+frame-slot case stays `NarrowSrc::Slot(i32, &'static str)` because the
-+displacement is *re-emitted canonically* (`format!("{}({})", disp, base)`) —
-+the line's ESP-slot-biased text must never leak into the compare operand.
-+`cargo fmt` clean, 3143 unit tests green (net −3: the three tests of the
-+reverted pass below were removed with it).
-+
-+## 3. The setCC self-zext deletion: wrong premise, full revert
-+
-+The first half of the session extended `delete_setcc_self_zext` to the
-+`movsbl` twin on the stated "ISA law" that a low-byte write zeroes bits
-+8..31 of the containing register. **That law is false on x86.** A `setCC
-+%al` is a partial-register *merge*: it writes the byte and leaves bits 8..31
-+of `%eax` exactly as they were. (The zero-extension rule I confused it with
-+is x86-64's "32-bit writes zero-extend into the 64-bit register" — a
-+different width, a different direction.) The `movzbl %al,%eax` after a
-+setCC is **load-bearing**, and the two pins that asserted it survives
-+(`setcc_fuse_keeps_window_for_live_bool` and the setbe test) were *right*
-+before I "improved" them.
-+
-+How it was caught, because that chain is the reusable lesson:
-+
-+1. The new freestanding guard `tests/regression/i686_narrow_cmp_fold.c`
-+   (flag-law edge sweep, exit-status checksum, regparm-free, multilib) ran
-+   red: gcc rc=0, lccc rc=1.
-+2. `-S` outputs on/off of both peephole switches were byte-identical —
-+   **`-S` skips `peephole_optimize`**, so that diff proves nothing (written
-+   down as a measurement trap: text-level switch A/B must go through the
-+   object path, e.g. `peephole_optimize` unit tests or assembled objects).
-+3. The guard decomposed per-helper: rows through the *narrow-compare* fold
-+   (slot, register, word shapes) matched gcc exactly — the fold is innocent.
-+   Divergence started exactly at the `sete`/`setne` + relay shape.
-+4. A 256-value sweep (`00:1 80:6 FF:2` correct vs `00:7 80:6 FF:6` broken,
-+   i.e. *every* byte wrong, both select arms always taken) pinned it: with
-+   the `movzbl` deleted, `sete %al` leaves garbage in bits 8..31 of `%eax`,
-+   the full-width `movl %eax,%ecx`/`%esi` relays propagate it, and every
-+   downstream `testl %ecx,%ecx; jne` mispredicts the branch — the selects
-+   all take the "true" arm.
-+
-+Reverted completely: pass, wiring, kill switch `CCC_NO_SETCC_ZEXT_DEL`,
-+and its three unit tests deleted. The two pins restored to their original
-+assertions **with** a justification comment documenting the partial-register
-+merge law and the failed attempt, so the next reader cannot re-derive it.
-+The surviving `setcc` pin also re-checks the movzbl presence explicitly.
-+
-+Nothing else consumed the deleted pass: `fold_narrow_load_imm_compare` never
-+depended on it (its unit tests exercise the fold with the movzbl present),
-+and the boot census below is measured after the revert.
-+
-+## 4. The narrow zext→immediate-compare fold (what shipped in S06)
-+
-+`fold_narrow_load_imm_compare`, kill switch `CCC_NO_NARROW_CMP_FOLD`:
-+
-+    movzbl SRC,%r; cmpl $I,%r; jcc   →  cmpb $I,SRC; jcc    I ∈ [0,127]
-+    movzwl SRC,%r; cmpl $I,%r; jcc   →  cmpw $I,SRC; jcc    I ∈ [0,32767]
-+    movzwl SRC,%r; testl %r,%r; je/jne → cmpb $0,SRC; je/jne
-+    movzwl K(%esp),%r; cmpw $I,%r    →  cmpw $I,K(%esp)
-+
-+Flag-law proof (unit-tested at the exact wrap rows): for immediates inside
-+the window, every condition code of the narrow compare of a zero-extended
-+value equals the 32-bit compare — the wrap row (byte ≥ 128 / word ≥ 32768)
-+sets SF and OF *together* on the narrow view, which is what makes `jl/jg`
-+decode to the unsigned order; `testl → cmpb $0` is restricted to ZF-only
-+readers (`je/jne/sete/setne`) because SF diverges. Refusals, each pinned:
-+sign-extending sources (`movsbl`/`movswl` — the value is negative),
-+out-of-window immediates, signed consumers of `testl`, live consumers after
-+the compare (adjacency = nops-only window), indexed/scaled operands,
-+opcode mismatches, `%esp`/`%ebp` destinations.
-+
-+Source shapes, generalised across the session: base-only frame slots →
-+narrow registers (`%dl`,`%dx`) → base-only indirect operands (`2(%edi)` —
-+pointer loads; the compare re-reads the byte-identical address expression,
-+fault-equivalence argued in the parser comment). The parser is the narrow
-+twin of `parse_load_from_ebp` (which deliberately only matches full-width
-+moves, so narrow extends classify as `Other` — that is why the old sibling
-+dispatch never saw them, and why `testl` needs text-dispatch *inside* the
-+`Cmp` arm: `testl` classifies as `Cmp`, making a sibling `else if` dead).
-+
-+### Measured effect (boot corpus, 21 `arch/x86/boot` TUs)
-+
-+| stage | lccc insn | lccc bytes | gcc insn | gcc bytes |
-+|---|---|---|---|---|
-+| pre (session-61 start) | 5477 | 24460 | 3461 | 14270 |
-+| + slot folds | 5468 | 24424 | | |
-+| + register sources | 5457 | 24356 | | |
-+| + indirect sources | **5451** | **24332** | 3461 | 14270 |
-+
-+Mnemonic closers (lccc vs gcc): `movzwl` 167/49, `movzbl` 134/50,
-+`cmpl` 238/150, `cmpb` 39/78, `cmpw` 25/35. The gap is now dominated by
-+structural levers, not this peephole: store-to-frame 515 vs 46 (RA quality),
-+loop accumulators resident in slots (cpucheck: 515-vs-46 class), and
-+reg-vs-reg narrow compares (`video-mode`: 28 residual `movzwl`).
-+
-+### The guard test (shipped)
-+
-+`tests/regression/i686_narrow_cmp_fold.c` + `.flags` (`-m32 -Os -mregparm=3
-+-fno-pic`): every branch flavour (signed/unsigned/eq) driven across the
-+byte and word wrap boundaries on slot, register, and pointer sources, plus
-+the bool-materialisation shape; checksum verified against `EXPECT_A`
-+(derived from gcc -O0/-O2/-Os agreement; `-DPRINT_REF` re-derives). It is
-+deliberately freestanding so it links under the boot regime. This is the
-+test that caught §3 — its continued presence is the insurance that the
-+partial-register-merge lesson can never regress silently.
-+
-+## 5. Validation
-+
-+- `cargo test --lib`: **3143/0** (fastbuild).
-+- 256-value byte-map sweep vs gcc: **0 divergences** (post-revert).
-+- Guard test: gcc rc=0, lccc rc=0 (was rc=1 pre-revert).
-+- Boot census/oracle: 5451 insn / 24332 B (above).
-+- `ci_local.sh --fast`: **59 passed, 0 failed, 3 skipped — ALL GATES GREEN**.
-+- Full CachyMod 6.18.52 rebuild by lccc/lccc-ld: SUCCESS; vmlinux
-+  `.text` 11894550, boot gate `_end = 28944` (paired, 3824 headroom).
-+  Paired gate A/B (same tree state, boot TUs forced): fold OFF
-+  `_end = 29024` → fold ON **28944 = −80 B** on the setup sector; the
-+  fold's corpus-level effect (−128 B over 21 TUs) does not fully reach the
-+  gate because the gate measures a different (compressed+setup) blend.
-+- `qemu_boot_test.sh`: **16/16 PASS, zero WARNING/Call Trace/ACPI noise**
-+  on the serial log (bzImage sha `9c3fe192…`).
-+- Godbolt oracle (`scripts/godbolt.py compare`, revisions pinned:
-+  gcc 16.2, clang 23.1.0, icx latest, icc 2021.10.0) on the guard test
-+  itself, i686 `-Os -fno-pic`: **lccc 90** instructions vs **gcc 128**,
-+  **clang 161**, **icx 161**, **icc 198** — the first corpus in the
-+  campaign where lccc beats every competitor outright (−30% vs gcc,
-+  −44% vs clang/icx, −55% vs icc). Artifacts in
-+  `artifacts/godbolt-s06/`.
-+
-+## 6. Still open, in evidence order
-+
-+1. **i686 RA slot-residence** (515 store-to-frame vs gcc 46): the dominant
-+   remaining lever; cpucheck's loop accumulator is the canonical repro.
-+2. **Reg-vs-reg narrow compares** (`movzwl (%edi),%edx; movzwl
-+   %bx,%eax; cmpl %eax,%edx` → `cmpw (%edi),%bx` after allocation-width
-+   reasoning): 28 sites in video-mode alone.
-+3. **andl-mask zext gap** (`movzwl 60(%esp),%eax; andl $-32769,%eax;
-+   movzwl %ax,%eax`): the mask kills the high bit, but the fold needs a
-+   mask-aware value-range argument before it may widen.
-+4. Shift-bit-test IV placement (cpucheck: `movl $1,%eax; movl %ebx,%ecx;
-+   shll %cl,%eax` vs gcc's IV-in-%ecx).
-+5. The gdbstub `free_large_kmalloc` discriminator (carried from S02).
-+
-+<!-- src: engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md -->
-diff --git a/engineering/journal/2026-09-W3.md b/engineering/journal/2026-09-W3.md
-index 364d6d91..6f6d321b 100644
---- a/engineering/journal/2026-09-W3.md
-+++ b/engineering/journal/2026-09-W3.md
-@@ -733,3 +733,59 @@ short-lived in-loop values lose), x87↔GP pair lowering (`i686.md` §2.1,
- untouched), the `free_large_kmalloc` discriminator, `reg-to-reg-movl` +230
- (but only 26 of 74 survive into the *object* — measure objects, not `-S`),
- `compare-against-frame-slot` +29.
-+
-+## Session 61 (cont): the narrow-cmp fold lands, the setCC self-zext deletion dies by its own guard
-+
-+<!-- src: engineering/FOLLOWUP-2026-09-22C-narrow-cmp-fold-and-setcc-revert.md -->
-+
-+**Landed** `fold_narrow_load_imm_compare` (S06, kill switch
-+`CCC_NO_NARROW_CMP_FOLD`): `movzbl/wl SRC,%r; cmpl $I,%r; jcc` →
-+`cmpb/w $I,SRC; jcc` for I in the flag-law window (byte 127 / word 32767 —
-+the wrap rows set SF and OF *together* on the narrow view, which is why
-+signed branches still decode to unsigned order), plus the
-+`testl→cmpb $0` shape restricted to ZF-only readers. Sources generalised
-+across the day: frame slots → narrow registers → base-only indirect
-+(pointer loads: the compare re-reads the byte-identical address text).
-+Parser de-leaked (`NarrowSrc::Verbatim(String)`; slots keep canonical
-+re-emission because the ESP-slot-biased line text must never reach an
-+operand). Boot corpus **5477→5451 insn, 24460→24332 B** (gcc 3461/14270);
-+paired boot gate **29024→28944 (−80 B)**; QEMU **16/16**, zero serial
-+noise; `ci_local --fast` **59/0**.
-+
-+**The guard test I wrote to prove the fold then caught an unrelated live
-+miscompile — the day's real event.** The first half of the session had
-+landed `delete_setcc_self_zext` on a stated "ISA law": *a low-byte write
-+zeroes bits 8..31*. That law is **false on x86**: `setCC %al` is a
-+partial-register merge; the `movzbl %al,%eax` after it is load-bearing.
-+(What I conflated: x86-64's 32-bit-writes-zero-extend-to-64 — a different
-+width, a different direction.) The catch chain, each link reusable:
-+
-+1. New freestanding flag-law guard (`tests/regression/
-+   i686_narrow_cmp_fold.c`, every branch flavour across the wrap rows,
-+   exit-status checksum): gcc rc=0, lccc rc=1.
-+2. `-S` A/B on the peephole switches: byte-identical — **`-S` skips
-+   `peephole_optimize`**; a switch A/B through text proves nothing. (Trap
-+   written down; object-path or unit-test A/Bs only from now on.)
-+3. Row decomposition: every narrow-fold row matched gcc; divergence began
-+   exactly at the `sete`/`setne`+relay shape → the fold innocent.
-+4. 256-value sweep (`00:1 80:6 FF:2` vs `00:7 80:6 FF:6`, *every* byte
-+   wrong, both select arms always taken): with the movzbl gone, garbage
-+   bits 8..31 ride `movl %eax,%ecx/%esi` relays into `testl %ecx; jne`.
-+
-+Full revert: pass, wiring, kill switch `CCC_NO_SETCC_ZEXT_DEL`, three
-+tests. The two original pins were **right** — restored verbatim plus a
-+justification comment so the false law can't be re-derived. Net unit count
-+3146→3143 (the deleted pass's tests left with it).
-+
-+**Also fixed this half**: the peephole's `testl` dispatch (testl
-+classifies as `LineKind::Cmp`, so the old sibling `else if` was dead —
-+text dispatch now lives inside the Cmp arm), the parser's comma bug
-+(`.trim()` after a memory operand keeps the next operand's leading comma;
-+split first), and ret-tail test inputs (liveness is exact: `ret` reads
-+`%eax`, so load+cmp with a ret tail *must* refuse — fix the test, never
-+the pass).
-+
-+**Still open, evidence order**: i686 RA slot-residence (515 vs 46
-+store-to-frame — cpucheck's loop accumulator is the canonical repro),
-+reg-vs-reg narrow compares (video-mode: 28 `movzwl`), the andl-mask zext
-+gap, shift-bit-test IV placement.
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 8823ada2..e0081d3b 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -8167,6 +8167,265 @@ fn try_fold_memory_operand(
-     None
- }
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 72089b6c..73da3b55 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -205,6 +205,14 @@ jobs:
+           CCC: target/fastbuild/lccc
+         run: bash tests/regression/check_machinst_window_alloc_wide_copy.sh
  
-+// ── Pass: fold a narrow slot load into the immediate compare/test that reads it ──
-+//
-+// The i686 lowering materialises every sub-int comparison operand through a
-+// zero-extend into a register:
-+//
-+//     movzbl 12(%esp), %eax        cmpb  $57, 12(%esp)
-+//     cmpl   $57, %eax       ~=    (flags identical, see below)
-+//     je     .Lx                   je    .Lx
-+//
-+// The fold deletes the load (2-3 bytes), shrinks the compare (cmpl $imm,%reg
-+// is 5-6 bytes; cmpb $imm,mem is 3-4), frees the register, and — the part the
-+// instruction census actually measured (boot_insn_census.py: movzwl +130,
-+// movzbl +106, cmpl +109 vs gcc over arch/x86/boot) — removes the register
-+// round-trip that keeps the value alive in the accumulator.  GCC's answer at
-+// -Os is the memory compare; three oracle families (gcc 16.2 i386 -Os, the
-+// boot corpus census, clang -m32) all lower this shape to the narrow op.
-+//
-+// FLAG LAW — why `cmpb $I, K` is EXACTLY `cmpl $I, zext_byte(K)`:
-+// for 0 <= I <= 127 both views compare the same two mathematical integers
-+// (the zero-extended byte lies in [0,255], I in [0,127] — neither has the
-+// wide view's sign bit set).  ZF and CF are equality/ordering of those same
-+// integers in both views.  In the 32-bit view no wrap can occur (the result
-+// lies in [-127,255]), so SF = (result < 0) = unsigned-less and OF = 0.  In
-+// the 8-bit view a wrap (> 127) sets both SF and OF together, so
-+// SF != OF still holds exactly when the unsigned order says less — every
-+// condition code (e/ne/l/ge/le/g/b/ae/a/be + setcc forms) decodes to the
-+// same answer.  Word twin: 0 <= I <= 32767, same proof.
-+//
-+// The `testl %R, %R` shape folds to `cmpb $0, K` with ONE divergence: SF.
-+// testl always clears SF; cmpb $0 copies bit 7 of the byte.  CF and OF are
-+// 0 in both, ZF is identical, so the fold fires only when the consumer reads
-+// ZF alone: `je`/`jne` branches and `sete`/`setne` writers.  A `js`/`jns`/
-+// `jl`/... consumer keeps the pair intact (fail closed).
-+//
-+// Fail-closed rules, each with its wrong-code shape:
-+//   * `movsbl`/`movswl` are refused: a sign-extended operand changes every
-+//     flag row the proof above rests on (the byte's wide-view sign bit is
-+//     the byte's bit 7, which for a negative char is 1);
-+//   * immediates outside [0,127] / [0,32767] are refused (the 8-bit view
-+//     wraps where the 32-bit view does not — mem=200, I=200: cmpb says
-+//     equal, cmpl says above);
-+//   * the loaded register must be DEAD after the consumer (whole-function
-+//     GprLiveness oracle, same discipline as fold_memory_operands);
-+//   * the slot must be base-only (%ebp/%esp, no index/scale) — a scaled
-+//     address cannot move into the compare's one memory operand;
-+//   * the consumer must be ADJACENT (nops only between): anything else may
-+//     write the register or the slot, or depend on the load's side effects
-+//     (there are none, but adjacency is what makes "no side effects" local);
-+//   * `%esp` is never the loaded register (dataflow only).
-+//
-+// Kill switch: CCC_NO_NARROW_CMP_FOLD.
-+fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    if std::env::var_os("CCC_NO_NARROW_CMP_FOLD").is_some() {
-+        return false;
-+    }
-+    let len = infos.len();
-+    let mut changed = false;
-+    let mut liveness_cache: Option<GprLiveness> = None;
-+    let mut i = 0;
-+    while i < len {
-+        if infos[i].is_nop() {
-+            i += 1;
-+            continue;
-+        }
-+        let Some((width, src, dst_reg)) = parse_narrow_zext_src(store, &infos[i], i) else {
-+            i += 1;
-+            continue;
-+        };
-+        // Never fold through the stack/frame pointer (house parity with
-+        // fold_memory_operands: %esp moves the frame, %ebp homes are live
-+        // across barriers far too often to be worth the oracle's blessing).
-+        if dst_reg == REG_ESP || dst_reg == REG_EBP {
-+            i += 1;
-+            continue;
-+        }
-+        let j = next_non_nop(infos, i + 1);
-+        if j >= len {
-+            i += 1;
-+            continue;
-+        }
-+        let s = trimmed(store, &infos[j], j);
-+        // Consumer 1: `cmpl $I, %R` — all flags match, any consumer works.
-+        // (testl classifies as LineKind::Cmp too, hence the text dispatch
-+        // inside the Cmp arm.)
-+        let mut replacement: Option<String> = None;
-+        // Consumer 2: `testl %R, %R` — ZF-only, gated on the flag reader.
-+        let mut test_shape = false;
-+        if infos[j].kind == LineKind::Cmp {
-+            if let Some(rest) = s.strip_prefix("cmpl $") {
-+                if let Some((imm_str, reg_str)) = rest.split_once(", %") {
-+                    if let Ok(imm) = imm_str.trim().parse::<i64>() {
-+                        if register_family(reg_str.trim()) == dst_reg
-+                            && imm >= 0
-+                            && imm <= if width == MoveSize::B { 127 } else { 32767 }
-+                        {
-+                            let mnem = if width == MoveSize::B { "cmpb" } else { "cmpw" };
-+                            let operand = match src {
-+                                NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
-+                                NarrowSrc::Verbatim(v) => v,
-+                            };
-+                            replacement = Some(format!("    {} ${}, {}", mnem, imm, operand));
-+                        }
-+                    }
++      # undefined-weak symbols must reach the system linker as @GOTPCREL
++      # (R_X86_64_PC32 against an undefined weak is rejected in PIE links);
++      # compiles with lccc, links with the SYSTEM gcc driver, then runs.
++      - name: Verify undefined-weak PIE link (system driver)
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_weak_undef_pie_link.sh
++
+       - name: Verify over-aligned alloca typed-census admission
+         env:
+           CCC: target/fastbuild/lccc
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 8859afd5..4b67ccfb 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -200,6 +200,10 @@ gate "strict-computed-recip-codegen" fast \
+ 
+ gate "machinst-window-alloc" fast \
+     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
++# Undefined weak addresses must link under the system gcc driver's default
++# PIE mode (weak->GOTPCREL in every code model; PR #581 regression gate).
++gate "weak-undef-pie-link" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_weak_undef_pie_link.sh
+ 
+ gate "overalign-typed-census" fast \
+     env CCC=target/fastbuild/lccc bash tests/regression/check_overalign_typed_census.sh
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index 7438d40d..39377bd7 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -4543,9 +4543,30 @@ fn generate_function(
+             cg.state().vec_last_store_slot = None;
+             cg.state().vec_last_store_val = None;
+             cg.state().vec_last_store_reg = false;
++            cg.state().vec_last_store_reg_name = None;
+             cg.state().sse_last_store_slot = None;
+             cg.state().sse_last_store_val = None;
+             cg.state().sse_last_store_reg = false;
++            cg.state().sse_last_store_reg_name = None;
++            // vec_live_regs claims are BLOCK-LOCAL by contract ("vec_live_regs
++            // only tracks within a block; reg_assignments is the source of
++            // truth at block boundaries") — nothing enforced it. A claim
++            // recorded by the final emission of the textually-previous block
++            // survived into this one, and at a JOIN (multiple incoming edges)
++            // the claim only holds on the fall-through edge: the chorba_sse41
++            // miscompile — block 13's `vpxor` claimed its result v109 into
++            // xmm0 (sse_commit_dest_direct), block 14 (also entered via `jne`
++            // from block 12, where xmm0 holds an unrelated Loaddqu) elided
++            // v109's reload and consumed the stale xmm0. Claims are only
++            // sound along straight-line fall-through, but even a
++            // single-predecessor block's textual predecessor can differ from
++            // its CFG predecessor (then/else layout: the then-arm's claims
++            // leak into the else-arm), so the map is cleared at EVERY label.
++            // Cross-block elision remains available through reg_assignments
++            // (RA-managed, liveness-correct) and pending_vec_memfold (a
++            // re-issued slot load, kept defined by the pending_vec_store
++            // flush above).
++            cg.state().vec_live_regs.clear();
+             // Tight-loop marker: the structural audit in
+             // passes::loop_align qualified this header; the integrated
+             // assembler measures the exact encoded body span during its
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index d433b473..a3965b90 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -3158,6 +3158,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+             .collect();
+         for (idx, dests) in &config.folded_index_uses {
+             let mut new_end: Option<u32> = None;
++            // Diagnostic (LCCC_DEBUG_SIB_CLASH): trace the folded-index
++            // interval extension end-to-end — per-link required spans, the
++            // post-extension segments, and the returned liveness — so an
++            // extension that silently no-ops (the zlib-ng deflateHeaders
++            // wrong-piece stretch) is visible without a debugger.
++            let dbg_ext = std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some();
+             // Real-liveness ranges the operand must survive: one per
+             // consumer. dest.start is the GEP, but a peeled index's last
+             // IR use is typically a widening Cast / scale BEFORE the GEP
+@@ -3199,11 +3205,68 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+                         };
+                         if req_s < e {
+                             required.push((req_s, e));
++                            // LOOP-WRAP PROTECTION. Linear [def..use] spans
++                            // assume the emitted access executes after the
++                            // def on every path that reaches it. A loop
++                            // back-edge invalidates that: re-entering the
++                            // body after the def re-executes the folded
++                            // access on the NEXT iteration, by which time
++                            // any sibling that "linearly" started after the
++                            // index's segment may legally own the register
++                            // (select/cmov chains materialise mid-loop).
++                            // zstd_opt lvl16: v2579 home %ebp, def @60003,
++                            // fold `(%r11,%rbp,4)` @60125, back-edge
++                            // `jae 60060` re-enters after the def; rival
++                            // v2911 (linearly disjoint, segs (694,743) vs
++                            // (630,683)) steals %ebp via `cmovne %r13d,
++                            // %ebp` @601d9 → garbage index on iteration 2.
++                            // Require the WHOLE innermost loop cycle that
++                            // contains the access so no sibling claim can
++                            // exist anywhere inside the emitted iteration.
++                            // NARROWED for in-loop-def indices: the span
++                            // starts at the index's FIRST DEF, not at the
++                            // loop head. Before its own def the value is
++                            // dead — the next def re-establishes it — so a
++                            // sibling may legally hold the register in
++                            // [h, first_def): it conflicts with the
++                            // [first_def, l] span from the def onward, and
++                            // the def dominates the access inside every
++                            // executed iteration. This keeps the zstd_opt
++                            // lvl16 protection while removing the dead
++                            // head-window pressure that cost ~3-5% lvl1
++                            // compression throughput in the F6 A/B
++                            // (the head window sits on the hot prologue).
++                            let mut best: Option<(u32, u32)> = None;
++                            let mut span_s;
++                            for &(h, l) in &liveness.loop_extents {
++                                if h <= e && e <= l && best.map_or(true, |(bh, bl)| l - h < bl - bh)
++                                {
++                                    span_s = h;
++                                    if let Some(&(idx_s, _)) = bounds_of.get(idx) {
++                                        // First def strictly inside the
++                                        // cycle and before the access: the
++                                        // dead head window is droppable.
++                                        if idx_s > h && idx_s < e {
++                                            span_s = idx_s;
++                                        }
++                                    }
++                                    best = Some((span_s, l));
++                                }
++                            }
++                            if let Some((h, l)) = best {
++                                required.push((h, l));
++                            }
+                         }
+                     }
+                 }
+             }
+             if let Some(e) = new_end {
++                if dbg_ext {
++                    eprintln!(
++                        "[sib-clash-ext] fn={} idx=v{idx} dests={dests:?} new_end={e} required={required:?}",
++                        func.name
++                    );
 +                }
-+            } else if s.starts_with("testl ") {
-+                if let Some(rest) = s.strip_prefix("testl ") {
-+                    if let Some((a, b)) = rest.split_once(',') {
-+                        let ra = a.trim();
-+                        let rb = b.trim();
-+                        if ra.starts_with('%')
-+                            && ra == rb
-+                            && register_family(ra) == dst_reg
-+                            && zf_only_flags_reader(store, infos, j)
-+                        {
-+                            test_shape = true;
-+                            let operand = match src {
-+                                NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
-+                                NarrowSrc::Verbatim(v) => v,
-+                            };
-+                            replacement = Some(format!("    cmpb $0, {}", operand));
+                 for iv in &mut liveness.intervals {
+                     if iv.value_id == *idx && iv.end < e {
+                         iv.end = e;
+@@ -3244,10 +3307,129 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+                         insert_segment_union(&mut merged, &required);
+                         pieces = merged;
+                     } else {
+-                        // Historical tail stretch (single-def shapes).
+-                        if let Some(last) = pieces.last_mut() {
+-                            if last.1 < e {
+-                                last.1 = e;
++                        // Single-def shapes. The historical tail stretch
++                        // extended only the LAST piece — a silent NO-OP for
++                        // multi-segment values, whose consumer access sits
++                        // after a NON-last piece's end (the hole between the
++                        // pieces is exactly where the allocator then placed
++                        // another value, e.g. the folded access's own base).
++                        // zlib-ng deflateHeaders `put_byte`: the U32 index
++                        // `s->pending` had segments [(136,146),(606,619)],
++                        // required (146,149); the last-piece stretch left the
++                        // hole open, the base `s->pending_buf` [(147,149)]
++                        // got the index's register, and ensure_sib_index_form
++                        // zero-extended the index IN PLACE over the freshly
++                        // reloaded base → `mov %r10b,(%rdi,%rdi,1)` with
++                        // rdi = base = index (store through a wild address).
++                        //
++                        // Extend instead the piece the access actually
++                        // follows: the piece containing the required span's
++                        // start (the last IR-visible read position), or the
++                        // piece ending latest at or before it. Like the
++                        // historical stretch, a piece END only ever grows —
++                        // no span is invented, no first/last live-unit anchor
++                        // moves (the union-merge anchor effects that required
++                        // gating the merge to multi-def latches do not apply:
++                        // the global max end is untouched whenever any later
++                        // piece exists, and grows exactly to the access when
++                        // the stretched piece IS the last one).
++                        // Fail-closed accounting: a required span must land
++                        // on a piece. The loop-wrap span (h,l) matches NEITHER
++                        // lookup when the index is first defined INSIDE the
++                        // loop (every piece then starts and ends after h, so
++                        // nothing contains h and nothing ends at-or-before
++                        // it). Silently dropping it would re-open the exact
++                        // bug class this extension exists to close — a
++                        // linearly-disjoint sibling claims the register
++                        // mid-loop and the re-entered fold (back-edge) reads
++                        // the sibling instead of the index.
++                        // A required span must land ON a piece — as an
++                        // explicit segment. The loop-wrap span (h,l) matches
++                        // NEITHER lookup when the index is first defined
++                        // INSIDE the loop (every piece then starts and ends
++                        // after h, so nothing contains h and nothing ends
++                        // at-or-before it). Silently dropping it would
++                        // re-open the exact bug class this extension exists
++                        // to close — a linearly-disjoint sibling claims the
++                        // register mid-loop and the re-entered fold
++                        // (back-edge) reads the sibling instead of the
++                        // index. Dropping the value's segments instead is
++                        // equally wrong: consumers of `liveness.segments`
++                        // (the hole-aware interference scan) see a
++                        // segment-less value and hand the register to a
++                        // sibling — bb_slp_v8 SIGSEGV'd exactly there. So
++                        // the unmatched span is inserted into the piece
++                        // union verbatim: the coverage h..first_piece is
++                        // real liveness for the emitted iteration (the fold
++                        // re-executes it every cycle after the def), and
++                        // over-covering the def-free head is conservative.
++                        let mut unmatched: Vec<(u32, u32)> = Vec::new();
++                        for &(req_s, req_e) in &required {
++                            let containing = pieces.iter_mut().find(|piece| {
++                                let (ss, ee) = **piece;
++                                ss <= req_s && req_s < ee
++                            });
++                            if let Some(piece) = containing {
++                                if piece.1 < req_e {
++                                    piece.1 = req_e;
++                                    // Keep the fat envelope in sync with
++                                    // grown segments: loop-span ends run
++                                    // past `e` (the consumer bound), and
++                                    // coarse interference reads the
++                                    // envelope while the scan reads the
++                                    // segments.
++                                    for iv in &mut liveness.intervals {
++                                        if iv.value_id == *idx && iv.end < req_e {
++                                            iv.end = req_e;
++                                        }
++                                    }
++                                }
++                                continue;
++                            }
++                            let preceding = pieces
++                                .iter_mut()
++                                .filter(|piece| piece.1 <= req_s)
++                                .max_by_key(|piece| piece.1);
++                            if let Some(piece) = preceding {
++                                if piece.1 < req_e {
++                                    piece.1 = req_e;
++                                }
++                                continue;
++                            }
++                            unmatched.push((req_s, req_e));
 +                        }
++                        if !unmatched.is_empty() {
++                            if dbg_ext {
++                                eprintln!(
++                                    "[sib-clash-ext] fn={} idx=v{idx} unmatched required spans {unmatched:?} (in-loop-def index); inserted as explicit segments",
++                                    func.name
++                                );
++                            }
++                            for &(req_s, req_e) in &unmatched {
++                                insert_segment_union(&mut pieces, &[(req_s, req_e)]);
++                            }
++                            // Keep the fat envelope consistent with the
++                            // grown segments: the loop-wrap span's l runs
++                            // past the access and past `new_end` (which only
++                            // tracks the consumer bounds), and the verifier
++                            // requires interval.end >= max(segment end).
++                            let max_end = unmatched.iter().map(|&(_, re)| re).max().unwrap_or(e);
++                            for iv in &mut liveness.intervals {
++                                if iv.value_id == *idx && iv.end < max_end {
++                                    iv.end = max_end;
++                                }
++                            }
++                        }
++                        // Historical behaviour for the common single-piece
++                        // shape: make sure the envelope target `e` is
++                        // honoured even when `required` came out empty
++                        // (covering-segment case where the piece already
++                        // contains dest.start).
++                        if required.is_empty() {
++                            if let Some(last) = pieces.last_mut() {
++                                if last.1 < e {
++                                    last.1 = e;
++                                }
+                             }
+                         }
+                         pieces.sort_unstable();
+@@ -3265,11 +3447,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+                 // Values without segment data keep the fat-envelope
+                 // extension above (fail-closed: the scan and the verifier
+                 // both fall back to the envelope for them).
++            } else if dbg_ext {
++                eprintln!(
++                    "[sib-clash-ext] fn={} idx=v{idx} dests={dests:?} new_end=NONE (no consumer bound found)",
++                    func.name
++                );
+             }
+         }
+         liveness
+             .segments
+             .sort_unstable_by_key(|segment| (segment.start, segment.value_id, segment.end));
++        if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
++            for (idx, _) in &config.folded_index_uses {
++                let segs: Vec<(u32, u32)> = liveness
++                    .segments
++                    .iter()
++                    .filter(|s| s.value_id == *idx)
++                    .map(|s| (s.start, s.end))
++                    .collect();
++                eprintln!(
++                    "[sib-clash-ext] fn={} post-ext v{idx} segments={segs:?}",
++                    func.name
++                );
++            }
++        }
+     }
+     let iv_map = interval_map(&liveness);
+     let call_points = &liveness.call_points;
+@@ -5815,6 +6016,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+     accumulator_assignments.retain(|a| !assignments.contains_key(&a.value_id));
+     verify_accumulator_assignments(func, &accumulator_assignments);
+ 
++    if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
++        for (idx, _) in &config.folded_index_uses {
++            let segs: Vec<(u32, u32)> = liveness
++                .segments
++                .iter()
++                .filter(|s| s.value_id == *idx)
++                .map(|s| (s.start, s.end))
++                .collect();
++            eprintln!(
++                "[sib-clash-ext] fn={} at-return v{idx} segments={segs:?}",
++                func.name
++            );
++        }
++    }
++
+     RegAllocResult {
+         assignments,
+         accumulator_assignments,
+@@ -12266,6 +12482,241 @@ mod phi_coalesce_tests {
+         }
+     }
+ 
++    /// F1 (S06): the loop-wrap required span (h,l) must NOT be silently
++    /// dropped for a single-def index that is FIRST DEFINED INSIDE the loop.
++    /// Thief geometry: v3 is defined and consumed (folded GEP/Store) inside
++    /// the loop; v7 (fed by preheader v9) is redefined after the access and
++    /// escapes to the exit, so its segment is linearly disjoint from v3's
++    /// def->cast span yet live across the back edge. Pre-fix, the (h,l) span
++    /// matched no piece (all pieces start after h) and vanished, leaving the
++    /// linearly-disjoint sibling free to claim v3's register — the re-entered
++    /// fold then read garbage. The fix detects the unmatched span and falls
++    /// back to the fat envelope stretched over the loop cycle.
++    #[test]
++    fn loop_wrap_span_in_loop_def_index_falls_back_to_envelope() {
++        let mut func = IrFunction::new("in_loop_def_index".to_string(), IrType::I32, vec![], false);
++        func.blocks = vec![
++            block(
++                0,
++                vec![
++                    Instruction::Alloca {
++                        dest: Value(0),
++                        ty: IrType::I8,
++                        size: 64,
++                        align: 1,
++                        volatile: false,
++                        semantic_volatile: false,
++                    },
++                    Instruction::Copy {
++                        dest: Value(9),
++                        src: Operand::Const(IrConst::I32(16)),
++                    },
++                    Instruction::Copy {
++                        dest: Value(10),
++                        src: Operand::Const(IrConst::I32(0)),
++                    },
++                ],
++                Terminator::Branch(BlockId(1)),
++            ),
++            // Header: IV test, while-form (false edge exits).
++            block(
++                1,
++                vec![
++                    Instruction::Copy {
++                        dest: Value(1),
++                        src: Operand::Value(Value(10)),
++                    },
++                    Instruction::Cmp {
++                        dest: Value(2),
++                        op: IrCmpOp::Slt,
++                        lhs: Operand::Value(Value(1)),
++                        rhs: Operand::Const(IrConst::I32(8)),
++                        ty: IrType::I32,
++                    },
++                ],
++                Terminator::CondBranch {
++                    cond: Operand::Value(Value(2)),
++                    true_label: BlockId(2),
++                    false_label: BlockId(4),
++                },
++            ),
++            // Body: index v3 defined IN-loop, folded into the GEP/Store;
++            // sibling v7 redefined after the access and escaping to the exit.
++            block(
++                2,
++                vec![
++                    Instruction::Copy {
++                        dest: Value(3),
++                        src: Operand::Const(IrConst::I32(5)),
++                    },
++                    Instruction::Cast {
++                        dest: Value(11),
++                        src: Operand::Value(Value(3)),
++                        from_ty: IrType::I32,
++                        to_ty: IrType::I64,
++                    },
++                    Instruction::GetElementPtr {
++                        dest: Value(4),
++                        base: Value(0),
++                        offset: Operand::Value(Value(11)),
++                        ty: IrType::Ptr,
++                    },
++                    Instruction::Store {
++                        volatile: false,
++                        val: Operand::Const(IrConst::I8(0)),
++                        ptr: Value(4),
++                        ty: IrType::I8,
++                        seg_override: crate::common::types::AddressSpace::Default,
++                    },
++                    Instruction::BinOp {
++                        dest: Value(7),
++                        op: IrBinOp::Add,
++                        lhs: Operand::Value(Value(9)),
++                        rhs: Operand::Const(IrConst::I32(1)),
++                        ty: IrType::I32,
++                    },
++                    Instruction::Copy {
++                        dest: Value(8),
++                        src: Operand::Value(Value(7)),
++                    },
++                    Instruction::BinOp {
++                        dest: Value(12),
++                        op: IrBinOp::Add,
++                        lhs: Operand::Value(Value(1)),
++                        rhs: Operand::Const(IrConst::I32(1)),
++                        ty: IrType::I32,
++                    },
++                ],
++                Terminator::Branch(BlockId(3)),
++            ),
++            // Latch: back edge to the header.
++            block(
++                3,
++                vec![Instruction::Copy {
++                    dest: Value(10),
++                    src: Operand::Value(Value(12)),
++                }],
++                Terminator::Branch(BlockId(1)),
++            ),
++            block(
++                4,
++                vec![],
++                Terminator::Return(Some(Operand::Value(Value(8)))),
++            ),
++        ];
++        func.next_value_id = 13;
++
++        let mut folded = FxHashMap::default();
++        folded.insert(3u32, vec![4u32]);
++        let config = RegAllocConfig {
++            available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)],
++            accumulator_policy: AccumulatorPolicy {
++                operand_order: AccumulatorOperandOrder::LhsFirst,
++                return_consumes_accumulator: false,
++            },
++            caller_saved_regs: vec![
++                PhysReg(10),
++                PhysReg(11),
++                PhysReg(12),
++                PhysReg(13),
++                PhysReg(14),
++                PhysReg(15),
++            ],
++            call_arg_regs: vec![PhysReg(14), PhysReg(15), PhysReg(12), PhysReg(13)],
++            indirect_target_regs: vec![PhysReg(11)],
++            allow_inline_asm_regalloc: false,
++            leaf_caller_saved_homes: false,
++            xmm_regs: Vec::new(),
++            never_materialized: FxHashSet::default(),
++            folded_index_uses: folded,
++            reg_hints: FxHashMap::default(),
++            ra_config: Arc::new(RaConfig::default()),
++        };
++        let result = allocate_registers(&func, &config);
++        let liv = result.liveness.expect("liveness");
++        assert!(
++            !liv.loop_extents.is_empty(),
++            "back edge b3->b1 must register a loop extent"
++        );
++        let loop_end = liv
++            .loop_extents
++            .iter()
++            .map(|&(_, l)| l)
++            .max()
++            .expect("loop extent end");
++        let v3_segs: Vec<(u32, u32)> = liv
++            .segments
++            .iter()
++            .filter(|s| s.value_id == 3)
++            .map(|s| (s.start, s.end))
++            .collect();
++        assert!(
++            !v3_segs.is_empty(),
++            "unmatched loop-wrap span must become an explicit segment; got none"
++        );
++        let loop_head = liv
++            .loop_extents
++            .iter()
++            .map(|&(h, _)| h)
++            .min()
++            .expect("loop extent head");
++        let mut segs_sorted = v3_segs.clone();
++        segs_sorted.sort_unstable();
++        // Narrowed-span contract: coverage must begin at the index's FIRST
++        // DEF inside the cycle (the head window [loop_head, first_def) is
++        // deliberately left to siblings — the value is dead there), and run
++        // through the latch end.
++        let v3_start = segs_sorted[0].0;
++        assert!(
++            v3_start > loop_head,
++            "narrowed span must start after the loop head (at the first \
++             in-loop def): start={v3_start} head={loop_head}"
++        );
++        let mut covered = v3_start;
++        for &(s, e) in &segs_sorted {
++            if s <= covered && e > covered {
++                covered = e;
++            }
++        }
++        assert!(
++            covered >= loop_end,
++            "v3 segments must cover [first_def, latch_end] explicitly: \
++             start={v3_start} covered={covered} end={loop_end} segs={v3_segs:?}"
++        );
++        let v3_iv = liv
++            .intervals
++            .iter()
++            .find(|iv| iv.value_id == 3)
++            .expect("index interval");
++        assert!(
++            v3_iv.end >= loop_end,
++            "fat envelope must cover the whole loop cycle (end {} < loop end {})",
++            v3_iv.end,
++            loop_end
++        );
++        // The escape-crossing sibling must genuinely conflict with the index
++        // envelope — otherwise this test proves nothing about co-assignment.
++        let v7_segs: Vec<(u32, u32)> = liv
++            .segments
++            .iter()
++            .filter(|s| s.value_id == 7)
++            .map(|s| (s.start, s.end))
++            .collect();
++        assert!(
++            !v7_segs.is_empty(),
++            "sibling must have segment data for the overlap assertion"
++        );
++        assert!(
++            v7_segs
++                .iter()
++                .any(|&(s, e)| s < v3_iv.end && e > v3_iv.start),
++            "sibling {v7_segs:?} must overlap the index envelope ({}, {}) — \
++             the thief geometry is gone",
++            v3_iv.start,
++            v3_iv.end
++        );
++    }
++
+     /// Split-latch loop helper:
+     ///   0: v1 = 0            (preheader init)
+     ///   1: v2 = v1 + 1; condbr v2 -> 2 (latch) / 3 (exit)
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index 7390889d..2463a63a 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -285,6 +285,9 @@ pub struct CodegenState {
+     pub direct_fp_result: Option<u32>,
+     /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
+     /// provably holds the vector data (128-bit vector register allocation).
++    /// Only tracks within a block; reg_assignments is the source of truth at
++    /// block boundaries. ENFORCED: the map is cleared at every label in
++    /// generate_function (generation.rs) — cross-block claims cannot survive.
+     pub vec_live_regs: FxHashMap<u32, &'static str>,
+     /// True once this function emitted any 256/512-bit vector instruction.
+     /// Dirty upper YMM halves trigger the AVX-SSE transition penalty in
+@@ -1139,6 +1142,20 @@ impl CodegenState {
+         if self.local_symbols.contains(name) {
+             return false;
+         }
++        // Weak symbols need GOT indirection in EVERY code model (mirrors
++        // needs_got_aarch64): a weak undefined symbol resolves to zero at
++        // runtime and a weak defined one may be overridden at static-link
++        // time. A direct rip-relative LEA emits R_X86_64_PC32, which the
++        // system linker rejects for undefined weaks in PIE links
++        // ("relocation R_X86_64_PC32 against undefined symbol ... can not
++        // be used when making a PIE object" — lib/common/zstd_trace.h's
++        // ZSTD_trace_compress_begin address compare inside lccc-built
++        // libzstd.a). @GOTPCREL assembles in non-PIE, PIE and shared links
++        // alike, and the linker fills the GOT entry with the final address
++        // (overriding definition or zero) — always semantically correct.
++        if self.weak_extern_symbols.contains(name) {
++            return true;
++        }
+         if self.pie_mode {
+             // RA-01 kill switch restores the old fully-GOT default so workload
+             // A/B runs isolate direct-global rematerialisation exactly.
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 793f625c..09560b29 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -529,6 +529,9 @@ pub(super) fn shiftx_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
+ /// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
+ pub struct X86Codegen {
+     pub(crate) state: CodegenState,
++    /// Sampled once per codegen instance: env reads are not free on the
++    /// per-vector-value path (F5), so the debug switch is hoisted here.
++    pub(super) dbg_vec_merge: bool,
+     pub(super) current_return_type: IrType,
+     /// SysV ABI eightbyte classification for the current function's return struct.
+     /// Set in prologue, used in emit_return_i128_to_regs for the function's own return.
+@@ -1100,6 +1103,7 @@ impl X86Codegen {
+         let machinst_disabled_kinds = parse_machinst_disabled_kinds(&ra_config.mi_disable_kinds);
+         Self {
+             state: CodegenState::new_with_ra_config(ra_config),
++            dbg_vec_merge: std::env::var_os("LCCC_DEBUG_VEC_MERGE").is_some(),
+             current_return_type: IrType::I64,
+             func_ret_classes: Vec::new(),
+             func_set_second_ret: false,
+@@ -6596,8 +6600,23 @@ impl ArchCodegen for X86Codegen {
+         // (regression glibc_gottpoff, second read returned 42).  The text
+         // path (emit_tls_global_addr_impl) selects the right TLS model, so
+         // keep TLS addresses off the fast path.
++        //
++        // Same contract for GOT-indirected and absolute symbols: LeaSym
++        // hardcodes `leaq sym(%rip)` (R_X86_64_PC32), which the system
++        // linker rejects for UNDEFINED WEAK symbols in PIE links
++        // ("relocation R_X86_64_PC32 against undefined symbol
++        // ZSTD_trace_compress_begin can not be used when making a PIE
++        // object" — lccc-built libzstd.a linked by the distro gcc driver).
++        // needs_got_for_addr already returns true for weak symbols in every
++        // code model and for PIC/PIE externals; absolute_symbols need the
++        // `movq $sym` immediate form. The text emitters
++        // (emit_global_addr_impl / emit_global_addr_into_reg) own that
++        // decision — route through them.
+         if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
+-            if self.state.tls_symbols.contains(name) {
++            if self.state.tls_symbols.contains(name)
++                || self.state.needs_got_for_addr(name)
++                || self.state.absolute_symbols.contains(name)
++            {
+                 return false;
+             }
+         }
+diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
+index 31ec046b..76e7881a 100644
+--- a/src/backend/x86/codegen/intrinsics.rs
++++ b/src/backend/x86/codegen/intrinsics.rs
+@@ -188,6 +188,12 @@ impl X86Codegen {
+             if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                 if is_xmm_reg(reg) {
+                     let name = phys_reg_name(reg);
++                    if self.dbg_vec_merge {
++                        eprintln!(
++                            "[vec-merge] fn={} v{} homed {} loaded into {}",
++                            self.state.current_func_name, v.0, name, xmm
++                        );
++                    }
+                     // A pending deferred store to this value flowed through
+                     // the register; anything else must be flushed before we
+                     // potentially clobber xmm0/xmm1 scratch.
+@@ -209,6 +215,16 @@ impl X86Codegen {
+             }
+             // CCC_ENABLE_VECREG: value provably in its allocated XMM register.
+             if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
++                if self.dbg_vec_merge {
++                    eprintln!(
++                        "[vec-merge] fn={} v{} vec-live {} (want {}) -> {}",
++                        self.state.current_func_name,
++                        v.0,
++                        held,
++                        xmm,
++                        if held == xmm { "ELIDE" } else { "copy" }
++                    );
++                }
+                 if held != xmm {
+                     self.state
+                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
+@@ -227,6 +243,16 @@ impl X86Codegen {
+             // provably untouched whenever this fires.
+             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0) {
+                 let held = self.state.sse_last_store_reg_name.unwrap_or("xmm0");
++                if self.dbg_vec_merge {
++                    eprintln!(
++                        "[vec-merge] fn={} v{} last-store {} (want {}) -> {}",
++                        self.state.current_func_name,
++                        v.0,
++                        held,
++                        xmm,
++                        if held == xmm { "ELIDE" } else { "copy" }
++                    );
++                }
+                 if held != xmm {
+                     self.state
+                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
+diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
+index f244eb44..d19d0adb 100644
+--- a/src/backend/x86/codegen/memory.rs
++++ b/src/backend/x86/codegen/memory.rs
+@@ -2243,24 +2243,33 @@ impl X86Codegen {
+             }
+             return false;
+         };
+-        if is_xmm_reg(b)
+-            || self
+-                .reg_assignments
+-                .get(&index.0)
+-                .copied()
+-                .is_none_or(is_xmm_reg)
+-        {
++        let Some(&x) = self.reg_assignments.get(&index.0) else {
++            return false;
++        };
++        if is_xmm_reg(b) || is_xmm_reg(x) {
++            return false;
++        }
++        // SIB soundness gate — see emit_store_indexed_impl for the full
++        // rationale. base==index in one SIB operand computes base + 2*index
++        // and the in-place index extension clobbers the base; refuse the
++        // fold and let the staging path rematerialise both operands.
++        if b == x {
++            if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
++                eprintln!(
++                    "[sib-clash] load v{} (base) and v{} (index) share home {} — refusing SIB fold (shift {}, disp {})",
++                    base.0,
++                    index.0,
++                    phys_reg_name(b),
++                    shift,
++                    disp
++                );
++            }
+             return false;
+         }
+         if !self.ensure_sib_index_form(index) {
+             return false;
+         }
+-        let mem = Self::sib_mem64(
+-            phys_reg_name(b),
+-            phys_reg_name(self.reg_assignments[&index.0]),
+-            shift,
+-            disp,
+-        );
++        let mem = Self::sib_mem64(phys_reg_name(b), phys_reg_name(x), shift, disp);
+         self.emit_load_indexed_common(dest, index, shift, ty, mem)
+     }
+ 
+@@ -2283,24 +2292,49 @@ impl X86Codegen {
+             }
+             return false;
+         };
+-        if is_xmm_reg(b)
+-            || self
+-                .reg_assignments
+-                .get(&index.0)
+-                .copied()
+-                .is_none_or(is_xmm_reg)
+-        {
++        let Some(&x) = self.reg_assignments.get(&index.0) else {
++            return false;
++        };
++        if is_xmm_reg(b) || is_xmm_reg(x) {
++            return false;
++        }
++        // SIB soundness gate: x86 has no meaningful base==index encoding —
++        // `mem(%r, %r, 1)` computes base + 2*index. If the allocator handed
++        // the base and the index the SAME physical register while both are
++        // live at this access, splicing them into one SIB operand not only
++        // computes a wild address, the in-place `ensure_sib_index_form`
++        // extension of the index would also destroy the just-consumed base.
++        // Refusing the fold falls back to the staging path, which
++        // rematerialises both operands independently (always correct).
++        // This gate has caught a real zlib-ng deflateHeaders miscompile
++        // (`put_byte` → `mov %r10b,(%rdi,%rdi,1)` with rdi holding the
++        // freshly-reloaded `s->pending_buf`): treat any firing as an RA
++        // interference bug and make it visible.
++        if b == x {
++            if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
++                eprintln!(
++                    "[sib-clash] fn={} store v{} (base, {:?}) and v{} (index, {:?}) share home {} — refusing SIB fold (shift {}, disp {})",
++                    self.state.current_func_name,
++                    base.0,
++                    self.value_types.get(&base.0),
++                    index.0,
++                    self.value_types.get(&index.0),
++                    phys_reg_name(b),
++                    shift,
++                    disp
++                );
++                for (label, v) in [("base", base.0), ("index", index.0)] {
++                    if let Some(segs) = self.value_live_segments.get(&v) {
++                        eprintln!("[sib-clash]   {label} v{v} segments: {segs:?}");
 +                    }
 +                }
 +            }
+             return false;
+         }
+         if !self.ensure_sib_index_form(index) {
+             return false;
+         }
+-        let mem = Self::sib_mem64(
+-            phys_reg_name(b),
+-            phys_reg_name(self.reg_assignments[&index.0]),
+-            shift,
+-            disp,
+-        );
++        let mem = Self::sib_mem64(phys_reg_name(b), phys_reg_name(x), shift, disp);
+         self.emit_store_indexed_common(val, index, shift, ty, mem)
+     }
+ 
+@@ -2333,6 +2367,12 @@ impl X86Codegen {
+         if is_xmm_reg(x) {
+             return false;
+         }
++        // PIC staging soundness (checked BEFORE the in-place extension so a
++        // refused fold has zero side effects): the %rcx leaq staging below
++        // would overwrite an index homed in %rcx.
++        if self.state.pic_mode && phys_reg_name(x) == "rcx" {
++            return false;
 +        }
-+        let Some(new_text) = replacement else {
+         if !self.ensure_sib_index_form(index) {
+             return false;
+         }
+@@ -2374,6 +2414,11 @@ impl X86Codegen {
+         if is_xmm_reg(x) {
+             return false;
+         }
++        // PIC staging soundness — mirror of emit_load_indexed_sym_impl: the
++        // %rcx leaq staging must not overwrite an index homed in %rcx.
++        if self.state.pic_mode && phys_reg_name(x) == "rcx" {
++            return false;
++        }
+         if !self.ensure_sib_index_form(index) {
+             return false;
+         }
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index beffc931..0edc1c4c 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -969,6 +969,17 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+                 changed |= c;
+             }
+         }
++        // Commutative RMW whose fresh destination is copied straight back
++        // into the accumulator operand: swap operands into the accumulator
++        // and drop the copy (fnv-1a hash loop: xorq %r9,%rsi; movq %rsi,%r9
++        // -> xorq %rsi,%r9 — one instruction less in the hottest loop).
++        if !sk("rmw_swap_fold") {
++            {
++                let c = relay_and_lea::fold_rmw_into_copy(&mut store, &mut infos);
++                trace("fold_rmw_into_copy", pass_count, c, &store, &infos);
++                changed |= c;
++            }
++        }
+         if !sk("copy_add_lea") {
+             {
+                 let c = flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
+@@ -1650,6 +1661,9 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+ #[cfg(test)]
+ mod whitespace_invariance;
+ 
++#[cfg(test)]
++mod rmw_fold_tests;
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
+index a8d0e60d..eac244c4 100644
+--- a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
++++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
+@@ -254,22 +254,29 @@ fn a_copy_survives_when_the_use_also_writes_the_destination() {
+         "    movl %esi, %eax\n",
+         "    ret"
+     )));
+-    // Rule 4 must never rewrite the use into `addl %ecx, %eax` (that would
+-    // clobber the copy source before `movl %esi, %eax` reads the result).
+-    assert_eq!(
+-        count(&out, "addl %ecx, %eax"),
+-        0,
+-        "rule 4 violated:\n{}",
+-        out
+-    );
+-    // The copy may still disappear through a different, legal route: the
+-    // later `load_op_fuse` "copy + commutative op into the dying operand"
+-    // pass turns the triple into `addl %eax, %ecx; movl %ecx, %eax` because
+-    // %ecx (caller-saved) and %esi are dead at `ret`. Either shape is correct;
+-    // the illegal rule-4 shape is the only thing this test forbids.
++    // The TRUE rule-4 violation is a stale trailing read: `addl %ecx, %eax`
++    // with `movl %esi, %eax` still AFTER it (the swap clobbers the copy
++    // source before that mov reads the pre-op value). That combination is
++    // forbidden in every route.
++    let stale_trailing_read =
++        count(&out, "addl %ecx, %eax") > 0 && count(&out, "movl %esi, %eax") > 0;
++    assert!(!stale_trailing_read, "rule 4 violated:\n{}", out);
++    // Three legal final shapes exist; all compute `eax = eax_old + ecx_old`
++    // with %esi dead:
++    // * survives — the original triple;
++    // * bridged  — load_op_fuse moves the op into the dying operand:
++    //   `addl %eax, %ecx; movl %ecx, %eax`;
++    // * fused    — rmw_fold then swaps the bridged op into %eax and drops
++    //   the now-dead copy: `addl %ecx, %eax` (commutative, so the value is
++    //   identical; %eax's old value is the op's own input).
+     let survives = count(&out, "movl %eax, %esi") == 1 && out.contains("addl %ecx, %esi");
+     let bridged = out.contains("addl %eax, %ecx") && out.contains("movl %ecx, %eax");
+-    assert!(survives || bridged, "unexpected shape:\n{}", out);
++    let fused = out.contains("addl %ecx, %eax");
++    assert!(survives || bridged || fused, "unexpected shape:\n{}", out);
++    if fused {
++        assert_eq!(count(&out, "movl %ecx, %eax"), 0, "{}", out);
++        assert_eq!(count(&out, "movl %esi"), 0, "{}", out);
++    }
+ }
+ 
+ #[test]
+diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+index b103b4be..6e9aac1e 100644
+--- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
++++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+@@ -1239,34 +1239,95 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
+         if !is_relayable_family(b_fam) {
+             continue;
+         }
+-        // The adjacent (NOPs apart) copy of the LEA result.
++        // The copy of the LEA result must read exactly the LEA's destination
++        // family and write a different relayable family that the LEA's
++        // source references (the aliased case — unaliased retargeting is the
++        // other pass's job). The copy need not be adjacent: a bounded
++        // straight-line window of intermediate instructions is allowed,
++        // provided none of them writes either family, reads %rA (its old
++        // value still lives there until the copy point), redefines %rB, or
++        // is anything but a plain instruction. Intermediate reads of %rB are
++        // collected into the same rename set the post-copy window applies —
++        // between the LEA and the copy, %rB holds exactly the LEA result,
++        // and after the retarget %rA holds it from the LEA's own position,
++        // so renaming preserves every value (zstd clamp_sum:
++        // `leaq (%r8,%rsi),%r11d; cmpq $1000,%r11d; movq %r11,%r8`).
+         let mut j = li + 1;
+-        while j < len && infos[j].is_nop() {
+-            j += 1;
+-        }
+-        if j >= len || infos[j].pinned || infos[j].is_barrier() {
+-            continue;
++        let mut pre_renames: Vec<(usize, String, String)> = Vec::new();
++        let mut found: Option<(u8, RegId)> = None;
++        {
++            let mut scanned = 0usize;
++            while j < len {
++                if infos[j].is_nop() {
++                    j += 1;
++                    continue;
++                }
++                if scanned >= 6 || infos[j].pinned || infos[j].is_barrier() {
++                    break;
++                }
++                let t = infos[j].trimmed(store.get(j)).to_string();
++                if has_implicit_reg_usage(&t) {
++                    break;
++                }
++                // Copy candidate? Tried before the %rA-mention abort below:
++                // the copy itself names both families.
++                let parsed = t
++                    .strip_prefix("movq ")
++                    .map(|r| (64u8, r))
++                    .or_else(|| t.strip_prefix("movl ").map(|r| (32u8, r)));
++                if let Some((cw, crest)) = parsed {
++                    if let Some((csrc, cdst)) = split_two_operands(crest) {
++                        let cfam = plain_gp_operand(cdst);
++                        if register_family_fast(csrc) == b_fam
++                            && plain_gp_operand(csrc).is_some()
++                            && cfam.is_some()
++                            && cfam != Some(b_fam)
++                            && cfam.map(|f| is_relayable_family(f)) == Some(true)
++                        {
++                            found = Some((cw, cfam.unwrap()));
++                            break;
++                        }
++                    }
++                    // Not the copy we own. Fall through to the generic
++                    // collection path below — an unrelated `movl $1000,
++                    // %ecx` between LEA and copy is common (zstd clamp_sum)
++                    // and the late family checks plus the plain-read rename
++                    // keep it correct; a mov that writes or reads either
++                    // family aborts or renames there.
++                }
++                if is_full_write(&infos[j], &t, b_fam) || get_dest_reg(&infos[j]) == b_fam {
++                    break; // %rB redefined (or RMW'd) before its copy
++                }
++                // NOTE: %rA is not known yet (it comes FROM the copy), so a
++                // generic line is only COLLECTED here; the family checks and
++                // the %rB→%rA rename run once a_fam is known. Anything the
++                // checks cannot prove stays unrenamed and aborts.
++                pre_renames.push((j, t, String::new()));
++                scanned += 1;
++                j += 1;
++            }
+         }
+-        let copy = infos[j].trimmed(store.get(j)).to_string();
+-        let (copy_w, copy_rest) = if let Some(r) = copy.strip_prefix("movq ") {
+-            (64u8, r)
+-        } else if let Some(r) = copy.strip_prefix("movl ") {
+-            (32u8, r)
+-        } else {
++        let Some((copy_w, a_fam)) = found else {
+             continue;
+         };
+-        let Some((copy_src, copy_dst)) = split_two_operands(copy_rest) else {
+-            continue;
+-        };
+-        // The copy must read exactly the LEA's destination family and write
+-        // a different relayable family that the LEA's source references
+-        // (the aliased case — unaliased retargeting is the other pass's job).
+-        if register_family_fast(copy_src) != b_fam || plain_gp_operand(copy_src).is_none() {
+-            continue;
++        // Late family checks + rename computation for the collected lines.
++        let mut window_ok = true;
++        for (_, t, new_t) in pre_renames.iter_mut() {
++            if line_refs_family(t, a_fam) {
++                window_ok = false;
++                break;
++            }
++            match rename_plain_family_reads(t, b_fam, a_fam) {
++                Some(nt) => *new_t = nt,
++                None => {
++                    window_ok = false;
++                    break;
++                }
++            }
+         }
+-        let Some(a_fam) = plain_gp_operand(copy_dst) else {
++        if !window_ok {
+             continue;
+-        };
++        }
+         if a_fam == b_fam || !is_relayable_family(a_fam) {
+             continue;
+         }
+@@ -1291,7 +1352,9 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
+         // --- family or a barrier. Collect rewrites; abort on any shape we
+         // --- cannot rename (RMW of %rB, memory mention, implicit usage).
+         let b_mask = 1u16 << b_fam;
+-        let mut rewrites: Vec<(usize, String, String)> = Vec::new(); // (idx, orig, new)
++        // Pre-copy window renames merge into the same set so apply/rollback
++        // handles them atomically with the post-copy ones.
++        let mut rewrites: Vec<(usize, String, String)> = pre_renames;
+         let mut abort = false;
+         let mut k = j + 1;
+         while k < len {
+@@ -1374,6 +1437,140 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
+     changed
+ }
+ 
++// ── Pass: commutative RMW + trailing copy → swapped in-place RMW ──────────
++
++/// Commutative two-operand ALU mnemonics (AT&T, destination last) eligible
++/// for the swap fold. `sub`/`shl`/… are NOT commutative and stay excluded —
++/// swapping their operands changes the computed value.
++const COMMUTATIVE_RMW_OPS: &[(&str, u8)] = &[
++    ("addq ", 64),
++    ("addl ", 32),
++    ("andq ", 64),
++    ("andl ", 32),
++    ("orq ", 64),
++    ("orl ", 32),
++    ("xorq ", 64),
++    ("xorl ", 32),
++    ("imulq ", 64),
++    ("imull ", 32),
++];
++
++/// Fold the accumulator round-trip the two-address lowering emits for
++/// `acc = acc OP byte_temp` when RA hands the op a fresh destination:
++///
++/// ```text
++///     xorq %r9, %rsi            xorq %rsi, %r9
++///     movq %rsi, %r9        ->
++/// ```
++///
++/// The op reads BOTH registers and writes `%rT`; the copy moves `%rT` into
++/// `%rD`. Because the mnemonic is commutative, writing `%rD` instead — with
++/// the operands swapped — computes the identical value from the identical
++/// inputs, and the copy dies. Conditions, each checked below:
++/// * the copy is the next real instruction, `movq`/`movl %rT, %rD`, and
++///   `%rD` is exactly the family the op's SOURCE operand names (the swap
++///   preserves the read set only for that shape; an op whose source is NOT
++///   the copy destination would need `%rD`'s old value as an input, which
++///   the original never read);
++/// * width rules match [`retarget_producer_into_copy`]: a 64-bit op under a
++///   32-bit copy is rejected (the copy truncates, the swap would not), the
++///   32-bit-op forms zero-extend so a `movq` copy stays legal;
++/// * `%rT` is provably dead after the copy (same proof as pass 3 — no
++///   reader on any path, back edges, calls and `ret` included);
++/// * the op position is untouched, so flag results are unaffected.
++pub(super) fn fold_rmw_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let len = store.len();
++    let mut lv = FileLiveness::new(store, infos);
++    let mut changed = false;
++    let mut i = 0;
++    while i < len {
++        if infos[i].is_nop() || infos[i].pinned || infos[i].is_barrier() {
++            i += 1;
++            continue;
++        }
++        let op_line = infos[i].trimmed(store.get(i)).to_string();
++        let Some((opname, w)) = COMMUTATIVE_RMW_OPS
++            .iter()
++            .find(|p| op_line.starts_with(p.0))
++            .map(|&(n, w)| (n, w))
++        else {
 +            i += 1;
 +            continue;
 +        };
-+        // The fold deletes the load: the loaded register must be dead after
-+        // the consumer.  Copy propagation may extend the byte's register
-+        // across later readers; the oracle answers for the whole function.
-+        let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
-+        if !liveness.dead_after(j, dst_reg) {
++        let Some((src, dst)) = split_two_operands(&op_line[opname.len()..]) else {
++            i += 1;
++            continue;
++        };
++        let Some(t_fam) = plain_gp_operand(dst) else {
++            i += 1;
++            continue;
++        };
++        // The op's source must be a plain register; the copy below pins it
++        // to the copy-destination family.
++        let Some(d_fam) = plain_gp_operand(src) else {
++            i += 1;
++            continue;
++        };
++        if t_fam == d_fam || !is_relayable_family(t_fam) || !is_relayable_family(d_fam) {
 +            i += 1;
 +            continue;
 +        }
-+        // For the test shape the cmpb must reach its ZF reader without a
-+        // writer in between (the reader was checked adjacent to the test;
-+        // deleting the test between them keeps them adjacent — nothing to
-+        // do, but the invariant is load-bearing for the ZF-only gate).
-+        let _ = test_shape;
-+        store.replace(i, new_text);
-+        infos[i] = classify_line(store.get(i));
-+        infos[j].kind = LineKind::Nop;
++        if has_implicit_reg_usage(&op_line) {
++            i += 1;
++            continue;
++        }
++        // Next real instruction is the copy.
++        let mut j = i + 1;
++        while j < len && infos[j].is_nop() {
++            j += 1;
++        }
++        if j >= len || infos[j].pinned || infos[j].is_barrier() {
++            i += 1;
++            continue;
++        }
++        let copy = infos[j].trimmed(store.get(j)).to_string();
++        let (copy_w, crest) = if let Some(r) = copy.strip_prefix("movq ") {
++            (64u8, r)
++        } else if let Some(r) = copy.strip_prefix("movl ") {
++            (32u8, r)
++        } else {
++            i += 1;
++            continue;
++        };
++        let Some((copy_src, copy_dst)) = split_two_operands(crest) else {
++            i += 1;
++            continue;
++        };
++        if register_family_fast(copy_src) != t_fam || plain_gp_operand(copy_src).is_none() {
++            i += 1;
++            continue;
++        }
++        if plain_gp_operand(copy_dst) != Some(d_fam) {
++            i += 1;
++            continue;
++        }
++        // A 64-bit op under a 32-bit copy would keep the upper half.
++        if w == 64 && copy_w == 32 {
++            i += 1;
++            continue;
++        }
++        // %rT must have no reader after the deleted copy.
++        if !provably_dead_lv(&lv, store, infos, j, t_fam, &[i, j]) {
++            i += 1;
++            continue;
++        }
++        let r_t = REG_NAMES[usize::from(w == 32)][t_fam as usize];
++        let r_d = REG_NAMES[usize::from(w == 32)][d_fam as usize];
++        let new_op = format!("    {}{}, {}", opname, r_t, r_d);
++        replace_line(store, &mut infos[i], i, new_op);
++        mark_nop(&mut infos[j]);
++        lv.refresh_at(store, infos, i);
 +        changed = true;
-+        i += 1;
++        i = j + 1;
 +    }
 +    changed
 +}
 +
-+/// The narrowed SOURCE of a zero-extend the narrow-compare fold can consume:
-+/// a canonical base-only frame slot (`-8(%esp)`), or the load's source text
-+/// verbatim (a narrow register `%dl`/`%dx`/`%dh`, or a base-only indirect
-+/// operand `2(%edi)` — for those the compare must re-read the EXACT address
-+/// expression, so the text is carried, never arithmetic-remixed).
-+enum NarrowSrc {
-+    Slot(i32, &'static str),
-+    Verbatim(String),
+ // ── Pass: copy-into-RMW-consumer coalescing ──────────────────────────────
+ 
+ /// Two-operand ALU mnemonics (AT&T, destination last) eligible as the
+@@ -4222,9 +4419,16 @@ mod tests {
+             ".cfi_endproc\n",
+         ));
+         assert!(out.contains("andl $2080895, %r8d"), "{out}");
+-        assert!(out.contains("addl %eax, %r8d"), "{out}");
+-        assert!(out.contains("movl %r8d, %eax"), "{out}");
+         assert!(!out.contains("%r10"), "{out}");
++        // Two legal final shapes:
++        // * `addl %eax, %r8d; movl %r8d, %eax` — the coalesced pair;
++        // * `addl %r8d, %eax` — rmw_fold then swaps the commutative add into
++        //   %eax and drops the dead copy: eax = eax + (r8 & K), identical to
++        //   the original's (r8 & K) + eax, with %r8's dead post-add value
++        //   dropped (nothing reads it — the deadness proof guarantees it).
++        let paired = out.contains("addl %eax, %r8d") && out.contains("movl %r8d, %eax");
++        let fused = out.contains("addl %r8d, %eax");
++        assert!(paired || fused, "unexpected shape:\n{out}");
+     }
+ 
+     #[test]
+diff --git a/src/backend/x86/codegen/peephole/passes/rmw_fold_tests.rs b/src/backend/x86/codegen/peephole/passes/rmw_fold_tests.rs
+new file mode 100644
+index 00000000..6e2666b4
+--- /dev/null
++++ b/src/backend/x86/codegen/peephole/passes/rmw_fold_tests.rs
+@@ -0,0 +1,126 @@
++//! Tests for the commutative RMW swap fold ([`relay_and_lea::fold_rmw_into_copy`])
++//! and the windowed [`relay_and_lea::fold_copy_into_lea_base`].
++//!
++//! Positives pin the two real-world shapes that motivated the passes (the
++//! fnv-1a accumulator round-trip and the zstd clamp_sum lea/copy window with
++//! an unrelated compare in between). Negatives pin every legality rule: each
++//! one corresponds to a silent-miscompile hazard if it ever stops blocking.
++
++use super::super::peephole_optimize;
++
++fn run(input: &str) -> String {
++    peephole_optimize(input.to_string())
 +}
 +
-+/// Parse `movzbl|movzwl SRC, %REG` where SRC is a base-only frame slot, a
-+/// narrow register, or a base-only indirect operand.  Returns (load width,
-+/// source, dest family).  The narrow twin of `parse_load_from_ebp` (which
-+/// deliberately matches only movl/movw/movb, so narrow extends classify as
-+/// Other) — this parser refuses every shape it cannot pin down exactly.
-+fn parse_narrow_zext_src(
-+    store: &LineStore,
-+    info: &LineInfo,
-+    idx: usize,
-+) -> Option<(MoveSize, NarrowSrc, RegId)> {
-+    let t = trimmed(store, info, idx);
-+    let (mnem, width) = if let Some(r) = t.strip_prefix("movzbl ") {
-+        (r, MoveSize::B)
-+    } else if let Some(r) = t.strip_prefix("movzwl ") {
-+        (r, MoveSize::W)
-+    } else {
-+        return None;
-+    };
-+    let mnem = mnem.trim();
-+    let after = match mnem.find(", %") {
-+        Some(c) => &mnem[c..],
-+        None => return None,
-+    };
-+    if !after.starts_with(", %") {
-+        return None;
-+    }
-+    let reg_str = after[1..].trim();
-+    let dst = register_family(reg_str);
-+    if dst == REG_NONE || dst > REG_GP_MAX {
-+        return None;
-+    }
-+    let src_part = mnem[..mnem.len() - after.len()].trim();
-+    // Source shape 1: base-only frame slot (no index/scale/symbol — the
-+    // compare's memory operand must be the exact bytes the load read; the
-+    // displacement is re-emitted canonically so the ESP-slot bias of the
-+    // line text can never leak into the operand).
-+    if let Some(paren_pos) = src_part.find("(%ebp)").or_else(|| src_part.find("(%esp)")) {
-+        let base: &'static str = if src_part[paren_pos..].starts_with("(%ebp)") {
-+            "%ebp"
-+        } else {
-+            "%esp"
-+        };
-+        let disp_str = &src_part[..paren_pos];
-+        if disp_str.contains('(') || disp_str.contains(',') || disp_str.contains('%') {
-+            return None;
-+        }
-+        let disp = if disp_str.is_empty() {
-+            0
-+        } else {
-+            parse_offset(disp_str)
-+        };
-+        return Some((width, NarrowSrc::Slot(disp, base), dst));
-+    }
-+    // Source shape 2: a narrow register spelling, or a base-only indirect
-+    // operand `DISP(%reg)` (pointer loads: `movzwl (%edi), %edx`).  For the
-+    // indirect form the compare re-reads the EXACT same address expression
-+    // the load read — identical bytes, identical fault behaviour — so the
-+    // flag law carries over unchanged.  Adjacency (nops only between load
-+    // and consumer) is what makes "the memory is unchanged" local.
-+    if src_part.starts_with('%') && register_family(src_part) != REG_NONE {
-+        return Some((width, NarrowSrc::Verbatim(src_part.to_string()), dst));
-+    }
-+    if let Some(paren) = src_part.find("(%") {
-+        let disp_str = &src_part[..paren];
-+        let tail = &src_part[paren..];
-+        // Base-only: `%reg)` with no index/scale comma inside the parens.
-+        if disp_str.contains('(')
-+            || disp_str.contains(',')
-+            || disp_str.contains('%')
-+            || tail.contains(',')
-+        {
-+            return None;
-+        }
-+        return Some((width, NarrowSrc::Verbatim(src_part.to_string()), dst));
-+    }
-+    None
++/// Wrap a body in the CFI markers `FileLiveness` needs to analyse a function.
++fn f(body: &str) -> String {
++    format!(".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n", body)
 +}
 +
-+/// Whether the flag reader following line `j` (immediately, nops allowed)
-+/// consumes ZF only.  The testl fold changes SF semantics, so the reader
-+/// must be a `je`/`jne` branch or a `sete`/`setne` writer; anything else
-+/// (arithmetic on flags, carry chains, sign tests, other setcc/jcc forms)
-+/// refuses the fold.
-+fn zf_only_flags_reader(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
-+    let k = next_non_nop(infos, j + 1);
-+    if k >= infos.len() {
++fn count(hay: &str, needle: &str) -> usize {
++    hay.matches(needle).count()
++}
++
++// ── A. commutative RMW swap ──────────────────────────────────────────────────
++
++#[test]
++fn a_xor_round_trip_swaps_into_the_accumulator() {
++    // The fnv-1a hot-loop shape: the op's source IS the copy destination.
++    let out = run(&f(
++        "    xorq %r9, %rsi\n    movq %rsi, %r9\n    imulq %r8, %r9\n    ret",
++    ));
++    assert_eq!(count(&out, "xorq %rsi, %r9"), 1, "{}", out);
++    assert_eq!(count(&out, "movq %rsi, %r9"), 0, "{}", out);
++}
++
++#[test]
++fn a_addl_round_trip_with_widening_copy_folds() {
++    // 32-bit op zero-extends, so the 64-bit copy may fold.
++    let out = run(&f("    addl %r8d, %esi\n    movq %rsi, %r8\n    ret"));
++    assert_eq!(count(&out, "addl %esi, %r8d"), 1, "{}", out);
++    assert_eq!(count(&out, "movq %rsi, %r8"), 0, "{}", out);
++}
++
++#[test]
++fn a_64_bit_op_under_a_32_bit_copy_is_rejected() {
++    // SOUNDNESS: the copy truncates to 32 bits; the swapped 64-bit op would
++    // keep the upper half in %r8.
++    let out = run(&f(
++        "    xorq %r9, %rsi\n    movl %esi, %r8d\n    movl %r8d, %eax\n    ret",
++    ));
++    // The swap fold must not fire. (Neighbouring dead-copy passes may
++    // forward the dead %r8d — legal — so only the swap text is forbidden.)
++    assert_eq!(count(&out, "xorq %rsi, %r9"), 0, "{}", out);
++}
++
++#[test]
++fn a_live_temp_blocks_the_fold() {
++    // SOUNDNESS: %rsi is read after the copy — the op must keep its own
++    // destination and the copy must stay.
++    let out = run(&f(
++        "    xorq %r9, %rsi\n    movq %rsi, %r9\n    movq %rsi, %rax\n    ret",
++    ));
++    assert_eq!(count(&out, "xorq %rsi, %r9"), 0, "{}", out);
++    // %rax must still receive %rsi's value (the pre-op one), never %r9's.
++    assert_eq!(count(&out, "movq %rsi, %rax"), 1, "{}", out);
++    assert_eq!(count(&out, "movq %r9, %rax"), 0, "{}", out);
++}
++
++#[test]
++fn a_sub_is_never_swapped() {
++    // SOUNDNESS: `subq %r9,%rsi` computes rsi = rsi - r9; swapping computes
++    // r9 = r9 - rsi — a different value. `sub` stays out of the table.
++    let out = run(&f("    subq %r9, %rsi\n    movq %rsi, %r9\n    ret"));
++    assert_eq!(count(&out, "subq %r9, %rsi"), 1, "{}", out);
++}
++
++#[test]
++fn an_op_whose_source_is_not_the_copy_dest_is_rejected() {
++    // SOUNDNESS: `xorq %r8,%rsi; movq %rsi,%r9` — swapping would compute
++    // r8 = r8 ^ rsi, but %r8's old value was never an input of the original.
++    let out = run(&f("    xorq %r8, %rsi\n    movq %rsi, %r9\n    ret"));
++    assert_eq!(count(&out, "xorq %rsi, %r8"), 0, "{}", out);
++}
++
++#[test]
++fn a_barrier_between_op_and_copy_blocks_the_fold() {
++    // The temp may be re-defined on the fallthrough path; the proof must not
++    // reach across the label.
++    let out = run(&f("    xorq %r9, %rsi\n.L1:\n    movq %rsi, %r9\n    ret"));
++    assert_eq!(count(&out, "xorq %rsi, %r9"), 0, "{}", out);
++}
++
++// ── B. windowed lea-base fold ────────────────────────────────────────────────
++
++#[test]
++fn b_lea_copy_with_intervening_compare_folds() {
++    // The zstd clamp_sum shape: the compare reads the LEA temp between the
++    // LEA and its copy — the window must rename it like the post-copy reads.
++    let out = run(&f(
++        "    leaq (%r8,%rsi), %r11\n    cmpq $1000, %r11\n    movq %r11, %r8\n    cmovaq %rcx, %r8\n    ret",
++    ));
++    assert_eq!(count(&out, "movq %r11, %r8"), 0, "{}", out);
++    assert_eq!(count(&out, "cmpq $1000, %r8"), 1, "{}", out);
++}
++
++#[test]
++fn b_intervening_read_of_the_copy_dest_blocks_the_fold() {
++    // SOUNDNESS: the unrelated line reads %r8's OLD value; after the
++    // retarget %r8 would already hold the LEA result.
++    let out = run(&f(
++        "    leaq (%r8,%rsi), %r11\n    addq %r8, %rax\n    movq %r11, %r8\n    ret",
++    ));
++    // The retargeted form must not exist; neighbouring dead-store passes
++    // may delete the dead chain entirely (legal — nothing reads it here).
++    assert_eq!(count(&out, "leaq (%r8,%rsi), %r8"), 0, "{}", out);
++}
++
++#[test]
++fn b_intervening_write_of_the_temp_blocks_the_fold() {
++    // SOUNDNESS: the LEA temp is redefined before its copy — the copy moves
++    // the REDEFINITION, not the LEA result.
++    let out = run(&f(
++        "    leaq (%r8,%rsi), %r11\n    leaq 4(%r11), %r11\n    movq %r11, %r8\n    ret",
++    ));
++    assert_eq!(count(&out, "leaq (%r8,%rsi), %r8"), 0, "{}", out);
++}
+diff --git a/src/frontend/preprocessor/macro_defs.rs b/src/frontend/preprocessor/macro_defs.rs
+index 34940a73..4de06386 100644
+--- a/src/frontend/preprocessor/macro_defs.rs
++++ b/src/frontend/preprocessor/macro_defs.rs
+@@ -52,6 +52,9 @@ fn would_paste_tokens(last: u8, first: u8) -> bool {
+         (b'/', b'*') | (b'/', b'/') => true,
+         // . followed by digit (e.g., prevent "1." + "5" pasting weirdly)
+         (b'.', b'0'..=b'9') => true,
++        // digit followed by '.' (e.g., "1" from a macro + "." from source
++        // would re-lex as the pp-number "1." instead of two tokens)
++        (a, b'.') if a.is_ascii_digit() => true,
+         // Identifier/number continuation: letter/digit/_ followed by letter/digit/_
+         (a, b) if is_ident_cont_byte(a) && is_ident_cont_byte(b) => true,
+         _ => false,
+@@ -92,6 +95,27 @@ const BLUE_PAINT_MARKER: u8 = 0x01;
+ const PASTE_PROTECT_START: u8 = 0x02;
+ const PASTE_PROTECT_END: u8 = 0x03;
+ 
++/// Token-boundary marker emitted where macro replacement output abuts
++/// surrounding tokens with no intervening whitespace (C11 §6.10.3.4).
++///
++/// Rescanning operates on *preprocessing tokens*, not on the spelling text:
++/// replacement tokens and source tokens never merge into a new token merely
++/// because their spellings are adjacent (e.g. `#define MAJOR 1` followed by
++/// the body `MAJOR.MINOR` yields the three tokens `1`, `.`, `MINOR`, and
++/// `MINOR` is still macro-expandable — it is NOT part of a pp-number
++/// `1.MINOR`). A plain string-based expander cannot see that boundary, which
++/// previously made `expand_identifier`'s pp-number continuation check swallow
++/// identifiers across expansion boundaries and broke glibc/zstd-style
++/// version stringification (`ZSTD_EXPAND_AND_QUOTE(ZSTD_LIB_VERSION)` ->
++/// "1.ZSTD_VERSION_MINOR. 0" instead of "1.6.0").
++///
++/// The barrier marks "token boundary, no whitespace". Consumers:
++/// - `stringify_arg` drops it (adjacent tokens stringify without a space),
++/// - `expand_line_reuse` converts it to a real space only where the two
++///   neighbours would otherwise paste into one token (matches gcc -E output).
++/// Uses 0x04 to avoid collision with the other marker bytes.
++const EXPANSION_BARRIER: u8 = 0x04;
++
+ /// Strip all blue-paint markers from a string.
+ /// Used when substituting arguments into ## token paste operations,
+ /// since the pasted result is a new token that should be rescanned
+@@ -301,28 +325,96 @@ impl MacroTable {
+         // - 0x01 (BLUE_PAINT_MARKER): prevents re-expansion per C11 §6.10.3.4
+         // - 0x02/0x03 (PASTE_PROTECT_START/END): should already be consumed by
+         //   substitute_params, but strip defensively in case any leak through.
++        // - 0x04 (EXPANSION_BARRIER): a token boundary with no whitespace.
++        //   For final SPELLING output it becomes a space only where the two
++        //   neighbours would otherwise re-lex as a single token (matching the
++        //   traditional paste-guard behaviour); everywhere else it vanishes,
++        //   so the spelling keeps the whitespace-free form that C11
++        //   §6.10.3.2 stringification and the pp-number continuation check
++        //   downstream rely on.
++        let has_barrier = result.as_bytes().iter().any(|&b| b == EXPANSION_BARRIER);
+         if result
+             .as_bytes()
+             .iter()
+             .any(|&b| b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END)
+         {
+-            result.replace(
++            let stripped = result.replace(
+                 [
+                     BLUE_PAINT_MARKER as char,
+                     PASTE_PROTECT_START as char,
+                     PASTE_PROTECT_END as char,
+                 ],
+                 "",
+-            )
++            );
++            return if has_barrier {
++                Self::resolve_barriers(&stripped)
++            } else {
++                stripped
++            };
++        }
++        if has_barrier {
++            Self::resolve_barriers(&result)
+         } else {
+             result
+         }
+     }
+ 
+-    /// Append `expanded` text to `result`, inserting spaces as needed to prevent
+-    /// accidental token pasting between the end of `result` and the start/end
+-    /// of `expanded`, and between the end of `expanded` and `next_byte` (the
+-    /// next byte in the source after the expansion site).
++    /// Replace EXPANSION_BARRIER markers in final output: a barrier becomes a
++    /// real space exactly when its two neighbours would paste into one token;
++    /// otherwise it is dropped (pure token boundary, no whitespace).
++    /// Operates on raw bytes (barriers are single ASCII control bytes, and the
++    /// surrounding text — e.g. UTF-8 string literal contents — must be copied
++    /// through byte-exact).
++    fn resolve_barriers(s: &str) -> String {
++        let bytes = s.as_bytes();
++        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
++        let mut i = 0;
++        while i < bytes.len() {
++            let b = bytes[i];
++            if b != EXPANSION_BARRIER {
++                out.push(b);
++                i += 1;
++                continue;
++            }
++            let prev = out.last().copied();
++            // Find the next non-barrier byte (defensive: doubled barriers).
++            let mut j = i + 1;
++            while j < bytes.len() && bytes[j] == EXPANSION_BARRIER {
++                j += 1;
++            }
++            let next = if j < bytes.len() {
++                Some(bytes[j])
++            } else {
++                None
++            };
++            if let (Some(p), Some(n)) = (prev, next) {
++                // would_paste_tokens' final arm already covers every
++                // ident-continuation pair; no separate ident test here.
++                if would_paste_tokens(p, n) {
++                    out.push(b' ');
++                }
++            }
++            // A barrier at the very edge of the line carries no paste risk;
++            // drop it.
++            i = j;
++        }
++        // The text (barriers included) is pure ASCII-safe bytes — 0x04 is a
++        // valid one-byte UTF-8 sequence — so this cannot fail.
++        String::from_utf8(out)
++            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
++    }
++
++    /// Append `expanded` text to `result`, inserting token-boundary barriers as
++    /// needed to prevent accidental token pasting between the end of `result`
++    /// and the start/end of `expanded`, and between the end of `expanded` and
++    /// `next_byte` (the next byte in the source after the expansion site).
++    ///
++    /// The barrier is an invisible EXPANSION_BARRIER marker rather than a
++    /// literal space: adjacent replacement tokens stringify WITHOUT whitespace
++    /// (C11 §6.10.3.2 — the spelling records only whitespace that existed in
++    /// the token sequence), while `expand_line_reuse` turns the barrier back
++    /// into a space for final output exactly where the neighbours would
++    /// otherwise re-lex as a single token.
+     fn append_with_paste_guard(result: &mut String, expanded: &str, next_byte: Option<u8>) {
+         if expanded.is_empty() {
+             return;
+@@ -334,7 +426,7 @@ impl MacroTable {
+             if would_paste_tokens(last, first)
+                 || (is_ident_cont_byte(last) && is_ident_cont_byte(first))
+             {
+-                result.push(' ');
++                result.push(EXPANSION_BARRIER as char);
+             }
+         }
+         result.push_str(expanded);
+@@ -342,7 +434,7 @@ impl MacroTable {
+         if let Some(next) = next_byte {
+             let last_expanded = expanded.as_bytes()[expanded.len() - 1];
+             if would_paste_tokens(last_expanded, next) {
+-                result.push(' ');
++                result.push(EXPANSION_BARRIER as char);
+             }
+         }
+     }
+@@ -1615,6 +1707,17 @@ fn stringify_arg(arg: &str) -> String {
+             continue;
+         }
+ 
++        // Skip EXPANSION_BARRIER markers (token boundaries with no whitespace
++        // introduced where macro replacement output abuts other tokens —
++        // §6.10.3.2 records only whitespace that exists in the token
++        // sequence, and adjacent replacement tokens stringify without a
++        // space). Without this, `EQ(V)` with V expanding to `1.MINOR.RELEASE`
++        // would stringify as "1. MINOR. RELEASE" instead of "1.6.0".
++        if bytes[i] == EXPANSION_BARRIER {
++            i += 1;
++            continue;
++        }
++
+         // Collapse whitespace sequences to a single space
+         if bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' {
+             if !result.is_empty() {
+diff --git a/src/passes/inline.rs b/src/passes/inline.rs
+index ae0d5b54..842814f7 100644
+--- a/src/passes/inline.rs
++++ b/src/passes/inline.rs
+@@ -234,6 +234,21 @@ const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 200;
+ /// safe for stack-frame and I-cache size.
+ const MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER: usize = 600;
+ 
++/// Dedicated budget for inlining SMALL, LOOP-FREE callees at call sites
++/// INSIDE the caller's loops once the normal budgets/caps are exhausted by
++/// the caller's own size. Per-iteration call overhead in the hottest loop of
++/// a function dominates its runtime (zstd `ZSTD_decompressSequences_default`
++/// paid ~9 calls per SEQUENCE — `BIT_readBitsFast` x4, `ZSTD_initFseState`
++/// x3, `ZSTD_execSequence`, `BIT_reloadDStream` — because the caller had
++/// grown past MAX_CALLER_INSTRUCTIONS_AFTER_INLINE/HARD_CAP; fullbench
++/// measured decompress at 383 MB/s vs gcc's 966 MB/s, and gcc/clang inline
++/// these shapes unconditionally). Growth is bounded: at most ~300 small-callee
++/// instructions per caller, and the frame-growth bound that motivates the
++/// caller-size caps holds per small callee (<= ~160 B by the 8-byte-slot
++/// model), so worst-case added frame is ~2.4 KB — within the kernel's 16 KB
++/// stack headroom argument for the existing caps.
++const MAX_HOT_LOOP_INLINE_BUDGET_PER_CALLER: usize = 300;
++
+ /// Additional always_inline budget for the second (correctness) pass.
+ /// After the main inlining loop exhausts max_rounds, any remaining
+ /// always_inline call sites are processed in a second pass with this
+@@ -352,6 +367,7 @@ fn select_inline_site(
+     budget_remaining: usize,
+     always_inline_budget_remaining: usize,
+     pgo_force_budget_remaining: usize,
++    hot_loop_budget_remaining: usize,
+     size_optimized: bool,
+     loop_blocks: &FxHashSet<usize>,
+     caller_has_loops: bool,
+@@ -597,9 +613,17 @@ fn select_inline_site(
+                 && callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS;
+             let size_cap_exempt = callee_data.is_single_call_site_static
+                 && callee_data.size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST;
++            // HOT-LOOP EXEMPTION: a small loop-free callee called from inside
++            // one of the caller's loops executes once per iteration — the
++            // call/ret + argument traffic costs more than the inlined body
++            // ever adds to the frame. Exempt it from the caller-size caps
++            // (bounded by the dedicated hot-loop budget, see the const).
++            let site_in_hot_loop =
++                in_loop && !callee_data.has_loops && callee_inst_count <= MAX_INLINE_INSTRUCTIONS;
+             if caller_too_large
+                 && !callee_data.is_always_inline
+                 && !size_cap_exempt
++                && !site_in_hot_loop
+                 && !(in_loop
+                     && !callee_data.has_loops
+                     && callee_inst_count <= MAX_INLINE_INSTRUCTIONS)
+@@ -609,16 +633,21 @@ fn select_inline_site(
+             }
+             // Absolute cap: stop normal inlining for extremely large callers.
+             // always_inline callees MUST still be inlined (C semantic requirement).
+-            if caller_at_absolute_cap && !callee_data.is_always_inline {
++            if caller_at_absolute_cap && !callee_data.is_always_inline && !site_in_hot_loop {
+                 continue;
+             }
+             // Hard cap: stop normal inlining to prevent kernel stack overflow.
+             // always_inline callees are still inlined (C semantic requirement),
+             // but are limited by the always_inline budget.
+-            if caller_at_hard_cap && !callee_data.is_always_inline {
++            if caller_at_hard_cap && !callee_data.is_always_inline && !site_in_hot_loop {
+                 continue;
+             }
+         }
++        // Recompute for the second-pass scope (same predicate as the gate
++        // above): small loop-free callee at an in-loop site.
++        let site_in_hot_loop = loop_blocks.contains(&site.block_idx)
++            && !callee_data.has_loops
++            && callee_inst_count <= MAX_INLINE_INSTRUCTIONS;
+         let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
+         // Budget enforcement: always_inline callees use a separate budget;
+         // non-always_inline callees use the normal budget. PGO-forced sites
+@@ -638,6 +667,15 @@ fn select_inline_site(
+             if callee_inst_count > pgo_force_budget_remaining {
+                 continue;
+             }
++        } else if site_in_hot_loop {
++            // Small in-loop callees draw from the dedicated hot-loop budget,
++            // NOT from the normal per-caller budget: a 800-instruction
++            // decompress loop exhausts the normal budget on its first
++            // sequences, yet every remaining per-iteration call still costs
++            // more than inlining it.
++            if callee_inst_count > hot_loop_budget_remaining {
++                continue;
++            }
+         } else if !callee_data.is_single_call_site_static && callee_inst_count > budget_remaining {
+             // Single-call-site statics don't consume the normal budget: each
+             // is inlined at most once module-wide, so they cannot cause the
+@@ -766,13 +804,20 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
+         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
+         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
+         let mut pgo_force_budget_remaining = MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER;
++        let mut hot_loop_budget_remaining = MAX_HOT_LOOP_INLINE_BUDGET_PER_CALLER;
+         // During one -Os inliner invocation, clone a large ordinary callee at
+         // most once into a given caller. This permits one profitable
+         // specialization while avoiding repeated medium-body expansion.
+         let mut size_inlined_large_callees: FxHashSet<String> = FxHashSet::default();
+         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
+         // Limit iterations to prevent infinite loops from recursive inline functions.
+-        let max_rounds = 200;
++        // 200 rounds starve large fixed-point callers: inlining one site per
++        // round, a decompressor that absorbs ZSTD_decodeSequence (6 nested
++        // BIT_readBitsFast/ZSTD_initFseState sites) plus ~180 other sites runs
++        // out of rounds with per-sequence calls still emitted. The loop still
++        // early-breaks when a round selects nothing, so the cap is only a
++        // runaway guard.
++        let max_rounds = 2000;
+         for _round in 0..max_rounds {
+             // Check if the caller has grown too large for further normal inlining.
+             // Each SSA value in CCC gets an 8-byte stack slot, so functions with
+@@ -945,6 +990,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
+                 budget_remaining,
+                 always_inline_budget_remaining,
+                 pgo_force_budget_remaining,
++                hot_loop_budget_remaining,
+                 size_optimized,
+                 &loop_blocks,
+                 caller_has_loops,
+@@ -1031,7 +1077,21 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
+                     pgo_force_budget_remaining =
+                         pgo_force_budget_remaining.saturating_sub(callee_inst_count);
+                 } else {
+-                    budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
++                    // Mirror of select_inline_site's hot-loop test: small
++                    // loop-free callees at in-loop sites draw from the
++                    // dedicated hot-loop budget.
++                    let site_in_hot_loop = loop_blocks.contains(&site.block_idx)
++                        && !callee_map
++                            .get(&site.callee_name)
++                            .map(|d| d.has_loops)
++                            .unwrap_or(true)
++                        && callee_inst_count <= MAX_INLINE_INSTRUCTIONS;
++                    if site_in_hot_loop {
++                        hot_loop_budget_remaining =
++                            hot_loop_budget_remaining.saturating_sub(callee_inst_count);
++                    } else {
++                        budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
++                    }
+                 }
+                 total_inlined += 1;
+                 module.functions[func_idx].has_inlined_calls = true;
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index db5e7923..a50523f4 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -4915,6 +4915,34 @@ fn cond_store_no_escaping_uses(
+ /// Fail-closed: any shape deviation (extra side effects, a second load, a
+ /// different skip target, volatile access, non-integer compares the flip
+ /// table does not cover) leaves the loop untouched.
++///
++/// S04c guard (`cond_store_phi_incoming_safe`): the rewrite deletes every
++/// computation in the guard chain and the store block. A header phi whose
++/// back edge takes its value from one of those blocks is a loop-carried
++/// recurrence — `if (b[i]=='\n') { b[i]=0; lineCount++; }` in
++/// UTIL_processLines — that the select-store silently drops, which zeroed
++/// the line count and broke zstd's `--filelist`. The map transform's own
++/// contract allows no loop-carried value except the induction variable, so
++/// such shapes must not be rewritten at all.
++fn cond_store_phi_incoming_safe(func: &IrFunction, rewritten_blocks: &[usize]) -> bool {
++    let rewritten_labels: FxHashSet<BlockId> = rewritten_blocks
++        .iter()
++        .map(|&bi| func.blocks[bi].label)
++        .collect();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Phi { incoming, .. } = inst {
++                for (_op, label) in incoming {
++                    if rewritten_labels.contains(label) {
++                        return false;
++                    }
++                }
++            }
++        }
++    }
++    true
++}
++
+ fn rewrite_conditional_store(
+     func: &mut IrFunction,
+     loop_info: &loop_analysis::NaturalLoop,
+@@ -5237,6 +5265,24 @@ fn rewrite_conditional_store(
+         return false;
+     }
+ 
++    if !same_address {
 +        return false;
 +    }
-+    let t = trimmed(store, &infos[k], k);
-+    if infos[k].kind == LineKind::CondJmp {
-+        return t.starts_with("je ") || t.starts_with("jne ");
-+    }
-+    if matches!(infos[k].kind, LineKind::SetCC { .. }) {
-+        return t.starts_with("sete ") || t.starts_with("setne ");
-+    }
-+    false
-+}
 +
- // ── Pass: indirect call through a spilled global function pointer ───────────
++    // S04c fail-closed: chain blocks + the store block are about to be
++    // deleted; refuse when a phi takes its incoming from any of them (a
++    // loop-carried recurrence the select-store would silently drop).
++    {
++        let mut rewritten: Vec<usize> = chain.iter().map(|&(b, _)| b).collect();
++        rewritten.push(store_block);
++        if !cond_store_phi_incoming_safe(func, &rewritten) {
++            set_reject("conditional store feeds a loop-carried phi");
++            if debug {
++                eprintln!("[VEC-COND] bail: phi incoming from rewritten block");
++            }
++            return false;
++        }
++    }
+     // ── Rewrite ──────────────────────────────────────────────────────────
+     // Move the store block's value computation into the first chain
+     // block, re-point the store at the load's address, and select the
+@@ -5862,6 +5908,20 @@ fn rewrite_folded_cond_store(
+         negated
+     };
  
- /// Does `s` reference the ESP-relative slot at raw displacement `disp`?
-@@ -11511,6 +11770,11 @@ pub fn peephole_optimize(asm: String) -> String {
-     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
-     let global_changed = global_changed | fuse_setcc_branch(&mut store, &mut infos);
-     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
-+    // Narrow compare folds run right after the full-width memory-operand
-+    // fold: they transform the CONSUMER's width (cmpl->cmpb/cmpw) instead of
-+    // moving a full-width load into it, so the union-miscompile guard above
-+    // (is_full_width_load) is untouched — this is the width-correct twin.
-+    let global_changed = global_changed | fold_narrow_load_imm_compare(&mut store, &mut infos);
-     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
-     let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
-     let global_changed = global_changed | collapse_slot_rmw_i686(&mut store, &mut infos);
-@@ -11529,6 +11793,7 @@ pub fn peephole_optimize(asm: String) -> String {
-             changed2 |= eliminate_dead_stores(&store, &mut infos);
-             changed2 |= fuse_setcc_branch(&mut store, &mut infos);
-             changed2 |= fold_memory_operands(&mut store, &mut infos);
-+            changed2 |= fold_narrow_load_imm_compare(&mut store, &mut infos);
-             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
-             changed2 |= fuse_sext_testb(&mut store, &mut infos);
-             pass_count2 += 1;
-@@ -14046,6 +14311,12 @@ mod tests {
-         .to_string();
-         let result = peephole_optimize(asm.to_string());
-         assert!(result.contains("setbe %al"));
-+        // The movzbl is LOAD-BEARING: `setbe %al` writes only the byte —
-+        // the upper 24 bits of %eax are a partial-register MERGE, not a
-+        // zero-extension (8-bit writes never zero-extend on x86; the
-+        // zero-extension is the movzbl's job).  A pass that deleted it
-+        // (briefly tried, session 60) made every `testl %eax,%eax` consumer
-+        // read garbage upper bits and take both select arms.
-         assert!(result.contains("movzbl %al, %eax"));
-         assert!(!result.contains("movsbl %al"), "{result}");
-     }
-@@ -15675,6 +15946,8 @@ mod tests {
-         let r = peephole_optimize(asm.to_string());
-         assert!(!r.contains("testl %eax, %edx"), "test dropped: {}", r);
-         assert!(r.contains("setne %al"), "setCC kept (bool live): {}", r);
-+        // The movzbl stays: a setCC byte write does not zero-extend %eax
-+        // (partial-register merge), so the extend is load-bearing.
-         assert!(r.contains("movzbl %al, %eax"), "movzbl kept: {}", r);
-         assert!(r.contains("movl %eax, %edx"), "relay kept: {}", r);
-     }
-@@ -18707,4 +18980,252 @@ mod tests {
-         });
-         let _ = std::fs::remove_file(&path);
-     }
-+    // ── Narrow load → immediate compare/test folds ─────────────────────────
-+    // (fold_narrow_load_imm_compare: the flag-law and its fail-closed gates)
-+
-+    #[test]
-+    fn narrow_byte_load_imm_compare_folds_to_cmpb() {
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl 12(%esp), %eax\n",
-+            "    cmpl $57, %eax\n",
-+            "    je .L1\n",
-+            "    xorl %ebx, %ebx\n",
-+            ".L1:\n",
-+            "    xorl %eax, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("cmpb $57, 12(%esp)"),
-+            "the byte compare did not fold:\n{out}"
-+        );
-+        assert!(
-+            !out.contains("movzbl 12(%esp)"),
-+            "the load survived the fold:\n{out}"
-+        );
-+        assert!(
-+            !out.contains("cmpl $57"),
-+            "the wide compare survived the fold:\n{out}"
-+        );
++    if !same_address {
++        return false;
 +    }
 +
-+    #[test]
-+    fn narrow_word_load_imm_compare_folds_to_cmpw() {
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzwl 8(%ebp), %ecx\n",
-+            "    cmpl $1000, %ecx\n",
-+            "    jne .L1\n",
-+            "    xorl %ebx, %ebx\n",
-+            ".L1:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("cmpw $1000, 8(%ebp)"),
-+            "the word compare did not fold:\n{out}"
-+        );
++    // S04c fail-closed: the guard header + store block are about to be
++    // rewritten; refuse when a phi takes its incoming from either (a
++    // loop-carried recurrence the select-store would silently drop).
++    if !cond_store_phi_incoming_safe(func, &[header_idx, store_block]) {
++        set_reject("conditional store feeds a loop-carried phi");
++        if debug {
++            eprintln!("[VEC-COND] bail: phi incoming from rewritten block (folded)");
++        }
++        return false;
 +    }
-+
-+    #[test]
-+    fn narrow_fold_folds_the_exact_byte_the_union_hazard_needed() {
-+        // The historical miscompile shape (uu.b[0] != 0x04 becoming
-+        // `cmpl $4, 176(%esp)`, comparing the whole word 0x01020304) is the
-+        // one shape this pass may fold — by TRANSFORMING the width.  cmpb
-+        // reads exactly the byte the movzbl read.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl 176(%esp), %eax\n",
-+            "    cmpl $4, %eax\n",
-+            "    jne .L1\n",
-+            "    xorl %ebx, %ebx\n",
-+            ".L1:\n",
-+            "    movl %ebx, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("cmpb $4, 176(%esp)"),
-+            "the width-transforming fold did not fire:\n{out}"
-+        );
-+        assert!(
-+            !out.contains("cmpl $4, 176(%esp)"),
-+            "cmpl must not appear:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn narrow_fold_refuses_sign_extending_loads() {
-+        // movsbl sign-extends: every flag row of the proof changes.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movsbl 12(%esp), %eax\n",
-+            "    cmpl $57, %eax\n",
-+            "    jl .L1\n",
-+            "    xorl %ebx, %ebx\n",
-+            ".L1:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("movsbl 12(%esp)") && out.contains("cmpl $57"),
-+            "sign-extending load was folded:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn narrow_fold_refuses_immediates_outside_the_byte_window() {
-+        // mem=200, I=200: cmpb says equal, cmpl says above — the window is
-+        // the law, not a heuristic.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl 12(%esp), %eax\n",
-+            "    cmpl $200, %eax\n",
-+            "    je .L1\n",
-+            "    xorl %ebx, %ebx\n",
-+            ".L1:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        // The refusal invariant: no cmpb may appear.  (The existing 16-bit
-+        // canonicaliser may still narrow the cmpl to `cmpw $200, %ax` — the
-+        // word view of the same proof — which is correct and orthogonal.)
-+        assert!(!out.contains("cmpb $200"), "cmpb $200 appeared:\n{out}");
-+    }
-+
-+    #[test]
-+    fn narrow_fold_refuses_negative_immediates() {
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl 12(%esp), %eax\n",
-+            "    cmpl $-1, %eax\n",
-+            "    je .L1\n",
-+            "    xorl %ebx, %ebx\n",
-+            ".L1:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("cmpl $-1"),
-+            "negative immediate folded:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn testl_folds_to_cmpb_zero_for_zf_only_readers() {
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl 20(%esp), %eax\n",
-+            "    testl %eax, %eax\n",
-+            "    je .L1\n",
-+            "    xorl %ebx, %ebx\n",
-+            ".L1:\n",
-+            "    movl %ebx, %eax\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("cmpb $0, 20(%esp)"),
-+            "the test did not fold to cmpb $0:\n{out}"
-+        );
-+        assert!(!out.contains("testl %eax"), "testl survived:\n{out}");
-+    }
-+
-+    #[test]
-+    fn testl_fold_refuses_sign_flag_readers() {
-+        // js reads SF, which cmpb $0 and testl disagree on.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl 20(%esp), %eax\n",
-+            "    testl %eax, %eax\n",
-+            "    js .L1\n",
-+            "    xorl %ebx, %ebx\n",
-+            ".L1:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("testl %eax"),
-+            "SF-reading consumer was folded:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn narrow_fold_refuses_when_the_register_survives() {
-+        // Copy propagation may extend the loaded byte's register across
-+        // later readers; the liveness oracle must refuse those.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl 12(%esp), %eax\n",
-+            "    cmpl $57, %eax\n",
-+            "    je .L1\n",
-+            ".L1:\n",
-+            "    movl %eax, %ebx\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("movzbl 12(%esp)"),
-+            "live register was folded away:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn narrow_fold_refuses_indexed_and_mismatched_consumers() {
-+        // Indexed source: the compare's one memory operand cannot spell it.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl (%esp,%ebx), %eax\n",
-+            "    cmpl $57, %eax\n",
-+            "    je .L1\n",
-+            "    xorl %ecx, %ecx\n",
-+            ".L1:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("movzbl (%esp,%ebx)"),
-+            "indexed load was folded:\n{out}"
-+        );
-+        // Consumer reads a DIFFERENT register: not the loaded value.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    movzbl 12(%esp), %eax\n",
-+            "    cmpl $57, %ebx\n",
-+            "    je .L1\n",
-+            "    xorl %ecx, %ecx\n",
-+            ".L1:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(
-+            out.contains("movzbl 12(%esp)") && out.contains("cmpl $57, %ebx"),
-+            "mismatched consumer was folded:\n{out}"
-+        );
-+    }
-+
-+    // ── setCC self-zero-extension deletion ─────────────────────────────────
- }
-diff --git a/tests/regression/i686_narrow_cmp_fold.c b/tests/regression/i686_narrow_cmp_fold.c
+     // ── Rewrite ──────────────────────────────────────────────────────────
+     // The store block's computation, minus the store itself and the
+     // store's address GEP (the new store reuses the load's address),
+diff --git a/tests/regression/check_weak_undef_pie_link.sh b/tests/regression/check_weak_undef_pie_link.sh
 new file mode 100644
-index 00000000..75ccb999
+index 00000000..6410b06c
 --- /dev/null
-+++ b/tests/regression/i686_narrow_cmp_fold.c
-@@ -0,0 +1,139 @@
-+/* i686: narrow zero-extends folded into the immediate compare that reads
-+ * them — `movzbl SRC, %R; cmpl $I, %R` becomes `cmpb $I, SRC`, and the
-+ * `testl %R, %R` shape becomes `cmpb $0, SRC` (ZF-only readers only).
-+ *
-+ * FLAG LAW UNDER TEST (see fold_narrow_load_imm_compare for the proof):
-+ * for 0 <= I <= 127 every condition code of the byte compare of a
-+ * zero-extended byte matches the 32-bit compare of its zero-extension —
-+ * including the wrap rows (byte >= 128), where the 8-bit view sets SF and
-+ * OF together and the signed conditions still decode to the unsigned
-+ * order.  This test drives every branch flavour over the wrap boundary so
-+ * a wrong row is a wrong exit code, not a style opinion.
-+ *
-+ * Shapes exercised, in the exact spellings the backend emits:
-+ *   * frame-slot sources (both %esp and %ebp slots, byte and word);
-+ *   * register sources (movzbl %dl / movsbl twins, high-byte %dh alias —
-+ *     same family as %dl but a different byte: the fold must NOT touch it);
-+ *   * indirect pointer sources (movzwl (%edi), %edx);
-+ *   * the testl->cmpb shape with je/jne and sete/setne consumers;
-+ *   * signed branches (jl/jg) and unsigned (jb/ja) across the wrap rows.
-+ *
-+ * Freestanding on purpose: the checksum is observed through the exit
-+ * status so the test links under -mregparm=3 (the boot regime), where
-+ * calling libc would be an ABI violation.  The expected constants are
-+ * pure C semantics (gcc/clang -m32 -O0..-O3 agree; -DPRINT_REF and a
-+ * regparm-free build re-derives them). */
-+#include <stdint.h>
-+#ifdef PRINT_REF
-+/* Derivation build only (regparm-free, so libc calls are legal). */
++++ b/tests/regression/check_weak_undef_pie_link.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++# Undefined-weak address materialisation must link under the SYSTEM gcc
++# driver's default PIE mode (PR #581 regression gate).
++#
++# `(fn != NULL)` on an undefined weak function materialises the symbol
++# address. lccc emitted a direct `leaq sym(%rip)` (R_X86_64_PC32), which
++# GNU ld rejects for undefined weaks in PIE links:
++#   relocation R_X86_64_PC32 against undefined symbol
++#   `ZSTD_trace_compress_begin' can not be used when making a PIE object
++# (real-world hit: an lccc-built libzstd.a linked by the distro gcc
++# driver, lib/common/zstd_trace.h tracing hooks). The fix routes weak
++# addresses through @GOTPCREL in every code model.
++#
++# The corpus runner links through lccc's built-in linker, which accepts
++# the PC32 form — so this pipeline is only checkable end-to-end here:
++# lccc -c  ->  system gcc driver link (default PIE)  ->  run.
++# Pre-fix this gate goes red at the link step.
++set -u -o pipefail
++CCC=${CCC:-./target/fastbuild/lccc}
++CCC="$(cd "$(dirname "$CCC")" && pwd)/$(basename "$CCC")"
++src="$(dirname "$0")/weak_extern_pie_link.c"
++tmp="$(mktemp -d)"
++trap 'rm -rf "$tmp"' EXIT
++
++"$CCC" -O2 -c "$src" -o "$tmp/wu.o" || { >&2 echo "FAIL: lccc -c"; exit 1; }
++gcc "$tmp/wu.o" -o "$tmp/wu" || {
++    >&2 echo "FAIL: system gcc driver rejected the lccc object (PIE link)"
++    exit 1
++}
++out="$("$tmp/wu")" || { >&2 echo "FAIL: run"; exit 1; }
++[ "$out" = "v=41" ] || { >&2 echo "FAIL: output '$out' != 'v=41'"; exit 1; }
++
++# GCC oracle: same object shape must link and agree (differential anchor).
++gcc -O2 "$src" -o "$tmp/wu_gcc" 2>/dev/null && {
++    out_gcc="$("$tmp/wu_gcc")"
++    [ "$out_gcc" = "$out" ] || { >&2 echo "FAIL: lccc '$out' != gcc '$out_gcc'"; exit 1; }
++}
++
++echo "OK check_weak_undef_pie_link"
+diff --git a/tests/regression/macro_version_stringify.c b/tests/regression/macro_version_stringify.c
+new file mode 100644
+index 00000000..7bc22748
+--- /dev/null
++++ b/tests/regression/macro_version_stringify.c
+@@ -0,0 +1,25 @@
++/* Two-level expand-and-quote version string (glibc/zstd
++ * ZSTD_EXPAND_AND_QUOTE(ZSTD_LIB_VERSION) shape): MAJOR.MINOR.PATCH are
++ * separate macros concatenated with '.' in an intermediate macro, then
++ * stringified through the two-level # operator chain. The rescan of the
++ * replacement text operates on preprocessing tokens: the identifier after
++ * the "1" plus "." replacement must still macro-expand (it is NOT part of
++ * a pp-number "1.MINOR"). Pre-fix produced "1.MINOR. 0". Both the
++ * compile-time _Static_assert and the run-time diff catch it. */
 +#include <stdio.h>
-+#endif
 +
-+#ifndef EXPECT_A
-+#define EXPECT_A 569u
-+#endif
++#define VERSION_MAJOR 1
++#define VERSION_MINOR 6
++#define VERSION_PATCH 0
++#define VER_STRING BASE.VERSION_MINOR.VERSION_PATCH
++#define BASE VERSION_MAJOR
++#define STR_(x) #x
++#define STR(x) STR_(x)
 +
-+volatile uint32_t g_sink;
++static const char version[] = STR(VER_STRING);
 +
-+/* noinline + regparm-free wrappers keep every comparison in its own
-+ * function so no caller-side folding can mask a broken callee shape. */
-+__attribute__((noinline)) static uint32_t cmpb_slot(signed char c) {
-+    /* The wrap rows: 127 (top of window), -128 (byte 0x80), -1 (0xFF). */
-+    uint32_t r = 0;
-+    if (c == 57)
-+        r |= 1;
-+    if (c != 57)
-+        r |= 2;
-+    if (c < 100)
-+        r |= 4; /* signed: -128 and -1 take it, 127 does not */
-+    if ((unsigned char)c > 200u)
-+        r |= 8; /* unsigned: 0xFF and 0x80 take it */
-+    if ((unsigned char)c >= 0x80u)
-+        r |= 16; /* the SF/OF wrap row */
-+    return r;
++int main(void) {
++    _Static_assert(sizeof(version) == 6, "version must stringify as 1.6.0");
++    printf("%s\n", version);
++    return version[1] == '.' && version[3] == '.' ? 0 : 1;
 +}
+diff --git a/tests/regression/sib_base_index_clash.c b/tests/regression/sib_base_index_clash.c
+new file mode 100644
+index 00000000..321eafef
+--- /dev/null
++++ b/tests/regression/sib_base_index_clash.c
+@@ -0,0 +1,49 @@
++/* SIB base==index + loop-wrap soundness (zlib-ng deflateHeaders `put_byte`
++ * shape): base pointer and index both come from the same struct, the store
++ * `s->buf[s->pos++]` folded into a SIB operand whose in-place index
++ * extension must not clobber the base, and the index stays live across the
++ * loop back edge (RA folded-index loop-wrap protection). Differential vs
++ * the GCC oracle on the transformed-buffer checksum. */
++#include <stdio.h>
++#include <stdlib.h>
 +
-+__attribute__((noinline)) static uint32_t cmpw_slot(short s) {
-+    uint32_t r = 0;
-+    if (s == 1000)
-+        r |= 1;
-+    if (s != 1000)
-+        r |= 2;
-+    if (s < 0)
-+        r |= 4; /* -32768: the word wrap row */
-+    if ((unsigned short)s > 40000u)
-+        r |= 8; /* 0x8000+ territory */
-+    return r;
-+}
++struct outbuf {
++    unsigned char *buf;
++    unsigned pos;
++    unsigned char *lit;
++    unsigned lpos;
++};
 +
-+__attribute__((noinline)) static uint32_t cmpb_reg(unsigned char b) {
-+    /* movzbl %dl, %eax; cmpl $I, %eax shapes (the backend widens `b`
-+     * through the accumulator for every compare). */
-+    uint32_t r = 0;
-+    if (b == 32)
-+        r |= 1;
-+    if (b > 32)
-+        r |= 2;
-+    if (b <= 32)
-+        r |= 4;
-+    if (b != 255)
-+        r |= 8;
-+    return r;
-+}
-+
-+__attribute__((noinline)) static uint32_t testb_ptr(const uint8_t *p) {
-+    /* movzbl (%edi), %edx; testl %edx, %edx; je shapes. */
-+    uint32_t r = 0;
-+    if (*p == 0)
-+        r |= 1;
-+    if (*p != 0)
-+        r |= 2;
-+    if (*p == 0x80)
-+        r |= 4; /* the high-bit byte: ZF row and nothing else */
-+    return r;
-+}
-+
-+__attribute__((noinline)) static int bool_from_cmp(unsigned char b) {
-+    /* sete %al; movzbl %al, %eax shapes: the bool materialisation. */
-+    int t = (b == 7);
-+    int u = (b != 7);
-+    return t * 10 + u;
++__attribute__((noinline)) static void put_bytes(struct outbuf *s,
++                                                const unsigned char *p,
++                                                unsigned n) {
++    for (unsigned i = 0; i < n; i++) {
++        s->buf[s->pos++] = (unsigned char)(p[i] ^ 0x5A);
++        s->lit[s->lpos++] = (unsigned char)(p[i] + i);
++    }
 +}
 +
 +int main(void) {
-+    uint32_t r = 0;
-+    r ^= cmpb_slot(57) * 3u;
-+    r ^= cmpb_slot(-128) * 5u;
-+    r ^= cmpb_slot(-1) * 7u;
-+    r ^= cmpb_slot(127) * 11u;
-+    r ^= cmpb_slot(100) * 13u;
-+    g_sink = r;
-+
-+    r ^= cmpw_slot(1000) * 17u;
-+    r ^= cmpw_slot(-32768) * 19u;
-+    r ^= cmpw_slot((short)0xBEEF) * 23u;
-+    g_sink = r;
-+
-+    r ^= cmpb_reg(32) * 29u;
-+    r ^= cmpb_reg(255) * 31u;
-+    r ^= cmpb_reg(0) * 37u;
-+    g_sink = r;
-+
-+    static const uint8_t bytes[3] = {0, 0x80, 0xFF};
-+    r ^= testb_ptr(&bytes[0]) * 41u;
-+    r ^= testb_ptr(&bytes[1]) * 43u;
-+    r ^= testb_ptr(&bytes[2]) * 47u;
-+    g_sink = r;
-+
-+    r ^= (uint32_t)bool_from_cmp(7) * 53u;
-+    r ^= (uint32_t)bool_from_cmp(9) * 59u;
-+    g_sink = r;
-+
-+#ifdef PRINT_REF
-+    printf("#define EXPECT_A %uu\n", r);
-+#else
-+    if (r != EXPECT_A)
-+        return 1;
-+#endif
++    struct outbuf s;
++    s.buf = malloc(512);
++    s.lit = malloc(512);
++    s.pos = 0;
++    s.lpos = 0;
++    unsigned char in[257];
++    for (unsigned i = 0; i < 257; i++)
++        in[i] = (unsigned char)(i * 31 + 7);
++    put_bytes(&s, in, 257);
++    unsigned long h = 1469598103934665603ULL;
++    for (unsigned i = 0; i < s.pos; i++) {
++        h ^= s.buf[i];
++        h *= 1099511628211ULL;
++    }
++    for (unsigned i = 0; i < s.lpos; i++) {
++        h ^= s.lit[i];
++        h *= 1099511628211ULL;
++    }
++    printf("pos=%u lpos=%u h=%016llx\n", s.pos, s.lpos, h);
++    free(s.buf);
++    free(s.lit);
 +    return 0;
 +}
-diff --git a/tests/regression/i686_narrow_cmp_fold.flags b/tests/regression/i686_narrow_cmp_fold.flags
+diff --git a/tests/regression/vec_condstore_linecount.c b/tests/regression/vec_condstore_linecount.c
 new file mode 100644
-index 00000000..c211b609
+index 00000000..fdc4dd15
 --- /dev/null
-+++ b/tests/regression/i686_narrow_cmp_fold.flags
++++ b/tests/regression/vec_condstore_linecount.c
+@@ -0,0 +1,38 @@
++/* Conditional store with a data-dependent counter inside the if-body
++ * (zstd programs/util.c UTIL_processLines shape): the vectorizer's
++ * conditional-store rewrite replaced the body with a predicated
++ * select-store and silently dropped the `lineCount++` increment, so the
++ * function returned 0 for every single-line file and `zstd --filelist`
++ * failed with "error reading <file>". The rewrite must fail closed when
++ * a loop-carried phi is fed from a rewritten block. Differential vs GCC. */
++#include <stdio.h>
++
++__attribute__((noinline)) static size_t processLines(char *b, size_t n) {
++    size_t lineCount = 0;
++    for (size_t i = 0; i < n; i++) {
++        if (b[i] == '\n') {
++            b[i] = '\0';
++            lineCount++;
++        }
++    }
++    if (n > 0 && (n == 0 || b[n - 1] != '\0'))
++        lineCount++;
++    return lineCount;
++}
++
++int main(void) {
++    char buf[32];
++    for (int k = 0; k < 2; k++) {
++        for (int i = 0; i < 31; i++)
++            buf[i] = (char)('a' + (i % 26));
++        buf[30] = '\n';
++        buf[31] = '\0';
++        size_t lines = processLines(buf, 31);
++        printf("k=%d lines=%zu first=%c\n", k, lines, buf[0]);
++        if (lines != 1) {
++            printf("FAIL: expected 1 line\n");
++            return 1;
++        }
++    }
++    return 0;
++}
+diff --git a/tests/regression/vec_live_regs_join_reload.c b/tests/regression/vec_live_regs_join_reload.c
+new file mode 100644
+index 00000000..94055006
+--- /dev/null
++++ b/tests/regression/vec_live_regs_join_reload.c
+@@ -0,0 +1,42 @@
++/* vec_live_regs cross-block elision (chorba_sse41 join-edge stale-scratch
++ * shape): block A ends with a vector op whose result is claimed by a
++ * scratch register; the conditional branch enters block B, whose own vector
++ * op reuses the same scratch; after the join the value A produced is
++ * consumed again. The reg-live claim map is block-local, so the join-edge
++ * consumer must reload from the stack home, not trust the scratch.
++ * Requires CCC_ENABLE_VECREG (see .env). Differential vs GCC. */
++#include <stdio.h>
++
++int a[64], b[64], c[64], d[64];
++
++__attribute__((noinline)) static int run(int mode) {
++    for (int i = 0; i < 64; i++) {
++        a[i] = b[i] * 3 + 7;
++    }
++    int t = 0;
++    if (mode & 1) {
++        for (int i = 0; i < 64; i++) {
++            c[i] = b[i] * 5 - 3;
++        }
++        t += c[3];
++    } else {
++        for (int i = 0; i < 64; i++) {
++            d[i] = b[i] << 2;
++        }
++        t -= d[5];
++    }
++    /* Consume A's product AFTER the join. */
++    for (int i = 0; i < 64; i++) {
++        t += a[i];
++    }
++    return t;
++}
++
++int main(void) {
++    for (int i = 0; i < 64; i++)
++        b[i] = i * 11 - 5;
++    int r0 = run(0);
++    int r1 = run(1);
++    printf("r0=%d r1=%d\n", r0, r1);
++    return (r0 == r1) ? 1 : 0;
++}
+diff --git a/tests/regression/vec_live_regs_join_reload.c.env b/tests/regression/vec_live_regs_join_reload.c.env
+new file mode 100644
+index 00000000..b44e67e8
+--- /dev/null
++++ b/tests/regression/vec_live_regs_join_reload.c.env
 @@ -0,0 +1 @@
-+-m32 -Os -mregparm=3 -fno-pic
++CCC_ENABLE_VECREG=1
+diff --git a/tests/regression/weak_extern_pie_link.c b/tests/regression/weak_extern_pie_link.c
+new file mode 100644
+index 00000000..49198fcb
+--- /dev/null
++++ b/tests/regression/weak_extern_pie_link.c
+@@ -0,0 +1,20 @@
++/* Undefined weak symbol referenced from executable code (glibc/zstd
++ * zstd_trace.h tracing-hook shape): the address compare `(fn != NULL)`
++ * materialises the symbol address. With a direct PC32 LEA the system
++ * linker rejects the default PIE link ("relocation R_X86_64_PC32 against
++ * undefined symbol ... can not be used when making a PIE object"); the
++ * fix routes weak addresses through @GOTPCREL, which resolves in every
++ * code model. Pre-fix this test fails to LINK under the default driver —
++ * the regression IS the link failure. Differential vs GCC. */
++#include <stdio.h>
++
++extern int exotic_trace_hook(void) __attribute__((weak));
++
++int main(void) {
++    int v = 41;
++    if (exotic_trace_hook != NULL) {
++        v += exotic_trace_hook();
++    }
++    printf("v=%d\n", v);
++    return v == 41 ? 0 : 1;
++}
