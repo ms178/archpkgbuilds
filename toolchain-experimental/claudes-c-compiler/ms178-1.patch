@@ -1,951 +1,1654 @@
-diff --git a/engineering/FOLLOWUP-2026-09-22D-dataflow-unblind-and-pair-fold.md b/engineering/FOLLOWUP-2026-09-22D-dataflow-unblind-and-pair-fold.md
-new file mode 100644
-index 00000000..438ea0ac
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-22D-dataflow-unblind-and-pair-fold.md
-@@ -0,0 +1,173 @@
-+# Follow-up: unblinding the i686 narrow-fact dataflow, the zext-pair compare fold, and the RA evidence that ends the census argument
-+
-+Date: 2026-09-23 (session 62)
-+Base: `fe2fd653` (`ms178/lccc` main; S06 merged upstream as `2b6fb4d1`,
-+PR #593; carries the user's `101601d9` SIB-composition/power-of-two-width
-+and `e8a9fa35` i128-urem work — both red-teamed, both sound, no
-+supersession needed).
-+Head: `764324e1` — S07.
-+
-+---
-+
-+## 1. Red-team of the merged upstream (101601d9, e8a9fa35)
-+
-+`101601d9` fixed two silent miscompiles with the right engineering:
-+power-of-two constants now read at the operation's width (the
-+`0xffffffffffffffff0000000000000001` → `x << 0` bug), the LEA relay fold
-+composes SIB addresses through a real model that fails closed on
-+two-scaled-register/three-register/two-symbol shapes, and the integrated
-+assembler now *rejects* a fourth comma field instead of silently
-+truncating. `e8a9fa35` fixes the i128 urem mask with per-class guards and
-+exhaustive regression tests. Both carry the push/pop RSP-shift lesson for
-+text peepholes (now documented in `i128_ops.rs`): a text peephole does not
-+model `%rsp` movement, so emitters must not push/pop around windows whose
-+slots the peephole matches. Adopted as a standing constraint; no
-+competitors' design mistakes found to supersede.
-+
-+## 2. The two blind spots in `eliminate_redundant_zext_i686`
-+
-+The whole-function narrow-fact dataflow (is_byte/is_16 per family) — the
-+pass that deletes redundant `movz*` self-extensions — was running nearly
-+blind on real command lines, for two independent reasons:
-+
-+1. **Directives sat in `is_barrier()`.** lccc's boot command lines carry
-+   `-g`, so the emitter writes a `.loc` per statement; every `.loc` is a
-+   `LineKind::Directive`, every directive was a barrier, and every barrier
-+   cleared all facts. Between two statements of real code there is always
-+   a directive — the dataflow therefore never accumulated a fact across
-+   one. The same REG_NONE fallthrough also hit
-+   `invalidates_all_narrow_facts`, whose fail-closed arm wipes *all*
-+   facts for any line whose destination register does not parse.
-+
-+   The law is now: **a directive emits no instruction** — it writes no
-+   register, no memory, no flags — so it fences nothing. `is_barrier()`
-+   documents this; labels, calls, jumps, returns and inline-asm regions
-+   stay barriers. (Precedent in-house: `is_metadata_directive` and
-+   `is_debug_location` already treated `.loc`/`.cfi_*` as transparent in
-+   the slot-window passes; the barrier list was the outlier.) The x86-64
-+   `redundant_ext.rs` pass already skipped directives explicitly and even
-+   documents the fixed label-vs-directive soundness bug — the i686 side
-+   now matches it.
-+
-+2. **AND was not modeled as monotone.** `andl $imm` *reassigned* the
-+   facts from the immediate's range: any mask outside [0, 65535] dropped
-+   `is_16` even when the value was already known < 2^16. But AND can only
-+   clear bits — a narrow value stays narrow under every mask. The law is
-+   now `fact = fact || imm_covers_range` (monotone), which is what makes
-+   video-mode.c's `movzwl 60(%esp),%eax; andl $-32769,%eax;
-+   movzwl %ax,%eax` finally lose its identity re-extension (the mask
-+   0xFFFF7FFF spans bits above 16 and used to kill the fact).
-+
-+Measured on the boot corpus (21 `arch/x86/boot` TUs, identical command
-+lines): **5460 → 5442 instructions, 24368 → 24290 bytes** vs gcc's
-+3461/14270 — including recovering every deletion of a now-revoked local
-+peephole attempt (see §4).
-+
-+## 3. `fold_zext_pair_reg_compare` (new, `CCC_NO_ZEXT_PAIR_CMP_FOLD`)
-+
-+    movz/sext S1,%A; movz/sext S2,%B; cmpl %A,%B; jcc/setcc
-+      →  cmp{b,w} OP1,OP2; jcc/setcc      (both extensions deleted)
-+
-+Each compare operand is the extension's **memory source verbatim**
-+(base-only indirect — the compare re-reads the byte-identical address
-+expression, fault-equivalent, unchanged because only directives/nops sit
-+between) or the **narrow view of its destination**. Flag law, unit-tested
-+at the wrap rows: ZF and CF are width-invariant for zext/zext pairs (both
-+operands in [0, 2^w)) and for sext/sext pairs (sign-extension is monotone
-+in *both* signed and unsigned order — proved via the pattern-map
-+monotonicity argument in the pass comment); **signed readers refuse
-+zext/zext** (the 32-bit view compares two non-negative values while the
-+w-bit view compares two's complement — they disagree exactly on the
-+top-bit row); **mixed zext/sext refuses outright** (no condition class
-+survives both). Adjacency scans hop directives, never labels.
-+
-+Honest measurement: the pass fires **zero times** in the v6.18.52 boot
-+corpus — its one candidate shape (`movzwl %bx,%edi; movzwl 24(%esi),%eax;
-+cmpl %eax,%edi; jl`) is a signed reader and the refusal is correct. It is
-+kept because the law is fully pinned (ten unit tests, including an
-+asm-routed encoding test per the S59 lesson) and the shape class is what
-+the RA work (§6) will surface once the staging relays that break its
-+adjacency are gone. The runtime guard (§5) exercises the shape end-to-end
-+so the law cannot silently rot.
-+
-+## 4. The revoked attempt (do-not-retry ledger)
-+
-+A local (adjacency-walk) `delete_masked_self_zext` was built first —
-+zext-def + AND-run + self-zext, hopping directives. Once the dataflow's
-+two blind spots were fixed, the whole-function pass subsumed it *and
-+found more* (barriers other than directives aside, the dataflow tracks
-+facts through copies and arbitrary clearing ops). Revoked before commit;
-+the whole-function pass is the architectural home of this transform.
-+
-+## 5. Guard corpus extension and validation
-+
-+`tests/regression/i686_narrow_cmp_fold.c` gains the pair shapes:
-+u16-vs-u16 and memory-vs-register comparisons across the top-bit row
-+(0x7FFF/0x8000/0xFFFE), each function driving signed *and* unsigned
-+readers — a wrong fold flips the exit-status checksum. `EXPECT_A`
-+569 → 683, re-derived from gcc `-O0/-Os/-O2` agreement.
-+
-+- `cargo test --lib`: **3191/0** (ten new pair tests, dataflow pins).
-+- Runtime guard: rc=0 (lccc =O2/-Os = gcc -O0/-Os/-O2).
-+- 256-value byte-map sweep: **0 divergences**.
-+- Boot census: 5460 → **5442 insn / 24290 B** (gcc 3461/14270).
-+- `ci_local.sh --fast`: **60 passed, 0 failed, 3 skipped — ALL GATES
-+  GREEN** (one gate more than S06's 59: upstream added it).
-+- Full CachyMod 6.18.52 rebuild by lccc/lccc-ld: SUCCESS; boot gate
-+  `_end = 28928` (was 28944 pre-merge; the −16 B is this session's boot
-+  work; the kernel-wide `.text` 11894550 → 11879078 also carries the
-+  upstream i128/SIB improvements).
-+- `qemu_boot_test.sh`: **16/16 PASS, zero WARNING/Call Trace/ACPI noise**.
-+
-+## 6. The census argument is closed: everything left is the RA
-+
-+The godbolt/local oracle work this session closed the narrow-compare
-+front: cpucheck.c now compiles to **equal `movz*` counts vs gcc** (1/1),
-+and the corpus mnemonics are at or inside striking distance. What remains
-+is one defect class with a number on it:
-+
-+    cpucheck.c (i686 -Os, boot flags):   lccc 350 insns   gcc 157
-+      slot-stores:   lccc 43    gcc 0
-+      slot-loads:    lccc 30    gcc 0
-+      reg-relay movl: lccc 14    gcc 0
-+
-+Corpus-wide: store-to-frame **515 vs 46**, load-from-frame **354 vs 67**,
-+reg-to-reg movl **447 vs 226**. Not a single remaining peephole class —
-+pure register residency. The `LCCC_DBG_RA` dump for `check_cpuflags`
-+names the mechanism:
-+
-+    values=22 assigned=10
-+      v36 [0,32]  slot uses=21 elig=false   ← the accumulator, whole-range
-+      v10 [8,10]  slot uses=10 elig=true    ← hot, short, spilled anyway
-+      v13 [10,16] slot uses=10 elig=true
-+      v16 [12,14] slot uses=10 elig=true
-+      v21 [16,18] slot uses=20 elig=true
-+      r0 [1,30] r1 [6,17] r2 [5,17] r3 [7,17] …  ← pool spent on long ranges
-+
-+The greedy scan allocates by live-range **start point**, so long low-use
-+ranges take all ~6 physical registers before the short hot values are
-+considered — values the pass itself marks `elig=true`. S59 falsified the
-+naive flip (`CCC_NO_I686_ACCUM_NOHOME`, +391 B); the defect is not the
-+no-home policy but the **allocation order and the absence of eviction**.
-+
-+Next session's opening move, with a falsifier per step:
-+1. Order candidates by spill cost (uses per live-range unit), not start
-+   point — hot short values claim registers first.
-+2. Add second-chance eviction: a waiting high-cost range may evict a
-+   resident low-cost long range (paying its reload) when the cost model
-+   says so; the segments/holes infrastructure and `RA-EXPLAIN` dumps
-+   already exist for the A/B.
-+3. Keep the accumulator as the canonical repro: `orl` in the loop must
-+   become register-resident (gcc: `orl $130, %ebx`, one instruction vs
-+   lccc's five-line load/modify/double-store/reload staging).
-+
-+## 7. Godbolt oracle status
-+
-+Self-contained distillation continues on the guard corpus (gcc 16.2,
-+clang 23.1.0, icx latest, icc 2021.10; artifacts under
-+`artifacts/godbolt-s06/` — lccc 90 vs gcc 128/161/161/198 still stands as
-+the outright win). Kernel TUs are not self-contained; they distill via
-+`scripts/boot_size_oracle.sh` + per-class census on this machine
-+(§6 numbers: cpucheck lccc 350 vs gcc 157 insns, movz* at parity 1/1).
-+
-+<!-- src: engineering/FOLLOWUP-2026-09-22D-dataflow-unblind-and-pair-fold.md -->
-diff --git a/engineering/journal/2026-09-W3.md b/engineering/journal/2026-09-W3.md
-index 6f6d321b..04eee973 100644
---- a/engineering/journal/2026-09-W3.md
-+++ b/engineering/journal/2026-09-W3.md
-@@ -789,3 +789,53 @@ the pass).
- store-to-frame — cpucheck's loop accumulator is the canonical repro),
- reg-vs-reg narrow compares (video-mode: 28 `movzwl`), the andl-mask zext
- gap, shift-bit-test IV placement.
-+
-+## Session 62: unblinding the narrow-fact dataflow — the -g directive blindness
-+
-+<!-- src: engineering/FOLLOWUP-2026-09-22D-dataflow-unblind-and-pair-fold.md -->
-+
-+**The census argument is closed.** After S06's narrow-compare folds, the
-+remaining boot-code gap is one defect class with a number on it:
-+cpucheck.c is lccc 350 insns vs gcc 157 with **movz* at parity (1/1)** —
-+the residue is 43 slot-stores + 30 slot-loads + 14 relay movls where gcc
-+emits zero. Store-to-frame corpus-wide: 515 vs 46. It is all register
-+residency now.
-+
-+**Two blind spots fixed in `eliminate_redundant_zext_i686`** (the
-+whole-function is_byte/is_16 dataflow):
-+
-+1. `LineKind::Directive` sat in `is_barrier()`, and with `-g` the emitter
-+   writes a `.loc` per statement — the dataflow wiped every fact at every
-+   statement boundary and never accumulated across one. The same
-+   REG_NONE fallthrough hit `invalidates_all_narrow_facts`' fail-closed
-+   arm. The law now written down: **a directive emits no instruction, so
-+   it fences nothing**; labels/calls/jumps/returns/inline-asm stay
-+   barriers. The x86-64 `redundant_ext.rs` already had this right.
-+2. `andl $imm` reassigned facts from the immediate's range. But AND only
-+   clears bits — a narrow value stays narrow under every mask. The law is
-+   now monotone (`fact = fact || imm_covers_range`), which is what lets
-+   video-mode.c's `andl $-32769` keep `is_16` and its trailing
-+   `movzwl %ax,%eax` finally die.
-+
-+Boot corpus: **5460 → 5442 insns, 24368 → 24290 B** (gcc 3461/14270).
-+Unit 3191/0; CI 60/0; QEMU 16/16, zero serial noise; gate 28928.
-+
-+**Landed** `fold_zext_pair_reg_compare` (CCC_NO_ZEXT_PAIR_CMP_FOLD):
-+`movz/sext S1,%A; movz/sext S2,%B; cmpl %A,%B; jcc/setcc` → one
-+`cmp{b,w}` with memory sources substituted verbatim. Flag law pinned at
-+the wrap rows: signed readers refuse zext/zext (top-bit rows disagree);
-+sext/sext folds everything (sext is monotone in both orders); mixed
-+refuses. Fires zero times in this boot corpus — its one candidate is a
-+`jl` reader and the refusal is correct — kept for the shapes the RA work
-+will surface; the runtime guard drives the shape end-to-end
-+(EXPECT_A 569 → 683).
-+
-+**RA evidence locked for next session** (`LCCC_DBG_RA check_cpuflags`):
-+values=22 assigned=10; the pool (r0/r1/r2/r3/r5/r6) is spent on long
-+low-use ranges allocated by **start-point order**, while short hot values
-+(`v10 [8,10] uses=10`, `v13`, `v16`, `v21`) sit in slots *marked
-+elig=true*. Next move: spill-cost-ordered allocation + second-chance
-+eviction, canonical repro = cpucheck's loop accumulator (`orl $130,%ebx`
-+in gcc vs lccc's five-line staging). S59's falsification
-+(CCC_NO_I686_ACCUM_NOHOME, +391 B) rules out the naive flip; this is an
-+allocation-order defect, not a policy defect.
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index e0081d3b..c31156f7 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -141,11 +141,19 @@ impl LineInfo {
-     }
-     #[inline]
-     fn is_barrier(self) -> bool {
-+        // NOTE: LineKind::Directive is deliberately NOT a barrier.  A
-+        // directive (`.loc`, `.cfi_*`, `.p2align`, `.type`, …) emits no
-+        // instruction — it writes no register, no memory, and no flags —
-+        // so it is transparent to every locality window this peephole
-+        // keeps.  Treating it as a barrier (the old law) blinded the
-+        // whole-function narrow-fact dataflow at every `.loc` the `-g`
-+        // command lines emit, and with it every fact-based fold behind
-+        // those windows.  Inline-asm regions, labels, calls, jumps and
-+        // returns remain barriers: those are real control/data fences.
-         matches!(
-             self.kind,
-             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
--            LineKind::CondJmp | LineKind::Ret | LineKind::RetN | LineKind::Directive
--                | LineKind::InlineAsm |
-+            LineKind::CondJmp | LineKind::Ret | LineKind::RetN | LineKind::InlineAsm |
-             // ESP changes renumber every (%esp) slot: push/pop and explicit
-             // %esp arithmetic fence all slot windows now that ESP-relative
-             // slots participate in the peepholes. Pushes/pops only appear
-@@ -8426,6 +8434,294 @@ fn zf_only_flags_reader(store: &LineStore, infos: &[LineInfo], j: usize) -> bool
-     false
- }
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 61d9f87e..f27540fb 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -374,6 +374,15 @@ jobs:
+           CCC: target/fastbuild/lccc
+         run: bash tests/regression/check_lea_hoist_rorx.sh
  
-+// ── Pass: fold a register-vs-register compare of two narrow extensions ──────
++      # CH/MAJ oracle consensus (session 585): the SHA-256 mux fold defers
++      # to the backend's 3-operand ANDN under BMI1, the majority keeps its
++      # earliest And (composite last, no park), and the acc-resident ALU
++      # consumption eliminates the exposed store-to-load forwards.
++      - name: Verify CH/MAJ codegen contracts
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_ch_maj_codegen.sh
 +
-+/// What a `movz*`/`movs*` line tells the pair-compare fold: the extension
-+/// width, whether it zero- or sign-extends, the destination, and the
-+/// verbatim source text (the source decides which operand text the folded
-+/// compare may use — see `fold_zext_pair_reg_compare`).
-+struct NarrowExt<'a> {
-+    width: MoveSize,
-+    signed: bool,
-+    dst: RegId,
-+    src: &'a str,
-+}
+       # Cross-PR interaction red-team (session 574): the per-feature gates
+       # pin each PR's own contract; this one pins the INTERACTIONS between
+       # the last ten merged PRs — FMA families through copy brackets, calls
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 856ba2d6..398c6699 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -420,6 +420,12 @@ gate "call-arg-staging" fast \
+ gate "lea-hoist-rorx" fast \
+     bash tests/regression/check_lea_hoist_rorx.sh
+ 
++# CH/MAJ oracle consensus: andn-gated mux fold, kept-earliest majority,
++# acc-resident ALU consumption, zero exposed forwards (negative-verified
++# against the pre-change tree: 0 andn + the loop slot shape fail there).
++gate "ch-maj-codegen" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_ch_maj_codegen.sh
 +
-+/// Parse `movz{b,w}l|movs{b,w}l SRC, %REG` (any SRC shape).
-+fn parse_narrow_ext32(t: &str) -> Option<NarrowExt<'_>> {
-+    let (rest, width, signed) = if let Some(r) = t.strip_prefix("movzbl ") {
-+        (r, MoveSize::B, false)
-+    } else if let Some(r) = t.strip_prefix("movswl ") {
-+        (r, MoveSize::W, true)
-+    } else if let Some(r) = t.strip_prefix("movzwl ") {
-+        (r, MoveSize::W, false)
-+    } else if let Some(r) = t.strip_prefix("movsbl ") {
-+        (r, MoveSize::B, true)
-+    } else {
-+        return None;
-+    };
-+    let rest = rest.trim();
-+    let after = rest.find(", %")?;
-+    let reg_str = rest[after..].trim_start_matches(", ").trim();
-+    let dst = register_family(reg_str);
-+    if dst == REG_NONE || dst > REG_GP_MAX {
-+        return None;
-+    }
-+    let src = rest[..after].trim();
-+    Some(NarrowExt {
-+        width,
-+        signed,
-+        dst,
-+        src,
-+    })
-+}
-+
-+/// The next line after `idx` that is a real instruction: hops blanks, nops,
-+/// and assembler directives (`.loc`/`.cfi`/… write nothing, so they do not
-+/// break adjacency or liveness windows).  Labels and inline-asm regions are
-+/// control-flow/locality boundaries and are NEVER hopped.  `None` at end.
-+fn next_instruction(infos: &[LineInfo], idx: usize) -> Option<usize> {
-+    let mut k = idx;
-+    while k < infos.len() {
-+        let kind = infos[k].kind;
-+        if kind == LineKind::Nop || kind == LineKind::Empty || kind == LineKind::Directive {
-+            k += 1;
-+            continue;
-+        }
-+        return Some(k);
-+    }
-+    None
-+}
-+
-+/// The previous real instruction before `idx` (same law as
-+/// `next_instruction`); `None` at the top of the function.
-+fn prev_instruction(infos: &[LineInfo], idx: usize) -> Option<usize> {
-+    let mut k = idx;
-+    while k > 0 {
-+        k -= 1;
-+        let kind = infos[k].kind;
-+        if kind == LineKind::Nop || kind == LineKind::Empty || kind == LineKind::Directive {
-+            continue;
-+        }
-+        return Some(k);
-+    }
-+    None
-+}
-+
-+/// Whether `src` is a base-only indirect memory operand `DISP(%reg)` — the
-+/// shape whose address expression the folded compare may re-read verbatim
-+/// (byte-identical text, identical fault behaviour; adjacency to the
-+/// compare proves nothing rewrote the memory in between).
-+fn base_only_indirect(src: &str) -> bool {
-+    let Some(paren) = src.find("(%") else {
-+        return false;
-+    };
-+    let (disp, tail) = (&src[..paren], &src[paren..]);
-+    !disp.contains('(') && !disp.contains(',') && !disp.contains('%') && !tail.contains(',')
-+}
-+
-+/// Condition classes a compare's reader may use.  The pair fold's flag law
-+/// (see `fold_zext_pair_reg_compare`) accepts equality always; unsigned
-+/// conditions always for zext/zext pairs; signed conditions only for
-+/// sext/sext pairs.  Returns `None` for readers this pass does not model
-+/// (cmov classifies as `Other`, flag chains, `jcxz`, …) — a `None` refuses.
-+fn cond_class(t: &str) -> Option<&'static str> {
-+    let tok = t.split_whitespace().next()?;
-+    let body = tok.strip_prefix('j').or_else(|| tok.strip_prefix("set"))?;
-+    match body {
-+        "e" | "ne" => Some("eq"),
-+        "b" | "nae" | "c" | "nb" | "ae" | "nc" | "be" | "a" => Some("uns"),
-+        "l" | "le" | "g" | "ge" => Some("sgn"),
-+        _ => None,
-+    }
-+}
-+
-+/// Fold
+ # Cross-PR interaction red-team: FMA families x copy brackets x
+ # if-conversion x constant promotion x NonZero x the AVX1+FMA target
+ # class, bit-exact vs the reference compiler at matched march (canonical
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 9216a7f6..865a0482 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -1125,6 +1125,73 @@ impl X86Codegen {
+                     && (use_32bit || !self.state.is_small_slot(rhs_val.0))
+                 {
+                     if let Some(slot) = self.state.get_slot(rhs_val.0) {
++                        // ACC-RESIDENT SOURCE: the accumulator may already hold
++                        // rhs_val (its own computation, or a `store_eax_to`
++                        // park). Folding the slot in that state is an exposed
++                        // store-to-load forward (measured ~5% end-to-end on
++                        // sha256_transform's MAJ chain) — and staging lhs
++                        // into %eax first would destroy the resident copy.
++                        // Consume %eax in place instead, sourcing the OTHER
++                        // operand without touching the accumulator:
++                        // immediate, register home, or %ecx staging.
++                        // Sub is excluded: `sub src, %eax` would compute
++                        // rhs-lhs, not lhs-rhs (non-commutative).
++                        if !matches!(op, IrBinOp::Sub)
++                            && self.state.reg_cache.acc_has(rhs_val.0, false)
++                        {
++                            let suffix = if use_32bit { "l" } else { "q" };
++                            let acc = if use_32bit { "eax" } else { "rax" };
++                            let src_reg =
++                                if let Some(imm) = Self::const_as_imm32_typed(lhs, use_32bit) {
++                                    self.state.emit_fmt(format_args!(
++                                        "    {}{} ${}, %{}",
++                                        mnem, suffix, imm, acc
++                                    ));
++                                    if use_32bit {
++                                        self.store_eax_to(dest);
++                                    } else {
++                                        self.store_rax_to(dest);
++                                    }
++                                    return;
++                                } else if let Some(lreg) = self
++                                    .operand_reg(lhs)
++                                    .filter(|r| !super::emit::is_xmm_reg(*r))
++                                {
++                                    let name = if use_32bit {
++                                        super::emit::phys_reg_name_32(lreg)
++                                    } else {
++                                        super::emit::phys_reg_name(lreg)
++                                    };
++                                    self.state.emit_fmt(format_args!(
++                                        "    {}{} %{}, %{}",
++                                        mnem, suffix, name, acc
++                                    ));
++                                    if use_32bit {
++                                        self.store_eax_to(dest);
++                                    } else {
++                                        self.store_rax_to(dest);
++                                    }
++                                    return;
++                                } else {
++                                    // %ecx staging: the last resort that still
++                                    // avoids the exposed forward. The staging
++                                    // never writes %rax, so the resident copy
++                                    // survives to be consumed here.
++                                    self.operand_to_rcx(lhs);
++                                    "ecx"
++                                };
++                            let src_name = if use_32bit { src_reg } else { "rcx" };
++                            self.state.emit_fmt(format_args!(
++                                "    {}{} %{}, %{}",
++                                mnem, suffix, src_name, acc
++                            ));
++                            if use_32bit {
++                                self.store_eax_to(dest);
++                            } else {
++                                self.store_rax_to(dest);
++                            }
++                            return;
++                        }
+                         if use_32bit {
+                             self.operand_to_eax(lhs);
+                         } else {
+@@ -1159,6 +1226,62 @@ impl X86Codegen {
+                         && (use_32bit || !self.state.is_small_slot(lhs_val.0))
+                     {
+                         if let Some(slot) = self.state.get_slot(lhs_val.0) {
++                            // ACC-RESIDENT SOURCE (the commutative mirror of
++                            // the rhs path above): the accumulator holds
++                            // lhs_val; consume it in place and source rhs
++                            // without touching the accumulator. `op src,
++                            // %eax` computes rhs OP lhs — equal to lhs OP
++                            // rhs for every commutative op that reaches
++                            // here (Sub is excluded above).
++                            if self.state.reg_cache.acc_has(lhs_val.0, false) {
++                                let suffix = if use_32bit { "l" } else { "q" };
++                                let acc = if use_32bit { "eax" } else { "rax" };
++                                if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
++                                    self.state.emit_fmt(format_args!(
++                                        "    {}{} ${}, %{}",
++                                        mnem, suffix, imm, acc
++                                    ));
++                                    if use_32bit {
++                                        self.store_eax_to(dest);
++                                    } else {
++                                        self.store_rax_to(dest);
++                                    }
++                                    return;
++                                }
++                                if let Some(rreg) = self
++                                    .operand_reg(rhs)
++                                    .filter(|r| !super::emit::is_xmm_reg(*r))
++                                {
++                                    let name = if use_32bit {
++                                        super::emit::phys_reg_name_32(rreg)
++                                    } else {
++                                        super::emit::phys_reg_name(rreg)
++                                    };
++                                    self.state.emit_fmt(format_args!(
++                                        "    {}{} %{}, %{}",
++                                        mnem, suffix, name, acc
++                                    ));
++                                    if use_32bit {
++                                        self.store_eax_to(dest);
++                                    } else {
++                                        self.store_rax_to(dest);
++                                    }
++                                    return;
++                                }
++                                // %ecx staging (never writes %rax).
++                                self.operand_to_rcx(rhs);
++                                let src_name = if use_32bit { "ecx" } else { "rcx" };
++                                self.state.emit_fmt(format_args!(
++                                    "    {}{} %{}, %{}",
++                                    mnem, suffix, src_name, acc
++                                ));
++                                if use_32bit {
++                                    self.store_eax_to(dest);
++                                } else {
++                                    self.store_rax_to(dest);
++                                }
++                                return;
++                            }
+                             if use_32bit {
+                                 self.operand_to_eax(rhs);
+                             } else {
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 002fb131..2864330f 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -2164,15 +2164,20 @@ impl X86Codegen {
+                         // Stale home, unwritten slot: the def chain was
+                         // re-emitted into @target (e.g. a sign-extended
+                         // index re-extended from its narrow source slot).
+-                    } else if self.state.get_slot(v.0).is_some() {
+-                        // Stale home: reload the value from its slot.
+-                        self.value_to_reg(v, target_name);
+                     } else if self.state.reg_cache.acc_has(v.0, false)
+                         || self.state.reg_cache.acc_has(v.0, true)
+                     {
++                        // ACC-RESIDENT FIRST (exposed-forward fix): a value
++                        // parked in %eax must be read from %eax, not reloaded
++                        // from its slot — the reload would store-to-load
++                        // forward the park the very next instruction (the
++                        // sha256 MAJ-chain pathology, measured ~5%).
+                         self.state
+                             .out
+                             .emit_instr_reg_reg("    movq", "rax", target_name);
++                    } else if self.state.get_slot(v.0).is_some() {
++                        // Stale home: reload the value from its slot.
++                        self.value_to_reg(v, target_name);
+                     } else {
+                         // Stale home with no slot/remat/acc path. Reading the
+                         // home register would feed the consumer whatever
+@@ -2187,6 +2192,16 @@ impl X86Codegen {
+                             v.0, self.state.current_func_name
+                         );
+                     }
++                } else if self.state.reg_cache.acc_has(v.0, false)
++                    || self.state.reg_cache.acc_has(v.0, true)
++                {
++                    // ACC-RESIDENT FIRST (exposed-forward fix, mirroring the
++                    // stale-home chain): %rax holds the value right now; the
++                    // slot below is a memory read — and right after a park it
++                    // is an exposed store-to-load forward.
++                    self.state
++                        .out
++                        .emit_instr_reg_reg("    movq", "rax", target_name);
+                 } else if let Some(slot) = self.state.get_slot(v.0) {
+                     // Delegate to value_to_reg: it handles allocas (leaq with
+                     // over-alignment), vector values, and — critically — loads
+@@ -2196,12 +2211,6 @@ impl X86Codegen {
+                     // half that shows up in later 64-bit operations (xorq,
+                     // addq, ...).
+                     self.value_to_reg(v, target_name);
+-                } else if self.state.reg_cache.acc_has(v.0, false)
+-                    || self.state.reg_cache.acc_has(v.0, true)
+-                {
+-                    self.state
+-                        .out
+-                        .emit_instr_reg_reg("    movq", "rax", target_name);
+                 } else {
+                     // Value not in any register, stack slot, or accumulator cache.
+                     // A rematerialisable GlobalAddr stages straight into
+@@ -3444,12 +3453,14 @@ impl X86Codegen {
+                     self.state
+                         .out
+                         .emit_instr_reg_reg("    movq", reg_name, "rcx");
+-                } else if self.state.get_slot(v.0).is_some() {
+-                    self.value_to_reg(v, "rcx");
+                 } else if self.state.reg_cache.acc_has(v.0, false)
+                     || self.state.reg_cache.acc_has(v.0, true)
+                 {
++                    // ACC-RESIDENT FIRST (exposed-forward fix): read the
++                    // %rax copy before touching the slot.
+                     self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
++                } else if self.state.get_slot(v.0).is_some() {
++                    self.value_to_reg(v, "rcx");
+                 } else {
+                     // value_to_reg rebuilds a rematerialisable GlobalAddr (a
+                     // value with deliberately no home) and otherwise fails
+@@ -5102,11 +5113,142 @@ pub(super) const X86_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r
+ /// For instructions where the vreg is a dst (two-address ALU), we need to use
+ /// rax as scratch: load→operate→store (or, now, the window allocator's
+ /// reload/operate/store).
++/// Fail-closed %rax-touch scan over a MachInst window.
 +///
-+/// ```text
-+/// movz{b,w}l S1, %A        (line k)
-+/// movz{b,w}l S2, %B        (line i, adjacent)
-+/// cmpl %SB, %SA            (line j, adjacent)   either operand order
-+/// jcc/setcc ...            (line m, adjacent)
-+/// ```
++/// A window is eligible for the acc-resident substitution only when NO
++/// instruction in it can touch %rax — explicitly (a `Phys(RAX)` operand
++/// anywhere, including memory bases) or implicitly (division's rax:rdx
++/// pair, call/return clobbers, the `Raw` escape hatch whose register
++/// effects are invisible). Anything uncertain fails closed: the window
++/// keeps its slot reads, which are always correct.
++/// Every IR value id a MachInst window DEFINES (a Vreg destination).
 +///
-+/// into `cmp{b,w} %BB, %BA; jcc/setcc` with both extensions deleted, when
-+/// the reader's condition class is covered by the law.
-+///
-+/// FLAG LAW: after the extensions, %A's narrow view is exactly the value
-+/// that was zero- or sign-extended into the 32-bit register, and likewise
-+/// for %B — so `cmp{b,w} %BB, %BA` compares the same w-bit values the
-+/// `cmpl` compares.  Width-invariant flags: ZF (equal iff equal) and CF
-+/// for zext pairs (both operands lie in [0, 2^w), where the w-bit and
-+/// 32-bit subtractions produce identical borrows) and for sext pairs
-+/// (sign-extension is monotone, so both the signed AND the unsigned
-+/// 32-bit order match the corresponding w-bit order: the unsigned-32 view
-+/// of a sign-extended value is a monotone function of the byte pattern).
-+/// NOT width-invariant for zext pairs: the signed conditions — the 32-bit
-+/// view compares two non-negative values while the w-bit view compares
-+/// two two's-complement values; the orders disagree exactly when one
-+/// operand has its top bit set.  Hence:
-+///
-+/// * zext/zext: `eq` and `uns` readers accept, `sgn` refuses;
-+/// * sext/sext: every reader accepts;
-+/// * mixed zext/sext: refuse outright (the two extensions do not agree on
-+///   which value the 32-bit register names for operands with the top bit
-+///   set, and no condition class survives both).
-+///
-+/// Liveness: both 32-bit destinations must be dead after the compare —
-+/// any later reader would still see the right value (the extension already
-+/// happened), but keeping the lines would defeat the point; the oracle
-+/// answers for the whole function.  Neither extension writes flags and the
-+/// folded compare writes exactly the flags the old one did, so nothing
-+/// between the lines may observe a difference: the zexts are adjacent to
-+/// the compare (nops only), which is the locality proof.
-+fn fold_zext_pair_reg_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    if std::env::var_os("CCC_NO_ZEXT_PAIR_CMP_FOLD").is_some() {
-+        return false;
++/// The acc-resident substitution may only fire for values the window does
++/// not redefine: a read AFTER an in-window definition must observe the
++/// definition's result (the slot write for a spilled Vreg, the home for a
++/// pre-colored one), never the pre-window image still sitting in %rax.
++/// The rotated-latch shape (phi elimination + loop rotation) puts the
++/// `Copy v_phi <- v_next` and the duplicated exit test in ONE window —
++/// the compare must see the copy's new value, not the previous
++/// iteration's park (latch_dead_at_boundaries_segment:
++/// rounds=4214233 instead of 41).
++fn machinst_window_defs(
++    buf: &[super::machinst::MachInst],
++) -> crate::common::fx_hash::FxHashSet<u32> {
++    use super::machinst::{MachInst, MachOperand, MachReg};
++    fn vreg_ids(op: &MachOperand, out: &mut crate::common::fx_hash::FxHashSet<u32>) {
++        if let MachOperand::Reg(MachReg::Vreg(id)) = op {
++            out.insert(*id);
++        }
 +    }
-+    let len = infos.len();
-+    let mut changed = false;
-+    let mut liveness_cache: Option<GprLiveness> = None;
-+    let mut i = 0;
-+    while i < len {
-+        if infos[i].is_nop() {
-+            i += 1;
-+            continue;
++    fn reg_id(r: &MachReg, out: &mut crate::common::fx_hash::FxHashSet<u32>) {
++        if let MachReg::Vreg(id) = r {
++            out.insert(*id);
 +        }
-+        // Line i: the second extension (the one adjacent to the compare).
-+        let t = trimmed(store, &infos[i], i);
-+        let Some(ext_i) = parse_narrow_ext32(t) else {
-+            i += 1;
-+            continue;
-+        };
-+        if ext_i.dst == REG_ESP || ext_i.dst == REG_EBP {
-+            i += 1;
-+            continue;
-+        }
-+        // Line k: the FIRST extension, adjacent above (nops/directives only).
-+        let Some(k) = prev_instruction(infos, i) else {
-+            i += 1;
-+            continue;
-+        };
-+        let tk = trimmed(store, &infos[k], k);
-+        let Some(ext_k) = parse_narrow_ext32(tk) else {
-+            i += 1;
-+            continue;
-+        };
-+        if ext_k.dst == REG_ESP || ext_k.dst == REG_EBP || ext_k.dst == ext_i.dst {
-+            i += 1;
-+            continue;
-+        }
-+        if ext_k.width != ext_i.width {
-+            i += 1;
-+            continue;
-+        }
-+        // Line j: the 32-bit compare, adjacent below (nops/directives only).
-+        let Some(j) = next_instruction(infos, i + 1) else {
-+            i += 1;
-+            continue;
-+        };
-+        if j >= len || infos[j].kind != LineKind::Cmp {
-+            i += 1;
-+            continue;
-+        }
-+        let sj = trimmed(store, &infos[j], j);
-+        let Some(rest) = sj.strip_prefix("cmpl ") else {
-+            i += 1;
-+            continue;
-+        };
-+        let Some((src_str, dst_str)) = rest.split_once(", ") else {
-+            i += 1;
-+            continue;
-+        };
-+        let src_fam = register_family(src_str.trim());
-+        let dst_fam = register_family(dst_str.trim());
-+        // The compare's two operands must be exactly the two extensions'
-+        // destinations, one on each side.
-+        let ok = (src_fam == ext_i.dst && dst_fam == ext_k.dst)
-+            || (src_fam == ext_k.dst && dst_fam == ext_i.dst);
-+        if !ok || src_fam == REG_NONE || dst_fam == REG_NONE {
-+            i += 1;
-+            continue;
-+        }
-+        // Line m: the flag reader, adjacent below the compare.
-+        let Some(m) = next_instruction(infos, j + 1) else {
-+            i += 1;
-+            continue;
-+        };
-+        let tm = trimmed(store, &infos[m], m);
-+        let Some(class) = cond_class(tm) else {
-+            i += 1;
-+            continue;
-+        };
-+        let reader_kind_ok =
-+            infos[m].kind == LineKind::CondJmp || matches!(infos[m].kind, LineKind::SetCC { .. });
-+        if !reader_kind_ok {
-+            i += 1;
-+            continue;
-+        }
-+        match (ext_i.signed, ext_k.signed) {
-+            // Mixed extensions: no condition class survives.
-+            (a, b) if a != b => {
-+                i += 1;
-+                continue;
++    }
++    let mut defs = crate::common::fx_hash::FxHashSet::default();
++    for inst in buf {
++        match inst {
++            MachInst::Mov { src, dst, .. } | MachInst::FMov { src, dst, .. } => {
++                vreg_ids(src, &mut defs);
++                vreg_ids(dst, &mut defs);
 +            }
-+            // zext/zext: signed readers refuse.
-+            (false, false) if class == "sgn" => {
-+                i += 1;
-+                continue;
++            MachInst::Cmov { src, dst, .. } => {
++                vreg_ids(src, &mut defs);
++                reg_id(dst, &mut defs);
 +            }
-+            // sext/sext: everything accepts.
++            MachInst::Movzx { dst, .. } | MachInst::Movsx { dst, .. } => reg_id(dst, &mut defs),
++            MachInst::SetCC { dst, .. } => reg_id(dst, &mut defs),
++            MachInst::Alu { dst, .. }
++            | MachInst::Imul3 { dst, .. }
++            | MachInst::Neg { dst, .. }
++            | MachInst::Not { dst, .. }
++            | MachInst::Shift { dst, .. }
++            | MachInst::ShiftX { dst, .. }
++            | MachInst::Rorx { dst, .. }
++            | MachInst::LeaSym { dst, .. }
++            | MachInst::LeaSlot { dst, .. } => reg_id(dst, &mut defs),
++            MachInst::Lea {
++                base: _,
++                index,
++                dst,
++                ..
++            } => {
++                reg_id(dst, &mut defs);
++                if let Some((i, _)) = index {
++                    reg_id(i, &mut defs);
++                }
++            }
++            // Fail-closed kinds never coexist with an eligible window
++            // (rax-touch scan rejects them); no def extraction needed.
 +            _ => {}
 +        }
-+        // Both 32-bit values must be dead after the compare.
-+        let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
-+        if !liveness.dead_after(j, ext_i.dst) || !liveness.dead_after(j, ext_k.dst) {
-+            i += 1;
-+            continue;
++    }
++    defs
++}
++
++fn machinst_window_rax_free(buf: &[super::machinst::MachInst]) -> bool {
++    use super::machinst::{MachInst, MachOperand, MachReg};
++    let is_rax = |r: &MachReg| matches!(r, MachReg::Phys(p) if p.0 == super::machinst::RAX.0);
++    let op_rax = |op: &MachOperand| -> bool {
++        match op {
++            MachOperand::Reg(r) => is_rax(r),
++            MachOperand::Mem { base, .. } => is_rax(base),
++            MachOperand::MemIndex { base, index, .. } => is_rax(base) || is_rax(index),
++            _ => false,
 +        }
-+        // Emit: `cmp{b,w} OP_S, OP_D` with the operand roles preserved
-+        // (`cmpl %S, %D` computes %D - %S; the narrow compare must too).
-+        // A side whose extension read MEMORY substitutes the verbatim
-+        // memory operand (the compare re-reads the same address — the
-+        // value there is unchanged because nops are the only thing between
-+        // the extensions and the compare); every other side uses the
-+        // narrow view of its extension's destination.  At most one side
-+        // may be a memory operand (no two-memory compare exists).
-+        let mnem = if ext_i.width == MoveSize::B {
-+            "cmpb"
-+        } else {
-+            "cmpw"
-+        };
-+        let op_for = |e: &NarrowExt, fam: RegId| -> Option<String> {
-+            if base_only_indirect(e.src) {
-+                Some(e.src.to_string())
-+            } else {
-+                narrow_reg_name(fam, e.width).map(str::to_string)
++    };
++    for inst in buf {
++        let touches = match inst {
++            // Implicit rax contracts: fail closed.
++            MachInst::Cqto { .. }
++            | MachInst::Div { .. }
++            | MachInst::Call { .. }
++            | MachInst::CallTyped { .. }
++            | MachInst::Ret
++            | MachInst::Raw(_) => true,
++            MachInst::Mov { src, dst, .. } => op_rax(src) || op_rax(dst),
++            MachInst::FMov { src, dst, .. } => op_rax(src) || op_rax(dst),
++            MachInst::FAlu {
++                src2, src1, dst, ..
++            } => op_rax(src2) || is_rax(src1) || is_rax(dst),
++            MachInst::Mov128 { src, dst } => op_rax(src) || op_rax(dst),
++            MachInst::Movzx { src, dst, .. } => op_rax(src) || is_rax(dst),
++            MachInst::Movsx { src, dst, .. } => op_rax(src) || is_rax(dst),
++            MachInst::Alu { src, dst, .. } => op_rax(src) || is_rax(dst),
++            MachInst::Imul3 { src, dst, .. } => is_rax(src) || is_rax(dst),
++            MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => is_rax(dst),
++            MachInst::Shift { amount, dst, .. } => op_rax(amount) || is_rax(dst),
++            MachInst::ShiftX {
++                count, src, dst, ..
++            } => is_rax(count) || is_rax(src) || is_rax(dst),
++            MachInst::Rorx { src, dst, .. } => is_rax(src) || is_rax(dst),
++            MachInst::Lea {
++                base, index, dst, ..
++            } => is_rax(base) || index.is_some_and(|(i, _)| is_rax(&i)) || is_rax(dst),
++            MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => is_rax(dst),
++            MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
++                op_rax(lhs) || op_rax(rhs)
 +            }
++            MachInst::SetCC { dst, .. } => is_rax(dst),
++            MachInst::Cmov { src, dst, .. } => op_rax(src) || is_rax(dst),
++            MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Label(_) => false,
++            MachInst::XorRdx => false,
 +        };
-+        let (Some(op_s), Some(op_d)) = (
-+            op_for(if src_fam == ext_i.dst { &ext_i } else { &ext_k }, src_fam),
-+            op_for(if dst_fam == ext_i.dst { &ext_i } else { &ext_k }, dst_fam),
-+        ) else {
-+            i += 1;
-+            continue;
-+        };
-+        if base_only_indirect(&op_s) && base_only_indirect(&op_d) {
-+            i += 1;
-+            continue;
++        if touches {
++            return false;
 +        }
-+        store.replace(k, format!("    {} {}, {}", mnem, op_s, op_d));
-+        infos[k] = classify_line(store.get(k));
-+        infos[i].kind = LineKind::Nop;
-+        infos[j].kind = LineKind::Nop;
-+        changed = true;
-+        // The folded compare sits at k; do not let the scan re-match it.
-+        i += 1;
 +    }
-+    changed
++    true
 +}
 +
- // ── Pass: indirect call through a spilled global function pointer ───────────
+ fn resolve_stack_vregs(
+     inst: &super::machinst::MachInst,
+     ra: &FxHashMap<u32, PhysReg>,
+     state: &CodegenState,
+     reg_classified: &crate::common::fx_hash::FxHashSet<u32>,
++    acc_subst: bool,
++    window_defs: &crate::common::fx_hash::FxHashSet<u32>,
+ ) -> super::machinst::MachInst {
+     use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
  
- /// Does `s` reference the ESP-relative slot at raw displacement `disp`?
-@@ -11775,6 +12071,8 @@ pub fn peephole_optimize(asm: String) -> String {
-     // moving a full-width load into it, so the union-miscompile guard above
-     // (is_full_width_load) is untouched — this is the width-correct twin.
-     let global_changed = global_changed | fold_narrow_load_imm_compare(&mut store, &mut infos);
-+    let global_changed = global_changed | fold_zext_pair_reg_compare(&mut store, &mut infos);
-+
-     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
-     let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
-     let global_changed = global_changed | collapse_slot_rmw_i686(&mut store, &mut infos);
-@@ -11794,6 +12092,8 @@ pub fn peephole_optimize(asm: String) -> String {
-             changed2 |= fuse_setcc_branch(&mut store, &mut infos);
-             changed2 |= fold_memory_operands(&mut store, &mut infos);
-             changed2 |= fold_narrow_load_imm_compare(&mut store, &mut infos);
-+            changed2 |= fold_zext_pair_reg_compare(&mut store, &mut infos);
-+
-             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
-             changed2 |= fuse_sext_testb(&mut store, &mut infos);
-             pass_count2 += 1;
-@@ -12119,6 +12419,17 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo])
-             i += 1;
-             continue;
+@@ -5138,11 +5280,41 @@ fn resolve_stack_vregs(
+ 
+     // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
+     // Vregs the window allocator owns (reg_classified) are never substituted.
+-    let resolve_op = |op: &MachOperand, inst_size: OpSize| -> MachOperand {
++    //
++    // ACC-RESIDENT SUBSTITUTION (acc_subst): when the whole window is
++    // provably %rax-free (see machinst_window_rax_free) and owns no
++    // scratch registers, a Vreg the accumulator cache holds may be read
++    // as %rax directly instead of its slot — the slot read right after a
++    // park is an exposed store-to-load forward (the sha256 loop-counter
++    // compare: `movq %rax, 72(%rsp); movq %rbp, %r11; movq 72(%rsp),
++    // %rax; cmpl $8, %eax`). The value's def executed on the text path
++    // BEFORE the window (only that path maintains the cache), so every
++    // window reference to it is a use of the pre-window image %rax holds.
++    // The slot_fits width discipline is shared with the memory form: a
++    // read wider than the slot never substitutes (the leftover Vreg
++    // trips the fallback, which loads at the true width).
++    let resolve_op = |op: &MachOperand, inst_size: OpSize, is_read: bool| -> MachOperand {
+         match op {
+             MachOperand::Reg(MachReg::Vreg(id))
+                 if !ra.contains_key(id) && !reg_classified.contains(id) =>
+             {
++                // READS ONLY. A write position redirected into %rax would
++                // store the result into the accumulator instead of the
++                // value's slot — and for the phi-elimination copies (the
++                // one multi-def shape in the stream) the acc entry can
++                // still name the value from a PREDECESSOR block's text
++                // park, so the slot would keep the stale incoming value
++                // and every later slot reader would see the wrong
++                // iteration's data (latch_dead_at_boundaries_segment:
++                // rounds=4214233 instead of 41).
++                if is_read
++                    && acc_subst
++                    && !window_defs.contains(id)
++                    && slot_fits(id, inst_size)
++                    && state.reg_cache.acc_has(*id, false)
++                {
++                    return MachOperand::Reg(MachReg::Phys(super::machinst::RAX));
++                }
+                 if let Some(slot) = state.get_slot(*id) {
+                     if slot_fits(id, inst_size) {
+                         MachOperand::StackSlot(slot.0)
+@@ -5195,13 +5367,13 @@ fn resolve_stack_vregs(
+             }
+             MachInst::Mov {
+                 src: MachOperand::AllocaAddr(*id),
+-                dst: resolve_op(dst, *size),
++                dst: resolve_op(dst, *size, false),
+                 size: *size,
+             }
          }
-+        // Directives and blank lines are inert (see is_barrier): they must
-+        // reach neither the fact-updating arms nor the REG_NONE fail-closed
-+        // invalidation, which would otherwise wipe the facts at every
-+        // `-g`-emitted `.loc`.
-+        if matches!(
-+            infos[i].kind,
-+            LineKind::Directive | LineKind::Empty | LineKind::Nop
-+        ) {
-+            i += 1;
-+            continue;
+         MachInst::Mov { src, dst, size } => MachInst::Mov {
+-            src: resolve_op(src, *size),
+-            dst: resolve_op(dst, *size),
++            src: resolve_op(src, *size, true),
++            dst: resolve_op(dst, *size, false),
+             size: *size,
+         },
+         // FMov never carries vregs: the lowering admits only xmm-homed
+@@ -5223,7 +5395,7 @@ fn resolve_stack_vregs(
+             size,
+         } => MachInst::FAlu {
+             op: *op,
+-            src2: resolve_op(src2, *size),
++            src2: resolve_op(src2, *size, true),
+             src1: *src1,
+             dst: *dst,
+             size: *size,
+@@ -5239,7 +5411,7 @@ fn resolve_stack_vregs(
+             }
+             MachInst::Alu {
+                 op: *op,
+-                src: resolve_op(src, *size),
++                src: resolve_op(src, *size, true),
+                 dst: *dst,
+                 size: *size,
+             }
+@@ -5256,7 +5428,15 @@ fn resolve_stack_vregs(
+             // `from_size` bytes wide, which never exceeds the slot.
+             // A slot-backed dst stays a vreg and is caught by
+             // has_unresolvable_vreg -> window allocator (or fallback).
+-            let src_resolved = resolve_reg_or_slot(src, ra, state, reg_classified, *from_size);
++            let src_resolved = resolve_reg_or_slot(
++                src,
++                ra,
++                state,
++                reg_classified,
++                *from_size,
++                acc_subst,
++                &window_defs,
++            );
+             MachInst::Movzx {
+                 src: src_resolved,
+                 dst: *dst,
+@@ -5270,7 +5450,15 @@ fn resolve_stack_vregs(
+             from_size,
+             to_size,
+         } => {
+-            let src_resolved = resolve_reg_or_slot(src, ra, state, reg_classified, *from_size);
++            let src_resolved = resolve_reg_or_slot(
++                src,
++                ra,
++                state,
++                reg_classified,
++                *from_size,
++                acc_subst,
++                &window_defs,
++            );
+             MachInst::Movsx {
+                 src: src_resolved,
+                 dst: *dst,
+@@ -5279,18 +5467,18 @@ fn resolve_stack_vregs(
+             }
+         }
+         MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
+-            lhs: resolve_op(lhs, *size),
+-            rhs: resolve_op(rhs, *size),
++            lhs: resolve_op(lhs, *size, true),
++            rhs: resolve_op(rhs, *size, true),
+             size: *size,
+         },
+         MachInst::Test { lhs, rhs, size } => MachInst::Test {
+-            lhs: resolve_op(lhs, *size),
+-            rhs: resolve_op(rhs, *size),
++            lhs: resolve_op(lhs, *size, true),
++            rhs: resolve_op(rhs, *size, true),
+             size: *size,
+         },
+         MachInst::Cmov { cc, src, dst, size } => MachInst::Cmov {
+             cc: *cc,
+-            src: resolve_op(src, *size),
++            src: resolve_op(src, *size, true),
+             dst: *dst,
+             size: *size,
+         },
+@@ -5329,7 +5517,7 @@ fn resolve_stack_vregs(
+             signed,
+             size,
+         } => MachInst::Div {
+-            divisor: resolve_op(divisor, *size),
++            divisor: resolve_op(divisor, *size, true),
+             signed: *signed,
+             size: *size,
+         },
+@@ -5348,12 +5536,23 @@ fn resolve_reg_or_slot(
+     state: &CodegenState,
+     reg_classified: &crate::common::fx_hash::FxHashSet<u32>,
+     size: super::machinst::OpSize,
++    acc_subst: bool,
++    window_defs: &crate::common::fx_hash::FxHashSet<u32>,
+ ) -> MachOperand {
+     use super::machinst::MachOperand;
+     match op {
+         MachOperand::Reg(super::machinst::MachReg::Vreg(id))
+             if !ra.contains_key(id) && !reg_classified.contains(id) =>
+         {
++            // ACC-RESIDENT (reads only — this helper is only ever applied
++            // to source operands): see resolve_stack_vregs.
++            if acc_subst
++                && !window_defs.contains(id)
++                && !(state.is_small_slot(*id) && matches!(size, super::machinst::OpSize::S64))
++                && state.reg_cache.acc_has(*id, false)
++            {
++                return MachOperand::Reg(super::machinst::MachReg::Phys(super::machinst::RAX));
++            }
+             if let Some(slot) = state.get_slot(*id) {
+                 let fits = if state.is_small_slot(*id) {
+                     matches!(
+@@ -7208,11 +7407,30 @@ impl ArchCodegen for X86Codegen {
+             &self.machinst_buf,
+             Some(&self.state.small_slot_values),
+         );
++        // ACC-RESIDENT SUBSTITUTION eligibility, fail-closed on both
++        // axes: the window owns no scratch registers (an owned window may
++        // assign %rax to a vreg behind the substitution's back), and no
++        // instruction in the window touches %rax in any way.
++        let window_rax_free =
++            reg_classified.is_empty() && machinst_window_rax_free(&self.machinst_buf);
++        let acc_subst = window_rax_free;
++        let window_defs = if acc_subst {
++            machinst_window_defs(&self.machinst_buf)
++        } else {
++            crate::common::fx_hash::FxHashSet::default()
++        };
+         let resolved: Vec<MachInst> = self
+             .machinst_buf
+             .iter()
+             .map(|inst| {
+-                resolve_stack_vregs(inst, &self.reg_assignments, &self.state, &reg_classified)
++                resolve_stack_vregs(
++                    inst,
++                    &self.reg_assignments,
++                    &self.state,
++                    &reg_classified,
++                    acc_subst,
++                    &window_defs,
++                )
+             })
+             .collect();
+         let final_insts = if reg_classified.is_empty() {
+@@ -7248,6 +7466,8 @@ impl ArchCodegen for X86Codegen {
+                                 &self.reg_assignments,
+                                 &self.state,
+                                 &crate::common::fx_hash::FxHashSet::default(),
++                                false,
++                                &crate::common::fx_hash::FxHashSet::default(),
+                             )
+                         })
+                         .collect()
+@@ -7316,6 +7536,14 @@ impl ArchCodegen for X86Codegen {
+ 
+         super::machinst_emit::emit_machinsts(&final_insts, &mut self.state.out);
+ 
++        // Register-cache coherence (SOUNDNESS): the window's instructions
++        // may write %rax/%rcx (pre-colored div staging, Phys destinations)
++        // without the text-path cache ever seeing it. A stale acc/sec
++        // entry after the window would hand a later text consumer the
++        // wrong register content. The replay path above needs no such
++        // invalidation — it IS text emission, cache-maintained throughout.
++        self.state.reg_cache.invalidate_all();
++
+         // Home-freshness bookkeeping (SOUNDNESS): MachInst-buffered
+         // instructions bypass generate_instruction, so their destinations
+         // never passed through note_dest_defined at their own position. The
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index 8e8ce464..696c0a26 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -4966,14 +4966,32 @@ pub(super) fn hoist_loop_invariant_gpr_load(
+                 if infos[k].is_nop() {
+                     continue;
+                 }
+-                if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
+-                    continue;
+-                }
+                 let text_k = infos[k].trimmed(store.get(k));
+-                let kills_it = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == REG_NONE)
++                let kills_it = matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family)
++                    || matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == REG_NONE)
+                     || writes_family(&infos[k], text_k, dst_family);
+                 if kills_it {
+-                    break; // a full definition: the hoisted value dies here
++                    // TAIL-CFG SOUNDNESS: a kill only ends the scan when it
++                    // is UNCONDITIONAL from the loop exit — the kill sits in
++                    // the branch-free straight-line prefix [latch+1..=k].
++                    // A kill behind a label or jump is path-conditional: a
++                    // sibling path may still read the pre-loop value after
++                    // the loop, so the scan must CONTINUE past it (a later
++                    // read still vetoes).  The straight-line prefix, having
++                    // no label, cannot be targeted from anywhere, and every
++                    // path out of the loop falls through it — so a kill
++                    // there dominates the whole rest of the tail.
++                    let unconditional = (latch + 1..=k).all(|m| {
++                        infos[m].is_nop()
++                            || !matches!(
++                                infos[m].kind,
++                                LineKind::Label | LineKind::Jmp | LineKind::CondJmp
++                            )
++                    });
++                    if unconditional {
++                        break; // a dominating full definition: the value dies here
++                    }
++                    continue; // conditional kill: a sibling path may still read
+                 }
+                 if infos[k].reg_refs & dst_bit != 0 {
+                     return false;
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index a9f5d955..848e3854 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -1810,6 +1810,10 @@ impl Driver {
+                 && !self.no_sse
+                 && !self.general_regs_only,
+             self.enable_fma,
++            // Scalar BMI1 (ANDN) for the middle end's CH-fold defer —
++            // mirrors CodegenOptions::bmi1 for the x86-64 backend (the
++            // i686 backend has no andn fusion, so it stays false there).
++            self.target == Target::X86_64 && self.enable_bmi,
+             ra_config.as_ref(),
+         );
+         if time_phases {
+diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
+index 929d210e..da2355e7 100644
+--- a/src/passes/bit_idioms.rs
++++ b/src/passes/bit_idioms.rs
+@@ -189,6 +189,10 @@ fn peeled_value(
+ /// Result of [`match_bool_mux_algebra`]: the consumer's replacement plus
+ /// deferred producer rewrites `(block, index, instruction)` for the
+ /// pass-end application (dest-verified, like `pending_masks`).
++/// `has_scalar_andn` is the BMI1 ANDN capability resolved once by the
++/// pipeline (target + `-mbmi`/`-march` + the `CCC_NO_ANDN_FUSION` kill
++/// switch): when the backend's Not+And fusion is selectable, Pattern B
++/// defers to it — see the pattern's comment.
+ pub(super) fn match_bool_mux_algebra(
+     c_lhs: Operand,
+     c_rhs: Operand,
+@@ -200,6 +204,7 @@ pub(super) fn match_bool_mux_algebra(
+     defs: &[Option<Instruction>],
+     use_counts: &[u32],
+     def_loc: &[Option<(usize, usize)>],
++    has_scalar_andn: bool,
+ ) -> Option<(Instruction, Vec<(usize, usize, Instruction)>)> {
+     // Structural resolution is COPY-FREE: the consumer must name its
+     // producers directly. A producer reached through a `Copy` chain would
+@@ -253,10 +258,20 @@ pub(super) fn match_bool_mux_algebra(
+     };
+ 
+     // ── Pattern C: majority ────────────────────────────────────────────
+-    // consumer {Xor|Or}( inner{Xor|Or}(And(x,y), And(x,z)), And(y,z) )
++    // consumer {Xor|Or}( inner{Xor|Or}(And(·,·), And(·,·)), And(·,·) )
+     //   (inner Or with consumer Xor is a DIFFERENT function — rejected)
+-    // →  a2 := Xor(x, y);  and3 := And(z, a2);  consumer := Xor(a1, and3)
+-    for (inner_opnd, and3_opnd) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
++    // maj(x,y,z) = (x&y) ^ (z & (x^y)): ANY of the three pairwise Ands may
++    // be the KEPT term (it is only read); the other two repurpose — the
++    // earlier-positioned slot becomes Xor(p,q) (the kept term's operands)
++    // and the later becomes And(r, xor) (r = the third variable). Every
++    // sound role assignment is collected and the one whose KEPT term is
++    // defined EARLIEST wins: the composite then computes last, which is
++    // both the tightest live-range schedule and the shape GCC emits
++    // (kept-And first, composite last — nothing parks between the
++    // composite and its consumer). The preference is dominance-safe by
++    // construction: the kept term is only ever READ, at the consumer,
++    // where it already dominates (SSA argument above).
++    for (inner_opnd, third_opnd) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+         let Some(Instruction::BinOp {
+             op: inner_op,
+             lhs: i_lhs,
+@@ -279,66 +294,128 @@ pub(super) fn match_bool_mux_algebra(
+         let Some((a2_lhs, a2_rhs)) = and_strict(&i_rhs) else {
+             continue;
+         };
+-        let Some((a3_lhs, a3_rhs)) = and_strict(&and3_opnd) else {
++        let Some((a3_lhs, a3_rhs)) = and_strict(&third_opnd) else {
+             continue;
+         };
+-        let Operand::Value(a1v) = i_lhs else { continue };
+-        let Operand::Value(a2v) = i_rhs else { continue };
+-        let Operand::Value(a3v) = and3_opnd else {
++        // The inner node's value is repurposed away — its only reader
++        // (the consumer) stops reading it — so its dest needs the
++        // single-use proof. The three Ands are named directly
++        // (copy-free), one ty.
++        if !single_use(&inner_opnd) {
+             continue;
+-        };
+-        // a2 and and3 are repurposed: same block as the consumer, and the
+-        // single-use proofs (a2, and3, and the inner xor which must die —
+-        // its value changes because a2 changes).
+-        let (Some((a2b, a2i)), Some((a3b, a3i))) = (loc_of(&i_rhs), loc_of(&and3_opnd)) else {
+-            continue;
+-        };
+-        if a2b != block_bi || a3b != block_bi || !(a2i < a3i) {
+-            continue; // and3 reads a2 after the rewrite
+         }
+-        if !single_use(&i_rhs) || !single_use(&and3_opnd) || !single_use(&inner_opnd) {
+-            continue;
+-        }
+-        for (x, y) in [(a1_lhs, a1_rhs), (a1_rhs, a1_lhs)] {
+-            for (x2, z) in [(a2_lhs, a2_rhs), (a2_rhs, a2_lhs)] {
+-                if !same_value(x, x2, defs) || same_value(y, z, defs) {
+-                    continue;
+-                }
+-                let yz = (same_value(a3_lhs, y, defs) && same_value(a3_rhs, z, defs))
+-                    || (same_value(a3_lhs, z, defs) && same_value(a3_rhs, y, defs));
+-                if !yz {
++        let arm_opnds = [i_lhs, i_rhs, third_opnd];
++        let arm_pairs = [(a1_lhs, a1_rhs), (a2_lhs, a2_rhs), (a3_lhs, a3_rhs)];
++        let is_and_of = |pair: (Operand, Operand), a: Operand, b: Operand| {
++            (same_value(pair.0, a, defs) && same_value(pair.1, b, defs))
++                || (same_value(pair.0, b, defs) && same_value(pair.1, a, defs))
++        };
++        // (rank, new_early, new_late, new_consumer, early_idx, late_idx)
++        let mut best: Option<(
++            (u32, u32),
++            Instruction,
++            Instruction,
++            Instruction,
++            usize,
++            usize,
++        )> = None;
++        for kept in 0..3 {
++            let (k_lhs, k_rhs) = arm_pairs[kept];
++            let others = [(kept + 1) % 3, (kept + 2) % 3];
++            for (p, q) in [(k_lhs, k_rhs), (k_rhs, k_lhs)] {
++                if same_value(p, q, defs) {
+                     continue;
+                 }
+-                // New operand of the repurposed a2: y (an a1 operand). It
+-                // must dominate a2's position.
+-                if !same_block_before(&y, a2i) {
+-                    continue;
++                // r candidates: the operands of the two non-kept Ands. The
++                // pair must be And(p,r) and And(q,r) for one common r.
++                for r in [
++                    arm_pairs[others[0]].0,
++                    arm_pairs[others[0]].1,
++                    arm_pairs[others[1]].0,
++                    arm_pairs[others[1]].1,
++                ] {
++                    if same_value(r, p, defs) || same_value(r, q, defs) {
++                        continue;
++                    }
++                    let roles_ok = (is_and_of(arm_pairs[others[0]], p, r)
++                        && is_and_of(arm_pairs[others[1]], q, r))
++                        || (is_and_of(arm_pairs[others[0]], q, r)
++                            && is_and_of(arm_pairs[others[1]], p, r));
++                    if !roles_ok {
++                        continue;
++                    }
++                    // Repurposed producers: the consumer's own block (v1).
++                    let (Some((b1, i1)), Some((b2, i2))) =
++                        (loc_of(&arm_opnds[others[0]]), loc_of(&arm_opnds[others[1]]))
++                    else {
++                        continue;
++                    };
++                    if b1 != block_bi || b2 != block_bi {
++                        continue;
++                    }
++                    // Both repurposed Ands change value: single-use proofs.
++                    if !single_use(&arm_opnds[others[0]]) || !single_use(&arm_opnds[others[1]]) {
++                        continue;
++                    }
++                    // The And(r, ·) reads the Xor's dest: earlier slot first.
++                    let (early, late, ei, li) = if i1 < i2 {
++                        (others[0], others[1], i1, i2)
++                    } else {
++                        (others[1], others[0], i2, i1)
++                    };
++                    // New operands must dominate their new positions: the
++                    // Xor reads the KEPT term's operands (p, q) at the
++                    // early slot; the And reads r at the late slot.
++                    if !same_block_before(&p, ei) || !same_block_before(&q, ei) {
++                        continue;
++                    }
++                    if !same_block_before(&r, li) {
++                        continue;
++                    }
++                    let (Operand::Value(ev), Operand::Value(lv), Operand::Value(kv)) =
++                        (arm_opnds[early], arm_opnds[late], arm_opnds[kept])
++                    else {
++                        continue;
++                    };
++                    let new_early = Instruction::BinOp {
++                        dest: ev,
++                        op: IrBinOp::Xor,
++                        lhs: p,
++                        rhs: q,
++                        ty: c_ty,
++                    };
++                    let new_late = Instruction::BinOp {
++                        dest: lv,
++                        op: IrBinOp::And,
++                        lhs: r,
++                        rhs: Operand::Value(ev),
++                        ty: c_ty,
++                    };
++                    let new_consumer = Instruction::BinOp {
++                        dest: c_dest,
++                        op: IrBinOp::Xor,
++                        lhs: Operand::Value(kv),
++                        rhs: Operand::Value(lv),
++                        ty: c_ty,
++                    };
++                    // Kept-term rank: entry-available first, then the
++                    // same-block def order.
++                    let rank = match def_loc.get(kv.0 as usize).copied().flatten() {
++                        Some((b, i)) if b == block_bi => (1, i as u32),
++                        _ => (0, 0),
++                    };
++                    if best.as_ref().is_none_or(|(br, ..)| rank < *br) {
++                        // Store the INSTRUCTION indices (ei, li) — the
++                        // pending rewrites address block slots, not arms.
++                        best = Some((rank, new_early, new_late, new_consumer, ei, li));
++                    }
+                 }
+-                let new_a2 = Instruction::BinOp {
+-                    dest: a2v,
+-                    op: IrBinOp::Xor,
+-                    lhs: x,
+-                    rhs: y,
+-                    ty: c_ty,
+-                };
+-                let new_a3 = Instruction::BinOp {
+-                    dest: a3v,
+-                    op: IrBinOp::And,
+-                    lhs: z,
+-                    rhs: Operand::Value(a2v),
+-                    ty: c_ty,
+-                };
+-                let new_consumer = Instruction::BinOp {
+-                    dest: c_dest,
+-                    op: IrBinOp::Xor,
+-                    lhs: Operand::Value(a1v),
+-                    rhs: Operand::Value(a3v),
+-                    ty: c_ty,
+-                };
+-                let pending = vec![(a2b, a2i, new_a2), (a3b, a3i, new_a3)];
+-                return Some((new_consumer, pending));
+             }
+         }
++        if let Some((_, new_early, new_late, new_consumer, ei, li)) = best {
++            let pending = vec![(block_bi, ei, new_early), (block_bi, li, new_late)];
++            return Some((new_consumer, pending));
 +        }
-         let t = trimmed(store, &infos[i], i).to_string();
+     }
  
-         // movzbl SRC, %DST
-@@ -12212,14 +12523,24 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo])
-             _ => {
-                 let d = parse_dest_reg(&t);
-                 if d <= REG_GP_MAX && t.starts_with("andl $") {
--                    // andl $imm: result <= imm, so byte/16 flags follow
--                    // the immediate's range regardless of prior state.
-+                    // andl $imm: AND can only CLEAR bits.  A value already
-+                    // known to fit in a byte / halfword keeps that property
-+                    // under every mask, so the facts are monotone here:
-+                    // they survive when the prior state had them, and are
-+                    // re-established when the immediate alone guarantees
-+                    // the range.  (The old law — facts follow the
-+                    // immediate's range and drop otherwise — silently
-+                    // dropped `is_16` at masks like $-32769 and left the
-+                    // following `movzwl %ax,%eax` un-deleted; the boot
-+                    // corpus carries that exact shape in video-mode.)
-                     let imm = t["andl $".len()..]
-                         .split(',')
-                         .next()
-                         .and_then(|v| v.trim().parse::<i64>().ok());
--                    is_byte[d as usize] = matches!(imm, Some(v) if (0..=255).contains(&v));
--                    is_16[d as usize] = matches!(imm, Some(v) if (0..=65535).contains(&v));
-+                    is_byte[d as usize] =
-+                        is_byte[d as usize] || matches!(imm, Some(v) if (0..=255).contains(&v));
-+                    is_16[d as usize] =
-+                        is_16[d as usize] || matches!(imm, Some(v) if (0..=65535).contains(&v));
-                 } else if d <= REG_GP_MAX {
-                     is_byte[d as usize] = false;
-                     is_16[d as usize] = false;
-@@ -15839,7 +16160,7 @@ mod tests {
-         // block) and must find the setCC reader there. cmpl producer: no
-         // other pass may drop this test, and a wrong fusion would show
-         // jne (invert of "e").
--        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
-+        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
-         assert!(!r.contains("jne .L1"), "fusion must be refused: {}", r);
-         assert!(r.contains("testl"), "test kept: {}", r);
-@@ -15928,7 +16249,7 @@ mod tests {
-     // safe: the reader sees the writer's flags either way.
+     // ── Pattern B: mux (CH) ────────────────────────────────────────────
+@@ -348,6 +425,46 @@ pub(super) fn match_bool_mux_algebra(
+     // ((x,y)-side vs (~x,z)-side) are found either way round, and BOTH of
+     // the xor's operands (y and z) must dominate the early position — in
+     // each role assignment exactly one of them is new to it.
++    //
++    // BMI1 defer: the backend fuses a single-use `Not` that IMMEDIATELY
++    // precedes its `And` into one 3-operand `andn` (detect_and_not_fusions
++    // + emit_and_not_impl) — the shape GCC, Clang and ICX all emit for
++    // CH. Folding here would erase the Not the fusion needs. The fold
++    // defers exactly when that fusion is predictable at THIS point:
++    // `has_scalar_andn` (the pipeline resolved BMI1 + the kill switch),
++    // the Not's type is in the fusion's width domain, its dest is
++    // single-use, and it sits at the immediately preceding index of the
++    // SAME block as the ~x-side And. A Not reached through a Copy chain
++    // never predicts (the fusion needs the raw adjacency).
++    let andn_fusion_predicted = |not_opnd: Operand, and_opnd: Operand| -> bool {
++        let Operand::Value(nv) = not_opnd else {
++            return false;
++        };
++        match defs.get(nv.0 as usize).and_then(Option::as_ref) {
++            Some(Instruction::UnaryOp {
++                op: crate::ir::reexports::IrUnaryOp::Not,
++                ty: nty,
++                ..
++            }) => {
++                if *nty != c_ty
++                    || !matches!(nty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
++                {
++                    return false;
++                }
++                if use_counts.get(nv.0 as usize).copied() != Some(1) {
++                    return false;
++                }
++                match (
++                    def_loc.get(nv.0 as usize).copied().flatten(),
++                    loc_of(&and_opnd),
++                ) {
++                    (Some((nb, ni)), Some((ab, ai))) => nb == ab && ni + 1 == ai,
++                    _ => false,
++                }
++            }
++            _ => false,
++        }
++    };
+     for (first, second) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+         let Some((f_lhs, f_rhs)) = and_strict(&first) else {
+             continue;
+@@ -377,12 +494,18 @@ pub(super) fn match_bool_mux_algebra(
+             } else {
+                 (s_lhs, s_rhs)
+             };
++            let nz_and = if swap_roles { first } else { second };
+             for (x, y) in [(xy_lhs, xy_rhs), (xy_rhs, xy_lhs)] {
+                 for (maybe_not, z) in [(nz_lhs, nz_rhs), (nz_rhs, nz_lhs)] {
+                     if let Some(nx) = not_source(maybe_not, defs) {
+                         if !same_value(nx, x, defs) {
+                             continue;
+                         }
++                        // The andn fusion is the better form under BMI1:
++                        // defer the whole mux fold to the backend.
++                        if has_scalar_andn && andn_fusion_predicted(maybe_not, nz_and) {
++                            continue;
++                        }
+                         // The repurposed early And becomes Xor(y, z); both
+                         // must dominate its position (whichever of the two
+                         // is an operand of the LATE arm is new here).
+@@ -422,6 +545,20 @@ pub(super) fn match_bool_mux_algebra(
+     // consumer {Xor|Or}( And(x,y), And(x,z) )  →  repurposed := Xor/Or(y,z);
+     // consumer := And(x, repurposed). Creates no new dominance edges beyond
+     // the repurposed operand's def, checked below.
++    //
++    // MAJ defer: when this pair is the INNER of a majority tree, firing
++    // here destroys the structure Pattern C needs — the pair's Ands get
++    // folded into `x & (y^z)`, and the third pairwise And is left reading
++    // a composite computed before it (the park the emitter then pays
++    // for; sha256_transform's MAJ was exactly this). Defer when C would
++    // fire at the outer consumer: find the {Xor|Or} that reads this
++    // consumer's dest and ask the matcher, recursively, on the same defs
++    // snapshot. The probe is exact under the scan order (C runs before A
++    // at the outer's own turn, and no pattern between here and there
++    // touches a three-And majority); if an intermediate fold ever did,
++    // the loss is a missed optimization, never a miscompile. The
++    // recursion cannot re-enter: at the outer, both arms' defs must be
++    // Ands for A to fire, and one of them is this consumer (a Xor/Or).
+     for (a, b) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+         let Some((a_lhs, a_rhs)) = and_strict(&a) else {
+             continue;
+@@ -447,6 +584,55 @@ pub(super) fn match_bool_mux_algebra(
+                 if !same_block_before(&z, ai) {
+                     continue;
+                 }
++                // Majority-defer probe (cheap pre-filter: the outer
++                // reader exists only when this dest is single-use).
++                if use_counts.get(c_dest.0 as usize).copied() == Some(1) {
++                    let mut deferred = false;
++                    for cand in defs.iter().filter_map(Option::as_ref) {
++                        let Instruction::BinOp {
++                            op: u_op,
++                            lhs: u_lhs,
++                            rhs: u_rhs,
++                            dest: u_dest,
++                            ty: u_ty,
++                        } = cand
++                        else {
++                            continue;
++                        };
++                        if !matches!(u_op, IrBinOp::Xor | IrBinOp::Or)
++                            || *u_ty != c_ty
++                            || (*u_lhs != Operand::Value(c_dest)
++                                && *u_rhs != Operand::Value(c_dest))
++                        {
++                            continue;
++                        }
++                        let Some((ub, ui)) = def_loc.get(u_dest.0 as usize).copied().flatten()
++                        else {
++                            continue;
++                        };
++                        if match_bool_mux_algebra(
++                            *u_lhs,
++                            *u_rhs,
++                            *u_op,
++                            *u_dest,
++                            *u_ty,
++                            ub,
++                            ui,
++                            defs,
++                            use_counts,
++                            def_loc,
++                            has_scalar_andn,
++                        )
++                        .is_some()
++                        {
++                            deferred = true;
++                            break;
++                        }
++                    }
++                    if deferred {
++                        continue;
++                    }
++                }
+                 let Operand::Value(av) = a else { continue };
+                 let inner_op = if c_op == IrBinOp::Or {
+                     IrBinOp::Or
+@@ -1178,6 +1364,7 @@ pub(crate) fn recognize_function(
+     enable_bit_reverse: bool,
+     max_rotate_bits: u32,
+     min_rotate_bits: u32,
++    has_scalar_andn: bool,
+ ) -> usize {
+     let mut defs = vec![None; func.max_value_id() as usize + 1];
+     // (block index, instruction index) of each value's defining instruction,
+@@ -1415,6 +1602,7 @@ pub(crate) fn recognize_function(
+                         &defs,
+                         &use_counts,
+                         &def_loc,
++                        has_scalar_andn,
+                     ) {
+                         // Apply producer repurposes (same block, earlier
+                         // indices), then the consumer, keeping defs and
+@@ -2349,6 +2537,7 @@ mod tests {
+             &fx.defs,
+             &fx.use_counts,
+             &fx.def_loc,
++            false,
+         )
+         .expect("the shape must match");
+         // Apply the rewrite to a copy of the program.
+@@ -2492,6 +2681,7 @@ mod tests {
+                 &fx.defs,
+                 &fx.use_counts,
+                 &fx.def_loc,
++                false,
+             )
+             .is_none()
+         );
+@@ -2542,6 +2732,7 @@ mod tests {
+                 &fx.defs,
+                 &fx.use_counts,
+                 &fx.def_loc,
++                false,
+             )
+             .is_none()
+         );
+@@ -2569,6 +2760,7 @@ mod tests {
+                 &fx.defs,
+                 &fx.use_counts,
+                 &fx.def_loc,
++                false,
+             )
+             .is_none()
+         );
+@@ -2598,35 +2790,352 @@ mod tests {
+                 &fx.defs,
+                 &fx.use_counts,
+                 &def_loc,
++                false,
+             )
+             .is_none()
+         );
+     }
+ 
      #[test]
-     fn setcc_fuse_allows_writer_before_reader() {
--        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    cmpl $2, %ecx\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
-+        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    cmpl $2, %ecx\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
-         // je targets the immediate fallthrough, so the (correct) branch
-         // elimination drops it entirely; the writer (cmpl) makes dropping
-@@ -15942,7 +16263,7 @@ mod tests {
-     // may drop; the setCC/movzbl/relay window must survive intact.
-     #[test]
-     fn setcc_fuse_keeps_window_for_live_bool() {
--        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    movl %edx, 8(%esp)\n    xorl %ecx, %ecx\n    movl 8(%esp), %eax\n    ret\n";
-+        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    movl %edx, 8(%esp)\n    xorl %ecx, %ecx\n    movl 8(%esp), %eax\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
-         assert!(!r.contains("testl %eax, %edx"), "test dropped: {}", r);
-         assert!(r.contains("setne %al"), "setCC kept (bool live): {}", r);
-@@ -15987,7 +16308,7 @@ mod tests {
-     // deleted; the caller-visible return registers are protected.
-     #[test]
-     fn census_fallback_kills_label_crossing_dead_move() {
--        let asm = "f:\n    movl %eax, %ebx\n    testl %eax, %eax\n    je .L1\n.L1:\n    movl $9, %eax\n    ret\n";
-+        let asm = "f:\n    movl %eax, %ebx\n    testl %eax, %eax\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    movl $9, %eax\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
+-    fn maj_with_a_new_operand_defined_too_late_declines() {
+-        // The repurposed a2 would read y, but y is defined AFTER a2 in the
+-        // block (between a2 and a1) — the dominance check must reject.
++    fn maj_new_operand_late_finds_kept_earliest_assignment() {
++        // The literal v1 assignment (repurpose a2@0 into Xor(x,y)) reads y,
++        // which is defined AFTER a2 — rejected. The generalized matcher
++        // instead keeps the EARLIEST And (a2@0 = And(x,z)) and repurposes
++        // the two later Ands, whose new operands all dominate: kept=
++        // earliest is always the dominance-safe choice. The rewrite must
++        // fire and stay bit-exact.
+         let fx = fixture(vec![
+-            and3(4, v(0), v(2)),                     // a2 = And(x, z) at idx 0  [→ Xor(x,y)]
+-            xor3(5, v(1), v(2)),                     // y  = Xor(y_in, z) at idx 1  [AFTER a2]
+-            and3(6, v(0), Operand::Value(Value(5))), // a1 = And(x, y) at idx 2
+-            and3(7, Operand::Value(Value(5)), v(2)), // a3 = And(y, z) at idx 3
++            and3(4, v(0), v(2)),                     // a2 = And(x, z) at idx 0  [KEPT]
++            xor3(5, v(1), v(2)),                     // y  = Xor(y_in, z) at idx 1
++            and3(6, v(0), Operand::Value(Value(5))), // a1 = And(x, y) at idx 2  [→ Xor(x,z)]
++            and3(7, Operand::Value(Value(5)), v(2)), // a3 = And(y, z) at idx 3  [→ And(y, xor)]
+             xor3(8, v(6), v(4)),                     // inner at idx 4
+             xor3(9, v(8), v(7)),                     // consumer at idx 5
+         ]);
++        assert_rewrite_bit_exact(&fx, 5);
++        // Pin the kept-term choice itself: the consumer reads the earliest
++        // And (v4) as its kept operand and the LATEST slot (v7, the old
++        // And(y,z)) as the composite.
++        let (new_consumer, _) = match_bool_mux_algebra(
++            v(8),
++            v(7),
++            IrBinOp::Xor,
++            Value(9),
++            IrType::U32,
++            0,
++            5,
++            &fx.defs,
++            &fx.use_counts,
++            &fx.def_loc,
++            false,
++        )
++        .expect("the kept=earliest assignment must fire");
++        let Instruction::BinOp { lhs, rhs, .. } = &new_consumer else {
++            panic!("consumer stays a BinOp");
++        };
++        assert_eq!(*lhs, v(4), "kept term is the earliest And");
++        assert_eq!(*rhs, v(7), "composite is computed at the latest slot");
++    }
++
++    #[test]
++    fn maj_kept_term_is_the_earliest_and() {
++        // The canonical left-associated MAJ source (sha256's spelling):
++        // ((x&y) ^ (x&z)) ^ (y&z). Three sound kept choices exist; the
++        // matcher must keep And(x,y) — the FIRST And — so the composite
++        // computes last (the GCC shape, no park between composite and
++        // consumer).
++        let fx = fixture(vec![
++            and3(4, v(0), v(1)), // And(x, y) at idx 0  [KEPT]
++            and3(5, v(0), v(2)), // And(x, z) at idx 1  [→ Xor(x,y)]
++            and3(6, v(1), v(2)), // And(y, z) at idx 2  [→ And(z, xor)]
++            xor3(7, v(4), v(5)), // inner at idx 3
++            xor3(8, v(7), v(6)), // consumer at idx 4
++        ]);
++        assert_rewrite_bit_exact(&fx, 4);
++        let (new_consumer, pending) = match_bool_mux_algebra(
++            v(7),
++            v(6),
++            IrBinOp::Xor,
++            Value(8),
++            IrType::U32,
++            0,
++            4,
++            &fx.defs,
++            &fx.use_counts,
++            &fx.def_loc,
++            false,
++        )
++        .expect("the majority must fold");
++        let Instruction::BinOp { lhs, rhs, .. } = &new_consumer else {
++            panic!("consumer stays a BinOp");
++        };
++        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
++        assert_eq!(*rhs, v(6), "composite is the old And(y,z) slot");
++        // The repurposes: idx 1 becomes the Xor, idx 2 the composite And.
++        let mut kinds = [None, None];
++        for (_, ii, inst) in &pending {
++            match *ii {
++                1 => kinds[0] = Some(inst.clone()),
++                2 => kinds[1] = Some(inst.clone()),
++                _ => panic!("unexpected repurpose index"),
++            }
++        }
++        assert!(matches!(
++            kinds[0],
++            Some(Instruction::BinOp {
++                op: IrBinOp::Xor,
++                ..
++            })
++        ));
++        assert!(matches!(
++            kinds[1],
++            Some(Instruction::BinOp {
++                op: IrBinOp::And,
++                ..
++            })
++        ));
++    }
++
++    #[test]
++    fn maj_right_assoc_source_keeps_earliest_too() {
++        // (x&y) ^ ((x&z) ^ (y&z)) — the third And is the consumer's FIRST
++        // arm. Same kept-earliest truth.
++        let fx = fixture(vec![
++            and3(4, v(0), v(1)), // And(x, y) at idx 0  [KEPT]
++            and3(5, v(0), v(2)), // And(x, z) at idx 1
++            and3(6, v(1), v(2)), // And(y, z) at idx 2
++            xor3(7, v(5), v(6)), // inner at idx 3
++            xor3(8, v(4), v(7)), // consumer at idx 4
++        ]);
++        let (new_consumer, _) = match_bool_mux_algebra(
++            v(4),
++            v(7),
++            IrBinOp::Xor,
++            Value(8),
++            IrType::U32,
++            0,
++            4,
++            &fx.defs,
++            &fx.use_counts,
++            &fx.def_loc,
++            false,
++        )
++        .expect("the majority must fold");
++        let Instruction::BinOp { lhs, .. } = &new_consumer else {
++            panic!("consumer stays a BinOp");
++        };
++        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
++    }
++
++    #[test]
++    fn distributive_defers_to_majority_outer() {
++        // The sha256 defect shape: at the INNER consumer
++        // ((x&y) ^ (x&z)) the plain distributive fold used to fire first
++        // and destroy the majority tree (fixing the kept term LAST — the
++        // park). With the outer completing the majority, the inner must
++        // DECLINE and leave the tree for Pattern C.
++        let fx = fixture(vec![
++            and3(4, v(0), v(1)), // And(x, y)
++            and3(5, v(0), v(2)), // And(x, z)
++            and3(6, v(1), v(2)), // And(y, z)
++            xor3(7, v(4), v(5)), // INNER consumer (the distributive pair)
++            xor3(8, v(7), v(6)), // outer consumer (completes the majority)
++        ]);
++        assert!(
++            match_bool_mux_algebra(
++                v(4),
++                v(5),
++                IrBinOp::Xor,
++                Value(7),
++                IrType::U32,
++                0,
++                3,
++                &fx.defs,
++                &fx.use_counts,
++                &fx.def_loc,
++                false,
++            )
++            .is_none(),
++            "the inner distributive must defer to the majority"
++        );
++        // ... and the outer fires with kept = the earliest And.
++        let (new_consumer, _) = match_bool_mux_algebra(
++            v(7),
++            v(6),
++            IrBinOp::Xor,
++            Value(8),
++            IrType::U32,
++            0,
++            4,
++            &fx.defs,
++            &fx.use_counts,
++            &fx.def_loc,
++            false,
++        )
++        .expect("the outer majority must fold");
++        let Instruction::BinOp { lhs, .. } = &new_consumer else {
++            panic!("consumer stays a BinOp");
++        };
++        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
++    }
++
++    #[test]
++    fn distributive_still_fires_when_outer_is_not_majority() {
++        // ((x&y) ^ (x&z)) ^ (x&w) — the outer shares the selector but is
++        // NOT a majority (no (y,z)-style third pairwise And): the inner
++        // distributive must still fire (cascading x & ((y^z)^w)).
++        let fx = fixture(vec![
++            and3(4, v(0), v(1)),
++            and3(5, v(0), v(2)),
++            and3(6, v(0), Operand::Value(Value(9))),
++            xor3(7, v(4), v(5)),
++            xor3(8, v(7), v(6)),
++        ]);
++        assert!(
++            match_bool_mux_algebra(
++                v(4),
++                v(5),
++                IrBinOp::Xor,
++                Value(7),
++                IrType::U32,
++                0,
++                3,
++                &fx.defs,
++                &fx.use_counts,
++                &fx.def_loc,
++                false,
++            )
++            .is_some(),
++            "a non-majority outer must not suppress the distributive"
++        );
++    }
++
++    #[test]
++    fn mux_ch_defers_to_andn_fusion_under_bmi() {
++        // Not IMMEDIATELY before its And (the ~x-side arm): the fusion is
++        // predictable, so under BMI1 the mux fold must decline and leave
++        // the Not+And for emit_and_not_impl's 3-operand ANDN.
++        let fx = fixture(vec![
++            and3(4, v(0), v(1)), // And(x, y) at idx 0
++            not3(3, v(0)),       // ~x at idx 1 — adjacent to the And below
++            and3(5, v(3), v(2)), // And(~x, z) at idx 2
++            xor3(6, v(4), v(5)), // consumer at idx 3
++        ]);
++        assert!(
++            match_bool_mux_algebra(
++                v(4),
++                v(5),
++                IrBinOp::Xor,
++                Value(6),
++                IrType::U32,
++                0,
++                3,
++                &fx.defs,
++                &fx.use_counts,
++                &fx.def_loc,
++                true,
++            )
++            .is_none(),
++            "BMI1 must defer the CH fold to the andn fusion"
++        );
++        // Without BMI1 the same shape folds (the baseline truth).
++        let fx2 = fixture(vec![
++            not3(3, v(0)),
++            and3(4, v(0), v(1)),
++            and3(5, v(3), v(2)),
++            xor3(6, v(4), v(5)),
++        ]);
++        assert_rewrite_bit_exact(&fx2, 3);
++    }
++
++    #[test]
++    fn mux_ch_andn_defer_requires_not_single_use() {
++        // The Not feeds a second reader: the backend fusion cannot fire
++        // (detect_and_not_fusions requires the single-use Not), so the
++        // mux fold must fire even under BMI1.
++        let fx = fixture(vec![
++            and3(4, v(0), v(1)),
++            not3(3, v(0)),
++            and3(5, v(3), v(2)),
++            xor3(6, v(4), v(5)),
++            xor3(7, v(3), v(2)), // second reader of the Not
++        ]);
++        assert!(
++            match_bool_mux_algebra(
++                v(4),
++                v(5),
++                IrBinOp::Xor,
++                Value(6),
++                IrType::U32,
++                0,
++                3,
++                &fx.defs,
++                &fx.use_counts,
++                &fx.def_loc,
++                true,
++            )
++            .is_some(),
++            "a multi-use Not cannot fuse; the mux fold must fire"
++        );
++    }
++
++    #[test]
++    fn mux_ch_andn_defer_requires_adjacency() {
++        // The Not is NOT immediately before the ~x-side And (the (x,y)
++        // And sits between): the fusion cannot fire, so the mux fold
++        // must fire even under BMI1.
++        let fx = fixture(vec![
++            not3(3, v(0)),       // ~x at idx 0
++            and3(4, v(0), v(1)), // And(x, y) at idx 1 — in between
++            and3(5, v(3), v(2)), // And(~x, z) at idx 2
++            xor3(6, v(4), v(5)), // consumer at idx 3
++        ]);
++        assert!(
++            match_bool_mux_algebra(
++                v(4),
++                v(5),
++                IrBinOp::Xor,
++                Value(6),
++                IrType::U32,
++                0,
++                3,
++                &fx.defs,
++                &fx.use_counts,
++                &fx.def_loc,
++                true,
++            )
++            .is_some(),
++            "a non-adjacent Not cannot fuse; the mux fold must fire"
++        );
++    }
++
++    #[test]
++    fn maj_two_multi_use_terms_decline() {
++        // Two of the three pairwise Ands have second readers: whichever
++        // term is kept, one multi-use And must be repurposed — the
++        // majority fold declines (fail-closed).
++        let fx = fixture(vec![
++            and3(4, v(0), v(1)),  // And(x, y) — multi-use below
++            and3(5, v(0), v(2)),  // And(x, z)
++            and3(6, v(1), v(2)),  // And(y, z) — multi-use below
++            xor3(7, v(4), v(5)),  // inner
++            xor3(8, v(7), v(6)),  // consumer
++            xor3(9, v(4), v(2)),  // second reader of And(x,y)
++            xor3(10, v(6), v(0)), // second reader of And(y,z)
++        ]);
          assert!(
-             !r.contains("movl %eax, %ebx"),
-@@ -16003,7 +16324,7 @@ mod tests {
-         // functions with the return-uses-edx comment, which both the CFG
-         // liveness pass and the census fallback's ret-observation guard
-         // honour.
--        let asm = "f:\n    # lccc-i686-return-uses-edx\n    movl %eax, %edx\n    testl %eax, %eax\n    je .L1\n.L1:\n    ret\n";
-+        let asm = "f:\n    # lccc-i686-return-uses-edx\n    movl %eax, %edx\n    testl %eax, %eax\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
-         assert!(r.contains("movl %eax, %edx"), "edx return kept: {}", r);
-     }
-@@ -16012,7 +16333,7 @@ mod tests {
-     #[test]
-     fn canonical_16_cmp_narrows_to_cmpw() {
-         // imm >= 128: cmpw $imm16 (4 B) beats cmpl $imm32 (6 B).
--        let asm = "f:\n    movzwl 8(%esp), %eax\n    cmpl $200, %eax\n    je .L1\n.L1:\n    ret\n";
-+        let asm = "f:\n    movzwl 8(%esp), %eax\n    cmpl $200, %eax\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
-         assert!(r.contains("cmpw $200, %ax"), "narrowed: {}", r);
-         assert!(!r.contains("cmpl $200"), "32-bit cmp gone: {}", r);
-@@ -16021,7 +16342,7 @@ mod tests {
-     #[test]
-     fn canonical_16_keeps_imm8_compares() {
-         // imm < 128 already encodes as cmpl imm8 (3 B) — narrowing would grow.
--        let asm = "f:\n    movzwl 8(%esp), %eax\n    cmpl $79, %eax\n    je .L1\n.L1:\n    ret\n";
-+        let asm = "f:\n    movzwl 8(%esp), %eax\n    cmpl $79, %eax\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    ret\n";
-         let r = peephole_optimize(asm.to_string());
-         assert!(r.contains("cmpl $79, %eax"), "imm8 kept 32-bit: {}", r);
-     }
-@@ -19228,4 +19549,194 @@ mod tests {
-     }
- 
-     // ── setCC self-zero-extension deletion ─────────────────────────────────
+             match_bool_mux_algebra(
+-                v(8),
+                 v(7),
++                v(6),
+                 IrBinOp::Xor,
+-                Value(9),
++                Value(8),
+                 IrType::U32,
+                 0,
+-                5,
++                4,
+                 &fx.defs,
+                 &fx.use_counts,
+                 &fx.def_loc,
++                false,
+             )
+             .is_none()
+         );
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 1d497827..9f4299da 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -932,6 +932,7 @@ pub(crate) fn run_passes(
+     x86_avx2: bool,
+     x86_sse4_1: bool,
+     x86_fma: bool,
++    x86_bmi1: bool,
+     ra_config: &crate::backend::regalloc::RaConfig,
+ ) {
+     // x86 SIMD register-file availability for the middle end. Under `-mno-sse`
+@@ -1859,6 +1860,16 @@ pub(crate) fn run_passes(
+             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+             let max_rotate_bits = target_rotate_bits(target);
+             let min_rotate_bits = target_min_rotate_bits(target);
++            // Scalar ANDN (BMI1) for the bool-mux algebra's CH fold: the
++            // mux fold must defer to the backend's Not+And -> andn fusion
++            // when the 3-operand form is selectable (emit_and_not_impl).
++            // The CCC_NO_ANDN_FUSION kill switch is resolved here, once —
++            // the same switch supports_and_not consults at emission — so
++            // the fold-time prediction and the emission-time decision
++            // cannot drift within one compilation.
++            let has_scalar_andn = target == crate::backend::Target::X86_64
++                && x86_bmi1
++                && std::env::var_os("CCC_NO_ANDN_FUSION").is_none();
+             let n = timed_pass!(
+                 "bit_idioms",
+                 run_on_visited(module, &dirty, &mut changed, |func| {
+@@ -1867,6 +1878,7 @@ pub(crate) fn run_passes(
+                         enable_bit_reverse,
+                         max_rotate_bits,
+                         min_rotate_bits,
++                        has_scalar_andn,
+                     )
+                 })
+             );
+@@ -2029,6 +2041,9 @@ pub(crate) fn run_passes(
+             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+             let max_rotate_bits = target_rotate_bits(target);
+             let min_rotate_bits = target_min_rotate_bits(target);
++            let has_scalar_andn = target == crate::backend::Target::X86_64
++                && x86_bmi1
++                && std::env::var_os("CCC_NO_ANDN_FUSION").is_none();
+             let n = timed_pass!(
+                 "bit_idioms_post_ifconv",
+                 run_on_visited(module, &dirty, &mut changed, |func| {
+@@ -2037,6 +2052,7 @@ pub(crate) fn run_passes(
+                         enable_bit_reverse,
+                         max_rotate_bits,
+                         min_rotate_bits,
++                        has_scalar_andn,
+                     )
+                 })
+             );
+diff --git a/tests/regression/check_ch_maj_codegen.sh b/tests/regression/check_ch_maj_codegen.sh
+new file mode 100755
+index 00000000..c6c93bff
+--- /dev/null
++++ b/tests/regression/check_ch_maj_codegen.sh
+@@ -0,0 +1,134 @@
++#!/usr/bin/env bash
++# CH/MAJ codegen gate — pins the four-oracle consensus shapes for
++# SHA-256's CH (mux) and MAJ (majority) under BMI1 and the register-only
++# forms everywhere, plus the exposed-forward elimination the
++# acc-resident consumption fixes.
++#
++# Checks:
++#   A. runtime differential, bit-exact vs gcc over the opt x march matrix
++#      (incl. both kill switches: CCC_NO_ANDN_FUSION, CCC_NO_BOOL_ALGEBRA)
++#   B. under -mbmi -O2: exactly one 3-operand andn in sha256_transform
++#      (CH = the GCC/Clang/ICX shape), zero andn without BMI
++#   C. the 64-round compression loop is slot-write free (the park class)
++#      and the MAJ region is register-only (no slot reads between the
++#      kept And and its consumer)
++#   D. zero exposed store-to-load forwards in the whole function at the
++#      measured configurations (a slot read within 3 lines of its park)
++set -u
++CCC=${CCC:-target/fastbuild/lccc}
++SRC=$(dirname "$0")/../benchmark/programs/sha256_transform.c
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++GCC=${GCC_BIN:-gcc}
++GCCINC=$("$GCC" -print-file-name=include 2>/dev/null)
++[ -d "$GCCINC" ] && GCCINC="-I$GCCINC" || GCCINC=""
++fails=0
++note() { printf '%s\n' "$*"; }
++bad()  { note "FAIL: $*"; fails=$((fails+1)); }
 +
-+    // ── Narrow pair compare fold (fold_zext_pair_reg_compare) ───────────────
++# ── A. runtime differential ─────────────────────────────────────────
++for MARCH in "" "-mbmi" "-march=x86-64-v3"; do
++  for OPT in -O1 -O2 -O3 -Os; do
++    TAG="$MARCH $OPT"
++    "$GCC" $MARCH $OPT -o "$TMP/g.x" "$SRC" -lm 2>/dev/null \
++      || { note "skip $TAG (gcc)"; continue; }
++    "$CCC" $GCCINC $MARCH $OPT -o "$TMP/l.x" "$SRC" -lm 2>/dev/null \
++      || { bad "$TAG lccc compile"; continue; }
++    G=$("$TMP/g.x"; echo "rc=$?")
++    L=$("$TMP/l.x"; echo "rc=$?")
++    [ "$G" = "$L" ] || bad "$TAG runtime differs (gcc=[$G] lccc=[$L])"
++  done
++done
++for OPT in -O2 -O3; do
++  for VAR in CCC_NO_ANDN_FUSION CCC_NO_BOOL_ALGEBRA; do
++    env "$VAR=1" "$CCC" $GCCINC -mbmi $OPT -o "$TMP/l.x" "$SRC" -lm 2>/dev/null \
++      || { bad "$VAR $OPT compile"; continue; }
++    L=$("$TMP/l.x"; echo "rc=$?")
++    "$GCC" -march=x86-64-v3 $OPT -o "$TMP/g.x" "$SRC" -lm 2>/dev/null
++    G=$("$TMP/g.x"; echo "rc=$?")
++    [ "$G" = "$L" ] || bad "$VAR $OPT runtime differs"
++  done
++done
++note "A. runtime differential done (fails so far: $fails)"
 +
-+    /// A complete function frame for pair tests: both extensions feed the
-+    /// compare, the reader follows, nothing else touches the registers.
-+    fn pair_fn(body: &str) -> String {
-+        // The tail redefines %eax: `ret` reads it, so a bare `ret` would
-+        // keep every extension destination live and refuse every fold
-+        // (that refusal is exact — the same law the imm-fold pins use).
-+        format!("f:\n.cfi_startproc\n{body}\n    movl %esi, %eax\n    ret\n.cfi_endproc\n")
-+    }
++# ── B. andn census ──────────────────────────────────────────────────
++"$CCC" $GCCINC -mbmi -O2 -S "$SRC" -o "$TMP/bmi.s" 2>/dev/null
++N=$(grep -c 'andn' "$TMP/bmi.s" || true)
++[ "$N" -eq 1 ] || bad "-mbmi: expected exactly 1 andn (CH), got $N"
++"$CCC" $GCCINC -O2 -S "$SRC" -o "$TMP/base.s" 2>/dev/null
++N=$(grep -c 'andn' "$TMP/base.s" || true)
++[ "$N" -eq 0 ] || bad "baseline: expected 0 andn, got $N"
 +
-+    #[test]
-+    fn zext_pair_reg_compare_folds_word_eq_reader() {
-+        let asm = pair_fn(
-+            "    movzwl %bx, %edi\n    movzwl %si, %eax\n    cmpl %eax, %edi\n    jne .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(out.contains("cmpw %ax, %di"), "word pair folded:\n{out}");
-+        assert!(!out.contains("movzwl %bx, %edi"), "ext 1 deleted:\n{out}");
-+        assert!(
-+            !out.contains("movzwl 24(%esi), %eax"),
-+            "ext 2 deleted:\n{out}"
-+        );
-+        assert!(!out.contains("cmpl %eax, %edi"), "cmpl deleted:\n{out}");
-+    }
++# ── C. compression-loop slot discipline ─────────────────────────────
++python3 - "$TMP/bmi.s" <<'PYEOF' || bad "compression loop slot/MAJ shape"
++import sys
++lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
++start = next(i for i, l in enumerate(lines)
++             if l.startswith("rorl $") or l.startswith("rorxl $"))
++end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("jl "))
++loop = lines[start:end + 1]
++def plain_slot_ref(opnd):
++    # "N(%rsp)" with no index register inside the parentheses.
++    return opnd.endswith("(%rsp)") and "," not in opnd
++bad_lines = []
++for l in loop:
++    toks = l.split()
++    if len(toks) == 3 and toks[0] in ("movl", "movq") and toks[1].startswith("%") \
++       and plain_slot_ref(toks[2].rstrip(",")):
++        bad_lines.append(("slot write", l))
++    if len(toks) == 3 and toks[0] in ("andl", "andq", "xorl", "xorq", "orl", "orq") \
++       and plain_slot_ref(toks[1].rstrip(",")):
++        bad_lines.append(("slot-fold ALU", l))
++if bad_lines:
++    print(bad_lines[:3]); sys.exit(1)
++PYEOF
++note "B/C. shape census done (fails so far: $fails)"
 +
-+    #[test]
-+    fn zext_pair_reg_compare_folds_byte_unsigned_reader() {
-+        let asm = pair_fn(
-+            "    movzbl %cl, %edx\n    movzbl %bh, %eax\n    cmpl %eax, %edx\n    jb .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("cmpb %al, %dl"),
-+            "byte pair folded (narrow dest views):\n{out}"
-+        );
-+        assert!(out.contains("jb .L1"), "unsigned reader kept:\n{out}");
-+    }
++# ── D. exposed store-to-load forwards ───────────────────────────────
++for CFG in "-mbmi -O2" "-mbmi -O3" "-march=x86-64-v3 -O2" "-march=x86-64-v3 -O3"; do
++  "$CCC" $GCCINC $CFG -S "$SRC" -o "$TMP/f.s" 2>/dev/null
++  python3 - "$TMP/f.s" "$CFG" <<'PYEOF' || bad "exposed forwards under $CFG"
++import sys
++raw = [l.rstrip() for l in open(sys.argv[1])]
++# Scope to sha256_transform itself: the benchmark driver's outer loop
++# counter keeps one sound phi-copy forward by design (the MachInst
++# window-defs gate); the compression function must have none.
++try:
++    f0 = next(i for i, l in enumerate(raw) if l.strip() == "sha256_transform:")
++    f1 = next(i for i in range(f0 + 1, len(raw))
++              if raw[i].strip().endswith(":") and raw[i].strip().startswith("main"))
++except StopIteration:
++    f0, f1 = 0, len(raw)
++lines = [l.strip() for l in raw[f0:f1] if l.strip()]
++forwards = 0; stores = {}
++def park(l):
++    parts = l.split(", ")
++    if len(parts) == 2 and parts[0].split(" ")[0] in ("movl", "movq") \
++       and parts[0].split(" ")[1].startswith("%") \
++       and parts[1].endswith("(%rsp)") and "," not in parts[1]:
++        return parts[1][: parts[1].index("(%rsp)")]
++    return None
++for i, l in enumerate(lines):
++    s = park(l)
++    if s is not None:
++        stores[s] = i; continue
++    for slot, si in list(stores.items()):
++        if ("(%s(%%rsp))" % slot).replace("%%", "%") in l.replace(", ", ",") \
++           and 0 < i - si <= 3 and park(l) != slot + "(%rsp)":
++            if (" " + slot + "(%rsp)") in l or ("," + slot + "(%rsp)") in l:
++                forwards += 1
++    for slot in list(stores):
++        if (" " + slot + "(%rsp)") in l or ("," + slot + "(%rsp)") in l:
++            if park(l) is None:
++                del stores[slot]
++if forwards:
++    print(f"{sys.argv[2]}: {forwards} exposed store-to-load forwards"); sys.exit(1)
++PYEOF
++done
 +
-+    #[test]
-+    fn zext_pair_memory_source_substitutes_the_operand_verbatim() {
-+        // The memory-sourced extension dies into the compare's operand
-+        // slot: the compare re-reads the byte-identical address text.
-+        let asm = pair_fn(
-+            "    movzwl %bx, %edi\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    ja .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("cmpw 24(%esi), %di"),
-+            "memory operand substituted verbatim:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn zext_pair_memory_destination_substitutes_on_the_dst_role() {
-+        // cmpl %eax, %edx with edx = zext(mem): dst role carries the memory
-+        // text — `cmpw %ax, 0(%edi)` computes mem - ax, exactly %edx - %eax.
-+        let asm = pair_fn(
-+            "    movzbl %cl, %eax\n    movzbl (%edi), %edx\n    cmpl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("cmpb %al, (%edi)"),
-+            "memory on the dst role:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn sext_pair_accepts_signed_reader() {
-+        let asm = pair_fn(
-+            "    movsbl %cl, %edx\n    movsbl 8(%esp), %eax\n    cmpl %eax, %edx\n    jl .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("cmpb 8(%esp), %dl"),
-+            "sext pair folds signed:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn zext_pair_refuses_signed_reader() {
-+        // The 32-bit view compares two non-negative values; the word view
-+        // compares two's complement — they disagree on the top-bit row.
-+        let asm = pair_fn(
-+            "    movzwl %bx, %edi\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    jl .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("cmpl %eax, %edi"),
-+            "signed reader refused:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn pair_refuses_mixed_zext_sext() {
-+        let asm = pair_fn(
-+            "    movzbl %cl, %edx\n    movsbl %dh, %eax\n    cmpl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("cmpl %eax, %edx"),
-+            "mixed extensions refused:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn pair_refuses_when_a_destination_survives_the_compare() {
-+        let asm = pair_fn(
-+            "    movzwl %bx, %edi\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    movl %edi, %ebx\n    ret\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(out.contains("cmpl %eax, %edi"), "live dest refused:\n{out}");
-+    }
-+
-+    #[test]
-+    fn pair_refuses_non_adjacent_extensions() {
-+        let asm = pair_fn(
-+            "    movzwl %bx, %edi\n    movl $7, %ecx\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("cmpl %eax, %edi"),
-+            "writer between exts refused:\n{out}"
-+        );
-+    }
-+
-+    #[test]
-+    fn pair_hops_directives_but_never_labels() {
-+        // .loc between the pieces is fine (writes nothing)...
-+        let asm = pair_fn(
-+            "    movzwl %bx, %edi\n    .loc 1 132 5\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    .loc 1 133 1\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("cmpw 24(%esi), %di"),
-+            "directives hopped:\n{out}"
-+        );
-+        // ...a label is a control-flow boundary and is not.
-+        let asm2 = pair_fn(
-+            "    movzwl %bx, %edi\n.Lmid:\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
-+        );
-+        let out2 = peephole_optimize(asm2);
-+        assert!(
-+            out2.contains("cmpl %eax, %edi"),
-+            "label between exts refused:\n{out2}"
-+        );
-+    }
-+
-+    #[test]
-+    fn pair_output_assembles() {
-+        // House law (S59): text assertions cannot see encoding damage —
-+        // route the folded output through the real i686 assembler.
-+        let asm = concat!(
-+            "    .text\n",
-+            "    .globl f\n",
-+            "f:\n",
-+            "    movzwl %bx, %edi\n",
-+            "    movzwl 24(%esi), %eax\n",
-+            "    cmpl %eax, %edi\n",
-+            "    je .L1\n",
-+            "    movl %ebx, 8(%esp)\n",
-+            ".L1:\n",
-+            "    movl %esi, %eax\n",
-+            "    ret\n",
-+        );
-+        let out = peephole_optimize(asm.to_string());
-+        assert!(out.contains("cmpw 24(%esi), %di"), "{out}");
-+        let obj = std::env::temp_dir().join("lccc_pair_cmp_assembles.o");
-+        let path = obj.to_string_lossy().into_owned();
-+        crate::backend::i686::assembler::assemble(&out, &path).unwrap_or_else(|e| {
-+            panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
-+        });
-+        let _ = std::fs::remove_file(&path);
-+    }
-+
-+    #[test]
-+    fn masked_self_zext_refuses_setcc_def_partial_register_merge() {
-+        // THE S05 LAW: a setCC byte write MERGES into the register — the
-+        // upper bits are garbage, so the self-extension is load-bearing.
-+        // This test is the regression pin that keeps it that way.
-+        let asm = pair_fn(
-+            "    cmpl %eax, %ebx\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %ebx\n",
-+        );
-+        let out = peephole_optimize(asm);
-+        assert!(
-+            out.contains("movzbl %al, %eax"),
-+            "setCC merge keeps the extend:\n{out}"
-+        );
-+    }
- }
-diff --git a/tests/regression/i686_narrow_cmp_fold.c b/tests/regression/i686_narrow_cmp_fold.c
-index 75ccb999..c4a5c95b 100644
---- a/tests/regression/i686_narrow_cmp_fold.c
-+++ b/tests/regression/i686_narrow_cmp_fold.c
-@@ -30,7 +30,7 @@
- #endif
- 
- #ifndef EXPECT_A
--#define EXPECT_A 569u
-+#define EXPECT_A 683u
- #endif
- 
- volatile uint32_t g_sink;
-@@ -93,6 +93,36 @@ __attribute__((noinline)) static uint32_t testb_ptr(const uint8_t *p) {
-     return r;
- }
- 
-+
-+/* The zext-pair compare law: two sub-word values widened to 32 bits and
-+ * compared there fold to one narrow register/memory compare for equality
-+ * and unsigned readers, never for signed readers (the top-bit rows
-+ * disagree).  Each function drives both classes so a wrong fold is a
-+ * wrong exit code. */
-+__attribute__((noinline)) static uint32_t pair_cmp_reg(unsigned short a, unsigned short b) {
-+    uint32_t r = 0;
-+    if (a == b)
-+        r |= 1;
-+    if (a != b)
-+        r |= 2;
-+    if (a < b)
-+        r |= 4; /* unsigned reader: foldable */
-+    if ((short)a < (short)b)
-+        r |= 8; /* signed reader: the fold must refuse */
-+    return r;
-+}
-+
-+__attribute__((noinline)) static uint32_t pair_cmp_mem(const unsigned short *p, unsigned short v) {
-+    uint32_t r = 0;
-+    if (*p == v)
-+        r |= 1;
-+    if (*p > v)
-+        r |= 2; /* unsigned */
-+    if (*p < v)
-+        r |= 4; /* unsigned */
-+    return r;
-+}
-+
- __attribute__((noinline)) static int bool_from_cmp(unsigned char b) {
-     /* sete %al; movzbl %al, %eax shapes: the bool materialisation. */
-     int t = (b == 7);
-@@ -125,6 +155,19 @@ int main(void) {
-     r ^= testb_ptr(&bytes[2]) * 47u;
-     g_sink = r;
- 
-+    r ^= pair_cmp_reg(0x7FFF, 0x7FFF) * 61u;
-+    r ^= pair_cmp_reg(0x8000, 0x0001) * 67u; /* the top-bit row */
-+    r ^= pair_cmp_reg(0xFFFE, 0xFFFF) * 71u;
-+    g_sink = r;
-+
-+    {
-+        static const unsigned short words[3] = {0x8000, 0x0001, 0xFFFF};
-+        r ^= pair_cmp_mem(&words[0], 0x8000) * 73u;
-+        r ^= pair_cmp_mem(&words[1], 0x0002) * 79u;
-+        r ^= pair_cmp_mem(&words[2], 0xFFFE) * 83u;
-+    }
-+    g_sink = r;
-+
-     r ^= (uint32_t)bool_from_cmp(7) * 53u;
-     r ^= (uint32_t)bool_from_cmp(9) * 59u;
-     g_sink = r;
++if [ "$fails" -eq 0 ]; then
++  note "ch/maj codegen gate: PASS"
++  exit 0
++fi
++note "ch/maj codegen gate: $fails FAILURES"
++exit 1
