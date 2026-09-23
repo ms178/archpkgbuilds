@@ -1,8 +1,149 @@
-diff --git a/src/alloc-aligned.c b/src/alloc-aligned.c
-index 3a4383e0..221ef26c 100644
---- a/src/alloc-aligned.c
-+++ b/src/alloc-aligned.c
-@@ -5,12 +5,38 @@ terms of the MIT license. A copy of the license can be found in the file
+diff -ruN -x .git pristine-353/CMakeLists.txt opt-353/CMakeLists.txt
+--- a/CMakeLists.txt	2026-09-23 14:09:17.003749655 +0000
++++ b/CMakeLists.txt	2026-09-23 16:27:45.050478902 +0000
+@@ -290,6 +290,15 @@
+     list(APPEND mi_cflags -Wall)
+ endif()
+ 
++# NEW_DISCOVERY (layout stabilization): pin function/loop placement. LTO otherwise places
++# hot entries at arbitrary offsets; that alone moved tight-loop microbenchmarks by up to
++# ±35% between instruction-identical builds (validated with paired A/A noise floors and
++# no-LTO asm equality). Pinned placement makes performance reproducible across builds and
++# removed the residual calloc-path placement penalty (see REPORT §3.5/§4).
++if(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND NOT MSVC)
++  list(APPEND mi_cflags -falign-functions=64 -falign-loops=32)
++endif()
++
+ if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang")
+   list(APPEND mi_cflags -Wno-deprecated)
+ endif()
+diff -ruN -x .git pristine-353/include/mimalloc/bits.h opt-353/include/mimalloc/bits.h
+--- a/include/mimalloc/bits.h	2026-09-23 14:09:17.019749655 +0000
++++ b/include/mimalloc/bits.h	2026-09-23 15:16:21.115749655 +0000
+@@ -104,6 +104,9 @@
+ 
+ #if MI_ARCH_X64 && defined(__AVX2__)
+ #include <immintrin.h>
++// B6/OLD_PATCH note (validated on 3.5.3): block-`next` encode/decode is always compiled in
++// (also used by debug double-free checks); optional SIMD kernels are gated on
++// `MI_OPT_SIMD >= 1` (this arm64 branch is one of them). Keep this split when adding SIMD.
+ #elif MI_ARCH_ARM64 && MI_OPT_SIMD
+ #include <arm_neon.h>
+ #endif
+diff -ruN -x .git pristine-353/include/mimalloc/types.h opt-353/include/mimalloc/types.h
+--- a/include/mimalloc/types.h	2026-09-23 14:09:17.019749655 +0000
++++ b/include/mimalloc/types.h	2026-09-23 16:25:03.618478902 +0000
+@@ -437,6 +437,39 @@
+ static inline size_t mi_xused_alloc_count(mi_used_t xused)   { return ((xused.used_alloc>>16) & 0xFFFF); }
+ static inline mi_used_t mi_xused_used_reset(mi_used_t xused) { xused.used_alloc =  xused.used_alloc & ~0xFFFF; return xused; }
+ 
++// ---------------------------------------------------------------------------
++// Memory-model audit for `mi_page_s` atomics (B2, 10-point summary):
++//  (1) `page->free` is a non-atomic pointer, mutated ONLY under ownership (the `xthread_free`
++//      owned bit is the ownership proof); concurrent readers use `mi_atomic_load_relaxed` --
++//      a torn read cannot occur on the supported targets (pointer-sized, naturally aligned)
++//      and any stale value is only CAS fodder / a hint (re-checked on the owner path). Never
++//      dereference a relaxed-read `page->free` without ownership.
++//  (2) `page->xthread_free`: relaxed load + acq_rel CAS push (see `mi_free_block_mt`) -- the
++//      release part publishes the block + its `next`; the acquire part pairs with pushes.
++//  (3) `page->xthread_free`: acq_rel CAS/exchange collect (see `mi_page_thread_free_collect`)
++//      -- acquire materializes the chain; release publishes the removal. `release` alone is
++//      NOT enough (answers the historical `release is enough?` question in `page.c`).
++//  (4) Ownership hand-off (`mi_abandoned_page_unown_from_free`): strong acq_rel CAS (see the
++//      local comment in `free.c`); strong, not weak: each failure must refresh `tf_expect`.
++//  (5) `page->xthread_id` (+flags in the low bits): relaxed loads classify in the `mi_free`
++//      fast path; flag updates are CAS'd acq_rel. The relaxed read is a hint -- everything it
++//      selects is validated afterwards (padding/ownership re-checks).
++//  (6) `xused` (packed `_Atomic`, relaxed RMW): owner-only traffic (owned bit = single
++//      writer), so relaxed suffices; it is `_Atomic` only because the 32-bit packed slot
++//      would tear against `used_free` under plain 64-bit RMW on ILP32.
++//  (7) `local_free`: owner-only, non-atomic (ownership invariant covers it).
++//  (8) Queue links `next`/`prev`: mutated under ownership + the page-queue lock; no lock-free
++//      concurrent mutation exists.
++//  (9) `memid` and other const provenance: written before the page is published into a queue
++//      (publication = release store of the queue link), so plain reads after publication are
++//      ordered.
++//  (10) Rules adopted from these cases: (a) never loosen a memory order purely for
++//      performance -- the B2 acquire->relaxed relaxation applies only to CAS-fodder loads
++//      (items 1/2); (b) never use release-only where the consumer must *read* the published
++//      data (acquire is required there); (c) relaxed is reserved for counters/hints whose
++//      consumers perform no cross-thread data-dependent reads.
++// ---------------------------------------------------------------------------
++
+ // A page contains blocks of one specific size (`block_size`).
+ // Each page has three list of free blocks:
+ // `free` for blocks that can be allocated,
+@@ -462,13 +495,31 @@
+ //   that case the `xthreadid` is 0 or 4 (4 is for abandoned pages that
+ //   are in the `pages_abandoned` lists of an arena, these are called "mapped" abandoned pages).
+ // - page flags are in the bottom 3 bits of `xthread_id` for the fast path in `mi_free`.
+-// - The layout below is optimized for `free.c:mi_free` and `alloc.c:mi_page_alloc`
++// - The layout below is a cache-line tri-split tuned for `free.c:mi_free`, `free.c:mi_free_block_mt`,
++//   and `alloc.c:mi_page_malloc_zero`:
++//     line 0: read-mostly fields shared by the owner *and* concurrent remote frees (never
++//             written on hot paths -- `xthread_id` flags change only on full/unfull/abandon),
++//     line 1: fields written by the owning thread on every `malloc`/local `free`,
++//     line 2: `xthread_free` (CAS'd by concurrent remote frees) and cold provenance data.
++//   This keeps cross-thread frees from invalidating the owner's hot line and vice versa.
+ 
+ typedef struct mi_page_s {  
++  // ---- cache line 0: read-mostly (hot for local `free` dispatch and remote `free` dispatch) ----
++  // Written only on rare transitions (full/unfull/abandon flags in `xthread_id`); no hot
++  // writer on this line -> the dispatch reads of both local and remote frees never bounce.
+   #if (MI_PAGE_META_IS_ALIGNED)
+   _Atomic(struct mi_page_s*) self;             // points to the actual page info (for pages that span multiple slices)
+   #endif
+   _Atomic(mi_threadid_t)    xthread_id;        // thread this page belongs to. (= `theap->thread_id (or 0 or 4 if abandoned) | page_flags`)
++  mi_theap_t*               theap;             // the theap owning this page (may not be valid or NULL for abandoned pages)
++  mi_heap_t*                heap;              // const: the heap owning this page
++  uintptr_t                 keys[2];           // const: random keys to encode the free lists (see `_mi_block_next`); only the first `MI_PAGE_KEY_COUNT` entries are used.
++
++  // ---- cache line 1: the owning thread's hot metadata (hot for `malloc`/`calloc` and local `free`) ----
++  // Everything the alloc side touches per operation lives on this single line (`free`,
++  // `xused`, `local_free`, `block_size`, `page_offset`, `free_is_zero`): one metadata line
++  // per pop/zero, exactly like the original unsplit layout.
++  mi_decl_align(64)                                 // start a new cache line (tri-split, see above)
+   mi_block_t*               free;              // list of available free blocks (`malloc` allocates from this list)
+   mi_used_t                 xused;             // number of blocks in use (including blocks in `thread_free`) (and the allocated count for statistics)
+   #if MI_SIZE_SIZE < 8
+@@ -476,7 +527,8 @@
+   uint16_t                  xlast_alloc;       // for sampling; on 64-bit platforms it is in bits 48..63 of xused.
+   #endif
+   mi_block_t*               local_free;        // list of deferred free blocks by this thread (migrates to `free`)
+- 
++  struct mi_page_s*         next;              // next page owned by the theap with the same `block_size`
++  struct mi_page_s*         prev;              // previous page owned by the theap with the same `block_size`
+   size_t                    block_size;        // const: size available in each block (always `>0`)
+   size_t                    page_offset;       // const: relative offset from the page to the start of the blocks
+   uint16_t                  capacity;          // number of blocks committed
+@@ -484,19 +536,12 @@
+   uint16_t                  slice_pcommitted;  // committed size in OS page sizes relative to the first arena slice of the page data (or 0 if the page is fully committed already)
+   uint8_t                   retire_expire;     // expiration count for retired blocks
+   bool                      free_is_zero;      // `true` if the blocks in the free list are zero initialized
+- 
+-  // next cache line
+-  _Atomic(mi_thread_free_t) xthread_free;      // list of deferred free blocks freed by other threads (= `mi_block_t* | (1 if owned)`)
+-  mi_theap_t*               theap;             // the theap owning this page (may not be valid or NULL for abandoned pages)
+-  mi_heap_t*                heap;              // const: the heap owning this page
+ 
+-  struct mi_page_s*         next;              // next page owned by the theap with the same `block_size`
+-  struct mi_page_s*         prev;              // previous page owned by the theap with the same `block_size`
++  // ---- cache line 2: concurrent remote frees (hot for `mi_free_block_mt`) and cold data ----
++  // CAS'd by concurrent remote frees only; never bounced against the owner's hot writes.
++  mi_decl_align(64)                                 // start a new cache line (tri-split, see above)
++  _Atomic(mi_thread_free_t) xthread_free;      // list of deferred free blocks freed by other threads (= `mi_block_t* | (1 if owned)`)
+   mi_memid_t                memid;             // const: provenance of the page memory
+-  
+-  #if (MI_ENCODE_FREELIST || MI_PADDING)
+-  uintptr_t                 keys[MI_PAGE_KEY_COUNT]; // const: one or two random keys to encode the free lists (see `_mi_block_next`) or padding canary
+-  #endif
+ } mi_page_t;
+ 
+ // ------------------------------------------------------
+diff -ruN -x .git pristine-353/src/alloc-aligned.c opt-353/src/alloc-aligned.c
+--- a/src/alloc-aligned.c	2026-09-23 14:09:17.019749655 +0000
++++ b/src/alloc-aligned.c	2026-09-23 15:11:00.411749655 +0000
+@@ -5,12 +5,38 @@
  "LICENSE" at the root of this distribution.
  -----------------------------------------------------------------------------*/
  
@@ -41,57 +182,10 @@ index 3a4383e0..221ef26c 100644
  // ------------------------------------------------------
  // Aligned Allocation
  // ------------------------------------------------------
-@@ -208,7 +234,10 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
-   // try first if there happens to be a small block available with just the right alignment
-   // since most small power-of-2 blocks (under MI_PAGE_MAX_BLOCK_START_ALIGN2) are already
-   // naturally aligned this can be often the case.
--  if mi_likely(size <= MI_SMALL_SIZE_MAX && alignment <= size)
-+  // note: we also handle the case where the alignment is at most MI_MAX_ALIGN_SIZE but larger
-+  // than the size specially (see below) by allocating from the size class of the alignment
-+  // itself to avoid the over-allocation fallback.
-+  if mi_likely(size <= MI_SMALL_SIZE_MAX && (alignment <= size || alignment <= MI_MAX_ALIGN_SIZE))
-   {
-     #if MI_THEAP_INITASNULL
-     if mi_likely(theap!=NULL)
-@@ -220,6 +249,33 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
-       {
-         const uintptr_t align_mask = alignment-1;       // for any x, `(x & align_mask) == (x % alignment)`
-         const size_t padsize = size + MI_PADDING_SIZE;
-+        if mi_unlikely(alignment > padsize && offset == 0) {
-+          // `size < alignment <= MI_MAX_ALIGN_SIZE`: allocate directly from the size class of
-+          // `alignment` instead of the over-allocation fallback. Such a class is exactly
-+          // `alignment` sized (a small power-of-two class) and page block areas start at least
-+          // MI_MAX_ALIGN_SIZE aligned, so all its blocks are naturally aligned -- the same
-+          // guarantee `mi_malloc_is_naturally_aligned` relies on in the generic path.
-+          // This avoids `alignment-1` bytes of extra internal fragmentation and the slower
-+          // over-allocation + interior-pointer bookkeeping for e.g. `aligned_alloc(16,8)`.
-+          mi_assert_internal(alignment <= MI_MAX_ALIGN_SIZE);
-+          mi_page_t* page = NULL;
-+          void* p = mi_theap_malloc_zero_no_guarded(theap, alignment, zero, &page);
-+          if mi_likely((((uintptr_t)p) & align_mask) == 0) {
-+            if (ppage != NULL) { *ppage = page; }
-+            if (p != NULL) {
-+              // re-track with the requested size (the block was tracked internally as `alignment`)
-+              mi_track_free_size(p, alignment);
-+              mi_track_malloc(p, size, zero);
-+            }
-+            return p;
-+          }
-+          else {
-+            // this should never happen since blocks of the `alignment` class are naturally aligned..
-+            // (guarded or sampled blocks could deviate, in which case we free and use the generic fallback)
-+            mi_assert_internal(false);
-+            mi_free(p);
-+          }
-+        }
-         mi_page_t* page = _mi_theap_get_free_small_page(theap, padsize, false);
-         if mi_likely(page->free != NULL) {
-           const bool is_aligned = (((uintptr_t)page->free + offset) & align_mask)==0;
-diff --git a/src/alloc-posix.c b/src/alloc-posix.c
-index a2252494..a39286a2 100644
---- a/src/alloc-posix.c
-+++ b/src/alloc-posix.c
-@@ -9,16 +9,27 @@ terms of the MIT license. A copy of the license can be found in the file
+diff -ruN -x .git pristine-353/src/alloc-posix.c opt-353/src/alloc-posix.c
+--- a/src/alloc-posix.c	2026-09-23 14:09:17.019749655 +0000
++++ b/src/alloc-posix.c	2026-09-23 14:48:33.035749655 +0000
+@@ -9,16 +9,27 @@
  // mi prefixed publi definitions of various Posix, Unix, and C++ functions
  // for convenience and used when overriding these functions.
  // ------------------------------------------------------------------------
@@ -120,7 +214,7 @@ index a2252494..a39286a2 100644
  
  #ifdef _MSC_VER
  #pragma warning(disable:4996)  // getenv _wgetenv
-@@ -40,8 +51,8 @@ int mi_posix_memalign(void** p, size_t alignment, size_t size) {  // mi_attr_noe
+@@ -40,8 +51,8 @@
    // <http://man7.org/linux/man-pages/man3/posix_memalign.3.html>
    if (p == NULL) return EINVAL;
    // it is required that alignment is a power of 2 and a multiple of sizeof(void*)
@@ -131,7 +225,7 @@ index a2252494..a39286a2 100644
    if (q==NULL && size != 0) return ENOMEM;
    mi_assert_internal(_mi_is_aligned(q,alignment));
    *p = q;
-@@ -96,24 +107,27 @@ mi_decl_nodiscard int mi_reallocarr( void* ptrp, size_t count, size_t size ) mi_
+@@ -96,24 +107,27 @@
    mi_assert(size != 0);
    mi_assert(ptrp != NULL);
    if (ptrp == NULL || size == 0) {
@@ -168,7 +262,7 @@ index a2252494..a39286a2 100644
  }
  
  void* mi__expand(void* p, size_t newsize) mi_attr_noexcept {  // Microsoft
-@@ -124,13 +138,18 @@ void* mi__expand(void* p, size_t newsize) mi_attr_noexcept {  // Microsoft
+@@ -124,13 +138,18 @@
  
  mi_decl_nodiscard mi_decl_restrict wchar_t* mi_wcsdup(const wchar_t* s) mi_attr_noexcept {
    if (s==NULL) return NULL;
@@ -193,7 +287,7 @@ index a2252494..a39286a2 100644
    }
    return p;
  }
-@@ -142,15 +161,15 @@ mi_decl_nodiscard mi_decl_restrict unsigned char* mi_mbsdup(const unsigned char*
+@@ -142,15 +161,15 @@
  int mi_dupenv_s(char** buf, size_t* size, const char* name) mi_attr_noexcept {
    if (size != NULL) *size = 0;
    if (buf==NULL || name==NULL) return EINVAL;
@@ -215,7 +309,7 @@ index a2252494..a39286a2 100644
    return 0;
  }
  
-@@ -162,15 +181,15 @@ int mi_wdupenv_s(wchar_t** buf, size_t* size, const wchar_t* name) mi_attr_noexc
+@@ -162,15 +181,15 @@
    *buf = NULL;
    return EINVAL;
  #else
@@ -237,11 +331,10 @@ index a2252494..a39286a2 100644
    return 0;
  #endif
  }
-diff --git a/src/alloc.c b/src/alloc.c
-index ded0a00c..8be005bf 100644
---- a/src/alloc.c
-+++ b/src/alloc.c
-@@ -9,14 +9,82 @@ terms of the MIT license. A copy of the license can be found in the file
+diff -ruN -x .git pristine-353/src/alloc.c opt-353/src/alloc.c
+--- a/src/alloc.c	2026-09-23 14:09:17.023749655 +0000
++++ b/src/alloc.c	2026-09-23 16:16:49.334478902 +0000
+@@ -8,14 +8,82 @@
  #define _DEFAULT_SOURCE   // for realpath() on Linux
  #endif
  
@@ -324,7 +417,7 @@ index ded0a00c..8be005bf 100644
  #define MI_IN_ALLOC_C
  #include "alloc-override.c"
  #include "free.c"
-@@ -30,15 +98,15 @@ terms of the MIT license. A copy of the license can be found in the file
+@@ -31,15 +99,15 @@
  static mi_decl_noinline void mi_page_block_setup_padding(mi_page_t* page, mi_block_t* block, size_t size) mi_attr_noexcept {
    const size_t bsize = mi_page_usable_block_size(page);
    mi_padding_t* const padding = (mi_padding_t*)((uint8_t*)block + bsize);
@@ -343,7 +436,33 @@ index ded0a00c..8be005bf 100644
      for (size_t i = 0; i < maxpad; i++) { fill[i] = MI_DEBUG_PADDING; }
    }
    #endif
-@@ -484,6 +552,10 @@ static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, voi
+@@ -335,11 +403,14 @@
+   return _mi_theap_malloc_zero(theap, size, true, 0, NULL);
+ }
+ 
+-mi_decl_nodiscard mi_decl_restrict void* mi_malloc(size_t size) mi_attr_noexcept {
++// NEW_DISCOVERY: hot exported entries pinned to a 64-byte boundary. LTO otherwise places
++// them at arbitrary offsets; that alone moved unrelated microbenchmarks by -6..-35%
++// (validated: the paths are instruction-identical in non-LTO builds).
++mi_decl_align(64) mi_decl_nodiscard mi_decl_restrict void* mi_malloc(size_t size) mi_attr_noexcept {
+   return mi_theap_malloc(_mi_theap_default(), size);
+ }
+ 
+-mi_decl_nodiscard mi_decl_restrict void* mi_zalloc(size_t size) mi_attr_noexcept {
++mi_decl_align(64) mi_decl_nodiscard mi_decl_restrict void* mi_zalloc(size_t size) mi_attr_noexcept {
+   return mi_theap_zalloc(_mi_theap_default(), size);
+ }
+ 
+@@ -374,7 +445,7 @@
+   return mi_theap_zalloc(theap,total);
+ }
+ 
+-mi_decl_nodiscard mi_decl_restrict void* mi_calloc(size_t count, size_t size) mi_attr_noexcept {
++mi_decl_align(64) mi_decl_nodiscard mi_decl_restrict void* mi_calloc(size_t count, size_t size) mi_attr_noexcept {
+   return mi_theap_calloc(_mi_theap_default(), count, size);
+ }
+ 
+@@ -514,6 +585,10 @@
        ((uint8_t*)newp)[0] = 0; // work around for applications that expect zero-reallocation to be zero initialized (issue #725)
      }
      if mi_likely(p != NULL) {
@@ -354,7 +473,7 @@ index ded0a00c..8be005bf 100644
        mi_track_mem_defined(p,copy_size);  // _mi_useable_size may be too large for byte precise memory tracking..
        _mi_memcpy_aligned(newp, p, copy_size);
        mi_free(p); // only free the original pointer if successful
-@@ -687,7 +759,7 @@ static size_t mi_path_max(void) {
+@@ -709,7 +784,7 @@
      if (m <= 0) pmax = 4096;      // guess
      else if (m < 256) pmax = 256; // at least 256
      else if (m > 64*1024) pmax = 64*1024;  // at most 64 KiB
@@ -363,7 +482,7 @@ index ded0a00c..8be005bf 100644
      size_t expected = 0;
      mi_atomic_cas_strong_acq_rel(&path_max, &expected, pmax);
    }
-@@ -933,8 +1005,13 @@ void* _mi_externs[] = {
+@@ -956,8 +1031,13 @@
    (void*)&mi_zalloc_small,
    (void*)&mi_heap_malloc,
    (void*)&mi_heap_malloc_small,
@@ -377,11 +496,10 @@ index ded0a00c..8be005bf 100644
 +#if defined(__clang__)
 +#pragma GCC diagnostic pop   // -Wstatic-in-inline (pushed at the top of this file)
 +#endif
-diff --git a/src/bitmap.c b/src/bitmap.c
-index 01de1999..0963180e 100644
---- a/src/bitmap.c
-+++ b/src/bitmap.c
-@@ -9,11 +9,42 @@ terms of the MIT license. A copy of the license can be found in the file
+diff -ruN -x .git pristine-353/src/bitmap.c opt-353/src/bitmap.c
+--- a/src/bitmap.c	2026-09-23 14:09:17.023749655 +0000
++++ b/src/bitmap.c	2026-09-23 14:48:33.035749655 +0000
+@@ -9,11 +9,42 @@
  Concurrent bitmap that can set/reset sequences of bits atomically
  ---------------------------------------------------------------------------- */
  
@@ -424,7 +542,7 @@ index 01de1999..0963180e 100644
  
  #ifndef MI_OPT_SIMD
  #define MI_OPT_SIMD   0
-@@ -232,14 +263,17 @@ static inline bool mi_bfield_atomic_try_clearX(_Atomic(mi_bfield_t)*b, bool* all
+@@ -232,14 +263,17 @@
  // ------- mi_bfield_atomic_is_set ---------------------------------------
  
  // Check if a bit is set
@@ -444,7 +562,7 @@ index 01de1999..0963180e 100644
    return ((x & mi_bfield_mask(1, idx)) == 0);
  }
  
-@@ -252,14 +286,14 @@ static inline bool mi_bfield_atomic_is_xset(mi_xset_t set, const _Atomic(mi_bfie
+@@ -252,14 +286,14 @@
  // Check if all bits corresponding to a mask are set.
  static inline bool mi_bfield_atomic_is_set_mask(const _Atomic(mi_bfield_t)* b, mi_bfield_t mask) {
    mi_assert_internal(mask != 0);
@@ -461,7 +579,7 @@ index 01de1999..0963180e 100644
    return ((x & mask) == 0);
  }
  
-@@ -272,7 +306,7 @@ static inline bool mi_bfield_atomic_is_xset_mask(mi_xset_t set, const _Atomic(mi
+@@ -272,7 +306,7 @@
  
  // Count bits in a mask
  static inline size_t mi_bfield_atomic_popcount_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t mask) {
@@ -470,7 +588,7 @@ index 01de1999..0963180e 100644
    return mi_bfield_popcount(x & mask);
  }
  
-@@ -376,12 +410,32 @@ static inline bool mi_bchunk_clear(mi_bchunk_t* chunk, size_t cidx, bool* all_cl
+@@ -376,12 +410,32 @@
    return mi_bfield_atomic_clear(&chunk->bfields[i], idx, all_clear);
  }
  
@@ -506,7 +624,7 @@ index 01de1999..0963180e 100644
    return mi_bchunk_xsetNC(MI_BIT_CLEAR, chunk, cidx, n, NULL, maybe_all_clear);
  }
  
-@@ -698,7 +752,7 @@ static inline bool mi_bchunk_try_find_and_clear(mi_bchunk_t* chunk, size_t* pidx
+@@ -698,7 +752,7 @@
      #endif
    }
    #else
@@ -515,7 +633,7 @@ index 01de1999..0963180e 100644
      if (mi_bchunk_try_find_and_clear_at(chunk, i, pidx)) return true;
    }
    #endif
-@@ -756,7 +810,7 @@ static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, s
+@@ -756,7 +810,7 @@
      const uint64_t mask = ((uint64_t)mask2 << 32) | mask1;
      // mask is inverted, so each bit is 0xFF iff the corresponding byte has a bit set (and thus can be cleared)
      if (mask==0) return false;
@@ -524,7 +642,7 @@ index 01de1999..0963180e 100644
      const size_t chunk_idx = bidx / 8;
      const size_t idx = (bidx % 8)*8;
      mi_assert_internal(chunk_idx < MI_BCHUNK_FIELDS);
-@@ -773,7 +827,7 @@ static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, s
+@@ -773,7 +827,7 @@
      #endif
    }
    #else
@@ -533,7 +651,7 @@ index 01de1999..0963180e 100644
        if (mi_bchunk_try_find_and_clear8_at(chunk, i, pidx, did_temp_clear_bits)) return true;
      }
    #endif
-@@ -794,7 +848,7 @@ mi_decl_noinline static bool mi_bchunk_try_find_and_clearNX(mi_bchunk_t* chunk,
+@@ -794,7 +848,7 @@
    if (n == 0 || n > MI_BFIELD_BITS) return false;
    const mi_bfield_t mask = mi_bfield_mask(n, 0);
    // for all fields in the chunk
@@ -542,7 +660,7 @@ index 01de1999..0963180e 100644
      mi_bfield_t b0 = mi_atomic_load_relaxed(&chunk->bfields[i]);
      mi_bfield_t b = b0;
      size_t idx;
-@@ -933,13 +987,17 @@ static inline void mi_bchunk_clear_once_set(mi_subproc_t* subproc, mi_bchunk_t*
+@@ -933,13 +987,17 @@
  // are all bits in a bitmap chunk clear?
  static inline bool mi_bchunk_all_are_clear_relaxed(mi_bchunk_t* chunk) {
    #if MI_OPT_SIMD && defined(__AVX2__) && (MI_BCHUNK_BITS==256)
@@ -566,7 +684,7 @@ index 01de1999..0963180e 100644
    #elif MI_OPT_SIMD && (MI_BCHUNK_BITS==512) && MI_ARCH_ARM64
    const uint64x2_t v0 = vld1q_u64((uint64_t*)chunk->bfields);
    const uint64x2_t v1 = vld1q_u64((uint64_t*)chunk->bfields + 2);
-@@ -947,37 +1005,39 @@ static inline bool mi_bchunk_all_are_clear_relaxed(mi_bchunk_t* chunk) {
+@@ -947,37 +1005,39 @@
    const uint64x2_t v3 = vld1q_u64((uint64_t*)chunk->bfields + 6);
    const uint64x2_t v  = vorrq_u64(vorrq_u64(v0,v1),vorrq_u64(v2,v3));
    return (vmaxvq_u32(vreinterpretq_u32_u64(v)) == 0);
@@ -621,7 +739,7 @@ index 01de1999..0963180e 100644
  }
  
  
-@@ -994,7 +1054,52 @@ static bool mi_bchunk_bsr(mi_bchunk_t* chunk, size_t* pidx) {
+@@ -994,7 +1054,52 @@
    return false;
  }
  
@@ -675,7 +793,7 @@ index 01de1999..0963180e 100644
    for (size_t i = MI_BCHUNK_FIELDS; i > 0; ) {
      i--;
      mi_bfield_t b = mi_atomic_load_relaxed(&chunk->bfields[i]);
-@@ -1949,49 +2054,48 @@ rollback:
+@@ -1949,49 +2054,48 @@
  // Todo: This scans directly through the chunks -- we might want to consult the cmap as well?
  bool mi_bbitmap_try_find_and_clearN_(mi_bbitmap_t* bbitmap, size_t tseq, size_t n, size_t* pidx) {
    MI_UNUSED(tseq);
@@ -758,11 +876,10 @@ index 01de1999..0963180e 100644
    }
    return false;
  }
-diff --git a/src/free.c b/src/free.c
-index cf352849..c37371cb 100644
---- a/src/free.c
-+++ b/src/free.c
-@@ -7,9 +7,55 @@ terms of the MIT license. A copy of the license can be found in the file
+diff -ruN -x .git pristine-353/src/free.c opt-353/src/free.c
+--- a/src/free.c	2026-09-23 14:09:17.023749655 +0000
++++ b/src/free.c	2026-09-23 16:29:36.678478902 +0000
+@@ -7,9 +7,55 @@
  #if !defined(MI_IN_ALLOC_C)
  #error "this file should be included from 'alloc.c' (so aliases can work from alloc-override)"
  // add includes help an IDE
@@ -817,8 +934,24 @@ index cf352849..c37371cb 100644
 +#endif
  #endif
  
- // forward declarations
-@@ -100,7 +146,7 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
+ 
+@@ -80,6 +126,15 @@
+   // push atomically on the page thread free list
+   // mi_theap_t* theap = _mi_page_associated_theap_peek(page);
+   mi_thread_free_t tf_new;
++  // Memory-order audit (B2/OLD_PATCH, item 1 of 10) -- remote push of a freed block:
++  //  * `next` store + block payload writes happen-before the CAS' release part in program
++  //    order, so any thread that acquires `xthread_free` (collect/swap, item 2) sees a fully
++  //    initialized block chain. The CAS must therefore NOT be relaxed/release-only.
++  //  * The RMW's acquire part pairs with the release of concurrent pushes so our traversal of
++  //    the captured `next` chain reads coherent links.
++  //  * The initial load is relaxed: `tf_old` is only CAS fodder -- a stale value is harmless
++  //    (the weak CAS fails and reloads); no ordering is required from it. (B2: the acquire->>
++  //    relaxed relaxation on this load is safe for exactly this reason.)
+   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
+   do {
+     mi_block_set_next(page, block, mi_tf_block(tf_old));
+@@ -103,7 +158,7 @@
  static inline mi_block_t* mi_page_ptr_unalign_ex(const mi_page_t* page, const void* p, size_t* poffset) {
    mi_assert_internal(page!=NULL && p!=NULL);
  
@@ -827,7 +960,29 @@ index cf352849..c37371cb 100644
    const size_t block_size = mi_page_block_size(page);
    size_t adjust = diff & (block_size - 1); 
    if mi_unlikely(!_mi_is_power_of_two(block_size)) {
-@@ -554,7 +600,7 @@ static size_t mi_decl_noinline mi_page_usable_aligned_size_of(const mi_page_t* p
+@@ -286,7 +341,7 @@
+   }
+ }
+ 
+-void mi_free(void* p) mi_attr_noexcept {  
++mi_decl_align(64) void mi_free(void* p) mi_attr_noexcept {
+   mi_page_t* page; 
+   if mi_likely(mi_ptr_page_is_valid(p,"mi_free",&page)) {    
+     mi_free_nonnull(p, page, NULL, true /* allow reclaim? */);
+@@ -437,6 +492,12 @@
+   mi_assert_internal(mi_page_is_abandoned(page));
+   mi_assert_internal(!mi_page_all_free(page));
+   // try to cas atomically the original free list (`mt_free`) back with the ownership cleared.
++  // Memory-order audit (B2/OLD_PATCH, item 3 of 10) -- ownership drop on abandonment:
++  //  * release (RMW): all prior owner writes to the page (free list, used count) are published
++  //    with the `!owned` transition; a later owner's acquire sees them.
++  //  * acquire (RMW): captures concurrent remote pushes into `tf_expect` so the retry loop's
++  //    `_mi_page_free_collect`/`mi_abandoned_page_try_free` operate on fresh chain data.
++  //  * The strong CAS (not weak) is intentional: each failure must fully refresh `tf_expect`.
+   mi_thread_free_t tf_expect = mi_tf_create(page_thread_free,true);       
+   mi_thread_free_t tf_new    = mi_tf_set_owned(tf_expect,false);
+   while mi_unlikely(!mi_atomic_cas_strong_acq_rel(&page->xthread_free, &tf_expect, tf_new)) {
+@@ -565,7 +626,7 @@
    const bool is_guarded = mi_block_ptr_is_guarded(block,p);
    const size_t size = mi_page_usable_size_of(page, block, is_guarded);
    mi_assert_internal((void*)p >= (void*)block);
@@ -836,11 +991,73 @@ index cf352849..c37371cb 100644
    mi_assert_internal(adjust <= size);
    const size_t aligned_size = (adjust <= size ? size - adjust : 0);  // size can be zero if the padding is corrupted
    return aligned_size;
-diff --git a/src/page.c b/src/page.c
-index aa669cdd..8cf497a2 100644
---- a/src/page.c
-+++ b/src/page.c
-@@ -11,11 +11,55 @@ terms of the MIT license. A copy of the license can be found in the file
+diff -ruN -x .git pristine-353/src/init.c opt-353/src/init.c
+--- a/src/init.c	2026-09-23 14:09:17.023749655 +0000
++++ b/src/init.c	2026-09-23 14:49:05.495749655 +0000
+@@ -13,37 +13,33 @@
+ #include <stdlib.h>  // atexit
+ 
+ // Empty page used to initialize the small free pages array
++// (designated initializers: robust against field reordering, e.g. the cache-line tri-split)
+ static const mi_page_t mi_page_empty = {
+   #if MI_PAGE_META_IS_ALIGNED
+-  MI_ATOMIC_VAR_INIT(NULL),  // self
++  .self        = MI_ATOMIC_VAR_INIT(NULL),
+   #endif
+-  MI_ATOMIC_VAR_INIT(0),  // xthread_id
+-  NULL,                   // free
+-  {0},                    // xused
++  .xthread_id  = MI_ATOMIC_VAR_INIT(0),
++  .block_size  = 0,
++  .page_offset = 0,
++  .theap       = NULL,
++  .heap        = NULL,
++  .keys        = { 0, 0 },
++  .free        = NULL,
++  .xused       = {0},
+   #if MI_SIZE_SIZE < 8
+-  0,                      // xlast_used
+-  0,                      // xlast_alloc
+-  #endif
+-  NULL,                   // local_free
+-  0,                      // block_size
+-  0,                      // page_offset
+-  0,                      // capacity
+-  0,                      // reserved capacity
+-  0,                      // slice_pcommitted
+-  0,                      // retire_expire
+-  false,                  // is_zero
+-  MI_ATOMIC_VAR_INIT(0),  // xthread_free
+-  NULL,                   // theap
+-  NULL,                   // heap
+-  NULL, NULL,             // next, prev
+-  MI_MEMID_STATIC,        // memid
+-  #if (MI_PADDING || MI_ENCODE_FREELIST)
+-  #if MI_PAGE_KEY_COUNT==2
+-  { 0, 0 },               // keys
+-  #else
+-  { 0 },                  // key
+-  #endif
++  .xlast_used  = 0,
++  .xlast_alloc = 0,
+   #endif
++  .local_free  = NULL,
++  .next        = NULL,
++  .prev        = NULL,
++  .capacity    = 0,
++  .reserved    = 0,                      // reserved capacity
++  .slice_pcommitted = 0,
++  .retire_expire = 0,
++  .free_is_zero = false,                 // is_zero
++  .xthread_free = MI_ATOMIC_VAR_INIT(0),
++  .memid       = MI_MEMID_STATIC,
+ };
+ 
+ #define MI_PAGE_EMPTY() ((mi_page_t*)&mi_page_empty)
+diff -ruN -x .git pristine-353/src/page.c opt-353/src/page.c
+--- a/src/page.c	2026-09-23 14:09:17.023749655 +0000
++++ b/src/page.c	2026-09-23 15:15:11.467749655 +0000
+@@ -11,11 +11,55 @@
    exported is `mi_malloc_generic`.
  ----------------------------------------------------------- */
  
@@ -896,7 +1113,7 @@ index aa669cdd..8cf497a2 100644
  
  /* -----------------------------------------------------------
    Definition of page queues for each block size
-@@ -25,6 +69,17 @@ terms of the MIT license. A copy of the license can be found in the file
+@@ -25,6 +69,17 @@
  #include "page-queue.c"
  #undef MI_IN_PAGE_C
  
@@ -914,7 +1131,29 @@ index aa669cdd..8cf497a2 100644
  
  /* -----------------------------------------------------------
    Page helpers
-@@ -373,7 +428,7 @@ static void mi_page_thread_free_collect(mi_page_t* page)
+@@ -359,12 +414,20 @@
+   // atomically capture the thread free list
+   mi_block_t* head;
+   mi_thread_free_t tfreex;
++  // Memory-order audit (B2/OLD_PATCH, item 2 of 10) -- owner-side collect:
++  //  * acquire (RMW): pairs with the release of the push (item 1) so `head` and the `next`
++  //    chain are fully initialized before we splice them into the local list. (Answering the
++  //    historical `release is enough?` question: NO -- release alone would publish the NULL
++  //    head but give no happens-before for reading the chain; acquire is required.)
++  //  * release (RMW): publishes the list removal to concurrent pushers, which rebuild their
++  //    `next` from the fresh `tf_old`; without it a pusher could link onto a stale head.
++  //  * The pre-CAS load is relaxed (B2): pure CAS fodder, see item 1.
+   mi_thread_free_t tfree = mi_atomic_load_relaxed(&page->xthread_free);
+   do {
+     head = mi_tf_block(tfree);
+     if mi_likely(head == NULL) return; // return if the list is empty
+     tfreex = mi_tf_create(NULL,mi_tf_is_owned(tfree));  // set the thread free list to NULL
+-  } while (!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tfree, tfreex));  // release is enough?
++  } while (!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tfree, tfreex));
+   mi_assert_internal(head != NULL);
+ 
+   // and move it to the local list
+@@ -373,7 +436,7 @@
  
  
  // returns `true` if after collection `mi_page_immediate_available` is true.
@@ -923,7 +1162,7 @@ index aa669cdd..8cf497a2 100644
    if mi_likely(page->free != NULL) return true;
    if (page->local_free == NULL) return false;
    // move local_free to free
-@@ -623,9 +678,9 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
+@@ -623,9 +686,9 @@
      if (pq->count==1 || bsize < MI_SMALL_SIZE_MAX) {
        mi_theap_t* theap = mi_page_theap(page);
        mi_theap_stat_counter_increase(theap, pages_retire, 1);
@@ -935,7 +1174,7 @@ index aa669cdd..8cf497a2 100644
        mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
        if (index < theap->page_retired_min) theap->page_retired_min = index;
        if (index > theap->page_retired_max) theap->page_retired_max = index;
-@@ -778,17 +833,17 @@ static mi_decl_noinline void mi_page_free_list_extend( mi_page_t* const page, co
+@@ -778,17 +841,17 @@
    void* const page_area = mi_page_start(page);
  
    mi_block_t* const start = mi_page_block_at(page, page_area, bsize, page->capacity);
@@ -960,7 +1199,7 @@ index aa669cdd..8cf497a2 100644
    page->free = start;
  }
  
-@@ -876,7 +931,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
+@@ -876,7 +939,7 @@
      mi_page_free_list_extend_secure(theap, page, bsize, extend);
    }
    // enable the new free list
@@ -969,7 +1208,7 @@ index aa669cdd..8cf497a2 100644
    mi_theap_stat_increase(theap, page_committed, extend * bsize);
    mi_assert_expensive(mi_page_is_valid_init(page));
    return true;
-@@ -946,6 +1001,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
+@@ -946,6 +1009,7 @@
    // search through the pages in "next fit" order
    size_t count = 0;
    long candidate_limit = 0;          // we reset this on the first candidate to limit the search
@@ -977,17 +1216,20 @@ index aa669cdd..8cf497a2 100644
    long page_full_retain = (pq->block_size > MI_SMALL_MAX_OBJ_SIZE ? 0 : theap->page_full_retain); // only retain small pages
    mi_page_t* page_candidate = NULL;  // a page with free space
    mi_page_t* page = pq->first;
-@@ -953,7 +1009,8 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
+@@ -953,7 +1017,11 @@
  
    while (page!=NULL)
    {
 -    mi_page_t* next = page->next; // remember next (as this page can move to another queue)
 +    mi_page_t* const next = page->next; // remember next (as this page can move to another queue)
-+    mi_prefetch_read(next);             // prefetch the next page metadata (L2 ~17 cycles) while processing this page
++    mi_prefetch_read(next);             // prefetch the next page metadata (line 0: read-mostly fields)
++    if (next != NULL) {
++      mi_prefetch_read((const uint8_t*)next + 64);  // ...and line 1 (owner fields: free/xused/capacity used below)
++    }
      count++;
      candidate_limit--;
  
-@@ -985,7 +1042,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
+@@ -985,7 +1053,7 @@
        // we prefer non-expandable pages with high usage as candidates (to reduce commit, and increase chances of free-ing up pages)
        if (page_candidate == NULL) {
          page_candidate = page;
@@ -996,7 +1238,7 @@ index aa669cdd..8cf497a2 100644
        }
        else if (mi_page_all_free(page_candidate)) {
          _mi_page_free(page_candidate, pq);
-@@ -1063,6 +1120,7 @@ static inline mi_page_t* mi_page_queue_lookup_free_first(mi_theap_t* theap, mi_p
+@@ -1063,6 +1131,7 @@
    mi_assert_internal(!mi_page_queue_is_huge(pq));
    mi_page_t* page = pq->first;
    if mi_likely(page!=NULL && mi_page_free_quick_collect(page)) {
@@ -1004,7 +1246,7 @@ index aa669cdd..8cf497a2 100644
      // fast path
      #if (MI_SECURE>=2) // in secure mode, we extend half the time to increase randomness
      if (page->capacity < page->reserved && ((_mi_theap_random_next(theap) & 1) == 1)) {
-@@ -1138,8 +1196,8 @@ static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_align
+@@ -1138,8 +1207,8 @@
    }
    mi_page_queue_t* pq = mi_page_queue(theap, (huge_alignment > 0 ? MI_LARGE_MAX_OBJ_SIZE+1 : size));
    mi_page_t* page;
@@ -1015,7 +1257,7 @@ index aa669cdd..8cf497a2 100644
      page = mi_huge_page_alloc(theap,size,huge_alignment,pq);
    }
    else {
-@@ -1329,7 +1387,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
+@@ -1329,7 +1398,7 @@
    mi_assert_internal(theap != NULL);
    #endif
    const bool zero = ((zero_huge_alignment & 1) != 0);
@@ -1024,11 +1266,29 @@ index aa669cdd..8cf497a2 100644
    mi_page_t* page = NULL;
  
    // fast path objects that fit in a small page
-diff --git a/src/threadlocal.c b/src/threadlocal.c
-index 6f280d09..d2198c2a 100644
---- a/src/threadlocal.c
-+++ b/src/threadlocal.c
-@@ -11,9 +11,28 @@ terms of the MIT license. A copy of the license can be found in the file
+diff -ruN -x .git pristine-353/src/sample-guarded.c opt-353/src/sample-guarded.c
+--- a/src/sample-guarded.c	2026-09-23 14:09:17.023749655 +0000
++++ b/src/sample-guarded.c	2026-09-23 15:25:23.667749655 +0000
+@@ -141,6 +141,7 @@
+ // Remove guard page when building with MI_GUARDED
+ #if MI_GUARDED
+ void _mi_page_block_unguard(mi_page_t* page, mi_block_t* block, void* p) {
++  (void)p; // unused unless tracking/assertions are enabled (warning-clean fix)
+   // if (!mi_block_ptr_is_guarded(block,p)) return;
+   mi_assert_internal(mi_block_ptr_is_guarded(block, p));
+   mi_assert_internal(mi_page_has_interior_pointers(page));
+@@ -165,6 +166,7 @@
+ }
+ #else
+ void _mi_page_block_unguard(mi_page_t* page, mi_block_t* block, void* p) {
++  (void)p; // unused unless tracking/assertions are enabled (warning-clean fix)
+   MI_UNUSED(page); MI_UNUSED(block); MI_UNUSED(p);
+ }
+ void _mi_page_unguard_all(mi_page_t* page) {
+diff -ruN -x .git pristine-353/src/threadlocal.c opt-353/src/threadlocal.c
+--- a/src/threadlocal.c	2026-09-23 14:09:17.023749655 +0000
++++ b/src/threadlocal.c	2026-09-23 14:48:33.035749655 +0000
+@@ -11,9 +11,28 @@
    that can be allocated.
  -----------------------------------------------------------------------------*/
  
@@ -1057,7 +1317,7 @@ index 6f280d09..d2198c2a 100644
  
  /* -----------------------------------------------------------
    Each thread can have (a dynamically expanding) array of
-@@ -80,6 +99,7 @@ mi_define_thread_local(void*, mi_slot_fast, NULL)
+@@ -80,6 +99,7 @@
  #endif
  #define MI_TLS_IDX_MASK     ((MI_ZU(1)<<MI_TLS_IDX_BITS)-1)
  #define MI_TLS_IDX_MAX      MI_TLS_IDX_MASK
@@ -1065,7 +1325,7 @@ index 6f280d09..d2198c2a 100644
  #define MI_TLS_VERSION_MAX  ((MI_ZU(1)<<(MI_SIZE_BITS - MI_TLS_IDX_BITS))-1)
  
  
-@@ -100,29 +120,54 @@ static mi_thread_local_t mi_key_create( size_t index, size_t version ) {
+@@ -100,29 +120,54 @@
  }
  
  
@@ -1132,7 +1392,7 @@ index 6f280d09..d2198c2a 100644
    if mi_unlikely(tls==NULL) return NULL;
    tls->memid = memid;
    tls->count = count;
-@@ -132,6 +177,7 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
+@@ -132,6 +177,7 @@
  
  static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key, void* val ) {
    if (val==NULL) return true;
@@ -1140,7 +1400,7 @@ index 6f280d09..d2198c2a 100644
    const size_t idx = mi_key_index(key);
    mi_thread_locals_t* tls = mi_thread_locals_expand(idx);
    if (tls==NULL) {
-@@ -148,9 +194,9 @@ static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key,
+@@ -148,9 +194,9 @@
  // set a tls slot; returns `true` if successful.
  // Can return `false` if we could not reallocate the slots array.
  static mi_decl_noinline bool mi_thread_local_set_regular( mi_thread_local_t key, void* val ) {
@@ -1151,7 +1411,7 @@ index 6f280d09..d2198c2a 100644
    const size_t idx = mi_key_index(key);
    if mi_likely(idx < tls->count) {
      tls->slots[idx].value = val;
-@@ -163,7 +209,7 @@ static mi_decl_noinline bool mi_thread_local_set_regular( mi_thread_local_t key,
+@@ -163,7 +209,7 @@
  }
  
  bool _mi_thread_local_set( mi_thread_local_t key, void* val ) {
@@ -1160,7 +1420,7 @@ index 6f280d09..d2198c2a 100644
    if (key == mi_thread_local_key_fast) {
      return mi_slot_fast_set(val);
    }
-@@ -174,6 +220,7 @@ bool _mi_thread_local_set( mi_thread_local_t key, void* val ) {
+@@ -174,6 +220,7 @@
  
  // get a tls slot value
  static mi_decl_noinline void* mi_thread_local_get_regular( mi_thread_local_t key ) {
@@ -1168,7 +1428,7 @@ index 6f280d09..d2198c2a 100644
    const mi_thread_locals_t* const tls = mi_thread_locals_peek();
    if mi_unlikely(tls==NULL) {
      // this can happen if a thread local is accessed after the thread local has been freed
-@@ -222,9 +269,12 @@ static mi_lock_t    mi_thread_locals_lock;    // we need a lock in order to re-a
+@@ -222,9 +269,12 @@
  static mi_bitmap_t* mi_thread_locals_free;    // reuse an arena bitmap to track which slots were assigned (1=free, 0=in-use)
  static mi_memid_t   mi_thread_locals_memid;   // provenance of mi_thread_locals_free
  static size_t       mi_thread_locals_version; // version to be able to reuse slots safely
@@ -1181,7 +1441,7 @@ index 6f280d09..d2198c2a 100644
  }
  
  void _mi_thread_locals_done(void) {
-@@ -232,7 +282,10 @@ void _mi_thread_locals_done(void) {
+@@ -232,7 +282,10 @@
      mi_bitmap_t* const slots = mi_thread_locals_free;
      if (slots!=NULL) {
        _mi_meta_free(_mi_subproc_main(), slots, mi_thread_locals_memid);
@@ -1192,7 +1452,7 @@ index 6f280d09..d2198c2a 100644
    }
    mi_lock_done(&mi_thread_locals_lock);
    mi_thread_locals_delete();
-@@ -250,24 +303,35 @@ static bool mi_thread_local_claim_fun(size_t _slice_index, mi_arena_t* _arena, b
+@@ -250,24 +303,35 @@
  // (so if we reuse a slot it will be returning NULL initially when a thread tries to get it)
  static mi_thread_local_t mi_thread_local_claim(void) {
    size_t idx = 0;
@@ -1203,6 +1463,7 @@ index 6f280d09..d2198c2a 100644
 -  }
 -  else {
 -    return 0;
+-  }
 +  mi_bitmap_t* const slots = mi_thread_locals_free;
 +  if (slots == NULL) return 0;
 +
@@ -1211,7 +1472,7 @@ index 6f280d09..d2198c2a 100644
 +  bool claimed = mi_bitmap_try_find_and_claim(slots, mi_thread_locals_search_start, &idx, &mi_thread_local_claim_fun, NULL);
 +  if (!claimed && mi_thread_locals_search_start != 0) {
 +    claimed = mi_bitmap_try_find_and_claim(slots, 0, &idx, &mi_thread_local_claim_fun, NULL);
-   }
++  }
 +  if (!claimed) return 0;
 +
 +  const size_t max_bits = mi_bitmap_max_bits(slots);
@@ -1239,7 +1500,7 @@ index 6f280d09..d2198c2a 100644
    mi_memid_t memid;
    mi_bitmap_t* newslots = (mi_bitmap_t*)_mi_meta_zalloc_aligned(_mi_subproc_main(), newsize, MI_BCHUNK_SIZE, &memid); // always allocate thread locals in the main subprocess
    mi_assert_internal(_mi_is_aligned(newslots,MI_BCHUNK_SIZE));
-@@ -279,9 +343,12 @@ static bool mi_thread_local_create_expand(void) {
+@@ -279,9 +343,12 @@
      _mi_meta_free(_mi_subproc_main(), slots, mi_thread_locals_memid);
    }
    mi_bitmap_init(newslots, newcount, true /* pretend already zero'd so we do not zero out the copied old entries */);
@@ -1253,7 +1514,7 @@ index 6f280d09..d2198c2a 100644
    return true;
  }
  
-@@ -310,6 +377,10 @@ void _mi_thread_local_free(mi_thread_local_t key) {
+@@ -310,6 +377,10 @@
      mi_bitmap_t* const slots = mi_thread_locals_free;
      if (slots!=NULL && idx < mi_bitmap_max_bits(slots)) {
        mi_bitmap_set(slots,idx);
