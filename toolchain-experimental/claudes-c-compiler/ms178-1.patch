@@ -1,1322 +1,2261 @@
-diff --git a/engineering/FOLLOWUP-2026-09-23-urem-pow2-mask.md b/engineering/FOLLOWUP-2026-09-23-urem-pow2-mask.md
-new file mode 100644
-index 0000000..3f1031d
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-23-urem-pow2-mask.md
-@@ -0,0 +1,280 @@
-+# Follow-up: the urem-by-power-of-two mask, and the review of PR #595
-+
-+Session of 2026-09-23. Base `321e6f8` (PR #595 merged). Head after this work:
-+`d3c0c5f`.
-+
-+## 1. What the review found, and what I verified
-+
-+The review of PR #595 raised four findings. I re-derived each from the source
-+and from the compiler rather than accepting or rejecting them, because a review
-+cannot compile. The verdicts differ per item, and two of the review's own
-+factual claims turned out to be wrong.
-+
-+### F1 -- the urem mask was built in i64: **AGREE, and it is the review's best find**
-+
-+`src/passes/simplify.rs`'s `SRem | URem` arm built its mask with
-+
-+```rust
-+let mask = (1i64 << shift) - 1;
-+```
-+
-+while `const_power_of_two` -- widened in the same PR -- can return 127 for the
-+128-bit types.  I reproduced it end to end, with the divisor as a literal in a
-+`noinline` function so the fold actually fires:
-+
-+```
-+$ lccc -O2 i128_divrem_pow2.c      # before the fix
-+FAILED case=urem 2^64 (89 bad)
-+REM  BAD k= 64 got=00000000000000000000000000000000 want=...ffffffffffffffff
-+REM  BAD k= 65 got=00000000000000000000000000000001 want=...1ffffffffffffffff
-+REM  BAD k=100 got=00000000000000000000000fffffffff want=...fffffffffffffffff
-+```
-+
-+The review predicted the exact arithmetic and it is exactly right: `1i64 << 64`
-+is `1` (the shift amount is masked modulo 64) so the mask for 2^64 became 0;
-+`1i64 << 65` is `2` so the mask became 1; `1i64 << 100` is `2^36` so it masked
-+with only the low 36 bits.  `k = 127`'s `2^36 - 1`-style truncation matches
-+too.  Silent wrong code: the program assembled, ran, and printed plausible
-+numbers.
-+
-+**The review understated one thing and I want it on the record.** It framed the
-+`2^63` dev-profile panic as a general hazard ("correct in release by
-+wrap-around luck, panics in any dev-profile build") which reads as
-+pre-existing.  It is not.  The predicate it depends on required a POSITIVE
-+i64:
-+
-+```rust
-+let val = c.to_i64()?;
-+if val > 0 && (val & (val - 1)) == 0 { Some(val.trailing_zeros()) }
-+```
-+
-+so `shift` could never exceed **62** and neither the shift wrap nor the
-+subtraction overflow was reachable.  **Both halves of F1 were opened by the
-+widening in PR #595: the predicate's recognition range was widened without
-+widening its one downstream consumer.**  That is the whole lesson of the bug,
-+and it is mine.
-+
-+#### The fix, and why it is not the review's patch
-+
-+The review proposed an inline `u128` mask with a two-arm `match`.  That is
-+correct, and I did something slightly different on purpose:
-+
-+`IrConst::low_mask(ty, bits)` in `src/ir/constants.rs` -- a single
-+width-correct constructor, accumulating in `u128` and building the 128-bit
-+case as `IrConst::I128` directly (`from_i64` sign-extends from bit 63 and
-+cannot carry a wider mask).  The defect existed because a *range* was widened
-+without its *consumer*; the durable fix is to give every such consumer one
-+place that already knows how to be correct, and to unit-test that place once
-+rather than re-deriving the width arithmetic at each site.  The inline version
-+fixes today's bug; the constructor fixes the class.
-+
-+`bits` is clamped to the type's width, so an over-wide mask saturates instead
-+of shifting out of range, and no width or `bits` value can panic.
-+
-+### F2 -- the const-mul cache invariant: **AGREE on the finding, DISAGREE on the facts and on one placement**
-+
-+The review's conclusion -- document and enforce the invariant -- is right, and
-+I implemented it.  Two of its supporting claims are wrong, and a wrong reason
-+attached to a right conclusion is how the next engineer gets misled:
-+
-+* *"the mul sequence contains no cache-consulting loads (raw text emits only)"*
-+  -- false.  `emit_i128_mul_const_impl` opens with `self.operand_to_rax_rdx(lhs)`,
-+  which is exactly such a load.  It is *sound* because it runs before the first
-+  clobber, but that is a different invariant from "there are none", and it is
-+  the difference between a rule that can be followed and one that cannot.
-+  The comment now states the rule that actually holds: exactly ONE
-+  cache-consulting load is permitted, at the head, before any clobber.
-+* *"the identical note applies to `emit_i128_prep_shift_lhs_impl`"* -- that
-+  function is `self.operand_to_rax_rdx(lhs)` and nothing else.  It performs no
-+  clobbering emit, so it has no window of its own; the window belongs to the
-+  shift sequences it opens.  I applied the invalidation to the sequence heads
-+  (`emit_i128_mul_const_impl` and `emit_i128_prep_shift_lhs_impl`, which is
-+  the head of both shift sequences) via a named
-+  `begin_raw_i128_sequence()`, so the rule is stated once and cannot drift
-+  between call sites.
-+
-+Evidence rather than assertion: `operand_to_rax_rdx` contains **no**
-+`reg_cache` reference anywhere in its body (checked mechanically over
-+lines 3745-3888), so the i128 pair path neither consults nor populates the
-+scalar cache, and the entry invalidation cannot pessimize it.
-+`scripts/census_ab.py` confirms zero delta (below).
-+
-+### F3 -- test coverage: **AGREE**
-+
-+Correct on all three counts: the div/mod suite was 64-bit only (zero
-+`__int128`), there was no direct unit test for `const_power_of_two`, and
-+`udiv i128` by 2^k for k in [64,127] was legal and untested.  All three are
-+now covered; see section 3.
-+
-+### F4 -- the gate never proves the failure path; `parse_disp` hex: **AGREE**
-+
-+Correct that the assemble-failure verdict was never exercised end to end -- a
-+tool that always reported clean would have passed every existing phase.  Phase 5
-+now builds a synthetic bad trace and demands exit 1 *and* the offending pass
-+named, then repairs the dump and demands a clean verdict again, so the check is
-+demonstrably on the operand and not on the presence of an extra dump.
-+
-+On hex: I checked the actual failure mode before deciding, because the review
-+called it theoretical.  Rust's `"0x10".parse::<i64>()` fails, so a hex
-+displacement was classified as a **symbol** -- which renders correctly and
-+whose `0x10+8(%rax)` form GAS evaluates as an expression, so it was indeed not
-+a wrong-code path.  But it silently disabled the displacement arithmetic in
-+`compose_sib`, so it is a real (if invisible) loss of folding, and it cost six
-+lines to remove.  One correction to my own first attempt, caught by the test I
-+wrote for it: `i64::from_str_radix` is *signed* and rejects
-+`0xffffffffffffffff`, so the unsigned parse is reinterpreted as a bit pattern.
-+
-+### What the review did not examine
-+
-+I swept the class rather than the instance.  Every shift-to-mask construction
-+in the tree was enumerated:
-+
-+| site | verdict |
-+|---|---|
-+| `simplify.rs` `SRem\|URem` mask | **the bug** (fixed) |
-+| `try_mul_power_of_two` (`simplify.rs:1791`) | sound -- passes a SHIFT AMOUNT (<=127), not a mask; `from_i64` carries it exactly, and `const_power_of_two` masks to the width so the shift is always narrower than the type |
-+| `iv_strength_reduce.rs:720` | sound -- guarded by `(0..64).contains(&shift)` |
-+| `backend/arm/codegen/alu.rs:414`, `generation.rs:1251,1298`, `memory.rs:330,562` | sound -- backend-local shift ranges, never fed by the widened predicate |
-+
-+`try_mul_power_of_two` is the sibling the review did not look at, because it is
-+the other `const_power_of_two` consumer.  I verified it empirically rather than
-+by reading: `x * 2^k` for `u128` at k = 1, 8, 63, 64, 65, 100, 127 is correct
-+at -O1 and -O2.  The mask site is the only wrong-code site in the class.
-+
-+I also re-derived the review's methodology row 2 (128-bit shifts by >= 64)
-+against the compiler: `emit_i128_lshr_const_impl` has explicit `==64` and `>64`
-+arms, and `udiv i128` by 2^k at k = 64, 65, 100, 126, 127 returns exact
-+quotients.  Agreed, and now covered by a test instead of by argument.
-+
-+## 2. Verification
-+
-+### Mutation proof, release profile (the miscompile)
-+
-+```
-+tests/regression/i128_divrem_pow2.c
-+  -O1  OLD rc=1  FAILED case=urem 2^64 (89 bad)     NEW rc=0  ALL-OK
-+  -O2  OLD rc=1  FAILED case=urem 2^64 (89 bad)     NEW rc=0  ALL-OK
-+  -O3  OLD rc=1  FAILED case=urem 2^64 (89 bad)     NEW rc=0  ALL-OK
-+  -Os  OLD rc=1  FAILED case=urem 2^64 (89 bad)     NEW rc=0  ALL-OK
-+  gcc  -O2 rc=0  ALL-OK
-+```
-+
-+### Mutation proof, DEV profile (the panic)
-+
-+The unit tests are only worth anything if they run where the panic lives, so I
-+reintroduced the i64 construction and ran them under `cargo test --profile dev`
-+(overflow-checks **on**):
-+
-+```
-+---- low_mask_never_panics ----
-+panicked at src/ir/constants.rs:657: attempt to subtract with overflow
-+---- low_mask_saturates_to_all_ones ----
-+panicked at src/ir/constants.rs:657: attempt to shift left with overflow
-+test result: FAILED. 1 passed; 4 failed
-+```
-+
-+Both predicted panics, four of five tests failing.  With the fix in place the
-+same tests pass in the dev profile (5 + 6).  The file is restored automatically
-+by the proof script's `trap`.
-+
-+### Performance: the fix is free
-+
-+`scripts/census_ab.py --opt=-O2` over 749 files / 3135 functions:
-+
-+```
-+file  fn  insns  rrmov  stkref  push  acc      (all NEW-OLD)
-+TOTAL       0      0       0     0    0
-+gate: HOT stkref 8418->8418, insns 74760->74760 => PASS
-+```
-+
-+Zero in every column, so neither the mask fix nor the entry invalidation costs
-+anything.  Two methodology notes, because the first run of this measurement was
-+misleading:
-+
-+* The new test file must be EXCLUDED from the A/B.  It is a reproducer for a
-+  miscompile the old compiler has, so the old side has no valid baseline: the
-+  old compiler folds `x % 2^64` to `x & 0` and then eliminates `urem_pow64`
-+  entirely, and the census correctly reports it as `[MISSING SIDE]` with a
-+  spurious +13 instruction "regression".  With the file excluded the delta is
-+  exactly zero across the other 3135 functions.
-+* The census columns are instruction counts and register traffic, not operand
-+  text; a change that alters no instruction count can still change correctness,
-+  which is exactly this fix.
-+
-+### Assembly evidence that the fold still fires
-+
-+```
-+urem_pow64:                          # NEW, -O2
-+    mov  $0xffffffffffffffff,%rcx
-+    and  %rcx,%rax                   # low half & (2^64 - 1)
-+    xor  %esi,%esi
-+    and  %rsi,%rdx                   # high half & 0
-+```
-+
-+Exactly `x % 2^64 == lo`, one instruction per half.  Whole file: 42 `andq`, and
-+**zero** `__udivti3`/`__umodti3` calls -- the strength reduction is still
-+applied, which is what acceptance criterion 2 asked for.
-+
-+## 3. Test inventory added
-+
-+* `tests/regression/i128_divrem_pow2.c` (+`.flags`, `-O2`) -- 24 dividends x 12
-+  divisors `{2^1, 2^31, 2^32, 2^60, 2^62, 2^63, 2^64, 2^65, 2^96, 2^100, 2^126,
-+  2^127}` for both `/` and `%`, dividends straddling every boundary the divisors
-+  split, with non-power-of-two controls (`3`, `2^63+1`, `2^64+1`, `2^128-1`)
-+  whose reference is independent of the fold, plus signed `%` controls.
-+* 5 unit tests for `IrConst::low_mask`: exact `2^k - 1` for every `k` in
-+  `0..=width` across ten types; the i64 boundary pinned individually; all-ones
-+  saturation; never-panics at `bits` = 0/1/63/64/65/127/128/129/`u32::MAX`;
-+  and bit-identical agreement with the old `from_i64` construction for every
-+  `k` below 64 bits, so the change is provably a no-op there.
-+* 6 unit tests for `const_power_of_two`: the `to_i64` truncation trap and its
-+  mirrors, the full `2^0..2^127` range for both 128-bit types, the 64-bit
-+  boundary including all-ones at four widths, narrow signed types, off-width
-+  bit masking, and rejection of non-constants and zero.
-+* `tests/regression/i128_mul_pow2.c` (+`.flags`, `-O2`) -- the multiply
-+  consumer, which carries a shift AMOUNT and so should never have been wrong.
-+  A guard, not a reproducer, and labelled as one.  It is mutation-proven all
-+  the same, and the proof demonstrates something worth stating: perturbing the
-+  multiply's shift amount by one makes THIS file fail
-+  (`FAILED case=mul 2^2 (125 bad)`) while `i128_divrem_pow2.c` stays ALL-OK on
-+  the same compiler -- so the two files guard **orthogonal** consumers rather
-+  than duplicating each other.
-+* 3 unit tests for hex displacements and 1 gate phase.
-+
-+The regression test's shape requirements are documented in the file because
-+each was measured, not assumed -- in particular that the divisor must be a
-+literal (a runtime divisor never reaches the fold, and a first draft of this
-+very test passed against the broken compiler for exactly that reason).
-+
-+## 4. State: green everywhere, and how that was established
-+
-+| gate | result |
-+|---|---|
-+| `ci_local.sh --fast` (frozen tree, nothing else running) | **60 passed, 0 failed**, 3 skipped |
-+| `cargo-test` (unit suite) | **3179 passed / 0 failed** |
-+| `cargo fmt --all -- --check` | PASS |
-+| `cargo clippy --all-targets --profile fastbuild --locked -j 1 -- -D warnings` | PASS |
-+| regression corpus | **781 passed / 0 failed** |
-+| `regression-corpus-ssa` (`CCC_VALIDATE_SSA=1`, skipped by `--fast`) | PASS -- 781 / 0 |
-+| `peephole-whitespace-invariance` (skipped by `--fast`) | PASS |
-+| dev-profile unit tests (overflow-checks ON) | 11 / 11 |
-+
-+Two process notes, because they affect how much the numbers above are worth:
-+
-+* **An earlier `--fast` run was discarded as untrustworthy.**  While it was in
-+  flight I rebuilt `target/fastbuild/lccc` from a mutated source to prove
-+  `i128_mul_pow2.c` can fail, and several gates in that run would have executed
-+  against the mutated binary.  No reading of that log can tell which.  The run
-+  reported here was made on a frozen, committed tree with nothing else running,
-+  after `scripts/build_lccc_fast.sh` from a verified-clean source.  A green
-+  result obtained from a binary of unknown provenance is not a result.
-+* The `--fast` skips are covered explicitly rather than assumed: the SSA corpus
-+  and the whitespace gate both exercise code this change touches (the pass and
-+  the peephole), so both were run by hand.
-+
-+Still open, unchanged and unstarted: **dead frames -- 483 of 1412 framed
-+functions (34.2%) reserve a frame no instruction references, 15,200 B plus two
-+instructions each.**  It changes `%rsp` at every call site, so it needs the
-+alignment argument *and* the kernel boot gate, and the linux-cachymod tree is
-+absent from this workspace.  Also open: the `clz32`/`ctz32`/`hweight8` oracle
-+gaps and the `cmovgl`-after-`cmpl` builder.
-diff --git a/src/backend/x86/codegen/i128_ops.rs b/src/backend/x86/codegen/i128_ops.rs
-index eea542a..9e1db20 100644
---- a/src/backend/x86/codegen/i128_ops.rs
-+++ b/src/backend/x86/codegen/i128_ops.rs
-@@ -126,6 +126,36 @@ impl X86Codegen {
-     /// multiply by a 128-bit magic constant whose high half is always zero:
-     /// `x /u C` is `mulhi(x, M) >> s`, so `hi == 0` and the sequence collapses
-     /// to five instructions — matching what GCC, Clang and ICX emit.
-+    /// State the accumulator-cache invariant for a raw-emit i128 sequence, and
-+    /// start the sequence from a known-empty cache.
-+    ///
-+    /// A 128-bit value lives in the `%rax:%rdx` PAIR, and `%rax` alone is only
-+    /// the low half -- not a valid scalar IR value.  Every sequence opened with
-+    /// this call therefore performs raw emits that clobber `%rax`/`%rdx` (and
-+    /// `%rcx` or `%rsi` as scratch) and leaves the cache alone until the value
-+    /// is committed by `store_rax_rdx_to`, which invalidates on the way out.
-+    ///
-+    /// THE INVARIANT: between this call and that final invalidation the
-+    /// sequence may perform exactly ONE cache-consulting load -- the
-+    /// `operand_to_rax_rdx` below, which runs BEFORE the first clobber and is
-+    /// therefore sound.  Any further cache-consulting load (an `operand_to_rax`
-+    /// on a small constant, say) placed after a clobber would read a cache that
-+    /// still claims `%rax` for a value the clobber destroyed, and would hand
-+    /// back the wrong register -- silently, since the resulting code still
-+    /// assembles.  Keep such a load out of the region, or invalidate again
-+    /// after it.
-+    ///
-+    /// The entry invalidation is cheap insurance rather than a fix for a
-+    /// present bug: the pair path never consults the scalar cache (verified by
-+    /// inspection -- `operand_to_rax_rdx` contains no `reg_cache` reference at
-+    /// all) and the exit invalidation closes the window.  It means the region
-+    /// cannot inherit a stale entry from its CALLER, which is the half of the
-+    /// hazard the exit invalidation cannot cover.
-+    #[inline]
-+    fn begin_raw_i128_sequence(&mut self) {
-+        self.state.reg_cache.invalidate_all();
-+    }
-+
-     pub(super) fn emit_i128_mul_const_impl(
-         &mut self,
-         lhs: &Operand,
-@@ -133,7 +163,9 @@ impl X86Codegen {
-         lo: u64,
-         hi: u64,
-     ) {
--        // LHS into %rax:%rdx (low:high); %rcx/%r8/%rsi are scratch.
-+        self.begin_raw_i128_sequence();
-+        // LHS into %rax:%rdx (low:high); %rcx/%r8/%rsi are scratch.  The one
-+        // permitted cache-consulting load, before any clobber.
-         self.operand_to_rax_rdx(lhs);
-         // `mulq` overwrites both accumulator halves, so park the LHS halves
-         // that the cross terms still need first. lhs.lo is only needed when
-@@ -213,6 +245,9 @@ impl X86Codegen {
-     }
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 73b79721..72089b6c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -346,6 +346,34 @@ jobs:
+           CCC: target/fastbuild/lccc
+         run: bash tests/regression/check_vector_copy_elimination.sh
  
-     pub(super) fn emit_i128_prep_shift_lhs_impl(&mut self, lhs: &Operand) {
-+        // Opens the shift sequences, which clobber the pair with raw emits the
-+        // same way the multiply does; see `begin_raw_i128_sequence`.
-+        self.begin_raw_i128_sequence();
-         self.operand_to_rax_rdx(lhs);
-     }
++      # Call-argument staging (PR #584's miscompile class): the FP liveness
++      # oracle's call model must never mark live SSE-argument staging dead.
++      # The chain that broke: the GP dead-write pass legitimately deletes the
++      # `movb $N, %al` census at non-variadic callees, the fallback window
++      # walk broke at the hazard-area release / stack-argument pushes / relay
++      # GP halves, and eliminate_dead_vector_copies deleted the staging (a
++      # 10-double call lost 7 of 8 register arguments). Pinned end to end:
++      # runtime equality with the reference compiler on volatile 8..12-ary
++      # f64/f32, mixed GP+SSE, SSE structs, negation compositions, indirect
++      # and in-loop calls; the `# LCCC_CALL_FP` authority-marker counts; the
++      # census lifecycle (deleted at prototyped callees, kept at variadic);
++      # and all eight registers staged in the 10-argument window.
++      - name: Verify call-argument staging contracts
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_call_arg_staging.sh
++
++      # Loop-invariant LEA hoisting (guarded/fall-through-entry loops) and
++      # the direct 3-operand RORX: two loop-body instruction-quality
++      # contracts from the worst-15 benchmark campaign. The K-table
++      # rematerialization inside the 64-round loop (sha256_transform at
++      # 1.20x gcc) and the staged `movq` before every `rorxl` (BMI2 RORX
++      # is non-destructive; a fresh register home is read in place).
++      - name: Verify LEA hoist and RORX contracts
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_lea_hoist_rorx.sh
++
+       # Cross-PR interaction red-team (session 574): the per-feature gates
+       # pin each PR's own contract; this one pins the INTERACTIONS between
+       # the last ten merged PRs — FMA families through copy brackets, calls
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 531c3af6..8859afd5 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -403,6 +403,23 @@ gate "boot-size-measurement" fast \
+ gate "vector-copy-elimination" fast \
+     bash tests/regression/check_vector_copy_elimination.sh
  
-diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-index 6aa0a78..2e5d501 100644
---- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-+++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-@@ -862,6 +862,35 @@ fn parse_disp(text: &str) -> Option<(Option<String>, i64)> {
-     if let Ok(v) = text.parse::<i64>() {
-         return Some((None, v));
-     }
-+    // Hex displacements: the x86 emitter formats `$imm` operands in hex, and
-+    // although it does not currently do so for the displacement field, a
-+    // numeric literal arriving here must not be mistaken for a SYMBOL.  As a
-+    // symbol it would still render (`0x10+8(%rax)` evaluates correctly in
-+    // GAS), but the displacement arithmetic in `compose_sib` would be skipped
-+    // and two such operands could not be summed -- a silent loss of folding
-+    // rather than wrong code, and cheap to rule out.
-+    if let Some(d) = text
-+        .strip_prefix("-0x")
-+        .or_else(|| text.strip_prefix("-0X"))
-+    {
-+        // Negated hex is parsed as a magnitude and negated, so `-0x8000000000000000`
-+        // fails closed instead of wrapping to the same value as the positive form.
-+        return i64::from_str_radix(d, 16)
-+            .ok()
-+            .and_then(|v| v.checked_neg())
-+            .map(|v| (None, v));
-+    }
-+    if let Some(d) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-+        // UNSIGNED parse, reinterpreted as a bit pattern: the emitter's 64-bit
-+        // displacements include values above `i64::MAX`, and `i64::from_str_radix`
-+        // would reject `0xffffffffffffffff` outright.  A value too wide for u64
-+        // is not a displacement at all, so it fails closed.
-+        return u64::from_str_radix(d, 16).ok().map(|v| (None, v as i64));
-+    }
-+    if text == "-" || text == "+" {
-+        // A bare sign is not a displacement and must not become a symbol.
-+        return None;
-+    }
-     // `sym[+|-]N`: split at the LAST sign so `a-b-4` can never be reached
-     // through a malformed input, and require a non-empty symbol.
-     let bytes = text.as_bytes();
-@@ -2949,7 +2978,7 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String>
- #[cfg(test)]
- mod tests {
-     use super::super::super::peephole_optimize;
--    use super::{SibAddr, compose_sib, operand_start};
-+    use super::{SibAddr, compose_sib, operand_start, parse_disp};
- 
-     fn run(asm: &str) -> String {
-         peephole_optimize(asm.to_string())
-@@ -5458,4 +5487,42 @@ mod tests {
++# Call-argument staging (PR #584's miscompile class): the FP liveness
++# oracle's call model must never mark live SSE-argument staging dead.
++# The census is legitimately dead-eliminated at non-variadic callees; the
++# `# LCCC_CALL_FP` authority marker and the hardened window walk carry the
++# read set past every rsp adjustment, stack-argument push and relay half.
++# Runtime differential on volatile 8..12-ary f64/f32, mixed GP+SSE, SSE
++# structs, negation compositions, indirect and in-loop calls, plus the
++# marker/census/staging-window shape pins.
++gate "call-arg-staging" fast \
++    bash tests/regression/check_call_arg_staging.sh
++
++# Loop-invariant LEA hoisting (guarded loops, pure-LEA insertion placement
++# before the alignment run) + direct 3-operand RORX (no movq staging into
++# the destination of a non-destructive BMI2 rotate).
++gate "lea-hoist-rorx" fast \
++    bash tests/regression/check_lea_hoist_rorx.sh
++
+ # Cross-PR interaction red-team: FMA families x copy brackets x
+ # if-conversion x constant promotion x NonZero x the AVX1+FMA target
+ # class, bit-exact vs the reference compiler at matched march (canonical
+diff --git a/src/backend/peephole_common.rs b/src/backend/peephole_common.rs
+index d950ab79..ea5de6b2 100644
+--- a/src/backend/peephole_common.rs
++++ b/src/backend/peephole_common.rs
+@@ -424,6 +424,30 @@ impl LineStore {
          };
-         assert_eq!(compose_sib(&inner, &outer).as_deref(), Some("8(%rsp, %r8)"));
-     }
-+
-+    #[test]
-+    fn parse_disp_handles_hex_literals() {
-+        // A hex displacement must be a NUMBER, not a symbol: as a symbol it
-+        // would silently disable displacement arithmetic in compose_sib.
-+        assert_eq!(parse_disp("0x10"), Some((None, 16)));
-+        assert_eq!(parse_disp("0X10"), Some((None, 16)));
-+        assert_eq!(parse_disp("0x4"), Some((None, 4)));
-+        assert_eq!(parse_disp(""), Some((None, 0)));
-+        assert_eq!(parse_disp("16"), Some((None, 16)));
-+        assert_eq!(parse_disp("-8"), Some((None, -8)));
-+        // Unsigned reinterpretation: the all-ones word is -1 as a bit pattern.
-+        assert_eq!(parse_disp("0xffffffffffffffff"), Some((None, -1)));
-+        // Negated hex reaches the full range without the reinterpretation.
-+        assert_eq!(parse_disp("-0x10"), Some((None, -16)));
-+        // Symbols and symbol+offset still parse as symbols.
-+        assert_eq!(parse_disp("table"), Some((Some("table".to_string()), 0)));
-+        assert_eq!(parse_disp("table+8"), Some((Some("table".to_string()), 8)));
-+        assert_eq!(parse_disp("table-4"), Some((Some("table".to_string()), -4)));
-+        // A bare sign is not a displacement.
-+        assert_eq!(parse_disp("+"), None);
-+    }
-+
-+    /// Hex displacements feed the composition arithmetic the same way decimal
-+    /// ones do, so a hex-addressed producer still folds.
-+    #[test]
-+    fn compose_sums_hex_displacements() {
-+        let inner = SibAddr::parse("0x10(%rax)").expect("hex disp parses to a number");
-+        assert_eq!(inner.disp, 16);
-+        assert_eq!(inner.sym, None, "a hex literal is not a symbol");
-+        let outer = SibAddr {
-+            sym: None,
-+            disp: 8,
-+            base: None,
-+            index: None,
-+        };
-+        assert_eq!(compose_sib(&inner, &outer).as_deref(), Some("24(%rax)"));
-+    }
- }
-diff --git a/src/ir/constants.rs b/src/ir/constants.rs
-index 73bc7b5..be8bd00 100644
---- a/src/ir/constants.rs
-+++ b/src/ir/constants.rs
-@@ -624,6 +624,52 @@ impl IrConst {
-         }
      }
  
-+    /// The value `2^bits - 1` -- an all-ones mask over the low `bits` bits --
-+    /// represented in `ty`.
++    /// Insert a new line at `idx`, shifting every later line's index up by
++    /// one.  The text lands in the replacements arena (a `REPLACED`-style
++    /// entry pointing at it), so no original-buffer surgery happens.
 +    ///
-+    /// A single width-correct constructor exists because getting this wrong is
-+    /// invisible in release builds and loud only in debug ones.  The mask MUST
-+    /// be accumulated in `u128`: `bits` reaches 127 for the 128-bit types, and
-+    /// an `i64` construction fails twice over --
-+    ///
-+    /// ```text
-+    ///   release (overflow-checks off):  1i64 << 64  ==  1i64     (shift masked
-+    ///                                   modulo 64), so a 2^64 mask came out 0
-+    ///                                   and `x % 2^64` compiled to `x & 0`;
-+    ///   debug   (overflow-checks on):   (1i64 << 63) - 1 panics -- "attempt to
-+    ///                                   subtract with overflow".
-+    /// ```
-+    ///
-+    /// `from_i64` cannot carry the result either: it sign-extends from 64 bits,
-+    /// so a mask with any bit set at or above bit 63 must be built as
-+    /// `IrConst::I128` directly.  Both of those bit the `x % 2^k` fold for
-+    /// 128-bit operands; see `simplify.rs`'s `SRem | URem` arm.
-+    ///
-+    /// `bits` is clamped to the type's width: a mask wider than the type is
-+    /// all-ones for that type, and clamping keeps the shift in range for every
-+    /// caller.
-+    pub fn low_mask(ty: IrType, bits: u32) -> Self {
-+        let width = ty.size().saturating_mul(8).min(128) as u32;
-+        let bits = bits.min(width);
-+        let mask: u128 = if bits >= 128 {
-+            u128::MAX
-+        } else {
-+            (1u128 << bits) - 1
++    /// Only for rare, structural rewrites (the loop-invariant LEA hoist
++    /// placing an instruction on a fall-through entry path): callers MUST
++    /// adjust every index they hold at or above `idx`, including loop
++    /// bounds discovered before the insertion.  O(len) in the entry splice.
++    pub(crate) fn insert_line(&mut self, idx: usize, text: String) {
++        let end = line_len_without_trailing_blanks(text.as_bytes());
++        let mut new_text = text;
++        new_text.truncate(end);
++        let rep_idx = self.replacements.len();
++        debug_assert!(rep_idx <= u32::MAX as usize);
++        self.replacements.push(new_text);
++        self.entries.insert(
++            idx,
++            LineEntry {
++                start: rep_idx as u32,
++                len: REPLACED,
++            },
++        );
++    }
++
+     /// Concatenate kept lines, each followed by `\n`.
+     pub(crate) fn build_result(&self, skip: impl Fn(usize) -> bool) -> String {
+         let mut result = String::with_capacity(self.original.len());
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index 33d16f5c..7390889d 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -426,6 +426,23 @@ pub struct CodegenState {
+     /// gate shifted its register allocation).  6 = the conservative
+     /// default (i686, hand-written fragments, non-argument call paths).
+     pub call_gp_arg_count: usize,
++    /// Number of leading x86-64 SysV SSE argument registers the call being
++    /// emitted actually reads (0..=8).  Armed by the x86-64 register-argument
++    /// phase from the same authoritative `CallArgClass` classification and
++    /// published as `# LCCC_CALL_FP <n>` after the call text (the same
++    /// authority contract as `call_gp_arg_count`).  The FP liveness oracle's
++    /// fallback (no marker) reconstructs the set from the `movb $N, %al`
++    /// census or the staged-move window — but the census is DELETED by the
++    /// GP dead-write pass for non-variadic callees (legitimately: %al is
++    /// dead there), and the window walk is a heuristic; a call site that
++    /// stages FP arguments across a hazard-area release (`addq $K, %rsp`)
++    /// or a deep relay chain was modeled as reading NO xmm register, and
++    /// `eliminate_dead_vector_copies` deleted live argument staging
++    /// (found via PR #584's CI: a 10-double call lost 7 of 8 register
++    /// arguments).  `None` = the marker is not published (hand-written
++    /// fragments, raw `call` emissions, MachInst calls) and the oracle
++    /// falls back to the census/window heuristics; `Some(n)` is exact.
++    pub call_fp_arg_count: Option<usize>,
+     /// Patchable function entry: (total_nops, nops_before_entry).
+     /// When set, emits NOP padding around function entry points and records
+     /// them in __patchable_function_entries for runtime patching (ftrace).
+@@ -640,6 +657,7 @@ impl CodegenState {
+             call_is_variadic: false,
+             chain_call: false,
+             call_gp_arg_count: 6,
++            call_fp_arg_count: None,
+             patchable_function_entry: None,
+             mcount: None,
+             pending_classic_mcount_label: None,
+@@ -860,6 +878,7 @@ impl CodegenState {
+         self.chain_call = false;
+         self.call_is_variadic = false;
+         self.call_gp_arg_count = 6;
++        self.call_fp_arg_count = None;
+         self.value_locations.clear();
+         self.alloca_values.clear();
+         self.volatile_alloca_values.clear();
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index 5f53a151..1ab1c8ad 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -951,6 +951,12 @@ pub trait ArchCodegen {
+         // the PREVIOUS call's count — a stale low count would drop a real
+         // argument read from the liveness oracle's model.
+         self.state().call_gp_arg_count = 6;
++        // Same hygiene for the FP count marker: armed by the register-argument
++        // phase below, discharged by the call emission. `None` publishes no
++        // marker and the FP liveness oracle falls back to its census/window
++        // heuristics — a stale count would be worse (it would drop real SSE
++        // argument reads from the model and re-open the staging deletion).
++        self.state().call_fp_arg_count = None;
+ 
+         use super::call_abi::*;
+         let config = self.call_abi_config();
+diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
+index f3bcd418..e8b6992c 100644
+--- a/src/backend/x86/codegen/calls.rs
++++ b/src/backend/x86/codegen/calls.rs
+@@ -589,6 +589,31 @@ impl X86Codegen {
+         // home is an argument register already written by an earlier-staged
+         // argument, and pre-spill those values to a transient stack area
+         // BEFORE any staging write.  Symmetric for GPR argument registers.
++        //
++        // REGISTER-CLASS ARGS ONLY: a Stack-class argument's value was
++        // already consumed by `emit_call_stack_args_impl` (the driver runs
++        // the stack-argument pushes BEFORE this phase), so no register
++        // staging can clobber its read.  Pre-spilling it anyway (the old
++        // behavior) bought a dead `movsd %xmmN, K(%rsp)`, the `subq/addq`
++        // pair for a hazard area that protected nothing, and — worse — an
++        // `addq $K, %rsp` between the register staging and the `call` that
++        // the FP liveness oracle's fallback window used to break on (see
++        // `call_xmm_reads`): every ≥9-FP-argument call with a stack arg
++        // homed in a low xmm bank paid the churn (measured on the PR #584
++        // repro: f10 carried a 16-byte hazard area for one stack arg).
++        let arg_stages_into_reg = |cls: &CallArgClass| {
++            matches!(
++                cls,
++                CallArgClass::FloatReg { .. }
++                    | CallArgClass::IntReg { .. }
++                    | CallArgClass::StructSseReg { .. }
++                    | CallArgClass::F128SseReg { .. }
++                    | CallArgClass::StructMixedIntSseReg { .. }
++                    | CallArgClass::StructMixedSseIntReg { .. }
++                    | CallArgClass::I128RegPair { .. }
++                    | CallArgClass::StructByValReg { .. }
++            )
 +        };
-+        match ty {
-+            // 128-bit: `from_i64` would sign-extend the low 64 bits, so the
-+            // mask is built at full width.  `mask as i128` is a bit-pattern
-+            // reinterpretation, which is what the IR constant stores -- for
-+            // `bits == 128` it yields all-ones, correct for both signednesses.
-+            IrType::I128 | IrType::U128 => IrConst::I128(mask as i128),
-+            // Every narrower type: the cast to i64 preserves the low 64 bits,
-+            // and `from_i64` narrows to the target width (so `I32` of 2^32-1
-+            // becomes the all-ones `I32(-1)`).  For a 64-bit type the i64 cast
-+            // is itself the bit pattern (`2^64-1` -> `-1` -> all-ones).
-+            _ => IrConst::from_i64(mask as i64, ty),
-+        }
-+    }
-+
-     /// Coerce this constant to match a target IrType, with optional source type for signedness.
-     pub fn coerce_to_with_src(&self, target_ty: IrType, src_ty: Option<IrType>) -> IrConst {
-         // Check if already the right type
-@@ -788,3 +834,171 @@ impl IrConst {
+         let mut written_xmm: [bool; 8] = [false; 8];
+         let mut written_gpr: [bool; 6] = [false; 6];
+         // (arg index, phys home, is_fp)
+@@ -596,27 +621,29 @@ impl X86Codegen {
+         for (i, arg) in args.iter().enumerate() {
+             if let Operand::Value(v) = arg {
+                 if let Some(&phys) = self.reg_assignments.get(&v.0) {
+-                    if super::emit::is_xmm_reg(phys) {
+-                        // Allocator XMM homes are PhysReg 20..33 = xmm2..xmm15.
+-                        let src_idx = phys.0 as i64 - 18;
+-                        if (0..=7).contains(&src_idx) && written_xmm[src_idx as usize] {
+-                            hazards.push((i, phys, true));
+-                        }
+-                    } else {
+-                        // Allocatable GPR homes that double as SysV arg regs:
+-                        // rdi=14→arg0, rsi=15→arg1, rdx=16→arg2, r8=12→arg4,
+-                        // r9=13→arg5 (rcx/rax are not allocatable homes).
+-                        let src_idx: Option<usize> = match phys.0 {
+-                            14 => Some(0),
+-                            15 => Some(1),
+-                            16 => Some(2),
+-                            12 => Some(4),
+-                            13 => Some(5),
+-                            _ => None,
+-                        };
+-                        if let Some(si) = src_idx {
+-                            if written_gpr[si] {
+-                                hazards.push((i, phys, false));
++                    if arg_stages_into_reg(&arg_classes[i]) {
++                        if super::emit::is_xmm_reg(phys) {
++                            // Allocator XMM homes are PhysReg 20..33 = xmm2..xmm15.
++                            let src_idx = phys.0 as i64 - 18;
++                            if (0..=7).contains(&src_idx) && written_xmm[src_idx as usize] {
++                                hazards.push((i, phys, true));
++                            }
++                        } else {
++                            // Allocatable GPR homes that double as SysV arg regs:
++                            // rdi=14→arg0, rsi=15→arg1, rdx=16→arg2, r8=12→arg4,
++                            // r9=13→arg5 (rcx/rax are not allocatable homes).
++                            let src_idx: Option<usize> = match phys.0 {
++                                14 => Some(0),
++                                15 => Some(1),
++                                16 => Some(2),
++                                12 => Some(4),
++                                13 => Some(5),
++                                _ => None,
++                            };
++                            if let Some(si) = src_idx {
++                                if written_gpr[si] {
++                                    hazards.push((i, phys, false));
++                                }
+                             }
+                         }
+                     }
+@@ -1082,6 +1109,21 @@ impl X86Codegen {
+             // `float_count > 0` arm above).
+             self.state.emit("    xorl %eax, %eax");
          }
-     }
- }
-+
-+#[cfg(test)]
-+mod low_mask_tests {
-+    use super::*;
-+
-+    /// Read a constant back as a 128-bit BIT PATTERN.  `to_i128` sign-extends
-+    /// the narrow variants, so masking to the type's width is what makes the
-+    /// all-ones cases comparable for signed and unsigned types alike.
-+    fn bits(c: IrConst, ty: IrType) -> u128 {
-+        let width = ty.size() * 8;
-+        let v = c.to_i128().expect("mask must be an integer constant") as u128;
-+        if width >= 128 {
-+            v
-+        } else {
-+            v & ((1u128 << width) - 1)
++        // Arm the FP-count authority marker: the exact number of leading
++        // SSE argument registers this call reads (every FloatReg/
++        // StructSseReg/F128/mixed-fp staging incremented `float_count`, the
++        // hazard-restore path included). The `movb $N, %al` census above
++        // carries the same number, but the GP dead-write pass legitimately
++        // deletes it for non-variadic callees (%al is dead there) — after
++        // which the FP liveness oracle's window heuristic is the only
++        // source left, and it under-collects across hazard-area releases
++        // and deep relay chains (PR #584: a 10-double call lost 7 of its 8
++        // register arguments to `eliminate_dead_vector_copies`). The
++        // marker is a comment: free to keep, exact, and immune to every
++        // value-shape pass. Emitted right after the call text by
++        // `emit_call_instruction_impl` (same discharge contract as
++        // `call_gp_arg_count`).
++        self.state.call_fp_arg_count = Some(float_count.min(8));
+         self.state.reg_cache.invalidate_all();
+         self.flush_pending_vec_store_impl();
+         self.state.invalidate_vec_peephole();
+@@ -1206,10 +1248,31 @@ impl X86Codegen {
+         // values may be proven dead across the call. This is what un-pins
+         // %r10 (the RA's most common scratch after rax/rcx/rdx) from every
+         // call in the text liveness oracles.
++        //
++        // ORDERING CONTRACT: the GP liveness oracle scans a TIGHT window
++        // (the two lines after the call text) for this marker, so it must
++        // stay in the same position the pre-FP-marker emission gave it —
++        // [call][VA?][CALL_ARGS][CHAIN?] with CHAIN at n+1/n+2. The
++        // LCCC_CALL_FP marker below is therefore emitted LAST.
+         if self.state.chain_call {
+             self.state.emit("    # LCCC_CHAIN_CALL");
+             self.state.chain_call = false;
+         }
++        // FP-argument count marker (the same authority contract as
++        // LCCC_CALL_ARGS above): the exact number of leading SSE argument
++        // registers this call reads, armed by `emit_call_reg_args_impl`
++        // from the authoritative classification. Consumed by the FP
++        // liveness oracle's `call_xmm_reads` BEFORE its census/window
++        // heuristics, so the argument staging can never be modeled dead
++        // once the `movb $N, %al` census is dead-eliminated. Absent marker
++        // (hand-written fragments, raw libcall emissions) keeps the
++        // heuristic path: fail-closed to the census first. Emitted LAST:
++        // every earlier marker's consumer scans a tight window measured
++        // from the call text, and this one's parser skips sibling markers.
++        if let Some(fp) = self.state.call_fp_arg_count {
++            self.state
++                .emit_fmt(format_args!("    # LCCC_CALL_FP {}", fp.min(8)));
 +        }
+         self.state.reg_cache.invalidate_all();
+         self.flush_pending_vec_store_impl();
+         self.state.invalidate_vec_peephole();
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index b928b775..dc1cd934 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -4679,15 +4679,67 @@ impl X86Codegen {
+         let dest_typed = typed_phys_reg_name(dest_phys, ty);
+ 
+         if let Some(imm) = Self::const_as_imm32(rhs) {
+-            // Sub-word sources load with their typed form so the home stays
+-            // zero-extended; 32/64-bit sources keep the generic staging.
+-            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
+             // Reduce explicitly instead of leaning on the hardware mask: the
+             // emitted immediate then documents the real rotation, and a count
+             // of 0 (or any multiple of the width) folds away to the copy that
+             // already produced the value, rather than emitting a flag-writing
+             // no-op.
+             let amount = (imm as i64).rem_euclid(width);
++            // Direct 3-operand rorx: RORX is NON-DESTRUCTIVE (BMI2's whole
++            // point), so a lhs that is provably fresh in a register home can
++            // be read in place — no staging move into the destination first.
++            // sha256's sigma functions homed their inputs in callee-saved
++            // registers and staged `movq %r14, %rbp` before EVERY
++            // `rorxl $k, %ebp, %ebp` — three dead 64-bit moves per round,
++            // ~192 per transform call (measured on the benchmark corpus:
++            // sha256_transform at 1.20x gcc). The typed view is enough:
++            // `rorxl $k, %r14d, %ebp` reads the low 32 bits of the home and
++            // fully defines the destination (the write zero-extends into
++            // the upper half, which the sext32 normalization below then
++            // adjusts for signed results exactly as the staged form did).
++            if amount != 0
++                && self.bmi2_enabled
++                && super::isel::rorx_allowed()
++                && (width == 32 || width == 64)
++            {
++                let direct_src = match lhs {
++                    Operand::Value(v) => {
++                        // Home-freshness gate (operand_to_callee_reg's
++                        // discipline): only a register that provably still
++                        // holds the value may be read directly.
++                        self.reg_assignments
++                            .get(&v.0)
++                            .copied()
++                            .filter(|&r| !is_xmm_reg(r))
++                            .filter(|_| !self.home_clobbered.contains(&v.0))
++                    }
++                    _ => None,
++                };
++                if let Some(src) = direct_src {
++                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
++                    let ror_amount = match op {
++                        IrBinOp::RotateLeft => (width - amount) % width,
++                        IrBinOp::RotateRight => amount,
++                        _ => amount,
++                    };
++                    debug_assert!(ror_amount != 0);
++                    let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
++                    let src_typed = typed_phys_reg_name(src, ty);
++                    self.state.emit_fmt(format_args!(
++                        "    {} ${}, %{}, %{}",
++                        ror_mnem, ror_amount, src_typed, dest_typed
++                    ));
++                    if width == 32 {
++                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
++                    }
++                    self.state.reg_cache.invalidate_acc();
++                    self.note_inplace_compute(dest_phys, dest_value_id);
++                    return;
++                }
++            }
++            // Sub-word sources load with their typed form so the home stays
++            // zero-extended; 32/64-bit sources keep the generic staging.
++            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
+             if amount != 0 {
+                 if self.bmi2_enabled && super::isel::rorx_allowed() && (width == 32 || width == 64)
+                 {
+diff --git a/src/backend/x86/codegen/peephole/passes/fp_liveness.rs b/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
+index ff25e92b..c425fe74 100644
+--- a/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
++++ b/src/backend/x86/codegen/peephole/passes/fp_liveness.rs
+@@ -625,7 +625,55 @@ fn is_plain_store(mn: &str) -> bool {
+ ///
+ /// Function-pointer calls through the retpoline thunks and PLT calls all
+ /// pass through the same census emitter.
++///
++/// ── THE ORDERING HOLE (PR #584) ──
++///
++/// The census is only "free to keep" at the ABI level; the GP dead-write
++/// pass is ENTITLED to delete `movb $N, %al` before a non-variadic callee
++/// (the accumulator is provably dead there, and deleting it is a real
++/// instruction-count win).  Once it does, this oracle's only source for
++/// the SSE-argument set is the staged-move window below — and that window
++/// walk used to BREAK on the first line that was not itself a staging
++/// move: the hazard-area release `addq $K, %rsp`, the stack-argument
++/// `pushq %rax`, and the GP half of every rax relay (`movq %xmmN, %rax`)
++/// all terminated the scan, so a call that staged its arguments across
++/// any of those was modeled as reading ZERO xmm registers — and
++/// `eliminate_dead_vector_copies` deleted the live argument staging (a
++/// 10-double call compiled with 7 of its 8 register arguments reading
++/// garbage).  Two fixes, layered:
++///
++/// 1. `# LCCC_CALL_FP <n>` (Phase 0 below): the codegen's authoritative
++///    count, published after the call text exactly like `# LCCC_CALL_ARGS`
++///    — a comment, immune to every value-shape pass.  Exact for every
++///    call that went through `emit_call_reg_args_impl`.
++/// 2. The window walk (Phase 2) now SKIPS register-file-transparent lines
++///    (rsp adjustments, pushes/pops) and the GP half of relay pairs, with
++///    a step budget that covers the full 8-register staging window.  This
++///    keeps the hand-emitted libcall sites sound too.
+ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize) -> u64 {
++    // Phase 0: the authority marker. `# LCCC_CALL_FP <n>` is published by
++    // `emit_call_instruction_impl` within a few lines after the call text
++    // (same discharge contract as `# LCCC_CALL_ARGS`); it survives every
++    // peephole pass because it is a comment. n = the exact number of
++    // leading SSE argument registers the callee reads (0..=8).
++    for k in n + 1..(n + 5).min(infos.len()) {
++        if infos[k].is_nop() {
++            continue;
++        }
++        let mk = infos[k].trimmed(store.get(k));
++        if let Some(rest) = mk.strip_prefix("# LCCC_CALL_FP ") {
++            if let Ok(v) = rest.trim().parse::<u32>() {
++                if v <= 8 {
++                    return (1u64 << v) - 1;
++                }
++            }
++            break; // illegible marker: fall through to the heuristics
++        }
++        if mk.starts_with('#') {
++            continue; // a sibling marker (LCCC_CALL_ARGS / VA / CHAIN)
++        }
++        break; // real code: no marker published for this call
 +    }
-+
-+    /// The mask for `bits` in `ty` is exactly `2^bits - 1`, for every width
-+    /// and every bit position that a strength-reduced `x % 2^k` can ask for.
-+    ///
-+    /// This runs in the DEV profile, where `overflow-checks` are on.  A
-+    /// reintroduced `(1i64 << shift) - 1` panics here at shift 63 rather than
-+    /// silently miscompiling in a release build, which is the whole reason
-+    /// this constructor exists.
-+    #[test]
-+    fn low_mask_is_exact_at_every_width() {
-+        let types = [
-+            IrType::I8,
-+            IrType::U8,
-+            IrType::I16,
-+            IrType::U16,
-+            IrType::I32,
-+            IrType::U32,
-+            IrType::I64,
-+            IrType::U64,
-+            IrType::I128,
-+            IrType::U128,
-+        ];
-+        for ty in types {
-+            let width = ty.size() * 8;
-+            let max_bits = if width >= 128 { 128 } else { width };
-+            for k in 0..=max_bits {
-+                let want: u128 = if k >= 128 {
-+                    u128::MAX
-+                } else {
-+                    (1u128 << k) - 1
-+                };
-+                let got = bits(IrConst::low_mask(ty, k as u32), ty);
-+                // For a mask wider than the type the expectand saturates.
-+                let want_c = if k > width {
-+                    (1u128 << width) - 1
-+                } else {
-+                    want
-+                };
-+                assert_eq!(
-+                    got, want_c,
-+                    "low_mask({ty:?}, {k}) = {got:#x}, want {want_c:#x}"
-+                );
+     // Calls whose census (if any) is NOT in the adjacent window: the inline
+     // retpoline (`call .Lrpl_inner_N` behind a `jmp`/label pair, census
+     // emitted before the `jmp`), the external thunks, and any indirect
+@@ -674,24 +722,66 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
+     // Phase 2: no census.  Indirect calls without one (`__builtin_apply`'s
+     // `call *%r11`, whose eight `movups` loads sit behind a label) stay
+     // conservative.  A direct call without a census is either GP-only or a
+-    // raw libcall site whose FP operand is staged by the plain XMM moves
+-    // IMMEDIATELY before it (`movq %rax, %xmm0` / `movd %eax, %xmm0` /
+-    // `movdqu (%rax), %xmm0`, at most two): collect the argument registers
+-    // those moves define and stop at the first line that is not such a move.
++    // site whose FP operands are staged by plain XMM moves in the window
++    // before it (`movq %rax, %xmm0` / `movd %eax, %xmm0` /
++    // `movdqu (%rax), %xmm0`): collect the argument registers those moves
++    // define and stop at the first line that is neither such a move nor
++    // REGISTER-FILE-TRANSPARENT.
++    //
++    // Transparent lines (skipped, consuming a step): rsp adjustments
++    // (`addq/subq $K, %rsp` — the hazard-area release, the stack-argument
++    // cleanup, alignment), `pushq`/`popq` (no xmm definition; `pushq %rax`
++    // is the stack-argument staging for an FP value read via rax), and the
++    // GP half of a rax relay (`movq/vmovq/movd/vmovd %xmmN, %rax` — reads
++    // an xmm, DEFINES a GP register, and is immediately followed below by
++    // its xmm-writing partner).  Skipping any of these can only EXTEND the
++    // walk and collect MORE registers — conservative-safe: the failure
++    // mode of the old break-on-first-foreign-line was the opposite
++    // (under-collection), and under-collection is what deleted live
++    // argument staging (PR #584).
++    //
++    // Step budget: 24 = the full SysV staging window (8 SSE argument
++    // registers, up to two lines per relay-staged argument) plus the
++    // transparent adjustments. Anything real that is not staging still
++    // breaks the walk — the contiguous-window soundness guard stands.
+     let mut written = 0u64;
+     let mut k = n;
+     let mut steps = 0;
+-    while k > start && steps < 4 {
++    while k > start && steps < 24 {
+         k -= 1;
+         if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Directive | LineKind::Empty) {
+             continue;
+         }
++        // Register-file-transparent lines are checked BEFORE the barrier
++        // test: `pushq`/`popq` ARE barriers (they adjust %rsp, which the
++        // slot-tracking passes must not see through) but they define and
++        // read no XMM register, so the call-reads walk crosses them.  A
++        // stack-argument `pushq %rax` sits between every >=9-FP-argument
++        // call's register staging and its `call`.
++        let tk = infos[k].trimmed(store.get(k));
++        let (mn, operands) = split_mnemonic(tk);
++        if mn == "pushq" || mn == "popq" || mn == "pushfq" || mn == "popfq" {
++            steps += 1;
++            continue;
++        }
++        // rsp adjustment with an immediate (`addq $16, %rsp` /
++        // `subq $8, %rsp`) — the hazard-area release, the stack-argument
++        // cleanup, alignment padding.  Also an %rsp-family barrier shape
++        // for the slot passes; XMM-transparent here.
++        if mn == "addq" || mn == "subq" {
++            let ops = operand_list(operands);
++            if ops.len() == 2
++                && ops[0].starts_with('$')
++                && (ops[1] == "%rsp" || ops[1] == "%rsp)" || ops[1] == "%esp")
++            {
++                steps += 1;
++                continue;
 +            }
 +        }
-+    }
+         if infos[k].is_barrier() {
+             break;
+         }
+         steps += 1;
+-        let tk = infos[k].trimmed(store.get(k));
+-        let (mn, operands) = split_mnemonic(tk);
+         let staging = matches!(
+             mn,
+             "movq"
+@@ -719,7 +809,24 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
+         );
+         match dest_operand(operands).and_then(xmm_index) {
+             Some(d) if staging => written |= 1u64 << d,
+-            _ => break,
++            _ => {
++                // GP half of a relay pair: `movq %xmmN, %rax` — an xmm
++                // SOURCE with a GP destination. It defines no xmm register
++                // (nothing to collect) and its partner below was already
++                // collected; skipping it extends the walk to arguments
++                // staged further up. Only the exact xmm→GP move forms;
++                // anything else is real code and stops the scan.
++                let ops = operand_list(operands);
++                let relay_half = matches!(mn, "movq" | "vmovq" | "movd" | "vmovd")
++                    && dest_operand(operands).is_some_and(|d| xmm_index(d).is_none())
++                    && ops[..ops.len().saturating_sub(1)]
++                        .iter()
++                        .any(|s| s.starts_with("%xmm") || s.starts_with("%ymm"));
++                if relay_half {
++                    continue;
++                }
++                break;
++            }
+         }
+     }
+     written & CALL_READS
+@@ -1673,6 +1780,207 @@ mod tests {
+         }
+     }
+ 
++    /// ── The PR #584 bug class ──
++    ///
++    /// `eliminate_dead_pure_writes` legitimately deletes the `movb $N, %al`
++    /// census before a non-variadic callee (%al is dead there).  Once the
++    /// census is gone, the fallback window walk is the only source for the
++    /// SSE-argument set.  It used to BREAK on the first non-staging line —
++    /// the hazard-area release `addq $K, %rsp`, the stack-argument
++    /// `pushq %rax`, and the GP half of every rax relay all terminated the
++    /// scan — so the call was modeled as reading ZERO xmm registers and
++    /// `eliminate_dead_vector_copies` deleted the live argument staging
++    /// (a 10-double call lost 7 of its 8 register arguments to garbage).
++    /// The `# LCCC_CALL_FP <n>` authority marker fixes the general case;
++    /// the tests below pin every layer.
 +
-+    /// The two shifts that the old i64 construction got wrong, pinned
-+    /// individually so a regression names the exact case.
++    /// The authority marker is exact and immune to the census deletion:
++    /// no census anywhere, marker says 8 → all eight argument registers
++    /// read across the hazard-area release.
 +    #[test]
-+    fn low_mask_at_the_i64_boundary_is_not_wrapped_or_truncated() {
-+        // Release wrapped `1i64 << 64` to 1, so a 2^64 mask became 0.
-+        assert_eq!(
-+            bits(IrConst::low_mask(IrType::U128, 64), IrType::U128),
-+            u64::MAX as u128
++    fn call_fp_marker_is_authoritative_without_census() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm8, %xmm1\n\
++             \x20   movsd %xmm9, %xmm2\n\
++             \x20   movsd %xmm10, %xmm3\n\
++             \x20   movsd %xmm11, %xmm4\n\
++             \x20   movsd %xmm12, %xmm5\n\
++             \x20   movsd %xmm13, %xmm6\n\
++             \x20   movsd %xmm14, %xmm7\n\
++             \x20   movq %xmm7, %rax\n\
++             \x20   movq %rax, %xmm0\n\
++             \x20   addq $16, %rsp\n\
++             \x20   call f10@PLT\n\
++             \x20   # LCCC_CALL_ARGS 0\n\
++             \x20   # LCCC_CALL_FP 8\n",
 +        );
-+        assert_eq!(
-+            bits(IrConst::low_mask(IrType::I128, 64), IrType::I128),
-+            u64::MAX as u128
-+        );
-+        // `1i64 << 65` became 2, so the mask came out 1.
-+        assert_eq!(
-+            bits(IrConst::low_mask(IrType::U128, 65), IrType::U128),
-+            ((1u128 << 65) - 1)
-+        );
-+        // `(1i64 << 63) - 1` overflowed; the value was right only by wrapping.
-+        assert_eq!(
-+            bits(IrConst::low_mask(IrType::U128, 63), IrType::U128),
-+            ((1u128 << 63) - 1)
-+        );
-+        assert_eq!(
-+            bits(IrConst::low_mask(IrType::U64, 63), IrType::U64),
-+            ((1u128 << 63) - 1)
-+        );
-+        // The largest shift `const_power_of_two` can report for a 128-bit type.
-+        assert_eq!(
-+            bits(IrConst::low_mask(IrType::U128, 127), IrType::U128),
-+            ((1u128 << 127) - 1)
-+        );
-+    }
-+
-+    /// `bits == width` must give all-ones for the type, including the 128-bit
-+    /// case where `mask as i128` reinterprets as -1.
-+    #[test]
-+    fn low_mask_saturates_to_all_ones() {
-+        for ty in [IrType::U8, IrType::U16, IrType::U32, IrType::U64] {
-+            let width = (ty.size() * 8) as u32;
++        for (probe, reg) in [
++            ("movsd %xmm8, %xmm1", 1),
++            ("movsd %xmm10, %xmm3", 3),
++            ("movsd %xmm14, %xmm7", 7),
++        ] {
++            let n = line_of(&store, probe);
 +            assert_eq!(
-+                bits(IrConst::low_mask(ty, width), ty),
-+                ((1u128 << width) - 1),
-+                "all-ones for {ty:?}"
++                lv.xmm_live_after(n, reg),
++                Some(true),
++                "{probe}: staged argument read (marker says 8)"
 +            );
 +        }
++    }
++
++    /// The marker sits among sibling markers (`VA`, `CALL_ARGS`, `CHAIN`)
++    /// and is skipped by their parsers; it must parse through them too.
++    /// The order matches `emit_call_instruction_impl`: CHAIN keeps its
++    /// tight-window position (the GP oracle scans n+1..n+3 for it) and
++    /// CALL_FP is emitted LAST — reordering them regresses nested
++    /// functions (the static-chain staging gets deleted; found via
++    /// nested_functions in the corpus).
++    #[test]
++    fn call_fp_marker_parses_through_sibling_markers() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm3, %xmm1\n\
++             \x20   call g@PLT\n\
++             \x20   # LCCC_VA_CALL\n\
++             \x20   # LCCC_CALL_ARGS 2\n\
++             \x20   # LCCC_CHAIN_CALL\n\
++             \x20   # LCCC_CALL_FP 2\n",
++        );
++        let n = line_of(&store, "movsd %xmm3, %xmm1");
++        assert_eq!(lv.xmm_live_after(n, 1), Some(true));
++        assert_eq!(lv.xmm_live_after(n, 2), Some(false));
++        assert_eq!(lv.xmm_live_after(n, 3), Some(false));
++        assert_eq!(lv.xmm_live_after(n, 7), Some(false));
++    }
++
++    /// A zero-count marker models a GP-only call exactly (Phase 0 wins
++    /// over the census-less window heuristic even when xmm moves happen
++    /// to sit in the window for other reasons).
++    #[test]
++    fn call_fp_zero_marker_is_exact() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm3, %xmm1\n\
++             \x20   call g@PLT\n\
++             \x20   # LCCC_CALL_ARGS 1\n\
++             \x20   # LCCC_CALL_FP 0\n",
++        );
++        let n = line_of(&store, "movsd %xmm3, %xmm1");
++        assert_eq!(lv.xmm_live_after(n, 1), Some(false));
++    }
++
++    /// The hardened window walk (no marker, no census — the hand-emitted
++    /// libcall shape): rsp adjustments, pushes and relay GP-halves are
++    /// register-file-transparent; the staging collected through them all.
++    #[test]
++    fn window_walk_skips_transparent_lines_and_relay_halves() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm8, %xmm1\n\
++             \x20   movq %xmm9, %rax\n\
++             \x20   movq %rax, %xmm2\n\
++             \x20   movq %xmm2, %rax\n\
++             \x20   pushq %rax\n\
++             \x20   subq $8, %rsp\n\
++             \x20   movq %xmm15, %rax\n\
++             \x20   movq %rax, %xmm0\n\
++             \x20   addq $16, %rsp\n\
++             \x20   call raw_helper@PLT\n",
++        );
++        let n = line_of(&store, "movsd %xmm8, %xmm1");
 +        assert_eq!(
-+            bits(IrConst::low_mask(IrType::U128, 128), IrType::U128),
-+            u128::MAX
++            lv.xmm_live_after(n, 1),
++            Some(true),
++            "staging survives the push/addq/window"
 +        );
 +        assert_eq!(
-+            bits(IrConst::low_mask(IrType::I128, 128), IrType::I128),
-+            u128::MAX
++            lv.xmm_live_after(n, 9),
++            Some(true),
++            "the relay half below reads %xmm9"
 +        );
-+        // A mask wider than the type clamps instead of shifting out of range.
++        let m = line_of(&store, "movq %rax, %xmm2");
 +        assert_eq!(
-+            bits(IrConst::low_mask(IrType::I32, 127), IrType::I32),
-+            u32::MAX as u128
++            lv.xmm_live_after(m, 2),
++            Some(true),
++            "relay-staged argument read through the relay GP half"
++        );
++        let k = line_of(&store, "movq %xmm9, %rax");
++        assert_eq!(
++            lv.xmm_live_after(k, 9),
++            Some(false),
++            "the relay half consumes its source"
 +        );
 +    }
 +
-+    /// No width, and no over-wide `bits`, may panic -- in any profile.
++    /// The window walk still STOPS at real code: a computation between
++    /// the staging and the call ends the collection, so the staging is
++    /// not modeled as a call argument.
 +    #[test]
-+    fn low_mask_never_panics() {
-+        for ty in [
-+            IrType::I8,
-+            IrType::U8,
-+            IrType::I32,
-+            IrType::U32,
-+            IrType::I64,
-+            IrType::U64,
-+            IrType::I128,
-+            IrType::U128,
-+            IrType::Ptr,
-+        ] {
-+            for k in [0u32, 1, 63, 64, 65, 127, 128, 129, u32::MAX] {
-+                let _ = IrConst::low_mask(ty, k);
-+            }
++    fn window_walk_still_stops_at_real_code() {
++        let (store, _i, lv) = build(
++            "    movsd %xmm5, %xmm1\n\
++             \x20   vaddsd %xmm4, %xmm3, %xmm3\n\
++             \x20   call raw_helper@PLT\n",
++        );
++        let n = line_of(&store, "movsd %xmm5, %xmm1");
++        // The staging is separated from the call by a real instruction:
++        // the collection stopped at the vaddsd, so the call's read set is
++        // empty and the staged xmm1 is dead past its own definition.
++        assert_eq!(
++            lv.xmm_live_after(n, 1),
++            Some(false),
++            "staging behind real code is not a call argument"
++        );
++        assert_eq!(lv.xmm_live_after(n, 5), Some(false));
++    }
++
++    /// Full-depth relay chain: eight arguments staged as rax relays with
++    /// a hazard-area release before the call — the exact f10 shape from
++    /// the PR #584 repro, without any marker or census.  Every staged
++    /// destination must be read by the call, and every relay source must
++    /// stay live until its own relay half.
++    #[test]
++    fn window_walk_covers_the_full_eight_argument_relay_chain() {
++        let mut body = String::new();
++        for d in 0..8u32 {
++            body.push_str(&format!(
++                "    movq %xmm{}, %rax\n    movq %rax, %xmm{}\n",
++                d + 7,
++                d
++            ));
++        }
++        body.push_str("    addq $16, %rsp\n    call f10@PLT\n");
++        let (store, _i, lv) = build(&body);
++        // (a) every staged destination is a call argument: live-out of its
++        // own staging line (the anti-deletion property the bug broke).
++        for d in 0..8u32 {
++            let probe = format!("movq %rax, %xmm{d}");
++            let n = line_of(&store, &probe);
++            assert_eq!(
++                lv.xmm_live_after(n, d),
++                Some(true),
++                "xmm{d} staged argument is read by the call"
++            );
++        }
++        // (b) chain integrity: each relay source stays live out of the
++        // PREVIOUS pair's staging line (its own relay half is next) and
++        // dies at the relay half itself.
++        for d in 1..8u32 {
++            let src = d + 7;
++            let staging_below = format!("movq %rax, %xmm{}", d - 1);
++            let n = line_of(&store, &staging_below);
++            assert_eq!(
++                lv.xmm_live_after(n, src),
++                Some(true),
++                "%xmm{src} live until its relay half"
++            );
++            let half = format!("movq %xmm{src}, %rax");
++            let h = line_of(&store, &half);
++            assert_eq!(
++                lv.xmm_live_after(h, src),
++                Some(false),
++                "the relay half consumes %xmm{src}"
++            );
 +        }
 +    }
 +
-+    /// The narrow types keep the exact bit pattern `from_i64` produced before
-+    /// this constructor existed, so the change is a no-op below 64 bits.
-+    #[test]
-+    fn low_mask_matches_from_i64_for_narrow_types() {
-+        for ty in [
-+            IrType::I8,
-+            IrType::U8,
-+            IrType::I16,
-+            IrType::U16,
-+            IrType::I32,
-+            IrType::U32,
-+        ] {
-+            let width = (ty.size() * 8) as u32;
-+            for k in 0..width {
-+                let mask = (1u128 << k) - 1;
-+                assert_eq!(
-+                    IrConst::low_mask(ty, k),
-+                    IrConst::from_i64(mask as i64, ty),
-+                    "low_mask({ty:?}, {k}) must equal the previous construction"
-+                );
+     #[test]
+     fn reg_reg_movsd_merge_keeps_destination_live() {
+         let (store, _i, lv) = build(
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index b391f44e..e1c95fb8 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -4575,6 +4575,7 @@ fn loop_entry_is_unique(
+     header: usize,
+     latch: usize,
+     entry: usize,
++    fallthrough_ok: bool,
+ ) -> bool {
+     let (func_start, func_end) = function_range(store, infos, header).unwrap_or((0, store.len()));
+     let mut labels: Vec<&str> = Vec::new();
+@@ -4617,7 +4618,14 @@ fn loop_entry_is_unique(
+             _ => {}
+         }
+     }
+-    entries == 1
++    // A jmp-entry loop has exactly one outside edge (the preheader jump,
++    // exempted at `entry`).  A fall-through-entry loop (guarded shape)
++    // has ZERO jump edges — the single entry is the fall-through past the
++    // guard, which the placement scan verified ends in a control-flow
++    // boundary.  `fallthrough_ok` admits that shape; any jump edge into
++    // the loop still returns false above (a second entry bypasses the
++    // hoist placement).
++    entries == 1 || (fallthrough_ok && entries == 0)
+ }
+ 
+ // ── Loop-invariant GPR load hoisting ────────────────────────────────────────
+@@ -4670,8 +4678,11 @@ fn loop_entry_is_unique(
+ // Pinned candidates (volatile / address-taken slots, param-ABI reads) are
+ // never touched.
+ 
+-pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+-    let len = store.len();
++pub(super) fn hoist_loop_invariant_gpr_load(
++    store: &mut LineStore,
++    infos: &mut Vec<LineInfo>,
++) -> bool {
++    let mut len = store.len();
+     let mut changed = false;
+ 
+     let mut i = 0;
+@@ -4762,10 +4773,51 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+                 break;
+             }
+         }
+-        // Fall-through or multiple-entry: no dominating placement exists.
+-        let Some(entry) = entry_jmp else {
+-            i += 1;
+-            continue;
++        // Fall-through entry: a guarded loop (`guard: cmp; jcc exit; .p2align*;
++        // header:`) enters by falling through the guard's conditional.
++        // A LOAD cannot be placed there (it would execute even when the
++        // loop body runs zero times — a load may fault), but a PURE LEA
++        // can: it computes a constant address, touches no memory, writes
++        // no flags.  The insertion lands after the last control-flow
++        // boundary before the header's directive run, so the alignment
++        // directives stay adjacent to the header label (the loop's
++        // alignment is preserved exactly).
++        //
++        // `insert_entry` = Some(pos) selects insertion-at-pos placement
++        // (LEA candidates only); `None` keeps the jmp-replacement path.
++        let mut insert_entry: Option<usize> = None;
++        let entry = if let Some(e) = entry_jmp {
++            e
++        } else {
++            let mut q = header;
++            let mut place = None;
++            while q > func_start + 1 {
++                q -= 1;
++                if infos[q].is_nop()
++                    || matches!(infos[q].kind, LineKind::Directive | LineKind::Empty)
++                {
++                    continue; // the alignment/directive run before the label
++                }
++                // The first real instruction above the directive run must
++                // be a control-flow boundary: the LEA lands directly after
++                // it, before the directives.  A compute instruction there
++                // could be feeding flags into the loop body — bail (fail
++                // closed) rather than reason about cross-block flag
++                // liveness.
++                if matches!(
++                    infos[q].kind,
++                    LineKind::CondJmp | LineKind::Jmp | LineKind::Label
++                ) {
++                    place = Some(q + 1);
++                }
++                break;
 +            }
-+        }
-+    }
-+}
++            let Some(place) = place else {
++                i += 1;
++                continue;
++            };
++            insert_entry = Some(place);
++            place
+         };
+ 
+         // Rules 1+3: single entry (no second edge into ANY loop label, no
+@@ -4789,7 +4841,10 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+                 _ => {}
+             }
+         }
+-        if has_ret || has_call || !loop_entry_is_unique(store, infos, header, i, entry) {
++        if has_ret
++            || has_call
++            || !loop_entry_is_unique(store, infos, header, i, entry, insert_entry.is_some())
++        {
+             i += 1;
+             continue;
+         }
+@@ -4811,100 +4866,44 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+         // Scan body for movq OFFSET(%rsp), %REG (or %rbp) candidates.
+         // Only hoist one load per loop per pass (to avoid interactions).
+         let mut hoisted_one = false;
+-        for pos in body_start + 1..i {
+-            if hoisted_one {
+-                break;
+-            }
+-            if infos[pos].is_nop() {
+-                continue;
+-            }
+ 
+-            // Match: movq OFFSET(%rsp), %REG or movq OFFSET(%rbp), %REG
+-            let t = infos[pos].trimmed(store.get(pos));
+-            if !t.starts_with("movq ") {
+-                continue;
+-            }
+-            // Pinned lines (volatile / address-taken slots, param-ABI
+-            // reads) are never hoisted.
+-            if infos[pos].pinned {
+-                continue;
+-            }
+-            // Parse: "movq SRC, %DST"
+-            let after_movq = &t[5..];
+-            let comma = match after_movq.find(", %") {
+-                Some(c) => c,
+-                None => continue,
+-            };
+-            let src_part = &after_movq[..comma];
+-            let dst_part = &after_movq[comma + 2..]; // includes %
+-
+-            // Source must be a stack slot
+-            let base: RegId = if src_part.ends_with("(%rsp)") {
+-                4
+-            } else if src_part.ends_with("(%rbp)") {
+-                5
+-            } else {
+-                continue;
+-            };
+-            // Destination must be a GP register — and never %rsp (family 4):
+-            // the backend never allocates it, and writing it moves every
+-            // rsp-relative address. (%rbp stays legal: under
+-            // -fomit-frame-pointer it is an ordinary callee-saved register,
+-            // and with a frame pointer the allocator never deals it.)
+-            let dst_family = register_family_fast(dst_part);
+-            if dst_family == REG_NONE || dst_family > REG_GP_MAX || dst_family == 4 {
+-                continue;
+-            }
+-            // Don't hoist into rax/rcx (accumulator) or rsp/rbp
+-            // Skip rax (primary accumulator), rsp, rbp (frame registers)
+-            if dst_family == 0 || dst_family == 4 || dst_family == 5 {
+-                continue;
+-            }
+-
+-            // Rule 2: the slot is stable and its base cannot move in
+-            // `[entry..=i]` (shared engine: XMM/RMW/string/atomic stores,
+-            // pointer stores, push/pop, rsp arithmetic, ...).
+-            let slot = parse_frame_slot(src_part, 8);
+-            if !frame_slot_stable_in_range(store, infos, entry, i, base, slot) {
+-                continue;
+-            }
+-
+-            // Rule 4: the destination is written nowhere else in
+-            // `[entry..=i]` — exact implicits plus an unknown-destination
+-            // fallback (the implicit-operand table yields `(0, 0)` for
+-            // unknown mnemonics).
+-            let mut reg_written_elsewhere = false;
+-            for chk in entry..=i {
+-                if chk == pos {
+-                    continue;
+-                } // skip the load itself
+-                if infos[chk].is_nop() {
++        // Shared register-safety rules for a hoist candidate at `pos`
++        // writing `dst_family` (Rules 4, 4b, 5 and 6 from the load path —
++        // they are about REGISTER lifetimes and apply identically to
++        // every pure candidate form):
++        //
++        //   Rule 4:  the destination is written nowhere else in
++        //            `[entry..=i]` (exact implicits plus the
++        //            unknown-destination fallback);
++        //   Rule 4b: no forward edge in `[header..pos)` jumps over the
++        //            candidate into `(pos..i]`;
++        //   Rule 5:  the old value is dead at the hoist point — no mention
++        //            (read) in `[entry..pos)`;
++        //   Rule 6:  the destination is not observed after the loop.
++        let reg_safe_for_hoist = |store: &LineStore,
++                                  infos: &[LineInfo],
++                                  entry: usize,
++                                  header: usize,
++                                  latch: usize,
++                                  func_end: usize,
++                                  len: usize,
++                                  pos: usize,
++                                  dst_family: RegId|
++         -> bool {
++            // Rule 4: written nowhere else.
++            for chk in entry..=latch {
++                if chk == pos || infos[chk].is_nop() {
+                     continue;
+                 }
+                 if matches!(infos[chk].kind, LineKind::Other { dest_reg }
+                     if dest_reg == REG_NONE)
+                     || writes_family(&infos[chk], infos[chk].trimmed(store.get(chk)), dst_family)
+                 {
+-                    reg_written_elsewhere = true;
+-                    break;
++                    return false;
+                 }
+             }
+-            if reg_written_elsewhere {
+-                continue;
+-            }
+-
+-            // Rule 4b (skip-edge veto): no forward edge in `[header..pos)`
+-            // may jump over the candidate into `(pos..i]`. Such an edge
+-            // would let a use below `pos` read the pre-loop value while
+-            // the hoisted load overwrites it (a backend-valid
+-            // partial-redefinition shape: the skipped `dst` definition
+-            // normally forces a join copy that Rule 4 vetoes, but this
+-            // rule must not depend on that producer invariant).
+-            // Backward edges (target at/above the jump) cannot skip `pos`
+-            // and are exempt; indirect jumps and inline asm are already
+-            // vetoed function-wide by Rule 1.
+-            let mut skips_pos = false;
+-            'rule4b: for chk in header..pos {
++            // Rule 4b: skip-edge veto.
++            for chk in header..pos {
+                 if infos[chk].is_nop() {
+                     continue;
+                 }
+@@ -4915,9 +4914,6 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+                 let Some(tgt) = jt.split_whitespace().nth(1) else {
+                     continue;
+                 };
+-                // Locate the target label; an unresolvable target fails
+-                // closed (direct jumps always name a file-local label, so
+-                // this only fires on shapes the classifier misjudged).
+                 let tgt_label = format!("{tgt}:");
+                 let mut tgt_pos = None;
+                 for l in 0..len {
+@@ -4929,72 +4925,209 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
+                     }
+                 }
+                 let Some(tp) = tgt_pos else {
+-                    skips_pos = true;
+-                    break;
++                    return false;
+                 };
+                 if tp <= chk {
+                     continue; // backward edge: cannot skip pos
+                 }
+-                if tp > pos && tp <= i {
+-                    skips_pos = true;
+-                    break 'rule4b;
++                if tp > pos && tp <= latch {
++                    return false;
+                 }
+             }
+-            if skips_pos {
+-                continue;
+-            }
+-
+-            // Rule 5: the old value is dead at the hoist point — any mention
+-            // in `[entry..pos)` is a read (rule 4 proved no writes there).
+-            // `reg_refs` is textual, so instructions with implicit register
+-            // operands additionally veto when the destination is in the
+-            // implicitly-readable range (`div`, shifts, `cpuid`, `syscall`,
+-            // ... only ever touch families below `%r12`).
++            // Rule 5: the old value is dead at the hoist point.
+             let dst_bit = 1u16 << dst_family;
+-            let mut old_value_observed = false;
+             for chk in entry..pos {
+                 if infos[chk].is_nop() {
+                     continue;
+                 }
+                 if infos[chk].reg_refs & dst_bit != 0 {
+-                    old_value_observed = true;
+-                    break;
++                    return false;
+                 }
+                 if dst_family < 12 && has_implicit_reg_usage(infos[chk].trimmed(store.get(chk))) {
+-                    old_value_observed = true;
+-                    break;
++                    return false;
+                 }
+             }
+-            if old_value_observed {
+-                continue;
+-            }
+-
+-            // Rule 6: the destination is not observed after the loop — no
+-            // mention past the back-edge (same implicit backstop; `ret`
+-            // reads `%rdx` for 128-bit returns). `pop %dst` restores are
+-            // pure kills, not reads, and are skipped.
+-            let mut observed_after_loop = false;
+-            for k in i + 1..func_end {
++            // Rule 6: not READ after the loop.  A full WRITE to the
++            // destination before any read is a pure kill — the hoisted
++            // value is dead from that point backward, so the scan stops
++            // there and the hoist is allowed (sha256's tail stages
++            // `movq %rsi, %rcx` right after the 64-round loop: rcx's
++            // loop value is never read, only overwritten).  `pop %dst`
++            // restores are kills too.  A read (or an implicit-usage line,
++            // or a 128-bit `ret` reading rdx) observes the value and
++            // vetoes.
++            for k in latch + 1..func_end {
+                 if infos[k].is_nop() {
+                     continue;
+                 }
+                 if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
+                     continue;
+                 }
++                let text_k = infos[k].trimmed(store.get(k));
++                let kills_it = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == REG_NONE)
++                    || writes_family(&infos[k], text_k, dst_family);
++                if kills_it {
++                    break; // a full definition: the hoisted value dies here
++                }
+                 if infos[k].reg_refs & dst_bit != 0 {
+-                    observed_after_loop = true;
+-                    break;
++                    return false;
+                 }
+                 if matches!(infos[k].kind, LineKind::Ret) && dst_family == 2 {
+-                    observed_after_loop = true;
+-                    break;
++                    return false;
+                 }
+-                if dst_family < 12 && has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
+-                    observed_after_loop = true;
+-                    break;
++                if dst_family < 12 && has_implicit_reg_usage(text_k) {
++                    return false;
++                }
++            }
++            true
++        };
++
++        for pos in body_start + 1..i {
++            if hoisted_one {
++                break;
++            }
++            if infos[pos].is_nop() {
++                continue;
++            }
++
++            // Match: movq OFFSET(%rsp), %REG or movq OFFSET(%rbp), %REG
++            let t = infos[pos].trimmed(store.get(pos));
++            if !t.starts_with("movq ") {
++                // Candidate class 2 — the rip-relative address
++                // materialization: `leaq SYM(%rip), %REG`.  Pure (an
++                // address computation, no memory read), so Rule 2 (slot
++                // stability) does not apply; every register rule does.
++                // This is the rematerialized global base that the array
++                // lowering re-emits per access — sha256's K-table inside
++                // the 64-round loop paid the LEA every round (measured:
++                // sha256_transform at 1.20x gcc; the load through it is
++                // `movl (%rcx, %r10, 4), %r15d`, so the base cannot fold
++                // into the memory operand — RIP-relative addressing
++                // takes no index register, the LEA is load-bearing and
++                // only hoisting removes it).
++                if !t.starts_with("leaq ") {
++                    continue;
++                }
++                if infos[pos].pinned {
++                    continue;
++                }
++                let after_lea = &t[5..];
++                let Some(comma) = after_lea.find(", %") else {
++                    continue;
++                };
++                let src_part = after_lea[..comma].trim();
++                let dst_part = after_lea[comma + 2..].trim();
++                // Exactly `SYM(%rip)` / `SYM+OFF(%rip)`: no base register,
++                // no index/scale — anything else reads a register and is
++                // not a constant.
++                if !src_part.ends_with("(%rip)") || src_part.contains(',') {
++                    continue;
++                }
++                let dst_family = register_family_fast(dst_part);
++                if dst_family == REG_NONE
++                    || dst_family > REG_GP_MAX
++                    || dst_family == 4
++                    || dst_family == 5
++                    || dst_family == 0
++                {
++                    continue;
+                 }
++                if !reg_safe_for_hoist(
++                    store, infos, entry, header, i, func_end, len, pos, dst_family,
++                ) {
++                    continue;
++                }
++                let lea_text = store.get(pos).to_string();
++                let lea_text = lea_text.trim_end().to_string();
++                match insert_entry {
++                    Some(ins) => {
++                        // Fall-through entry: INSERT the LEA after the
++                        // control-flow boundary, before the directive run.
++                        // The insertion shifts every line at or above `ins`
++                        // — adjust the backedge `i`, `len`, and the
++                        // candidate `pos` (always > ins: the candidate is
++                        // inside the loop, the insertion before its header).
++                        store.insert_line(ins, lea_text.clone());
++                        let new_info = classify_line(&lea_text);
++                        // Vec splice: the pass contract keeps
++                        // `infos.len() == store.len()` — both grew by
++                        // exactly one line.
++                        infos.insert(ins, new_info);
++                        i += 1;
++                        len += 1;
++                        mark_nop(&mut infos[pos + 1]);
++                    }
++                    None => {
++                        // Jmp entry: the LEA replaces the entry jump and
++                        // falls through into the header (the load path's
++                        // mechanics).
++                        replace_line(store, &mut infos[entry], entry, lea_text);
++                        mark_nop(&mut infos[pos]);
++                    }
++                }
++                changed = true;
++                hoisted_one = true;
++                continue;
+             }
+-            if observed_after_loop {
++            // Pinned lines (volatile / address-taken slots, param-ABI
++            // reads) are never hoisted.
++            if infos[pos].pinned {
++                continue;
++            }
++            // A LOAD may only take the jmp-replacement placement: on a
++            // fall-through (guarded) entry the hoisted load would execute
++            // even when the loop body runs zero times, and a load may
++            // fault.  Only the pure LEA candidate above may insert.
++            if insert_entry.is_some() {
++                continue;
++            }
++            // Parse: "movq SRC, %DST"
++            let after_movq = &t[5..];
++            let comma = match after_movq.find(", %") {
++                Some(c) => c,
++                None => continue,
++            };
++            let src_part = &after_movq[..comma];
++            let dst_part = &after_movq[comma + 2..]; // includes %
++
++            // Source must be a stack slot
++            let base: RegId = if src_part.ends_with("(%rsp)") {
++                4
++            } else if src_part.ends_with("(%rbp)") {
++                5
++            } else {
++                continue;
++            };
++            // Destination must be a GP register — and never %rsp (family 4):
++            // the backend never allocates it, and writing it moves every
++            // rsp-relative address. (%rbp stays legal: under
++            // -fomit-frame-pointer it is an ordinary callee-saved register,
++            // and with a frame pointer the allocator never deals it.)
++            let dst_family = register_family_fast(dst_part);
++            if dst_family == REG_NONE || dst_family > REG_GP_MAX || dst_family == 4 {
++                continue;
++            }
++            // Don't hoist into rax/rcx (accumulator) or rsp/rbp
++            // Skip rax (primary accumulator), rsp, rbp (frame registers)
++            if dst_family == 0 || dst_family == 4 || dst_family == 5 {
++                continue;
++            }
++
++            // Rule 2: the slot is stable and its base cannot move in
++            // `[entry..=i]` (shared engine: XMM/RMW/string/atomic stores,
++            // pointer stores, push/pop, rsp arithmetic, ...).
++            let slot = parse_frame_slot(src_part, 8);
++            if !frame_slot_stable_in_range(store, infos, entry, i, base, slot) {
++                continue;
++            }
++
++            // Rules 4, 4b, 5 and 6 — the shared register-safety
++            // closure (identical semantics to the original inline block:
++            // written-nowhere-else, skip-edge veto, old-value-dead,
++            // not-observed-after-loop).
++            if !reg_safe_for_hoist(
++                store, infos, entry, header, i, func_end, len, pos, dst_family,
++            ) {
+                 continue;
+             }
+ 
 diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index 21fde94..05aa046 100644
+index ab015c98..5c9dd072 100644
 --- a/src/passes/simplify.rs
 +++ b/src/passes/simplify.rs
-@@ -2023,13 +2023,19 @@ fn simplify_binop(
-             // but URem still has unsigned semantics regardless of type signedness.
-             if op == IrBinOp::URem && (ty.is_integer() || ty == IrType::Ptr) {
-                 if let Some(shift) = const_power_of_two(rhs, ty) {
--                    // x % 2^k => x & (2^k - 1)
--                    let mask = (1i64 << shift) - 1;
-+                    // x % 2^k => x & (2^k - 1).  The mask is built at the
-+                    // OPERATION's width, not i64's: `const_power_of_two`
-+                    // reports shifts up to 127 for the 128-bit types, and an
-+                    // i64 construction of the mask is wrong in two ways --
-+                    // `1i64 << 64` is `1` in a release build (the shift amount
-+                    // is masked modulo 64), so a 2^64 mask became 0 and
-+                    // `x % 2^64` compiled to `x & 0`; and `(1i64 << 63) - 1`
-+                    // panics in a debug build.  See `IrConst::low_mask`.
-                     return Some(Instruction::BinOp {
-                         dest,
-                         op: IrBinOp::And,
-                         lhs: *lhs,
--                        rhs: Operand::Const(IrConst::from_i64(mask, ty)),
-+                        rhs: Operand::Const(IrConst::low_mask(ty, shift)),
-                         ty,
+@@ -770,7 +770,7 @@ struct BinOpDef {
+ /// Bisection helper for the preboot-ZSTD miscompile. `CCC_SIMPLIFY_SKIP` is a
+ /// comma-separated list of fold families to disable:
+ /// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`,
+-/// `negneg`.
++/// `negneg`, `addneg`.
+ fn simplify_skip(family: &str) -> bool {
+     static SKIP: std::sync::LazyLock<String> =
+         std::sync::LazyLock::new(|| std::env::var("CCC_SIMPLIFY_SKIP").unwrap_or_default());
+@@ -980,6 +980,13 @@ fn try_simplify(
+     )
+ }
+ 
++/// Test wrapper for the Neg-def-sensitive folds (neg-of-neg,
++/// add/sub-of-neg): threads the NegDef map with everything else empty.
++#[cfg(test)]
++fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<Instruction> {
++    try_simplify_with_types(inst, &[], &[], &[], &[], neg_defs, &[], &[], &[], &[], &[])
++}
++
+ /// Simplify a Cast instruction.
+ ///
+ /// Handles:
+@@ -1813,6 +1820,41 @@ fn simplify_binop(
+                     return Some(inst);
+                 }
+             }
++            // Floats: x + (neg y) => x - y, plus the commuted spelling —
++            // the four-oracle consensus (GCC 16.2, Clang 23.1, ICX and
++            // local GCC 14.2 all emit the mirrored op; oracle-checked on
++            // add_neg/sub_neg/chain_pin and the MULTI-USE shapes, where
++            // GCC folds just the same — fold-const carries no use
++            // analysis). Exact for every numeric input and both zeros
++            // (IEEE 754 defines sub as the addition of the negation, and
++            // the zero-sign table is symmetric); the qNaN sign of the
++            // result may differ when y's NaN is the propagated one — the
++            // C11 6.5p8 latitude. ADJUDICATION: the house rule "take the
++            // latitude only when the materialisation dies" was derived
++            // when lccc was the conservative outlier; with every oracle
++            // folding unconditionally, NOT folding is what diverges from
++            // the competition on NaN-sign rows. The fold therefore fires
++            // unconditionally, like the oracles — bit-parity with GCC
++            // requires taking the latitude GCC takes.
++            if is_float && !simplify_skip("addneg") {
++                if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
++                    return Some(Instruction::BinOp {
++                        dest,
++                        op: IrBinOp::Sub,
++                        lhs: *lhs,
++                        rhs: neg_src,
++                        ty,
++                    });
++                } else if let Some(neg_src) = get_neg_def(lhs, neg_defs) {
++                    return Some(Instruction::BinOp {
++                        dest,
++                        op: IrBinOp::Sub,
++                        lhs: *rhs,
++                        rhs: neg_src,
++                        ty,
++                    });
++                }
++            }
+         }
+         IrBinOp::Sub => {
+             if rhs_zero && (!is_float || is_positive_zero(rhs)) {
+@@ -1844,6 +1886,20 @@ fn simplify_binop(
                      });
                  }
-@@ -5637,4 +5643,221 @@ mod tests {
-         };
-         assert!(simplify_default(&inst).is_none());
-     }
-+
-+    // ==================================================================
-+    // const_power_of_two: the predicate behind every `x / 2^k` and
-+    // `x % 2^k` strength reduction.
-+    //
-+    // This predicate is a trap detector.  It used to read the operand
-+    // through `to_i64()`, which TRUNCATES a 128-bit constant: the value
-+    // 0xffffffffffffffff_0000000000000001 arrived as `1`, was judged a
-+    // power of two, and `x * that` compiled to a copy of `x`.  It was
-+    // rewritten to read the bit pattern at the operation's width, which
-+    // then made shifts up to 127 reachable -- and that widening exposed
-+    // an i64 mask construction downstream (see `IrConst::low_mask`).
-+    //
-+    // Both halves of that history are pinned below: the truncation trap,
-+    // the full widened range, and the width masking.
-+    // ==================================================================
-+
-+    #[test]
-+    fn const_power_of_two_rejects_the_to_i64_truncation_trap() {
-+        // The historical miscompile: low 64 bits are a power of two, the
-+        // high half is non-zero.  `to_i64()` saw only the low half.
-+        let trap = IrConst::I128(0xffffffffffffffff_0000000000000001_u128 as i128);
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(trap), IrType::I128),
-+            None,
-+            "a constant whose low half is a power of two but whose high half is \
-+             non-zero is NOT a power of two"
-+        );
-+        // The same value as an unsigned type.
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(trap), IrType::U128),
-+            None
-+        );
-+        // Mirrors of the trap: a power of two PLUS a low bit (here 2^64 + 1),
-+        // and one with the bit one position up (2^64 + 2).  Both have a single
-+        // set bit in the i64 view and must still be rejected.
-+        for v in [
-+            0x0000000000000001_0000000000000001_u128, // 2^64 + 1
-+            0x0000000000000001_0000000000000002_u128, // 2^64 + 2
-+            0x8000000000000000_8000000000000000_u128, // 2^127 + 2^63
-+        ] {
-+            assert_eq!(
-+                const_power_of_two(&Operand::Const(IrConst::I128(v as i128)), IrType::U128),
-+                None,
-+                "{v:#x} is not a power of two"
-+            );
-+        }
-+        // Sanity: the value that IS 2^64 must be recognised, so the rejections
-+        // above are about the extra bits and not about the width.
-+        let p64 = IrConst::I128(0x0000000000000001_0000000000000000_u128 as i128);
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(p64), IrType::U128),
-+            Some(64)
-+        );
-+    }
-+
-+    #[test]
-+    fn const_power_of_two_covers_the_full_128_bit_range() {
-+        for k in 0..=127u32 {
-+            let v = 1u128 << k;
-+            assert_eq!(
-+                const_power_of_two(&Operand::Const(IrConst::I128(v as i128)), IrType::I128),
-+                Some(k),
-+                "I128 2^{k}"
-+            );
-+            assert_eq!(
-+                const_power_of_two(&Operand::Const(IrConst::I128(v as i128)), IrType::U128),
-+                Some(k),
-+                "U128 2^{k}"
-+            );
-+        }
-+    }
-+
-+    #[test]
-+    fn const_power_of_two_at_the_64_bit_boundary() {
-+        // 2^63 is i64::MIN as a bit pattern, and was unreachable before the
-+        // predicate stopped demanding a positive i64.  It is the case whose
-+        // downstream i64 mask overflowed.
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I64(i64::MIN)), IrType::U64),
-+            Some(63)
-+        );
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I64(i64::MIN)), IrType::I64),
-+            Some(63)
-+        );
-+        // 2^64 and up only exist in the 128-bit types.
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I64(i64::MIN)), IrType::U128),
-+            Some(63),
-+            "a 128-bit operation on an I64 constant sees only its low 64 bits"
-+        );
-+        // An all-ones constant is 2^width - 1: never a power of two, at any
-+        // width.  As a 128-bit value `I64(-1)` is 2^64 - 1, one SHORT of a
-+        // power of two -- a distinction the old `to_i64()` predicate could not
-+        // make, since it could not see past bit 63 at all.
-+        for ty in [IrType::I64, IrType::U64, IrType::I128, IrType::U128] {
-+            assert_eq!(
-+                const_power_of_two(&Operand::Const(IrConst::I64(-1)), ty),
-+                None,
-+                "all-ones ({ty:?}) is 2^n - 1, not a power of two"
-+            );
-+        }
-+        // ...whereas the neighbouring value, 2^64, is one, at 128 bits.
-+        assert_eq!(
-+            const_power_of_two(
-+                &Operand::Const(IrConst::I128(
-+                    0x0000000000000001_0000000000000000_u128 as i128
-+                )),
-+                IrType::U128
-+            ),
-+            Some(64)
-+        );
-+    }
-+
-+    #[test]
-+    fn const_power_of_two_on_narrow_signed_types() {
-+        // Signed narrow constants carrying a single set bit.
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I8(0x80u8 as i8)), IrType::I8),
-+            Some(7)
-+        );
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I16(0x8000u16 as i16)), IrType::I16),
-+            Some(15)
-+        );
-+        assert_eq!(
-+            const_power_of_two(
-+                &Operand::Const(IrConst::I32(0x0001_0000u32 as i32)),
-+                IrType::I32
-+            ),
-+            Some(16)
-+        );
-+        assert_eq!(
-+            const_power_of_two(
-+                &Operand::Const(IrConst::I32(0x4000_0000u32 as i32)),
-+                IrType::I32
-+            ),
-+            Some(30)
-+        );
-+    }
-+
-+    #[test]
-+    fn const_power_of_two_masks_bits_above_the_operation_width() {
-+        // Bits above the width are not part of the value: a 2^40 bit in a
-+        // 32-bit operation is not a power of two, it is not anything.
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I64(1i64 << 40)), IrType::I32),
-+            None
-+        );
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I64(1i64 << 40)), IrType::U32),
-+            None
-+        );
-+        // 2^32 is off-width for a 32-bit type but in range for 64.
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I64(1i64 << 32)), IrType::U32),
-+            None
-+        );
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I64(1i64 << 32)), IrType::U64),
-+            Some(32)
-+        );
-+        // A 2^100 bit in a 64-bit operation likewise vanishes.
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I128(1i128 << 100)), IrType::U64),
-+            None
-+        );
-+    }
-+
-+    #[test]
-+    fn const_power_of_two_rejects_non_constants_and_zero() {
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::I64(0)), IrType::I64),
-+            None,
-+            "zero has no power-of-two exponent"
-+        );
-+        assert_eq!(
-+            const_power_of_two(&Operand::Const(IrConst::F64(4.0)), IrType::F64),
-+            None,
-+            "a float constant is not an integer power of two for this fold"
-+        );
-+        assert_eq!(
-+            const_power_of_two(&Operand::Value(Value(0)), IrType::I64),
-+            None,
-+            "a non-constant must never be classified"
-+        );
-+    }
-+
-+    /// End-to-end through the simplification of an actual `urem`: the mask
-+    /// that comes out must be the exact `2^k - 1` at the operation's width.
-+    /// This is the unit-level twin of tests/regression/i128_divrem_pow2.c.
-+    #[test]
-+    fn urem_by_pow2_folds_to_the_exact_mask_at_128_bits() {
-+        for k in [1u32, 31, 32, 63, 64, 65, 100, 126, 127] {
-+            let d = IrConst::I128((1u128 << k) as i128);
-+            let inst = binop(
-+                IrBinOp::URem,
-+                Operand::Value(Value(0)),
-+                Operand::Const(d),
-+                IrType::U128,
-+            );
-+            let out = simplify_default(&inst).expect("urem by 2^k must fold");
-+            match out {
-+                Instruction::BinOp {
-+                    op: IrBinOp::And,
-+                    rhs: Operand::Const(c),
-+                    ..
-+                } => {
-+                    let got = c.to_i128().expect("mask is an integer") as u128;
-+                    let want = (1u128 << k) - 1;
-+                    assert_eq!(got, want, "mask for 2^{k} is not exact");
+             }
++            // Floats: x - (neg y) => x + y — the same four-oracle
++            // consensus fold as the Add mirror above, unconditional for
++            // the same bit-parity reason (see the adjudication there).
++            if is_float && !simplify_skip("addneg") {
++                if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
++                    return Some(Instruction::BinOp {
++                        dest,
++                        op: IrBinOp::Add,
++                        lhs: *lhs,
++                        rhs: neg_src,
++                        ty,
++                    });
 +                }
-+                other => panic!("expected an AND fold for 2^{k}, got {other:?}"),
 +            }
+         }
+         IrBinOp::Mul => {
+             if !is_float && (rhs_zero || lhs_zero) {
+@@ -4951,6 +5007,204 @@ mod tests {
+         assert!(try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).is_none());
+     }
+ 
++    // === Float add/sub-of-neg tests (the four-oracle consensus folds) ===
++
++    #[test]
++    fn float_add_of_neg_folds_to_sub() {
++        // x + (neg y) => x - y (GCC 16.2, Clang 23.1, ICX and local GCC
++        // 14.2 all emit the mirrored op — the four-oracle consensus).
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F64,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        match result {
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                lhs,
++                rhs,
++                ..
++            } => {
++                assert!(matches!(lhs, Operand::Value(v) if v.0 == 0));
++                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
++            }
++            _ => panic!("Expected Sub(V0, V1), got {:?}", result),
 +        }
 +    }
- }
-diff --git a/tests/regression/check_peephole_trace_bisect.sh b/tests/regression/check_peephole_trace_bisect.sh
-index 067567e..c6666e1 100755
---- a/tests/regression/check_peephole_trace_bisect.sh
-+++ b/tests/regression/check_peephole_trace_bisect.sh
-@@ -140,6 +140,45 @@ if $PY "$TOOL" --trace-dir "$TMPD/does-not-exist" >/dev/null 2>&1; then
-     : # listing a missing dir raises; only the exit code is contractual
- fi
++
++    #[test]
++    fn float_add_of_neg_commuted_folds_to_sub() {
++        // (neg y) + x => x - y (Sub is non-commutative: the plain operand
++        // stays the minuend).
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(2)),
++            rhs: Operand::Value(Value(0)),
++            ty: IrType::F64,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        match result {
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                lhs,
++                rhs,
++                ..
++            } => {
++                assert!(
++                    matches!(lhs, Operand::Value(v) if v.0 == 0),
++                    "minuend must be the plain operand"
++                );
++                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
++            }
++            _ => panic!("Expected Sub(V0, V1), got {:?}", result),
++        }
++    }
++
++    #[test]
++    fn float_sub_of_neg_folds_to_add() {
++        // x - (neg y) => x + y for floats (the extension of the historical
++        // integer fold to the float domain, matching every oracle).
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Sub,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F64,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        match result {
++            Instruction::BinOp {
++                op: IrBinOp::Add,
++                lhs,
++                rhs,
++                ..
++            } => {
++                assert!(matches!(lhs, Operand::Value(v) if v.0 == 0));
++                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
++            }
++            _ => panic!("Expected Add(V0, V1), got {:?}", result),
++        }
++    }
++
++    #[test]
++    fn float_add_of_neg_f32_folds_to_sub() {
++        // The fold is width-agnostic (f32 mirror).
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F32,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        assert!(matches!(
++            result,
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn float_add_of_multi_use_neg_folds_too() {
++        // The MULTI-USE adjudication pin: every oracle folds the add even
++        // when the negation has other readers (gcc: `(x + t) + (x * t)`
++        // with t = -y emits vsubsd + vfnmadd132sd — the add folds, the
++        // product's negation rides the family). NOT folding here is what
++        // would diverge from the competition on NaN-sign rows.
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F64,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        assert!(matches!(
++            result,
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn int_sub_of_neg_still_folds() {
++        // Historical behaviour pin: the INTEGER fold is exact (ring
++        // identity) and keeps firing exactly as before.
++        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
++        neg_defs[2] = Some(NegDef {
++            src: Operand::Value(Value(1)),
++        });
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Sub,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::I32,
++        };
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        assert!(matches!(
++            result,
++            Instruction::BinOp {
++                op: IrBinOp::Add,
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn float_add_of_non_neg_stays() {
++        // Discriminating control: no Neg def, no fold.
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Value(Value(2)),
++            ty: IrType::F64,
++        };
++        assert!(try_simplify_neg(&inst, &[]).is_none());
++    }
++
++    #[test]
++    fn float_add_of_const_stays() {
++        // A constant operand has no def to look through.
++        let inst = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(0)),
++            rhs: Operand::Const(IrConst::F64(1.5)),
++            ty: IrType::F64,
++        };
++        assert!(try_simplify_neg(&inst, &[]).is_none());
++    }
++
+     // === Subtract-of-negation tests ===
  
-+echo "== phase 5: the tool NAMES the offender on a synthetic bad trace =="
-+# Phases 1-3 prove the tool is quiet when the compiler is clean and that its
-+# parser agrees with a 21-case table.  Neither proves it can still FAIL, and a
-+# tool that silently reports clean on everything would satisfy both.  So: build
-+# a trace whose one bad dump is exactly the historical unencodable operand and
-+# demand exit 1 plus the offending pass named in the verdict.
-+SYN=$TMPD/synthetic
-+mkdir -p "$SYN"
-+# Two innocuous dumps and the bad one, named so the offender is unambiguous.
-+printf 'f:\n    leaq 0(,%%r11,4), %%r8\n    leaq (%%r8, %%r10, 1), %%r9\n' > "$SYN/000-p0-innocent.s"
-+printf 'f:\n    leaq (%%r10, %%r11, 4), %%r9\n' > "$SYN/001-p0-also_innocent.s"
-+printf 'f:\n    leaq 0(,%%r11,4, %%r10, 1), %%r9\n' > "$SYN/999-p0-synthetic_bad.s"
-+if $PY "$TOOL" --trace-dir "$SYN" --quiet >"$TMPD/syn_v" 2>&1; then
-+    bad "the tool reported a CLEAN verdict on a trace containing an unencodable operand"
-+    sed 's/^/    /' "$TMPD/syn_v"
-+else
-+    rc=$?
-+    if [ "$rc" -eq 1 ]; then
-+        note "synthetic bad trace -> exit 1"
-+    else
-+        bad "synthetic bad trace -> exit $rc, expected 1"
-+    fi
-+    if grep -q 'synthetic_bad' "$TMPD/syn_v"; then
-+        note "verdict names the offending pass"
-+    else
-+        bad "verdict does not name synthetic_bad:"
-+        sed 's/^/    /' "$TMPD/syn_v"
-+    fi
-+fi
-+# The same trace must stay clean once the bad operand is repaired, so the
-+# phase is measuring the operand and not merely the presence of a third dump.
-+printf 'f:\n    leaq (%%r10, %%r11, 4), %%r9\n' > "$SYN/999-p0-synthetic_bad.s"
-+if $PY "$TOOL" --trace-dir "$SYN" --quiet >"$TMPD/syn_ok" 2>&1; then
-+    note "repaired dump -> clean verdict again (the check is on the operand)"
-+else
-+    bad "repaired dump still reported bad:"
-+    sed 's/^/    /' "$TMPD/syn_ok"
-+fi
-+
- if [ "$fail" -ne 0 ]; then
-     echo "peephole-trace-bisect: FAIL" >&2
-     exit 1
-diff --git a/tests/regression/i128_divrem_pow2.c b/tests/regression/i128_divrem_pow2.c
-new file mode 100644
-index 0000000..63a7344
+     #[test]
+@@ -4984,7 +5238,17 @@ mod tests {
+ 
+     #[test]
+     fn test_sub_neg_float_not_simplified() {
+-        // Float x - (neg y) should NOT be simplified (IEEE 754 concerns)
++        // REWRITTEN (the four-oracle adjudication): float x - (neg y) now
++        // DOES fold to x + y. The historical "IEEE 754 concerns" pin was
++        // more conservative than every compiler in the competition set —
++        // GCC 16.2, Clang 23.1, ICX and local GCC 14.2 all emit the
++        // mirrored vaddsd for `x - (-y)` (oracle-verified). The fold is
++        // exact for every numeric input and both zeros (IEEE 754 defines
++        // sub as the addition of the negation); the qNaN-sign latitude is
++        // C11 6.5p8-sanctioned and, with every oracle taking it, NOT
++        // folding is what diverges. The dedicated coverage lives in
++        // float_sub_of_neg_folds_to_add; this pin keeps the historical
++        // name as the record of the flip.
+         let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+         neg_defs[2] = Some(NegDef {
+             src: Operand::Value(Value(1)),
+@@ -4996,8 +5260,14 @@ mod tests {
+             rhs: Operand::Value(Value(2)),
+             ty: IrType::F64,
+         };
+-        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]);
+-        assert!(result.is_none());
++        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
++        assert!(matches!(
++            result,
++            Instruction::BinOp {
++                op: IrBinOp::Add,
++                ..
++            }
++        ));
+     }
+ 
+     // === Unsigned comparison simplification tests ===
+diff --git a/tests/regression/check_call_arg_staging.sh b/tests/regression/check_call_arg_staging.sh
+new file mode 100755
+index 00000000..000b1346
 --- /dev/null
-+++ b/tests/regression/i128_divrem_pow2.c
-@@ -0,0 +1,204 @@
-+/*
-+ * i128_divrem_pow2.c -- 128-bit divide/remainder by powers of two.
-+ *
-+ * Guards the mask the `x % 2^k  =>  x & (2^k - 1)` strength reduction builds.
-+ *
-+ * `const_power_of_two` reports shifts up to 127 for the 128-bit types.  The
-+ * mask used to be constructed in i64:
-+ *
-+ *     let mask = (1i64 << shift) - 1;
-+ *
-+ * which is wrong twice over once shift can reach 128-bit territory:
-+ *
-+ *   release (overflow-checks off): `1i64 << 64` is `1i64` -- the shift amount
-+ *     is masked modulo 64 -- so the mask for 2^64 came out 0 and `x % 2^64`
-+ *     compiled to `x & 0`.  Every larger k wrapped to `2^(k mod 64) - 1`, so
-+ *     `x % 2^100` masked with only the low 36 bits.
-+ *
-+ *   debug (overflow-checks on): `(1i64 << 63) - 1` panics outright, so even a
-+ *     u64 remainder by 2^63 aborted the compiler.
-+ *
-+ * The release form was a SILENT wrong-code miscompile: the program assembled,
-+ * ran and printed plausible values.  The mask is now built at the operation's
-+ * width by `IrConst::low_mask` (u128 accumulator), so this file fails loudly
-+ * against the old compiler and passes against the new one.
-+ *
-+ * Shape notes, each of which was measured rather than assumed:
-+ *
-+ *  - The divisor must be a LITERAL.  A divisor read from an array or computed
-+ *    into a variable is a runtime value, `const_power_of_two` never fires, and
-+ *    the test would validate the libcall path instead of the fold.  Each
-+ *    divisor therefore gets its own noinline function.
-+ *  - `1 << k` written as a C constant expression is folded to an IR constant
-+ *    before the strength-reduction pass runs, which is what makes the fold
-+ *    reachable here; verified by the old binary failing this file at both -O1
-+ *    and -O2.
-+ *  - `__int128` has no printf conversion in ISO C, so results are compared in
-+ *    the program and only the verdict is printed.
-+ */
++++ b/tests/regression/check_call_arg_staging.sh
+@@ -0,0 +1,250 @@
++#!/usr/bin/env bash
++# Call-argument staging gate: every SSE argument a call makes reaches its
++# register, the authority marker says the truth, and the FP liveness oracle
++# cannot model a live staging as dead.
++#
++# WHY THIS EXISTS
++#
++# PR #584's CI found a miscompile class that every other gate missed: a call
++# with >= 9 FP arguments (register staging + stack pushes) compiled with 7 of
++# its 8 register arguments reading garbage.  The causal chain, established
++# with the peephole trace instrumentation:
++#
++#   1. `emit_call_reg_args_impl` stages FP arguments as rax relays and
++#      publishes the count as `movb $N, %al` (the census);
++#   2. `eliminate_dead_pure_writes` LEGITIMATELY deletes the census for a
++#      non-variadic callee (%al is dead there per the GP liveness oracle);
++#   3. `eliminate_fp_xmm_roundtrips` converts the innermost relay into a
++#      direct `movsd %xmmN, %xmmM` (also legitimate);
++#   4. `eliminate_dead_vector_copies` asks `call_xmm_reads` for the call's
++#      SSE read set; the census is gone, and the fallback window walk broke
++#      at the first line that was not itself a staging move — the
++#      hazard-area release `addq $K, %rsp`, the stack-argument `pushq %rax`,
++#      the GP half of every remaining relay — so the call was modeled as
++#      reading ZERO xmm registers and the live argument staging was deleted.
++#
++# The fix is layered: the codegen now publishes `# LCCC_CALL_FP <n>` after
++# the call text (the same authority contract as `# LCCC_CALL_ARGS`; a
++# comment, immune to every value-shape pass), and the window walk skips
++# register-file-transparent lines (rsp adjustments, pushes/pops, relay
++# GP-halves) with a step budget that covers the full 8-register staging
++# window.  The emitter also no longer pre-spills STACK-class arguments into
++# the hazard area (their value was already pushed by the stack-argument
++# phase, which the driver runs first).
++#
++# This gate pins all three layers end to end:
++#
++#   A. runtime equality with the reference compiler on argument shapes built
++#      to hit every layer: volatile local and global sources (the original
++#      repros), 8..12 arguments (every stack-argument arity), f32, mixed
++#      GP+FP, struct-by-SSE-register, FMA-negation compositions (the
++#      add-of-neg fold freeing a multi-use negation into the staging),
++#      register-hazard shapes (pre-spill + restore staging), indirect
++#      calls, and calls inside loops;
++#   B. the marker: present with the exact count for FP calls, absent for
++#      GP-only calls, the census deleted for prototyped callees (the
++#      instruction win) but KEPT for variadic ones (SysV 3.5.7 requires it);
++#   C. the staging survival: the 10-argument volatile call writes ALL EIGHT
++#      SSE argument registers in its staging window, and no FP argument is
++#      routed through a GPR sign mask.
++#
++# Usage:
++#   tests/regression/check_call_arg_staging.sh
++# Environment:
++#   LCCC            compiler to test (default: target/fastbuild/lccc)
++#   CCC_ORACLE_CC   reference compiler (default: cc, gcc or clang)
++set -uo pipefail
 +
++repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++cd "$repo_root"
++
++LCCC=${LCCC:-target/fastbuild/lccc}
++[[ "$LCCC" == /* ]] || LCCC="$repo_root/$LCCC"
++[[ -x "$LCCC" ]] || { echo "FAIL: no compiler at $LCCC" >&2; exit 1; }
++ORACLE=${CCC_ORACLE_CC:-}
++if [[ -z "$ORACLE" ]]; then
++    for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { ORACLE=$c; break; }; done
++fi
++[[ -n "$ORACLE" ]] || { echo "FAIL: no reference compiler found" >&2; exit 1; }
++
++FLAGS=(-O2 -march=x86-64-v3)
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++pass=0; fail=0; skip=0
++note() { printf '  %s\n' "$*"; }
++ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
++bad()  { fail=$((fail+1)); printf 'FAIL %s\n' "$*"; }
++skipped() { skip=$((skip+1)); printf 'skip %s\n' "$*"; }
++
++# ── A. runtime differential: every staging shape, bit-exact ─────────────────
++cat > "$work/staging.c" <<'EOF_STAGING'
 +#include <stdio.h>
++#include <math.h>
++#define NI __attribute__((noinline))
 +
-+typedef unsigned __int128 u128;
-+typedef signed __int128 s128;
-+
-+/* One noinline wrapper per divisor so the divisor stays a literal. */
-+#define GEN_REM(K)                                                     \
-+    __attribute__((noinline)) static u128 urem_pow##K(u128 x)          \
-+    {                                                                  \
-+        return x % (((u128)1) << (K));                                 \
-+    }
-+#define GEN_QUO(K)                                                     \
-+    __attribute__((noinline)) static u128 udiv_pow##K(u128 x)          \
-+    {                                                                  \
-+        return x / (((u128)1) << (K));                                 \
-+    }
-+
-+/* The boundary set: below the i64 limit, exactly at it, one past it, and up to
-+ * the largest power of two a u128 can hold.  63 and 64 are the pair that the
-+ * i64 construction got exactly backwards (63 correct-by-wrap in release and a
-+ * panic in debug; 64 wholly wrong in release). */
-+GEN_REM(1) GEN_QUO(1)
-+GEN_REM(31) GEN_QUO(31)
-+GEN_REM(32) GEN_QUO(32)
-+GEN_REM(60) GEN_QUO(60)
-+GEN_REM(62) GEN_QUO(62)
-+GEN_REM(63) GEN_QUO(63)
-+GEN_REM(64) GEN_QUO(64)
-+GEN_REM(65) GEN_QUO(65)
-+GEN_REM(96) GEN_QUO(96)
-+GEN_REM(100) GEN_QUO(100)
-+GEN_REM(126) GEN_QUO(126)
-+GEN_REM(127) GEN_QUO(127)
-+
-+/* Controls: not powers of two, so the fold must NOT fire and the libcall path
-+ * must stay correct.  If one of these fails, the defect is something else. */
-+#define GEN_CTRL(NAME, D)                                              \
-+    __attribute__((noinline)) static u128 NAME(u128 x) { return x % (D); }
-+GEN_CTRL(urem_3, 3)
-+GEN_CTRL(urem_pow63_plus1, (((u128)1) << 63) + 1)
-+GEN_CTRL(urem_pow64_plus1, (((u128)1) << 64) + 1)
-+GEN_CTRL(urem_allones, ~(u128)0)
-+
-+/* Signed 128-bit remainder: SRem is deliberately not strength-reduced (the
-+ * sign fixup is a separate sequence), so this is a control that the widening
-+ * did not accidentally capture it. */
-+__attribute__((noinline)) static s128 srem_pow64(s128 x)
-+{
-+    return x % (s128)(((u128)1) << 64);
++/* The arities: 8 = exactly the SSE register file; 9..12 = 1..4 stack
++ * arguments (the push sequences that used to terminate the liveness
++ * window walk).  Sources are VOLATILE: every argument is re-read from
++ * memory, defeating constant propagation and forcing the full staging. */
++NI static double f8(double a,double b,double c,double d,double e,double f,double g,double h)
++{ return a+b+c+d+e+f+g+h; }
++NI static double f9(double a,double b,double c,double d,double e,double f,double g,double h,double i)
++{ return a+b+c+d+e+f+g+h+i; }
++NI static double f10(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j)
++{ return a+b+c+d+e+f+g+h+i+j; }
++NI static double f11(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j,double k)
++{ return a+b+c+d+e+f+g+h+i+j+k; }
++NI static double f12(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j,double k,double l)
++{ return a+b+c+d+e+f+g+h+i+j+k+l; }
++NI static float g8(float a,float b,float c,float d,float e,float f,float g,float h)
++{ return a+b+c+d+e+f+g+h; }
++NI static float g9(float a,float b,float c,float d,float e,float f,float g,float h,float i)
++{ return a+b+c+d+e+f+g+h+i; }
++NI static float g10(float a,float b,float c,float d,float e,float f,float g,float h,float i,float j)
++{ return a+b+c+d+e+f+g+h+i+j; }
++/* Mixed GP+SSE: the classification interleaves IntReg and FloatReg. */
++NI static double m10(int p,double a,int q,double b,int r,double c,int s,double d,double e)
++{ return p+a+q+b+r+c+s+d+e; }
++/* Two-double struct: SSE-classified by eightbyte (StructSseReg), two
++ * registers per argument, stack overflow at arity 5. */
++typedef struct { double x, y; } dd;
++NI static double s3(dd a, dd b, dd c) { return a.x+a.y+b.x+b.y+c.x+c.y; }
++NI static double s5(dd a, dd b, dd c, dd d, dd e)
++{ return a.x+a.y+b.x+b.y+c.x+c.y+d.x+d.y+e.x+e.y; }
++/* The FMA-negation composition: the add-of-neg fold frees the multi-use
++ * negation into the peel while the staging runs (the shape that found
++ * the original defect). */
++NI static double neg9(double a,double b,double c,double d,double e,double f,double g,double h,double i)
++{ return -a + -b + -c + -d + -e + -f + -g + -h + -i; }
++NI static double fma_neg(double a, double b, double c)
++{ double n = -a; return __builtin_fma(n, b, c) + n; }
++/* Indirect call: the conservative path (no marker heuristics apply). */
++NI static double (*fpi)(double,double,double,double,double,double,double,double,double);
++/* Calls in a loop: cross-iteration staging, the liveness must hold at
++ * every iteration boundary. */
++NI static double loop9(volatile double *src, int n) {
++    double acc = 0.0;
++    for (int i = 0; i < n; i++)
++        acc += f9(src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7], src[8]);
++    return acc;
 +}
-+__attribute__((noinline)) static s128 srem_pow63(s128 x)
-+{
-+    return x % (s128)(((u128)1) << 63);
-+}
++NI static double mixld(double a, long double b, double c)
++{ return a + (double)b + c; }
 +
-+static unsigned long long bad;
-+static const char *what;
-+
-+static void check(const char *name, u128 got, u128 want)
-+{
-+    if (got != want) {
-+        bad++;
-+        if (bad == 1)
-+            what = name;
-+    }
-+}
-+
-+#define CHECK_REM(K, X) check("urem 2^" #K, urem_pow##K(X), (X) & (mask_k(K)))
-+#define CHECK_QUO(K, X) check("udiv 2^" #K, udiv_pow##K(X), (X) >> (K))
-+
-+static u128 mask_k(int k)
-+{
-+    return k >= 128 ? ~(u128)0 : ((((u128)1) << k) - 1);
-+}
-+
-+/* Dividends that straddle every bit position the divisors above can split:
-+ * values below, at and above each boundary, the all-ones word, a pattern with
-+ * both halves non-zero, and the exact multiples of the divisors. */
-+static const u128 cases[] = {
-+    0,
-+    1,
-+    2,
-+    3,
-+    ((u128)1 << 31) - 1,
-+    (u128)1 << 31,
-+    ((u128)1 << 32) - 1,
-+    (u128)1 << 32,
-+    ((u128)1 << 60) - 1,
-+    (u128)1 << 60,
-+    ((u128)1 << 63) - 1,
-+    (u128)1 << 63,
-+    (((u128)1 << 63) - 1) | ((u128)1 << 64),
-+    (u128)1 << 64,
-+    ((u128)1 << 64) + 1,
-+    ((u128)0x123456789ABCDEF0ULL << 64) | (u128)0xFEDCBA9876543210ULL,
-+    ((u128)1 << 100) - 1,
-+    (u128)1 << 100,
-+    ((u128)1 << 126) - 1,
-+    (u128)1 << 126,
-+    ((u128)1 << 127) - 1,
-+    (u128)1 << 127,
-+    ~(u128)0,
-+    ~(u128)0 - 1,
-+};
-+
-+int main(void)
-+{
-+    unsigned long long i;
-+
-+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-+        u128 x = cases[i];
-+
-+        CHECK_REM(1, x);
-+        CHECK_REM(31, x);
-+        CHECK_REM(32, x);
-+        CHECK_REM(60, x);
-+        CHECK_REM(62, x);
-+        CHECK_REM(63, x);
-+        CHECK_REM(64, x);
-+        CHECK_REM(65, x);
-+        CHECK_REM(96, x);
-+        CHECK_REM(100, x);
-+        CHECK_REM(126, x);
-+        CHECK_REM(127, x);
-+
-+        CHECK_QUO(1, x);
-+        CHECK_QUO(31, x);
-+        CHECK_QUO(32, x);
-+        CHECK_QUO(60, x);
-+        CHECK_QUO(62, x);
-+        CHECK_QUO(63, x);
-+        CHECK_QUO(64, x);
-+        CHECK_QUO(65, x);
-+        CHECK_QUO(96, x);
-+        CHECK_QUO(100, x);
-+        CHECK_QUO(126, x);
-+        CHECK_QUO(127, x);
-+
-+        /* Controls: the reference here is an independent libcall, so a
-+         * mismatch means the fold fired where it should not have. */
-+        check("urem 3", urem_3(x), x - (u128)3 * (x / (u128)3));
-+        check("urem 2^63+1", urem_pow63_plus1(x), x - ((((u128)1 << 63) + 1) * (x / (((u128)1 << 63) + 1))));
-+        check("urem 2^64+1", urem_pow64_plus1(x), x - ((((u128)1 << 64) + 1) * (x / (((u128)1 << 64) + 1))));
-+        /* Divisor 2^128-1 has a closed form independent of any division:
-+         * every x < 2^128-1 is already its own remainder, and the single
-+         * input that reaches the divisor maps to 0. */
-+        check("urem all-ones", urem_allones(x),
-+              (x == ~(u128)0) ? (u128)0 : x);
-+    }
-+
-+    /* Signed: result must match a sign-corrected reference. */
-+    {
-+        s128 v = (s128)(((u128)1 << 127) | (u128)0x5A5A5A5A5A5A5A5AULL);
-+        check("srem 2^64 (neg)", (u128)srem_pow64(-v), (u128)((-v) % ((s128)(((u128)1) << 64))));
-+        check("srem 2^63 (neg)", (u128)srem_pow63(-v), (u128)((-v) % ((s128)(((u128)1) << 63))));
-+        check("srem 2^64 (pos)", (u128)srem_pow64(v), (u128)(v % ((s128)(((u128)1) << 64))));
-+    }
-+
-+    if (bad) {
-+        printf("FAILED case=%s (%llu bad)\n", what, bad);
-+        return 1;
-+    }
-+    printf("ALL-OK (0 bad)\n");
++static double volsrc;
++volatile double varr[9];
++int main(int argc, char **argv) {
++    /* Opaque base: no constant folding of the argument values. */
++    double s = argc * 1.0 + 0.125;
++    volatile double vl = s;
++    for (int i = 0; i < 9; i++) varr[i] = s + i;
++    printf("%.17g %.17g %.17g %.17g %.17g\n",
++        f8(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7),
++        f9(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8),
++        f10(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8,vl+9),
++        f11(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8,vl+9,vl+10),
++        f12(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8,vl+9,vl+10,vl+11));
++    volsrc = s;
++    printf("%.9g %.9g %.9g\n",
++        g8((float)volsrc,(float)volsrc+1,(float)volsrc+2,(float)volsrc+3,
++           (float)volsrc+4,(float)volsrc+5,(float)volsrc+6,(float)volsrc+7),
++        g9((float)volsrc,(float)volsrc+1,(float)volsrc+2,(float)volsrc+3,
++           (float)volsrc+4,(float)volsrc+5,(float)volsrc+6,(float)volsrc+7,(float)volsrc+8),
++        g10((float)volsrc,(float)volsrc+1,(float)volsrc+2,(float)volsrc+3,
++            (float)volsrc+4,(float)volsrc+5,(float)volsrc+6,(float)volsrc+7,
++            (float)volsrc+8,(float)volsrc+9));
++    printf("%.17g\n", m10(argc, vl, argc+1, vl+1, argc+2, vl+2, argc+3, vl+3, vl+4));
++    dd A = { s, s+1 }, B = { s+2, s+3 }, C = { s+4, s+5 }, D = { s+6, s+7 }, E = { s+8, s+9 };
++    printf("%.17g %.17g\n", s3(A,B,C), s5(A,B,C,D,E));
++    printf("%.17g\n", neg9(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8));
++    printf("%.17g\n", fma_neg(vl, vl+1, vl+2));
++    fpi = f9;
++    printf("%.17g\n", fpi(vl,vl+1,vl+2,vl+3,vl+4,vl+5,vl+6,vl+7,vl+8));
++    printf("%.17g\n", loop9(varr, 3));
++    printf("%.17g\n", mixld(vl, (long double)vl + 0.5L, vl+1));
 +    return 0;
 +}
-diff --git a/tests/regression/i128_divrem_pow2.flags b/tests/regression/i128_divrem_pow2.flags
-new file mode 100644
-index 0000000..3a3b579
---- /dev/null
-+++ b/tests/regression/i128_divrem_pow2.flags
-@@ -0,0 +1 @@
-+-O2
-diff --git a/tests/regression/i128_mul_pow2.c b/tests/regression/i128_mul_pow2.c
-new file mode 100644
-index 0000000..b83c389
---- /dev/null
-+++ b/tests/regression/i128_mul_pow2.c
-@@ -0,0 +1,124 @@
-+/*
-+ * i128_mul_pow2.c -- 128-bit multiply by powers of two, the SIBLING consumer of
-+ * the widened `const_power_of_two` predicate.
-+ *
-+ * `const_power_of_two` feeds exactly two strength reductions:
-+ *
-+ *   x / 2^k  =>  x >> k          (UDiv,  a shift AMOUNT)
-+ *   x % 2^k  =>  x & (2^k - 1)   (URem,  a MASK)
-+ *   x * 2^k  =>  x << k          (Mul,   a shift AMOUNT)
-+ *
-+ * PR #595 widened the predicate's range to 2^127 without widening the one
-+ * consumer that builds a mask, and `x % 2^k` miscompiled for k >= 64 (see
-+ * i128_divrem_pow2.c).  This file covers the OTHER consumer, which carries a
-+ * shift amount rather than a mask and so was not affected -- the distinction
-+ * is exactly what the fix turns on, and it deserves a permanent guard rather
-+ * than a one-off verification.
-+ *
-+ * A shift amount is representable for every k the predicate can report
-+ * (k <= 127 fits an i64, and `const_power_of_two` masks to the type width so k
-+ * is always narrower than the type), so this path should never have been
-+ * wrong -- which is the point of testing it: if the two consumers ever get
-+ * conflated, or a mask construction is introduced here, this file fails.
-+ *
-+ * Coverage mirrors i128_divrem_pow2.c: literal divisors only (a runtime
-+ * divisor never reaches the fold), the 63/64 boundary, both 128-bit
-+ * signednesses, and controls at non-powers-of-two.
-+ */
++EOF_STAGING
 +
++if "$ORACLE" "${FLAGS[@]}" -o "$work/staging.oracle" "$work/staging.c" -lm 2>/dev/null; then
++    "$work/staging.oracle" > "$work/stg.oracle" 2>&1
++    stg_ok=1
++    for cf in "-O0" "-O1" "-O2" "-O2 -march=x86-64-v2" "-O2 -march=x86-64-v3" "-O3 -march=x86-64-v3" "-O2 -march=x86-64-v3 -ffp-contract=off"; do
++        # shellcheck disable=SC2086
++        if ! "$LCCC" $cf -o "$work/staging.lccc" "$work/staging.c" -lm 2>"$work/stg.err"; then
++            stg_ok=0; bad "staging.c did not compile with lccc at $cf:"; head -3 "$work/stg.err" | note; continue
++        fi
++        "$work/staging.lccc" > "$work/stg.lccc" 2>&1
++        if ! diff -q "$work/stg.lccc" "$work/stg.oracle" >/dev/null; then
++            stg_ok=0; bad "staging output differs from $ORACLE at $cf:"; diff "$work/stg.lccc" "$work/stg.oracle" | head -8 | note
++        fi
++    done
++    if [[ "$stg_ok" -eq 1 ]]; then
++        ok "call-argument staging bit-exact vs $ORACLE at 7 flag sets (volatile 8..12-ary f64/f32, mixed GP+SSE, SSE structs, neg compositions, indirect, loop, x87 mix)"
++    fi
++else
++    bad "reference compiler could not build staging.c"
++fi
++
++# ── B. the authority marker and the census lifecycle ────────────────────────
++"$LCCC" "${FLAGS[@]}" -S -o "$work/staging.s" "$work/staging.c" 2>/dev/null
++# Marker counts: every noinline 8-SSE-register call in the file publishes
++# CALL_FP 8 (f8..f12, g8..g10, neg9, the f9-in-loop site, the s5 struct
++# call, the indirect site — data-calibrated, >= 10 with margin for
++# devirtualisation), and the sub-8 arities are present with their exact
++# counts (m10's 5 doubles, mixld's 2, loop9's GP-only 0).
++n_fp8=$(grep -c '^    # LCCC_CALL_FP 8$' "$work/staging.s" || true)
++n_fp5=$(grep -c '^    # LCCC_CALL_FP 5$' "$work/staging.s" || true)
++n_fp2=$(grep -c '^    # LCCC_CALL_FP 2$' "$work/staging.s" || true)
++n_fp0=$(grep -c '^    # LCCC_CALL_FP 0$' "$work/staging.s" || true)
++if [[ "$n_fp8" -ge 10 && "$n_fp5" -ge 1 && "$n_fp2" -ge 1 && "$n_fp0" -ge 1 ]]; then
++    ok "# LCCC_CALL_FP published with exact counts (8 x$n_fp8 register-file calls, 5 x$n_fp5 mixed, 2 x$n_fp2 x87-mix, 0 x$n_fp0 GP-only)"
++else
++    bad "LCCC_CALL_FP marker counts wrong: fp8=$n_fp8 fp5=$n_fp5 fp2=$n_fp2 fp0=$n_fp0 (expected >=10, >=1, >=1, >=1)"
++fi
++# The census is DEAD-ELIMINATED for prototyped callees (the instruction win
++# that triggered the bug) and KEPT for variadic ones (SysV 3.5.7: printf
++# reads %al).  Both sides of the dead-write interaction are pinned.
++n_census=$(grep -cE '^[[:space:]]*movb \$[1-8], %al$' "$work/staging.s" || true)
++n_printf=$(grep -c 'call printf@PLT' "$work/staging.s" || true)
++if [[ "$n_census" -eq "$n_printf" ]]; then
++    ok "the movb census survives exactly at the $n_printf variadic call(s) and is dead-eliminated at every prototyped callee"
++else
++    bad "census lifecycle: $n_census movb vs $n_printf printf calls (the census must survive ONLY at variadic sites)"
++fi
++
++# ── C. staging survival: all eight registers written in the f10 window ──────
++# The original defect: f10's STAGING (in main, the caller) lost 7 of 8
++# register writes.  Extract the contiguous window above the f10 call in
++# main — everything after the last arithmetic line (vaddsd/vmulsd/vcvtsi*/
++# x87 constant synthesis) within 40 lines of the call — and require the
++# staging-class moves in it to write every SSE argument register.  The
++# call text is `call f10` (same-TU static callee: no PLT).
++window=$(grep -B40 -E 'call f10(@PLT)?$' "$work/staging.s" \
++    | awk '/vaddsd|vmulsd|vcvtsi|vxorpd|fnmadd|fmadd|fld|fst|movabsq/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }')
++staged=$(printf '%s\n' "$window" \
++    | grep -oE '^    (movq %rax, %xmm[0-7]|movsd %xmm[0-9]+, %xmm[0-7]|movsd? [^,]+, %xmm[0-7])$' \
++    | grep -oE '%xmm[0-7]$' | sort -u | wc -l)
++if [[ "$staged" -eq 8 ]]; then
++    ok "the 10-argument volatile call stages all 8 SSE argument registers (the exact shape the bug deleted)"
++else
++    bad "f10 staging window writes only $staged of 8 SSE argument registers"
++    printf '%s\n' "$window" | tail -25 | note
++fi
++# No FP argument routed through a GPR sign mask INSIDE the staging window
++# (the other face of a lost staging: the value rebuilt through movabsq).
++# Scoped to the window: x87 constant synthesis elsewhere in the file
++# legitimately stages sign/exponent bits through GP registers.
++n_gpr_mask=$(printf '%s\n' "$window" \
++    | grep -cE 'movabsq \$-9223372036854775808|xorl \$0x80000000, %eax' || true)
++if [[ "$n_gpr_mask" -eq 0 ]]; then
++    ok "no FP argument routed through a GPR sign mask in the staging window"
++else
++    bad "$n_gpr_mask GPR sign-mask materialisations inside the f10 staging window"
++fi
++
++echo
++echo "call-argument staging gate: PASS=$pass FAIL=$fail SKIP=$skip"
++[[ "$fail" -eq 0 ]] || exit 1
++exit 0
+diff --git a/tests/regression/check_lea_hoist_rorx.sh b/tests/regression/check_lea_hoist_rorx.sh
+new file mode 100755
+index 00000000..75ec7044
+--- /dev/null
++++ b/tests/regression/check_lea_hoist_rorx.sh
+@@ -0,0 +1,277 @@
++#!/usr/bin/env bash
++# Loop-invariant LEA hoisting + direct 3-operand RORX: two loop-body
++# instruction-quality contracts, each born from a worst-15 benchmark gap.
++#
++# WHY THIS EXISTS
++#
++# sha256_transform measured 1.20x slower than gcc, and the loop bodies
++# carried two classes of pure waste:
++#
++#   1. The rip-relative global-address rematerialization: the K-table load
++#      `leaq K(%rip), %rcx; movl (%rcx, %r10, 4), ...` paid the LEA EVERY
++#      round.  RIP-relative addressing takes no index register, so the base
++#      cannot fold into the memory operand — only hoisting removes it.  The
++#      IR-level LICM hoists GlobalAddrs when it can, but under register
++#      pressure the RA rematerializes them into the loop; the peephole-level
++#      hoist (hoist_loop_invariant_gpr_load's LEA candidate class) sees the
++#      FINAL addressing form and hoists only what actually materialized.
++#      A guarded (fall-through-entry) loop cannot use the load path's
++#      jmp-replacement placement (a LOAD would execute on zero-trip paths
++#      and may fault) — a PURE LEA may: the insertion lands after the
++#      guard's conditional, before the alignment directives, so the loop's
++#      .p2align stays adjacent to the header label exactly.
++#
++#   2. The RORX staging dance: BMI2 RORX is NON-DESTRUCTIVE (3-operand),
++#      but the rotate emitter staged its lhs into the destination with a
++#      full 64-bit `movq` first (`movq %r14, %rbp; rorxl $25, %ebp, %ebp`).
++#      A fresh register home can be read in place: `rorxl $25, %r14d, %ebp`
++#      — the typed view reads the low 32 bits and the write fully defines
++#      the destination.  sha256's sigma functions paid three dead moves per
++#      round.
++#
++# This gate pins: the hoisted LEA's placement (outside the loop, the
++# alignment directives still adjacent to the header), the zero-trip safety
++# (a guarded loop whose body never runs still computes its correct result),
++# the direct RORX form (no register-to-register `movq` immediately staging
++# a `rorxl`), and runtime equality with the reference compiler at both
++# BMI2 and baseline levels.
++#
++# Usage:
++#   tests/regression/check_lea_hoist_rorx.sh
++# Environment:
++#   LCCC            compiler to test (default: target/fastbuild/lccc)
++#   CCC_ORACLE_CC   reference compiler (default: cc, gcc or clang)
++set -uo pipefail
++
++repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++cd "$repo_root"
++
++LCCC=${LCCC:-target/fastbuild/lccc}
++[[ "$LCCC" == /* ]] || LCCC="$repo_root/$LCCC"
++[[ -x "$LCCC" ]] || { echo "FAIL: no compiler at $LCCC" >&2; exit 1; }
++ORACLE=${CCC_ORACLE_CC:-}
++if [[ -z "$ORACLE" ]]; then
++    for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { ORACLE=$c; break; }; done
++fi
++[[ -n "$ORACLE" ]] || { echo "FAIL: no reference compiler found" >&2; exit 1; }
++
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++pass=0; fail=0; skip=0
++note() { printf '  %s\n' "$*"; }
++ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
++bad()  { fail=$((fail+1)); printf 'FAIL %s\n' "$*"; }
++skipped() { skip=$((skip+1)); printf 'skip %s\n' "$*"; }
++
++# ── A. the K-table shape: LEA hoisted, alignment preserved ──────────────────
++cat > "$work/ktab.c" <<'EOF_K'
 +#include <stdio.h>
-+
-+typedef unsigned __int128 u128;
-+
-+/* One noinline wrapper per factor so the factor stays a literal. */
-+#define GEN(K)                                                          \
-+    __attribute__((noinline)) static u128 mul_pow##K(u128 x)            \
-+    {                                                                   \
-+        return x * (((u128)1) << (K));                                  \
-+    }
-+
-+GEN(1) GEN(2) GEN(8) GEN(31) GEN(32) GEN(62) GEN(63) GEN(64) GEN(65) GEN(96) \
-+GEN(100) GEN(126) GEN(127)
-+
-+/* Not powers of two: the fold must not fire.  The reference for these is the
-+ * defining shift identity, so a mismatch means the fold fired wrongly. */
-+#define GEN_CTRL(NAME, F)                                               \
-+    __attribute__((noinline)) static u128 NAME(u128 x) { return x * (F); }
-+
-+GEN_CTRL(mul_3, 3)
-+GEN_CTRL(mul_6, 6)
-+GEN_CTRL(mul_pow63_plus1, (((u128)1) << 63) + 1)
-+GEN_CTRL(mul_pow64_plus1, (((u128)1) << 64) + 1)
-+
-+static unsigned long long bad;
-+static const char *what;
-+
-+static void check(const char *name, u128 got, u128 want)
-+{
-+    if (got != want) {
-+        bad++;
-+        if (bad == 1)
-+            what = name;
-+    }
++static const unsigned K[64] = {
++    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
++    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
++    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
++    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
++    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
++/* The guarded 64-round loop over a rip-relative table with a scaled-index
++ * load — the sha256 compression shape (fall-through entry, so the load
++ * path's jmp-replacement placement does not apply: only the pure LEA
++ * candidate may hoist). */
++unsigned rounds(unsigned x, unsigned n) {
++    unsigned s = 0;
++    for (unsigned i = 0; i < n; i++)
++        s += K[i & 63] + (x >> ((i & 7) + 1));
++    return s;
 +}
-+
-+#define C(K, X) check("mul 2^" #K, mul_pow##K(X), (X) << (K))
-+
-+int main(void)
-+{
-+    /* Values that place set bits on both sides of every boundary above, and
-+     * the extremes.  The modular identities below are the oracle: for a
-+     * power-of-two factor the product is exact, and for the non-power-of-two
-+     * controls the product is checked against repeated shifting, which is an
-+     * independent formulation. */
-+    static const u128 cases[] = {
-+        0,
-+        1,
-+        2,
-+        3,
-+        (u128)1 << 31,
-+        ((u128)1 << 32) - 1,
-+        (u128)1 << 32,
-+        ((u128)1 << 63) - 1,
-+        (u128)1 << 63,
-+        ((u128)0x0123456789ABCDEFULL << 64) | (u128)0xFEDCBA9876543210ULL,
-+        (u128)1 << 64,
-+        ((u128)1 << 100) - 1,
-+        (u128)1 << 126,
-+        (u128)1 << 127,
-+    };
-+    unsigned long long i;
-+
-+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-+        u128 x = cases[i];
-+
-+        C(1, x);
-+        C(2, x);
-+        C(8, x);
-+        C(31, x);
-+        C(32, x);
-+        C(62, x);
-+        C(63, x);
-+        C(64, x);
-+        C(65, x);
-+        C(96, x);
-+        C(100, x);
-+        C(126, x);
-+        C(127, x);
-+
-+        /* Controls, referenced by repeated doubling instead of a shift. */
-+        check("mul 3", mul_3(x), x + x + x);
-+        check("mul 6", mul_6(x), (x + x + x) + (x + x + x));
-+        check("mul 2^63+1", mul_pow63_plus1(x),
-+              (x << 63) + x);
-+        check("mul 2^64+1", mul_pow64_plus1(x),
-+              (x << 64) + x);
-+    }
-+
-+    if (bad) {
-+        printf("FAILED case=%s (%llu bad)\n", what, bad);
-+        return 1;
-+    }
-+    printf("ALL-OK (0 bad)\n");
++/* Zero-trip safety: the hoisted LEA sits after the guard's conditional;
++ * when the loop body never runs the result must be exactly the identity. */
++unsigned zero_trip(void) { return rounds(0xdeadbeef, 0); }
++int main(void) {
++    printf("%u %u\n", rounds(0x13572468u, 64 * 3), zero_trip());
 +    return 0;
 +}
-diff --git a/tests/regression/i128_mul_pow2.flags b/tests/regression/i128_mul_pow2.flags
-new file mode 100644
-index 0000000..3a3b579
---- /dev/null
-+++ b/tests/regression/i128_mul_pow2.flags
-@@ -0,0 +1 @@
-+-O2
++EOF_K
++
++"$LCCC" -O2 -march=x86-64-v3 -S -o "$work/ktab.s" "$work/ktab.c" 2>/dev/null
++# The hoisted LEA: outside the loop body.  Find the loop (the label whose
++# block contains the K load) and require no `leaq K(%rip)` inside it, and
++# exactly one before it in the function.
++# Extract each loop (label .. its backedge jump) by label matching,
++# and count leaq K inside.
++leaks=$(python3 - "$work/ktab.s" <<'EOF_PY'
++import re, sys
++lines = open(sys.argv[1]).read().splitlines()
++# find labels and jumps
++labels = {l.strip()[:-1]: i for i, l in enumerate(lines) if re.match(r'^\.L\w+:$', l)}
++loops = []
++for i, l in enumerate(lines):
++    m = re.match(r'^\s*j\w+\s+(\.L\w+)$', l)
++    if m and m.group(1) in labels and labels[m.group(1)] < i:
++        loops.append((labels[m.group(1)], i))
++bad = 0
++for start, end in loops:
++    for i in range(start, end + 1):
++        if re.match(r'^\s*leaq K\(%rip\)', lines[i]):
++            bad += 1
++print(bad)
++EOF_PY
++)
++total_lea=$(grep -cE '^\s*leaq K\(%rip\)' "$work/ktab.s" || true)
++if [[ "$leaks" -eq 0 && "$total_lea" -ge 1 ]]; then
++    ok "the K-table LEA is hoisted out of the loop ($total_lea materialisation, 0 inside loop bodies)"
++else
++    bad "K-table LEA hoisting: $leaks in-loop materialisations remain ($total_lea file-wide)"
++fi
++# Alignment preservation: the .p2align directives must still immediately
++# precede the loop's header label (the insertion placed the LEA BEFORE the
++# directive run, not between the directives and the label).
++align_ok=$(python3 - "$work/ktab.s" <<'EOF_PY'
++import re, sys
++lines = open(sys.argv[1]).read().splitlines()
++ok = True
++for i, l in enumerate(lines):
++    if re.match(r'^\.L\w+:$', l) and i > 0:
++        # the header of a loop (has a backedge somewhere below)
++        j = i + 1
++        # find a backedge to this label within 400 lines
++        lab = l.strip()[:-1]
++        has_backedge = any(
++            re.match(r'^\s*j\w+\s+' + re.escape(lab) + r'$', x) for x in lines[i:i+400]
++        )
++        if has_backedge and i > 1:
++            # the nearest preceding non-empty line must be .p2align or the LEA-after-guard shape
++            k = i - 1
++            while k >= 0 and not lines[k].strip():
++                k -= 1
++            prev = lines[k].strip()
++            if not (prev.startswith('.p2align')):
++                # acceptable: the hoisted LEA directly before the label when
++                # the loop had no alignment directives to begin with
++                if not prev.startswith('leaq'):
++                    ok = False
++print("1" if ok else "0")
++EOF_PY
++)
++if [[ "$align_ok" == "1" ]]; then
++    ok "loop alignment directives remain adjacent to header labels (the insertion placed the LEA before the directive run)"
++else
++    bad "an alignment directive was displaced from its header label"
++fi
++# Zero-trip + runtime equality at three flag sets.
++if "$ORACLE" -O2 -march=x86-64-v3 -o "$work/ktab.oracle" "$work/ktab.c" 2>/dev/null; then
++    "$work/ktab.oracle" > "$work/ktab.oracle.txt" 2>&1
++    okall=1
++    for cf in "-O2" "-O2 -march=x86-64-v3" "-O3 -march=x86-64-v3"; do
++        # shellcheck disable=SC2086
++        if ! "$LCCC" $cf -o "$work/ktab.lccc" "$work/ktab.c" 2>/dev/null; then
++            okall=0; bad "ktab.c did not compile at $cf"; continue
++        fi
++        "$work/ktab.lccc" > "$work/ktab.lccc.txt" 2>&1
++        diff -q "$work/ktab.lccc.txt" "$work/ktab.oracle.txt" >/dev/null \
++            || { okall=0; bad "ktab output differs from $ORACLE at $cf"; }
++    done
++    [[ "$okall" -eq 1 ]] && ok "K-table loop bit-exact vs $ORACLE at 3 flag sets (incl. the zero-trip identity)"
++else
++    bad "reference compiler could not build ktab.c"
++fi
++
++# ── B. the direct 3-operand RORX ────────────────────────────────────────────
++cat > "$work/rotx.c" <<'EOF_R'
++#include <stdio.h>
++unsigned rot_r(unsigned x) { return (x >> 11) | (x << 21); }
++unsigned rot_l(unsigned x) { return (x << 11) | (x >> 21); }
++unsigned chain(unsigned x) {
++    unsigned a = (x >> 6) | (x << 26);
++    unsigned b = (a >> 11) | (a << 21);
++    return (b >> 25) | (b << 7);
++}
++int main(void) { printf("%u %u %u\n", rot_r(0x12345678u), rot_l(0x9abcdef0u), chain(0x0f0f0f0fu)); return 0; }
++EOF_R
++"$LCCC" -O2 -march=x86-64-v3 -S -o "$work/rotx.s" "$work/rotx.c" 2>/dev/null
++# No `movq %rA, %rB` immediately staging a same-register `rorxl $k, %rBd, %rBd`.
++staged=$(python3 - "$work/rotx.s" <<'EOF_PY'
++import re, sys
++lines = [l.strip() for l in open(sys.argv[1]).read().splitlines()]
++bad = 0
++for i in range(len(lines) - 1):
++    m1 = re.match(r'^movq %(\w+), %(\w+)$', lines[i])
++    m2 = re.match(r'^rorx[lq] \$\d+, %(\w+), %(\w+)$', lines[i + 1])
++    if m1 and m2 and m1.group(2) == m2.group(1) == m2.group(2):
++        bad += 1
++print(bad)
++EOF_PY
++)
++nrorx=$(grep -cE '^\s*rorx[lq] ' "$work/rotx.s" || true)
++if [[ "$staged" -eq 0 && "$nrorx" -ge 4 ]]; then
++    ok "RORX reads fresh register homes directly ($nrorx three-operand forms, 0 staged movq+same-reg dances)"
++else
++    bad "RORX staging: $staged movq-staged forms remain ($nrorx rorx total)"
++fi
++if "$ORACLE" -O2 -march=x86-64-v3 -o "$work/rotx.oracle" "$work/rotx.c" 2>/dev/null; then
++    "$work/rotx.oracle" > "$work/rotx.oracle.txt" 2>&1
++    "$LCCC" -O2 -march=x86-64-v3 -o "$work/rotx.lccc" "$work/rotx.c" 2>/dev/null
++    "$work/rotx.lccc" > "$work/rotx.lccc.txt" 2>&1
++    if diff -q "$work/rotx.lccc.txt" "$work/rotx.oracle.txt" >/dev/null; then
++        ok "rotate idioms bit-exact vs $ORACLE"
++    else
++        bad "rotate idiom output differs from $ORACLE"
++    fi
++else
++    bad "reference compiler could not build rotx.c"
++fi
++
++# ── C. the guarded-loop insertion end to end: sha256's compression ─────────
++if [[ -f tests/benchmark/programs/sha256_transform.c ]]; then
++    "$LCCC" -O2 -march=x86-64-v3 -S -o "$work/sha.s" tests/benchmark/programs/sha256_transform.c 2>/dev/null
++    inloop=$(python3 - "$work/sha.s" <<'EOF_PY'
++import re, sys
++lines = open(sys.argv[1]).read().splitlines()
++labels = {l.strip()[:-1]: i for i, l in enumerate(lines) if re.match(r'^\.L\w+:$', l)}
++backedges = []
++for i, l in enumerate(lines):
++    m = re.match(r'^\s*j\w+\s+(\.L\w+)$', l)
++    if m and m.group(1) in labels and labels[m.group(1)] < i:
++        backedges.append((labels[m.group(1)], i))
++# Innermost loop around each K-indexed load must not re-materialise the
++# base (one-level-up placement inside an enclosing loop is legitimate).
++loads = [i for i, l in enumerate(lines) if re.match(r'^\s*movl?\s+\(%r\w+, %r\w+d\)', l)]
++bad = 0
++for li in loads:
++    inner = min(
++        ((s, e) for s, e in backedges if s <= li <= e),
++        key=lambda se: se[1] - se[0],
++        default=None,
++    )
++    if inner is None:
++        continue
++    for k in range(inner[0], inner[1] + 1):
++        if re.match(r'^\s*leaq K\(%rip\)', lines[k]):
++            bad += 1
++print(bad)
++EOF_PY
++    )
++    if [[ "$inloop" -eq 0 ]]; then
++        ok "sha256_transform's K-table LEA hoisted out of the 64-round loop"
++    else
++        bad "sha256_transform still materialises the K-table inside the loop ($inloop sites)"
++    fi
++    "$LCCC" -O2 -march=x86-64-v3 -o "$work/sha.lccc" tests/benchmark/programs/sha256_transform.c 2>/dev/null
++    "$ORACLE" -O2 -march=x86-64-v3 -o "$work/sha.oracle" tests/benchmark/programs/sha256_transform.c 2>/dev/null
++    "$work/sha.lccc" > "$work/sha.l.txt" 2>&1
++    "$work/sha.oracle" > "$work/sha.o.txt" 2>&1
++    if diff -q "$work/sha.l.txt" "$work/sha.o.txt" >/dev/null; then
++        ok "sha256_transform bit-exact vs $ORACLE with the hoist"
++    else
++        bad "sha256_transform output differs from $ORACLE"
++    fi
++else
++    skipped "no sha256_transform.c in the tree"
++fi
++
++echo
++echo "lea-hoist/rorx gate: PASS=$pass FAIL=$fail SKIP=$skip"
++[[ "$fail" -eq 0 ]] || exit 1
++exit 0
+diff --git a/tests/regression/check_vector_copy_elimination.sh b/tests/regression/check_vector_copy_elimination.sh
+index 012d299e..df5491f4 100644
+--- a/tests/regression/check_vector_copy_elimination.sh
++++ b/tests/regression/check_vector_copy_elimination.sh
+@@ -454,9 +454,14 @@ EOF
+     NI static double b_named(double a, double b, double c) { double na = -a, nc = -c; return __builtin_fma(na, b, nc); }
+     NI static double b_chainneg(double a, double b, double c) { return __builtin_fma(-(-a), b, c); }
+     NI static float b_nmsubf(float a, float b, float c) { return __builtin_fmaf(-a, b, -c); }
+-    /* negative control: the negation has a SECOND consumer (the return
+-     * reads n again), so the single-use discipline must keep it
+-     * materialised — exactly one vxorpd in the whole file below. */
++    /* composition control (ADVANCED with the add-of-neg fold): the
++     * negation still has a SECOND consumer (the return reads n again),
++     * but x + (neg y) => x - y folds the tail into a subtraction of a,
++     * the freed negation's last reader is the fma, and the peel absorbs
++     * it — ZERO vxorpd, vfnmadd + vsubsd, gcc's exact instruction pair
++     * (measured: gcc -O2 -march=x86-64-v3 emits vfnmadd132sd + vsubsd
++     * for this shape).  This pin is the fold's multi-use adjudication
++     * record: every oracle in the competition set folds unconditionally. */
+     NI static double b_shared_neg(double a, double b, double c) { double n = -a; return __builtin_fma(n, b, c) + n; }
+     NI static double b_madd_p(double a, double b, const double *p) { return __builtin_fma(a, b, *p); }
+     NI static double b_madd_pm(double a, const double *p, double c) { return __builtin_fma(*p, a, c); }
+@@ -667,20 +672,27 @@ EOF_ALGEBRA
+         if [[ "$one_insn_ok" -eq 1 ]]; then
+             ok "all 35 straight-line FMA kernels are exactly one instruction plus ret (gcc parity, builtin sign variants included)"
+         fi
+-        # Anti-vacuity for the operand-negation peel: the ONLY materialised
+-        # negation in any kernel body is the multi-use control's (its Neg
+-        # feeds the fma AND the return, so single-use discipline must keep
+-        # it).  main's reference computations also negate (-a, -b_madd) and
+-        # are outside the kernel bodies by construction.  A peel regression
+-        # grows the count; a wrongly eager peel that broke the control would
+-        # shrink it to 0.
+-        nxor=$(fnbody "$work/fma_algebra.s" b_shared_neg | grep -cE '^vxorp[ds][[:space:]]' || true)
+-        nxor_all=$(grep -cE '^[[:space:]]*vxorp[ds][[:space:]]' "$work/fma_algebra.s" || true)
+-        if [[ "$nxor" -eq 1 ]]; then
+-            ok "exactly one materialised negation survives in the kernels: the multi-use control (operand-negation peel anti-vacuity)"
++        # Anti-vacuity for the operand-negation peel + the add-of-neg
++        # fold, ADVANCED to the composed truth: b_shared_neg's negation
++        # has a second consumer (the return reads n again), and the fold
++        # x + (neg y) => x - y turns the tail into a subtraction of a —
++        # the freed negation dies into the fma, the peel absorbs it, and
++        # the kernel is gcc's exact pair: one vfnmadd-family instruction
++        # plus one vsubsd, ZERO materialised sign masks (gcc -O2 -march=
++        # x86-64-v3: vfnmadd132sd + vsubsd).  main's reference
++        # computations also negate (-a, -b_madd) and are outside the
++        # kernel bodies by construction.  A fold or peel regression
++        # grows the xor count back; a wrongly eager peel on the OTHER
++        # kernels breaks the 35-kernel one-instruction check above.
++        bsn_body=$(fnbody "$work/fma_algebra.s" b_shared_neg)
++        nxor=$(printf '%s\n' "$bsn_body" | grep -cE '^vxorp[ds][[:space:]]' || true)
++        nfnm=$(printf '%s\n' "$bsn_body" | grep -cE '^vfnmadd[0-9]*sd[[:space:]]' || true)
++        nsub=$(printf '%s\n' "$bsn_body" | grep -cE '^vsubsd[[:space:]]' || true)
++        if [[ "$nxor" -eq 0 && "$nfnm" -eq 1 && "$nsub" -eq 1 ]]; then
++            ok "b_shared_neg composes to gcc's exact pair (vfnmadd + vsubsd, zero sign masks — the add-of-neg fold frees the multi-use negation for the peel)"
+         else
+-            bad "b_shared_neg should keep exactly 1 vxorpd (multi-use control), found $nxor of $nxor_all file-wide — the operand-negation peel regressed or over-fired"
+-            fnbody "$work/fma_algebra.s" b_shared_neg | note
++            bad "b_shared_neg should be vfnmadd+vsubsd with 0 vxorpd (the fold/peel composition), found xor=$nxor vfnmadd=$nfnm vsubsd=$nsub"
++            printf '%s\n' "$bsn_body" | note
+         fi
+     fi
+ 
+@@ -976,14 +988,24 @@ EOF_NEGATE
+             ok "negation kernel bit-exact vs $ORACLE on $(grep -c . "$work/neg.oracle") lines at 7 flag sets (-O0..-O3, v2/v3, contract)"
+         fi
+         # Anti-vacuity: the v3 build must use the xor form and never the GPR
+-        # round trip for a scalar negate.
++        # round trip for a scalar negate.  ADVANCED to the post-fold truth:
++        # exactly 17 rip-mask xors — every remaining site is semantically
++        # REQUIRED (a returned negation, a negation read by a non-foldable
++        # consumer, or n_many's leading term).  The folds that got us here,
++        # each GCC-verified: n_twice (neg-of-neg) folds to NOTHING; n_many
++        # (-a + -b + ... + -i, 9 negations) folds to ONE vxorpd + 8 vsubsd
++        # — gcc's exact shape for the same source; n_mul_sub and nf_fma ride
++        # the signed-FMA families (vfnmsub, zero xors); n_a_mul's product
++        # negation is the known residual (gcc folds it; follow-up list).
++        # Any future fold that retires another negation advances this pin in
++        # the same commit — the house style for exact-shape pins.
+         "$LCCC" -O2 -march=x86-64-v3 -S -o "$work/negate.s" "$work/negate.c" 2>/dev/null
+         n_xor=$(grep -cE '^[[:space:]]*vxorp[sd] \.LCFP_[0-9]+\(%rip\)' "$work/negate.s" || true)
+         n_gpr=$(grep -cE 'movabsq \$-9223372036854775808|xorl \$0x80000000, %eax' "$work/negate.s" || true)
+-        if [[ "$n_xor" -ge 20 && "$n_gpr" -eq 0 ]]; then
+-            ok "every scalar negate is an XMM-domain xor ($n_xor sites, 0 GPR sign-mask round trips)"
++        if [[ "$n_xor" -eq 17 && "$n_gpr" -eq 0 ]]; then
++            ok "every scalar negate is an XMM-domain xor ($n_xor required sites, 0 GPR sign-mask round trips; n_twice folds to nothing, n_many to gcc's 1-vxor+8-vsub shape)"
+         else
+-            bad "negate lowering: $n_xor xor sites, $n_gpr GPR round trips (expected >= 20 and 0)"
++            bad "negate lowering: $n_xor xor sites, $n_gpr GPR round trips (expected exactly 17 and 0 — a fold retired a negation without advancing the pin, or the lowering regressed)"
+         fi
+     else
+         skipped "reference compiler could not build negate.c"
+diff --git a/tests/regression/check_vectorize_isa_gate.sh b/tests/regression/check_vectorize_isa_gate.sh
+index f0837f13..ddb1b756 100644
+--- a/tests/regression/check_vectorize_isa_gate.sh
++++ b/tests/regression/check_vectorize_isa_gate.sh
+@@ -169,17 +169,21 @@ for flag in "-mno-avx2" "-march=x86-64-v3 -mno-avx2"; do
+           | grep -cE '\bvfnm(add|sub)[0-9]*p?sd\b' || true)" 1
+     # chain_pin: the site reads the OUTER negation, the INNER is pinned by
+     # the add. The neg-of-neg fold rewrites the outer link (-t where
+-    # t = -x) to x directly, so the fma takes the PLAIN family reading x:
+-    # ONE sign mask (the pinned inner, still materialised for the add) and
+-    # one vfmadd (GCC's family; GCC goes one further with r + (-x) -> r - x,
+-    # dropping the mask entirely -- the float add-of-neg fold is a
+-    # designed follow-up, NaN-sign-latitude analysis required).
+-    check_eq "$flag: pinned-inner chain keeps exactly one sign mask" \
++    # t = -x) to x directly, so the fma takes the PLAIN family reading x;
++    # the float add-of-neg fold then rewrites the add (r + t) to r - x,
++    # which kills the pinned inner's last reader: ZERO sign masks, one
++    # vfmadd and one vsub -- GCC's exact instruction pair (oracle: gcc
++    # emits vfmadd132sd + vsubsd; the remaining delta is the staging
++    # move, the destructive-form dst-preference follow-up).
++    check_eq "$flag: pinned-inner chain needs no sign mask (both folds)" \
+         "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
+-          | grep -cE '\bv?xorpd\b' || true)" 1
++          | grep -cE '\bv?xorpd\b' || true)" 0
+     check_eq "$flag: pinned-inner chain folds to one plain vfmadd" \
+         "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
+           | grep -cE '\bvfmadd[0-9]*p?sd\b' || true)" 1
++    check_eq "$flag: pinned-inner chain's add is a subtraction (r - x)" \
++        "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
++          | grep -cE '\bvsubsd\b' || true)" 1
+ done
+ 
+ # ---- 4c. fma implies vex: the explicit -mfma target classes ---------------
+diff --git a/tests/regression/fma_isa_gate.c b/tests/regression/fma_isa_gate.c
+index 680f3ab0..b7242613 100644
+--- a/tests/regression/fma_isa_gate.c
++++ b/tests/regression/fma_isa_gate.c
+@@ -43,11 +43,11 @@ double signed_np_na(double a, double b, double c) { return __builtin_fma(-a, b,
+  * reader keeps both links -- stays pinned by the unit test
+  * chained_negation_with_surviving_outer_reader_is_never_deleted.)
+  * `chain_pin`: the INNER negation is pinned by the add, the site reads the
+- * OUTER -- which the fold rewrites to x directly, so the fma takes the
+- * PLAIN family: ONE sign mask (the pinned inner) and one vfmadd. GCC drops
+- * the mask too (r + (-x) -> r - x); that float add-of-neg fold is a
+- * designed follow-up. Both live BEFORE shared_neg so the per-function sed
+- * ranges below stay disjoint.
++ * OUTER -- which the neg-of-neg fold rewrites to x directly (PLAIN
++ * family), and the float add-of-neg fold then rewrites the add itself
++ * (r + t, t = -x) to r - x, killing the inner's last reader: ZERO sign
++ * masks, vfmadd + vsub -- GCC's exact pair. Both live BEFORE shared_neg
++ * so the per-function sed ranges below stay disjoint.
+  */
+ double chain_live(double x, double b, double c)
+ {
