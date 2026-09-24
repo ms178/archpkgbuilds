@@ -1,0 +1,2931 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index ee4c6cf..fed4f3c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -394,6 +394,15 @@ jobs:
+           CCC: target/fastbuild/lccc
+         run: bash tests/regression/check_nbody_rbtree_perf_shapes.sh
+ 
++      # linux_find_bit: the inliner's bounded-tier clone-growth budget must
++      # admit the three-site kernel clone (two cold self-test calls + one
++      # hot in-loop call) that GCC/Clang/ICX all inline, and the inlined
++      # shape must keep the tzcnt + andn idiom distillations.
++      - name: Verify linux_find_bit inlining contract
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_findbit_inline.sh
++
+       # Cross-PR interaction red-team (session 574): the per-feature gates
+       # pin each PR's own contract; this one pins the INTERACTIONS between
+       # the last ten merged PRs — FMA families through copy brackets, calls
+diff --git a/engineering/FOLLOWUP-2026-09-23D-bmi-v3-default-sha256-fusion-and-audit-p0.md b/engineering/FOLLOWUP-2026-09-23D-bmi-v3-default-sha256-fusion-and-audit-p0.md
+new file mode 100644
+index 0000000..e847303
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-23D-bmi-v3-default-sha256-fusion-and-audit-p0.md
+@@ -0,0 +1,118 @@
++# Follow-up S01/S02 — BMI v3 default, sha256 fusion resurrection, and Review-AI audit P0 hardening
++
++Session date: 2026-09-23. Base: upstream `b228995` (main unchanged this
++session). Start of turn: the EPYC 9V45 benchmark report showed geomean
++0.6945 (LCCC ahead overall) but chacha20_block 2.19× and sha256_transform
++1.32× regressions; Review-AI audit of PR #604 in hand (verdict 8.0/10,
++findings F1–F10). End of turn: snapshot S02 — BMI v3 default fix plus the
++two list-drift fusion fixes measured as a sha256 WIN on Intel (0.966), all
++P0 audit items landed with tests, ch-maj gate re-pinned.
++
++## 1. PRIMARY: the EPYC regressions
++
++### chacha20_block 2.1914 — diagnosed, NOT fixed this session (structural)
++
++- PR #604 EXONERATED: the benchmark predates it (added by PR #512); the
++  ARX vectorizer path involved shipped before #604 and is not regressed
++  by it.
++- Root cause: the ARX vectorizer's cost model counts instructions only.
++  On Zen5 the vector-int ALU runs at 3 cycles/issue vs 1 cycle scalar,
++  so the vectorized chacha quarter-round loses ~2× despite fewer
++  instructions. The scalar fallback is ALSO broken: `live_range.rs`
++  structural auto-arming + `MAX_SPAN_REMCOST=100` force ~24
++  store-forwarded reloads per round (148-insn loop vs GCC's 130).
++- Decision: keep the vector default (fixing scalar breaks Raptor Lake
++  tuning; flipping the default is not justified). The scalar fix is a
++  register-residency rework — multi-session work, not a patch.
++
++### sha256_transform 1.32 — ROOT-CAUSED AND FIXED (the big find)
++
++Symptom under the restored BMI default: the two K/W `addl mem,%r15d`
++fusions of the compression loop vanished (paired new/base = 1.088 on
++Raptor Lake — a regression introduced BY enabling BMI).
++
++Root cause: **two independent dest-only mnemonic lists had drifted, and
++both were missing `rorx`:**
++
++1. `peephole/passes/helpers.rs` — `is_read_modify_write` (fix alone
++   insufficient: still 1.017, zero fused adds).
++2. `peephole/passes/liveness.rs` — `is_pure_write_mnemonic` (the
++   decisive one). Its unknown-mnemonic model is *read-all-mentioned,
++   write-nothing*, so every `rorxl` was treated as a phantom READ of its
++   own destination; the K/W register family stayed "live", the fusion
++   gate `live_after == Some(false)` failed, and load-op fusion declined.
++
++Fix: `rorx` added to both lists; the liveness list also gained the rest
++of the BMI dest-only class (`andn bzhi bextr pext pdep blsr blsi
++blsmsk`). `mulx` is deliberately OUT (implicit %rdx read + two dests).
++Cross-reference comments now tie the two lists together — this is the
++exact bug class the reviewer's F3 drift warning described.
++
++Measured (paired interleaved median, Raptor Lake, new/base):
++sha256_transform **0.9658** (was 1.088), chacha20_block 0.9609,
++sqlite_varint 0.8800, expat_xml_scan 0.9804, hash_table 1.005 — no
++regressions anywhere; 3290 unit tests green before the wipe.
++
++## 2. Review-AI audit adjudication (treated critically, per standing order)
++
++| # | Finding | Verdict / action |
++|---|---------|------------------|
++| F1 | No unit tests for `machinst_window_rax_free`/`machinst_window_defs` | **CONFIRMED, fixed** — new `machinst_window_predicate_tests` (4 tests: implicit-clobber rejection, operand-position rax scan incl. MemIndex, def-set extraction per arm, FMov/Mov128 pinning) |
++| F2 | Multi-block majority-rank branch untested (fixture hardcodes block 0) | **CONFIRMED, fixed** — `maj_kept_term_rank_prefers_entry_and_cross_block_defs`: same-block order, cross-block ⇒ rank (0,0), None ⇒ (0,0), plus the fail-closed repurposed-slot gate (two location-less Ands decline). Discovered en route: the strict `<` tie-break can never see equal (0,0) candidates — documented, not dead code |
++| F3 | andn predicate triplicated (fold-time / emission / fusion) | **CONFIRMED** — no mechanical merge (the three sites live in different layers with different inputs); instead an 8-row AGREEMENT TABLE test (`mux_ch_andn_defer_matches_backend_fusion_criteria`) asserts middle-end defer ⟺ backend-fusion transcription across BMI on/off, both type-mismatch directions, width domain, multi-use Not, adjacency gap. The sha256 rorx drift above is the bug class this table guards |
++| F4 | `check_store_alu_cross_join.sh` weakened to registry grep | **DISAGREE (deferred)** — the registry grep still fails if the pass is deregistered; a full cross-join re-strengthening is P2, tracked below |
++| F5 | rbtree derived-IV gate removed without pinning default-off | **CONFIRMED, fixed** — gate extracted to `ivsr_scalar_derived_enabled`; two EnvGuard tests pin unset⇒off, opt-in⇒on, IVSR-off⇒off. The gate script's REMOVED comment already carried the measurement provenance |
++| F6 | andn census `grep -c 'andn'` unanchored | **CONFIRMED, fixed** — anchored mnemonic regex `^[[:space:]]*andn[lq][[:space:]]` in `check_ch_maj_codegen.sh` |
++| F7 | acc substitution register-class-blind; `machinst_window_defs` ends `_ => {}` unlike exhaustive sibling | **PARTIALLY CONFIRMED, pinned** — the new tests pin the asymmetry with the fail-safe argument (Mov128/FAlu vregs never enter the integer acc cache, so the extractor fall-through cannot enable an unsound acc substitution). Full register-class threading stays P2 |
++| F8 | `CCC_IVSR_SCALAR_DERIVED`/`CCC_NO_ANDN_FUSION` undocumented | **CONFIRMED, fixed** — new "Codegen kill switches and opt-ins" section in scripts/README.md (also covers `CCC_NO_BOOL_ALGEBRA`, `CCC_NO_RORX`) |
++| F9 | Unguarded `next()` in gate checks C/D | **CONFIRMED, fixed** — check C now reports "compression loop bounds not found" instead of a StopIteration traceback (D was already guarded) |
++| F10 | Wording overclaims / stale names | **PARTIALLY CONFIRMED** — `check_nbody_rbtree_perf_shapes.sh` keeps its name (renaming touches ci_local.sh + ci.yml for zero functional gain; the header documents the removed rbtree check and the measurement provenance); overclaim sweep done in this doc |
++
++Re-litigated per standing order: NOTHING. The two verified-deliberate
++decisions (Sub excluded only from the rhs-resident path; (Or,Xor)
++majority rejection) stand untouched.
++
++## 3. Gate re-pinning after the BMI default (evidence-based, no reverts)
++
++`check_ch_maj_codegen.sh` section B previously pinned "baseline ⇒ 0 andn".
++With BMI now the v3 default that pin is obsolete BY DESIGN. Updated with
++measurement: bare `-O2` must carry exactly 1 anchored `andnl` (the CH
++fold), `-mbmi` likewise, and only the sticky `-mno-bmi` denial may drop
++to 0 (verified all three against the current binary before pinning).
++Gate PASS confirmed pre-wipe. The golden asm-shape gates elsewhere were
++NOT swept this session — see TODO.
++
++## 4. Harness wipe survival incident (process note)
++
++Mid-session the harness wiped `~/.cargo`, `target/`, swap, AND
++`lccc/.git` (and ~90 source files including all three files edited this
++session) between tool calls. Recovery that worked:
++`artifacts/lccc.bundle` (S01) → pack extracted with `git index-pack`
++after stripping the bundle header (plain `git bundle unbundle` failed on
++truncated history) → S01 tree materialized with `git archive` → missing
++files backfilled with `cp -a --no-clobber` → the three lost files
++reconstructed verbatim from session context → repo rebuilt (`git init` +
++pack copy + `reset --mixed e25fd3e`) → S02 committed and
++`/home/user/ms178-1.patch` (42 465 B, 9 files) published APPLIES-CLEAN
++BEFORE the toolchain finished restoring. Lesson re-confirmed: snapshot
++after EACH validated unit, never batch.
++
++## 5. TODO (next session, priority order)
++
++1. **RE-VERIFY S02 after the wipe rebuild**: cargo test (3290+ expected),
++   clippy, rustfmt, ch-maj gate, and a sha256 paired A/B — the
++   reconstructed emit.rs test module was written post-wipe and compiled
++   only in-session pending this check.
++2. Sweep remaining golden asm-shape gates for BMI-default pin drift
++   (ci_local.sh --fast full run; update pins only with measured evidence).
++3. F4: re-strengthen `check_store_alu_cross_join.sh` beyond the registry
++   grep (P2).
++4. F7: thread register class through the acc-substitution path instead of
++   relying on the fail-safe argument (P2, needs an XMM-in-window repro).
++5. chacha20 scalar RA rework (multi-session): kill the structural
++   auto-arm for ARX loops or cost rematerialization honestly; target the
++   130-insn GCC loop on Zen5.
++6. linux_find_bit 1.42, sieve 1.25, glibc_strstr 1.11, fannkuch 1.11 —
++   next oracle-distillation candidates (godbolt GCC 16.2 / Clang 23.1).
++7. Rebase onto latest ms178/lccc main before final submission (main
++   unchanged this session; base ref still b228995).
+diff --git a/engineering/FOLLOWUP-2026-09-24A-rebase-unification-inline-growth-budget.md b/engineering/FOLLOWUP-2026-09-24A-rebase-unification-inline-growth-budget.md
+new file mode 100644
+index 0000000..567fd17
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-24A-rebase-unification-inline-growth-budget.md
+@@ -0,0 +1,114 @@
++# Follow-up S04 — rebase onto PR #605, mnemonic-model unification, inline growth budget (linux_find_bit)
++
++Session date: 2026-09-24. Base moved: upstream merged PR #605 (i686
++audit adjudication, `07ac7c2`); this session rebased the cumulative
++S03 patch onto it and continued the audit/perf work. Three harness
++wipes hit mid-session; all recovered from the published artifacts
++(byte-exact round-trip: regenerated diff SHA-256 == ms178-1.patch
++SHA-256). Wipe #3 took /tmp (losing one CI log) but spared the tree;
++it also left a stray 8 GB `/swapfile` that filled the disk mid-build —
++removed; the mandatory `/var/swapfile-lccc` (6 GB) is the only swap.
++
++## 1. Rebase
++
++Clean: PR #605 touches i686 peephole; this work touches x86-64 codegen,
++middle-end passes, gate scripts. Zero conflicts. All gates re-run after
++the rebase (see §4).
++
++## 2. Red-team audit of S03 — findings and verdicts (self-audit, per standing order)
++
++| # | Item | Verdict |
++|---|------|---------|
++| A1 | Two drifted dest-only mnemonic lists (helpers `is_read_modify_write` vs liveness `is_pure_write_mnemonic`) — the sha256 bug class | **FIXED ARCHITECTURALLY**: liveness now DELEGATES to the helper (single source of truth; drift structurally impossible). Equivalence proven at the call site: string instructions short-circuit first, xmm dests never consult the predicate (`dest <= REG_GP_MAX` guard), and the caller's operand-text guards subsume the LEA self-address exception. New drift-alarm test pins the full semantic table in both directions |
++| A2 | LEA with dest inside its own address (`leaq 4(%rax), %rax`) | Old liveness list said pure-write; the caller's `src_reads_dest` guard already caught it — no hole, but the unified model now reports RMW directly (belt AND suspenders) |
++| A3 | `slot_width_fits` consolidation changed the acc-branch condition from `!(small && S64)` to the full width check | Strictly safer (rejects S64 AND anything outside {8,16,32}); identical for every integer MachInst size; proven bit-exact on sha256 pre-wipe and all golden gates green post-rebase |
++| A4 | F7 register-class-blind acc substitution | **DISAGREE with the finding as a defect**: `acc_has(v)` true ⇒ the emitter last wrote value `v` to %rax — the invariant is value identity, not register class; a class mismatch would also produce syntactically invalid asm (loud assembler error, never silent miscompile). The window-rax-free scan + window_defs + cache invalidation manage staleness. Kept the pinning tests; no code change |
++| A5 | `LCCC_DUMP_IR` in pipeline.rs flagged as debug leftover | **DISAGREE**: it is part of the documented debug-knob family (next to `LCCC_DUMP_PRECG`, `LCCC_DEBUG_LABELS`), not garbage. Kept |
++| A6 | Mov/FMov def-set source-side over-recording vs Movzx dst-only asymmetry | Sound both ways (the set gates acc substitution; over-recording only forbids, never permits). Pinned by test. Follow-up P2: dropping Mov src-recording may enable more substitutions — needs its own measurement |
++
++## 3. linux_find_bit: oracle distillation + inliner growth budget
++
++Godbolt oracle (pinned: GCC 16.2 `cg162`, Clang 23.1 `cclang2310`, ICX
++`cicxlatest` — `scripts/godbolt.py audit` clean) on
++`tests/benchmark/programs/linux_find_bit.c`, `-O3 -march=x86-64-v3`:
++
++- All three oracles inline `linux_find_next_andnot_bit` (static, 3 call
++  sites: two cold self-test calls + one hot in-loop call). LCCC kept it
++  outlined: the bounded loop-helper tier capped cloning at 2 sites.
++- LCCC's outlined body is instruction-selection SUPERIOR to GCC's
++  inlined shape: `andnq` for `& ~addr2`, `shlxq` mask build, and the
++  generic `__ffs` decision tree folded to a single `tzcntq` (GCC keeps
++  the 6-level branch tree even inlined). Static: lccc main 108 insns vs
++  clang 118 / icx 121 / gcc 274.
++- The runtime delta was therefore pure call overhead + missed
++  caller-context. Forced-inline probe (always_inline copy): 6–12%
++  faster in paired runs (contention-inflated; idle-box confirmation
++  flat-to-better, 1.00 vs base, **0.86 vs local GCC** at PASSES=4096,
++  outputs identical across lccc/base/gcc).
++
++Fix (principled, calibrated against existing provenance):
++`fits_static_loop_inline_limits` now bounds the bounded tier by a
++**clone-growth budget**: `inst_count * (sites - 1) <= 128` with the
++site cap raised 2→3. The budget reproduces the historical worst
++permitted case exactly (2 sites × 128 insns = 128) and admits the
++third site only while total growth stays inside the same envelope. The
++glibc-memcmp clone regression (five 27-insn clones, −7.1%) lives in the
++small tier and is untouched; the zlib Adler-32 `-Os` nest veto is
++untouched. Result: the kernel now inlines at all three sites (zero
++`call linux_find_next_andnot_bit` in the output, 3× `tzcntq`), golden
++codegen-quality gate green, 9-kernel runtime sweep vs base shows no
++regression (sha256 0.979, hash_table 0.979, sieve 0.976, rest flat).
++
++## 3b. ABM v3 default (LZCNT/TZCNT) — found by the find_bit gate
++
++The new `tests/regression/check_findbit_inline.sh` gate (pins zero
++outlined calls + tzcnt + andn at BOTH `-O2` and `-O3 -march=x86-64-v3`)
++caught an asymmetry in the S01 v3-baseline feature: `andn` (BMI1) was
++default-ON without `-march`, but `tzcnt` (ABM) was not — plain `-O2`
++emitted `bsfq` for the `__ffs` fold while `-march=x86-64-v3` emitted
++`tzcntq`. The pipeline's own docstring says the absent-`-march`
++baseline "projects x86-64-v3", and v3 carries ABM; the gap was an
++implementation drift, exactly the class the drift-alarm work targets.
++
++Fix mirrors the S01 BMI pattern exactly: `lzcnt_effective()` =
++explicit `-mlzcnt` OR (x86-64 && no explicit `-march`), AND NOT sticky
++`-mno-lzcnt` denial (new `lzcnt_explicitly_disabled` field; `-mlzcnt`
++after `-mno-lzcnt` re-enables, GCC last-explicit-wins semantics). Four
++new CLI tests pin default-on, sticky denial, re-enable, and the
++explicit-march ceiling (v1 removes it, v3 carries it). Soundness:
++`tzcnt`/`lzcnt` are at least as correct as the `bsf`/`bsr` they
++replace (defined on zero input), so defaulting them ON can only remove
++the undefined-zero-input hole, never change a defined program's result.
++Preprocessor feature macros stay on the raw flags — same precedent as
++the S01 BMI macros (codegen-effective default, source-visible gates stay
++explicit).
++
++## 4. Validation summary (post-rebase, post-changes)
++
++- `cargo test --lib`: 3302 passed / 0 failed (was 3292 + upstream PR #605
++  tests + 2 new: mnemonic drift-alarm table, inline growth-budget rows).
++- `ci_local.sh --fast` run 1 (rebase + unification): **63 passed, 0
++  failed, 3 skipped**. Run 2 (+ inliner change): see ledger — golden
++  codegen-quality gate PASS in both.
++- `check_ch_maj_codegen.sh`: PASS. `cargo fmt` / clippy `-D warnings`:
++  clean.
++- Correctness: linux_find_bit checksum identical across lccc /
++  lccc-base / gcc at PASSES 1024 and 4096.
++
++## 5. TODO (next session)
++
++1. chacha20 scalar RA rework on Zen5 (multi-session; structural).
++2. Remaining EPYC regression list re-measured post-S04 on real EPYC
++   hardware (sieve 1.25, glibc_strstr 1.11, fannkuch 1.11 are the next
++   oracle-distillation candidates; mandelbrot 1.09). Oracle distillation
++   for these four is in progress via `scripts/godbolt.py compare`.
++   Secondary finding from the find_bit oracle run: GCC vectorizes
++   `make_sparse_bitmaps` + the scan loop with AVX2 where LCCC stays
++   scalar — candidate for the vectorizer cost-model work.
++3. A6: measure dropping Mov/FMov src-side def over-recording (potential
++   extra acc substitutions).
++4. F4: re-strengthen `check_store_alu_cross_join.sh` beyond the registry
++   grep (P2).
++5. aarch64 execute suite + i686 torture under the inliner growth budget
++   on hosts that have QEMU/multilib CI parity (the 3 skipped local
++   gates).
+diff --git a/engineering/FOLLOWUP-2026-09-24B-narrow-copy-identity-imul-rmw-orphan-sweeps.md b/engineering/FOLLOWUP-2026-09-24B-narrow-copy-identity-imul-rmw-orphan-sweeps.md
+new file mode 100644
+index 0000000..c5e13a2
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-24B-narrow-copy-identity-imul-rmw-orphan-sweeps.md
+@@ -0,0 +1,153 @@
++# Follow-up S05→S06 — narrow copy identity, imul NDD phantom-RMW, orphan retirement, popcnt baseline
++
++Session date: 2026-09-24 (continuation of the S05 oracle-distillation session).
++Base: `07ac7c2` (unchanged upstream tip). A fourth harness wipe hit at
++session start (took `~/.cargo`, `~/.rustup`, `.git`, swap); recovered
++byte-exact again from `artifacts/lccc-src.tar.gz` + `lccc.bundle`
++(regenerated diff SHA-256 == `ms178-1.patch`). Toolchain reinstalled
++(rustc 1.98.1), swap re-armed (6 GB `/var/swapfile-lccc`).
++
++## 1. Root causes found and fixed (evidence-first)
++
++### 1.1 `movl` copies were never propagated into consumers (glibc_strstr, fannkuch relays)
++
++`copy_propagation.rs` tracked `movq` copies in `copy_src` and propagated
++them, but `movl` copies went into `copy_src32`, which was used ONLY to
++shorten `movl` chains — never to retarget consumers. Two hot-loop shapes
++paid for it:
++
++- glibc_strstr Horspool scan: `movzbl (%r10,%r9), %eax; movl %eax, %r9d;
++  cmpl %r9d, %esi` — a staging relay per iteration.
++- fannkuch swap: `movl %ebp, %eax; movl %eax, (%r8,%r9,4)` — a staging
++  relay per element swap.
++
++FIX: the LOW-32 IDENTITY contract (N1–N4, documented at the definition):
++a `movl` reg-reg copy proves bits 0..=31 of the destination family equal
++bits 0..=31 of the source family (the zeroed upper half is outside the
++identity). Two new application sites consume `copy_src32`:
++
++- N2 (consumer retarget): a consumer whose every occurrence of the family
++  is 32-bit-or-narrower (never the 64-bit name — that reads bits 32..=63;
++  never a legacy `%ah/%ch/%dh/%bh`) and that does not WRITE the family at
++  any width (the result must land where the program expects; subsumes
++  self-RMW) gets its occurrences retargeted. Address operands are
++  structurally excluded: base/index spellings are 64-bit names.
++- N3 (store-source retarget): `movX %S, MEM` reads exactly width X of the
++  family — `movq` requires the full identity (`copy_src`), `movl/movw/movb`
++  require only `copy_src32`. Only the source operand is rewritten.
++
++Frame-family policy (was: blanket exclusion of %rsp/%rbp copies):
++`parse_reg_to_reg_movl` now admits `%ebp` as a SOURCE (the RA homes values
++there — fannkuch keeps `perm[i]` in `%ebp`), because the narrow identity
++structurally cannot leak `%rbp` into addresses or frame-manipulation forms.
++`%rsp` stays excluded at both ends (implicit-writer world; zero demand),
++destinations in families 4/5 stay excluded (frame-setup shapes), and
++`parse_reg_to_reg_movq` keeps its full 4/5 exclusion (no measured demand
++for 64-bit frame-value propagation; smaller audit surface).
++
++Measured (fastbuild, `-O2` on the benchmark sources): strstr `movl %eax,
++%r9d` relays 1 → **0** (hot loop now 5 insns + branch, was 6 + relay);
++fannkuch `movl %ebp, %eax` relays 1 → **0** (store folded into
++`movl %ebp, (%r8,%r9,4)`). Sieve fold preserved (0 `movsbq`).
++
++### 1.2 3-operand `imul` was modelled as a phantom RMW of its destination
++
++`is_read_modify_write` is the single source of truth for the dest-only
++contract. It classified `imull $imm, %src, %dst` (the magic-division
++lowering — glibc_strstr's `% 26`, fannkuch's index math) as
++read-modify-write, i.e. a PHANTOM READ of the destination's old value.
++Isolated liveness probe (`FileLiveness::live_after`) proved it: the relay
++in front of `imull $5, %ebx, %r9d` reported live-out (kept forever),
++while the `leal` shape reported dead correctly.
++
++This is the same bug class as the rorx drift (S03) — a missing mnemonic
++form in the RMW model — one level deeper: OPERAND FORM, not just
++mnemonic. FIX: the predicate is now operand-count aware for the
++non-destructive forms of otherwise-RMW mnemonics:
++
++- `imul`/ALU `add sub adc sbb and or xor` family: 3+ operands ⇒ dest-only
++  (the extra-destination form: legacy 3-operand `imul`, APX NDD);
++- `neg not inc dec`: 2+ operands ⇒ dest-only (APX NDD unary form);
++- `shld`/`shrd` DELIBERATELY stay RMW at 3 operands (bits shift through
++  the destination); 1-operand `imul`/`mul`/`div` stay conservative.
++
++Exact-mnemonic matching (SSE look-alikes `addss`/`imulsd` never enter);
++SIB-aware operand counting (`last_top_level_comma`); trailing `#`
++comments stripped before counting (a comma inside a comment must not
++change the count). The `src == dst` degenerate spelling (`imull $5, %r9d,
++%r9d`) still reads the family — the liveness caller's `src_reads_dest`
++guard (verified at liveness.rs:962) covers it exactly as it covers
++`popcnt %eax, %eax`.
++
++### 1.3 Phase-2/3/4b folds orphan dead pure writes with nothing to retire them
++
++Pipeline defect: `eliminate_dead_pure_writes` (the only FileLiveness-proven
++pure-write killer) ran in Phase 1's fixpoint ONLY. Phase 2 runs ONCE after
++that (copy propagation, relay folds, slot DSE) and Phases 3/4b loop — every
++one of those folds orphans staging copies (`copy_fold`'s own comment
++promised "the copies this fold orphans are retired in the same round" and
++the only instrument that can prove it never ran there). Observed as the
++surviving `movl %ebp, %eax` after N3 retargeted its only consumer.
++
++FIX: `retire_dead_pure_writes` (shared helper — local fixpoint, because
++killing one relay exposes the next in a `mov A,B; mov B,C` chain) wired at
++four sites, all under the SAME `CCC_PEEPHOLE_SKIP=dead_pure_writes` knob
++as Phase 1: end of Phase 2 (feeding Phase 3), inside Phase 3's and 4b's
++fixpoint loops, and a final sweep after Phases 4c–8b so the terminal
++invariant holds: **no provably-dead GP pure write leaves the peephole.**
++
++### 1.4 POPCNT missing from the x86-64-v3 default baseline
++
++The BMI/ABM sticky-denial fix (S05) covered bmi1/bmi2/lzcnt but left
++`popcnt` explicit-only, so default `-O2` emitted the 15-instruction SWAR
++bitcount where `-mpopcnt` emitted `popcntl`. POPCNT is an x86-64-v2
++member (v3 carries it a fortiori). FIX: `popcnt_effective()` mirrors the
++other `*_effective()` contracts; sticky `-mno-popcnt` denial, later
++`-mpopcnt` lift (GCC last-explicit-wins), explicit v1 ceiling. Verified:
++default emits `popcntl`; `-mno-popcnt` emits the SWAR fallback; new CLI
++test pins all four cases.
++
++## 2. Tests added (all green; suite 3329/0, +14 vs S05)
++
++- copy_propagation: narrow consumer retarget (b/w/l), store-source retarget
++  (movl/movq + low32-refusal for movq), 64-bit-reader refusal,
++  address-use refusal (base/index = 64-bit read), dest-write refusal,
++  high-byte mixed-line refusal, SetCC-dest refusal, `%cl` shift-count
++  refusal, imul 3-op kill e2e + imul 2-op survival e2e, frame-family
++  store retarget e2e + full relay-death e2e.
++- liveness drift-alarm table: 3-operand `imul`/NDD dest-only set vs
++  2-operand `imul`, 1-operand `imul`, `neg`, `shld`, `addsd` RMW set.
++- cli.rs: popcnt baseline default / sticky denial / lift / v1 ceiling.
++
++## 3. Verification performed (no guesswork)
++
++- Isolated liveness probes before/after the imul fix (`imul3`/`add2`/`lea`
++  matrix) — documented above.
++- Real codegen: strstr + fannkuch + sieve assembly dumps compared line by
++  line (relays 1→0 both kernels; hot loops shown in the session log).
++- Gates: `check_vectorize_isa_gate.sh` PASS, `check_findbit_inline.sh`
++  PASS, `check_ch_maj_codegen.sh` PASS (A/B/C), golden codegen gate
++  (`ci-codegen-gate.py --lccc`) "all golden workloads within tolerance".
++- `cargo fmt` clean; `cargo clippy --all-targets` zero warnings;
++  `cargo test --lib` 3329 passed / 0 failed / 7 ignored;
++  `scripts/ci_local.sh --fast` green (S06 snapshot condition).
++
++## 4. Remaining TODO (unchanged in priority order)
++
++1. chacha20 2.19× (EPYC): ARX vectorizer cost model is instruction-count
++   only; Zen5 vector-int ALU 3c vs scalar 1c. Multi-session scalar RA
++   rework (live_range.rs auto-arming + MAX_SPAN_REMCOST).
++2. fannkuch swap-loop shaping: `movslq %r9d, %r13; shlq $2, %r13` pair
++   (r13 read elsewhere — verify before deleting), IV advance stack spill
++   (`leal 1(%rsi), %eax; movslq; movq 16(%rsp); movq %rsi`) — middle-end
++   pointer-walk IV would kill the whole `movl %edi, %r8d` SIB-staging
++   class (also the remaining strstr staging movl).
++3. strstr shift-table fill (256-iter scalar) needs a runtime-splat
++   memset/vector-fill variant in `loop_memset.rs` (GCC does SSE
++   broadcast); current refusal (runtime fill value) is correct.
++4. GCC sieve `cmpb $1; sbbl $-1` idiom needs middle-end VRP.
++5. expat 1.31×, mandelbrot ~1.09, sha256 1.32, linux_find_bit 1.42
++   (worst case after the inliner fix), sieve 1.25 (fold landed — re-measure
++   on EPYC).
++6. Cosmetic: `xorl %esi, %esi` before `popcntl %edi, %esi` is a redundant
++   zeroing (zero-cost via xor-elim, but a folding target).
+diff --git a/scripts/README.md b/scripts/README.md
+index 39101e3..ccd237e 100644
+--- a/scripts/README.md
++++ b/scripts/README.md
+@@ -44,6 +44,24 @@ Developer and research tooling. None of these are needed to build LCCC.
+ | `symstr_migrate.py` | Span-driven `String` → `SymStr` migration helper. Its diagnostic build resolves the manifest-selected Rust channel, locates the persisted Cargo proxy, and denies warnings unless explicitly opted out. |
+ | `gen_lcccsimd.py`, `strip_scalar_dups.py` | SIMD intrinsic header generation helpers. |
+ 
++## Codegen kill switches and opt-ins
++
++Environment knobs that gate the SHA/CH-style scalar codegen work; every
++one is resolved once per compilation and several gates consult the same
++resolution so fold-time prediction and emission cannot drift. Any value
++disables (they are presence checks unless noted).
++
++| Variable | Default | Effect |
++|---|---|---|
++| `CCC_NO_ANDN_FUSION` | unset (fusion on) | Disables the BMI1 3-operand `andn` fusion (backend `detect_and_not_fusions` + `emit_and_not_impl`) AND the bool-mux algebra's defer-to-fusion prediction (`has_scalar_andn`), in one shared resolution. |
++| `CCC_NO_BOOL_ALGEBRA` | unset (pass on) | Disables the whole `bit_idioms` bool-mux algebra (CH mux fold, MAJ majority fold, distributive). |
++| `CCC_NO_RORX` | unset (emission on) | Independent kill switch for BMI2 `rorx` instruction selection (does not affect the ANDN/bool-algebra gates). |
++| `CCC_IVSR_SCALAR_DERIVED` | **opt-in** (`=1` to enable) | Enables the scalar derived-IV flavor of IV strength reduction (`iv*C` without a GEP). Off by default: measured net runtime loss while latch phi-web parking exists (the PR #602 golden-workload regressions). |
++
++The `-mbmi`/`-mno-bmi`/`-march` front-end flags are the primary control;
++these switches exist for bisection and for pinning the pre-BMI shapes in
++the golden codegen gates.
++
+ ## Why more than one oracle
+ 
+ `insndiff.py` and `asmdiff.py` compare against a single local GNU as. That is
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index ab0e48f..ebde0a7 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -436,6 +436,13 @@ gate "ch-maj-codegen" fast \
+ gate "nbody-rbtree-perf-shapes" fast \
+     env CCC=target/fastbuild/lccc bash tests/regression/check_nbody_rbtree_perf_shapes.sh
+ 
++# linux_find_bit: the inliner's bounded-tier clone-growth budget must
++# admit the three-site kernel clone (two cold self-test calls + one hot
++# in-loop call) that GCC/Clang/ICX all inline, and the inlined shape
++# must keep the tzcnt + andn idiom distillations.
++gate "findbit-inline" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_findbit_inline.sh
++
+ # Cross-PR interaction red-team: FMA families x copy brackets x
+ # if-conversion x constant promotion x NonZero x the AVX1+FMA target
+ # class, bit-exact vs the reference compiler at matched march (canonical
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 39d7fc5..914dcb6 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -5438,6 +5438,24 @@ fn machinst_window_rax_free(buf: &[super::machinst::MachInst]) -> bool {
+     true
+ }
+ 
++/// Width discipline shared by every vreg→stack-slot substitution
++/// (`resolve_stack_vregs` and `resolve_reg_or_slot`): a 4-byte slot only
++/// admits 8/16/32-bit reads — a wider access (e.g. `cmpq $0, 28(%rsp)`)
++/// pulls the adjacent slot's garbage into the high bits (kernel lib/zstd
++/// ZSTD_decodeLiteralsBlock read `flags` from the neighboring slot and
++/// took the wrong HUF dispatch). Refusing the substitution leaves the
++/// Vreg in place; has_unresolvable_vreg then trips and the buffered
++/// window falls back to the default path, which loads at the true width.
++fn slot_width_fits(state: &CodegenState, id: u32, size: OpSize) -> bool {
++    if state.is_small_slot(id) {
++        // 4-byte slot: only 8/16/32-bit accesses are in-bounds.
++        matches!(size, OpSize::S8 | OpSize::S16 | OpSize::S32)
++    } else {
++        // 8-byte slot: every integer instruction width is in-bounds.
++        true
++    }
++}
++
+ fn resolve_stack_vregs(
+     inst: &super::machinst::MachInst,
+     ra: &FxHashMap<u32, PhysReg>,
+@@ -5454,25 +5472,10 @@ fn resolve_stack_vregs(
+     // WIDTH SOUNDNESS: a spilled vreg's slot is 4 bytes (small slot) or 8
+     // bytes. Substituting it into an instruction whose size is WIDER than
+     // the slot makes the emitter read bytes past the slot — e.g.
+-    // `cmpq $0, 28(%rsp)` on a 4-byte slot pulls the adjacent slot's
+-    // garbage into the high 32 bits (kernel lib/zstd
+-    // ZSTD_decodeLiteralsBlock: the 64-bit `!lhlCode` predicate read
+-    // `flags` from the neighboring slot and took the wrong HUF dispatch).
+-    // A register-form consumer is safe — a `movl` reload zero-extends —
+-    // but memory-operand substitution silently loses that extension.
+-    // Refuse the substitution when the instruction size exceeds the slot
+-    // width: the leftover Vreg trips has_unresolvable_vreg and the
+-    // buffered window falls back to the default (accumulator) path, which
+-    // loads every value at its true width.
+-    let slot_fits = |id: &u32, inst_size: OpSize| -> bool {
+-        if state.is_small_slot(*id) {
+-            // 4-byte slot: only 8/16/32-bit reads are in-bounds.
+-            matches!(inst_size, OpSize::S8 | OpSize::S16 | OpSize::S32)
+-        } else {
+-            // 8-byte slot: every instruction width reads in-bounds.
+-            true
+-        }
+-    };
++    // Slot-width discipline (see slot_width_fits): a register-form
++    // consumer is safe — a `movl` reload zero-extends — but
++    // memory-operand substitution silently loses that extension.
++    let slot_fits = |id: &u32, inst_size: OpSize| slot_width_fits(state, *id, inst_size);
+ 
+     // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
+     // Vregs the window allocator owns (reg_classified) are never substituted.
+@@ -5744,23 +5747,13 @@ fn resolve_reg_or_slot(
+             // to source operands): see resolve_stack_vregs.
+             if acc_subst
+                 && !window_defs.contains(id)
+-                && !(state.is_small_slot(*id) && matches!(size, super::machinst::OpSize::S64))
++                && slot_width_fits(state, *id, size)
+                 && state.reg_cache.acc_has(*id, false)
+             {
+                 return MachOperand::Reg(super::machinst::MachReg::Phys(super::machinst::RAX));
+             }
+             if let Some(slot) = state.get_slot(*id) {
+-                let fits = if state.is_small_slot(*id) {
+-                    matches!(
+-                        size,
+-                        super::machinst::OpSize::S8
+-                            | super::machinst::OpSize::S16
+-                            | super::machinst::OpSize::S32
+-                    )
+-                } else {
+-                    true
+-                };
+-                if fits {
++                if slot_width_fits(state, *id, size) {
+                     MachOperand::StackSlot(slot.0)
+                 } else {
+                     op.clone()
+@@ -9067,3 +9060,237 @@ mod machinst_resolution_tests {
+         assert_eq!(x64_stack_arg_push_imm(&IrConst::Zero), Some(0));
+     }
+ }
++
++#[cfg(test)]
++mod machinst_window_predicate_tests {
++    // Unit coverage for the two MachInst-window predicates that gate the
++    // accumulator-resident substitution (F1 of the review audit: they had
++    // none). `machinst_window_rax_free` is an exhaustive scan;
++    // `machinst_window_defs` is a deliberately partial extractor — these
++    // tests pin BOTH behaviours so a variant added to MachInst cannot
++    // silently change either contract.
++    use super::{machinst_window_defs, machinst_window_rax_free};
++    use crate::backend::regalloc::PhysReg;
++    use crate::backend::x86::codegen::machinst::{
++        AluOp, CallArgMove, CallTarget, CondCode, MachInst, MachOperand, MachReg, OpSize, RAX,
++        ShiftOp,
++    };
++
++    fn vreg(id: u32) -> MachReg {
++        MachReg::Vreg(id)
++    }
++    fn phys(id: u8) -> MachReg {
++        MachReg::Phys(PhysReg(id))
++    }
++
++    /// Each of these either reads/writes %rax by architectural contract
++    /// (Cqto, Div) or destroys the caller-saved world incl. %rax
++    /// (Call, CallTyped, Ret) — or is opaque text the scanner cannot
++    /// prove (Raw). One instruction is enough to poison the window.
++    #[test]
++    fn window_rax_free_rejects_implicit_clobbers() {
++        let clobbers = [
++            MachInst::Cqto { size: OpSize::S64 },
++            MachInst::Div {
++                divisor: MachOperand::Reg(vreg(7)),
++                signed: true,
++                size: OpSize::S64,
++            },
++            MachInst::Call { target: "f".into() },
++            MachInst::CallTyped {
++                caller_saves: Vec::new(),
++                args: vec![CallArgMove {
++                    src: MachOperand::Reg(vreg(3)),
++                    dst_reg: PhysReg(7),
++                    size: OpSize::S64,
++                }],
++                target: CallTarget::Direct("f".into()),
++                ret: None,
++            },
++            MachInst::Ret,
++            MachInst::Raw("lock cmpxchg16b (%rdi)".into()),
++        ];
++        for inst in clobbers {
++            assert!(
++                !machinst_window_rax_free(std::slice::from_ref(&inst)),
++                "{inst:?} must poison the rax-free window"
++            );
++        }
++    }
++
++    /// %rax must be seen in EVERY operand position the substitution could
++    /// redirect: plain register, memory base, indexed memory (base and
++    /// index), and in both source and dest slots. A vreg-only window of
++    /// the same shapes stays free.
++    #[test]
++    fn window_rax_free_sees_operand_positions() {
++        let rax = phys(RAX.0);
++        let rcx = phys(7); // another phys reg: must NOT poison
++        let poisons = [
++            MachInst::Mov {
++                src: MachOperand::Reg(rax),
++                dst: MachOperand::Reg(vreg(1)),
++                size: OpSize::S64,
++            },
++            MachInst::Mov {
++                src: MachOperand::Reg(vreg(1)),
++                dst: MachOperand::Reg(rax),
++                size: OpSize::S64,
++            },
++            MachInst::Mov {
++                src: MachOperand::Mem {
++                    base: rax,
++                    offset: 8,
++                },
++                dst: MachOperand::Reg(vreg(1)),
++                size: OpSize::S64,
++            },
++            MachInst::Alu {
++                op: AluOp::Add,
++                src: MachOperand::MemIndex {
++                    base: vreg(1),
++                    index: rax,
++                    scale: 4,
++                    offset: 0,
++                },
++                dst: vreg(2),
++                size: OpSize::S64,
++            },
++            MachInst::Cmp {
++                lhs: MachOperand::Reg(rax),
++                rhs: MachOperand::Imm(0),
++                size: OpSize::S64,
++            },
++            MachInst::ShiftX {
++                op: ShiftOp::Shr,
++                count: rax,
++                src: vreg(1),
++                dst: vreg(2),
++                size: OpSize::S64,
++            },
++        ];
++        for inst in poisons {
++            assert!(
++                !machinst_window_rax_free(std::slice::from_ref(&inst)),
++                "{inst:?} touches %rax and must poison the window"
++            );
++        }
++        // Same shapes with vregs / a non-rax phys reg: free.
++        let clean = [
++            MachInst::Mov {
++                src: MachOperand::Mem {
++                    base: vreg(1),
++                    offset: 8,
++                },
++                dst: MachOperand::Reg(vreg(2)),
++                size: OpSize::S64,
++            },
++            MachInst::Alu {
++                op: AluOp::Add,
++                src: MachOperand::Reg(rcx),
++                dst: vreg(2),
++                size: OpSize::S64,
++            },
++            MachInst::SetCC {
++                cc: CondCode::Ne,
++                dst: vreg(3),
++            },
++        ];
++        assert!(
++            machinst_window_rax_free(&clean),
++            "vreg-only / non-rax phys window must be rax-free"
++        );
++    }
++
++    /// Def-set extraction per arm. Mov/FMov deliberately over-approximate
++    /// (their SOURCE operand is recorded too — a mov's src is a use, but
++    /// recording it can only forbid substitutions, never permit unsound
++    /// ones). Dst-only arms record exactly the dest; ShiftX's MachReg
++    /// count/src are NOT recorded (only MachOperand positions and dsts
++    /// get the treatment), and Lea records dst + index but not the base.
++    #[test]
++    fn window_defs_extracts_every_dst_position() {
++        let window = [
++            // Mov: src AND dst vregs recorded (source-side over-approx).
++            MachInst::Mov {
++                src: MachOperand::Reg(vreg(101)),
++                dst: MachOperand::Reg(vreg(102)),
++                size: OpSize::S64,
++            },
++            // Cmov: operand src + reg dst.
++            MachInst::Cmov {
++                cc: CondCode::Ne,
++                src: MachOperand::Reg(vreg(103)),
++                dst: vreg(104),
++                size: OpSize::S64,
++            },
++            // Movzx: dst only — the operand src stays out.
++            MachInst::Movzx {
++                src: MachOperand::Reg(vreg(105)),
++                dst: vreg(106),
++                from_size: OpSize::S32,
++                to_size: OpSize::S64,
++            },
++            // ShiftX: dst only — count/src MachRegs stay out.
++            MachInst::ShiftX {
++                op: ShiftOp::Shl,
++                count: vreg(107),
++                src: vreg(108),
++                dst: vreg(109),
++                size: OpSize::S64,
++            },
++            // Lea: dst + index; the base stays out.
++            MachInst::Lea {
++                base: vreg(110),
++                index: Some((vreg(111), 4)),
++                offset: 0,
++                dst: vreg(112),
++            },
++            // SetCC: dst.
++            MachInst::SetCC {
++                cc: CondCode::E,
++                dst: vreg(113),
++            },
++        ];
++        let defs = machinst_window_defs(&window);
++        for id in [101u32, 102, 103, 104, 106, 109, 111, 112, 113] {
++            assert!(defs.contains(&id), "vreg {id}: def must be recorded");
++        }
++        for id in [105u32, 107, 108, 110] {
++            assert!(
++                !defs.contains(&id),
++                "vreg {id}: source/base positions stay out of the def set"
++            );
++        }
++    }
++
++    /// XMM-family pinning: FMov records both operand vregs (it shares the
++    /// Mov arm) and is rax-free, while Mov128 falls through the extractor's
++    /// `_ => {}` arm — the omission is fail-safe because the rax_free scan
++    /// covers Mov128 and the accumulator cache only ever holds integer
++    /// values, so acc-substitution can never fire for its vregs.
++    #[test]
++    fn window_xmm_forms_pinned() {
++        let fm = MachInst::FMov {
++            src: MachOperand::Reg(vreg(201)),
++            dst: MachOperand::Reg(vreg(202)),
++            size: OpSize::S64,
++        };
++        assert!(machinst_window_rax_free(std::slice::from_ref(&fm)));
++        let m128 = MachInst::Mov128 {
++            src: MachOperand::Reg(vreg(301)),
++            dst: MachOperand::Reg(vreg(302)),
++        };
++        assert!(machinst_window_rax_free(std::slice::from_ref(&m128)));
++        let defs = machinst_window_defs(&[fm.clone(), m128]);
++        for id in [201u32, 202] {
++            assert!(defs.contains(&id), "FMov vreg {id} recorded (Mov arm)");
++        }
++        for id in [301u32, 302] {
++            assert!(
++                !defs.contains(&id),
++                "Mov128 vreg {id}: extractor fall-through (`_ => {{}}`) pinned"
++            );
++        }
++    }
++}
+diff --git a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
+index 11ff21c..15013dd 100644
+--- a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
++++ b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
+@@ -18,6 +18,7 @@
+ 
+ use super::super::types::*;
+ use super::helpers::*;
++use super::relay_and_lea::{plain_gp_operand, split_two_operands};
+ 
+ /// Dynamic memory operands are normally alias-analysis barriers, but a single
+ /// ordinary move/LEA has fully explicit register semantics.  It is safe to
+@@ -31,6 +32,97 @@ fn allows_address_copy_propagation(trimmed: &str) -> bool {
+         && !has_implicit_reg_usage(trimmed)
+ }
+ 
++// ── narrow-identity substitution ─────────────────────────────────────────────
++//
++// A `movl` reg-reg copy establishes a LOW-32 identity: bits 0..=31 of the
++// destination family equal bits 0..=31 of the source family (the upper half
++// is zeroed on BOTH sides of the identity — it is not tracked).  The 64-bit
++// arm of the pass below consumes `copy_src` only; two hot shapes were left
++// paying for staging relays because their consumers read the 32-bit part:
++//
++//   movzbl (%r10,%r9), %eax      movl %ebp, %eax
++//   movl   %eax, %r9d            movl %eax, (%r8,%r9,4)
++//   cmpl   %r9d, %esi
++//
++// Both are value-identical operand substitutions under the low-32 identity.
++// The exact contract each substitution honors:
++//
++//   N1  `copy_src32[F] == S` claims equality of bits 0..=31 ONLY.
++//   N2  A consumer substitution rewrites every occurrence of family `F`
++//       whose width is 32 bits or narrower and requires:
++//         (a) NO occurrence of the 64-bit name of `F` (reads bits 32..=63,
++//             outside the identity) and NO legacy high-byte name of `F`
++//             (%ah/%ch/%dh/%bh) — those stay unrewritten, and a line mixing
++//             rewritten and unrewritten occurrences of one family is
++//             refused outright;
++//         (b) the line does not WRITE family `F` at any width — the result
++//             must land in the register the program expects (this also
++//             covers self-RMW forms, where retargeting BOTH operands would
++//             redirect the result);
++//         (c) no implicit register usage (break, as in the 64-bit arm);
++//       Memory address operands are intrinsically safe to refuse: base and
++//       index registers are 64-bit names, so (a) rejects any line that
++//       references `F` inside an address.
++//   N3  A scalar store `movX %S, MEM` reads exactly width X of family `S`,
++//       so `movq` needs the FULL identity (`copy_src`) while `movl/movw/
++//       movb` need only `copy_src32`; only the source operand is rewritten.
++//   N4  Both sites run under the pass's existing state discipline: every
++//       barrier clears the tables, every write invalidates the family, and
++//       the line is reclassified after each rewrite.
++
++/// Whole-name occurrence test: `%r8` must not match inside `%r8d`.
++fn contains_whole_name(line: &str, name: &str) -> bool {
++    let bytes = line.as_bytes();
++    let nb = name.as_bytes();
++    let mut pos = 0;
++    while pos + nb.len() <= bytes.len() {
++        if &bytes[pos..pos + nb.len()] == nb {
++            let after = pos + nb.len();
++            if after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() {
++                return true;
++            }
++        }
++        pos += 1;
++    }
++    false
++}
++
++/// Replace every whole-name occurrence of `from` with `to`.
++fn replace_whole_name(line: &str, from: &str, to: &str) -> String {
++    if !contains_whole_name(line, from) {
++        return line.to_string();
++    }
++    let mut out = String::with_capacity(line.len());
++    let bytes = line.as_bytes();
++    let fb = from.as_bytes();
++    let mut pos = 0;
++    while pos < bytes.len() {
++        if pos + fb.len() <= bytes.len() && &bytes[pos..pos + fb.len()] == fb {
++            let after = pos + fb.len();
++            if after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() {
++                out.push_str(to);
++                pos = after;
++                continue;
++            }
++        }
++        out.push(bytes[pos] as char);
++        pos += 1;
++    }
++    out
++}
++
++/// N2(a): true when `line` never reads family `fam` outside bits 0..=31.
++fn only_narrow_uses_of(line: &str, fam: RegId) -> bool {
++    if contains_whole_name(line, REG_NAMES[0][fam as usize]) {
++        return false;
++    }
++    const HIGH_BYTES: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
++    if (fam as usize) < 4 && contains_whole_name(line, HIGH_BYTES[fam as usize]) {
++        return false;
++    }
++    true
++}
++
+ /// Try to replace uses of `dst_id` with `src_id` in instruction at index `j`.
+ /// Returns true if a replacement was made.
+ fn try_propagate_into(
+@@ -195,7 +287,10 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
+         // because doing so can interfere with stronger SIB/LEA folds.
+         let trimmed = infos[i].trimmed(store.get(i));
+         if infos[i].has_indirect_mem {
+-            if allows_address_copy_propagation(trimmed) {
++            // Owned copy: `trimmed` borrows the store, and the mutable
++            // rewrite calls below must not see a live borrow.
++            let line_text = trimmed.to_string();
++            if allows_address_copy_propagation(&line_text) {
+                 let dest = get_dest_reg(&infos[i]);
+                 for reg in 0..16u8 {
+                     let src = copy_src[reg as usize];
+@@ -206,6 +301,56 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
+                         break;
+                     }
+                 }
++                // N3: a scalar store whose SOURCE register is a tracked
++                // copy can read the copy's origin directly — the memory
++                // destination is untouched and the store width selects the
++                // identity level (`movq` needs the full 64-bit identity,
++                // the narrow forms need only low-32).  All text is
++                // materialised into owned strings before the rewrite so
++                // the mutable store call borrows nothing stale.
++                if !infos[i].pinned {
++                    let parsed: Option<(usize, &str)> = line_text
++                        .strip_prefix("movq ")
++                        .map(|rest| (0usize, rest))
++                        .or_else(|| line_text.strip_prefix("movl ").map(|rest| (1, rest)))
++                        .or_else(|| line_text.strip_prefix("movw ").map(|rest| (2, rest)))
++                        .or_else(|| line_text.strip_prefix("movb ").map(|rest| (3, rest)));
++                    if let Some((width_row, rest)) = parsed {
++                        if let Some((src_op, dst_op)) = split_two_operands(rest) {
++                            if dst_op.contains('(') && src_op.starts_with('%') {
++                                if let Some(fam) = plain_gp_operand(src_op) {
++                                    let tracked = if width_row == 0 {
++                                        copy_src[fam as usize]
++                                    } else {
++                                        copy_src32[fam as usize]
++                                    };
++                                    if tracked != REG_NONE && tracked != fam {
++                                        let mnemonic = String::from(
++                                            &line_text[..line_text.len() - rest.len()],
++                                        );
++                                        let new_src = replace_whole_name(
++                                            src_op,
++                                            REG_NAMES[width_row][fam as usize],
++                                            REG_NAMES[width_row][tracked as usize],
++                                        );
++                                        let dst_owned = dst_op.to_string();
++                                        let full = store.get(i).to_string();
++                                        let lead_len = full.len() - line_text.len();
++                                        let new_line = format!(
++                                            "{}{}{}, {}",
++                                            &full[..lead_len],
++                                            mnemonic,
++                                            new_src,
++                                            dst_owned
++                                        );
++                                        replace_line(store, &mut infos[i], i, new_line);
++                                        changed = true;
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
+             }
+             copy_src = [REG_NONE; 16];
+             copy_src32 = [REG_NONE; 16];
+@@ -331,6 +476,62 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
+             }
+         }
+ 
++        // N2: low-32 identities into consumers that read only the 32-bit
++        // (or narrower) part of the family.  `movl` zero-extends
++        // identically on both sides of the identity, so those reads see
++        // exactly the same value for the copy and its origin.  This kills
++        // the staging relays the 64-bit arm cannot touch (`movl %ebp,
++        // %eax` before a `cmpl`/store; `movl %eax, %r9d` between a
++        // `movzbl` load and its compare).
++        for reg in 0..16u8 {
++            let src = copy_src32[reg as usize];
++            if src == REG_NONE || src == reg {
++                continue;
++            }
++            if infos[i].reg_refs & (1u16 << reg) == 0 {
++                continue;
++            }
++            // N2(b): the identity covers READS only — a line writing the
++            // family must keep its destination register.
++            if get_dest_reg(&infos[i]) == reg {
++                continue;
++            }
++            let cur_trimmed = infos[i].trimmed(store.get(i));
++            // N2(c): mirrors the 64-bit arm above.
++            if has_implicit_reg_usage(cur_trimmed) {
++                break;
++            }
++            // Shift/rotate counts are %cl by architecture: the 64-bit arm
++            // refuses to propagate into %rcx for exactly this reason, and
++            // the narrow arm must hold the same line even though %cl is a
++            // byte-width (narrow) occurrence.
++            if reg == 1 && is_shift_or_rotate(cur_trimmed) {
++                continue;
++            }
++            // N2(a): refuse 64-bit reads and mixed high-byte lines.
++            if !only_narrow_uses_of(cur_trimmed, reg) {
++                continue;
++            }
++            let mut new_text = cur_trimmed.to_string();
++            for row in 1..=3usize {
++                new_text = replace_whole_name(
++                    &new_text,
++                    REG_NAMES[row][reg as usize],
++                    REG_NAMES[row][src as usize],
++                );
++            }
++            if new_text != cur_trimmed {
++                let new_line = {
++                    let full = store.get(i);
++                    let lead_len = full.len() - cur_trimmed.len();
++                    format!("{}{}", &full[..lead_len], new_text)
++                };
++                replace_line(store, &mut infos[i], i, new_line);
++                changed = true;
++                break;
++            }
++        }
++
+         // If we propagated, don't increment i - re-process.
+         // But we still need to do invalidation below.
+         let _ = did_propagate;
+@@ -418,6 +619,283 @@ mod tests {
+         (store, infos)
+     }
+ 
++    /// Run `propagate_register_copies` to a local fixpoint (the pipeline
++    /// drives it repeatedly; two iterations expose chain-then-consume).
++    fn propagate(asm: &str) -> String {
++        let (mut store, mut infos) = build_pinned(asm);
++        for _ in 0..2 {
++            propagate_register_copies(&mut store, &mut infos);
++        }
++        (0..store.len())
++            .filter(|&i| !infos[i].is_nop())
++            .map(|i| store.get(i).trim().to_string())
++            .collect::<Vec<_>>()
++            .join("\n")
++    }
++
++    // NOTE on the choice of copy sources in these tests: the reg-reg copy
++    // parsers reject the frame families (%rsp/%rbp) by design, so every
++    // fixture uses %ebx/%edx-class sources.
++
++    #[test]
++    fn narrow_consumer_is_retargeted_to_the_movl_origin() {
++        // N2: `cmpl` reads only the low 32 bits of %eax, which the movl
++        // identity pins to %ebx — the read is retargeted.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    cmpl %eax, %esi\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("cmpl %ebx, %esi"), "{out}");
++    }
++
++    #[test]
++    fn byte_and_word_reads_are_retargeted() {
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    testb %al, %al\n",
++            "    movl %edx, %ecx\n",
++            "    testw %cx, %cx\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("testb %bl, %bl"), "{out}");
++        assert!(out.contains("testw %dx, %dx"), "{out}");
++    }
++
++    #[test]
++    fn movl_store_source_is_retargeted() {
++        // N3: the store reads exactly the low 32 bits the identity covers.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    movl %eax, (%r8,%r9,4)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movl %ebx, (%r8,%r9,4)"), "{out}");
++    }
++
++    #[test]
++    fn movq_store_source_uses_the_full_identity() {
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movq %rdx, %rax\n",
++            "    movq %rax, (%r8)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movq %rdx, (%r8)"), "{out}");
++    }
++
++    #[test]
++    fn movq_store_refuses_a_low32_only_identity() {
++        // `movl` zeroes the upper half — the 64-bit store must keep %rax.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    movq %rax, (%r8)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movq %rax, (%r8)"), "{out}");
++        assert!(!out.contains("movq %rbx"), "{out}");
++    }
++
++    #[test]
++    fn sixty_four_bit_reader_keeps_the_copy() {
++        // N2(a): `addq` reads bits 32..=63, outside the movl identity.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    addq %rax, %r9\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("addq %rax, %r9"), "{out}");
++    }
++
++    #[test]
++    fn address_use_keeps_the_copy() {
++        // N2(a)/(d): a base/index reference is a 64-bit read.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    movl (%rax), %esi\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movl (%rax), %esi"), "{out}");
++    }
++
++    #[test]
++    fn dest_write_keeps_the_copy() {
++        // N2(b): the result must land in %eax.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    subl %edx, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("subl %edx, %eax"), "{out}");
++    }
++
++    #[test]
++    fn high_byte_line_keeps_the_copy() {
++        // N2(a): %ah stays unrewritten; a mixed line is refused outright.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    addb %ah, %cl\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("addb %ah, %cl"), "{out}");
++        assert!(!out.contains("%bh"), "{out}");
++    }
++
++    #[test]
++    fn shift_count_in_cl_is_never_retargeted() {
++        // The count of a variable shift is %cl by architecture; the
++        // 64-bit arm refuses %rcx propagation there and the narrow arm
++        // must not sneak the byte-width occurrence through.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movq %rdi, %rcx\n",
++            "    shlq %cl, %r8\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("shlq %cl, %r8"), "{out}");
++        assert!(!out.contains("%dil"), "{out}");
++    }
++
++    #[test]
++    fn setcc_destination_is_never_retargeted() {
++        // SetCC writes the family at 8-bit width — N2(b) refuses it.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebx, %eax\n",
++            "    sete %al\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("sete %al"), "{out}");
++    }
++
++    #[test]
++    fn store_relay_dies_end_to_end_when_the_dest_is_redefined() {
++        // The fannkuch store shape through the full peephole pipeline:
++        // the store source is retargeted, then the now-dead relay is
++        // deleted (%eax is fully redefined before any read).
++        let out = super::super::super::peephole_optimize(
++            concat!(
++                "f:\n",
++                ".cfi_startproc\n",
++                "    movl %ebx, %eax\n",
++                "    movl %eax, (%r8,%r9,4)\n",
++                "    movl %edx, %eax\n",
++                "    ret\n",
++                ".cfi_endproc\n",
++            )
++            .to_string(),
++        );
++        assert!(out.contains("movl %ebx, (%r8,%r9,4)"), "{out}");
++        assert!(!out.contains("movl %ebx, %eax"), "{out}");
++        assert!(out.contains("movl %edx, %eax"), "{out}");
++    }
++
++    #[test]
++    fn imul_three_operand_overwrite_kills_the_relay_end_to_end() {
++        // The magic-division staple: `imull $imm, %src, %r9d` writes %r9d
++        // without reading it, so the staging relay in front of it dies.
++        // Regression pin for the phantom-RMW bug that kept the glibc_strstr
++        // `movl %eax, %r9d` alive one instruction per hot iteration.
++        let out = super::super::super::peephole_optimize(
++            concat!(
++                "f:\n",
++                ".cfi_startproc\n",
++                "    movl %eax, %r9d\n",
++                "    imull $5, %ebx, %r9d\n",
++                "    movq %r9, %rbx\n",
++                "    ret\n",
++                ".cfi_endproc\n",
++            )
++            .to_string(),
++        );
++        assert!(!out.contains("movl %eax, %r9d"), "{out}");
++        assert!(out.contains("imull $5, %ebx, %r9d"), "{out}");
++        assert!(out.contains("movq %r9, %rbx"), "{out}");
++    }
++
++    #[test]
++    fn imul_two_operand_still_reads_its_destination() {
++        // The two-operand form genuinely reads the destination: the relay
++        // must survive.
++        let out = super::super::super::peephole_optimize(
++            concat!(
++                "f:\n",
++                ".cfi_startproc\n",
++                "    movl %eax, %r9d\n",
++                "    imull %ebx, %r9d\n",
++                "    movq %r9, %rbx\n",
++                "    ret\n",
++                ".cfi_endproc\n",
++            )
++            .to_string(),
++        );
++        assert!(out.contains("movl %eax, %r9d"), "{out}");
++    }
++
++    #[test]
++    fn movl_store_source_is_retargeted_from_a_frame_family() {
++        // fannkuch's swap-loop shape: the RA homes perm[i] in %ebp and the
++        // store source is retargeted through the low-32 identity.
++        let out = propagate(concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl %ebp, %eax\n",
++            "    movl %eax, (%r8,%r9,4)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movl %ebp, (%r8,%r9,4)"), "{out}");
++    }
++
++    #[test]
++    fn frame_family_relay_dies_end_to_end_when_the_dest_is_redefined() {
++        let out = super::super::super::peephole_optimize(
++            concat!(
++                "f:\n",
++                ".cfi_startproc\n",
++                "    movl %ebp, %eax\n",
++                "    movl %eax, (%r8,%r9,4)\n",
++                "    movl %edx, %eax\n",
++                "    ret\n",
++                ".cfi_endproc\n",
++            )
++            .to_string(),
++        );
++        assert!(out.contains("movl %ebp, (%r8,%r9,4)"), "{out}");
++        assert!(!out.contains("movl %ebp, %eax"), "{out}");
++        assert!(out.contains("movl %edx, %eax"), "{out}");
++    }
++
+     #[test]
+     fn copy_state_does_not_cross_inline_asm() {
+         // `movq %rax, %rcx` copies; the asm block redefines %rax (and %rcx)
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+index 3c65550..16879cb 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+@@ -871,6 +871,12 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
+ /// disappear into the compare. Flag-for-flag identical: `cmp $0, mem` and
+ /// `test %r, %r` over the same value both clear CF/OF and set ZF/SF/PF from
+ /// it, and the sign of a sign-extended byte is the sign of the byte.
++/// Width-matched tests (`testb` after a byte load, `testw` after a word
++/// load) are flag-exact for sign AND zero extension, because they read only
++/// the memory bytes themselves; that admits the hot sieve shapes where a
++/// `testb %sil, %sil` follows the widening load.  Pure register staging
++/// (mov/lea, no memory operand, not touching the loaded family) is allowed
++/// between load and test.
+ ///
+ /// This needs the register to be dead after the test, ACROSS the branch that
+ /// follows — which is exactly what the block-local scans could never prove and
+@@ -920,9 +926,41 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
+             i += 1;
+             continue;
+         };
+-        // The very next instruction must be the self-test of that register.
++        // The self-test of the loaded register follows.  Pure, flag-neutral
++        // register staging may sit between the load and the test (sieve
++        // count loop: `leal 1(%r10), %esi` between the `movsbq` and the
++        // `testb`); mov/lea with register operands only neither read nor
++        // write flags nor touch memory, so sliding the compare past them is
++        // invisible to the program.
++        let fam_mask = 1u16 << fam;
+         let mut j = i + 1;
+-        while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
++        while j < len {
++            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
++                j += 1;
++                continue;
++            }
++            if infos[j].pinned {
++                break;
++            }
++            let st = infos[j].trimmed(store.get(j));
++            // lea only computes an address: no memory access, no flags —
++            // its `(...)` operand is syntax, not an access.  mov is pure
++            // only in the register/immediate forms (no memory operand).
++            let staging =
++                if st.starts_with("leaq ") || st.starts_with("leal ") || st.starts_with("leaw ") {
++                    true
++                } else if st.starts_with("movq ")
++                    || st.starts_with("movl ")
++                    || st.starts_with("movw ")
++                    || st.starts_with("movb ")
++                {
++                    !st.contains('(')
++                } else {
++                    false
++                } && infos[j].reg_refs & fam_mask == 0;
++            if !staging {
++                break;
++            }
+             j += 1;
+         }
+         if j >= len || infos[j].pinned {
+@@ -930,13 +968,28 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
+             continue;
+         }
+         let test = infos[j].trimmed(store.get(j)).to_string();
+-        let Some(args) = test
++        let Some((width, args)) = test
+             .strip_prefix("testq ")
+-            .or_else(|| test.strip_prefix("testl "))
++            .map(|r| ('q', r))
++            .or_else(|| test.strip_prefix("testl ").map(|r| ('l', r)))
++            .or_else(|| test.strip_prefix("testw ").map(|r| ('w', r)))
++            .or_else(|| test.strip_prefix("testb ").map(|r| ('b', r)))
+         else {
+             i += 1;
+             continue;
+         };
++        // A NARROWER-than-loaded test reads fewer bytes than the compare
++        // would (`testb` of a word load sees only the low byte), so it is
++        // never equivalent; admit narrow tests only at the loaded width.
++        // Wider tests (q/l after a byte/word load) keep the pre-existing
++        // sign-extension rules below.
++        if matches!(
++            (width, *cmp_mnemonic),
++            ('b', "cmpw" | "cmpl") | ('w', "cmpl")
++        ) {
++            i += 1;
++            continue;
++        }
+         let Some((a, b)) = split_two_operands(args) else {
+             i += 1;
+             continue;
+@@ -961,8 +1014,17 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
+         // would stop at the first writer on the fall-through path.
+         let signed_64 = matches!(*prefix, "movsbq " | "movswq " | "movslq ");
+         let signed_32 = matches!(*prefix, "movsbl " | "movswl ");
+-        let test_is_q = test.starts_with("testq ");
+-        if !(signed_64 || (signed_32 && !test_is_q))
++        let test_is_q = width == 'q';
++        // A test whose width matches the loaded width reads exactly the
++        // memory bytes (the low byte / low word are identical under sign
++        // AND zero extension), so every flag — SF included — is provably
++        // identical to the compare; no consumer walk is needed.  This is
++        // what admits `testb` at all: the q/l walks above would reject the
++        // zero-extended byte loads (SF bit 63 = 0 vs the byte's bit 7).
++        let width_matched =
++            (*cmp_mnemonic == "cmpb" && width == 'b') || (*cmp_mnemonic == "cmpw" && width == 'w');
++        if !width_matched
++            && !(signed_64 || (signed_32 && !test_is_q))
+             && super::flag_peepholes::flags_reach_an_sf_consumer(store, infos, j + 1)
+         {
+             i += 1;
+@@ -1566,6 +1628,142 @@ mod tests {
+         assert!(!out.contains("cmpb $0"), "{out}");
+     }
+ 
++    #[test]
++    fn byte_self_test_folds_to_a_memory_compare() {
++        // Width-matched test: `testb` reads only the low byte, which is the
++        // memory byte itself under sign AND zero extension, so every flag is
++        // identical and the fold needs no SF-consumer walk.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            ".LBB1:\n",
++            "    movsbq (%rbx), %rsi\n",
++            "    testb %sil, %sil\n",
++            "    je .LBB3\n",
++            "    leaq 1(%rbx), %rbx\n",
++            "    jmp .LBB1\n",
++            ".LBB3:\n",
++            "    movq %rbx, %rax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("cmpb $0, (%rbx)"), "{out}");
++        assert!(!out.contains("movsbq"), "{out}");
++    }
++
++    #[test]
++    fn zero_extended_byte_self_test_folds_even_for_a_sign_consumer() {
++        // `movzbl` + `testq` is the SF-divergent shape (bit 63 = 0 vs the
++        // byte's bit 7), but `testb` after the SAME load is flag-exact, so
++        // a downstream `js` cannot distinguish it from `cmpb $0`.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movzbl (%rbx), %esi\n",
++            "    testb %sil, %sil\n",
++            "    je .LBB3\n",
++            "    js .LBB4\n",
++            "    movl $1, %eax\n",
++            "    ret\n",
++            ".LBB3:\n",
++            ".LBB4:\n",
++            "    xorl %eax, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("cmpb $0, (%rbx)"), "{out}");
++        assert!(!out.contains("movzbl (%rbx)"), "{out}");
++    }
++
++    #[test]
++    fn byte_self_test_folds_across_pure_register_staging() {
++        // The sieve count loop: the count pre-increment (`leal 1(%r10)`)
++        // stages between the load and the `testb`.  mov/lea staging touches
++        // neither flags nor memory nor the loaded family, so the compare
++        // slides past it.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            ".LBB1:\n",
++            "    movsbq (%r11,%r8), %rdi\n",
++            "    leal 1(%r10), %esi\n",
++            "    testb %dil, %dil\n",
++            "    cmovnel %esi, %r10d\n",
++            "    addq $1, %r8\n",
++            "    cmpq $100, %r8\n",
++            "    jle .LBB1\n",
++            "    movl %r10d, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("cmpb $0, (%r11,%r8)"), "{out}");
++        assert!(!out.contains("movsbq"), "{out}");
++        assert!(out.contains("cmovnel %esi, %r10d"), "{out}");
++    }
++
++    #[test]
++    fn byte_load_test_is_kept_when_staging_sets_flags() {
++        // The intervening `imulq` writes flags; sliding the compare past it
++        // would clobber them.  Not staging — the fold refuses.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movsbq (%rbx), %rsi\n",
++            "    imulq %r9, %r10\n",
++            "    testb %sil, %sil\n",
++            "    je .LBB3\n",
++            "    movq %r10, %rax\n",
++            "    ret\n",
++            ".LBB3:\n",
++            "    xorl %eax, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movsbq (%rbx), %rsi"), "{out}");
++        assert!(!out.contains("cmpb $0"), "{out}");
++    }
++
++    #[test]
++    fn byte_load_test_is_kept_when_staging_writes_memory() {
++        // The intervening store could overwrite the compared byte.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movsbq (%rbx), %rsi\n",
++            "    movb $0, (%r9)\n",
++            "    testb %sil, %sil\n",
++            "    je .LBB3\n",
++            "    movq %r9, %rax\n",
++            "    ret\n",
++            ".LBB3:\n",
++            "    xorl %eax, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movsbq (%rbx), %rsi"), "{out}");
++        assert!(!out.contains("cmpb $0"), "{out}");
++    }
++
++    #[test]
++    fn word_self_test_folds_to_a_memory_compare() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            ".LBB1:\n",
++            "    movswq (%rbx), %rsi\n",
++            "    testw %si, %si\n",
++            "    je .LBB3\n",
++            "    leaq 2(%rbx), %rbx\n",
++            "    jmp .LBB1\n",
++            ".LBB3:\n",
++            "    movq %rbx, %rax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("cmpw $0, (%rbx)"), "{out}");
++        assert!(!out.contains("movswq"), "{out}");
++    }
++
+     #[test]
+     fn accumulator_roundtrip_is_applied_in_place() {
+         let out = run(concat!(
+diff --git a/src/backend/x86/codegen/peephole/passes/helpers.rs b/src/backend/x86/codegen/peephole/passes/helpers.rs
+index 595f734..3249c55 100644
+--- a/src/backend/x86/codegen/peephole/passes/helpers.rs
++++ b/src/backend/x86/codegen/peephole/passes/helpers.rs
+@@ -316,6 +316,18 @@ pub(super) fn parse_reg_to_reg_movq(info: &LineInfo, trimmed: &str) -> Option<(R
+     None
+ }
+ 
++/// Parse a `movl %src, %dst` reg-reg copy.  Unlike [`parse_reg_to_reg_movq`]
++/// this admits `%ebp` as a SOURCE: the RA legitimately homes values in the
++/// frame family (fannkuch's swap loop keeps `perm[i]` in `%ebp` and paid a
++/// `movl %ebp, %eax` staging relay in front of every store), and a `movl`
++/// identity is low-32 only — the narrow substitution sites refuse any line
++/// naming the 64-bit register, so `%rbp` can never leak into an address or a
++/// frame-manipulation form (`leave`/`popq %rbp`/`movq %rsp, %rbp` are
++/// implicit-reg barriers or write family 5, which invalidates the copy).
++/// `%rsp` stays excluded at both ends: its implicit writers (`push`/`pop`/
++/// `call`/`ret`/`andq`-style alignment) are too numerous to audit for one
++/// missed model entry, and the RA never copies `%esp` in real output.
++/// Destinations in families 4/5 stay excluded (frame-setup shapes).
+ pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(RegId, RegId)> {
+     if let LineKind::Other { dest_reg } = info.kind {
+         if dest_reg == REG_NONE || dest_reg > REG_GP_MAX {
+@@ -333,7 +345,6 @@ pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(R
+                 if sfam == REG_NONE
+                     || sfam > REG_GP_MAX
+                     || sfam == 4
+-                    || sfam == 5
+                     || dfam == REG_NONE
+                     || dfam > REG_GP_MAX
+                     || dfam == 4
+@@ -703,14 +714,144 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
+         || trimmed.starts_with("shlx")
+         || trimmed.starts_with("shrx")
+         || trimmed.starts_with("sarx")
++        // RORX (BMI2) is the three-operand rotate: it never reads its
++        // destination.  Forgetting it here turns every `rorxl` into a
++        // phantom RMW, inflating the destination's liveness and killing
++        // every liveness-driven peephole around it (measured: the sha256
++        // K[i]/W[i] load→add fusions died and the loop ran ~9% slower on
++        // a Raptor Lake-class core with BMI2 on).  The plain `rol`/`ror`
++        // two-operand forms ARE read-modify-write and stay in the default.
++        || trimmed.starts_with("rorx")
+     {
+         return false;
+     }
+ 
++    // ── non-destructive operand forms of the read-modify-write set ─────────
++    //
++    // The legacy two-operand forms (`imull %ebx, %r9d`, `addl $1, %eax`) and
++    // one-operand unary forms (`negl %eax`) READ their destination.  The
++    // extra-destination forms do not:
++    //   * `imul s1, s2, dst` (three operands) — the magic-division lowering
++    //     emits this on every division-by-constant (glibc_strstr's `% 26`,
++    //     fannkuch's index math, gzip's CRC folds);
++    //   * APX NDD `add/sub/adc/sbb/and/or/xor s1, s2, dst` (three operands);
++    //   * APX NDD unary `neg/not/inc/dec src, dst` (two operands).
++    // Calling those read-modify-write is a PHANTOM READ of the destination's
++    // old value: liveness then reports every staging relay in front of them
++    // live (`movl %eax, %r9d` before `imull $1664525, %ebx, %r9d` in the
++    // glibc_strstr Horspool loop) and dead-pure-write elimination refuses to
++    // delete it — one wasted instruction per hot iteration.
++    //
++    // `shld`/`shrd` are the deliberate counterexample that keeps this table
++    // exact: their three-operand form shifts bits THROUGH the destination and
++    // genuinely reads it, so they stay in the conservative default (as do all
++    // mnemonics not named below: `bsf`, `mul`, `div`, `xchg`, ...).  Mnemonic
++    // matching is EXACT so SSE look-alikes (`addss`, `imulsd`) never enter.
++    // The degenerate `src == dst` spellings (`imull $5, %r9d, %r9d`) still
++    // read the family — as the SOURCE operand; callers that care consult
++    // their own source-mentions-dest guard (see `is_pure_write_mnemonic`'s
++    // contract), which subsumes that case exactly as it does for `popcnt`.
++    {
++        let mnemonic_end = trimmed
++            .find(|c: char| c.is_whitespace())
++            .unwrap_or(trimmed.len());
++        let mnemonic = &trimmed[..mnemonic_end];
++        let ndd_unary = matches!(
++            mnemonic,
++            "neg"
++                | "negb"
++                | "negw"
++                | "negl"
++                | "negq"
++                | "not"
++                | "notb"
++                | "notw"
++                | "notl"
++                | "notq"
++                | "inc"
++                | "incb"
++                | "incw"
++                | "incl"
++                | "incq"
++                | "dec"
++                | "decb"
++                | "decw"
++                | "decl"
++                | "decq"
++        );
++        let ndd_binary = matches!(
++            mnemonic,
++            "add"
++                | "addb"
++                | "addw"
++                | "addl"
++                | "addq"
++                | "sub"
++                | "subb"
++                | "subw"
++                | "subl"
++                | "subq"
++                | "adc"
++                | "adcb"
++                | "adcw"
++                | "adcl"
++                | "adcq"
++                | "sbb"
++                | "sbbb"
++                | "sbbw"
++                | "sbbl"
++                | "sbbq"
++                | "and"
++                | "andb"
++                | "andw"
++                | "andl"
++                | "andq"
++                | "or"
++                | "orb"
++                | "orw"
++                | "orl"
++                | "orq"
++                | "xor"
++                | "xorb"
++                | "xorw"
++                | "xorl"
++                | "xorq"
++                | "imul"
++                | "imulb"
++                | "imulw"
++                | "imull"
++                | "imulq"
++        );
++        if ndd_unary || ndd_binary {
++            let ops = trimmed[mnemonic_end..].split('#').next().unwrap_or("");
++            let operands = count_top_level_operands(ops);
++            if (ndd_binary && operands >= 3) || (ndd_unary && operands >= 2) {
++                return false;
++            }
++        }
++    }
++
+     // Default: assume read-modify-write (conservative)
+     true
+ }
+ 
++/// Count AT&T operands in `ops`, honoring the balanced-paren scanner so a SIB
++/// address's internal commas (`disp(%base,%idx,4)`) never split an operand.
++fn count_top_level_operands(ops: &str) -> usize {
++    let mut n = 0usize;
++    let mut rest = ops.trim();
++    if rest.is_empty() {
++        return 0;
++    }
++    loop {
++        n += 1;
++        match crate::backend::peephole_common::last_top_level_comma(rest.as_bytes()) {
++            Some(i) => rest = rest[..i].trim(),
++            None => return n,
++        }
++    }
++}
++
+ // ── tests: register rewriting and redefinition predicates ───────────────────
+ 
+ #[cfg(test)]
+diff --git a/src/backend/x86/codegen/peephole/passes/liveness.rs b/src/backend/x86/codegen/peephole/passes/liveness.rs
+index 0096ceb..aed1528 100644
+--- a/src/backend/x86/codegen/peephole/passes/liveness.rs
++++ b/src/backend/x86/codegen/peephole/passes/liveness.rs
+@@ -32,7 +32,7 @@
+ //!   and `%r10` (static chain), and clobbers the caller-saved set.
+ 
+ use super::super::types::*;
+-use super::helpers::get_dest_reg;
++use super::helpers::{get_dest_reg, is_read_modify_write};
+ 
+ /// All 16 GP families.
+ const ALL: u16 = 0xFFFF;
+@@ -88,20 +88,27 @@ struct Effect {
+ 
+ /// Mnemonics whose destination operand is written without being read.
+ fn is_pure_write_mnemonic(t: &str) -> bool {
+-    // `cmov` is deliberately absent: it only conditionally updates its
+-    // destination, so the old value stays live.
+-    (t.starts_with("mov") && !t.starts_with("movs") || t.starts_with("movs") && t.len() > 5)
+-        || t.starts_with("lea")
+-        || t.starts_with("set")
+-        // Always-writing bit counters. `bsf`/`bsr` are deliberately absent:
+-        // they leave the destination untouched when the source is zero.
+-        || t.starts_with("lzcnt")
+-        || t.starts_with("tzcnt")
+-        || t.starts_with("popcnt")
+-        // BMI2 three-operand shifts always write their destination.
+-        || t.starts_with("shlx")
+-        || t.starts_with("shrx")
+-        || t.starts_with("sarx")
++    // SINGLE SOURCE OF TRUTH: the dest-only contract lives in
++    // `helpers::is_read_modify_write`.  This module used to keep its own
++    // copy of the list; the two drifted (rorx was missing here), every
++    // `rorxl` became a phantom read of its destination, the K[i]/W[i]
++    // families stayed live around the sha256 loop, and the load→add
++    // fusions died (~9% runtime on Raptor Lake-class cores).  Delegating
++    // makes drift structurally impossible.
++    //
++    // Call-site contract that makes the delegation exact:
++    // * string instructions (`rep movsb`, ...) short-circuit BEFORE this
++    //   predicate via `is_string_instruction`, so the `movs` len<=5
++    //   exclusion the old list carried is a dead path here;
++    // * the caller consults the result only for GP destinations
++    //   (`dest <= REG_GP_MAX`), so scalar-SSE look-alikes whose dest is
++    //   an xmm register (`movsd %xmm0, ...`) never reach it;
++    // * the caller applies its own operand-text guards (source mentions
++    //   the dest, partial-width dest), subsuming the LEA self-address
++    //   exception the helper carries.
++    // `cmov` stays read-modify-write (kept when the condition is false);
++    // `mulx` stays conservative (implicit %rdx read, two destinations).
++    !is_read_modify_write(t)
+ }
+ 
+ /// `true` for the x86 string instructions (`movs*`, `stos*`, `lods*`,
+@@ -1042,6 +1049,96 @@ mod tests {
+     use super::*;
+     use crate::backend::peephole_common::LineStore;
+ 
++    /// Drift alarm for the dest-only contract.  Since S03 the liveness
++    /// classifier DELEGATES to `helpers::is_read_modify_write` (the
++    /// sha256 regression was exactly such a drift: rorx present in one
++    /// list, missing in the other).  This table pins the semantic result
++    /// itself, so any future edit of the shared predicate that moves one
++    /// of these mnemonics fails loudly here instead of silently killing
++    /// liveness-driven peepholes on real workloads.
++    #[test]
++    fn pure_write_table_matches_the_shared_rmw_predicate() {
++        // Dest-only: written, never read.
++        let dest_only = [
++            "movq %rax, %rbx",
++            "movl $1, %eax",
++            "movabsq $4611686018427387904, %rax",
++            "movzbl %al, %eax",
++            "movsbl %al, %eax",
++            "movslq %eax, %rbx",
++            "leaq 8(%rcx), %rax",
++            "sete %al",
++            "lzcntq %rbx, %rax",
++            "tzcntl %ebx, %eax",
++            "popcntq %rbx, %rax",
++            "shlxl %ebx, %ecx, %edx",
++            "shrxq %rbx, %rcx, %rdx",
++            "sarxl %ebx, %ecx, %edx",
++            "rorxl $7, %edx, %eax",
++            "andnl %ebx, %ecx, %edx",
++            "bzhil %ebx, %ecx, %edx",
++            "bextrl %ebx, %ecx, %edx",
++            "pextq %rbx, %rcx, %rdx",
++            "pdepq %rbx, %rcx, %rdx",
++            "blsrl %ebx, %eax",
++            "blsil %ebx, %eax",
++            "blsmskl %ebx, %eax",
++        ];
++        for line in dest_only {
++            assert!(
++                is_pure_write_mnemonic(line) && !is_read_modify_write(line),
++                "{line}: must be dest-only in BOTH models"
++            );
++        }
++        // Non-destructive operand forms of otherwise-RMW mnemonics: the
++        // three-operand `imul` (magic-division staple) and the APX NDD
++        // forms write their destination without reading it.
++        let ndd_forms = [
++            "imull $5, %ebx, %r9d",
++            "imulq %rbx, %rcx, %rdx",
++            "imull (%rbx), %ecx, %eax",
++            "addl $1, %eax, %ebx",
++            "subq %rax, %rbx, %r12",
++            "negl %eax, %ebx",
++            "notq %rax, %r11",
++        ];
++        for line in ndd_forms {
++            assert!(
++                is_pure_write_mnemonic(line) && !is_read_modify_write(line),
++                "{line}: extra-destination form must be dest-only in BOTH models"
++            );
++        }
++        // Read-modify-write (or conservatively modelled as such).
++        let rmw = [
++            "addq %rax, %rbx",
++            "imull %ebx, %r9d",     // two-operand imul reads its destination
++            "imulq %rbx",           // one-operand: implicit %rax/%rdx world
++            "addl $1, %eax",        // two-operand ALU reads the destination
++            "negl %eax",            // one-operand unary reads the destination
++            "shldl $2, %esi, %edi", // bits shift THROUGH the destination
++            "addsd %xmm0, %xmm1",   // SSE look-alike stays RMW (exact match)
++            "cmovneq %rax, %rbx",   // dest kept when the condition is false
++            "bsfq %rbx, %rax",      // dest untouched for a zero source
++            "bsrq %rbx, %rax",
++            "mulxl %ebx, %ecx, %edx", // implicit %rdx read, two dests
++            "rolq $1, %rax",          // two-operand rotates read the dest
++            "shrq $1, %rax",
++            "incq %rax",
++            "xchgl %eax, %ebx",
++            "adoxq %rbx, %rax",
++            // LEA with the dest inside its own address reads the dest;
++            // the unified model reports RMW and the classifier keeps the
++            // old value live (soundness over the rare self-address form).
++            "leaq 4(%rax), %rax",
++        ];
++        for line in rmw {
++            assert!(
++                !is_pure_write_mnemonic(line) && is_read_modify_write(line),
++                "{line}: must stay read-modify-write in BOTH models"
++            );
++        }
++    }
++
+     fn build(asm: &str) -> (LineStore, Vec<LineInfo>, FileLiveness) {
+         let store = LineStore::new(asm.to_string());
+         let infos: Vec<LineInfo> = (0..store.len())
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index beffc93..9b25413 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -425,6 +425,23 @@ pub(crate) fn peephole_optimize_with_config(asm: String, ra_config: &RaConfig) -
+     out
+ }
+ 
++/// Delete GP pure writes whose value is provably dead, to a local fixpoint:
++/// retiring one relay can expose the next in an `mov A,B; mov B,C; ...` chain
++/// (each proof sees the reads the previous deletion removed).  Shared by the
++/// post-Phase-1 orphan sweeps: every global fold (copy propagation's consumer
++/// retargets, the relay/memory folds, stack-slot DSE, trampoline removal)
++/// orphans staging copies whose value became dead, and Phase 1's
++/// `eliminate_dead_pure_writes` never runs again afterwards.
++/// `CCC_PEEPHOLE_SKIP=dead_pure_writes` disables every site (Phase 1 and
++/// these sweeps alike).
++fn retire_dead_pure_writes(store: &LineStore, infos: &mut [LineInfo]) -> bool {
++    let mut any = false;
++    while dead_writes::eliminate_dead_pure_writes(store, infos) {
++        any = true;
++    }
++    any
++}
++
+ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+     // ms178 debug: dump pre-peephole asm
+     if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
+@@ -1390,6 +1407,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+         if !sk("store_alu_fold") {
+             global_changed |= memory_fold::fold_store_alu_memop(&mut store, &mut infos);
+         }
++        // Orphan retirement: every fold above can leave a staging copy whose
++        // value became dead.  Sweep them to a local fixpoint in the same
++        // round — the comment at `copy_fold` promised this retirement and the
++        // only instrument that can prove it (`FileLiveness`) sat in Phase 1.
++        if !sk("dead_pure_writes") {
++            global_changed |= retire_dead_pure_writes(&store, &mut infos);
++        }
+         global_changed
+     };
+     if let Some(s) = phase2_start {
+@@ -1498,6 +1522,12 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+             if !sk("vec_self_move") {
+                 changed2 |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
+             }
++            // Orphan retirement inside the fixpoint: folds above orphan pure
++            // writes; retiring them lets the next iteration see the cleaner
++            // code (and the while-changed loop then converges).
++            if !sk("dead_pure_writes") {
++                changed2 |= retire_dead_pure_writes(&store, &mut infos);
++            }
+             pass_count2 += 1;
+         }
+     }
+@@ -1561,6 +1591,10 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+                 changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+             }
+             changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
++            // Orphan retirement inside the fixpoint (see phase 3).
++            if !sk("dead_pure_writes") {
++                changed3 |= retire_dead_pure_writes(&store, &mut infos);
++            }
+             pass_count3 += 1;
+         }
+     }
+@@ -1630,6 +1664,15 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+         let _ = epilogue_merge::merge_epilogue_tails(&mut store, &mut infos);
+     }
+ 
++    // Final orphan sweep: phases 4c–8b (hoisting, rotation, tail calls, slot
++    // DSE, callee-save elimination, frame compaction, block merging) can each
++    // orphan a pure write after the last fixpoint loop above.  This restores
++    // the pipeline's terminal invariant: no provably-dead GP pure write
++    // leaves the peephole.
++    if !sk("dead_pure_writes") {
++        let _ = retire_dead_pure_writes(&store, &mut infos);
++    }
++
+     // Phase 9: Re-run the always-on text passes on the FINAL text. The early
+     // pushfq/popfq elimination is conservative about rsp-relative memory
+     // operands, and the local passes frequently remove/rewrite exactly those
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index 49713fa..9157813 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -1135,10 +1135,30 @@ impl Driver {
+                     self.enable_fma = true;
+                     self.fma_explicitly_disabled = false;
+                 }
+-                "-mbmi" => self.enable_bmi = true,
+-                "-mbmi2" => self.enable_bmi2 = true,
+-                "-mlzcnt" => self.enable_lzcnt = true,
+-                "-mpopcnt" => self.enable_popcnt = true,
++                "-mbmi" => {
++                    // Last-explicit ISA decision wins (GCC): a later `-mbmi`
++                    // lifts an earlier `-mno-bmi` sticky denial.
++                    self.enable_bmi = true;
++                    self.bmi1_explicitly_disabled = false;
++                }
++                "-mbmi2" => {
++                    self.enable_bmi2 = true;
++                    self.bmi2_explicitly_disabled = false;
++                }
++                "-mlzcnt" => {
++                    // Last-explicit ISA decision wins (GCC): a later
++                    // `-mlzcnt` lifts an earlier `-mno-lzcnt` sticky denial.
++                    self.enable_lzcnt = true;
++                    self.lzcnt_explicitly_disabled = false;
++                }
++                "-mpopcnt" => {
++                    // Last-explicit ISA decision wins (GCC): a later
++                    // `-mpopcnt` lifts an earlier `-mno-popcnt` sticky
++                    // denial.
++                    self.enable_popcnt = true;
++                    self.popcnt_explicitly_disabled = false;
++                }
++
+                 "-mmovbe" => self.enable_movbe = true,
+                 "-mrdrnd" => self.enable_rdrnd = true,
+                 // AVX-512 / AVX10 feature flags (completeness; backend coverage
+@@ -1203,10 +1223,32 @@ impl Driver {
+                     self.enable_fma = false;
+                     self.fma_explicitly_disabled = true;
+                 }
+-                "-mno-bmi" => self.enable_bmi = false,
+-                "-mno-bmi2" => self.enable_bmi2 = false,
+-                "-mno-lzcnt" => self.enable_lzcnt = false,
+-                "-mno-popcnt" => self.enable_popcnt = false,
++                "-mno-bmi" => {
++                    self.enable_bmi = false;
++                    // Sticky denial: the absent-march baseline is x86-64-v3,
++                    // which carries BMI1; only this explicit denial removes
++                    // the class from a default build (GCC keeps the denial
++                    // sticky across a later `-march=native` probe too).
++                    self.bmi1_explicitly_disabled = true;
++                }
++                "-mno-bmi2" => {
++                    self.enable_bmi2 = false;
++                    self.bmi2_explicitly_disabled = true;
++                }
++                "-mno-lzcnt" => {
++                    self.enable_lzcnt = false;
++                    // Sticky denial: the absent-march baseline is x86-64-v3,
++                    // which carries ABM (LZCNT/TZCNT); only this explicit
++                    // denial removes it from a default build.
++                    self.lzcnt_explicitly_disabled = true;
++                }
++                "-mno-popcnt" => {
++                    self.enable_popcnt = false;
++                    // Sticky denial: the absent-march baseline is x86-64-v3,
++                    // which carries POPCNT (since v2); only this explicit
++                    // denial removes it from a default build.
++                    self.popcnt_explicitly_disabled = true;
++                }
+                 "-mno-movbe" => self.enable_movbe = false,
+                 "-mno-rdrnd" => self.enable_rdrnd = false,
+                 "-mno-avx512f" => self.enable_avx512f = false,
+@@ -2601,4 +2643,200 @@ mod cli_tests {
+         assert!(!d.no_sse);
+         assert!(d.enable_avx);
+     }
++
++    /// The absent-`-march` code-generation baseline is x86-64-v3 (the same
++    /// contract as `Driver::x86_isa` returning `X86Isa::V3`), and BMI1/BMI2
++    /// are v3 members: a default build must arm ANDN/RORX-class selection
++    /// without any explicit `-mbmi*`.  Before this policy the flags stayed
++    /// explicit-only, so default `-O2` emitted `notq;andq` where `-mbmi`
++    /// emitted one `andn` — while AVX2 (also v3) was already on by default.
++    #[test]
++    fn bmi_defaults_to_v3_baseline() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(d.bmi1_effective(), "v3 default baseline carries BMI1");
++        assert!(d.bmi2_effective(), "v3 default baseline carries BMI2");
++    }
++
++    /// `-mno-bmi` is a STICKY denial against the v3 default baseline — the
++    /// default must not revive the class behind the user's back (GCC keeps
++    /// the last-explicit ISA decision).
++    #[test]
++    fn mno_bmi_sticky_denial_beats_default_baseline() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-bmi", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(!d.bmi1_effective(), "-mno-bmi must deny the v3 default");
++        assert!(d.bmi2_effective(), "-mno-bmi leaves the BMI2 class alone");
++
++        let mut d2 = Driver::new();
++        let args2: Vec<String> = ["ccc", "-mno-bmi2", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d2.parse_cli_args(&args2).is_ok());
++        assert!(!d2.bmi2_effective());
++        assert!(d2.bmi1_effective());
++    }
++
++    /// GCC last-explicit ISA semantics: a later `-mbmi` lifts an earlier
++    /// `-mno-bmi` sticky denial (mirrors `-msse` after `-mno-sse`).
++    #[test]
++    fn mbmi_after_mno_bmi_reenables() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-bmi", "-mbmi", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(d.bmi1_effective());
++    }
++
++    /// ABM (LZCNT/TZCNT) is an x86-64-v3 member: the absent-`-march`
++    /// baseline projects it, so `tzcnt`/`lzcnt` are the default codegen
++    /// choices (they supersede `bsf`/`bsr` and are defined on zero input).
++    #[test]
++    fn lzcnt_baseline_default_on() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(d.lzcnt_effective(), "v3 baseline must project ABM");
++    }
++
++    /// Sticky `-mno-lzcnt` denial beats the v3 default baseline; the BMI
++    /// classes are unaffected (independent ISA groups).
++    #[test]
++    fn mno_lzcnt_sticky_denial_beats_default_baseline() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-lzcnt", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(!d.lzcnt_effective(), "-mno-lzcnt must deny the v3 default");
++        assert!(d.bmi1_effective());
++        assert!(d.bmi2_effective());
++    }
++
++    /// GCC last-explicit ISA semantics: a later `-mlzcnt` lifts an earlier
++    /// `-mno-lzcnt` sticky denial.
++    #[test]
++    fn mlzcnt_after_mno_lzcnt_reenables() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-lzcnt", "-mlzcnt", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(d.lzcnt_effective());
++    }
++
++    /// POPCNT joined the baseline at x86-64-v2, so the v3 default
++    /// projects it; sticky `-mno-popcnt` wins; a later `-mpopcnt` lifts
++    /// the denial; an explicit v1 ceiling removes it.
++    #[test]
++    fn popcnt_baseline_default_on_sticky_denial_and_ceiling() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(d.popcnt_effective(), "v3 baseline must project POPCNT");
++
++        let mut d2 = Driver::new();
++        let args2: Vec<String> = ["ccc", "-mno-popcnt", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d2.parse_cli_args(&args2).is_ok());
++        assert!(
++            !d2.popcnt_effective(),
++            "-mno-popcnt must deny the v3 default"
++        );
++
++        let mut d3 = Driver::new();
++        let args3: Vec<String> = ["ccc", "-mno-popcnt", "-mpopcnt", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d3.parse_cli_args(&args3).is_ok());
++        assert!(d3.popcnt_effective(), "-mpopcnt lifts the sticky denial");
++
++        let mut d4 = Driver::new();
++        let args4: Vec<String> = ["ccc", "-march=x86-64", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d4.parse_cli_args(&args4).is_ok());
++        assert!(!d4.popcnt_effective(), "v1 ceiling must not carry POPCNT");
++    }
++
++    /// An explicit `-march=x86-64` (v1) ceiling removes ABM from the
++    /// default projection — the baseline only applies without `-march`.
++    #[test]
++    fn explicit_v1_march_removes_lzcnt_baseline() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-march=x86-64", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(!d.lzcnt_effective(), "v1 ceiling must not carry ABM");
++
++        let mut d2 = Driver::new();
++        let args2: Vec<String> = ["ccc", "-march=x86-64-v3", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d2.parse_cli_args(&args2).is_ok());
++        assert!(d2.lzcnt_effective(), "v3 profile carries ABM");
++    }
++
++    /// An explicit `-march=` is the ceiling (GCC-exact): v1 has no BMI, so
++    /// the default-baseline BMI dies — unless an explicit `-mbmi` re-adds
++    /// the feature on top of the ceiling.
++    #[test]
++    fn explicit_march_is_the_bmi_ceiling() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-march=x86-64", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(!d.bmi1_effective(), "v1 ceiling has no BMI1");
++        assert!(!d.bmi2_effective(), "v1 ceiling has no BMI2");
++
++        let mut d2 = Driver::new();
++        let args2: Vec<String> = ["ccc", "-march=x86-64", "-mbmi", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d2.parse_cli_args(&args2).is_ok());
++        assert!(d2.bmi1_effective(), "explicit -mbmi adds the feature");
++
++        let mut d3 = Driver::new();
++        let args3: Vec<String> = ["ccc", "-march=x86-64-v3", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d3.parse_cli_args(&args3).is_ok());
++        assert!(d3.bmi1_effective());
++        assert!(d3.bmi2_effective());
++    }
++
++    /// BMI is an INTEGER class: `-mno-sse` denies the xmm world but leaves
++    /// ANDN/RORX legal — the v3 default baseline still applies.
++    #[test]
++    fn bmi_baseline_survives_mno_sse() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-sse", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(d.bmi1_effective(), "integer BMI survives the xmm denial");
++        assert!(d.bmi2_effective());
++    }
+ }
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 848e385..17ff540 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -197,6 +197,24 @@ pub struct Driver {
+     /// `avx_explicitly_disabled` because `-mno-avx` alone keeps SSE4.1 legal
+     /// (x86-64-v2 hardware).
+     pub(super) sse41_explicitly_disabled: bool,
++    /// Set by `-mno-bmi`: BMI1 (ANDN and the rest of the class) is denied
++    /// even though the absent-`-march` baseline is x86-64-v3, which carries
++    /// BMI1.  GCC keeps the last-explicit ISA decision sticky; the default
++    /// baseline must not revive the class behind the user's back.
++    pub(super) bmi1_explicitly_disabled: bool,
++    /// Set by `-mno-bmi2`: the BMI2 class (RORX, SHLX/SHRX/SARX, BZHI, …)
++    /// is denied against the v3 default baseline for the same reason as
++    /// [`Self::bmi1_explicitly_disabled`].
++    pub(super) bmi2_explicitly_disabled: bool,
++    /// Set by `-mno-lzcnt`: LZCNT/TZCNT (ABM) is denied against the v3
++    /// default baseline for the same reason as
++    /// [`Self::bmi1_explicitly_disabled`].
++    pub(super) lzcnt_explicitly_disabled: bool,
++    /// Set by `-mno-popcnt`: POPCNT is denied against the v3 default
++    /// baseline for the same reason as [`Self::bmi1_explicitly_disabled`]
++    /// (POPCNT joined the baseline one level earlier, at x86-64-v2, so v3
++    /// carries it a fortiori).
++    pub(super) popcnt_explicitly_disabled: bool,
+     /// An explicit x86 `-march=` was seen.  Under an explicit profile the
+     /// requested feature set (`enable_*`) is the *ceiling* (GCC semantics);
+     /// without one the code-generation baseline is x86-64-v3 and only
+@@ -486,6 +504,10 @@ impl Driver {
+             avx2_explicitly_disabled: false,
+             fma_explicitly_disabled: false,
+             sse41_explicitly_disabled: false,
++            bmi1_explicitly_disabled: false,
++            lzcnt_explicitly_disabled: false,
++            popcnt_explicitly_disabled: false,
++            bmi2_explicitly_disabled: false,
+             x86_march_explicit: false,
+             skip_rax_setup: false,
+             no_x87: false,
+@@ -1813,7 +1835,9 @@ impl Driver {
+             // Scalar BMI1 (ANDN) for the middle end's CH-fold defer —
+             // mirrors CodegenOptions::bmi1 for the x86-64 backend (the
+             // i686 backend has no andn fusion, so it stays false there).
+-            self.target == Target::X86_64 && self.enable_bmi,
++            // Resolved through bmi1_effective so the v3 default baseline
++            // arms the fold exactly when the backend will fuse it.
++            self.bmi1_effective(),
+             ra_config.as_ref(),
+         );
+         if time_phases {
+@@ -2402,12 +2426,12 @@ impl Driver {
+             general_regs_only: self.general_regs_only,
+             code_model_kernel: self.code_model_kernel,
+             no_jump_tables: self.no_jump_tables,
+-            bmi1: self.enable_bmi,
+-            bmi2: self.enable_bmi2,
++            bmi1: self.bmi1_effective(),
++            bmi2: self.bmi2_effective(),
+             apx: self.enable_apxf,
+             tune,
+-            lzcnt: self.enable_lzcnt,
+-            popcnt: self.enable_popcnt,
++            lzcnt: self.lzcnt_effective(),
++            popcnt: self.popcnt_effective(),
+             avx512: self.enable_avx512f,
+             isa: self.x86_isa(),
+             no_relax: self.riscv_no_relax,
+@@ -2483,6 +2507,52 @@ impl Default for Driver {
+ }
+ 
+ impl Driver {
++    /// Effective BMI1 (ANDN class) availability for this translation unit.
++    ///
++    /// Policy is the same contract as [`Self::x86_isa`]: no explicit
++    /// `-march` means the project baseline x86-64-v3 — and BMI1 is part of
++    /// v3 — while an explicit `-march=` makes the requested feature set the
++    /// ceiling (GCC-exact).  Sticky `-mno-bmi` denials win in both worlds.
++    /// BMI is an INTEGER class, so `-mno-sse` / `-mgeneral-regs-only` do not
++    /// remove it (kernel builds keep it; the xmm denials only kill SIMD).
++    /// i686 keeps its historical explicit-flags-only behavior — its backend
++    /// has no andn fusion, and the 32-bit baseline story is different.
++    pub(crate) fn bmi1_effective(&self) -> bool {
++        let baseline = self.target == Target::X86_64 && !self.x86_march_explicit;
++        (self.enable_bmi || baseline) && !self.bmi1_explicitly_disabled
++    }
++
++    /// Effective BMI2 (RORX/SHLX/BZHI class) availability; same contract as
++    /// [`Self::bmi1_effective`] — BMI2 is likewise an x86-64-v3 member.
++    pub(crate) fn bmi2_effective(&self) -> bool {
++        let baseline = self.target == Target::X86_64 && !self.x86_march_explicit;
++        (self.enable_bmi2 || baseline) && !self.bmi2_explicitly_disabled
++    }
++
++    /// Effective LZCNT/TZCNT (ABM) availability; same contract as
++    /// [`Self::bmi1_effective`].  ABM is an x86-64-v3 member, so the
++    /// absent-`-march` baseline projects it; a sticky `-mno-lzcnt` denial
++    /// wins.  Soundness: `tzcnt` is at least as correct as the `bsf` it
++    /// replaces (defined on zero input), and `lzcnt` replaces `bsr` the
++    /// same way, so defaulting them ON never changes a defined program's
++    /// results — it only removes the undefined-zero-input hole.
++    pub(crate) fn lzcnt_effective(&self) -> bool {
++        let baseline = self.target == Target::X86_64 && !self.x86_march_explicit;
++        (self.enable_lzcnt || baseline) && !self.lzcnt_explicitly_disabled
++    }
++
++    /// Effective POPCNT availability; same contract as
++    /// [`Self::bmi1_effective`].  POPCNT joined the baseline at
++    /// x86-64-v2, so the v3 default projects it too.  Soundness is
++    /// trivial: the instruction IS the builtin's semantics — enabling it
++    /// only changes which lowering of `__builtin_popcount` wins (the
++    /// `popcnt` instruction vs. a bit-count idiom sequence), never a
++    /// defined program's results.
++    pub(crate) fn popcnt_effective(&self) -> bool {
++        let baseline = self.target == Target::X86_64 && !self.x86_march_explicit;
++        (self.enable_popcnt || baseline) && !self.popcnt_explicitly_disabled
++    }
++
+     /// x86-64 code-generation ISA permission for this translation unit.
+     ///
+     /// Policy (`backend::x86::isa`):
+diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
+index da2355e..691e916 100644
+--- a/src/passes/bit_idioms.rs
++++ b/src/passes/bit_idioms.rs
+@@ -2474,6 +2474,32 @@ mod tests {
+             ty: IrType::U32,
+         }
+     }
++    fn and_ty(d: u32, ty: IrType, a: Operand, b: Operand) -> Instruction {
++        Instruction::BinOp {
++            dest: Value(d),
++            op: IrBinOp::And,
++            lhs: a,
++            rhs: b,
++            ty,
++        }
++    }
++    fn xor_ty(d: u32, ty: IrType, a: Operand, b: Operand) -> Instruction {
++        Instruction::BinOp {
++            dest: Value(d),
++            op: IrBinOp::Xor,
++            lhs: a,
++            rhs: b,
++            ty,
++        }
++    }
++    fn not_ty(d: u32, ty: IrType, a: Operand) -> Instruction {
++        Instruction::UnaryOp {
++            dest: Value(d),
++            op: IrUnaryOp::Not,
++            src: a,
++            ty,
++        }
++    }
+ 
+     /// Evaluate a value under an environment for the def-less inputs
+     /// (ids 0,1,2 = x,y,z) — the exhaustive truth-table oracle.
+@@ -3109,6 +3135,226 @@ mod tests {
+         );
+     }
+ 
++    /// Agreement pin across the andn boundary: the middle-end's fusion
++    /// DEFER prediction (`andn_fusion_predicted`, inside the mux matcher)
++    /// must fire exactly when the backend would actually emit the
++    /// 3-operand ANDN (`detect_and_not_fusions` in generation.rs ∩
++    /// `supports_and_not` in emit.rs ∩ the pipeline BMI1 gate). Either
++    /// direction of drift is a silent perf cliff — defer without fusion
++    /// loses BOTH the mux fold and the andn; fusion without defer loses
++    /// the andn to the fold. `backend_fuses` below is a hand
++    /// transcription of the backend criteria; every row must land on the
++    /// same side. (The rorx liveness-list drift that broke sha256
++    /// fusion under BMI2 is the exact bug class this table guards.)
++    #[test]
++    fn mux_ch_andn_defer_matches_backend_fusion_criteria() {
++        enum Place {
++            Adjacent,
++            Gap,
++        }
++        // (name, bmi1, not_ty, consumer_ty, extra Not reader, placement)
++        let rows: [(&str, bool, IrType, IrType, bool, Place); 8] = [
++            (
++                "u32 baseline",
++                true,
++                IrType::U32,
++                IrType::U32,
++                false,
++                Place::Adjacent,
++            ),
++            (
++                "bmi1 off",
++                false,
++                IrType::U32,
++                IrType::U32,
++                false,
++                Place::Adjacent,
++            ),
++            (
++                "i64 agreement",
++                true,
++                IrType::I64,
++                IrType::I64,
++                false,
++                Place::Adjacent,
++            ),
++            (
++                "not wider than consumer",
++                true,
++                IrType::I64,
++                IrType::U32,
++                false,
++                Place::Adjacent,
++            ),
++            (
++                "consumer wider than not",
++                true,
++                IrType::U32,
++                IrType::I64,
++                false,
++                Place::Adjacent,
++            ),
++            (
++                "narrow not outside domain",
++                true,
++                IrType::I8,
++                IrType::U32,
++                false,
++                Place::Adjacent,
++            ),
++            (
++                "multi-use not",
++                true,
++                IrType::U32,
++                IrType::U32,
++                true,
++                Place::Adjacent,
++            ),
++            (
++                "gap between not and and",
++                true,
++                IrType::U32,
++                IrType::U32,
++                false,
++                Place::Gap,
++            ),
++        ];
++        for (name, bmi, nty, cty, extra_reader, place) in rows {
++            // Canonical CH shape; the ~x-side And always directly
++            // consumes the Not, so the backend's operand-wiring check is
++            // satisfied by construction and the matrix isolates the
++            // capability/type/use/adjacency criteria.
++            let mut insts = vec![
++                and_ty(4, cty, v(0), v(1)), // And(x, y)  @ 0
++                not_ty(3, nty, v(0)),       // ~x         @ 1
++            ];
++            if matches!(place, Place::Gap) {
++                insts.push(and_ty(8, cty, v(1), v(2))); // filler @ 2
++            }
++            insts.push(and_ty(5, cty, v(3), v(2))); // And(~x, z)
++            insts.push(xor_ty(6, cty, v(4), v(5))); // consumer
++            if extra_reader {
++                insts.push(xor_ty(7, cty, v(3), v(2))); // 2nd Not reader
++            }
++            let fx = fixture(insts);
++            // Transcription of the backend criteria: capability on, Not
++            // width in the fusion domain, single-use Not, type agreement
++            // between Not and And, raw same-block adjacency.
++            let backend_fuses = bmi
++                && matches!(nty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
++                && nty == cty
++                && !extra_reader
++                && matches!(place, Place::Adjacent);
++            let deferred = match_bool_mux_algebra(
++                v(4),
++                v(5),
++                IrBinOp::Xor,
++                Value(6),
++                cty,
++                0,
++                3,
++                &fx.defs,
++                &fx.use_counts,
++                &fx.def_loc,
++                bmi,
++            )
++            .is_none();
++            assert_eq!(
++                deferred, backend_fuses,
++                "row '{name}': middle-end defer must agree with backend fusion"
++            );
++        }
++    }
++
++    /// Majority kept-term rank across block boundaries: the fixture
++    /// builder pins every def to block 0, so these cases rewrite the
++    /// def_loc table afterwards to cover the rank arms — same-block
++    /// ordering, cross-block def (`b != block_bi` ⇒ entry-available
++    /// rank (0,0)), and missing location (`None` ⇒ (0,0)). The kept
++    /// term is only ever READ at the consumer, so ranking cross-block
++    /// or location-less defs as entry-available is dominance-safe; the
++    /// test pins that contract against silent reordering. It also pins
++    /// the repurposed-slot gate: the two Ands that change value must
++    /// have known same-block positions (their slots receive the pending
++    /// rewrites), so the fold fails CLOSED when two Ands lack
++    /// locations — which is also why the strict `<` rank tie-break can
++    /// never see two equal (0,0) candidates.
++    #[test]
++    fn maj_kept_term_rank_prefers_entry_and_cross_block_defs() {
++        // And(x,y)@0 (A=v4), And(x,z)@1 (B=v5), And(y,z)@2 (C=v6),
++        // inner Xor(A,B)@3, consumer Xor(inner, C)@4.
++        let build = || {
++            fixture(vec![
++                and3(4, v(0), v(1)),
++                and3(5, v(0), v(2)),
++                and3(6, v(1), v(2)),
++                xor3(7, v(4), v(5)),
++                xor3(8, v(7), v(6)),
++            ])
++        };
++        let call = |fx: &BoolFixture| {
++            match_bool_mux_algebra(
++                v(7),
++                v(6),
++                IrBinOp::Xor,
++                Value(8),
++                IrType::U32,
++                0,
++                4,
++                &fx.defs,
++                &fx.use_counts,
++                &fx.def_loc,
++                false,
++            )
++        };
++        let kept_dest_and_slots = |fx: &BoolFixture| -> (u32, std::collections::BTreeSet<usize>) {
++            let (consumer, pending) = call(fx).expect("majority shape must fold");
++            let Instruction::BinOp { lhs, .. } = &consumer else {
++                panic!("consumer must stay a BinOp");
++            };
++            let Operand::Value(kv) = *lhs else {
++                panic!("consumer lhs must name the kept And");
++            };
++            let slots: std::collections::BTreeSet<usize> =
++                pending.iter().map(|(_, idx, _)| *idx).collect();
++            (kv.0, slots)
++        };
++
++        // Baseline: every def in block 0 — earliest same-block def wins.
++        let fx = build();
++        assert_eq!(
++            kept_dest_and_slots(&fx),
++            (4, [1usize, 2].into_iter().collect())
++        );
++
++        // B defined in ANOTHER block: the `b != block_bi` arm ranks it
++        // entry-available (0,0) — it beats both same-block candidates
++        // (A and C stay in-block, so their repurpose slots are known).
++        let mut fx = build();
++        fx.def_loc[5] = Some((1, 7));
++        assert_eq!(
++            kept_dest_and_slots(&fx),
++            (5, [0usize, 2].into_iter().collect())
++        );
++
++        // A's location unknown (None): flatten() ranks it (0,0) — it
++        // wins over B (1,1) and C (1,2).
++        let mut fx = build();
++        fx.def_loc[4] = None;
++        assert_eq!(
++            kept_dest_and_slots(&fx),
++            (4, [1usize, 2].into_iter().collect())
++        );
++
++        // A AND B lack locations: every role assignment repurposes at
++        // least one of them, and the repurposed slots need concrete
++        // same-block positions — the fold declines (fail-closed).
++        let mut fx = build();
++        fx.def_loc[4] = None;
++        fx.def_loc[5] = None;
++        assert!(call(&fx).is_none(), "two location-less Ands must decline");
++    }
++
+     #[test]
+     fn maj_two_multi_use_terms_decline() {
+         // Two of the three pairwise Ands have second readers: whichever
+diff --git a/src/passes/inline.rs b/src/passes/inline.rs
+index ae0d5b5..5f21ba9 100644
+--- a/src/passes/inline.rs
++++ b/src/passes/inline.rs
+@@ -58,7 +58,23 @@ const MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS: usize = 8;
+ const MAX_SMALL_STATIC_LOOP_INLINE_CLONES: usize = 4;
+ const MAX_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 128;
+ const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
+-const MAX_STATIC_LOOP_INLINE_CALLS: usize = 2;
++/// Bounded-tier call-site cap.  Two sites was the historical limit; the
++/// third is admitted ONLY under the clone-growth budget below (the
++/// Linux find_next_andnot_bit shape: a 60-instruction scan kernel at
++/// three sites — two cold self-test calls plus one hot in-loop call —
++/// stayed outlined and lost 6–12% runtime to call overhead where GCC
++/// and Clang inline; measured paired A/B 2026-09-24, Intel).
++const MAX_STATIC_LOOP_INLINE_CALLS: usize = 3;
++/// Net clone-growth budget for the bounded tier:
++/// `inst_count * (direct_call_count - 1)` (the outlined body dies when
++/// every direct site is inlined and the address is never taken).  128
++/// reproduces the historical worst permitted case EXACTLY (two sites of
++/// a 128-instruction body) while the new third site is admitted only
++/// for bodies small enough that three copies stay within the same
++/// pressure envelope.  The glibc-memcmp clone regression (five 27-insn
++/// clones: caller 93→183 insns, 18 stack refs, −7.1%) sits in the small
++/// tier and is governed by MAX_SMALL_STATIC_LOOP_INLINE_CLONES instead.
++const MAX_STATIC_LOOP_INLINE_GROWTH_INSTRUCTIONS: usize = 128;
+ /// At -Os, larger loop bodies stay out of enclosing loops even when inlining
+ /// their final call site would remove the standalone copy. LCCC's current
+ /// register allocator spills the merged nest heavily (zlib-ng Adler-32).
+@@ -1988,7 +2004,12 @@ fn fits_static_loop_inline_limits(
+ ) -> bool {
+     let small = inst_count <= MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
+         && block_count <= MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS;
++    // Bounded tier: the growth budget is the real pressure proxy, the
++    // site cap a backstop.  `inst * (sites - 1)` counts the extra
++    // copies the module keeps after the outlined body dies.
++    let clone_growth = inst_count.saturating_mul(direct_call_count.saturating_sub(1));
+     let bounded_clone = direct_call_count <= MAX_STATIC_LOOP_INLINE_CALLS
++        && clone_growth <= MAX_STATIC_LOOP_INLINE_GROWTH_INSTRUCTIONS
+         && inst_count <= MAX_STATIC_LOOP_INLINE_INSTRUCTIONS
+         && block_count <= MAX_STATIC_LOOP_INLINE_BLOCKS;
+     small || bounded_clone
+@@ -4358,6 +4379,18 @@ mod inline_limit_tests {
+         assert!(!fits_static_loop_inline_limits(128, 16, 3));
+         assert!(!fits_static_loop_inline_limits(129, 16, 1));
+         assert!(!fits_static_loop_inline_limits(128, 17, 1));
++        // Growth budget: a third site is admitted while the net clone
++        // growth stays within 128 instructions — the Linux
++        // find_next_andnot_bit shape (60 insns, 13 blocks, three sites:
++        // two cold self-test calls + one hot in-loop call), measured a
++        // 6–12% runtime loss while it stayed outlined.
++        assert!(fits_static_loop_inline_limits(60, 13, 3));
++        assert!(fits_static_loop_inline_limits(64, 16, 3)); // 128 == budget
++        assert!(!fits_static_loop_inline_limits(65, 13, 3)); // 130 > budget
++        assert!(!fits_static_loop_inline_limits(40 + 1, 8 + 1, 5)); // 164 > budget
++        // The site cap backstops even tiny growth (four sites need the
++        // small tier, not the bounded tier).
++        assert!(!fits_static_loop_inline_limits(41, 9, 4));
+     }
+     #[test]
+     fn aggregate_frame_veto_is_size_optimized_and_multisite_only() {
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 00bb87b..d7ed37a 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1980,7 +1980,7 @@ pub(crate) fn run_passes(
+             // regressions it caused were the PR #602 CI RED.  The full data
+             // lives in the scalar section's comment in iv_strength_reduce.rs;
+             // revisit after the Unit-4 allocator work.
+-            let run_ivsr_scalar = run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok();
++            let run_ivsr_scalar = ivsr_scalar_derived_enabled(run_ivsr);
+             // Un-IVSR only pays off on targets with scaled-index addressing
+             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
+             let run_univsr = run_ivsr
+@@ -2699,6 +2699,45 @@ pub(crate) fn run_passes(
+     }
+ }
+ 
++/// Opt-in gate for the scalar derived-IV flavor of IVSR (`iv*C` without a
++/// GEP → secondary recurrence).  Factored out of `run_passes` so the
++/// default-OFF contract is unit-testable: the flavor measured as a net
++/// runtime loss while latch phi-web parking exists (the PR #602 golden
++/// regressions), so an unset environment must NEVER enable it.
++fn ivsr_scalar_derived_enabled(run_ivsr: bool) -> bool {
++    run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok()
++}
++
++#[cfg(test)]
++mod ivsr_scalar_derived_gate_tests {
++    use super::ivsr_scalar_derived_enabled;
++    use crate::test_support::EnvGuard;
++
++    #[test]
++    fn scalar_derived_ivsr_is_off_by_default() {
++        // Unset environment: the measured-regression flavor stays off even
++        // when IVSR itself runs.
++        let _guard = EnvGuard::unset("CCC_IVSR_SCALAR_DERIVED");
++        assert!(
++            !ivsr_scalar_derived_enabled(true),
++            "default (unset) must not enable scalar derived IVs"
++        );
++    }
++
++    #[test]
++    fn scalar_derived_ivsr_opt_in_and_ivsr_gate() {
++        let _set = EnvGuard::set("CCC_IVSR_SCALAR_DERIVED", "1");
++        assert!(
++            ivsr_scalar_derived_enabled(true),
++            "explicit opt-in enables the flavor when IVSR runs"
++        );
++        assert!(
++            !ivsr_scalar_derived_enabled(false),
++            "opt-in still requires IVSR itself to be on"
++        );
++    }
++}
++
+ #[cfg(test)]
+ mod ssa_validator_tests {
+     use super::validate_unique_defs;
+diff --git a/tests/regression/check_ch_maj_codegen.sh b/tests/regression/check_ch_maj_codegen.sh
+index c6c93bf..20c07ea 100755
+--- a/tests/regression/check_ch_maj_codegen.sh
++++ b/tests/regression/check_ch_maj_codegen.sh
+@@ -7,8 +7,11 @@
+ # Checks:
+ #   A. runtime differential, bit-exact vs gcc over the opt x march matrix
+ #      (incl. both kill switches: CCC_NO_ANDN_FUSION, CCC_NO_BOOL_ALGEBRA)
+-#   B. under -mbmi -O2: exactly one 3-operand andn in sha256_transform
+-#      (CH = the GCC/Clang/ICX shape), zero andn without BMI
++#   B. under -mbmi -O2 and under the bare v3-default build: exactly one
++#      3-operand andn in sha256_transform (CH = the GCC/Clang/ICX shape);
++#      zero andn under the sticky -mno-bmi denial (BMI is ON by default
++#      since the v3 baseline change, so "no flags" is no longer the
++#      no-BMI case)
+ #   C. the 64-round compression loop is slot-write free (the park class)
+ #      and the MAJ region is register-only (no slot reads between the
+ #      kept And and its consumer)
+@@ -52,20 +55,32 @@ done
+ note "A. runtime differential done (fails so far: $fails)"
+ 
+ # ── B. andn census ──────────────────────────────────────────────────
++# Anchored mnemonic census: an unanchored `grep -c 'andn'` also counts
++# comment/label text; the fusion emits `andnl`/`andnq` instructions.
++ANDN_RE='^[[:space:]]*andn[lq][[:space:]]'
+ "$CCC" $GCCINC -mbmi -O2 -S "$SRC" -o "$TMP/bmi.s" 2>/dev/null
+-N=$(grep -c 'andn' "$TMP/bmi.s" || true)
++N=$(grep -cE "$ANDN_RE" "$TMP/bmi.s" || true)
+ [ "$N" -eq 1 ] || bad "-mbmi: expected exactly 1 andn (CH), got $N"
+-"$CCC" $GCCINC -O2 -S "$SRC" -o "$TMP/base.s" 2>/dev/null
+-N=$(grep -c 'andn' "$TMP/base.s" || true)
+-[ "$N" -eq 0 ] || bad "baseline: expected 0 andn, got $N"
++# BMI is the v3 default baseline: the bare build carries the CH andn too.
++"$CCC" $GCCINC -O2 -S "$SRC" -o "$TMP/def.s" 2>/dev/null
++N=$(grep -cE "$ANDN_RE" "$TMP/def.s" || true)
++[ "$N" -eq 1 ] || bad "v3 default: expected exactly 1 andn (CH), got $N"
++# Only the sticky -mno-bmi denial may drop it.
++"$CCC" $GCCINC -mno-bmi -O2 -S "$SRC" -o "$TMP/base.s" 2>/dev/null
++N=$(grep -cE "$ANDN_RE" "$TMP/base.s" || true)
++[ "$N" -eq 0 ] || bad "-mno-bmi: expected 0 andn, got $N"
+ 
+ # ── C. compression-loop slot discipline ─────────────────────────────
+ python3 - "$TMP/bmi.s" <<'PYEOF' || bad "compression loop slot/MAJ shape"
+ import sys
+ lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+-start = next(i for i, l in enumerate(lines)
+-             if l.startswith("rorl $") or l.startswith("rorxl $"))
+-end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("jl "))
++try:
++    start = next(i for i, l in enumerate(lines)
++                 if l.startswith("rorl $") or l.startswith("rorxl $"))
++    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("jl "))
++except StopIteration:
++    print("compression loop bounds not found (ror/rorx .. jl) — shape changed?")
++    sys.exit(1)
+ loop = lines[start:end + 1]
+ def plain_slot_ref(opnd):
+     # "N(%rsp)" with no index register inside the parentheses.
+diff --git a/tests/regression/check_findbit_inline.sh b/tests/regression/check_findbit_inline.sh
+new file mode 100755
+index 0000000..01434cb
+--- /dev/null
++++ b/tests/regression/check_findbit_inline.sh
+@@ -0,0 +1,57 @@
++#!/usr/bin/env bash
++# linux_find_bit inlining gate — pins the inliner's bounded-tier
++# clone-growth budget on a real-workload kernel: Linux 6.18.42
++# find_next_andnot_bit (static, THREE call sites — two cold self-test
++# calls + one hot in-loop call).  Before the growth budget landed, the
++# flat two-site cap kept this kernel outlined while GCC 16.2 / Clang
++# 23.1 / ICX all inline it (godbolt oracle, pinned alias set); the
++# per-call frame cost 6–12% in paired A/B.  The inlined shape must also
++# keep the idiom distillations: the generic __ffs decision tree folded
++# to tzcnt and the `& ~addr2` arm folded to andn.  Both hold WITHOUT an
++# explicit -march because the absent-march baseline projects x86-64-v3
++# (BMI1 carries ANDN, ABM carries TZCNT); `-march=x86-64-v3` must match.
++#
++# Runtime differentials belong to the benchmark-output gate (204 cases);
++# this gate pins the CODEGEN contract and fails loudly if future
++# inliner tuning silently re-outlines this kernel class.
++set -u
++CCC=${CCC:-target/fastbuild/lccc}
++SRC=$(dirname "$0")/../benchmark/programs/linux_find_bit.c
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++GCC=${GCC_BIN:-gcc}
++fails=0
++note() { printf '%s\n' "$*"; }
++bad()  { note "FAIL: $*"; fails=$((fails+1)); }
++
++for CFG in "-O2" "-O3 -march=x86-64-v3"; do
++  "$CCC" $CFG -S "$SRC" -o "$TMP/fb.s" 2>/dev/null \
++    || { bad "$CFG: lccc compile"; continue; }
++  CALLS=$(grep -c 'call linux_find_next_andnot_bit' "$TMP/fb.s" || true)
++  [ "$CALLS" -eq 0 ] \
++    || bad "$CFG: $CALLS outlined calls remain (growth budget must admit the 3-site clone)"
++  TZ=$(grep -cE '^[[:space:]]*tzcnt[lq]' "$TMP/fb.s" || true)
++  [ "$TZ" -ge 1 ] \
++    || bad "$CFG: generic __ffs tree did not fold to tzcnt (got $TZ)"
++  ANDN=$(grep -cE '^[[:space:]]*andn[lq]' "$TMP/fb.s" || true)
++  [ "$ANDN" -ge 1 ] \
++    || bad "$CFG: & ~addr2 arm did not fold to andn (got $ANDN)"
++
++  # Bit-exact runtime differential vs the host C compiler.
++  "$CCC" $CFG "$SRC" -o "$TMP/l.x" 2>/dev/null \
++    || { bad "$CFG: lccc link"; continue; }
++  L=$("$TMP/l.x"; echo "rc=$?")
++  if "$GCC" $CFG "$SRC" -o "$TMP/g.x" 2>/dev/null; then
++    G=$("$TMP/g.x"; echo "rc=$?")
++    [ "$G" = "$L" ] || bad "$CFG: runtime differs (gcc=[$G] lccc=[$L])"
++  else
++    note "skip $CFG runtime differential (no host gcc)"
++  fi
++done
++
++if [ "$fails" -eq 0 ]; then
++  note "findbit inline gate: PASS"
++  exit 0
++fi
++note "findbit inline gate: $fails FAILURES"
++exit 1
+diff --git a/tests/regression/check_vectorize_isa_gate.sh b/tests/regression/check_vectorize_isa_gate.sh
+index ddb1b75..8d2de78 100644
+--- a/tests/regression/check_vectorize_isa_gate.sh
++++ b/tests/regression/check_vectorize_isa_gate.sh
+@@ -46,6 +46,8 @@ count_vfmadd() { grep -cE '\bvfmadd[0-9]*p?[sd]\b|\bvfmadd' "$1" || true; }
+ count_bitcount_zero_guards() { grep -cE '^\.Lc[lt]z_nz_' "$1" || true; }
+ count_bsf() { grep -cE '\bbsf[lq]\b' "$1" || true; }
+ count_bsr() { grep -cE '\bbsr[lq]\b' "$1" || true; }
++count_tzcnt() { grep -cE '\btzcnt[lq]\b' "$1" || true; }
++count_lzcnt() { grep -cE '\blzcnt[lq]\b' "$1" || true; }
+ 
+ run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
+     local label=$1; shift
+@@ -59,13 +61,25 @@ run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
+ # ---- 1. default: AVX2 baseline must survive -------------------------------
+ run_cfg default
+ check_gt0 "default AVX2 vectorization (ymm)" "$(count_ymm $tmp/default.s)"
+-# __builtin_clz/ctz have a nonzero source precondition. On baseline x86 the
+-# optimal lowering is branchless BSR/BSF; a .Lclz_nz/.Lctz_nz label proves the
+-# backend accidentally restored its internal defined-zero semantics.
++# __builtin_clz/ctz have a nonzero source precondition.  The absent-march
++# baseline projects x86-64-v3, and v3 carries ABM, so the optimal lowering is
++# branchless LZCNT/TZCNT — strictly better than BSR/BSF, which they supersede
++# (defined on zero input too); a .Lclz_nz/.Lctz_nz label proves the backend
++# accidentally restored its internal defined-zero semantics.
+ check_eq "baseline nonzero clz/ctz zero-fixup guards" \
+     "$(count_bitcount_zero_guards $tmp/default.s)" 0
+-check_gt0 "baseline nonzero ctz uses BSF" "$(count_bsf $tmp/default.s)"
+-check_gt0 "baseline nonzero clz uses BSR" "$(count_bsr $tmp/default.s)"
++check_gt0 "baseline nonzero ctz uses TZCNT" "$(count_tzcnt $tmp/default.s)"
++check_gt0 "baseline nonzero clz uses LZCNT" "$(count_lzcnt $tmp/default.s)"
++check_eq "baseline nonzero ctz leaves no BSF behind" \
++    "$(count_bsf $tmp/default.s)" 0
++check_eq "baseline nonzero clz leaves no BSR behind" \
++    "$(count_bsr $tmp/default.s)" 0
++
++# A sticky -mno-lzcnt denial removes ABM from the v3 projection; the lowering
++# must fall back to the classical branchless BSR/BSF pair.
++run_cfg nolzcnt -mno-lzcnt
++check_gt0 "-mno-lzcnt nonzero ctz falls back to BSF" "$(count_bsf $tmp/nolzcnt.s)"
++check_gt0 "-mno-lzcnt nonzero clz falls back to BSR" "$(count_bsr $tmp/nolzcnt.s)"
+ check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
+     "$(grep -c 'movq %rdi, %rax' "$tmp/default.s" || true)" 0
+ 
