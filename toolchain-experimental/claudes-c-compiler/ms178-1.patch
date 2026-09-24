@@ -1,354 +1,2401 @@
-From d67ea81df22417a95b23156658c13eb19cb4a37c Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Thu, 24 Sep 2026 16:12:57 +0000
-Subject: [PATCH 2/2] =?UTF-8?q?gvn:=20cross-block=20pure=20CSE=20for=20int?=
- =?UTF-8?q?eger=20Mul=20via=20use-renaming=20=E2=80=94=20sieve's=20triple?=
- =?UTF-8?q?=20i*i=20becomes=20one?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-The B1 work-order item, root-caused and fixed at the source: dominator-
-based GVN restricted pure-expression CSE to SAME-BLOCK only ("Cross-block
-CSE creates Copies whose source values may have their registers reused by
-the allocator before the Copy executes") — a Copy-form workaround for an
-old allocator hazard. sieve's count_primes computed i*i three times per
-outer iteration (header test, j-init under the sieve[i] branch, latch
-test) where gcc 14.2 keeps ONE multiply; 102 insns in the region vs
-gcc's 56.
-
-The fix removes the Copy entirely: a cross-block pure hit now DELETES the
-dominated instruction and renames its uses onto the dominator's value
-(apply_pending_renames, applied after the DFS walk).  No Copy is
-inserted, so the historical stale-home hazard does not exist — the
-register allocator sees a plain SSA value with dominated uses.
-
-Scope, arrived at empirically (each widening was measured against the
-803-test corpus, SSA-validated, before the next decision):
-- INTEGER Mul only.  Add is deliberately excluded: the loop passes
-  structurally consume Add shapes (the stencil matcher's documented
-   exit-compare form; find_iv_in_loop's latch-local IV-
-  increment contract) — a broad Add rename flipped stencil_vectorize's
-  checksum and broke 21 unroll/vectorize corpus shapes.  Mul has no such
-  structural consumers.  GEP/GlobalAddr stay retained-across-blocks by
-  design (gep_value_numbers); Cast keeps the cross-signedness machinery;
-  float BinOps are FMA-contraction-shape-sensitive.
-- The dominated dest must not feed any Phi incoming (phi_incoming_feeds):
-  the unrollers thread exit/IV phis off latch-local bookkeeping, and
-  sharing the IV-increment Add with a body value (legal SSA, gcc's own
-  form) collapses the latch after cfg_simplify — measured: the
-   accumulator returned the IV instead of the sum.
-- Multi-def dests keep their instruction (one definition of a redefined
-  id cannot be deleted).
-
-Measured: sieve count_primes 3 imull -> 1 (gcc parity), region 102 -> 95
-insns, benchmark ratio vs gcc -O2 1.116x -> 1.053x (55.8ms vs 53.0ms
-median-of-7, bit-exact output).  The 803-test regression corpus with
-CCC_VALIDATE_SSA=1: 774/0 (identical to the pre-change control).  The
-204-workload benchmark output oracle: 204/204 bit-exact.  cargo --lib
-3347/0 (the cross_block_cse contract test advanced from "must not CSE"
-to "must rename", with an Add-exclusion pin in the same function).
-ci_local --fast: 64/64 ALL GREEN (the env-hygiene ratchet caught and
-rejected a per-call env read in the first draft — the debug print now
-reuses the existing CSE trace site).
----
- src/passes/gvn.rs | 207 ++++++++++++++++++++++++++++++++++++++++++----
- 1 file changed, 190 insertions(+), 17 deletions(-)
-
-diff --git a/src/passes/gvn.rs b/src/passes/gvn.rs
-index 16069ce8..b8eaf47f 100644
---- a/src/passes/gvn.rs
-+++ b/src/passes/gvn.rs
-@@ -276,6 +276,26 @@ struct GvnState {
-     /// against the recorded `sext→v1020` and rewired the second zone
-     /// computation to read the ZONE POINTER — boot page fault).
-     multi_def_values: FxHashSet<u32>,
-+    /// Value ids that appear as a Phi INCOMING operand anywhere in the
-+    /// function.  Cross-block pure CSE must not delete an instruction whose
-+    /// value feeds a phi: the unrollers and the vectorizers structurally
-+    /// assume the loop-header IV increment (`Add %iv, step`) is
-+    /// latch-local — `find_iv_in_loop` only searches the latch, and the
-+    /// two-block unroller threads exit phis off the latch's bookkeeping.
-+    /// Sharing the increment Add with a body value (legal SSA, gcc's own
-+    /// form) collapses the latch after cfg_simplify and those passes then
-+    /// miscompile (measured: 22 corpus failures, the `s += i+1`
-+    /// accumulator returning the IV instead of the sum).  Renaming the
-+    /// USES of such a dest is fine for every OTHER consumer; the phi
-+    /// feeders keep their instruction.
-+    phi_incoming_feeds: FxHashSet<u32>,
-+    /// Value renames to apply after the walk: (dominated dest, dominating
-+    /// existing).  Cross-block pure CSE deletes the dominated instruction
-+    /// and renames its uses onto the dominator's value — no Copy is
-+    /// inserted, so the register allocator sees a plain SSA value with
-+    /// dominated uses (the historical Copy-based cross-block form's
-+    /// stale-home hazard does not exist for a rename).
-+    pending_renames: Vec<(Value, Value)>,
-     /// Per-value use info for cross-signedness load CSE: value id ->
-     /// (total use count, first-use kind). Computed once per function by
-     /// `find_value_use_info`; candidate counts are stable across the GVN
-@@ -371,6 +391,8 @@ impl GvnState {
-             load_rollback_log: Vec::new(),
-             store_fwd_rollback_log: Vec::new(),
-             vn_log: Vec::new(),
-+            pending_renames: Vec::new(),
-+            phi_incoming_feeds: FxHashSet::default(),
-             total_eliminated: 0,
-             escaped_param_allocas,
-             param_allocas,
-@@ -1472,11 +1494,70 @@ pub(crate) fn run_gvn_with_analysis_and_context(
-         noalias,
-         multi_def,
-     );
-+    state.phi_incoming_feeds = collect_phi_incoming_feeds(func);
-     state.xsign_use_info = find_value_use_info(func);
-     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
-+    apply_pending_renames(func, &mut state);
-     state.total_eliminated
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 59196c22..cc78936e 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -374,6 +374,14 @@ jobs:
+           CCC: target/fastbuild/lccc
+         run: bash tests/regression/check_lea_hoist_rorx.sh
+ 
++      # Integer-parameter provenance (P1 follow-up): a laundered
++      # `(T *)(uintptr_t)raw` copy keeps its runtime guard while a genuine
++      # pointer-param copy stays guard-free, plus runtime bit-exactness.
++      - name: Verify integer-parameter provenance contracts
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_provenance_int_param.sh
++
+       # CH/MAJ oracle consensus (session 585): the SHA-256 mux fold defers
+       # to the backend's 3-operand ANDN under BMI1, the majority keeps its
+       # earliest And (composite last, no park), and the acc-resident ALU
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 62e97319..b109def7 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -423,6 +423,14 @@ gate "call-arg-staging" fast \
+ gate "lea-hoist-rorx" fast \
+     bash tests/regression/check_lea_hoist_rorx.sh
+ 
++# Integer-parameter provenance (P1 follow-up): laundered `(T *)(uintptr_t)raw`
++# must not present a Param root. The laundered copy keeps its guard while the
++# genuine pointer-param copy stays guard-free (B3 intact), plus runtime
++# bit-exactness vs the oracle. Negative-verified: the pre-fix tree emits the
++# laundered vector loop with no guard.
++gate "provenance-int-param" fast \
++    bash tests/regression/check_provenance_int_param.sh
++
+ # CH/MAJ oracle consensus: andn-gated mux fold, kept-earliest majority,
+ # acc-resident ALU consumption, zero exposed forwards (negative-verified
+ # against the pre-change tree: 0 andn + the loop slot shape fail there).
+diff --git a/src/ir/mod.rs b/src/ir/mod.rs
+index 7d489feb..3f256eee 100644
+--- a/src/ir/mod.rs
++++ b/src/ir/mod.rs
+@@ -6,4 +6,5 @@ pub(crate) mod lowering;
+ pub(crate) mod mem2reg;
+ pub(crate) mod module;
+ pub(crate) mod ops;
++pub(crate) mod provenance;
+ pub(crate) mod reexports;
+diff --git a/src/ir/provenance.rs b/src/ir/provenance.rs
+new file mode 100644
+index 00000000..ae239692
+--- /dev/null
++++ b/src/ir/provenance.rs
+@@ -0,0 +1,306 @@
++//! Pointer-provenance model for optimizer root tracers.
++//!
++//! [`root_leaf`], [`chain_step`], and [`produces_pointer`] are the single
++//! home of the rules every alias-analysis root tracer must obey. Both
++//! `vectorize::proven_object_root` and `loop_idiom::object_root_inner` are
++//! written against this module so the leaf conditions cannot drift apart.
++//!
++//! # The IR's de-facto provenance model
++//!
++//! The frontend erases all integer↔pointer conversions: `emit_implicit_cast`
++//! (`src/ir/lowering/expr.rs`) returns the source operand unchanged whenever
++//! either side is `Ptr`, so `(char *)raw` and `(u64)p` lower to the *same
++//! SSA value* (later plumbing may wrap it in an untyped [`Instruction::Copy`],
++//! which is equally transparent). No production pass synthesizes an
++//! integer↔pointer [`Instruction::Cast`] either — only test fixtures do.
++//!
++//! Consequences, each load-bearing for the rules below:
++//!
++//! 1. **Pointer-ness is a leaf property.** A chain's value designates an
++//!    object only if the chain *ends* at a pointer-typed leaf
++//!    ([`Instruction::ParamRef`] with `ty == Ptr`, [`Instruction::Alloca`],
++//!    [`Instruction::GlobalAddr`]). An integer-typed leaf
++//!    (`ParamRef { ty: U64 }`, integer arithmetic) names no object: the
++//!    integer may coincidentally equal any live address, so presenting a
++//!    root for it would license `memcpy`-vs-`memmove` and alias-versioning
++//!    decisions on a guess. This is the same reason LLVM gives `inttoptr` a
++//!    may-alias-anything result.
++//! 2. **`Copy` is transparent and must be followed.** Gating `Copy` on
++//!    "known pointer" is unimplementable without whole-chain type inference
++//!    (`Copy` carries no type; [`Instruction::result_type`] returns `None`
++//!    for it by design) and unnecessary: `Copy` is semantically the identity,
++//!    so the chain's pointer-ness is *exactly* the leaf's. Following `Copy`
++//!    and checking the leaf is equivalent in strength to any inference.
++//! 3. **Arithmetic preserves the root; offsets need no provenance.**
++//!    `p + k` (or `p - k`, or a `GEP`) with an integer `k` stays inside `p`'s
++//!    object, and going out of bounds is UB (C17 6.5.6p8) — the optimizer may
++//!    assume it does not happen. This holds for *any* integer `k`, including
++//!    `ptrtoint`-derived and loaded ones: wild offsets are a UB question, not
++//!    an aliasing question. Only `ptr + ptr` (two rooted sides) is
++//!    meaningless — invalid C, fail closed — as is `int - ptr` (not valid
++//!    pointer arithmetic; only integer laundering produces it).
++//! 4. **`Cast` follows only `Ptr -> Ptr`.** Any other cast shape ends the
++//!    proof. This blocks nothing the frontend can produce (see above) and
++//!    closes the hole for synthesized/test IR.
++//!
++//! # What is deliberately NOT covered here
++//!
++//! `loop_memory_promote` and `passes::alias` run their own root/tag schemes,
++//! but both are immune to the leaf-typing question *by construction*: they
++//! never claim cross-root disjointness involving parameters
++//! (`loop_memory_promote::disjoint` requires two `ALLOCA`/`GLOBAL` tags;
++//! `alias::forms_disjoint` returns false for differing roots), and their
++//! same-root reasoning is pure address arithmetic on one base value, which
++//! needs no provenance. They were audited, not assumed — see the P1
++//! follow-up record.
++//!
++//! [`Instruction::Copy`]: super::instruction::Instruction::Copy
++//! [`Instruction::Cast`]: super::instruction::Instruction::Cast
++//! [`Instruction::ParamRef`]: super::instruction::Instruction::ParamRef
++//! [`Instruction::Alloca`]: super::instruction::Instruction::Alloca
++//! [`Instruction::GlobalAddr`]: super::instruction::Instruction::GlobalAddr
++//! [`Instruction::result_type`]: super::instruction::Instruction::result_type
++
++use super::instruction::{Instruction, Operand, Value};
++use crate::common::types::IrType;
++
++/// What a single definition contributes as an alias-analysis root leaf.
++///
++/// Only pointer-typed leaves name objects. Everything else — integer leaves,
++/// loads, calls, arithmetic — is [`RootLeaf::NotLeaf`]: the chain either
++/// continues through it ([`chain_step`]) or the proof ends.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum RootLeaf {
++    Global(String),
++    Alloca(u32),
++    Param(usize),
++    NotLeaf,
++}
++
++/// Classify one definition as a provenance leaf, or not a leaf.
++///
++/// A [`Instruction::ParamRef`] is a leaf **only** when its IR type is
++/// [`IrType::Ptr`]: an integer parameter converted to a pointer (the
++/// frontend erases the conversion — see the module docs) names no object
++/// and must not present a `Param` root. [`Instruction::Alloca`] and
++/// [`Instruction::GlobalAddr`] values are always addresses.
++pub fn root_leaf(inst: &Instruction) -> RootLeaf {
++    match inst {
++        Instruction::GlobalAddr { name, .. } => RootLeaf::Global(name.clone()),
++        Instruction::Alloca { dest, .. } => RootLeaf::Alloca(dest.0),
++        Instruction::ParamRef { param_idx, ty, .. } if *ty == IrType::Ptr => {
++            RootLeaf::Param(*param_idx)
++        }
++        _ => RootLeaf::NotLeaf,
++    }
++}
++
++/// One step of provenance-chain following.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ChainStep {
++    /// Continue the proof at this value.
++    Follow(Value),
++    /// This instruction is opaque to provenance; the tracer either applies
++    /// its own pass-specific rule (phi march, pointer arithmetic) or ends
++    /// the proof.
++    Stop,
++}
++
++/// Follow exactly the provenance-preserving chain operations.
++///
++/// * [`Instruction::GetElementPtr`] continues at its base.
++/// * [`Instruction::Copy`] is transparent (see the module docs).
++/// * [`Instruction::Cast`] continues **only** for `Ptr -> Ptr` with a value
++///   source; integer↔pointer conversions end the proof.
++///
++/// Everything else — loads, calls, arithmetic, phis — is [`ChainStep::Stop`].
++/// Arithmetic and phis are intentionally *not* resolved here: the two
++/// tracers have legitimately different rules for them (the vectorizer fails
++/// closed on both; loop_idiom accepts a vetted bump phi and `ptr ± int`
++/// with the [`produces_pointer`] side check), and sharing the leaf + chain
++/// core while keeping those local is what prevents both drift and
++/// over-generalization.
++pub fn chain_step(inst: &Instruction) -> ChainStep {
++    match inst {
++        Instruction::GetElementPtr { base, .. } => ChainStep::Follow(*base),
++        Instruction::Copy {
++            src: Operand::Value(v),
++            ..
++        } => ChainStep::Follow(*v),
++        Instruction::Cast {
++            src: Operand::Value(v),
++            from_ty,
++            to_ty,
++            ..
++        } if *from_ty == IrType::Ptr && *to_ty == IrType::Ptr => ChainStep::Follow(*v),
++        _ => ChainStep::Stop,
++    }
++}
++
++/// Does this definition produce a value of pointer type?
++///
++/// Conservative-`true`: only definitions the canonical
++/// [`Instruction::result_type`] types as [`IrType::Ptr`] return true.
++/// Transparent ([`Instruction::Copy`], `None`) and untyped/unknown producers
++/// return false — they are *not* known pointers.
++///
++/// The single consumer is loop_idiom's `Add`/`Sub` side check: an unrooted
++/// operand that is a *known* pointer (`ptr + ptr`, loaded pointer used as an
++/// offset) rejects the root, because adding two addresses is meaningless.
++/// Any other unrooted operand is an integer offset or UB in valid IR (C17
++/// 6.5.6 admits only `ptr ± int` / `int + ptr`), so it cannot disturb the
++/// rooted side's object identity. Note the check inspects the operand's
++/// *immediate* definition only: looking through `Copy` would misclassify the
++/// valid `p + (int)q` idiom (whose `ptrtoint` is an erased `Copy` of a
++/// pointer-typed value) as pointer-plus-pointer.
++pub fn produces_pointer(inst: &Instruction) -> bool {
++    inst.result_type() == Some(IrType::Ptr)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::instruction::Instruction;
++    use super::super::ops::IrBinOp;
++    use super::super::reexports::IrConst;
++    use super::*;
++    use crate::common::types::IrType;
++
++    fn param(idx: usize, ty: IrType) -> Instruction {
++        Instruction::ParamRef {
++            dest: Value(idx as u32),
++            param_idx: idx,
++            ty,
++        }
++    }
++
++    #[test]
++    fn leaf_typing_matrix() {
++        // Pointer params root; integer params never do (P1: laundered
++        // `(T *)(uintptr_t)raw` presents a Param root otherwise).
++        assert_eq!(root_leaf(&param(0, IrType::Ptr)), RootLeaf::Param(0));
++        assert_eq!(root_leaf(&param(1, IrType::U64)), RootLeaf::NotLeaf);
++        assert_eq!(root_leaf(&param(2, IrType::I32)), RootLeaf::NotLeaf);
++        assert_eq!(
++            root_leaf(&Instruction::Alloca {
++                dest: Value(9),
++                ty: IrType::U8,
++                size: 16,
++                align: 1,
++                volatile: false,
++                semantic_volatile: false,
++            }),
++            RootLeaf::Alloca(9)
++        );
++        assert_eq!(
++            root_leaf(&Instruction::GlobalAddr {
++                dest: Value(10),
++                name: "g".into(),
++            }),
++            RootLeaf::Global("g".into())
++        );
++        // Loads/calls/arithmetic are never leaves, whatever their type.
++        assert_eq!(
++            root_leaf(&Instruction::Load {
++                dest: Value(11),
++                ptr: Value(9),
++                ty: IrType::Ptr,
++                seg_override: crate::common::types::AddressSpace::Default,
++                volatile: false,
++            }),
++            RootLeaf::NotLeaf
++        );
++    }
++
++    #[test]
++    fn cast_gate_matrix() {
++        let cast = |from_ty, to_ty| Instruction::Cast {
++            dest: Value(20),
++            src: Operand::Value(Value(1)),
++            from_ty,
++            to_ty,
++        };
++        // Only Ptr -> Ptr continues the proof.
++        assert_eq!(
++            chain_step(&cast(IrType::Ptr, IrType::Ptr)),
++            ChainStep::Follow(Value(1))
++        );
++        assert_eq!(chain_step(&cast(IrType::U64, IrType::Ptr)), ChainStep::Stop);
++        assert_eq!(chain_step(&cast(IrType::Ptr, IrType::U64)), ChainStep::Stop);
++        assert_eq!(chain_step(&cast(IrType::I32, IrType::I64)), ChainStep::Stop);
++        // Const-source casts have no chain to follow.
++        assert_eq!(
++            chain_step(&Instruction::Cast {
++                dest: Value(21),
++                src: Operand::Const(IrConst::I64(0)),
++                from_ty: IrType::Ptr,
++                to_ty: IrType::Ptr,
++            }),
++            ChainStep::Stop
++        );
++        // Copy is transparent; GEP continues at its base.
++        assert_eq!(
++            chain_step(&Instruction::Copy {
++                dest: Value(22),
++                src: Operand::Value(Value(3)),
++            }),
++            ChainStep::Follow(Value(3))
++        );
++        assert_eq!(
++            chain_step(&Instruction::GetElementPtr {
++                dest: Value(23),
++                base: Value(4),
++                offset: Operand::Const(IrConst::I64(0)),
++                ty: IrType::Ptr,
++            }),
++            ChainStep::Follow(Value(4))
++        );
++        // Arithmetic/phi/load/call all stop here (pass-specific rules apply).
++        assert_eq!(
++            chain_step(&Instruction::BinOp {
++                dest: Value(24),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(4)),
++                rhs: Operand::Const(IrConst::I64(8)),
++                ty: IrType::U64,
++            }),
++            ChainStep::Stop
++        );
++    }
++
++    #[test]
++    fn produces_pointer_matrix() {
++        assert!(produces_pointer(&param(0, IrType::Ptr)));
++        assert!(!produces_pointer(&param(0, IrType::U64)));
++        assert!(produces_pointer(&Instruction::GetElementPtr {
++            dest: Value(23),
++            base: Value(4),
++            offset: Operand::Const(IrConst::I64(0)),
++            ty: IrType::I8, // element type is irrelevant: the dest is an address
++        }));
++        assert!(!produces_pointer(&Instruction::Copy {
++            dest: Value(22),
++            src: Operand::Value(Value(3)),
++        }));
++        assert!(!produces_pointer(&Instruction::BinOp {
++            dest: Value(24),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(4)),
++            rhs: Operand::Const(IrConst::I64(8)),
++            ty: IrType::U64,
++        }));
++        assert!(produces_pointer(&Instruction::Load {
++            dest: Value(11),
++            ptr: Value(9),
++            ty: IrType::Ptr,
++            seg_override: crate::common::types::AddressSpace::Default,
++            volatile: false,
++        }));
++        assert!(!produces_pointer(&Instruction::Cmp {
++            dest: Value(12),
++            op: crate::ir::ops::IrCmpOp::Ult,
++            lhs: Operand::Value(Value(1)),
++            rhs: Operand::Const(IrConst::I32(16)),
++            ty: IrType::I32,
++        }));
++    }
++}
+diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
+index 37b85501..46cde2b2 100644
+--- a/src/passes/bit_idioms.rs
++++ b/src/passes/bit_idioms.rs
+@@ -190,10 +190,14 @@ fn peeled_value(
+ /// (`detect_and_not_fusions` + `emit_and_not_impl`): a single-use `Not`
+ /// whose type is `c_ty` inside the shared ALU-fusion width domain, sitting
+ /// at the immediately preceding index of the SAME block as `and_opnd`'s
+-/// And.  Extracted from the Pattern-B closure so the contract test can run
+-/// BOTH predicates (this one and the backend detector) over the same
+-/// constructed scenarios — the audit's point was that the two spellings
+-/// of the criteria must never drift apart silently.
++/// And.  The predicate is COMPLETE — it validates `and_opnd`'s own
++/// definition (an `And` of the Not's type reading the Not's dest) rather
++/// than trusting a caller precondition — so it agrees with the backend
++/// detector on every shape, including non-And consumers. Extracted from
++/// the Pattern-B closure so the contract test can run BOTH predicates
++/// (this one and the backend detector) over the same constructed
++/// scenarios — the audit's point was that the two spellings of the
++/// criteria must never drift apart silently.
+ pub(super) fn andn_fusion_predicted_at(
+     defs: &[Option<Instruction>],
+     use_counts: &[u32],
+@@ -217,6 +221,26 @@ pub(super) fn andn_fusion_predicted_at(
+             if use_counts.get(nv.0 as usize).copied() != Some(1) {
+                 return false;
+             }
++            // The consumer must BE an `And` of the Not's type reading the
++            // Not's dest — mirroring `detect_and_not_fusions` exactly. No
++            // caller precondition: Pattern B establishes this anyway (via
++            // `and_strict`), but the prediction is only meaningful as a
++            // standalone predicate if it checks the full shape itself.
++            let Operand::Value(av) = and_opnd else {
++                return false;
++            };
++            match defs.get(av.0 as usize).and_then(Option::as_ref) {
++                Some(Instruction::BinOp {
++                    op: IrBinOp::And,
++                    lhs,
++                    rhs,
++                    ty: aty,
++                    ..
++                }) if *aty == *nty
++                    && (matches!(lhs, Operand::Value(v) if *v == nv)
++                        || matches!(rhs, Operand::Value(v) if *v == nv)) => {}
++                _ => return false,
++            }
+             let loc = |op: &Operand| -> Option<(usize, usize)> {
+                 match op {
+                     Operand::Value(v) => def_loc.get(v.0 as usize).copied().flatten(),
+@@ -3480,11 +3504,11 @@ mod tests {
+         // (label, block instructions, the Not operand value, the And operand
+         // value, the And's index inside the block, the mux type, expected)
+         //
+-        // Caller preconditions respected: `and_opnd`'s def is always an
+-        // And of `c_ty` reading the Not's dest (that is what the mux
+-        // matcher's `and_strict` guarantees before the prediction is
+-        // consulted) — the scenarios vary only the properties BOTH
+-        // predicates are responsible for deciding on their own.
++        // No caller preconditions: the helper validates the COMPLETE shape
++        // itself (Not def/type/use-count, And def/type/operand, adjacency),
++        // exactly like the backend detector. The "adjacent consumer is not
++        // an And" / "does not consume" / "type differs" scenarios fail
++        // against any helper that trusts `and_opnd` blindly.
+         let scenarios: Vec<(&str, Vec<Instruction>, u32, u32, usize, IrType, bool)> = vec![
+             (
+                 "adjacent single-use U32",
+@@ -3593,6 +3617,47 @@ mod tests {
+                 IrType::U32,
+                 false,
+             ),
++            (
++                "adjacent consumer is not an And",
++                // The Not is single-use and adjacent, but its consumer is a
++                // Xor: a helper that checks only the Not side predicts a
++                // fusion the backend will never perform.
++                vec![typed_not(3, v(0), IrType::U32), xor3(4, v(3), v(1))],
++                3,
++                4,
++                1,
++                IrType::U32,
++                false,
++            ),
++            (
++                "adjacent And does not consume the Not",
++                // Single-use (elsewhere) and adjacent, but the And reads
++                // other values: no fusion either way.
++                vec![
++                    typed_not(3, v(0), IrType::U32),
++                    typed_and(4, v(1), v(2), IrType::U32),
++                    xor3(5, v(3), v(0)),
++                ],
++                3,
++                4,
++                1,
++                IrType::U32,
++                false,
++            ),
++            (
++                "adjacent And type differs from the Not",
++                // The backend requires And.ty == Not.ty; U32 Not with a U64
++                // And consumer must not predict.
++                vec![
++                    typed_not(3, v(0), IrType::U32),
++                    typed_and(4, v(3), v(1), IrType::U64),
++                ],
++                3,
++                4,
++                1,
++                IrType::U32,
++                false,
++            ),
+             (
+                 "Not defined in another block",
+                 // The block handed to the backend detector contains only the
+diff --git a/src/passes/inline.rs b/src/passes/inline.rs
+index ccff3654..00bc45b6 100644
+--- a/src/passes/inline.rs
++++ b/src/passes/inline.rs
+@@ -58,8 +58,10 @@ const MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS: usize = 8;
+ const MAX_SMALL_STATIC_LOOP_INLINE_CLONES: usize = 4;
+ const MAX_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 128;
+ const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
+-/// Bounded-tier call-site cap.  A third site was trialled (PR #607) for the
+-/// Linux find_next_andnot_bit shape (60 insns at three sites) but reverted:
++/// Bounded-tier call-site cap.  A third site was trialled for the Linux
++/// find_next_andnot_bit shape (60 insns at three sites) but reverted — it
++/// measured neutral at -O2 and slower at -O3, so the two-site cap stays
++/// until backend evidence improves:
+ /// GCC 14.2/16.2 outline it at -O2, and LCCC-side the inline measures as a
+ /// tie at -O2 (paired A/B n=7 spans 1; layout-averaged k-sweep n=16 splits
+ /// 9–7) and a 3–8% LOSS at -O3 (k-sweep wins 3–13, p≈0.01) — the oracles
+diff --git a/src/passes/loop_idiom.rs b/src/passes/loop_idiom.rs
+index 689aa723..f7b550b1 100644
+--- a/src/passes/loop_idiom.rs
++++ b/src/passes/loop_idiom.rs
+@@ -153,17 +153,22 @@ fn is_byte_type(ty: IrType) -> bool {
  }
  
-+/// Every value id that appears as a Phi incoming operand anywhere in the
-+/// function — the cross-block pure-CSE rename must not delete any of their
-+/// defining instructions (see `GvnState::phi_incoming_feeds`).
-+fn collect_phi_incoming_feeds(func: &IrFunction) -> FxHashSet<u32> {
-+    let mut set = FxHashSet::default();
-+    for b in &func.blocks {
-+        for inst in &b.instructions {
-+            if let Instruction::Phi { incoming, .. } = inst {
-+                for (op, _) in incoming {
-+                    if let Operand::Value(v) = op {
-+                        set.insert(v.0);
-+                    }
-+                }
-+            }
+ /// Object identity for overlap reasoning: `Global(name)` for globals,
+-/// `Alloca(id)` for static stack slots, `Param(idx)` for function
+-/// parameters (distinct params are assumed non-overlapping for the
+-/// memcpy idiom; if they may alias we use memmove), `Other` for everything
+-/// else (dynamic allocas, computed pointers, unknowns).
++/// `Alloca(id)` for static stack slots, `Param(idx)` for POINTER-typed
++/// function parameters (an integer parameter converted to a pointer names
++/// no object — the frontend erases the conversion — so it is `Other`;
++/// distinct `Param` roots still take memmove unless disjoint by the
++/// freshness rule), `Other` for everything else (dynamic allocas, computed
++/// pointers, unknowns).
+ ///
+-/// The walk sees through `Phi` (preheader-edge init only — the latch edge
+-/// marches within the same object), `Copy`, integer `Cast`, `GEP` (base),
+-/// and `Add`/`Sub` (the side that resolves; an integer offset contributes
+-/// no root, and two rooted sides is nonsense → `Other`). Offsets are
+-/// deliberately ignored: cross-object disjointness needs roots only, and
+-/// same-object copies bail regardless of offsets (v1).
++/// Leaf typing and chain following come from `crate::ir::provenance` (shared
++/// with the vectorizer's tracer so the two cannot drift): the walk sees
++/// through `Phi` (preheader-edge init only — the latch edge marches within
++/// the same object), `Copy`, `Ptr -> Ptr` `Cast`, `GEP` (base), and
++/// `Add`/`Sub` (the side that resolves; an integer offset contributes no
++/// root, a known-pointer offset rejects the root, and two rooted sides is
++/// nonsense → `Other`). Offsets are deliberately ignored: cross-object
++/// disjointness needs roots only, and same-object copies bail regardless
++/// of offsets (v1).
+ #[derive(Clone, PartialEq, Eq, Debug)]
+ enum ObjectRoot {
+     Global(String),
+@@ -194,19 +199,23 @@ fn object_root_inner(
+     let Some(inst) = defs.get(&v.0) else {
+         return ObjectRoot::Other;
+     };
+-    match inst {
+-        Instruction::GlobalAddr { name, .. } => ObjectRoot::Global(name.clone()),
+-        Instruction::Alloca { dest, .. } => ObjectRoot::Alloca(dest.0),
+-        Instruction::ParamRef { param_idx, .. } => ObjectRoot::Param(*param_idx as u32),
+-        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
+-            Operand::Value(inner) => {
+-                object_root_inner(defs, label_to_idx, preheader_label, *inner, depth + 1)
+-            }
+-            Operand::Const(_) => ObjectRoot::Other,
+-        },
+-        Instruction::GetElementPtr { base, .. } => {
+-            object_root_inner(defs, label_to_idx, preheader_label, *base, depth + 1)
++    match crate::ir::provenance::root_leaf(inst) {
++        crate::ir::provenance::RootLeaf::Global(name) => {
++            return ObjectRoot::Global(name);
 +        }
++        crate::ir::provenance::RootLeaf::Alloca(id) => {
++            return ObjectRoot::Alloca(id);
++        }
++        crate::ir::provenance::RootLeaf::Param(idx) => {
++            return ObjectRoot::Param(idx as u32);
+         }
++        crate::ir::provenance::RootLeaf::NotLeaf => {}
 +    }
-+    set
++    if let crate::ir::provenance::ChainStep::Follow(inner) = crate::ir::provenance::chain_step(inst)
++    {
++        return object_root_inner(defs, label_to_idx, preheader_label, inner, depth + 1);
++    }
++    match inst {
+         Instruction::Phi { incoming, .. } => {
+             for (op, label) in incoming {
+                 if *label == preheader_label {
+@@ -242,18 +251,40 @@ fn object_root_inner(
+                 }
+                 Operand::Const(_) => ObjectRoot::Other,
+             };
++            // An unrooted side that is a KNOWN pointer (loaded pointer,
++            // call result, outer phi of pointer type, `Ptr`-typed cast of
++            // an integer) rejects the root: adding two addresses is
++            // meaningless. Immediate definitions only — looking through
++            // `Copy` would misclassify the valid `p + (int)q` idiom (whose
++            // `ptrtoint` is an erased `Copy` of a pointer-typed value).
++            // Any other unrooted side is an integer offset or UB in valid
++            // IR (C17 6.5.6 admits only `ptr ± int` / `int + ptr`), so it
++            // cannot disturb the rooted side's object identity. See
++            // `crate::ir::provenance`.
++            let side_known_pointer = |side: &Operand| -> bool {
++                match side {
++                    Operand::Const(_) => false,
++                    Operand::Value(v) => defs
++                        .get(&v.0)
++                        .is_some_and(|d| crate::ir::provenance::produces_pointer(d)),
++                }
++            };
+             match (l, r) {
+                 (ObjectRoot::Other, ObjectRoot::Other) => ObjectRoot::Other,
+                 // `ptr +/- int` keeps the LHS root: it stays in/near the
+                 // object and going out-of-bounds is UB, exactly like GEP.
+-                (root, ObjectRoot::Other) => root,
++                (root, ObjectRoot::Other) if !side_known_pointer(rhs) => root,
+                 // `int + ptr` is commutative with the above.  But `int -
+                 // ptr` (a rooted RHS under `Sub`) fails closed: not
+                 // valid pointer arithmetic (C17 6.5.6), it can only arise
+                 // from integer laundering (`(T*)(c - (intptr_t)p)` cast
+                 // back to a pointer), and an int-derived address may
+                 // alias anything.
+-                (ObjectRoot::Other, root) if matches!(op, IrBinOp::Add) => root,
++                (ObjectRoot::Other, root)
++                    if matches!(op, IrBinOp::Add) && !side_known_pointer(lhs) =>
++                {
++                    root
++                }
+                 // Two rooted sides (ptr + ptr, ptr - ptr used as an
+                 // address) is nonsense; fail closed.
+                 _ => ObjectRoot::Other,
+@@ -2140,12 +2171,18 @@ mod tests {
+         }
+     }
+     fn param_def(dest: u32, idx: usize) -> Instruction {
++        param_ty_def(dest, idx, IrType::Ptr)
++    }
++    fn param_ty_def(dest: u32, idx: usize, ty: IrType) -> Instruction {
+         Instruction::ParamRef {
+             dest: Value(dest),
+             param_idx: idx,
+-            ty: IrType::Ptr,
++            ty,
+         }
+     }
++    fn load_def(dest: u32, ptr: u32, ty: IrType) -> Instruction {
++        load(dest, ptr, ty)
++    }
+     fn global_def(dest: u32, name: &str) -> Instruction {
+         Instruction::GlobalAddr {
+             dest: Value(dest),
+@@ -2199,6 +2236,165 @@ mod tests {
+         object_root_inner(defs, &FxHashMap::default(), BlockId(0), Value(v), 0)
+     }
+ 
++    #[test]
++    fn int_param_to_alloca_copy_uses_memmove() {
++        // P1: an INTEGER parameter converted to a pointer (the frontend
++        // erases the conversion) names no object — it must not present a
++        // `Param` root, so the freshness rule cannot fire and the copy
++        // takes memmove.
++        let mut f = self_loop_copy_with_bases(alloca_def(1), param_ty_def(2, 0, IrType::U64), 1);
++        let n = run_function(&mut f);
++        assert_eq!(n, 1, "laundered-int-param copy must rewrite");
++        assert!(has_call(&f, "memmove"), "unknown provenance needs memmove");
++        assert!(!has_call(&f, "memcpy"), "no memcpy for unknown provenance");
++    }
++
++    #[test]
++    fn int_param_to_param_copy_uses_memmove() {
++        // Same hole, both sides laundered: still memmove, never memcpy.
++        let mut f = self_loop_copy_with_bases(
++            param_ty_def(1, 0, IrType::U64),
++            param_ty_def(2, 1, IrType::U64),
++            2,
++        );
++        let n = run_function(&mut f);
++        assert_eq!(n, 1, "int-param copy must rewrite");
++        assert!(has_call(&f, "memmove"), "unknown provenance needs memmove");
++        assert!(!has_call(&f, "memcpy"), "no memcpy for unknown provenance");
++    }
++
++    #[test]
++    fn typed_chain_matrix() {
++        // Integer param through a laundering chain: no root, even though
++        // the chain ends in pointer-typed operations.
++        let iparam = param_ty_def(1, 0, IrType::U64);
++        let copy = Instruction::Copy {
++            dest: Value(2),
++            src: val(1),
++        };
++        let gep = Instruction::GetElementPtr {
++            dest: Value(3),
++            base: Value(2),
++            offset: i32c(0),
++            ty: IrType::Ptr,
++        };
++        let defs: FxHashMap<u32, &Instruction> =
++            [(1, &iparam), (2, &copy), (3, &gep)].into_iter().collect();
++        assert_eq!(trace_root(&defs, 3), ObjectRoot::Other);
++        // Pointer -> int -> pointer roundtrip through typed casts: the
++        // int↔pointer casts end the proof (Ptr -> Ptr only is followed).
++        let pparam = param_def(4, 0);
++        let ptr_to_int = Instruction::Cast {
++            dest: Value(5),
++            src: val(4),
++            from_ty: IrType::Ptr,
++            to_ty: IrType::U64,
++        };
++        let int_to_ptr = Instruction::Cast {
++            dest: Value(6),
++            src: val(5),
++            from_ty: IrType::U64,
++            to_ty: IrType::Ptr,
++        };
++        let defs: FxHashMap<u32, &Instruction> = [(4, &pparam), (5, &ptr_to_int), (6, &int_to_ptr)]
++            .into_iter()
++            .collect();
++        assert_eq!(trace_root(&defs, 6), ObjectRoot::Other);
++        // Pointer-preserving Ptr -> Ptr cast: still roots.
++        let ppcast = Instruction::Cast {
++            dest: Value(7),
++            src: val(4),
++            from_ty: IrType::Ptr,
++            to_ty: IrType::Ptr,
++        };
++        let defs: FxHashMap<u32, &Instruction> = [(4, &pparam), (7, &ppcast)].into_iter().collect();
++        assert_eq!(trace_root(&defs, 7), ObjectRoot::Param(0));
++    }
++
++    #[test]
++    fn typed_add_side_matrix() {
++        // `p + dynamic_int_param` keeps the root (integer offsets, even
++        // dynamic ones, cannot disturb object identity — wild is UB).
++        let pparam = param_def(1, 0);
++        let iparam = param_ty_def(2, 1, IrType::U64);
++        let p_plus_dyn = Instruction::BinOp {
++            dest: Value(3),
++            op: IrBinOp::Add,
++            lhs: val(1),
++            rhs: val(2),
++            ty: IrType::U64,
++        };
++        let defs: FxHashMap<u32, &Instruction> = [(1, &pparam), (2, &iparam), (3, &p_plus_dyn)]
++            .into_iter()
++            .collect();
++        assert_eq!(trace_root(&defs, 3), ObjectRoot::Param(0));
++        // `p + loaded_int` keeps the root (loaded integer offset).
++        let loaded_int = load_def(4, 1, IrType::I32);
++        let p_plus_load = Instruction::BinOp {
++            dest: Value(5),
++            op: IrBinOp::Add,
++            lhs: val(1),
++            rhs: val(4),
++            ty: IrType::U64,
++        };
++        let defs: FxHashMap<u32, &Instruction> =
++            [(1, &pparam), (4, &loaded_int), (5, &p_plus_load)]
++                .into_iter()
++                .collect();
++        assert_eq!(trace_root(&defs, 5), ObjectRoot::Param(0));
++        // `p + loaded_pointer` rejects the root (adding two addresses is
++        // meaningless), both operand orders.
++        let loaded_ptr = load_def(6, 1, IrType::Ptr);
++        let p_plus_ptr = Instruction::BinOp {
++            dest: Value(7),
++            op: IrBinOp::Add,
++            lhs: val(1),
++            rhs: val(6),
++            ty: IrType::Ptr,
++        };
++        let ptr_plus_p = Instruction::BinOp {
++            dest: Value(8),
++            op: IrBinOp::Add,
++            lhs: val(6),
++            rhs: val(1),
++            ty: IrType::Ptr,
++        };
++        let defs: FxHashMap<u32, &Instruction> = [
++            (1, &pparam),
++            (6, &loaded_ptr),
++            (7, &p_plus_ptr),
++            (8, &ptr_plus_p),
++        ]
++        .into_iter()
++        .collect();
++        assert_eq!(trace_root(&defs, 7), ObjectRoot::Other);
++        assert_eq!(trace_root(&defs, 8), ObjectRoot::Other);
++        // The side check is immediate-def-only: `p + Copy(loaded_ptr)` —
++        // the shape of the valid `p + (int)q` idiom, whose ptrtoint is an
++        // erased Copy — keeps the root. (Copy is transparent; through-Copy
++        // checking would regress valid integer-offset code.)
++        let copy_of_ptr = Instruction::Copy {
++            dest: Value(9),
++            src: val(6),
++        };
++        let p_plus_copy = Instruction::BinOp {
++            dest: Value(10),
++            op: IrBinOp::Add,
++            lhs: val(1),
++            rhs: val(9),
++            ty: IrType::U64,
++        };
++        let defs: FxHashMap<u32, &Instruction> = [
++            (1, &pparam),
++            (6, &loaded_ptr),
++            (9, &copy_of_ptr),
++            (10, &p_plus_copy),
++        ]
++        .into_iter()
++        .collect();
++        assert_eq!(trace_root(&defs, 10), ObjectRoot::Param(0));
++    }
++
+     #[test]
+     fn sub_traced_roots() {
+         // `ptr - int` keeps the pointer's root (stays in/near the object;
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index f45c9998..5c1a2e0f 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -73,6 +73,49 @@ fn two_block_unroll_enabled() -> bool {
+     TWO_BLOCK_UNROLL_ENABLED.with(|cell| cell.get())
+ }
+ 
++thread_local! {
++    /// Whether the persisting-inner-loop gate uses the pre-S20 lenient
++    /// behavior (skip unrecognized nested inners instead of refusing the
++    /// outer unroll) — the `CCC_UNROLL_LEGACY_PERSIST_GATE` kill switch for
++    /// A/B and emergency revert.  Resolved once by the driver into
++    /// per-thread state for the same reason as
++    /// `TWO_BLOCK_UNROLL_ENABLED` above: an ambient `std::env` read here
++    /// would race parallel tests that toggle it.  Defaults to false (the
++    /// fail-closed gate), so unit tests exercise the shipped behavior.
++    static PERSIST_GATE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 +}
 +
-+/// Apply the cross-block pure-CSE renames collected during the walk:
-+/// every use of a dominated, deleted value reads the dominator's value.
-+/// Chains resolve transitively (a->b, b->c).  Applied AFTER the DFS so
-+/// the scoped value-numbering tables never observe a mid-walk rewrite.
-+fn apply_pending_renames(func: &mut IrFunction, state: &mut GvnState) {
-+    if state.pending_renames.is_empty() {
-+        return;
++/// Record whether the legacy lenient persist gate is active.  Called by
++/// `run_passes` before any unroll entry point runs on this thread.
++pub(crate) fn set_persist_gate_legacy(enabled: bool) {
++    PERSIST_GATE_LEGACY.with(|cell| cell.set(enabled));
++}
++
++thread_local! {
++    /// Whether veto-path tracing is active (`CCC_UNROLL_GATE_TRACE`).  Like
++    /// `PERSIST_GATE_LEGACY` above, resolved once by the driver into
++    /// per-thread state: the pass pipeline must not read the process
++    /// environment per call (`check_env_test_hygiene.sh` ratchets the
++    /// remaining sites).  Defaults to false.
++    static PERSIST_GATE_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Record whether persist-gate veto tracing is active.  Called by
++/// `run_passes` before any unroll entry point runs on this thread.
++pub(crate) fn set_persist_gate_trace(enabled: bool) {
++    PERSIST_GATE_TRACE.with(|cell| cell.set(enabled));
++}
++
++#[inline]
++fn persist_gate_trace() -> bool {
++    PERSIST_GATE_TRACE.with(|cell| cell.get())
++}
++
++#[inline]
++fn persist_gate_legacy() -> bool {
++    PERSIST_GATE_LEGACY.with(|cell| cell.get())
++}
++
+ /// Maximum number of body-work blocks (body excluding header and latch) for
+ /// a loop to be eligible. Prevents excessive code size growth.
+ const MAX_UNROLL_BODY_BLOCKS: usize = 12; // increased for hot loops via PGO
+@@ -689,7 +732,7 @@ fn analyze_loop(
+         exit_limit,
+         iv_is_lhs,
+         exit_cond_positive,
+-    ) = find_exit_condition(func, header, &lp.body, iv_phi)?;
++    ) = find_exit_condition(func, header, &lp.body, iv_phi, true)?;
+ 
+     // 8b. The IV phi may only be referenced by a phi OUTSIDE the loop when
+     //     that phi lives in the DIRECT exit block — Step 5 threads exactly
+@@ -1225,6 +1268,20 @@ fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, dept
+     }
+ }
+ 
++/// Observability for the persist gate: with `CCC_UNROLL_GATE_TRACE=1`, every
++/// veto prints the function, the outer/inner headers, and the arm that fired.
++/// Veto-path only (never on allow): the flag read runs solely when the gate is
++/// about to refuse, so steady-state compilation pays nothing for it.  The
++/// flag itself is resolved once by the driver (see `PERSIST_GATE_TRACE`).
++fn trace_persist_veto(func: &IrFunction, outer_header: usize, inner_header: usize, arm: &str) {
++    if persist_gate_trace() {
++        eprintln!(
++            "[UNROLL-GATE] veto fn={} outer={} inner={} arm={}",
++            func.name, outer_header, inner_header, arm
++        );
 +    }
-+    let mut rename: FxHashMap<u32, Value> = FxHashMap::default();
-+    for (from, to) in state.pending_renames.drain(..) {
-+        rename.insert(from.0, to);
++}
++
+ /// True when completely unrolling the outer loop `outer` would leave an inner
+ /// natural loop alive as a runtime loop in every clone.  That happens when a
+ /// properly-nested inner loop's IV/bound depends on a runtime value (anything
+@@ -1236,12 +1293,64 @@ fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, dept
+ /// wrong elements while GCC returns the correct value).  A CONSTANT-trip inner
+ /// loop is fine: the fixpoint fully unrolls it too.  Refusing keeps the outer
+ /// loop rolled, which is correct and matches GCC.
++///
++/// Fail-closed: the ONLY nested inner loop that does not persist is a clean
++/// counted loop (single latch with an unconditional Branch to the header, an
++/// Add/Sub-IV, a header exit on that IV) whose init and limit depend solely
++/// on constants and the outer IV — the triangular-cascade shape, which the
++/// fixpoint unrolls in the next round.  Every other nested inner loop
++/// (multi-latch, non-Branch latch, no Add/Sub-IV, no exit on the found IV,
++/// no recognizable init) is one the complete cloner cannot cascade by
++/// construction, so it persists in every clone and the outer unroll is
++/// refused.  This is a correctness AND a codegen rule: cloning a surviving
++/// runtime loop K times is pure growth (csv_field_sum's 6-trip column loop
++/// over two data-dependent digit while-loops: 19→89 blocks, +345 IR insns,
++/// +156% .text, +8% runtime; the digit extractor's exit reads the
++/// magic-divided value rather than its Add counter, and the digit emitter
++/// carries an Add counter but exits on its Sub countdown — an exit/IV
++/// mismatch in both cases, invisible to the old skip-on-unrecognized gate).
++/// Refusing reproduces GCC's rolled shape for these nests.
++///
++/// The exit match is deliberately VALUE-based, not syntactic: the limit is
++/// accepted whenever it depends only on constants and the outer IV, even
++/// when it is recomputed in the inner header rather than hoisted (g3's
++/// `i + 8`, invariant in value but defined in-body).  Substitution plus the
++/// fold/copyprop between fixpoint rounds makes such a limit per-clone
++/// constant, so the fixpoint still cascades — requiring syntactic
++/// loop-invariance here would veto unrolls the fixpoint completes.  The gate
++/// therefore predicts EXACTLY what the fixpoint can cascade: first-IV-only
++/// (matching the fixpoint's own finder — an exit/IV mismatch vetoes because
++/// the fixpoint would fail to unroll the inner too, so it would persist),
++/// with init/limit constability decided by value.
++///
++/// Detached cycles need no special handling: a natural loop's header
++/// dominates its body, so a block that is unreachable from the outer header
++/// can never sit in `outer.body` — the membership test below already excludes
++/// every dead mid-fixpoint artifact (`find_natural_loops` itself is
++/// dominance-rooted and cannot even report one).
++///
++/// Known conservative case: an inner loop carrying two IVs where the exit
++/// reads the SECOND one (csv's digit emitter: an Add o-counter plus a Sub
++/// t-countdown with the exit on the countdown). The IV finder returns the
++/// first IV, the exit match fails, and the gate refuses — even if the
++/// exit's own IV were cascade-able. Trying every IV until one matches an
++/// exit would recover that rare shape, but the added search in a
++/// correctness-critical gate is not worth a missed unroll the corpus has
++/// never shown; revisit with data if one appears.
++///
++/// `CCC_UNROLL_LEGACY_PERSIST_GATE=1` restores the pre-S20 lenient gate (skip
++/// unrecognized inners instead of refusing) for A/B and emergency revert.
+ fn body_contains_persisting_inner_loop(
+     func: &IrFunction,
+     cfg: &CfgAnalysis,
+     outer: &loop_analysis::NaturalLoop,
+     outer_iv: Value,
+ ) -> bool {
++    // Fail-closed (see the doc comment): every nested inner loop the complete
++    // cloner cannot cascade persists in every clone, so every unrecognized
++    // shape refuses the outer unroll.  The legacy knob restores the old
++    // skip-on-unrecognized behavior for A/B and emergency revert.
++    let legacy = persist_gate_legacy();
+     let all = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+     for inner in &all {
+         if inner.header == outer.header {
+@@ -1252,10 +1361,13 @@ fn body_contains_persisting_inner_loop(
+         }
+         let latches = inner.latches(&cfg.preds);
+         if latches.len() != 1 {
+-            // Multi-latch inner loops aren't handled by name here; the general
+-            // cloner treats other shapes separately and they are not the
+-            // chained-reduction miscompile this gate guards.
+-            continue;
++            // Multi-latch inner loops can never complete-unroll (the cloner
++            // requires a single latch), so they always persist.
++            if legacy {
++                continue;
++            }
++            trace_persist_veto(func, outer.header, inner.header, "multi-latch");
++            return true;
+         }
+         let latch = latches[0];
+         let latch_label = func.blocks[latch].label;
+@@ -1263,38 +1375,89 @@ fn body_contains_persisting_inner_loop(
+             &func.blocks[latch].terminator,
+             Terminator::Branch(l) if *l == func.blocks[inner.header].label
+         ) {
+-            continue;
++            // Without a Branch latch the cloner cannot cascade this inner
++            // loop — it persists.
++            if legacy {
++                continue;
++            }
++            trace_persist_veto(func, outer.header, inner.header, "latch-shape");
++            return true;
+         }
+         // Clean counted inner loop: IV, exit condition, and its initial value.
++        // Anything else (a div/mul-driven while whose exit reads no
++        // Add/Sub-IV, an exit/IV mismatch where the exit reads a different
++        // phi than the finder's first IV, a loop with no recognizable exit
++        // or init) persists: the fixpoint's own first-IV finder would fail
++        // on it too.
+         let Some((iv_phi, _ty, _step, _)) =
+             find_iv_in_loop_ext(func, inner.header, latch, latch_label)
+         else {
+-            continue;
++            if legacy {
++                continue;
++            }
++            trace_persist_veto(func, outer.header, inner.header, "no-iv");
++            return true;
+         };
++        // Value-based exit: no syntactic-invariance requirement (see
++        // `find_exit_condition`).  A limit recomputed in the inner header
++        // from the outer IV still cascades — substitution plus the
++        // fold/copyprop between fixpoint rounds makes it per-clone
++        // constant — so invariance is decided by `depends_only...` below.
++        // Legacy mode keeps the SYNTACTIC exit (`true`): the lenient gate
++        // must skip exactly the nests it skipped pre-S20, and a value exit
++        // would send unrecognized nests down the refuse path instead of
++        // the skip path (fse's main: 552 -> 405 in legacy mode).
+         let Some((_et, _be, _cmp, _cty, limit, _islhs, _pos)) =
+-            find_exit_condition(func, inner.header, &inner.body, iv_phi)
++            find_exit_condition(func, inner.header, &inner.body, iv_phi, legacy)
+         else {
+-            continue;
++            if legacy {
++                continue;
++            }
++            trace_persist_veto(func, outer.header, inner.header, "no-exit");
++            return true;
+         };
+-        let mut init_op = None;
++        // Every non-latch incoming of the IV phi is an entry value the inner
++        // loop can start from.  A multi-entry inner header (irreducible CFG)
++        // is per-clone constant only if ALL of them are — testing just one
++        // would bless a bound that varies by entry, and the fixpoint's
++        // `resolve_const_operand` cannot see through multi-entry phis
++        // anyway, so the inner would persist.  (Legacy mode keeps the old
++        // last-incoming-only test for exact A/B restoration.)
++        let mut init_ops = Vec::new();
+         for inst in &func.blocks[inner.header].instructions {
+             if let Instruction::Phi { dest, incoming, .. } = inst {
+                 if dest.0 == iv_phi.0 {
+                     for (op, lbl) in incoming {
+                         if *lbl != latch_label {
+-                            init_op = Some(op.clone());
++                            init_ops.push(op.clone());
+                         }
+                     }
+                 }
+             }
+         }
+-        let Some(init_op) = init_op else { continue };
++        if init_ops.is_empty() {
++            if legacy {
++                continue;
++            }
++            trace_persist_veto(func, outer.header, inner.header, "no-init");
++            return true;
++        }
++        let inits_to_test: &[Operand] = if legacy {
++            &init_ops[init_ops.len() - 1..]
++        } else {
++            &init_ops
++        };
+         // If the inner IV's initial value or its bound depends on a runtime
+         // value (not a constant and not the OUTER IV), the inner loop persists
+-        // after the outer unroll -> unsafe to unroll the outer loop.
+-        if !depends_only_on_const_and_iv(func, &init_op, outer_iv, 0)
++        // after the outer unroll -> unsafe to unroll the outer loop.  No
++        // legacy skip here (unlike the unrecognized-shape arms above): a
++        // recognized-but-dynamic bound persists under EITHER gate.
++        if inits_to_test
++            .iter()
++            .any(|op| !depends_only_on_const_and_iv(func, op, outer_iv, 0))
+             || !depends_only_on_const_and_iv(func, &limit, outer_iv, 0)
+         {
++            trace_persist_veto(func, outer.header, inner.header, "dynamic-bound");
+             return true;
+         }
+     }
+@@ -1617,10 +1780,12 @@ fn try_complete_unroll_general(
+         return false;
+     };
+ 
+-    // Fail closed (correctness, see `body_contains_persisting_inner_loop`):
+-    // refuse to unroll when the body contains a nested inner loop whose trip
+-    // count depends on a runtime value (so it survives as a runtime loop in
+-    // every clone).  The surviving sibling runtime reductions reuse one
++    // Fail closed (correctness AND codegen, see
++    // `body_contains_persisting_inner_loop`): refuse to unroll when the body
++    // contains a nested inner loop that would survive as a runtime loop in
++    // every clone — either its trip count depends on a runtime value, or it
++    // is a shape the complete cloner cannot cascade (no Add-IV, no clean
++    // latch/exit).  The surviving sibling runtime reductions reuse one
+     // accumulator, which the downstream late vectorizer miscompiles; staying
+     // rolled is correct and matches GCC for these shapes.
+     if body_contains_persisting_inner_loop(func, cfg, lp, iv_phi) {
+@@ -1629,7 +1794,7 @@ fn try_complete_unroll_general(
+ 
+     // Exit from the header's CondBranch.
+     let Some((exit_target, body_entry, raw_cmp_op, cmp_ty, exit_limit, iv_is_lhs, exit_pos)) =
+-        find_exit_condition(func, header, &lp.body, iv_phi)
++        find_exit_condition(func, header, &lp.body, iv_phi, true)
+     else {
+         return false;
+     };
+@@ -2168,7 +2333,7 @@ fn try_complete_unroll_two_block(
+         exit_limit,
+         iv_is_lhs,
+         exit_cond_positive,
+-    )) = find_exit_condition(func, header, &lp.body, iv_phi)
++    )) = find_exit_condition(func, header, &lp.body, iv_phi, true)
+     else {
+         return false;
+     };
+@@ -2730,7 +2895,7 @@ fn try_partial_unroll_two_block(
+         exit_limit,
+         iv_is_lhs,
+         exit_cond_positive,
+-    )) = find_exit_condition(func, header, &lp.body, iv_phi)
++    )) = find_exit_condition(func, header, &lp.body, iv_phi, true)
+     else {
+         return false;
+     };
+@@ -3549,11 +3714,22 @@ fn find_iv_in_loop_ext(
+ ///
+ /// Returns `(exit_target, body_entry, cmp_op, cmp_ty, limit, iv_is_lhs, exit_cond_positive)`.
+ /// `exit_cond_positive` is `true` when the condition evaluating to `true` means "exit".
++///
++/// `require_loop_invariant_limit` is true at every trip-computing caller:
++/// the closed form is only valid for a limit that is fixed for the whole
++/// loop.  The persisting-inner-loop gate passes false: it predicts
++/// post-substitution cascade-ability by VALUE (`depends_only_on_const_and_iv`
++/// on the limit), and a value-invariant limit recomputed in the inner header
++/// (g3's `i + 8`: invariant in value, defined in-body) still folds to a
++/// per-clone constant once the outer IV is substituted and fold/copyprop run
++/// before the next fixpoint round.  Requiring syntactic invariance there
++/// vetoes cascades the fixpoint would complete.
+ fn find_exit_condition(
+     func: &IrFunction,
+     header: usize,
+     loop_body: &FxHashSet<usize>,
+     iv_phi: Value,
++    require_loop_invariant_limit: bool,
+ ) -> Option<(BlockId, BlockId, IrCmpOp, IrType, Operand, bool, bool)> {
+     let header_block = &func.blocks[header];
+ 
+@@ -3626,13 +3802,17 @@ fn find_exit_condition(
+ 
+     let iv_id = iv_phi.0;
+ 
+-    // One Cmp operand must be exactly the IV phi; the other must be loop-invariant.
++    // One Cmp operand must be exactly the IV phi; the other is the limit.
++    // Trip-computing callers additionally require a syntactically
++    // loop-invariant limit (the closed form is only valid for a fixed
++    // limit); the persist gate passes false and decides invariance by
++    // VALUE instead (see the doc comment above).
+     let (iv_is_lhs, limit_op) = if matches!(cmp_lhs, Operand::Value(v) if v.0 == iv_id)
+-        && is_loop_invariant_op(cmp_rhs, loop_body, func)
++        && (!require_loop_invariant_limit || is_loop_invariant_op(cmp_rhs, loop_body, func))
+     {
+         (true, cmp_rhs)
+     } else if matches!(cmp_rhs, Operand::Value(v) if v.0 == iv_id)
+-        && is_loop_invariant_op(cmp_lhs, loop_body, func)
++        && (!require_loop_invariant_limit || is_loop_invariant_op(cmp_lhs, loop_body, func))
+     {
+         (false, cmp_lhs)
+     } else {
+@@ -6292,6 +6472,829 @@ mod tests {
+         }
+     }
+ 
++    // ── Persisting-inner-loop gate (fail-closed) ──────────────────────────────
++    //
++    // `body_contains_persisting_inner_loop` refuses an outer complete unroll
++    // unless every nested inner loop is a clean counted loop whose bound and
++    // init the outer IV substitution makes per-clone constant (the
++    // triangular-cascade shape).  These tests pin both directions of that
++    // predicate directly at the gate, plus end-to-end through `unroll_loops`.
++
++    /// Verdict of the persist gate for a hand-declared outer loop.
++    fn persist_gate_verdict(func: &IrFunction, outer_body: &[usize], outer_iv: Value) -> bool {
++        let cfg = CfgAnalysis::build(func);
++        let outer = loop_analysis::NaturalLoop {
++            header: 1,
++            body: outer_body.iter().copied().collect(),
++        };
++        body_contains_persisting_inner_loop(func, &cfg, &outer, outer_iv)
 +    }
-+    let resolve = |mut v: Value| {
-+        for _ in 0..16 {
-+            match rename.get(&v.0) {
-+                Some(n) if *n != v => v = *n,
-+                _ => break,
-+            }
-+        }
-+        v
-+    };
-+    for b in func.blocks.iter_mut() {
-+        for inst in b.instructions.iter_mut() {
-+            inst.for_each_value_use_mut(|v| *v = resolve(*v));
-+            inst.for_each_operand_mut(|o| {
-+                if let Operand::Value(v) = o {
-+                    *v = resolve(*v);
-+                }
-+            });
-+        }
-+        b.terminator.for_each_operand_mut(|o| {
-+            if let Operand::Value(v) = o {
-+                *v = resolve(*v);
-+            }
++
++    /// Push B0 (preheader) + B1 (`for (i = 0; i < limit; i++)` header, body
++    /// at B2, outer latch `latch`, exit `exit`) of a nest fixture.
++    fn persist_gate_push_outer_prefix(
++        func: &mut IrFunction,
++        limit: i32,
++        latch: BlockId,
++        exit: BlockId,
++    ) {
++        func.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![Instruction::Copy {
++                dest: Value(0),
++                src: Operand::Const(IrConst::I32(0)),
++            }],
++            terminator: Terminator::Branch(BlockId(1)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(1),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(1),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        (Operand::Value(Value(0)), BlockId(0)),
++                        (Operand::Value(Value(8)), latch),
++                    ],
++                },
++                Instruction::Cmp {
++                    dest: Value(10),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Const(IrConst::I32(limit)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(10)),
++                true_label: BlockId(2),
++                false_label: exit,
++            },
++            source_spans: Vec::new(),
 +        });
 +    }
-+}
 +
- /// Recursive DFS over the dominator tree for GVN.
- /// Processes block_idx, then recurses into dominated children.
- /// Uses rollback logs to restore state on backtracking.
-@@ -1606,10 +1687,14 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
-     // candidate expression. Track definitions explicitly to make large generated
-     // basic blocks O(n) instead of O(n^2) without changing CSE legality.
-     let mut block_defs: FxHashSet<u32> = FxHashSet::default();
--    // GVN replaces instructions 1:1 (original or Copy), so spans stay parallel
--    let new_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
-+    // GVN replaces instructions 1:1 (original or Copy), so spans stay
-+    // parallel — EXCEPT the cross-block rename path, which deletes the
-+    // instruction outright and removes its span by index.
-+    let mut new_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
-+    let mut inst_idx = 0usize;
- 
-     for inst in func.blocks[block_idx].instructions.drain(..) {
-+        inst_idx += 1;
-         // Memory invalidation: true clobbers (calls, atomics, asm, ...) and
-         // stores to unknown/seg-overridden pointers bump the global generation
-         // (conservative). Stores to a known global only advance that symbol's
-@@ -1809,15 +1894,69 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
-                 // Decide the CSE source value, if any. Returns the canonical
-                 // plus, for cross-signedness hits, the (canon, candidate)
-                 // exact types for the debug trace.
-+                // Cross-block pure hits become RENAMES, not Copies: the
-+                // dominator-scoped table guarantees the existing value's
-+                // block dominates this one, hence (SSA) every use of
-+                // `dest` is dominated by it too — the dominated
-+                // instruction is deleted and its uses read the dominator's
-+                // value directly.  No Copy is inserted, so the historical
-+                // cross-block hazard ("Copies whose source values may have
-+                // their registers reused by the allocator before the Copy
-+                // executes") does not exist: the register allocator sees a
-+                // plain SSA value with dominated uses.  A multi-def dest
-+                // keeps its instruction (deleting one definition of a
-+                // redefined id would change what the other definitions'
-+                // uses observe).
-+                let mut pure_cross_block_rename = false;
-                 let cse_source: Option<(Value, Option<(IrType, IrType)>)> = if let Some(ev) =
-                     existing_pure
-                 {
--                    // Only CSE within the same block to avoid cross-block Copy issues.
--                    // Cross-block CSE creates Copies whose source values may have
--                    // their registers reused by the allocator before the Copy executes.
--                    existing_pure
--                        .filter(|v| block_defs.contains(&v.0))
--                        .map(|v| (v, None))
-+                    if block_defs.contains(&ev.0) {
-+                        Some((ev, None))
-+                    } else if !matches!(
-+                        inst,
-+                        Instruction::BinOp {
-+                            op: IrBinOp::Mul,
-+                            ty: bin_ty, ..
-+                        } if !bin_ty.is_float()
-+                    ) {
-+                        // Cross-block RENAMING is scoped to INTEGER `Mul`
-+                        // — the audited work-order class ("redundant
-+                        // multiplications of induction variables"):
-+                        //  * GEPs and GlobalAddrs are deliberately RETAINED
-+                        //    across blocks (the backend's address
-+                        //    materialisation relies on site-local GEP
-+                        //    values — see `gep_value_numbers`), and Casts
-+                        //    carry the cross-signedness machinery;
-+                        //  * FLOAT BinOps are rounding- and shape-sensitive:
-+                        //    the FMA contraction passes decide per Add/Mul
-+                        //    shape, so deleting a duplicate float op changes
-+                        //    which contractions fire and the bit-exact op
-+                        //    order the FP gates pin;
-+                        //  * INTEGER `Add`s are exact values but load-bearing
-+                        //    SHAPES: the loop passes structurally match exit
-+                        //    compares (`i + 2 < n` is the stencil matcher's
-+                        //    documented form) and IV bookkeeping — measured,
-+                        //    a broad Add rename flipped
-+                        //    stencil_vectorize's checksum and collapsed 21
-+                        //    unroll/vectorize corpus shapes.  `Mul` has no
-+                        //    such structural consumers.
-+                        //  Same-block Copies remain available for the other
-+                        //  classes.
-+                        None
-+                    } else if state.multi_def_values.contains(&dest.0) {
-+                        None
-+                    } else if state.phi_incoming_feeds.contains(&dest.0) {
-+                        // The dominated value feeds a phi (an IV increment
-+                        // or an exit-merge edge): deleting it would leave
-+                        // the phi reading a body-defined value, which the
-+                        // unrollers/vectorizers structurally refuse (see
-+                        // `phi_incoming_feeds`).  Keep the instruction.
-+                        None
-+                    } else {
-+                        pure_cross_block_rename = true;
-+                        Some((ev, None))
-+                    }
-                 } else if let Some((canon, canon_ty, canon_is_load)) = existing_load {
-                     let cand_ty = match &inst {
-                         Instruction::Load { ty, .. } => *ty,
-@@ -1867,6 +2006,19 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
-                         state.vn_log.push((dest_idx, old_vn));
-                         state.value_numbers[dest_idx] = existing_vn;
-                     }
-+                    if pure_cross_block_rename {
-+                        // Delete the dominated instruction outright; the
-+                        // uses are renamed onto the dominator's value
-+                        // after the walk completes (see
-+                        // `apply_pending_renames`).  The CSE debug print
-+                        // above already traced this hit.
-+                        state.pending_renames.push((dest, existing_value));
-+                        if inst_idx <= new_spans.len() {
-+                            new_spans.remove(inst_idx - 1);
-+                        }
-+                        eliminated += 1;
-+                        continue;
-+                    }
-                     new_instructions.push(Instruction::Copy {
-                         dest,
-                         src: Operand::Value(existing_value),
-@@ -2452,8 +2604,10 @@ mod tests {
- 
-     #[test]
-     fn test_cross_block_cse() {
--        // Cross-block CSE is currently restricted to same-block only.
--        // This test verifies cross-block expressions are NOT CSE'd.
-+        // Cross-block pure CSE fires via USE-RENAMING: the dominated
-+        // instruction is deleted (no Copy is inserted — the historical
-+        // Copy form's stale-register-home hazard does not exist for a
-+        // rename) and its uses read the dominator's value directly.
-         // CFG: block0 -> block1 (block0 dominates block1)
-         let func = IrFunction {
-             name: "test".to_string(),
-@@ -2464,7 +2618,7 @@ mod tests {
-                     label: BlockId(0),
-                     instructions: vec![Instruction::BinOp {
-                         dest: Value(2),
--                        op: IrBinOp::Add,
-+                        op: IrBinOp::Mul,
-                         lhs: Operand::Value(Value(0)),
-                         rhs: Operand::Value(Value(1)),
-                         ty: IrType::I32,
-@@ -2475,9 +2629,20 @@ mod tests {
-                 BasicBlock {
-                     label: BlockId(1),
-                     instructions: vec![
--                        // Same expression as in block0 - should be CSE'd
-+                        // Same integer Mul as in block0 - CSE'd via rename
-                         Instruction::BinOp {
-                             dest: Value(3),
-+                            op: IrBinOp::Mul,
-+                            lhs: Operand::Value(Value(0)),
-+                            rhs: Operand::Value(Value(1)),
-+                            ty: IrType::I32,
-+                        },
-+                        // An identical integer Add in the second block: Add
-+                        // renames are OUT of scope (the loop passes match
-+                        // exit compares and IV bookkeeping by Add shape), so
-+                        // this Add must be KEPT.
-+                        Instruction::BinOp {
-+                            dest: Value(4),
-                             op: IrBinOp::Add,
-                             lhs: Operand::Value(Value(0)),
-                             rhs: Operand::Value(Value(1)),
-@@ -2533,12 +2698,20 @@ mod tests {
-         };
- 
-         let eliminated = module.for_each_function(run_gvn_function);
--        assert_eq!(eliminated, 0); // Cross-block CSE disabled (same-block only)
-+        assert_eq!(eliminated, 1, "the dominated Mul must be CSE'd (renamed)");
- 
--        // The expression in block1 should NOT be replaced (cross-block CSE disabled)
--        match &module.functions[0].blocks[1].instructions[0] {
--            Instruction::BinOp { dest, .. } => {
--                assert_eq!(dest.0, 3); // Original BinOp preserved
-+        // The dominated expression is DELETED and the use reads the
-+        // dominator's value.
++    /// Push the outer latch (`%8 = %1 + 1`, back to B1) + the returning exit.
++    fn persist_gate_push_outer_suffix(func: &mut IrFunction, latch: u32, exit: u32) {
++        func.blocks.push(BasicBlock {
++            label: BlockId(latch),
++            instructions: vec![Instruction::BinOp {
++                dest: Value(8),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            }],
++            terminator: Terminator::Branch(BlockId(1)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(exit),
++            instructions: vec![],
++            terminator: Terminator::Return(None),
++            source_spans: Vec::new(),
++        });
++        func.next_value_id = 32;
++    }
++
++    /// Triangular nest (`for i` / `for j = i+1; j < 4`): the cascade shape —
++    /// the inner init depends only on the outer IV, so the inner becomes
++    /// per-clone constant-trip and the fixpoint unrolls it next. Allowed.
++    fn persist_gate_triangular() -> IrFunction {
++        let mut func = IrFunction::new("tri".to_string(), IrType::Void, vec![], false);
++        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
++        // B1 also computes the triangular init j = i + 1.
++        func.blocks[1].instructions.push(Instruction::BinOp {
++            dest: Value(2),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(1)),
++            rhs: Operand::Const(IrConst::I32(1)),
++            ty: IrType::I32,
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(3),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        (Operand::Value(Value(2)), BlockId(1)),
++                        (Operand::Value(Value(7)), BlockId(4)),
++                    ],
++                },
++                Instruction::Cmp {
++                    dest: Value(11),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Const(IrConst::I32(4)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(11)),
++                true_label: BlockId(3),
++                false_label: BlockId(5),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::Copy {
++                dest: Value(9),
++                src: Operand::Value(Value(3)),
++            }],
++            terminator: Terminator::Branch(BlockId(4)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(4),
++            instructions: vec![Instruction::BinOp {
++                dest: Value(7),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(3)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            }],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: Vec::new(),
++        });
++        persist_gate_push_outer_suffix(&mut func, 5, 6);
++        func
++    }
++
++    #[test]
++    fn persist_gate_triangular_inner_allowed() {
++        let func = persist_gate_triangular();
 +        assert!(
-+            module.functions[0].blocks[1]
-+                .instructions
-+                .iter()
-+                .all(|i| !matches!(i, Instruction::BinOp { dest, .. } if dest.0 == 3)),
-+            "the dominated Mul must be deleted"
++            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "triangular inner (init on outer IV) must not veto the outer unroll"
 +        );
-+        match &module.functions[0].blocks[1].terminator {
-+            Terminator::Return(Some(Operand::Value(v))) => {
-+                assert_eq!(v.0, 2, "the return reads the dominator's value");
++    }
++
++    #[test]
++    fn persist_gate_rectangular_inner_allowed() {
++        // Const-init/const-bound inner: per-clone constant-trip. Allowed.
++        let mut func = persist_gate_triangular();
++        // Rectangularize: inner init becomes const 0 (drop the i+1 use).
++        if let Instruction::Phi { incoming, .. } = &mut func.blocks[2].instructions[0] {
++            incoming[0].0 = Operand::Const(IrConst::I32(0));
++        }
++        assert!(
++            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "rectangular const inner must not veto the outer unroll"
++        );
++    }
++
++    #[test]
++    fn persist_gate_clean_countdown_inner_allowed() {
++        // Single Sub-IV with the exit on it and const init/limit: a clean
++        // countdown, which the complete cloner (negative steps) cascades.
++        // Allowed — countdown unrolling is pinned by
++        // `unroll_countdown_chain_body.c` and must keep working nested.
++        let mut func = persist_gate_triangular();
++        func.blocks[2].instructions = vec![
++            Instruction::Phi {
++                dest: Value(3),
++                ty: IrType::I32,
++                incoming: vec![
++                    (Operand::Const(IrConst::I32(4)), BlockId(1)),
++                    (Operand::Value(Value(7)), BlockId(4)),
++                ],
++            },
++            Instruction::Cmp {
++                dest: Value(11),
++                op: IrCmpOp::Sgt,
++                lhs: Operand::Value(Value(3)),
++                rhs: Operand::Const(IrConst::I32(0)),
++                ty: IrType::I32,
++            },
++        ];
++        func.blocks[4].instructions = vec![Instruction::BinOp {
++            dest: Value(7),
++            op: IrBinOp::Sub,
++            lhs: Operand::Value(Value(3)),
++            rhs: Operand::Const(IrConst::I32(1)),
++            ty: IrType::I32,
++        }];
++        assert!(
++            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "clean countdown inner must not veto the outer unroll"
++        );
++    }
++
++    /// csv_field_sum's digit EXTRACTOR shape: the inner loop carries an Add
++    /// counter, but the exit reads the magic-divided value — no exit on any
++    /// Add-IV. The inner persists in every clone. Must refuse.
++    fn persist_gate_div_driven() -> IrFunction {
++        let mut func = IrFunction::new("divinner".to_string(), IrType::Void, vec![], false);
++        persist_gate_push_outer_prefix(&mut func, 6, BlockId(5), BlockId(6));
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(4),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        (Operand::Const(IrConst::I32(0)), BlockId(1)),
++                        (Operand::Value(Value(6)), BlockId(4)),
++                    ],
++                },
++                Instruction::Phi {
++                    dest: Value(3),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        // Const init ON PURPOSE: the refusal comes from the
++                        // exit/IV mismatch (exit reads the div-driven phi),
++                        // not from the bound.
++                        (Operand::Const(IrConst::I32(7)), BlockId(1)),
++                        (Operand::Value(Value(5)), BlockId(4)),
++                    ],
++                },
++                Instruction::Cmp {
++                    dest: Value(11),
++                    op: IrCmpOp::Sgt,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Const(IrConst::I32(0)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(11)),
++                true_label: BlockId(3),
++                false_label: BlockId(5),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::Copy {
++                dest: Value(9),
++                src: Operand::Value(Value(3)),
++            }],
++            terminator: Terminator::Branch(BlockId(4)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(4),
++            instructions: vec![
++                Instruction::BinOp {
++                    dest: Value(6),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(4)),
++                    rhs: Operand::Const(IrConst::I32(1)),
++                    ty: IrType::I32,
++                },
++                // Non-Add update of the exit phi (stands in for the
++                // magic-div chain): no Add-IV explains the exit.
++                Instruction::BinOp {
++                    dest: Value(5),
++                    op: IrBinOp::Mul,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Value(Value(3)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: Vec::new(),
++        });
++        persist_gate_push_outer_suffix(&mut func, 5, 6);
++        func
++    }
++
++    #[test]
++    fn persist_gate_div_driven_inner_refused() {
++        let func = persist_gate_div_driven();
++        assert!(
++            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "div-driven inner (exit on non-IV phi) must veto the outer unroll"
++        );
++    }
++
++    /// csv_field_sum's digit EMITTER shape: an Add o-counter listed FIRST
++    /// plus a Sub t-countdown, with the exit on the countdown. The IV
++    /// finder returns the Add-IV, the exit match fails, and the loop
++    /// persists. Must refuse.
++    fn persist_gate_two_iv_exit_on_second() -> IrFunction {
++        let mut func = persist_gate_div_driven();
++        // Turn the div update into a Sub countdown; keep the Add-phi first.
++        func.blocks[4].instructions[1] = Instruction::BinOp {
++            dest: Value(5),
++            op: IrBinOp::Sub,
++            lhs: Operand::Value(Value(3)),
++            rhs: Operand::Const(IrConst::I32(1)),
++            ty: IrType::I32,
++        };
++        func
++    }
++
++    #[test]
++    fn persist_gate_exit_on_second_iv_refused() {
++        let func = persist_gate_two_iv_exit_on_second();
++        assert!(
++            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "inner with the exit on its second IV must veto the outer unroll"
++        );
++    }
++
++    /// Multi-latch inner: B3 is the Branch latch, B4 re-enters the header
++    /// conditionally. The unmerged loop with tail B3 has two latches, which
++    /// the complete cloner can never cascade. Must refuse. (Tail order only
++    /// selects WHICH arm fires first — B3 < B4 puts the two-latch loop
++    /// first — but the verdict is order-independent: the other unmerged
++    /// loop is latch-malformed and refuses on its own.)
++    fn persist_gate_multi_latch() -> IrFunction {
++        let mut func = IrFunction::new("multilatch".to_string(), IrType::Void, vec![], false);
++        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(3),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        (Operand::Value(Value(7)), BlockId(4)),
++                        (Operand::Value(Value(6)), BlockId(3)),
++                        (Operand::Value(Value(0)), BlockId(1)),
++                    ],
++                },
++                Instruction::Cmp {
++                    dest: Value(11),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Const(IrConst::I32(10)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(11)),
++                true_label: BlockId(4),
++                false_label: BlockId(5),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::BinOp {
++                dest: Value(6),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(3)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            }],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(4),
++            instructions: vec![
++                Instruction::BinOp {
++                    dest: Value(7),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Const(IrConst::I32(1)),
++                    ty: IrType::I32,
++                },
++                Instruction::Cmp {
++                    dest: Value(12),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Const(IrConst::I32(5)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(12)),
++                true_label: BlockId(2),
++                false_label: BlockId(3),
++            },
++            source_spans: Vec::new(),
++        });
++        persist_gate_push_outer_suffix(&mut func, 5, 6);
++        func
++    }
++
++    #[test]
++    fn persist_gate_multi_latch_inner_refused() {
++        let func = persist_gate_multi_latch();
++        assert!(
++            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "multi-latch inner must veto the outer unroll"
++        );
++    }
++
++    #[test]
++    fn persist_gate_detached_cycle_no_veto() {
++        // A disconnected B5↔B6 cycle next to a clean unrollable outer loop:
++        // dead code must never veto optimization. The membership test
++        // excludes it even if loop detection ever learns to see detached
++        // cycles (a natural header dominates its body, so an unreachable
++        // block can never sit in `outer.body`); the second assertion pins
++        // today's invisibility as the tripwire for that analysis change.
++        let mut func = IrFunction::new("detached".to_string(), IrType::Void, vec![], false);
++        persist_gate_push_outer_prefix(&mut func, 4, BlockId(3), BlockId(4));
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![Instruction::Copy {
++                dest: Value(9),
++                src: Operand::Value(Value(1)),
++            }],
++            terminator: Terminator::Branch(BlockId(3)),
++            source_spans: Vec::new(),
++        });
++        persist_gate_push_outer_suffix(&mut func, 3, 4);
++        func.blocks.push(BasicBlock {
++            label: BlockId(5),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(6)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(6),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(5)),
++            source_spans: Vec::new(),
++        });
++        assert!(
++            !persist_gate_verdict(&func, &[1, 2, 3], Value(1)),
++            "detached cycle must not veto the outer unroll"
++        );
++        let cfg = CfgAnalysis::build(&func);
++        let all =
++            loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
++        assert!(
++            all.iter().all(|lp| lp.header != 5 && lp.header != 6),
++            "tripwire: loop detection learned to see detached cycles — \
++             re-examine the persist gate's membership argument"
++        );
++    }
++
++    #[test]
++    fn persist_gate_legacy_restores_lenient() {
++        // Differential pin: under the legacy knob the four refusing shapes
++        // above are allowed again (the pre-S20 skip-on-unrecognized gate),
++        // while the three cascade shapes stay allowed in both modes.
++        let prev = persist_gate_legacy();
++        set_persist_gate_legacy(true);
++        assert!(!persist_gate_verdict(
++            &persist_gate_triangular(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        let mut rect = persist_gate_triangular();
++        if let Instruction::Phi { incoming, .. } = &mut rect.blocks[2].instructions[0] {
++            incoming[0].0 = Operand::Const(IrConst::I32(0));
++        }
++        assert!(!persist_gate_verdict(&rect, &[1, 2, 3, 4, 5], Value(1)));
++        assert!(!persist_gate_verdict(
++            &persist_gate_affine_limit_in_header(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        assert!(!persist_gate_verdict(
++            &persist_gate_div_driven(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        assert!(!persist_gate_verdict(
++            &persist_gate_two_iv_exit_on_second(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        assert!(!persist_gate_verdict(
++            &persist_gate_multi_latch(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        assert!(!persist_gate_verdict(
++            &persist_gate_multi_entry_inner(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        set_persist_gate_legacy(prev);
++        // Restore verified: the refusing shapes veto again.
++        assert!(persist_gate_verdict(
++            &persist_gate_div_driven(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        assert!(persist_gate_verdict(
++            &persist_gate_two_iv_exit_on_second(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        assert!(persist_gate_verdict(
++            &persist_gate_multi_latch(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++        assert!(persist_gate_verdict(
++            &persist_gate_multi_entry_inner(),
++            &[1, 2, 3, 4, 5],
++            Value(1)
++        ));
++    }
++
++    /// g3's affine-limit shape (`for j = 2; j < i + 8; j++` with the limit
++    /// recomputed in the INNER header from the outer IV): invariant in value
++    /// but not hoisted, so no SYNTACTIC exit exists — yet substitution plus
++    /// the fold/copyprop between fixpoint rounds makes it per-clone
++    /// constant, and the fixpoint cascades. Must allow. (S20's syntactic
++    /// gate vetoed this: +20 insns on g3 plus a lost ipcp fold in main.
++    /// Legacy allows it too, but for the wrong reason — skipping the
++    /// unrecognized exit — while S20b allows it by value prediction.)
++    fn persist_gate_affine_limit_in_header() -> IrFunction {
++        let mut func = IrFunction::new("afflim".to_string(), IrType::Void, vec![], false);
++        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(3),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        (Operand::Const(IrConst::I32(2)), BlockId(1)),
++                        (Operand::Value(Value(7)), BlockId(4)),
++                    ],
++                },
++                // The limit, computed HERE (in-body, hence not
++                // syntactically invariant) from the OUTER iv %1.
++                Instruction::BinOp {
++                    dest: Value(12),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Const(IrConst::I32(8)),
++                    ty: IrType::I32,
++                },
++                Instruction::Cmp {
++                    dest: Value(11),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Value(Value(12)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(11)),
++                true_label: BlockId(3),
++                false_label: BlockId(5),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::Copy {
++                dest: Value(9),
++                src: Operand::Value(Value(3)),
++            }],
++            terminator: Terminator::Branch(BlockId(4)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(4),
++            instructions: vec![Instruction::BinOp {
++                dest: Value(7),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(3)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            }],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: Vec::new(),
++        });
++        persist_gate_push_outer_suffix(&mut func, 5, 6);
++        func
++    }
++
++    #[test]
++    fn persist_gate_affine_limit_in_header_allowed() {
++        let func = persist_gate_affine_limit_in_header();
++        assert!(
++            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "value-invariant limit recomputed in the inner header must not veto"
++        );
++    }
++
++    /// Multi-entry inner header (irreducible CFG): the IV phi has TWO
++    /// non-latch incomings, one const (B1) and one opaque-dynamic (B7, a
++    /// syntactic-only predecessor — Value(99) is deliberately undefined).
++    /// Per-clone constancy needs ALL entries constable. Must refuse. (The
++    /// const incoming is listed LAST so a last-incoming-wins test would
++    /// bless this nest — the S20/legacy false-negative this pins shut.)
++    fn persist_gate_multi_entry_inner() -> IrFunction {
++        let mut func = IrFunction::new("multientry".to_string(), IrType::Void, vec![], false);
++        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(3),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        (Operand::Value(Value(99)), BlockId(7)),
++                        (Operand::Const(IrConst::I32(0)), BlockId(1)),
++                        (Operand::Value(Value(7)), BlockId(4)),
++                    ],
++                },
++                Instruction::Cmp {
++                    dest: Value(11),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Const(IrConst::I32(4)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(11)),
++                true_label: BlockId(3),
++                false_label: BlockId(5),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::Copy {
++                dest: Value(9),
++                src: Operand::Value(Value(3)),
++            }],
++            terminator: Terminator::Branch(BlockId(4)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(4),
++            instructions: vec![Instruction::BinOp {
++                dest: Value(7),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(3)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            }],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: Vec::new(),
++        });
++        persist_gate_push_outer_suffix(&mut func, 5, 6);
++        // Syntactic-only second entry into the inner header.
++        func.blocks.push(BasicBlock {
++            label: BlockId(7),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: Vec::new(),
++        });
++        func
++    }
++
++    #[test]
++    fn persist_gate_multi_entry_inner_refused() {
++        let func = persist_gate_multi_entry_inner();
++        assert!(
++            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "multi-entry inner with a dynamic entry value must veto the outer unroll"
++        );
++    }
++
++    /// fse's shape: a value-only exit (affine limit recomputed in the inner
++    /// header) PLUS a dynamic init (Value(99) is deliberately undefined, an
++    /// opaque runtime value). The new gate finds the value exit, then
++    /// refuses on the unconstable init; the legacy gate must SKIP the nest
++    /// (no SYNTACTIC exit) exactly as pre-S20. Pins the legacy-fidelity fix:
++    /// with a value exit in legacy mode this nest would refuse (fse's main
++    /// 552 -> 405 with the knob set) instead of restoring the lenient gate.
++    fn persist_gate_dynamic_init_affine_limit() -> IrFunction {
++        let mut func = IrFunction::new("dyninit".to_string(), IrType::Void, vec![], false);
++        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(3),
++                    ty: IrType::I32,
++                    incoming: vec![
++                        (Operand::Value(Value(99)), BlockId(1)),
++                        (Operand::Value(Value(7)), BlockId(4)),
++                    ],
++                },
++                Instruction::BinOp {
++                    dest: Value(12),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Const(IrConst::I32(8)),
++                    ty: IrType::I32,
++                },
++                Instruction::Cmp {
++                    dest: Value(11),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(3)),
++                    rhs: Operand::Value(Value(12)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(11)),
++                true_label: BlockId(3),
++                false_label: BlockId(5),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::Copy {
++                dest: Value(9),
++                src: Operand::Value(Value(3)),
++            }],
++            terminator: Terminator::Branch(BlockId(4)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(4),
++            instructions: vec![Instruction::BinOp {
++                dest: Value(7),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(3)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            }],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: Vec::new(),
++        });
++        persist_gate_push_outer_suffix(&mut func, 5, 6);
++        func
++    }
++
++    #[test]
++    fn persist_gate_dynamic_init_affine_limit_vetoes_unless_legacy() {
++        let func = persist_gate_dynamic_init_affine_limit();
++        assert!(
++            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "value exit with a dynamic init must veto the outer unroll"
++        );
++        let prev = persist_gate_legacy();
++        set_persist_gate_legacy(true);
++        assert!(
++            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "legacy gate must skip the unrecognized nest, not refuse it"
++        );
++        set_persist_gate_legacy(prev);
++        assert!(
++            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
++            "restored gate must veto again"
++        );
++    }
++
++    #[test]
++    fn e2e_persist_gate_csv_nest_rolled_unless_legacy() {
++        // End-to-end through `unroll_loops`: the csv-shaped nest (const-6
++        // outer, div-driven inner) keeps its outer back-edge under the
++        // fail-closed gate, and unrolls it under the legacy knob — the
++        // committed differential proving this test discriminates the fix.
++        let mut func = persist_gate_div_driven();
++        let n = unroll_loops(&mut func, UnrollPhase::Early);
++        let latch = func.blocks.iter().find(|b| b.label == BlockId(5)).unwrap();
++        assert!(
++            matches!(&latch.terminator, Terminator::Branch(lbl) if *lbl == BlockId(1)),
++            "csv-shaped outer must stay rolled (n={n})"
++        );
++        assert!(
++            matches!(&func.blocks[1].terminator, Terminator::CondBranch { .. }),
++            "csv-shaped outer header must keep its loop exit"
++        );
++
++        let prev = persist_gate_legacy();
++        set_persist_gate_legacy(true);
++        let mut legacy_func = persist_gate_div_driven();
++        let legacy_n = unroll_loops(&mut legacy_func, UnrollPhase::Early);
++        let legacy_latch = legacy_func
++            .blocks
++            .iter()
++            .find(|b| b.label == BlockId(5))
++            .unwrap();
++        assert!(
++            !matches!(&legacy_latch.terminator, Terminator::Branch(lbl) if *lbl == BlockId(1)),
++            "legacy gate must still unroll the csv-shaped outer (n={legacy_n})"
++        );
++        assert!(legacy_n >= 1, "legacy gate must report the unroll");
++        set_persist_gate_legacy(prev);
++    }
++
++    #[test]
++    fn e2e_persist_gate_triangular_cascade_allowed() {
++        // The triangular nest still complete-unrolls outer→inner through
++        // `unroll_loops`: the gate's allow-path end-to-end.
++        let mut func = persist_gate_triangular();
++        let n = unroll_loops(&mut func, UnrollPhase::Early);
++        assert!(n >= 2, "triangular nest must cascade outer+inner (n={n})");
++        let latch = func.blocks.iter().find(|b| b.label == BlockId(5)).unwrap();
++        assert!(
++            !matches!(&latch.terminator, Terminator::Branch(lbl) if *lbl == BlockId(1)),
++            "triangular outer latch must feed the clone chain"
++        );
++        assert!(
++            func.blocks
++                .iter()
++                .any(|b| matches!(b.terminator, Terminator::Return(None))),
++            "triangular exit must still exist and return"
++        );
++    }
++
+     #[test]
+     fn substitution_covers_twenty_five_non_algebraic_use_positions() {
+         let mut instructions = vec![
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 89d8cc70..fcc0287c 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -864,8 +864,10 @@ fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
+ /// + the `CCC_NO_ANDN_FUSION` kill switch.  Single-sourced (audit P2-12)
+ /// so the two bit_idioms invocations — and therefore the fold-time defer
+ /// prediction vs. the emission-time fusion decision — can never drift
+-/// within one compilation.  The env read happens once per invocation of
+-/// the pass runner, not per function.
++/// within one compilation.  `run_passes` snapshots this ONCE at the top and
++/// hands the same value to both bit_idioms invocations (a second resolution
++/// mid-pipeline would re-read the environment and break the snapshot
++/// contract — env reads belong in the runner preamble only).
+ fn scalar_andn_available(target: crate::backend::Target, x86_bmi1: bool) -> bool {
+     target == crate::backend::Target::X86_64
+         && x86_bmi1
+@@ -963,6 +965,8 @@ pub(crate) fn run_passes(
+     // keeps the kill-switch unit test from racing its siblings (see
+     // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
+     loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
++    loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
++    loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
+     // Every remaining pass switch, resolved here for the same reason.  No pass
+     // reads the process environment any more: each of these was an `environ`
+     // scan (and an `OsString` or `String` allocation) PER FUNCTION — eight of
+@@ -993,6 +997,12 @@ pub(crate) fn run_passes(
+     });
+     backedge_pre::set_backedge_pre_env(backedge_pre::EnvConfig::from_env());
+     loop_align::set_tight_loop_mode(loop_align::TightLoopMode::from_env());
++    // Scalar ANDN (BMI1) capability for the bool-mux algebra's CH fold.
++    // Resolved ONCE per compilation: both bit_idioms invocations below
++    // receive this same snapshot, so the fold-time defer prediction can
++    // never observe a different capability value than its sibling (or a
++    // re-read environment variable mid-pipeline).
++    let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
+     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
+     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
+     // ignores this.
+@@ -1879,8 +1889,8 @@ pub(crate) fn run_passes(
+             // Scalar ANDN (BMI1) for the bool-mux algebra's CH fold: the
+             // mux fold must defer to the backend's Not+And -> andn fusion
+             // when the 3-operand form is selectable (emit_and_not_impl).
+-            // See scalar_andn_available for the single-sourced contract.
+-            let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
++            // `has_scalar_andn` is the per-compilation snapshot resolved at
++            // the top of run_passes (same value as the post-ifconv call).
+             let n = timed_pass!(
+                 "bit_idioms",
+                 run_on_visited(module, &dirty, &mut changed, |func| {
+@@ -2061,7 +2071,8 @@ pub(crate) fn run_passes(
+             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+             let max_rotate_bits = target_rotate_bits(target);
+             let min_rotate_bits = target_min_rotate_bits(target);
+-            let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
++            // Same per-compilation `has_scalar_andn` snapshot as the first
++            // bit_idioms call (resolved at the top of run_passes).
+             let n = timed_pass!(
+                 "bit_idioms_post_ifconv",
+                 run_on_visited(module, &dirty, &mut changed, |func| {
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index b579da6e..341f2ebc 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -3851,7 +3851,13 @@ enum ProvenObjectRoot {
+ /// parameter. Loads and arbitrary arithmetic stop the proof. The walk is
+ /// deliberately bounded/cycle-safe because malformed copy cycles must make an
+ /// optimization fail closed, never hang compilation.
++/// Leaf typing and chain following come from `crate::ir::provenance` (shared
++/// with loop_idiom so the two tracers cannot drift): in particular only a
++/// pointer-typed `ParamRef` presents a `Param` root — an integer parameter
++/// converted to a pointer (the frontend erases the conversion) names no
++/// object — and only `Ptr -> Ptr` casts are followed.
+ fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoot> {
++    use crate::ir::provenance::{ChainStep, RootLeaf, chain_step, root_leaf};
+     let mut cur = start;
+     let mut seen = FxHashSet::default();
+     for _ in 0..128 {
+@@ -3864,30 +3870,25 @@ fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoo
+                 .iter()
+                 .find(|inst| inst.dest() == Some(cur))
+         })?;
+-        match defining {
+-            Instruction::GlobalAddr { name, .. } => {
++        match root_leaf(defining) {
++            RootLeaf::Global(name) => {
+                 return Some(ProvenObjectRoot::Global(name.clone()));
              }
-             other => panic!("Expected BinOp (cross-block CSE disabled), got {:?}", other),
+-            Instruction::Alloca { dest, .. } => {
+-                return Some(ProvenObjectRoot::Alloca(dest.0));
++            RootLeaf::Alloca(id) => {
++                return Some(ProvenObjectRoot::Alloca(id));
+             }
+-            Instruction::ParamRef { param_idx, .. } => {
+-                let noalias = func.params.get(*param_idx).is_some_and(|p| p.noalias);
+-                return Some(ProvenObjectRoot::Param {
+-                    index: *param_idx,
+-                    noalias,
+-                });
+-            }
+-            Instruction::GetElementPtr { base, .. } => cur = *base,
+-            Instruction::Copy {
+-                src: Operand::Value(src),
+-                ..
++            RootLeaf::Param(index) => {
++                let noalias = func.params.get(index).is_some_and(|p| p.noalias);
++                return Some(ProvenObjectRoot::Param { index, noalias });
+             }
+-            | Instruction::Cast {
+-                src: Operand::Value(src),
+-                ..
+-            } => cur = *src,
+-            _ => return None,
++            RootLeaf::NotLeaf => {}
++        }
++        match chain_step(defining) {
++            ChainStep::Follow(next) => cur = next,
++            // Loads, arithmetic, phis, calls, integer↔pointer casts: the
++            // proof ends. (No phi/arithmetic following here by design —
++            // this tracer fails closed on both, unlike loop_idiom's.)
++            ChainStep::Stop => return None,
          }
--- 
-2.47.3
-
+     }
+     None
+diff --git a/tests/regression/check_bool_pair_tail_jmp.sh b/tests/regression/check_bool_pair_tail_jmp.sh
+index 87bc29ba..8e2f7120 100755
+--- a/tests/regression/check_bool_pair_tail_jmp.sh
++++ b/tests/regression/check_bool_pair_tail_jmp.sh
+@@ -85,7 +85,11 @@ fi
+ python3 - "$work/chains.s" <<'PYEOF'
+ import re, sys
+ 
+-jcc = re.compile(r"^[ \t]*(j[a-z]{2,3})[ \t]+(\.L\S+)$")
++# Conditional jumps only: 2-letter (jb/jl/je/...) and 3-letter (jae/jge/...)
++# alike — S20's rolled nests emit `jb` where the unrolled shape emitted
++# `jae`, and the old `{2,3}` class was blind to them.  `jmp` is excluded
++# (unconditional; it must never count as a chain edge).
++jcc = re.compile(r"^[ \t]*(?!jmp[ \t])(j[a-z]{1,3})[ \t]+(\.L\S+)$")
+ lbl = re.compile(r"^[ \t]*(\.L\S+):")
+ 
+ lines = open(sys.argv[1]).read().splitlines()
+diff --git a/tests/regression/check_ch_maj_codegen.sh b/tests/regression/check_ch_maj_codegen.sh
+index cec1ea58..b8bb4681 100755
+--- a/tests/regression/check_ch_maj_codegen.sh
++++ b/tests/regression/check_ch_maj_codegen.sh
+@@ -29,13 +29,16 @@ GCCINC=$("$GCC" -print-file-name=include 2>/dev/null)
+ fails=0
+ note() { printf '%s\n' "$*"; }
+ bad()  { note "FAIL: $*"; fails=$((fails+1)); }
++# Correctness gate: a broken reference build must FAIL, not silently skip
++# the differential (explicit opt-out only; CI never sets it).
++ALLOW_GCC_SKIP=${LCCC_ALLOW_GCC_SKIP:-0}
+ 
+ # ── A. runtime differential ─────────────────────────────────────────
+ for MARCH in "" "-mbmi" "-march=x86-64-v3"; do
+   for OPT in -O1 -O2 -O3 -Os; do
+     TAG="$MARCH $OPT"
+     "$GCC" $MARCH $OPT -o "$TMP/g.x" "$SRC" -lm 2>/dev/null \
+-      || { note "skip $TAG (gcc)"; continue; }
++      || { if [ "$ALLOW_GCC_SKIP" = 1 ]; then note "skip $TAG (gcc; LCCC_ALLOW_GCC_SKIP=1)"; else bad "$TAG gcc build failed (no silent skip: set LCCC_ALLOW_GCC_SKIP=1 to opt out)"; fi; continue; }
+     "$CCC" $GCCINC $MARCH $OPT -o "$TMP/l.x" "$SRC" -lm 2>/dev/null \
+       || { bad "$TAG lccc compile"; continue; }
+     G=$("$TMP/g.x"; echo "rc=$?")
+diff --git a/tests/regression/check_findbit_inline.sh b/tests/regression/check_findbit_inline.sh
+index 23dc56c3..e625603c 100755
+--- a/tests/regression/check_findbit_inline.sh
++++ b/tests/regression/check_findbit_inline.sh
+@@ -27,6 +27,9 @@ SRC=$(dirname "$0")/../benchmark/programs/linux_find_bit.c
+ TMP=$(mktemp -d)
+ trap 'rm -rf "$TMP"' EXIT
+ GCC=${GCC_BIN:-gcc}
++# The runtime differential is a correctness check: a broken reference
++# build must FAIL, not silently skip (explicit opt-out only).
++ALLOW_GCC_SKIP=${LCCC_ALLOW_GCC_SKIP:-0}
+ fails=0
+ note() { printf '%s\n' "$*"; }
+ bad()  { note "FAIL: $*"; fails=$((fails+1)); }
+@@ -55,7 +58,11 @@ check_cfg() {
+     G=$("$TMP/g.x"; echo "rc=$?")
+     [ "$G" = "$L" ] || bad "$CFG: runtime differs (gcc=[$G] lccc=[$L])"
+   else
+-    note "skip $CFG runtime differential (no host gcc)"
++    if [ "$ALLOW_GCC_SKIP" = 1 ]; then
++      note "skip $CFG runtime differential (no host gcc; LCCC_ALLOW_GCC_SKIP=1)"
++    else
++      bad "$CFG gcc build failed (no silent skip: set LCCC_ALLOW_GCC_SKIP=1 to opt out)"
++    fi
+   fi
+ }
+ 
+diff --git a/tests/regression/check_ivsr_scalar_derived_default.sh b/tests/regression/check_ivsr_scalar_derived_default.sh
+index 1b0b2ac0..c293083e 100755
+--- a/tests/regression/check_ivsr_scalar_derived_default.sh
++++ b/tests/regression/check_ivsr_scalar_derived_default.sh
+@@ -22,6 +22,11 @@
+ #      flipped on (the measured regression is back) or the machinery
+ #      died (the knob is a no-op nobody noticed rotting).
+ set -u
++# GCC availability: this is a CORRECTNESS gate (differentials A/B), so a
++# missing/broken reference compiler must FAIL, not silently skip both
++# comparisons. Set LCCC_ALLOW_GCC_SKIP=1 only for exotic environments
++# without any GCC (explicit opt-out, uniform across regression gates;
++# CI never sets it).
+ CCC=${CCC:-target/fastbuild/lccc}
+ RB=$(dirname "$0")/../benchmark/programs/linux_rbtree.c
+ TMP=$(mktemp -d)
+@@ -43,12 +48,15 @@ for MODE in default optin; do
+     TAG="opt-in (CCC_IVSR_SCALAR_DERIVED=1)"
+   fi
+   "$GCC" -O2 -o "$TMP/g_$MODE.x" "$RB" 2>/dev/null \
+-    || { note "skip $TAG (gcc build)"; continue; }
++    || { if [ "$ALLOW_GCC_SKIP" = 1 ]; then note "skip $TAG (gcc build; LCCC_ALLOW_GCC_SKIP=1)"; continue; else bad "$TAG gcc build failed (no silent skip: set LCCC_ALLOW_GCC_SKIP=1 to opt out)"; continue; fi; }
+   if [ -n "$ENVBIN" ]; then
+     env $ENVBIN "$CCC" $GCCINC -O2 -o "$TMP/l_$MODE.x" "$RB" 2>/dev/null \
+       || { bad "$TAG lccc compile"; continue; }
+   else
+-    "$CCC" $GCCINC -O2 -o "$TMP/l_$MODE.x" "$RB" 2>/dev/null \
++    # The default arm MUST force the default: an inherited exported
++    # CCC_IVSR_SCALAR_DERIVED would otherwise make this "default" build
++    # secretly opt-in (and the C pin below would compare opt-in vs opt-in).
++    env -u CCC_IVSR_SCALAR_DERIVED "$CCC" $GCCINC -O2 -o "$TMP/l_$MODE.x" "$RB" 2>/dev/null \
+       || { bad "$TAG lccc compile"; continue; }
+   fi
+   G=$("$TMP/g_$MODE.x"; echo "rc=$?")
+@@ -58,7 +66,9 @@ done
+ note "A/B. runtime differentials done (fails so far: $fails)"
+ 
+ # ── C. the default pin: knob unset vs set must DIFFER in asm ─────────
+-"$CCC" $GCCINC -O2 -S "$RB" -o "$TMP/def.s" 2>/dev/null \
++# (default arm forces the knob unset — see above — so ambient exports
++# cannot make this compare opt-in against itself).
++env -u CCC_IVSR_SCALAR_DERIVED "$CCC" $GCCINC -O2 -S "$RB" -o "$TMP/def.s" 2>/dev/null \
+   || bad "default -S compile"
+ env CCC_IVSR_SCALAR_DERIVED=1 "$CCC" $GCCINC -O2 -S "$RB" -o "$TMP/opt.s" 2>/dev/null \
+   || bad "opt-in -S compile"
+diff --git a/tests/regression/check_provenance_int_param.sh b/tests/regression/check_provenance_int_param.sh
+new file mode 100755
+index 00000000..7a7635c2
+--- /dev/null
++++ b/tests/regression/check_provenance_int_param.sh
+@@ -0,0 +1,130 @@
++#!/usr/bin/env bash
++# Integer-parameter provenance: laundered pointers must not present Param roots.
++#
++# WHY THIS EXISTS
++#
++# The frontend erases integer<->pointer conversions (`emit_implicit_cast`
++# returns the source operand unchanged when either side is Ptr), so
++# `(char *)raw` for an integer `raw` lowers to a GEP *directly on*
++# `ParamRef { ty: U64 }` — no Cast marks the laundering. The B3 freshness
++# rule (param-vs-alloca disjoint) briefly trusted every ParamRef, and the
++# vectorizer emitted an UNGUARDED vector copy for
++# `buf[i] = ((char *)raw)[i]` (negative-verified: the pre-fix tree emits the
++# ymm loop with no overlap check for h64 below). The shared
++# `src/ir/provenance.rs` leaf typing closes it: only pointer-typed ParamRefs
++# root, so the laundered copy keeps its runtime guard (or memmove/scalar).
++#
++# This gate pins BOTH directions so the fix cannot be "achieved" by
++# disabling the optimization:
++#   h64 (integer param laundered to pointer): vector loop AND guard present.
++#   g64 (genuine pointer param): vector loop present, NO guard (B3 intact).
++# plus runtime bit-exactness vs the oracle on a benign in-bounds input.
++#
++# Usage:
++#   tests/regression/check_provenance_int_param.sh
++# Environment:
++#   LCCC            compiler to test (default: target/fastbuild/lccc)
++#   CCC_ORACLE_CC   reference compiler (default: cc, gcc or clang)
++set -uo pipefail
++
++repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++cd "$repo_root"
++
++LCCC=${LCCC:-target/fastbuild/lccc}
++[[ "$LCCC" == /* ]] || LCCC="$repo_root/$LCCC"
++[[ -x "$LCCC" ]] || { echo "FAIL: no compiler at $LCCC" >&2; exit 1; }
++ORACLE=${CCC_ORACLE_CC:-}
++if [[ -z "$ORACLE" ]]; then
++    for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { ORACLE=$c; break; }; done
++fi
++[[ -n "$ORACLE" ]] || { echo "FAIL: no reference compiler found" >&2; exit 1; }
++
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++pass=0; fail=0; skip=0
++ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
++bad()  { fail=$((fail+1)); printf 'FAIL %s\n' "$*"; }
++
++cat > "$work/prov.c" <<'EOF_C'
++typedef unsigned long u64;
++static char sink[64];
++static char input[64];
++// Laundered: integer param converted to a pointer. The integer names no
++// object, so the copy may overlap the alloca and must stay guarded.
++void h64(u64 raw) {
++    char buf[64];
++    for (int i = 0; i < 64; i++) buf[i] = ((char *)raw)[i];
++    for (int i = 0; i < 64; i++) sink[i] = buf[i];
++}
++// Genuine: pointer param vs local alloca. Provably disjoint (B3 freshness),
++// so the copy must vectorize WITHOUT a guard.
++void g64(char *src) {
++    char buf[64];
++    for (int i = 0; i < 64; i++) buf[i] = src[i];
++    for (int i = 0; i < 64; i++) sink[i] = buf[i];
++}
++#ifndef NO_MAIN
++#include <stdio.h>
++int main(void) {
++    for (int i = 0; i < 64; i++) input[i] = (char)(i * 3 + 1);
++    h64((u64)input);
++    unsigned c = 0;
++    for (int i = 0; i < 64; i++) c = c * 33 + (unsigned char)sink[i];
++    printf("h64 %08x\n", c);
++    g64(input);
++    c = 0;
++    for (int i = 0; i < 64; i++) c = c * 33 + (unsigned char)sink[i];
++    printf("g64 %08x\n", c);
++    return 0;
++}
++#endif
++EOF_C
++
++"$LCCC" -O2 -march=x86-64-v3 -DNO_MAIN -S -o "$work/prov.s" "$work/prov.c" 2>/dev/null \
++    || { bad "lccc could not compile prov.c"; echo; echo "provenance-int-param gate: PASS=$pass FAIL=$fail SKIP=$skip"; exit 1; }
++
++read -r h_vec h_guard g_vec g_guard < <(python3 - "$work/prov.s" <<'EOF_PY'
++import re, sys
++txt = open(sys.argv[1]).read()
++def body(fn):
++    m = re.search(rf'^{fn}:\n(.*?)^\s*\.size\s+{fn}\b', txt, re.S | re.M)
++    return m.group(1) if m else ""
++out = []
++for fn in ("h64", "g64"):
++    b = body(fn)
++    vec = len(re.findall(r'^\s*v\w+\s+.*%ymm', b, re.M))
++    guard = len(re.findall(r'^\s*(?:jb|jae)\s+\.L', b, re.M))
++    out.extend((vec, guard))
++print(*out)
++EOF_PY
++)
++if [[ "$h_vec" -ge 1 && "$h_guard" -ge 1 ]]; then
++    ok "h64 laundered copy vectorizes guarded ($h_vec ymm memops, $h_guard guard jumps)"
++else
++    bad "h64 laundered copy must keep vector loop + guard (ymm=$h_vec guards=$h_guard)"
++fi
++if [[ "$g_vec" -ge 1 && "$g_guard" -eq 0 ]]; then
++    ok "g64 genuine copy vectorizes unguarded ($g_vec ymm memops, B3 intact)"
++else
++    bad "g64 genuine copy must vectorize guard-free (ymm=$g_vec guards=$g_guard)"
++fi
++
++if "$ORACLE" -O2 -march=x86-64-v3 -o "$work/prov.oracle" "$work/prov.c" 2>/dev/null; then
++    "$LCCC" -O2 -march=x86-64-v3 -o "$work/prov.lccc" "$work/prov.c" 2>/dev/null \
++        || { bad "lccc could not link prov.c"; }
++    "$work/prov.oracle" > "$work/o.txt" 2>&1
++    "$work/prov.lccc" > "$work/l.txt" 2>&1
++    if diff -q "$work/l.txt" "$work/o.txt" >/dev/null; then
++        ok "runtime bit-exact vs $ORACLE on benign in-bounds input"
++    else
++        bad "runtime output differs from $ORACLE"
++    fi
++else
++    bad "reference compiler could not build prov.c"
++fi
++
++echo
++echo "provenance-int-param gate: PASS=$pass FAIL=$fail SKIP=$skip"
++[[ "$fail" -eq 0 ]] || exit 1
++exit 0
+diff --git a/tests/regression/check_vector_copy_elimination.sh b/tests/regression/check_vector_copy_elimination.sh
+index df5491f4..2bb1b8aa 100644
+--- a/tests/regression/check_vector_copy_elimination.sh
++++ b/tests/regression/check_vector_copy_elimination.sh
+@@ -67,6 +67,11 @@ note() { printf '  %s\n' "$*"; }
+ ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
+ bad()  { fail=$((fail+1)); printf 'FAIL %s\n' "$*"; }
+ skipped() { skip=$((skip+1)); printf 'skip %s\n' "$*"; }
++# Runtime differentials are correctness checks: a missing/broken reference
++# compiler must FAIL, not silently skip (explicit opt-out only, uniform
++# across regression gates; CI never sets it).
++ALLOW_GCC_SKIP=${LCCC_ALLOW_GCC_SKIP:-0}
++gcc_skip() { if [[ "$ALLOW_GCC_SKIP" = 1 ]]; then skipped "$1"; else bad "$1 (no silent skip: set LCCC_ALLOW_GCC_SKIP=1 to opt out)"; fi; }
+ 
+ # The instruction lines of one function body, `ret` included, with labels,
+ # directives, comments and blanks dropped.  [[:space:]] and not \s: GCC indents
+@@ -194,7 +199,7 @@ fi
+ 
+ # ── B. runtime equality with GCC over kernels built for the legality rules ────
+ if [[ -z "$ORACLE" ]]; then
+-    skipped "no reference compiler for the runtime differential (set CCC_ORACLE_CC)"
++    gcc_skip "no reference compiler for the runtime differential (set CCC_ORACLE_CC)"
+ else
+     cat > "$work/runtime.c" <<'EOF'
+     /* Every function here is shaped to hit one legality rule of the vector copy
+@@ -373,7 +378,7 @@ EOF
+     if [[ $lccc_rc -ne 0 ]]; then
+         bad "runtime.c did not compile with lccc:"; head -5 "$work/lccc.err" | note
+     elif [[ $oracle_rc -ne 0 ]]; then
+-        skipped "reference compiler could not build runtime.c"
++        gcc_skip "reference compiler could not build runtime.c"
+     else
+         "$work/runtime.lccc" > "$work/out.lccc" 2>&1; rc_l=$?
+         "$work/runtime.oracle" > "$work/out.oracle" 2>&1; rc_o=$?
+@@ -615,7 +620,7 @@ EOF_ALGEBRA
+     if [[ $lccc_rc -ne 0 ]]; then
+         bad "fma_algebra.c did not compile with lccc:"; head -5 "$work/fa.err" | note
+     elif [[ $oracle_rc -ne 0 ]]; then
+-        skipped "reference compiler could not build fma_algebra.c"
++        gcc_skip "reference compiler could not build fma_algebra.c"
+     else
+         "$work/fma_algebra.lccc" > "$work/fa.lccc" 2>&1; rc_l=$?
+         "$work/fma_algebra.oracle" > "$work/fa.oracle" 2>&1; rc_o=$?
+@@ -1008,7 +1013,7 @@ EOF_NEGATE
+             bad "negate lowering: $n_xor xor sites, $n_gpr GPR round trips (expected exactly 17 and 0 — a fold retired a negation without advancing the pin, or the lowering regressed)"
+         fi
+     else
+-        skipped "reference compiler could not build negate.c"
++        gcc_skip "reference compiler could not build negate.c"
+     fi
+ 
+     # AVX-512: the fp liveness oracle treats a writemask destination as a
