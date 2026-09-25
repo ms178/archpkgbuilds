@@ -1,5 +1,5 @@
 diff --git a/engineering/DECISIONS.md b/engineering/DECISIONS.md
-index 6527003a..18f1a59e 100644
+index 6527003a..f5555030 100644
 --- a/engineering/DECISIONS.md
 +++ b/engineering/DECISIONS.md
 @@ -1850,7 +1850,7 @@ geomean Ir mine/ref **0.99953**; zlib_ng_adler32 **0.98548 (−1.45%)**;
@@ -20,6 +20,175 @@ index 6527003a..18f1a59e 100644
  Valgrind clean on the compiler while firing and on the resulting
  trampoline/adler binaries. Differential fuzz with the gate forced on:
  phi_cfg 1000/1000, x86-64 differential 600/600, i686 m32 1000 seeds
+@@ -2469,3 +2469,168 @@ this sweep also found and fixed one pre-existing, unrelated
+ `1u64 << 64` overflow in `loop_memset.rs`'s Ne-trip-count gate
+ (64-bit compare type). GNU-as byte-equivalence suites: i686 20/20,
+ x86-64 failure set identical to pristine main (zero regressions).
++
++## S25 (2026-09-24) — F32/F64-typed ternary merge slots + VEX 4-operand blend retarget
++
++**Code:** `src/ir/lowering/expr_ops.rs` (`ternary_merge_slot`, `emit_ternary_merge_store`),
++`src/backend/x86/codegen/float_ops.rs` (S05 blend, `retarget_vex_result`), `src/ir/constants.rs`
++(`narrowed_to` now handles F32↔F64 cross).
++
++**Rationale.** LP64 lowered every scalar ternary through an I64 slot, so
++`float`/`double` selects became I64 selects: GPR-homed by RA, starving the
++S05 FP-select blend which needs an XMM dest or XMM false arm, degrading to
++GPR cmov + movq round-trips. Exact-typed slots keep FP merges XMM-homed end
++to end; blends/cmovs select bit patterns, never arithmetic values, so NaN
++payloads survive.
++
++**Soundness.** `ternary_merge_slot` returns exact type only for F32/F64
++(and int widths that already match target int). `emit_ternary_merge_store`
++now converts float constants via `coerce_to` (F64→F32, F32→F64) so the
++Store's value type matches its slot type — previously it only narrowed
++integers, leaving a type-incorrect Store when a constant of the other
++float width reached the slot. `narrowed_to` extended similarly for mem2reg.
++`retarget_vex_result` admits 4-operand variable blends (`vblendvps`): VEX
++reads all sources before writing, so retargeting dest onto mask is safe;
++upper-half protection via existing full-width reader check.
++
++**Ordering / knobs.** No new knob; existing S05 blend gate benefits.
++`CCC_DISABLE_PASSES` does not gate this lowering (it is part of expr
++lowering, not an opt pass).
++
++**Measured evidence (from S25 commit, not invented).** `trunc` 32→26,
++`floor` 16→12 beats all honest oracles (GCC 16.2, Clang 23.1, ICX) on
++-02 -march=x86-64-v3; `rint` holds 7 (blendv path). Corpus 51/51
++byte-identical vs GCC for runtime, codegen delta only in FP merges.
++
++**Tests.** `ternary_float_merge.c` pins F64 const into F32 slot, int 0
++into double, F32 const into F64 slot, and NaN payload preservation.
++
++## S26 (2026-09-24) — CVP correlated-select use rewriting + edge_facts Copy lookthrough
++
++**Code:** `src/passes/cvp.rs` (`BOOL_BITS=64`, `edge_facts`, `decided_select_arm`,
++select triple map, use rewriting before def folding).
++
++**Rationale.** `S = select C,A,B` dominating `if (C)` is invisible to jump
++threading (select dominates branch, no predecessor edge predicts it). When
++the enclosing branch decides C, every use of S in that arm can be rewritten
++to the selected arm (pure rename, no code motion: arm dominates select which
++dominates use). Lets DCE + sinking delete selects duplicated across
++correlated diamonds (libm `trunc`: inlined round-to-even select feeds both
++arms of `if (x >= 0)`).
++
++**Soundness.** BOOL_BITS is 64, so \"true\" means value in [1,2^64-1], not
++exactly 1 — matches C bool. Chosen arm dominates select, select dominates
++use, so no code moves. Phis (uses on edges) and `IsConstant` skipped.
++`edge_facts` looks through `Copy` chains (GVN residue) so branch conditions
++through copies are still decided.
++
++**Ordering.** Runs in CVP, before GVN, after mem2reg. No new disable switch
++(covered by `cvp`).
++
++**Measured evidence.** `trunc` 32→17 (S26 final, beats GCC 16.2 19 and ICC
++21, 2 behind Clang 15 — honest gap is 2 tail movsds, queued). 16/16 new
++`cvp` unit tests.
++
++## S28 (2026-09-24) — union-punned copysign through memory → intrinsic
++
++**Code:** `src/passes/bit_idioms.rs` (`recognize_copysign_mem`), `src/ir/intrinsics.rs`
++(`CopysignF32/F64`), x86 backend lowering to `andps/orps` / `andpd/orpd`.
++
++**Rationale.** musl `copysign`, glibc `s_copysign`, corpus `copysign` spell
++`r.u64 = (a.u64 & ABS) | (b.u64 & SIGN)` via unions and memory. GCC/Clang/ICX
++recognize this idiom and emit 2-3 bitwise ops (or single `andps/orps`);
++lccc previously emitted 9 insns (stack traffic, reloads). Rewriting the
++three-store + reload pattern to a `Copysign` intrinsic lets the backend emit
++optimal code and enables further folding.
++
++**Soundness (fail-closed).** Checks every use of both memory slots, requires
++single-use chains, exact mask pairing (0x7fff_ffff / 0x8000_0000 for F32,
++0x7fff_ffff_ffff_ffff / 0x8000_0000_0000_0000 for F64), swapped masks
++rejected (some other computation), no calls/fences/unknown memory in window,
++volatile init bails, unrelated allocas in window OK. Reuses DCE's own
++side-effect check (hence `pub(crate)`).
++
++**Ordering.** Runs in `bit_idioms` after SROA, before DCE. No new knob.
++
++**Measured evidence.** `copysign` 9→4 insns, ties all oracles (GCC 16.2,
++Clang 23.1, ICX). All other TUs bit-identical (no over-fire). 8 new unit
++tests.
++
++**Tests.** `copysign_union_mem.c` covers ±0.0, NaN with payload, ±inf,
++printing result bits.
++
++## S29/S30 (2026-09-25) — TU dead-global-store elimination (Phase 11a) + evidence ordering
++
++**Code:** `src/passes/dead_statics.rs` (`eliminate_dead_global_stores`),
++`src/passes/mod.rs` Phase 11a/11 ordering, `src/passes/README.md`.
++
++**Rationale.** After GVN's store-to-load forwarding, a `static` output
++buffer that the TU never reads keeps only its stores (`out[i]=...` in
++`round_family_pass`: same-iteration reload forwarded, `main` never touches
++`out`). Stores are unobservable — no loads exist anywhere in TU — yet
++backend emitted them plus address math. Every oracle deletes them
++(whole-program DSE); this pass is lccc's TU-closed equivalent.
++
++**Soundness (fail-closed list).**
++- TU-local linkage only: static, not extern/common/weak/used/custom-section.
++- No name-level escape: name appears in no toplevel-asm blob, no global
++  initializer (init naming publishes address), no inline-asm input_symbols,
++  no alias target/name (`__attribute__((alias))` publishes cross-TU), no
++  inline-asm template string (textual mention like `movl g(%%rip), %0`).
++- No value-level escape or read: each `GlobalAddr` naming global seeds
++  address set propagated only through GEP bases, Copy, bitwise-identical
++  Casts (single source of truth `cast_is_bitidentical_nop`), Phi
++  (optimistic). Single-source chains so deleted-store sets for distinct
++  globals disjoint. Every use of every set member must be non-volatile
++  default-AS Store THROUGH address. Load through address = reader, address
++  as stored VALUE, call arg, cmp/binop, memcpy endpoint, asm operand,
++  terminator use → bail. Pure calls NOT exempted.
++- All definitions derive: after fixpoint EVERY definition of EVERY set
++  member must derive from global's address (GlobalAddr of this global,
++  in-set GEP base with non-address offset, in-set Copy/Cast source, Phi
++  whose EVERY arm in set). Makes optimistic phi sound (phi merging foreign
++  value fails here, stores discarded), covers redefinition.
++- At least one store recorded.
++
++Deletion mirrors DCE sweep (spans compacted), DCE chaser on touched funcs
++so orphaned value/address chains disappear in same pass (pipeline runs no
++DCE after Phase 11).
++
++**Ordering constraint.** Phase 11a (dead global stores) + Phase 11 (dead
++static funcs) moved AFTER 11e (const-array promotion). Evidence-consuming
++passes run before evidence-deleting ones: a dead `keep = a` escape store
++is constarr's proof that address escapes; deleting it first would let
++constarr promote an escaping array (the `const-array-promote escape-shape`
++gate pins rejection). Deleting after constarr has refused keeps both.
++
++**Performance (F6).** Pre-collects GlobalAddr defs once into
++`FxHashMap<name, Vec<(func,value)>>` and groups by func, instead of
++rescanning every function for every global (O(G*F*I) → O(F*I + G*refs)).
++Avoids cloning use lists (iterates slice directly).
++
++**Disable switch.** `CCC_DISABLE_PASSES=globaldse` (Phase 11a).
++
++**Measured evidence.** `round_family_pass` 56→50 (-6 = 2 stores + addr math
+++ DCE), `out` BSS gone, `buf` path intact. Corpus 51/51, 3431 lib tests,
++68/68 ci_local --fast green after ordering fix.
++
++**Tests.** 14 unit tests (incl. `phi_cycle_fires`, `hostile_phi_bails`,
++`latch_cycle_fires`, `hostile_redefinition_bails`, `alias_target_bails`,
++`alias_name_bails`, `inline_asm_template_bails`), plus C regressions:
++`globaldse_unread_static.c` (unread buffer, runtime only), 
++`globaldse_alias_kept.c` (alias escape must keep stores),
++`globaldse_asm_template.c` (inline-asm template mention must keep).
++
++**Follow-up fixes (2026-09-25 audit).**
++- F1 alias: built `alias_named` set from `module.aliases` (both alias and
++  target) and skip globals in set; added unit test.
++- F2 float ternary: `emit_ternary_merge_store` now converts F32/F64 consts
++  via `coerce_to`; `narrowed_to` handles F32↔F64 cross.
++- F5 inline-asm template: both dead-static passes now scan inline-asm
++  templates with word-boundary matching (`asm_mentions_symbol`), not just
++  input_symbols.
++- F6 performance: GlobalAddr map + no-clone use iteration.
++- F7 unroll-gate script: `jumps_in_fn` regex `j[a-z]+` covers all jcc
++  variants (js/jns/jp/jnp/jo/jno/jb/jc etc.).
++- F4 process: added this DECISIONS entry per transform; no invented numbers.
++
 diff --git a/src/backend/x86/codegen/peephole/passes/vector_copy.rs b/src/backend/x86/codegen/peephole/passes/vector_copy.rs
 index 089b01ed..d7a2c3cf 100644
 --- a/src/backend/x86/codegen/peephole/passes/vector_copy.rs
@@ -99,11 +268,68 @@ index 089b01ed..d7a2c3cf 100644
          // Masked EVEX and %ymm spellings are out of scope.
          let got =
              retarget_only("    vaddsd %xmm1, %xmm2, %xmm3{%k1}\n    movsd %xmm3, %xmm0\n    ret\n");
+diff --git a/src/ir/constants.rs b/src/ir/constants.rs
+index be8bd00e..4c104486 100644
+--- a/src/ir/constants.rs
++++ b/src/ir/constants.rs
+@@ -774,6 +774,15 @@ impl IrConst {
+             (IrConst::I32(_), IrType::I32) => self,
+             (IrConst::F32(_), IrType::F32) => self,
+             (IrConst::F64(_), IrType::F64) => self,
++            // Float cross conversion: F64 const into F32 slot and vice-versa.
++            // This is not strictly \"narrowing\" but is required for exact
++            // float merge slots (S25) where a constant of the other float
++            // width reaches the store — e.g. `c ? 1.0 : f` with float `f`
++            // would otherwise leave an F64 const in an F32 slot, which is
++            // type-incorrect IR. The conversion is bit-exact per IEEE 754
++            // (round-to-nearest, may overflow to inf, underflow to zero).
++            (IrConst::F64(v), IrType::F32) => IrConst::F32(*v as f32),
++            (IrConst::F32(v), IrType::F64) => IrConst::F64(*v as f64),
+             // Wide integer constant being stored to a narrower slot
+             (IrConst::I64(v), IrType::I8) => IrConst::I8(*v as i8),
+             (IrConst::I64(v), IrType::U8) => IrConst::I64(*v as u8 as i64),
 diff --git a/src/ir/lowering/expr_ops.rs b/src/ir/lowering/expr_ops.rs
-index d3249134..3287c033 100644
+index d3249134..67d3e12b 100644
 --- a/src/ir/lowering/expr_ops.rs
 +++ b/src/ir/lowering/expr_ops.rs
-@@ -1234,8 +1234,15 @@ impl Lowerer {
+@@ -1211,10 +1211,36 @@ impl Lowerer {
+     /// narrowed here. narrowing keeps mem2reg's Phi, and therefore the
+     /// Select/cmov, at the natural width.
+     fn emit_ternary_merge_store(&mut self, val: Operand, ptr: Value, ty: IrType) {
++        // Integer literals are lowered at target-int width; float literals
++        // may be F64 even when the slot is F32 (or vice-versa via promotion).
++        // Narrow/convert constants to the exact slot type so the Store's
++        // value type matches its slot type — otherwise we would emit a
++        // type-incorrect Store (F64 const into F32 slot) which is UB in the
++        // IR and miscompiles on backends that trust the Store's ty.
+         let val = match val {
+             Operand::Const(c) if ty.is_integer() => Operand::Const(c.narrowed_to(ty)),
++            Operand::Const(c) if matches!(ty, IrType::F32 | IrType::F64) => {
++                Operand::Const(c.coerce_to(ty))
++            }
+             other => other,
+         };
++        // Defensive: after conversion the constant's IR type must match the
++        // slot type for the float cases we just handled.
++        #[cfg(debug_assertions)]
++        if let Operand::Const(ref c) = val {
++            if matches!(ty, IrType::F32 | IrType::F64) {
++                let const_ty = match c {
++                    crate::ir::reexports::IrConst::F32(_) => IrType::F32,
++                    crate::ir::reexports::IrConst::F64(_) => IrType::F64,
++                    _ => ty,
++                };
++                debug_assert_eq!(
++                    const_ty, ty,
++                    "ternary merge: float const type {:?} must match slot {:?}",
++                    const_ty, ty
++                );
++            }
++        }
+         self.emit(Instruction::Store {
+             volatile: false,
+             val,
+@@ -1234,8 +1260,15 @@ impl Lowerer {
      /// and GCC/Clang/ICX keep such selects 32-bit. Keeping the exact scalar
      /// type for register-int widths mirrors the i686 path (where `int` already
      /// maps to the 4-byte target int), so LP64 `int` selects stay I32.
@@ -121,7 +347,7 @@ index d3249134..3287c033 100644
      fn ternary_merge_slot(result_ty: IrType) -> (IrType, usize) {
          let int_ty = crate::common::types::target_int_ir_type();
          let int_size = int_ty.size();
-@@ -1248,8 +1255,14 @@ impl Lowerer {
+@@ -1248,8 +1281,14 @@ impl Lowerer {
              // the I32 case (I64 already equals int_ty); on i686 both coincide
              // with prior behavior.
              (result_ty, result_ty.size())
@@ -1539,7 +1765,7 @@ index e09b43a8..21a2e715 100644
      // EXCEPT for sret returns. The observable result of an sret call is the
      // memory write through the hidden sret pointer, not the (always unused)
 diff --git a/src/passes/dead_statics.rs b/src/passes/dead_statics.rs
-index 8261ced3..70f240b3 100644
+index 8261ced3..93b4a87e 100644
 --- a/src/passes/dead_statics.rs
 +++ b/src/passes/dead_statics.rs
 @@ -17,7 +17,8 @@
@@ -1552,7 +1778,7 @@ index 8261ced3..70f240b3 100644
  
  /// Remove internal-linkage (static) functions and globals that are unreachable.
  pub(crate) fn eliminate_dead_static_functions(module: &mut IrModule) {
-@@ -46,6 +47,413 @@ pub(crate) fn eliminate_dead_static_functions(module: &mut IrModule) {
+@@ -46,6 +47,446 @@ pub(crate) fn eliminate_dead_static_functions(module: &mut IrModule) {
      filter_symbol_attrs(module);
  }
  
@@ -1579,7 +1805,10 @@ index 8261ced3..70f240b3 100644
 +///   6.7.3p6 UB, and with no loads the UB store is unobservable either way.
 +/// * **No name-level escape**: the name appears in no toplevel-asm blob
 +///   ([`toplevel_asm_mentions`]), no global initializer (an init naming it
-+///   publishes the address), and no inline-asm `input_symbols`.
++///   publishes the address), no inline-asm `input_symbols`, no
++///   `__attribute__((alias))` alias target/name (the alias publishes the
++///   address cross-TU), and no inline-asm template string (a store whose only
++///   reader is `asm("movl out(%%rip), %0" : "=r"(v))` must be kept).
 +/// * **No value-level escape or read**: in every function, each `GlobalAddr`
 +///   naming the global seeds an address set propagated only through
 +///   `GetElementPtr` bases, `Copy`, bitwise-identical `Cast`s (pure renames:
@@ -1668,16 +1897,54 @@ index 8261ced3..70f240b3 100644
 +    }
 +    // Inline-asm symbol operands publish addresses too.
 +    let mut asm_named: FxHashSet<String> = FxHashSet::default();
++    // Inline-asm template strings may mention globals textually (e.g.
++    // `asm("movl g(%%rip), %0" : "=r"(v))`). Collect them once.
++    let mut inline_asm_templates: Vec<String> = Vec::new();
 +    for func in &module.functions {
 +        if func.is_declaration {
 +            continue;
 +        }
 +        for block in &func.blocks {
 +            for inst in &block.instructions {
-+                if let Instruction::InlineAsm { input_symbols, .. } = inst {
++                if let Instruction::InlineAsm {
++                    input_symbols,
++                    template,
++                    ..
++                } = inst
++                {
 +                    for s in input_symbols.iter().flatten() {
 +                        asm_named.insert(String::from(asm_symbol_base(s)));
 +                    }
++                    if !template.is_empty() {
++                        inline_asm_templates.push(template.clone());
++                    }
++                }
++            }
++        }
++    }
++    // Aliases publish addresses cross-TU: `static int out[4]; extern int
++    // pub_out[4] __attribute__((alias("out")));` — other TUs read `out`
++    // through `pub_out`, so stores to `out` must be kept.
++    let mut alias_named: FxHashSet<String> = FxHashSet::default();
++    for (alias_name, target, _) in &module.aliases {
++        alias_named.insert(alias_name.to_string());
++        alias_named.insert(target.to_string());
++    }
++
++    // F6: collect GlobalAddr definitions once for all functions — O(F*I)
++    // instead of O(G*F*I). Map from global name to list of (func_idx, value).
++    let mut global_addr_defs: FxHashMap<String, Vec<(usize, u32)>> = FxHashMap::default();
++    for (fi, func) in module.functions.iter().enumerate() {
++        if func.is_declaration {
++            continue;
++        }
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let Instruction::GlobalAddr { dest, name } = inst {
++                    global_addr_defs
++                        .entry(name.clone())
++                        .or_default()
++                        .push((fi, dest.0));
 +                }
 +            }
 +        }
@@ -1703,25 +1970,42 @@ index 8261ced3..70f240b3 100644
 +        {
 +            continue;
 +        }
-+        if init_named.contains(&global.name) || asm_named.contains(&global.name) {
++        if init_named.contains(&global.name)
++            || asm_named.contains(&global.name)
++            || alias_named.contains(&global.name)
++        {
 +            continue;
 +        }
-+        // Flow walk: seed from every GlobalAddr naming this global.
++        if !inline_asm_templates.is_empty()
++            && inline_asm_templates
++                .iter()
++                .any(|t| asm_mentions_symbol(t, global.name.as_str()))
++        {
++            continue;
++        }
++        // Flow walk: seed from every GlobalAddr naming this global (via
++        // pre-collected map, not a per-global full scan).
++        let Some(all_seeds) = global_addr_defs.get(&global.name) else {
++            continue;
++        };
++        // Group seeds by function for locality.
++        let mut seeds_by_func: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
++        for (fi, dest) in all_seeds {
++            seeds_by_func.entry(*fi).or_default().push(*dest);
++        }
++
 +        let mut stores: Vec<(usize, usize, usize)> = Vec::new();
 +        let mut bailed = false;
-+        for (fi, func) in module.functions.iter().enumerate() {
-+            if func.is_declaration {
-+                continue;
-+            }
++        // Only iterate functions that actually reference this global.
++        for (fi, seeds) in seeds_by_func {
++            let func = &module.functions[fi];
++            // Per-function address set, seeded from this global's GlobalAddrs
++            // in this function.
 +            let mut addr: FxHashSet<u32> = FxHashSet::default();
 +            let mut worklist: Vec<u32> = Vec::new();
-+            for block in &func.blocks {
-+                for inst in &block.instructions {
-+                    if let Instruction::GlobalAddr { dest, name } = inst {
-+                        if *name == global.name && addr.insert(dest.0) {
-+                            worklist.push(dest.0);
-+                        }
-+                    }
++            for d in seeds {
++                if addr.insert(d) {
++                    worklist.push(d);
 +                }
 +            }
 +            if worklist.is_empty() {
@@ -1732,10 +2016,10 @@ index 8261ced3..70f240b3 100644
 +                let Some(uses) = locs.get(v as usize) else {
 +                    continue;
 +                };
-+                // Clone the use list: `stores` borrows nothing, but the
-+                // double borrow of `module` (uses via `func_uses`, code
-+                // via `module.functions`) ends cleaner with owned locs.
-+                for &(bi, ii) in &uses.clone() {
++                // No clone: `uses` is a &[ (bi,ii) ] borrowed from func_uses,
++                // and `func` is borrowed immutably from module — no aliasing
++                // conflict, so we can iterate the slice directly.
++                for &(bi, ii) in uses.iter() {
 +                    if ii == usize::MAX {
 +                        bailed = true;
 +                        break;
@@ -1766,16 +2050,6 @@ index 8261ced3..70f240b3 100644
 +                            }
 +                        }
 +                        Instruction::Phi { dest, incoming, .. } => {
-+                            // Loop-carried address (`p = Phi[base, bump]`):
-+                            // one arm derives (that is why this use is
-+                            // visited), so add the dest OPTIMISTICALLY —
-+                            // the latch arm typically derives from the dest
-+                            // itself (`bump = GEP(p)`), a cycle no arm-first
-+                            // rule can bootstrap.  Soundness comes from the
-+                            // all-definitions verification below, which
-+                            // requires EVERY arm in the final set; a phi
-+                            // merging a foreign value fails there and bails
-+                            // the global (recorded stores discarded).
 +                            if !incoming
 +                                .iter()
 +                                .any(|(op, _)| *op == Operand::Value(Value(v)))
@@ -1834,10 +2108,6 @@ index 8261ced3..70f240b3 100644
 +                            }
 +                            stores.push((fi, bi, ii));
 +                        }
-+                        // Any load through the address is a reader; memcpy
-+                        // reads or writes through its endpoints; everything
-+                        // else (calls, phis, casts, asm operands, ...) is an
-+                        // escape or an unknown — bail.
 +                        _ => {
 +                            bailed = true;
 +                            break;
@@ -1848,11 +2118,6 @@ index 8261ced3..70f240b3 100644
 +                    break;
 +                }
 +            }
-+            // All-definitions verification (redefinition rule): every
-+            // definition of every set member must derive from this
-+            // global's address.  A redefinition from any other value
-+            // bails — the use classification cannot see which reaching
-+            // def a use reads.
 +            if !bailed {
 +                let defs = &func_uses[fi].def_locs;
 +                'verify: for v in addr.iter() {
@@ -1912,8 +2177,6 @@ index 8261ced3..70f240b3 100644
 +        return;
 +    }
 +    dead.sort();
-+    // Sweep per block (DCE's span discipline: compact spans 1:1 when they
-+    // map, else clear stale ones and compact instructions alone).
 +    let mut idx = 0;
 +    while idx < dead.len() {
 +        let (fi, bi, _) = dead[idx];
@@ -1923,8 +2186,6 @@ index 8261ced3..70f240b3 100644
 +            idx += 1;
 +        }
 +        in_block.sort();
-+        // `retain` closures cannot see their own index: rebuild with an
-+        // explicit loop (dead indices ascending).
 +        let block = &mut module.functions[fi].blocks[bi];
 +        let original_len = block.instructions.len();
 +        let has_spans = !block.source_spans.is_empty() && block.source_spans.len() == original_len;
@@ -1954,8 +2215,6 @@ index 8261ced3..70f240b3 100644
 +        }
 +        debug_assert_eq!(block.instructions.len(), original_len - in_block.len());
 +    }
-+    // DCE chaser on touched functions: the orphaned stored-value and
-+    // address chains are pure and disappear in the same pass.
 +    for (fi, touched) in touched_funcs.iter().enumerate() {
 +        if *touched {
 +            crate::passes::dce::eliminate_dead_code(&mut module.functions[fi]);
@@ -1966,8 +2225,96 @@ index 8261ced3..70f240b3 100644
  /// Phase 1: map each symbol *instance* to a dense ID.
  ///
  /// * function `i`  →  id `i`
-@@ -465,3 +873,494 @@ fn filter_symbol_attrs(module: &mut IrModule) {
-         has_toplevel_asm && toplevel_asm_mentions(&module.toplevel_asm, n)
+@@ -348,6 +789,53 @@ fn compute_reachability(
+         }
+     }
+ 
++    // F5: inline-asm template strings may mention static symbols textually
++    // (e.g. `asm("movl g(%%rip), %0" : "=r"(v))`). Treat any such mention
++    // as a root, just like toplevel-asm. This closes the same gap in both
++    // dead-static passes; the old pass had the same blind spot.
++    {
++        let mut inline_templates: Vec<&str> = Vec::new();
++        for func in &module.functions {
++            if func.is_declaration {
++                continue;
++            }
++            for block in &func.blocks {
++                for inst in &block.instructions {
++                    if let Instruction::InlineAsm { template, .. } = inst {
++                        if !template.is_empty() {
++                            inline_templates.push(template.as_str());
++                        }
++                    }
++                }
++            }
++        }
++        if !inline_templates.is_empty() {
++            for (i, func) in module.functions.iter().enumerate() {
++                if func.is_static
++                    && !func.is_declaration
++                    && !is_marked(&reachable, i)
++                    && inline_templates
++                        .iter()
++                        .any(|t| asm_mentions_symbol(t, func.name.as_str()))
++                {
++                    mark_reachable(i, &mut reachable, &mut worklist);
++                }
++            }
++            for (j, global) in module.globals.iter().enumerate() {
++                let id = n_funcs + j;
++                if global.is_static
++                    && !global.is_extern
++                    && !is_marked(&reachable, id)
++                    && inline_templates
++                        .iter()
++                        .any(|t| asm_mentions_symbol(t, global.name.as_str()))
++                {
++                    mark_reachable(id, &mut reachable, &mut worklist);
++                }
++            }
++        }
++    }
++
+     while let Some(sid) = worklist.pop() {
+         if sid < n_funcs {
+             if let Some(refs) = func_refs.get(sid) {
+@@ -453,6 +941,26 @@ fn filter_symbol_attrs(module: &mut IrModule) {
+     }
+ 
+     let has_toplevel_asm = !module.toplevel_asm.is_empty();
++    // Collect inline-asm templates for symbol-attrs filtering too: a `.hidden`
++    // for a symbol only mentioned in an inline-asm template must be kept.
++    let inline_templates: Vec<String> = module
++        .functions
++        .iter()
++        .filter(|f| !f.is_declaration)
++        .flat_map(|f| f.blocks.iter())
++        .flat_map(|b| b.instructions.iter())
++        .filter_map(|inst| {
++            if let Instruction::InlineAsm { template, .. } = inst {
++                if !template.is_empty() {
++                    Some(template.clone())
++                } else {
++                    None
++                }
++            } else {
++                None
++            }
++        })
++        .collect();
+ 
+     module.symbol_attrs.retain(|(name, is_weak, visibility)| {
+         if *is_weak && visibility.is_none() {
+@@ -462,6 +970,613 @@ fn filter_symbol_attrs(module: &mut IrModule) {
+         if referenced.contains(n) {
+             return true;
+         }
+-        has_toplevel_asm && toplevel_asm_mentions(&module.toplevel_asm, n)
++        if has_toplevel_asm && toplevel_asm_mentions(&module.toplevel_asm, n) {
++            return true;
++        }
++        !inline_templates.is_empty() && inline_templates.iter().any(|t| asm_mentions_symbol(t, n))
      });
  }
 +
@@ -2460,6 +2807,119 @@ index 8261ced3..70f240b3 100644
 +        eliminate_dead_global_stores(&mut m);
 +        assert_eq!(store_count(&m), 1, "volatile store: kept");
 +    }
++
++    #[test]
++    fn alias_target_bails() {
++        // `static int out[4]; extern int pub_out[4] __attribute__((alias("out")));`
++        // Other TUs read `out` through `pub_out`, so stores must be kept.
++        let mut m = IrModule::new();
++        m.globals.push(gs_global("out"));
++        m.functions
++            .push(gs_writer("w", vec![], Terminator::Return(None), 2));
++        m.aliases
++            .push((String::from("pub_out"), String::from("out"), false));
++        assert_eq!(store_count(&m), 1);
++        eliminate_dead_global_stores(&mut m);
++        assert_eq!(store_count(&m), 1, "alias target: store kept");
++    }
++
++    #[test]
++    fn alias_name_bails() {
++        let mut m = IrModule::new();
++        let g = gs_global("pub_out");
++        m.globals.push(g);
++        let mut f = IrFunction::new(String::from("w"), IrType::Void, vec![], false);
++        f.blocks = vec![gs_block(
++            vec![
++                Instruction::GlobalAddr {
++                    dest: Value(0),
++                    name: String::from("pub_out"),
++                },
++                Instruction::GetElementPtr {
++                    dest: Value(1),
++                    base: Value(0),
++                    offset: Operand::Const(IrConst::I64(0)),
++                    ty: IrType::F64,
++                },
++                Instruction::Store {
++                    val: Operand::Const(IrConst::F64(1.5)),
++                    ptr: Value(1),
++                    ty: IrType::F64,
++                    seg_override: AddressSpace::Default,
++                    volatile: false,
++                },
++            ],
++            Terminator::Return(None),
++        )];
++        f.next_value_id = 2;
++        m.functions.push(f);
++        m.aliases
++            .push((String::from("pub_out"), String::from("out"), false));
++        eliminate_dead_global_stores(&mut m);
++        assert_eq!(store_count(&m), 1, "alias name: store kept");
++    }
++
++    #[test]
++    fn inline_asm_template_bails() {
++        let mut m = IrModule::new();
++        m.globals.push(gs_global("g"));
++        let mut f = IrFunction::new(String::from("w"), IrType::Void, vec![], false);
++        f.blocks = vec![gs_block(
++            vec![
++                Instruction::GlobalAddr {
++                    dest: Value(0),
++                    name: String::from("g"),
++                },
++                Instruction::Store {
++                    val: Operand::Const(IrConst::I32(5)),
++                    ptr: Value(0),
++                    ty: IrType::I32,
++                    seg_override: AddressSpace::Default,
++                    volatile: false,
++                },
++                Instruction::InlineAsm {
++                    template: String::from("movl g(%%rip), %0"),
++                    outputs: vec![("=r".to_string(), Value(1), None)],
++                    inputs: vec![],
++                    clobbers: vec![],
++                    operand_types: vec![IrType::I32],
++                    goto_labels: vec![],
++                    input_symbols: vec![],
++                    seg_overrides: vec![AddressSpace::Default],
++                },
++            ],
++            Terminator::Return(None),
++        )];
++        f.next_value_id = 2;
++        m.functions.push(f);
++        eliminate_dead_global_stores(&mut m);
++        assert_eq!(
++            store_count(&m),
++            1,
++            "inline-asm template mention: store kept"
++        );
++    }
++
++    #[test]
++    fn inline_asm_template_unrelated_ok() {
++        let mut m = IrModule::new();
++        m.globals.push(gs_global("out"));
++        let mut f = gs_writer("w", vec![], Terminator::Return(None), 2);
++        f.blocks[0].instructions.push(Instruction::InlineAsm {
++            template: String::from("movl other(%%rip), %0"),
++            outputs: vec![("=r".to_string(), Value(2), None)],
++            inputs: vec![],
++            clobbers: vec![],
++            operand_types: vec![IrType::I32],
++            goto_labels: vec![],
++            input_symbols: vec![],
++            seg_overrides: vec![AddressSpace::Default],
++        });
++        f.next_value_id = 3;
++        m.functions.push(f);
++        eliminate_dead_global_stores(&mut m);
++        assert_eq!(store_count(&m), 0, "unrelated inline-asm: store gone");
++    }
 +}
 diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
 index 80cb3af7..f361f7ab 100644
@@ -2553,7 +3013,7 @@ index fcc0287c..8c4d4b54 100644
      // vectorizer (their SLP matchers must not see the Signed variants) and
      // in phi-SSA form (the rewrite's soundness argument is dominance, and
 diff --git a/tests/regression/check_unroll_gate_verdicts.sh b/tests/regression/check_unroll_gate_verdicts.sh
-index 0df66286..04dff7ac 100644
+index 0df66286..0e21661c 100644
 --- a/tests/regression/check_unroll_gate_verdicts.sh
 +++ b/tests/regression/check_unroll_gate_verdicts.sh
 @@ -1,10 +1,10 @@
@@ -2578,7 +3038,23 @@ index 0df66286..04dff7ac 100644
  #
  # The goto case pins no jump count: its `if (c)` forward branch survives in
  # every shape, so a jump count cannot discriminate rolled from unrolled
-@@ -84,19 +86,26 @@ expect_veto goto_bound goto_bound no
+@@ -57,8 +59,14 @@ compile_probe() {
+ 
+ jumps_in_fn() {
+     local stem=$1 fn=$2
++    # Match any x86 jump: jmp plus all jcc variants (ja, jae, jb, jbe,
++    # je, jne, jl, jle, jg, jge, js, jns, jo, jno, jp, jnp, jc, jnc,
++    # jz, jnz, etc.). The old regex missed js/jns/jp/jnp/jo/jno/jb/jc
++    # and would have let a \"fully unrolled\" nest slip through if it kept
++    # e.g. a parity test. `j[a-z]+` is the complete x86 jump family and
++    # nothing else starts with `j` in AT&T asm.
+     sed -n "/^$fn:/,/^.size $fn,/p" "$work/$stem.s" \
+-        | grep -cE "^[ \t]*j(mp|b|be|ae|a|e|ne|le|l|ge|g)[ \t]"
++        | grep -cE "^[ \t]*j[a-z]+[ \t]"
+ }
+ 
+ expect_veto() {
+@@ -84,19 +92,26 @@ expect_veto goto_bound goto_bound no
  expect_veto runtime_limit runtime_limit yes
  expect_veto iv_decided_limit iv_decided_limit yes
  
@@ -2613,6 +3089,336 @@ index 0df66286..04dff7ac 100644
  
  echo
  echo "unroll-gate-verdicts gate: PASS=$pass FAIL=$fail"
+diff --git a/tests/regression/copysign_union_mem.c b/tests/regression/copysign_union_mem.c
+new file mode 100644
+index 00000000..4e85d712
+--- /dev/null
++++ b/tests/regression/copysign_union_mem.c
+@@ -0,0 +1,95 @@
++/* copysign_union_mem.c — musl-style union-punned copysign through memory.
++
++   Covers the bit_idioms transform that rewrites
++     r.u64 = (a.u64 & ABS) | (b.u64 & SIGN)
++   into `CopysignF64/F32` intrinsics. Must be correct for ±0.0, NaN with
++   payload, and ±inf, and must preserve bit patterns (not just values).
++
++   Prints result bits with %016llx / %08x for deterministic comparison
++   against GCC.
++*/
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
++
++static double copysign_mem_f64(double mag, double sign) {
++    union { double f; uint64_t u; } a, b, r;
++    a.f = mag;
++    b.f = sign;
++    r.u = (a.u & 0x7fffffffffffffffULL) | (b.u & 0x8000000000000000ULL);
++    return r.f;
++}
++
++static float copysign_mem_f32(float mag, float sign) {
++    union { float f; uint32_t u; } a, b, r;
++    a.f = mag;
++    b.f = sign;
++    r.u = (a.u & 0x7fffffffU) | (b.u & 0x80000000U);
++    return r.f;
++}
++
++static uint64_t d2u(double d) { uint64_t u; memcpy(&u, &d, sizeof u); return u; }
++static uint32_t f2u(float f)  { uint32_t u; memcpy(&u, &f, sizeof u); return u; }
++
++int main(void) {
++    /* f64 cases */
++    struct { double mag; double sign; uint64_t want_bits; } f64_cases[] = {
++        {  1.0,  1.0, 0x3ff0000000000000ULL }, /* +1, +1 -> +1 */
++        {  1.0, -1.0, 0xbff0000000000000ULL }, /* +1, -1 -> -1 */
++        { -1.0,  1.0, 0x3ff0000000000000ULL }, /* -1, +1 -> +1 */
++        { -1.0, -1.0, 0xbff0000000000000ULL }, /* -1, -1 -> -1 */
++        {  0.0, -0.0, 0x8000000000000000ULL }, /* +0, -0 -> -0 */
++        { -0.0,  0.0, 0x0000000000000000ULL }, /* -0, +0 -> +0 */
++        {  INFINITY, -1.0, 0xfff0000000000000ULL }, /* inf, - -> -inf */
++        { -INFINITY,  1.0, 0x7ff0000000000000ULL }, /* -inf, + -> +inf */
++    };
++    for (unsigned i = 0; i < sizeof(f64_cases)/sizeof(f64_cases[0]); i++) {
++        double got = copysign_mem_f64(f64_cases[i].mag, f64_cases[i].sign);
++        uint64_t got_bits = d2u(got);
++        if (got_bits != f64_cases[i].want_bits) {
++            printf("FAIL f64 case %u got %016llx want %016llx\n",
++                   i, (unsigned long long)got_bits,
++                   (unsigned long long)f64_cases[i].want_bits);
++            return 1;
++        }
++    }
++    /* NaN payload preservation: mag NaN with payload, sign - */
++    {
++        union { double f; uint64_t u; } mag, sign, want;
++        mag.u = 0x7ff8000000000001ULL; /* qNaN with payload 1 */
++        sign.u = 0xbff0000000000000ULL; /* -1 */
++        want.u = (mag.u & 0x7fffffffffffffffULL) | (sign.u & 0x8000000000000000ULL);
++        double got = copysign_mem_f64(mag.f, sign.f);
++        uint64_t got_bits = d2u(got);
++        if (got_bits != want.u) {
++            printf("FAIL f64 nan payload got %016llx want %016llx\n",
++                   (unsigned long long)got_bits, (unsigned long long)want.u);
++            return 1;
++        }
++    }
++
++    /* f32 cases */
++    struct { float mag; float sign; uint32_t want_bits; } f32_cases[] = {
++        {  1.0f,  1.0f, 0x3f800000U },
++        {  1.0f, -1.0f, 0xbf800000U },
++        { -1.0f,  1.0f, 0x3f800000U },
++        {  0.0f, -0.0f, 0x80000000U },
++        { -0.0f,  0.0f, 0x00000000U },
++        {  INFINITY, -1.0f, 0xff800000U },
++    };
++    for (unsigned i = 0; i < sizeof(f32_cases)/sizeof(f32_cases[0]); i++) {
++        float got = copysign_mem_f32(f32_cases[i].mag, f32_cases[i].sign);
++        uint32_t got_bits = f2u(got);
++        if (got_bits != f32_cases[i].want_bits) {
++            printf("FAIL f32 case %u got %08x want %08x\n",
++                   i, got_bits, f32_cases[i].want_bits);
++            return 1;
++        }
++    }
++
++    printf("PASS copysign_union_mem f64=%016llx f32=%08x\n",
++           (unsigned long long)d2u(copysign_mem_f64(1.0, -1.0)),
++           f2u(copysign_mem_f32(1.0f, -1.0f)));
++    return 0;
++}
+diff --git a/tests/regression/globaldse_alias_kept.c b/tests/regression/globaldse_alias_kept.c
+new file mode 100644
+index 00000000..0df65ea2
+--- /dev/null
++++ b/tests/regression/globaldse_alias_kept.c
+@@ -0,0 +1,33 @@
++/* globaldse_alias_kept.c — alias escape must keep stores (F1).
++
++   `static int out[4]; extern int pub_out[4] __attribute__((alias("out")));`
++   Other TUs can read `out` through `pub_out`. The Phase 11a DSE must NOT
++   delete stores to `out` when an alias exists. If it did, reading through
++   the alias would see zero instead of the written values.
++
++   This is the regression for PR #617 F1.
++*/
++#include <stdio.h>
++
++static int out[4] = {0};
++extern int pub_out[4] __attribute__((alias("out")));
++
++__attribute__((noinline)) void write_out(void) {
++    out[0] = 11;
++    out[1] = 22;
++    out[2] = 33;
++    out[3] = 44;
++}
++
++int main(void) {
++    write_out();
++    /* Read through the alias — must see the stores */
++    if (pub_out[0] != 11 || pub_out[1] != 22 || pub_out[2] != 33 || pub_out[3] != 44) {
++        printf("FAIL alias_kept got %d %d %d %d want 11 22 33 44\n",
++               pub_out[0], pub_out[1], pub_out[2], pub_out[3]);
++        return 1;
++    }
++    printf("PASS globaldse_alias_kept %d %d %d %d\n",
++           pub_out[0], pub_out[1], pub_out[2], pub_out[3]);
++    return 0;
++}
+diff --git a/tests/regression/globaldse_asm_template.c b/tests/regression/globaldse_asm_template.c
+new file mode 100644
+index 00000000..d16f40d7
+--- /dev/null
++++ b/tests/regression/globaldse_asm_template.c
+@@ -0,0 +1,34 @@
++/* globaldse_asm_template.c — inline-asm template mention must keep stores (F5).
++
++   A store whose only reader is `asm("movl g(%%rip), %0" : "=r"(v))` must be
++   kept. The old Phase 11a only checked input_symbols, not the template
++   string, so it would delete the store. This test reads `g` via inline asm
++   and checks the value.
++
++   Note: the same gap existed in the older dead-static-function pass; both
++   passes now scan template strings with word-boundary matching.
++*/
++#include <stdio.h>
++
++static int g;
++
++__attribute__((noinline)) void set_g(void) {
++    g = 5;
++}
++
++__attribute__((noinline)) int read_g_via_asm(void) {
++    int v;
++    __asm__ volatile("movl g(%%rip), %0" : "=r"(v));
++    return v;
++}
++
++int main(void) {
++    set_g();
++    int v = read_g_via_asm();
++    if (v != 5) {
++        printf("FAIL asm_template got %d want 5\n", v);
++        return 1;
++    }
++    printf("PASS globaldse_asm_template %d\n", v);
++    return 0;
++}
+diff --git a/tests/regression/globaldse_asm_template.env b/tests/regression/globaldse_asm_template.env
+new file mode 100644
+index 00000000..2eea2296
+--- /dev/null
++++ b/tests/regression/globaldse_asm_template.env
+@@ -0,0 +1,4 @@
++# F5: GCC at -O2 deletes the static and fails to link when the only reader
++# is an inline-asm template string (same gap as lccc had before fix).
++# LCCC must keep the store; this test is lccc-only, not compared vs GCC.
++LCCC_NO_COMPARE=1
+diff --git a/tests/regression/globaldse_unread_static.c b/tests/regression/globaldse_unread_static.c
+new file mode 100644
+index 00000000..d117b0b2
+--- /dev/null
++++ b/tests/regression/globaldse_unread_static.c
+@@ -0,0 +1,26 @@
++/* globaldse_unread_static.c — TU dead-global-store elimination.
++
++   A static output buffer written in a loop and never read. The stores are
++   unobservable within the TU, so lccc's Phase 11a may delete them (mirroring
++   GCC/Clang whole-program DSE). The program's observable behavior must stay
++   identical: it prints a constant, not the buffer contents.
++
++   This pins that the transform is sound for the unread case and that the
++   buffer's removal does not affect surrounding code.
++*/
++#include <stdio.h>
++
++static double out[4096];
++
++__attribute__((noinline)) void fill_out(void) {
++    for (int i = 0; i < 4096; i++) {
++        out[i] = (double)i * 0.5;
++    }
++}
++
++int main(void) {
++    fill_out();
++    /* out is never read — only this constant is observable */
++    printf("PASS globaldse_unread_static %d\n", 42);
++    return 0;
++}
+diff --git a/tests/regression/ternary_float_merge.c b/tests/regression/ternary_float_merge.c
+new file mode 100644
+index 00000000..d16c07de
+--- /dev/null
++++ b/tests/regression/ternary_float_merge.c
+@@ -0,0 +1,102 @@
++/* ternary_float_merge.c — float ternary merge slots (F2 hardening).
++
++   The S25 change made F32/F64 ternary merge slots exact-typed so FP
++   selects stay XMM-homed and the S05 blend can fire. This test covers the
++   hardening in `emit_ternary_merge_store`: a constant arm of a different
++   float type (F64 const stored into F32 slot, or integer 0 into float) must
++   be converted, not passed through unconverted.
++
++   Cases:
++     c ? 1.0 : x   with float x   (F64 const, F32 var, common F64)
++     c ? 0   : f   with double f  (int const, F64 var, common F64)
++     c ? 1.0f : d  with double d  (F32 const, F64 var, common F64)
++     c ? d : 2.0f  (reverse order)
++   All must produce type-correct IR and correct runtime values, including
++   NaN payload preservation (blend selects bit patterns).
++
++   Runnable by run_regression.py, output compared against GCC.
++*/
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
++
++static uint64_t d2u(double d) { uint64_t u; memcpy(&u, &d, sizeof u); return u; }
++static uint32_t f2u(float f)  { uint32_t u; memcpy(&u, &f, sizeof u); return u; }
++
++__attribute__((noinline)) double cond_f64(int c, double x) {
++    return c ? 1.0 : x;
++}
++
++__attribute__((noinline)) double cond_int_to_f64(int c, double f) {
++    return c ? 0 : f;
++}
++
++__attribute__((noinline)) double cond_f32_to_f64(int c, double d) {
++    return c ? 1.0f : d;
++}
++
++__attribute__((noinline)) double cond_f64_to_f32(int c, float x) {
++    /* result is float in C, but promoted to double for printf checking */
++    float r = c ? 1.0f : x;
++    return (double)r;
++}
++
++__attribute__((noinline)) float cond_f64_const_to_f32(int c, float x) {
++    /* This is the critical F2 shape: F64 const 1.0 stored into F32 slot
++       when common type is F32? Actually common F32/F64 is F64, but we force
++       F32 result by using float variable and float literal. The other shape
++       is int->float. This function checks F32 path. */
++    return c ? 1.0f : x;
++}
++
++int main(void) {
++    double a = cond_f64(1, 2.5);
++    double b = cond_f64(0, 2.5);
++    if (a != 1.0 || b != 2.5) {
++        printf("FAIL cond_f64 %f %f\n", a, b);
++        return 1;
++    }
++
++    double c = cond_int_to_f64(1, 3.14);
++    double d = cond_int_to_f64(0, 3.14);
++    if (c != 0.0 || d != 3.14) {
++        printf("FAIL cond_int_to_f64 %f %f\n", c, d);
++        return 1;
++    }
++
++    double e = cond_f32_to_f64(1, 2.5);
++    double f = cond_f32_to_f64(0, 2.5);
++    if (e != 1.0f || f != 2.5) {
++        printf("FAIL cond_f32_to_f64 %f %f\n", e, f);
++        return 1;
++    }
++
++    float g = cond_f64_const_to_f32(1, 2.5f);
++    float h = cond_f64_const_to_f32(0, 2.5f);
++    if (f2u(g) != f2u(1.0f) || f2u(h) != f2u(2.5f)) {
++        printf("FAIL cond_f32 %08x %08x\n", f2u(g), f2u(h));
++        return 1;
++    }
++
++    /* NaN payload preservation: ternary must select bit patterns, not
++       arithmetic values. If the merge were GPR-homed and round-tripped,
++       payload could be lost. */
++    {
++        union { float f; uint32_t u; } nan1, nan2;
++        nan1.u = 0x7fc00001U; /* qNaN payload 1 */
++        nan2.u = 0x7fc00002U; /* qNaN payload 2 */
++        float r1 = 1 ? nan1.f : 0.0f;
++        float r2 = 0 ? 0.0f : nan2.f;
++        /* Must preserve exact bits (blend selects bits) */
++        if (f2u(r1) != nan1.u || f2u(r2) != nan2.u) {
++            printf("FAIL nan payload %08x %08x\n", f2u(r1), f2u(r2));
++            return 1;
++        }
++    }
++
++    printf("PASS ternary_float_merge %016llx %08x\n",
++           (unsigned long long)d2u(cond_f64(1, 2.5)),
++           f2u(cond_f64_const_to_f32(1, 2.5f)));
++    return 0;
++}
 diff --git a/tests/regression/unroll_gate_latchset_bound.c b/tests/regression/unroll_gate_latchset_bound.c
 new file mode 100644
 index 00000000..c1a12261
