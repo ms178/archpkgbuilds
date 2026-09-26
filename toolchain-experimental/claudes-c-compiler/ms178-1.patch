@@ -1,1362 +1,1030 @@
-From a07d2ce865b999f6a4366362c31c82fc4be6dc31 Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Sat, 26 Sep 2026 19:55:39 +0000
-Subject: [PATCH 1/5] backend: scope the %rax shadow-epoch validator to the x86
- family by target, and enforce the discipline on i686
-
-F1 fix (PR #637 audit): the validator's park/epoch APIs are arch-generic
-on the shared CodegenState, and the generic pass layer (generate_module ->
-generate_load/store -> generate_copy, remat_indexed_acc_safe) runs for
-EVERY target. i686/ARM/RISC-V park via raw set_acc, so their
-acc_park_epoch stays frozen at 0 while the epoch moves: i686 emits
-%eax-destination lines (classified by the universal dest-last rule), and
-RISC-V 'call foo' / 'mul' / 'div' lines hit IMPLICIT_RAX_WRITES
-unconditionally on operands (common.rs table check precedes the operand
-check) - the audit caught 'call', 'mul'/'div' are the same class. The
-first acc_has_verified(has=true) after any such bump would debug_assert
-on a perfectly healthy foreign-target compilation. The patch's own doc
-claims ('targets never share a CodegenState with an x86-64 function';
-'keeps non-x86 lines from inflating the epoch') were factually wrong.
-
-Fix, going one step further than the audit's is_x86_64 gate: the epoch
-machinery is now target-SCOPED via a debug-only AsmOutput.rax_epoch_active
-flag (default false = inert), enabled by the x86-64 AND i686 constructors.
-Foreign ISAs are safe by construction, not by luck. i686 is INCLUDED in
-the discipline instead of gated off: its accumulator cache tracks %eax
-through the same generic paths (same dead-register exposure class), so
-its 13 park sites migrate to park_acc and its 2 consuming probes
-(operand_to_eax early-return, operand_to_ecx acc-resident arm) to
-acc_has_verified. The classifier's vocabulary already covers the full
-i686 AT&T set (pushl quiet via NEVER table, popl/leal/divl/etc. via the
-generic rule and implicit table).
-
-Both directions of the gate are pinned by unit tests
-(epoch_machinery_is_inert_without_target_opt_in,
-target_opt_in_arms_the_classifier); the pre-existing validator tests now
-opt in explicitly, documenting the precondition. Full unit suite re-run
-with debug-assertions ACTIVE: 3550/3550 - zero violations across the
-corpus, dual-arch.
----
- src/backend/common.rs               |  42 +++++++++-
- src/backend/i686/codegen/alu.rs     |   4 +-
- src/backend/i686/codegen/emit.rs    |  37 ++++++---
- src/backend/i686/codegen/globals.rs |   8 +-
- src/backend/state.rs                | 119 +++++++++++++++++++++++++---
- src/backend/x86/codegen/emit.rs     |   6 +-
- 6 files changed, 184 insertions(+), 32 deletions(-)
-
-diff --git a/src/backend/common.rs b/src/backend/common.rs
-index 66bcc85f..9c2e0762 100644
---- a/src/backend/common.rs
-+++ b/src/backend/common.rs
-@@ -1034,6 +1034,27 @@ pub struct AsmOutput {
-     /// fast paths (slot-independent sourcing, commuted-RHS) run on.
-     #[cfg(debug_assertions)]
-     pub(crate) rax_write_epoch: u64,
-+    /// DEBUG-ONLY: whether the %rax shadow-epoch machinery is active for the
-+    /// target being generated. Only the targets whose accumulator cache
-+    /// tracks the %rax-family register — x86-64 and i686 — opt in (their
-+    /// constructors call `CodegenState::enable_rax_epoch_discipline`); the
-+    /// field is `false` by construction for every other target.
-+    ///
-+    /// The opt-in is load-bearing for soundness of the ASSERTION (not of the
-+    /// cache): the sink classifier speaks AT&T x86 only, and foreign-ISA
-+    /// vocabularies can false-positive it. A RISC-V `call foo` line shares
-+    /// its mnemonic with the x86 implicit-%rax writer, and RISC-V `mul`/
-+    /// `div` would hit the implicit table before any operand check — on a
-+    /// target where the cached register is `a0`, not `%rax`. With the flag
-+    /// off, `debug_scan_tail` is inert and the epoch can never move, so a
-+    /// foreign-ISA compilation can neither false-assert nor silently corrupt
-+    /// an x86-64 function's epochs (each function generation owns its own
-+    /// `CodegenState`). The generic pass layer (generate_load/store,
-+    /// remat_indexed_acc_safe, generate_copy) runs for every target and
-+    /// speaks the verified API; the flag — not the call sites — is what
-+    /// scopes the semantics to the x86 family.
-+    #[cfg(debug_assertions)]
-+    pub(crate) rax_epoch_active: bool,
-     /// DEBUG-ONLY: the most recent line the analyzer could not classify, for
-     /// the assertion message. `None` once every emitted line was classified
-     /// by the table.
-@@ -1311,8 +1332,15 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
-     // table's job, answered above). An UNKNOWN mnemonic whose destination
-     // is rax-shaped still reports the write (dest-last is universal) and
-     // is recorded so the table can name it; an unknown mnemonic with a
--    // non-rax destination is soundly `false`, which keeps non-x86 lines
--    // and foreign mnemonics from inflating the epoch.
-+    // non-rax destination is soundly `false`.
-+    //
-+    // NOTE: "unknown mnemonic with a non-rax destination is false" does NOT
-+    // by itself make foreign-ISA assembly safe here — table hits above are
-+    // unconditional on operands (RISC-V `call`/`mul`/`div` share x86
-+    // mnemonics), and only the x86-64/i686 targets opt into scanning at all
-+    // (`AsmOutput::rax_epoch_active`). Within an opted-in target every
-+    // emitted line IS AT&T x86, which is the contract this classifier is
-+    // written against.
-     let ops = split_operands_top_level(operands_part);
-     match ops.last() {
-         Some(last) if pure_rax_reg(last) => {
-@@ -1361,6 +1389,8 @@ impl AsmOutput {
-             #[cfg(debug_assertions)]
-             rax_write_epoch: 0,
-             #[cfg(debug_assertions)]
-+            rax_epoch_active: false,
-+            #[cfg(debug_assertions)]
-             last_unclassified: None,
-         }
-     }
-@@ -1373,6 +1403,14 @@ impl AsmOutput {
-     pub(crate) fn debug_scan_tail(&mut self) {
-         #[cfg(debug_assertions)]
-         {
-+            // Inert unless the target opted in (x86-64, i686). Foreign-ISA
-+            // lines must never move the epoch: the classifier's vocabulary
-+            // is AT&T x86, and a RISC-V `call`/`mul`/`div` line would
-+            // false-positive the implicit-write table (see
-+            // `rax_epoch_active` for the full argument).
-+            if !self.rax_epoch_active {
-+                return;
-+            }
-             let buf = &self.buf;
-             if buf.is_empty() || !buf.ends_with('\n') {
-                 return;
-diff --git a/src/backend/i686/codegen/alu.rs b/src/backend/i686/codegen/alu.rs
-index a5516079..1655dce8 100644
---- a/src/backend/i686/codegen/alu.rs
-+++ b/src/backend/i686/codegen/alu.rs
-@@ -1255,13 +1255,13 @@ impl I686Codegen {
-             // move the remainder into %eax for its acc-flow consumer.
-             self.store_eax_to(&div_dest);
-             self.state.emit("    movl %edx, %eax");
--            self.state.reg_cache.set_acc(rem_dest.0, false);
-+            self.state.park_acc(rem_dest.0, false);
-         } else if div_slotless {
-             // Remainder out first (its store cannot touch %eax here); the
-             // quotient is already in %eax — just claim the cache entry its
-             // consumer will read.
-             self.store_edx_to(&rem_dest);
--            self.state.reg_cache.set_acc(div_dest.0, false);
-+            self.state.park_acc(div_dest.0, false);
-         } else if edx_side_writes_eax {
-             // Quotient first (its store cannot touch %edx here); then the
-             // remainder store rewrites %eax — invalidate the acc claim the
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index 010caf69..9d894b21 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -446,8 +446,14 @@ impl I686Codegen {
-     }
- 
-     pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
-+        let mut state = CodegenState::new_with_ra_config(ra_config);
-+        // i686 tracks the %eax accumulator (same rax-family discipline as
-+        // x86-64, same AT&T vocabulary for the sink classifier): arm the
-+        // shadow-epoch validator for this target too. Its parks go through
-+        // `park_acc` and its consuming probes through `acc_has_verified`.
-+        state.enable_rax_epoch_discipline();
-         Self {
--            state: CodegenState::new_with_ra_config(ra_config),
-+            state,
-             current_return_type: IrType::I32,
-             is_variadic: false,
-             reg_assignments: FxHashMap::default(),
-@@ -645,10 +651,13 @@ impl I686Codegen {
- 
-     /// Load an operand into %eax.
-     pub(super) fn operand_to_eax(&mut self, op: &Operand) {
--        // Check register cache - skip load if value is already in eax
-+        // Check register cache - skip load if value is already in eax.
-+        // This SOURCES the value from %eax when it returns early, so it is
-+        // a verified consume: the epoch contract must hold between the park
-+        // and this probe.
-         if let Operand::Value(v) = op {
-             let is_alloca = self.state.is_alloca(v.0);
--            if self.state.reg_cache.acc_has(v.0, is_alloca) {
-+            if self.state.acc_has_verified(v.0, is_alloca) {
-                 return;
-             }
-         }
-@@ -673,11 +682,11 @@ impl I686Codegen {
-                         // Value is homed in %eax itself (Phase 2e): it is
-                         // already where the caller wants it. Refresh the
-                         // cache entry and emit nothing.
--                        self.state.reg_cache.set_acc(v.0, false);
-+                        self.state.park_acc(v.0, false);
-                     } else {
-                         let reg = phys_reg_name(phys);
-                         emit!(self.state, "    movl %{}, %eax", reg);
--                        self.state.reg_cache.set_acc(v.0, false);
-+                        self.state.park_acc(v.0, false);
-                     }
-                 } else if let Some(slot) = self.state.get_slot(v.0) {
-                     let sr = self.slot_ref(slot);
-@@ -695,7 +704,7 @@ impl I686Codegen {
-                         // Regular value: load the value from the slot
-                         emit!(self.state, "    movl {}, %eax", sr);
-                     }
--                    self.state.reg_cache.set_acc(v.0, is_alloca);
-+                    self.state.park_acc(v.0, is_alloca);
-                 } else {
-                     // i686 acc-flow contract: the accumulator-centric backend
-                     // has paths where a no-home value is consumed DIRECTLY
-@@ -852,10 +861,12 @@ impl I686Codegen {
-                     } else {
-                         emit!(self.state, "    movl {}, %ecx", sr);
-                     }
--                } else if self.state.reg_cache.acc_has(v.0, false)
--                    || self.state.reg_cache.acc_has(v.0, true)
-+                } else if self.state.acc_has_verified(v.0, false)
-+                    || self.state.acc_has_verified(v.0, true)
-                 {
-                     // Value is in accumulator (no stack slot) — move eax to ecx.
-+                    // Verified consume: the eax→ecx move sources the value
-+                    // from the accumulator, so the epoch contract must hold.
-                     self.state.emit("    movl %eax, %ecx");
-                 } else {
-                     self.state.emit("    xorl %ecx, %ecx");
-@@ -870,16 +881,16 @@ impl I686Codegen {
-             if phys.0 == 6 {
-                 // Destination homed in %eax (Phase 2e): the result is already
-                 // home. Keep the cache entry, emit nothing.
--                self.state.reg_cache.set_acc(dest.0, false);
-+                self.state.park_acc(dest.0, false);
-                 return;
-             }
-             let reg = phys_reg_name(phys);
-             emit!(self.state, "    movl %eax, %{}", reg);
-             // `movl %eax,%reg` leaves %eax unchanged, so the accumulator still
-             // holds the value. Keep the cache entry (mirror the slot path's
--            // set_acc below) so a later operand_to_eax / cast skips the reload;
-+            // park below) so a later operand_to_eax / cast skips the reload;
-             // the cache is invalidated by any real %eax clobber anyway.
--            self.state.reg_cache.set_acc(dest.0, false);
-+            self.state.park_acc(dest.0, false);
-         } else if let Some(slot) = self.state.get_slot(dest.0) {
-             let sr = self.slot_ref(slot);
-             emit!(self.state, "    movl %eax, {}", sr);
-@@ -892,7 +903,7 @@ impl I686Codegen {
-                 let sr4 = self.slot_ref_offset(slot, 4);
-                 emit!(self.state, "    movl $0, {}", sr4);
-             }
--            self.state.reg_cache.set_acc(dest.0, false);
-+            self.state.park_acc(dest.0, false);
-         }
-     }
- 
-@@ -2363,7 +2374,7 @@ impl ArchCodegen for I686Codegen {
-         } else {
-             emit!(self.state, "    leal {}(%{}), %eax", offset as i32, b_name);
-         }
--        self.state.reg_cache.set_acc(dest.0, false);
-+        self.state.park_acc(dest.0, false);
-         self.emit_store_result(dest);
-         true
-     }
-diff --git a/src/backend/i686/codegen/globals.rs b/src/backend/i686/codegen/globals.rs
-index a8f36003..5c887073 100644
---- a/src/backend/i686/codegen/globals.rs
-+++ b/src/backend/i686/codegen/globals.rs
-@@ -85,7 +85,7 @@ impl I686Codegen {
-             self.store_eax_to(dest);
-         } else {
-             match reg {
--                "eax" => self.state.reg_cache.set_acc(dest.0, false),
-+                "eax" => self.state.park_acc(dest.0, false),
-                 "edx" => self.state.reg_cache.set_sec(dest.0, false),
-                 _ => {}
-             }
-@@ -130,7 +130,7 @@ impl I686Codegen {
-             let d_name = super::emit::phys_reg_name(d_reg);
-             emit!(self.state, "    {} {}, %{}", load_instr, sym, d_name);
-             match d_name {
--                "eax" => self.state.reg_cache.set_acc(dest.0, false),
-+                "eax" => self.state.park_acc(dest.0, false),
-                 "edx" => self.state.reg_cache.set_sec(dest.0, false),
-                 _ => {}
-             }
-@@ -223,7 +223,7 @@ impl I686Codegen {
-             self.store_eax_to(dest);
-         } else {
-             match reg {
--                "eax" => self.state.reg_cache.set_acc(dest.0, false),
-+                "eax" => self.state.park_acc(dest.0, false),
-                 "edx" => self.state.reg_cache.set_sec(dest.0, false),
-                 _ => {}
-             }
-@@ -257,7 +257,7 @@ impl I686Codegen {
-             self.store_eax_to(dest);
-         } else {
-             match reg {
--                "eax" => self.state.reg_cache.set_acc(dest.0, false),
-+                "eax" => self.state.park_acc(dest.0, false),
-                 "edx" => self.state.reg_cache.set_sec(dest.0, false),
-                 _ => {}
-             }
-diff --git a/src/backend/state.rs b/src/backend/state.rs
-index 234c1298..2952d407 100644
---- a/src/backend/state.rs
-+++ b/src/backend/state.rs
-@@ -61,9 +61,10 @@ pub struct RegCache {
-     /// a stack reload when the value was recently loaded to %rcx.
-     pub sec: Option<RegCacheEntry>,
-     /// DEBUG-ONLY: the `AsmOutput` %rax shadow epoch at the moment `acc`
--    /// was last (re)written. Every x86-64 park goes through
--    /// `CodegenState::park_acc` (which syncs this) and every x86-64 consume
--    /// goes through `CodegenState::acc_has_verified` (which asserts it).
-+    /// was last (re)written. Every park on an epoch-enabled target
-+    /// (x86-64, i686 — see `AsmOutput::rax_epoch_active`) goes through
-+    /// `CodegenState::park_acc` (which syncs this) and every consume goes
-+    /// through `CodegenState::acc_has_verified` (which asserts it).
-     /// An emitter that writes %rax without `invalidate_acc` leaves the
-     /// epochs unequal at the next consume — the dead-%rax-read miscompile
-     /// class becomes a loud debug assertion naming the value and the last
-@@ -1209,13 +1210,39 @@ pub enum SlotAddr {
- }
- 
- impl CodegenState {
-+    /// Declare that this compilation tracks the %rax-family accumulator
-+    /// (x86-64 or i686): every emitted line is AT&T x86 the sink's
-+    /// shadow-epoch analyzer can classify, and every park/consume is held
-+    /// to the epoch contract. Called by the x86-64 and i686 backend
-+    /// constructors. Foreign-ISA backends (AArch64, RISC-V) must NOT call
-+    /// this: their assembly is not AT&T x86 and the classifier's
-+    /// vocabulary cannot describe it (see `AsmOutput::rax_epoch_active`).
-+    #[inline]
-+    pub fn enable_rax_epoch_discipline(&mut self) {
-+        #[cfg(debug_assertions)]
-+        {
-+            self.out.rax_epoch_active = true;
-+        }
-+    }
-+
-     /// Record that the accumulator now holds `value_id`, syncing the debug
--    /// %rax shadow epoch (see [`RegCache::acc_park_epoch`]). Every x86-64
--    /// park MUST go through this — a raw `set_acc` leaves the epoch stale
--    /// and the next `acc_has_verified` would (correctly, but spuriously)
--    /// report a discipline violation. i686/ARM/RISC-V keep raw `set_acc`:
--    /// they run no verified consumes, and their targets never share a
--    /// `CodegenState` with an x86-64 function.
-+    /// %rax shadow epoch (see [`RegCache::acc_park_epoch`]). Every park on
-+    /// an epoch-enabled target (x86-64, i686) MUST go through this — a raw
-+    /// `set_acc` leaves the epoch stale and the next `acc_has_verified`
-+    /// would (correctly, but spuriously) report a discipline violation.
-+    /// Foreign-ISA backends (AArch64, RISC-V) keep raw `set_acc`: the epoch
-+    /// machinery is inert for them (`out.rax_epoch_active == false`), so a
-+    /// stale epoch there is unobservable.
-+    ///
-+    /// History note: this comment once claimed foreign targets "never share
-+    /// a `CodegenState` with an x86-64 function". That was false — the
-+    /// generic `generate_module` driver (generate_load/store,
-+    /// generate_copy, remat_indexed_acc_safe) runs for every target and
-+    /// speaks this verified API — and a RISC-V `call`/`mul`/`div` line
-+    /// moves the x86 classifier's implicit-write table regardless of its
-+    /// operands. The target-scoped opt-in flag is the fix: the generic pass
-+    /// layer keeps the verified API, and the flag (not the call sites)
-+    /// scopes the epoch semantics to the x86 family.
-     #[inline]
-     pub fn park_acc(&mut self, value_id: u32, is_alloca: bool) {
-         self.reg_cache.set_acc(value_id, is_alloca);
-@@ -1244,7 +1271,10 @@ impl CodegenState {
-         let has = self.reg_cache.acc_has(value_id, is_alloca);
-         #[cfg(debug_assertions)]
-         {
--            if has {
-+            // The assert is meaningful only on epoch-enabled targets; on a
-+            // foreign ISA the epoch cannot move (the scan is gated off), so
-+            // a stale park epoch would compare against a frozen 0.
-+            if has && self.out.rax_epoch_active {
-                 let park = self.reg_cache.acc_park_epoch;
-                 let now = self.out.debug_rax_epoch();
-                 debug_assert!(
-@@ -1355,6 +1385,9 @@ mod acc_epoch_validator_tests {
-     #[test]
-     fn unstaged_rax_clobber_is_caught_between_park_and_consume() {
-         let mut state = CodegenState::new();
-+        // This test speaks x86 vocabulary, so it opts into the discipline
-+        // exactly as the x86-64/i686 constructors do.
-+        state.enable_rax_epoch_discipline();
-         // Park v7 (e.g. the tail of store_rax_to): the park syncs the epoch.
-         state.park_acc(7, false);
-         assert!(
-@@ -1397,6 +1430,7 @@ mod acc_epoch_validator_tests {
-     #[test]
-     fn repark_after_clobber_resyncs_the_epoch() {
-         let mut state = CodegenState::new();
-+        state.enable_rax_epoch_discipline();
-         state.park_acc(3, false);
-         state.out.emit("    addq %rcx, %rax");
-         assert_ne!(
-@@ -1411,4 +1445,69 @@ mod acc_epoch_validator_tests {
-             "a re-park re-establishes residency with a fresh epoch"
-         );
-     }
-+
-+    /// The epoch machinery is target-scoped: a fresh `CodegenState` (what
-+    /// every foreign-ISA backend constructor produces) has it DISABLED, and
-+    /// on a disabled target the sink classifier is inert — lines that would
-+    /// be %rax writes on x86 (`call`, `movl ... %eax`) must NOT move the
-+    /// epoch, and a verified consume must NOT assert even when the park
-+    /// epoch is stale. This pins the F1 fix: the generic pass layer runs
-+    /// for every target, so a foreign-ISA compilation (RISC-V `call foo`,
-+    /// i686 %eax traffic on an unenabled state) can neither false-assert
-+    /// nor be silently validated by machinery whose vocabulary does not
-+    /// describe its assembly.
-+    #[test]
-+    fn epoch_machinery_is_inert_without_target_opt_in() {
-+        let mut state = CodegenState::new();
-+        assert!(
-+            !state.out.rax_epoch_active,
-+            "the discipline is opt-in per target; default state must be off"
-+        );
-+        // Park WITHOUT opting in (a foreign backend's park_acc): the epoch
-+        // syncs (to 0 — the scan is inert), but no assertion can fire.
-+        state.park_acc(7, false);
-+        // Lines that would be %rax writes on x86-64: `call` is in the
-+        // implicit-write table; `movl ... %eax` matches the dest-last rule.
-+        // With the machinery disabled these must be ignored entirely.
-+        state.out.emit("    call foo");
-+        state.out.emit("    movl $1, %eax");
-+        assert_eq!(
-+            state.out.debug_rax_epoch(),
-+            0,
-+            "a non-opted-in target must never move the epoch"
-+        );
-+        // The consume returns the raw residency predicate and — critically —
-+        // must not panic, although the park epoch was never re-synced after
-+        // these lines.
-+        assert!(
-+            state.acc_has_verified(7, false),
-+            "residency predicate is unchanged for foreign targets"
-+        );
-+    }
-+
-+    /// Opting in (as the x86-64/i686 constructors do) is what arms the
-+    /// classifier: the same two lines that were inert above now move the
-+    /// epoch and make a stale park assert. Paired with
-+    /// `epoch_machinery_is_inert_without_target_opt_in`, this pins BOTH
-+    /// directions of the target gate.
-+    #[test]
-+    fn target_opt_in_arms_the_classifier() {
-+        let mut state = CodegenState::new();
-+        state.enable_rax_epoch_discipline();
-+        assert!(state.out.rax_epoch_active);
-+        state.park_acc(7, false);
-+        state.out.emit("    call foo");
-+        assert_ne!(
-+            state.out.debug_rax_epoch(),
-+            0,
-+            "an opted-in target classifies `call` as an implicit %rax write"
-+        );
-+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+            state.acc_has_verified(7, false);
-+        }));
-+        assert!(
-+            refused.is_err(),
-+            "on an opted-in target the stale park must be refused"
-+        );
-+    }
- }
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 0bd25d39..1d7c42f7 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -1296,8 +1296,12 @@ impl X86Codegen {
-     pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
-         let machinst_enabled = !ra_config.no_machinst;
-         let machinst_disabled_kinds = parse_machinst_disabled_kinds(&ra_config.mi_disable_kinds);
-+        let mut state = CodegenState::new_with_ra_config(ra_config);
-+        // x86-64 tracks the %rax accumulator through the shared generic
-+        // passes: arm the sink's shadow-epoch validator for this target.
-+        state.enable_rax_epoch_discipline();
-         Self {
--            state: CodegenState::new_with_ra_config(ra_config),
-+            state,
-             current_return_type: IrType::I64,
-             func_ret_classes: Vec::new(),
-             func_set_second_ret: false,
--- 
-2.47.3
-
-
-From 93d6f99f1606431c62a4c44f5ac4e14c626d8793 Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Sat, 26 Sep 2026 20:35:05 +0000
-Subject: [PATCH 2/5] ci: run the full suite and the SSA regression corpus with
- debug-assertions ON
-
-F5 fix (PR #637 audit): [profile.fastbuild] inherits release, so CI's
-'cargo test --profile fastbuild' compiled every debug_assert! out -
-including the %rax shadow-epoch validator and the GVN span-lockstep
-check. The enforcement patch shipped into a pipeline that compiled the
-enforcement away; the loud-failure story required someone to remember
-'-C debug-assertions' locally (exactly how the GVN drained-Vec bug was
-found, and exactly the discipline relic this machinery exists to
-eliminate).
-
-Two closing steps, both cheap where it matters and loud where it counts:
-
-1. 'Run tests (debug-assertions on)' re-runs the whole suite with
-   profile.fastbuild.debug-assertions=true via Cargo's --config
-   env-override (no Cargo.toml change: the shipped fastbuild build stays
-   assertion-free; incremental off and debuginfo 0 keep the run lean).
-
-2. 'Regression corpus (debug-assertions compiler)' rebuilds the compiler
-   binary with assertions ON and re-runs the SSA-validated corpus
-   against real codegen. This step is the one that matters: the unit
-   suite alone demonstrably does NOT drive every acc-cache dataflow -
-   on a scratch tree with operand_to_rax's const-arm invalidate_acc
-   deliberately deleted, 3550/3550 unit tests stayed green while the
-   corpus failed immediately. It runs LAST because the assertions-ON
-   binary overwrites target/fastbuild/lccc and no later step uses it.
-
-Acceptance demonstrated locally against the clean tree at commit
-a07d2ce8: assertions-ON corpus 797/797; after deleting that single
-invalidate_acc, the corpus fails 796+1 with 'panicked at
-src/backend/state.rs: x86 codegen: acc cache claims value 242 is
-resident in %rax, but the %rax shadow epoch moved since the park
-(117 -> 118): some emitter wrote %rax without invalidate_acc ... Last
-unclassified emitted line: None'.
----
- .github/workflows/ci.yml | 51 ++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 51 insertions(+)
-
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 868f5d41..d6ea92a8 100644
+index f807ce9..5b8de25 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
-@@ -65,6 +65,29 @@ jobs:
-         # fastbuild policy: opt-level 1 and no more than two Cargo jobs.
-         run: cargo test --profile fastbuild --all-targets --locked -j 2
- 
-+      # The fastbuild profile inherits `release`, which compiles every
-+      # debug_assert! OUT - and with them the mechanical enforcement this
-+      # repo's correctness story rests on: the %rax shadow-epoch validator
-+      # (`CodegenState::acc_has_verified`), the GVN span-lockstep check, and
-+      # every other debug-only invariant. That is how the GVN drained-Vec
-+      # bug survived the suite until someone remembered to run
-+      # `-C debug-assertions` locally (see its fix commit). This second
-+      # invocation re-runs the whole suite with debug-assertions forced ON
-+      # via Cargo's profile env-override (no Cargo.toml change, so the
-+      # shipped fastbuild build stays assertion-free). The dual-layout
-+      # exploratory emission and the epoch validator make this run ~1.3x
-+      # the wall clock of the step above; it is the only place CI can
-+      # observe the debug-only contract, so the cost is the point.
-+      - name: Run tests (debug-assertions on)
-+        env:
-+          CARGO_BUILD_JOBS: "2"
-+          RUSTFLAGS: -D warnings
-+        run: >-
-+          cargo test --profile fastbuild --all-targets --locked -j 2
-+          --config 'profile.fastbuild.debug-assertions=true'
-+          --config 'profile.fastbuild.incremental=false'
-+          --config 'profile.fastbuild.debug=0'
+@@ -631,6 +631,7 @@ jobs:
+           bash tests/regression/check_i686_atomics.sh
+           bash tests/regression/check_i686_tls_ie_relax.sh
+           bash tests/regression/check_i686_integer_isa_parity.sh
++          bash tests/regression/check_map_i64_two_lane.sh
+           bash tests/regression/check_fortify_diagnose_as.sh
+           bash tests/regression/check_asm_case_insensitive.sh
+           bash tests/regression/check_debug_info_flags.sh
+diff --git a/engineering/FOLLOWUP-2026-09-26-pr638-eh-frame-bounds.md b/engineering/FOLLOWUP-2026-09-26-pr638-eh-frame-bounds.md
+new file mode 100644
+index 0000000..d0ebe8b
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-26-pr638-eh-frame-bounds.md
+@@ -0,0 +1,28 @@
++# PR #638 follow-up: red-team of the shared `.eh_frame` reader
 +
-       # Record the exact host/toolchain contract beside the regression JSON.
-       # Hosted runners vary their GCC/binutils versions and exposed CPU flags;
-       # a failing native-code test is not diagnosable from an exit status alone.
-@@ -616,6 +639,34 @@ jobs:
-             --iters 64 \
-             --seed "$FUZZ_SEED"
- 
-+      # Every corpus gate above runs a compiler binary whose fastbuild
-+      # profile compiles debug_assertions OUT - so the %rax shadow-epoch
-+      # validator and every other debug-only invariant never observe real
-+      # codegen in CI. This closing step rebuilds the compiler with
-+      # assertions forced ON (profile env-override; distinct unit
-+      # fingerprints, so the earlier gates' artifacts stay cached) and
-+      # re-runs the SSA-validated regression corpus against real codegen.
-+      # It runs LAST deliberately: the assertions-ON binary overwrites the
-+      # target/fastbuild/lccc path, and no later step in this job uses it.
-+      # A missed invalidate_acc() on any corpus-covered dataflow now fails
-+      # CI here - loudly, naming the value, both epochs, and the last
-+      # unclassified emitted line.
-+      - name: Regression corpus (debug-assertions compiler)
-+        env:
-+          CCC_VALIDATE_SSA: "1"
-+          CARGO_BUILD_JOBS: "2"
-+          RUSTFLAGS: -D warnings
-+        run: |
-+          set -o pipefail
-+          CARGO_INCREMENTAL=0 cargo build --profile fastbuild --bin lccc --locked -j 2 \
-+            --config 'profile.fastbuild.debug-assertions=true' \
-+            --config 'profile.fastbuild.incremental=false' \
-+            --config 'profile.fastbuild.debug=0'
-+          python3 tests/regression/run_regression.py \
-+            --lccc target/fastbuild/lccc \
-+            -j 2 \
-+            --json regression-dbgassert-results.json 2>&1 | tee regression-dbgassert-results.log
++**Upstream base:** `8624a5d069f9473adeefdaae26378f69681d8bb4` (`origin/main`, fetched again on 2026-09-27; PR #639). The `.eh_frame` fix began on `a89e685` and was rebased cleanly onto the current base. **Scope:** the newly extended shared ELF `.eh_frame` reader in `src/backend/linker_common/eh_frame.rs`; the x86-64, i686, ARM and RISC-V executable linkers all call its FDE counter/header writer. This is a correctness and input-hardening change, **not** a demonstrated generated-code speedup.
 +
-   clippy:
-     name: Clippy
-     runs-on: ubuntu-latest
--- 
-2.47.3
-
-
-From 185c63602036bba3d410b88cca325f7aa8fabb2b Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Sat, 26 Sep 2026 21:01:28 +0000
-Subject: [PATCH 3/5] backend: close the last unscanned emit sink and
- machine-check sink coverage at the module handoff
-
-F2 fix (PR #637 audit): emit_cmp_zero_mem_sized completed its line with a
-raw buf push and no debug_scan_tail() - the one sink (verified by a
-mechanical sweep over all 38 AsmOutput methods) that falsified the
-"every public emit method ends in debug_scan_tail()" banner. Benign
-today (a compare writes flags only), but precisely the escape hatch the
-epoch validator exists to close: a future %rax-writing form of that
-method would have been invisible to the validator. The method now scans.
-
-Going one step further than fixing the cited sink: sink coverage is now
-MACHINE-CHECKED instead of promised. debug_scan_tail classifies every
-emitted-but-unclassified complete line from a scanned_len watermark (the
-old tail-only form silently lost lines when an emit carried an embedded
-newline, and re-counted nothing after the exploratory dual-layout
-truncation rewound the buffer - both now handled: the watermark rewinds
-with the truncation, and every complete line is classified exactly
-once). At the single module handoff in generate_module_with_debug,
-debug_assert_fully_scanned() asserts scanned_len == buf.len(): any
-future emit method that completes a line without a scan fails CI's
-assertions-ON corpus step naming its first offending line, instead of
-silently blinding the validator. Foreign-ISA targets return immediately
-(they never scan).
-
-Also fixed en route: the acc-epoch assertion's "Last unclassified
-emitted line" context always printed None - the AsmOutput field was
-declared but never written. The classifier now records the actual line
-text in a thread-local at the point of classification, and
-debug_last_unclassified surfaces it (owned return; the field is gone).
-
-Tests pin: cmp_zero_mem scans and moves no epoch; a raw unscanned push
-fails the handoff assert and is classified exactly once by the next
-scan; embedded-newline emits classify every line (pushq+popq = one
-bump); the diagnostic record carries the actual line. Full suite with
-debug-assertions active: 3554/3554 - the handoff assert runs inside
-every module-level codegen test with zero trips, proving no second sink
-lurks.
----
- src/backend/common.rs     | 230 ++++++++++++++++++++++++++++++++++----
- src/backend/generation.rs |  10 ++
- 2 files changed, 220 insertions(+), 20 deletions(-)
-
-diff --git a/src/backend/common.rs b/src/backend/common.rs
-index 9c2e0762..b7712040 100644
---- a/src/backend/common.rs
-+++ b/src/backend/common.rs
-@@ -1055,11 +1055,18 @@ pub struct AsmOutput {
-     /// scopes the semantics to the x86 family.
-     #[cfg(debug_assertions)]
-     pub(crate) rax_epoch_active: bool,
--    /// DEBUG-ONLY: the most recent line the analyzer could not classify, for
--    /// the assertion message. `None` once every emitted line was classified
--    /// by the table.
-+    /// DEBUG-ONLY: byte offset through which the sink's line classifier has
-+    /// consumed the buffer. `debug_scan_tail` classifies every complete line
-+    /// not yet covered (not just the last one — an emit may carry embedded
-+    /// newlines, and the exploratory dual-layout truncation rewinds the
-+    /// tail), so this and `buf.len()` differ exactly while a line is mid-
-+    /// construction. The module handoff asserts equality: "every public
-+    /// emit method ends in `debug_scan_tail()`" is machine-checked, not
-+    /// taken on trust — the escape-hatch class (`emit_cmp_zero_mem_sized`
-+    /// pushed complete lines without a scan) fails this assert by
-+    /// construction. Inert for non-opted-in targets (see `rax_epoch_active`).
-     #[cfg(debug_assertions)]
--    pub(crate) last_unclassified: Option<String>,
-+    pub(crate) scanned_len: usize,
- }
++## Reproducer and root cause
++
++A 32-byte input with a DWARF64 length escape (`ff ff ff ff`), an extended length of `u64::MAX`, and a nonzero CIE pointer at byte 12 made `count_eh_frame_fdes` return **1** on the upstream fastbuild although the purported FDE extends far beyond the input. `scan_eh_frame_records` and the header decoder independently computed `body + (length as usize)` without checking overflow; release arithmetic wrapped to an earlier offset. The new unit test `oversized_extended_record_is_not_an_fde` was **RED against upstream** (`left: 1, right: 0`), then GREEN after the change. Separately, unsigned/signed LEB decoders could accept a missing terminator, shift by >=64, and treat bytes in a later record as part of this record. FDE initial-location decoding likewise had only an input-buffer bound, not an **FDE-record** bound. A DWARF64 CIE was recognized by the counter but its `R` augmentation was ignored by the address decoder. A second independent red test, `invalid_cie_pointer_cannot_fabricate_a_header_entry`, showed that a damaged CIE pointer silently fell back to absolute addressing and placed a bogus function address into the header's binary-search table.
++
++## Changes and design rationale
++
++- `record_bounds`: one constant-space structural check shared by the counter, relocated FDE scanner and unrelocated GC scanner. Reject impossible lengths with `usize::try_from`, `checked_add`, per-record ID-width validation and a buffer bound; every accepted record advances strictly. Pass the already-read length through, avoiding redundant loads in the counting path. This is cheaper and less error-prone than independently patching three near-identical scanners.
++- Decode the CIE within its own validated boundaries, for both 32- and 64-bit DWARF record formats. Treat a truncated augmentation, misplaced `R` byte or unknown variable-length personality field as **invalid** rather than reading the next CIE. The CIE cache now distinguishes `Some(0)` (valid absolute encoding) from `None` (invalid pointer/CIE) and omits undecodable FDEs instead of inventing search-table entries. Use the version-1 one-byte return-address register rule; newer CIEs use ULEB. Do not change the decoded format of existing ordinary CIEs.
++- Bound both LEB readers to at most ten bytes and reject values outside their signed/unsigned 64-bit domains. Pass a slice ending at the **FDE**, not at the enclosing section, to `decode_eh_pointer`. A bad input is not proof of a codegen speedup; the gain is deterministic parsing and safe failure.
++- Tests: oversized record and invalid CIE pointer (both red/green), unsigned/signed LEB limits and truncation, valid DWARF64 CIE+FDE pcrel address on both ELF bitnesses, and a deterministic 2,048-case arbitrary-byte/extended-length corpus checking count/scan agreement, monotone in-bounds records and panic-free header builds for 32/64-bit targets. The legacy shared-reader tests and live x86-64/i686 unwinding test must remain green.
++
++## Evidence and limits
++
++- Rust 1.98.1, `scripts/build_lccc_fast.sh` (Rust `-O1`, `-j2`, warnings denied), **6 GiB active swap**: build green.
++- Current focused run: **14/14** `.eh_frame` tests and `tests/regression/check_eh_frame_unwind.sh`, including **i686** after installing multilib. CI history: first run **82 passed, 1 failed (rustfmt), 3 intentionally skipped**; after formatting, second run **83 passed, 0 failed, 3 skipped**, including 3,601 library tests (7 ignored), CFI invariants, both-mode unwinding, linker fuzz, GAS 2.47.20260726 differential and Clippy. The invalid-CIE fix was subsequently rebased onto PR #639 and the rebased **exact tree** passed fast CI independently: 83 passed, 0 failed, 3 skipped. Further changes (the separate I64 map optimization) need their own exact-tree CI stamp; do not treat the earlier stamp as validation of later edits. The *exact-tree* final verdict is captured by `target/ci_local.pass` and the `ci_gate` field of the external session ledger (`/home/user/artifacts/SNAPSHOT_LEDGER.md`); only a matching gated snapshot certifies delivery. A fast CI baseline *before* multilib/large swap failed due to the environment: the Rust lib-test compile was SIGKILLed with only 1 GiB swap, and a header from `libc6-dev-i386` was absent. Those prerequisites were installed; they are not silently counted as compiler fixes.
++- No target i7-14700KF, PMU or controlled Raptor Lake measurements exist here. No claim about GCC 16.2 / Clang 23.1 / ICX speed, all supported architecture runtimes, or general fuzz completeness is made. The system GAS is 2.44 and **was not used as an encoding oracle**; the CI assembler-differential gate provisions GAS 2.47 itself.
++
++## Next-agent queue (not completed in this session)
++
++1. Preserve a matching exact-tree `scripts/ci_local.sh --fast` stamp for **every delivered edit**; if a gate fails, retain its log and diagnose the defect rather than masking it. Run the full (slow) gates on an adequately provisioned host.
++2. Differentially exercise emitted `.eh_frame_hdr` entries against GNU ld 2.47, mold 2.42.1 and lld 23.1 using **well-formed and malformed** real objects for x86-64, i686, ARM and RISC-V. The native VM can run x86-64 and multilib i686; the other target runtimes need a cross-toolchain/QEMU. The mold 2.42.1 source confirms `-DMOLD_TARGETS='X86_64;I386'` in `tools/linker/setup_oracles.sh` is already the right narrowly-scoped CMake option; do not rename it speculatively. Download/build of all linker oracles and a complete glibc 2.44/kernel validation were not performed here.
++3. Remaining `eh_frame` policy/design question: this fix **skips** an FDE pointing to an invalid CIE. Decide whether malformed CIEs should make the **whole** input link fail instead; audit relocation handling and `.eh_frame_hdr` reservation, which counts structurally valid FDEs before decoding and can reserve more space than the table actually uses if an input CIE is invalid.
++4. Codegen is tracked separately in `FOLLOWUP-2026-09-27-map-i64-performance.md`. The GCC 16.2/Clang 23.1/ICC/ICX four-workload survey, four timed real-workload proxies, and a measured two-lane I64 map optimization are recorded there. VM timings are screening evidence, not hardware proof; outstanding Expat/SQLite gaps need further profiling before optimizing their hot paths.
++5. Investigate and measure other PR #638 areas (CFI state transfer through indirect branches; ARX latency; TCE side-effect screening; COMDAT signature handling), including malformed-input fuzzers, target-specific runtime unwinding and an independent linker differential. This focused follow-up is **not** a whole-codebase audit.
+diff --git a/engineering/FOLLOWUP-2026-09-27-map-i64-performance.md b/engineering/FOLLOWUP-2026-09-27-map-i64-performance.md
+new file mode 100644
+index 0000000..12c1cb9
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-27-map-i64-performance.md
+@@ -0,0 +1,43 @@
++# Follow-up: measured x86-64 I64 map lowering and remaining codegen gaps
++
++**Base:** upstream `origin/main` `8624a5d069f9473adeefdaae26378f69681d8bb4` (PR #639; fetched again 2026-09-27). The `.eh_frame` hardening was rebased onto this base; see `FOLLOWUP-2026-09-26-pr638-eh-frame-bounds.md`. This follow-up concerns **generated-code performance**, not an unwinder-speed claim. The patch is relative to this base, not to the old `a89e685` checkout.
++
++## Finding and change
++
++`VecSubI64x2` was already wired to x86-64 SSE2 `psubq` (VEX `vpsubq` when enabled), but the map analyzer rejected I64/U64 loads and stores. Simply admitting them under AVX2 would be **incorrect**: the map transform computed `32 / 8 = 4` elements per iteration while every I64 load/sub/store intrinsic handled only **two**. It would silently skip half the destination. No such transform was active before this change. Admit I64/U64 only on the **x86-64 target**, use 16-byte/two-lane XMM operations even with AVX2, and retain the original scalar fallback for i686 (whose backend cannot lower the register-based Vec*I64x2 family), NEON, SIMD-disabled targets, and shapes outside the existing conservative map grammar. The target permission is refreshed per translation unit rather than inferred from the compiler-host architecture. This enables subtraction, addition and supported existing elementwise operations without changing the arithmetic semantics or the alias/dependence guard.
++
++`tests/regression/map_i64_two_lane.c` checks every trip count from 0 through 259, unsigned 64-bit wraparound, operand order with invariant subtraction, untouched tails, and overlapping/shifted destinations against volatile scalar references. `check_map_i64_two_lane.sh`, installed as a **fast CI gate**, checks runtime output against both GCC and LCCC's `CCC_NO_MAP_VEC=1` control on `-march=x86-64-v3` and baseline `-march=x86-64`; pins `vpsubq`/`psubq` in the generated `sub64`, verifies that AVX2 did not accidentally use YMM, and assembles the **i686** control (`-m32 -msse2`) without a packed I64 map operation. The existing `vectorize_int_map_lanes.c` regression also exercises I64/U64 output against GCC under `-O3`. This is a target-specific, recoverable speed improvement; the switch permits an A/B and an emergency scalar fallback. After the change, `-O2 -march=x86-64-v3` assembly for each of the four existing gzip CRC32, zlib-ng Adler32, Expat XML scan and SQLite varint proxy programs was **byte-identical** between the default and `CCC_NO_MAP_VEC=1` control: this particular optimization does not change their codegen. A second seven-round correctness-checked runtime screen passed all four; the Expat LCCC/Clang paired ratio was 1.311 (pre-change 1.312), despite noisy absolute times. Saved output: `/home/user/research/workloads-map64-final.json`. This does not establish that unrelated map-heavy real programs have no regressions.
++
++## Reproducible A/B measurement
++
++Run from repository root after the `fastbuild` (`-O1`, `-j2`) build:
++
++```sh
++python3 scripts/bench_kernels.py --kernels map64_sub \
++  --lccc-alt-env CCC_NO_MAP_VEC=1 --reps 9 --inner 10000 \
++  --flags='-O2 -march=x86-64-v3' --save map64-bench.json
++bash tests/regression/check_map_i64_two_lane.sh
++```
++
++The committed deterministic kernel `tests/bench/k_map64_sub.c` performs 1,024 64-bit subtracts per `bench_run`, reads an output and mutates an input to prevent hoisting. The common reference-compiled driver, identical compiler flags, output check, CPU-0 pinning, interleaved arms and nine samples are handled by `bench_kernels.py`. In this **Xeon 2.60 GHz hypervisor VM**, with no usable PMU and no i7-14700KF, best-of-nine times were:
++
++| Arm | Time (ms) | Relative to LCCC scalar |
++| --- | ---: | ---: |
++| LCCC two-lane (new) | **1.601** | **1.61× faster** |
++| LCCC `CCC_NO_MAP_VEC=1` | 2.571 | baseline |
++| host GCC **14.2** | 0.910 | faster than the new LCCC path |
++| host Clang **19.1** | 1.301 | faster than the new LCCC path |
++
++Exact times and distinct timed-function code hashes are in `engineering/evidence/map64-bench-2026-09-27.json`; the harness refuses a result mismatch. The speed gain is **only this kernel on this VM**. It does not establish superiority over GCC/Clang, on different memory sizes, or on the user's i7-14700KF. The i686 lowering is deliberately scalar; the test compiles/assembles that target but does not time it. No regression on the four existing workloads was inferred from this synthetic microbenchmark.
++
++## Other workload and oracle evidence (pre-optimization tree)
++
++A four-workload paired-median screen with seven randomized, pinned rounds and output checks used `-O2 -march=x86-64-v3` and host GCC 14.2 / Clang 19.1. LCCC divided by the fastest reference: gzip CRC32 **0.879** (faster); zlib-ng Adler32 **1.094** (slower); Expat XML scan **1.312** (slower); SQLite varint **1.162** (slower). Expat and several others varied by >5% across rounds, so treat their ordering and magnitudes as *screening*, not a statistically robust hardware result. Source: `/home/user/research/workloads-pr639.json` and `.md` from `tests/benchmark/run_benchmarks.py`. An existing timed-kernel screen also gave Adler DO8 0.307 ms vs GCC 3.318 ms / Clang 3.223 ms, but memchr was 6.949 ms vs Clang 4.018 ms; no universal win is claimed. Different fixtures and timing protocols must not be merged into one aggregate.
++
++The **separate, untimed** Compiler Explorer survey (`scripts/codegen_oracle.py`, GCC **16.2**, Clang **23.1**, ICC, ICX; four workload files) found an Expat `main` count of 154 LCCC vs 94 GCC, predominantly corpus initialization: GCC emits two YMM stores per 60-byte fragment, whereas LCCC copies each byte. Switching both oracles to `-fPIE` gave 154 vs 98, so the gap is not solely a PIE/non-PIE addressing artifact. It is **not proof** that the initialization dominates the 64-pass scan. SQLite `sqlite_get_varint` was 121 vs 115 Clang instructions; a small count gap alone does not explain the measured whole-program difference. Survey artifacts: `/home/user/research/oracle-pr639.json`, `/home/user/research/expat-fpie/`. No GCC 16.2, Clang 23.1, ICC or ICX **runtime** timing was available; their oracle results are static assembly comparisons, not throughput claims.
++
++## Validation boundary and next investigation
++
++A rebased **pre-map-change** fast CI was 83 pass / 0 fail / 3 skip and was saved as S05. The first map-change fast CI exposed a missing **hosted CI mirror** for the new local gate (83 pass / 1 fail / 3 skip); the workflow was fixed, not bypassed. The next exact-tree run passed **84 / 0 / 3** and was snapshotted as S06. After this final documentation update, only the matching `target/ci_local.pass` and `/home/user/artifacts/SNAPSHOT_LEDGER.md` certify the delivered tree; do not substitute S05 or S06 for a later edit. The fast profile intentionally skips slow SSA/corpus/benchmark-output gates; a full slow CI, cross-target ARM/RISC-V runtime, full upstream zlib-ng/gzip/Expat/SQLite projects, glibc and kernel builds, native Raptor Lake PMU counters, and runtime linker-oracle differentials remain **unperformed**. The reported benchmark programs are realistic kernels/proxies, not full package builds.
++
++For further optimization, first localize Expat's 64-pass scan and SQLite's decoder using controlled per-function measurements and inspect their assembly/spill costs; do not optimize a `main` initialization merely because it has more static instructions. On the I64 map kernel, GCC 14.2 and Clang 19.1 remain faster: the two-lane limitation and scalar remainder/unrolling are candidates for profiling, **not** permission to change lane width without a complete 256-bit I64 intrinsic/ABI implementation and differential tests. Re-run exact-tree fast CI and atomically snapshot every validated change before any further experiment.
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index bc2a087..87f7979 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -73,7 +73,7 @@ How to gather data (mandatory):
+ | OPT-40 (historical) | **SUPERSEDED DETAIL** | The early post-dominance wording is retained as history only. Session 11 corrected it to the loop-entry rule, and OPT-42 now adds transactional length-aware atomic chain profitability. | `passes/expr_sink.rs` | **M/C** Sessions 11–13 | — | restoring post-dominance as a sink-frequency proof |
+ | TOOL-02 | **LANDED** | `scripts/perf_ab.py` — dynamic per-knob A/B for a noisy shared VM. Interference here is strictly ADDITIVE, so the **minimum** of N interleaved rounds is the right estimator and a median is biased upward by exactly the neighbour noise it should reject; that bias inverted a verdict in session 9. Also: empty-process-floor exclusion (the artifact that makes `fib` read as 23.8x when it is 149x), and stdout comparison between the two sides, which is how the `nbody` miscompile was caught | `scripts/perf_ab.py` | **C** landed | — | judging code motion by instruction count, or by a median on this machine |
+ | RA-32 | P2 | **FP copy-web coalescing** (`fp_copy_web_groups`) merges copy-connected scalar-FP webs so a reduction's combine→carry handoff stops bouncing through a slot. Adopted from Agent Z; its interference validation now fails **closed** on members with no recorded segment (it silently skipped them, i.e. "no data" read as "no interference"). Remaining: the merged leader's interval is the fat `[min start, max end]` while `attach_scan_segments` only sees the leader's own segments — verify the scan cannot place another value in a member's live hole | `backend/regalloc.rs` | **C** landed | leader segment coverage proven or made conservative | widening the web admission before that proof |
+-| VEC-10 | P1 | **Integer map lane ops landed** (`VecSub/And/Or/Xor I32x4|x8`, `VecSubI64x2`). Verified emitting `vpsubd`/`vpand`/`vpor`/`vpxor` on the corpus and hash-identical to GCC at -O0/-O2/-O3/-Os and on i686. Remaining: `VecSubI64x2` (`psubq`) is wired and correct but never selected — the 2-lane I64 map path does not admit the shape; find and widen the gate, or delete the op if the shape is unreachable | `passes/vectorize.rs`, `x86/codegen/intrinsics.rs` | **C** psubq count 0 on the corpus | psubq fires or the op is removed | leaving a wired-but-dead lowering |
++| VEC-10 | **LANDED (x86-64)** | Integer map lane ops now include `VecSubI64x2`: I64/U64 element maps admit 64-bit loads/stores only on x86-64, always advance by exactly **two** XMM lanes (including under AVX2), and leave i686 scalar. New GCC/scalar differential and 0..259/tail/overlap regression. | `passes/vectorize.rs`, `tests/regression/map_i64_two_lane.c` | **M/C** `k_map64_sub`: 1.601 ms vs scalar 2.571 ms (1.61x), GCC 0.910 ms and Clang 1.301 ms on the VM; `engineering/evidence/map64-bench-2026-09-27.json` | SSE2 `psubq`, AVX2 `vpsubq`, i686 scalar | Claiming parity with GCC, or widening to four lanes without 256-bit I64 lowering |
+ | VEC-11 | P1 | **All four strict min/max ternary forms now fold.** The missing one was `l < r ? r : l` -> `max(r, l)` — the clamp HEAD `x < 0 ? 0 : x`. With it, `x<0?0:x; x>1?1:x` lowers to `vmaxps`+`vminps` (4-instruction vector body); **GCC 14.2 does not vectorize that loop at all**. The exactness argument is operand ORDER: MIN/MAX return src2 on every special case (NaN, both-zero), so a strict ternary folds iff its FALSE arm is src2 | `passes/vectorize.rs` | **C** landed, unit + differential tests | — | folding non-strict `<=`/`>=` (they differ on +-0, and `<= ? r : l` on NaN) |
+ | VEC-12 | P0 | **Loop-carried value other than the IV is now rejected** in BOTH the map and stencil analyzers (fail-closed). Was a live miscompile: `for (i) { d[i]=a[i]*2; acc+=3; } return acc;` returned 3*(n/8) — 0 at n=1. Rejecting it in the map analyzer alone just handed the shape to the stencil analyzer, which miscompiled it identically. Remaining: re-admit these shapes by RECONSTRUCTING the secondary affine recurrence in the epilogue (`acc0 + n*step`, `base + n*stride`) instead of refusing them — a real vectorization opportunity currently left on the table | `passes/vectorize.rs` | **C** landed | secondary affine recurrences reconstructed, differential-clean | re-admitting without an epilogue reconstruction |
+ | CG-07 | P1 | **`-0.0` in static data no longer collapses to `.zero`.** The array emitter used `is_zero()` (C truthiness, under which -0.0 IS zero) to build `.zero N` runs, so `static const float t[]={-0.0f}` read back as +0.0f and `1/t[0]`, `signbit`, `copysign` and MINPS/MAXPS lane selection all observed the wrong value. New `IrConst::is_all_zero_bits()` is the object-representation predicate. Remaining: audit the other `is_zero()` call sites in emitters for the same confusion (the NULL-pointer test in `const_eval_global_addr.rs` is correct as-is) | `ir/constants.rs`, `backend/common.rs` | **C** landed, regression test | emitter `is_zero()` audit complete | using `is_all_zero_bits` where C truthiness is meant |
+diff --git a/engineering/evidence/map64-bench-2026-09-27.json b/engineering/evidence/map64-bench-2026-09-27.json
+new file mode 100644
+index 0000000..56595c1
+--- /dev/null
++++ b/engineering/evidence/map64-bench-2026-09-27.json
+@@ -0,0 +1,12 @@
++{
++  "map64_sub": {
++    "_hash_clang": "fd3add78e270075b",
++    "_hash_gcc": "f7dd282bdf26e3f2",
++    "_hash_lccc": "ec3b5e4ee0be604f",
++    "_hash_lccc-alt": "99ba0b9dc0043948",
++    "clang": 0.001300972,
++    "gcc": 0.000910122,
++    "lccc": 0.001601313,
++    "lccc-alt": 0.002570901
++  }
++}
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index c4019e9..f6316c9 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -302,6 +302,12 @@ gate "i686-atomics" fast \
+ gate "i686-integer-isa-parity" fast \
+     bash tests/regression/check_i686_integer_isa_parity.sh
  
- /// Write an i64 directly into a String buffer using manual digit extraction.
-@@ -1364,6 +1371,9 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
-                         c.push(token.to_string());
-                     }
-                 });
-+                LAST_UNCLASSIFIED_LINE.with(|c| {
-+                    *c.borrow_mut() = Some(line.to_string());
-+                });
-             }
-             true
++# The x86-64 64-bit map SIMD path must use two lanes (including AVX2),
++# match GCC and the scalar kill switch for all tails/overlaps, and decline
++# the i686 backend that cannot lower register-based Vec*I64x2 intrinsics.
++gate "map-i64-two-lane" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_map_i64_two_lane.sh
++
+ gate "fortify-diagnose-as" fast \
+     bash tests/regression/check_fortify_diagnose_as.sh
+ 
+diff --git a/src/backend/linker_common/eh_frame.rs b/src/backend/linker_common/eh_frame.rs
+index f7e0213..d10b17f 100644
+--- a/src/backend/linker_common/eh_frame.rs
++++ b/src/backend/linker_common/eh_frame.rs
+@@ -14,6 +14,28 @@
+ //!     i32 initial_location (relative to eh_frame_hdr start)
+ //!     i32 fde_address      (relative to eh_frame_hdr start)
+ 
++/// Bounds of one non-zero CIE/FDE record.  The length excludes its own
++/// 4/12-byte header and must include the 4/8-byte CIE pointer.  Check it
++/// against the *remaining input* before advancing any of the three walkers:
++/// a wrapping extended length used to invent FDEs and even move backwards.
++fn record_bounds(data: &[u8], pos: usize, length: u32) -> Option<(usize, usize, usize)> {
++    if data.len().checked_sub(pos)? < 4 {
++        return None;
++    }
++    let (body, id_size, size) = if length == u32::MAX {
++        let body = pos.checked_add(12)?;
++        if body > data.len() {
++            return None;
++        }
++        (body, 8, read_u64_le(data, pos + 4))
++    } else {
++        (pos.checked_add(4)?, 4, u64::from(length))
++    };
++    let size = usize::try_from(size).ok()?;
++    let end = body.checked_add(size)?;
++    (size >= id_size && end <= data.len()).then_some((body, end, id_size))
++}
++
+ /// Count the number of FDE entries in an .eh_frame section by scanning structure.
+ /// This only reads length and CIE_id fields, so it works on unrelocated data.
+ /// Used during layout to reserve space for .eh_frame_hdr (12 + 8 * count bytes).
+@@ -21,32 +43,18 @@ pub fn count_eh_frame_fdes(data: &[u8]) -> usize {
+     let mut count = 0;
+     let mut pos = 0;
+     while pos + 4 <= data.len() {
+-        let length = read_u32_le(data, pos) as u64;
++        let length = read_u32_le(data, pos);
+         if length == 0 {
+-            // Zero terminator from a merged input section; skip it
+-            pos += 4;
++            pos += 4; // terminator between concatenated input sections
+             continue;
          }
-@@ -1377,6 +1387,14 @@ thread_local! {
-     /// table can be extended; release builds never touch it.
-     static UNCLASSIFIED_MNEMONICS: std::cell::RefCell<Vec<String>> =
-         const { std::cell::RefCell::new(Vec::new()) };
-+    /// The most recent full line carrying an unclassified mnemonic, for the
-+    /// acc-epoch assertion's "last unclassified emitted line" context. The
-+    /// AsmOutput field of the same name was declared but never written (the
-+    /// assert message therefore always printed None); this thread-local is
-+    /// the actual source, recorded at the point of classification where the
-+    /// line text is at hand.
-+    static LAST_UNCLASSIFIED_LINE: std::cell::RefCell<Option<String>> =
-+        const { std::cell::RefCell::new(None) };
- }
+-        let (actual_length, header_size) = if length == 0xFFFFFFFF {
+-            if pos + 12 > data.len() {
+-                break;
+-            }
+-            (read_u64_le(data, pos + 4), 12usize)
+-        } else {
+-            (length, 4usize)
+-        };
+-        let entry_data_start = pos + header_size;
+-        let entry_end = entry_data_start + actual_length as usize;
+-        if entry_end > data.len() || entry_data_start + 4 > data.len() {
++        let Some((entry_data_start, entry_end, id_size)) = record_bounds(data, pos, length) else {
+             break;
+-        }
+-        let cie_id = if length == 0xFFFFFFFF {
+-            if entry_data_start + 8 > data.len() {
+-                break;
+-            }
++        };
++        let cie_id = if id_size == 8 {
+             read_u64_le(data, entry_data_start)
+         } else {
+-            read_u32_le(data, entry_data_start) as u64
++            u64::from(read_u32_le(data, entry_data_start))
+         };
+         if cie_id != 0 {
+             count += 1;
+@@ -131,55 +139,39 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
+     // rather than a HashMap because the distinct-CIE count is in the single
+     // digits for essentially every real input, where linear scan over a
+     // contiguous array beats hashing.
+-    let mut cie_cache: Vec<(usize, u8)> = Vec::new();
++    let mut cie_cache: Vec<(usize, Option<u8>)> = Vec::new();
  
- impl AsmOutput {
-@@ -1391,14 +1409,21 @@ impl AsmOutput {
-             #[cfg(debug_assertions)]
-             rax_epoch_active: false,
-             #[cfg(debug_assertions)]
--            last_unclassified: None,
-+            scanned_len: 0,
+     while pos + 4 <= data.len() {
+-        let length = read_u32_le(data, pos) as u64;
++        let length = read_u32_le(data, pos);
+         if length == 0 {
+-            // Zero terminator from a merged input section; skip it
+             pos += 4;
+             continue;
+         }
+-
+-        let is_extended = length == 0xFFFFFFFF;
+-        let (actual_length, header_size) = if is_extended {
+-            if pos + 12 > data.len() {
+-                break;
+-            }
+-            (read_u64_le(data, pos + 4), 12usize)
+-        } else {
+-            (length, 4usize)
+-        };
+-
+         let entry_start = pos;
+-        let entry_data_start = pos + header_size;
+-        let entry_end = entry_data_start + actual_length as usize;
+-        if entry_end > data.len() {
+-            break;
+-        }
+-
+-        // CIE_id field (4 or 8 bytes depending on extended)
+-        if entry_data_start + 4 > data.len() {
++        let Some((entry_data_start, entry_end, cie_id_field_size)) =
++            record_bounds(data, pos, length)
++        else {
+             break;
+-        }
+-        let cie_id = if is_extended {
+-            if entry_data_start + 8 > data.len() {
+-                break;
+-            }
++        };
++        // CIE id is zero; an FDE instead points backwards to its CIE.
++        let cie_id = if cie_id_field_size == 8 {
+             read_u64_le(data, entry_data_start)
+         } else {
+-            read_u32_le(data, entry_data_start) as u64
++            u64::from(read_u32_le(data, entry_data_start))
+         };
+-
+-        // CIE has cie_id == 0; FDE has cie_id != 0 (it's a pointer back to CIE)
+         if cie_id != 0 {
+             // This is an FDE
+             // The CIE_pointer is relative: entry_data_start - cie_id points to the CIE
+-            let cie_id_field_size = if is_extended { 8 } else { 4 };
+-            let cie_pos = (entry_data_start as u64).wrapping_sub(cie_id) as usize;
++            let Some(cie_pos) = usize::try_from(cie_id)
++                .ok()
++                .and_then(|back| entry_data_start.checked_sub(back))
++            else {
++                pos = entry_end;
++                continue;
++            };
+ 
+             // Parse the CIE to get the FDE encoding (memoised; see cie_cache)
+-            let fde_encoding = match cie_cache.iter().find(|&&(p, _)| p == cie_pos) {
++            let encoding = match cie_cache.iter().find(|&&(p, _)| p == cie_pos) {
+                 Some(&(_, enc)) => enc,
+                 None => {
+                     let enc = parse_cie_fde_encoding(data, cie_pos, is_64bit);
+@@ -187,10 +179,14 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
+                     enc
+                 }
+             };
++            let Some(fde_encoding) = encoding else {
++                pos = entry_end;
++                continue; // invalid CIE: never guess an FDE encoding
++            };
+ 
+             // After CIE_pointer comes: initial_location, address_range, ...
+             let iloc_offset = entry_data_start + cie_id_field_size;
+-            if iloc_offset + 4 > data.len() {
++            if entry_end - iloc_offset < 4 {
+                 pos = entry_end;
+                 continue;
+             }
+@@ -199,7 +195,7 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
+ 
+             // Decode initial_location based on the CIE's FDE encoding
+             let initial_location = decode_eh_pointer(
+-                data,
++                &data[..entry_end],
+                 iloc_offset,
+                 fde_encoding,
+                 base_vaddr + iloc_offset as u64,
+@@ -224,105 +220,97 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
+ 
+ /// Parse a CIE to extract the FDE pointer encoding (R augmentation).
+ ///
+-/// Returns the encoding byte, or 0x00 (DW_EH_PE_absptr) if not found.
+-fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, _is_64bit: bool) -> u8 {
+-    if cie_pos + 4 > data.len() {
+-        return 0x00;
+-    }
+-
+-    let length = read_u32_le(data, cie_pos) as u64;
+-    if length == 0 || length == 0xFFFFFFFF {
+-        return 0x00;
+-    }
+-
+-    let header_size = 4usize;
+-    let cie_data_start = cie_pos + header_size;
+-    let cie_end = cie_data_start + length as usize;
+-    if cie_end > data.len() {
+-        return 0x00;
+-    }
+-
+-    // CIE_id must be 0
+-    if cie_data_start + 4 > data.len() {
+-        return 0x00;
+-    }
+-    let cie_id = read_u32_le(data, cie_data_start);
+-    if cie_id != 0 {
+-        return 0x00;
++/// `Some(0)` means a valid absolute encoding; `None` means malformed input.
++fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, is_64bit: bool) -> Option<u8> {
++    if data
++        .len()
++        .checked_sub(cie_pos)
++        .is_none_or(|remaining| remaining < 4)
++    {
++        return None;
+     }
+-
+-    // version (1 byte)
+-    if cie_data_start + 5 > data.len() {
+-        return 0x00;
++    let Some((start, end, id_size)) = record_bounds(data, cie_pos, read_u32_le(data, cie_pos))
++    else {
++        return None;
++    };
++    let id = if id_size == 8 {
++        read_u64_le(data, start)
++    } else {
++        u64::from(read_u32_le(data, start))
++    };
++    if id != 0 {
++        return None;
+     }
+-    let _version = data[cie_data_start + 4];
++    let Some(&version) = data.get(start + id_size).filter(|_| start + id_size < end) else {
++        return None;
++    };
++    let aug_start = start + id_size + 1;
++    let Some(aug_len) = data[aug_start..end].iter().position(|&b| b == 0) else {
++        return None;
++    };
++    let aug = &data[aug_start..aug_start + aug_len];
++    let mut cur = aug_start + aug_len + 1;
++    let cie = &data[..end];
+ 
+-    // augmentation string (null-terminated)
+-    let aug_start = cie_data_start + 5;
+-    let mut aug_end = aug_start;
+-    while aug_end < cie_end && data[aug_end] != 0 {
+-        aug_end += 1;
++    // The return-address column is a byte in CIE v1, ULEB in v3/v4.
++    let Some((_, n)) = read_uleb128(cie, cur) else {
++        return None;
++    };
++    cur += n; // code alignment factor
++    let Some((_, n)) = read_sleb128(cie, cur) else {
++        return None;
++    };
++    cur += n; // data alignment factor
++    if version == 1 {
++        if cur >= end {
++            return None;
++        }
++        cur += 1;
++    } else {
++        let Some((_, n)) = read_uleb128(cie, cur) else {
++            return None;
++        };
++        cur += n;
+     }
+-    if aug_end >= cie_end {
+-        return 0x00;
++    if aug.first() != Some(&b'z') {
++        return Some(0x00); // default absolute-pointer encoding
+     }
+-    let aug_str: Vec<u8> = data[aug_start..aug_end].to_vec();
+-    let mut cur = aug_end + 1; // skip null terminator
+-
+-    // code_alignment_factor (ULEB128)
+-    let (_, n) = read_uleb128(data, cur);
+-    cur += n;
+-    // data_alignment_factor (SLEB128)
+-    let (_, n) = read_sleb128(data, cur);
+-    cur += n;
+-    // return_address_register (ULEB128)
+-    let (_, n) = read_uleb128(data, cur);
++    let Some((len, n)) = read_uleb128(cie, cur) else {
++        return None;
++    };
+     cur += n;
+-
+-    // Parse augmentation data
+-    if !aug_str.is_empty() && aug_str[0] == b'z' {
+-        // Augmentation data length (ULEB128)
+-        let (aug_data_len, n) = read_uleb128(data, cur);
+-        cur += n;
+-        let aug_data_end = cur + aug_data_len as usize;
+-
+-        // Walk augmentation string after 'z'
+-        for &ch in &aug_str[1..] {
+-            if cur >= aug_data_end {
+-                break;
++    let Some(aug_end) = usize::try_from(len)
++        .ok()
++        .and_then(|len| cur.checked_add(len))
++        .filter(|&e| e <= end)
++    else {
++        return None;
++    };
++    for &ch in &aug[1..] {
++        match ch {
++            b'R' => {
++                return data.get(cur).filter(|_| cur < aug_end).copied();
+             }
+-            match ch {
+-                b'R' => {
+-                    // FDE encoding
+-                    if cur < data.len() {
+-                        return data[cur];
+-                    }
+-                    return 0x00;
+-                }
+-                b'L' => {
+-                    // LSDA encoding (skip 1 byte)
+-                    cur += 1;
+-                }
+-                b'P' => {
+-                    // Personality encoding + pointer
+-                    if cur >= data.len() {
+-                        return 0x00;
+-                    }
+-                    let enc = data[cur];
+-                    cur += 1;
+-                    let ptr_size = eh_pointer_size(enc, _is_64bit);
+-                    cur += ptr_size;
+-                }
+-                b'S' | b'B' => {
+-                    // Signal frame / has ABI tag - no data
++            b'L' => cur += 1,
++            b'P' => {
++                let Some(&enc) = data.get(cur).filter(|_| cur < aug_end) else {
++                    return None;
++                };
++                cur += 1;
++                let size = eh_pointer_size(enc, is_64bit);
++                if size == 0 {
++                    return None; // variable-length personality: cannot locate R
+                 }
+-                _ => break,
++                cur += size;
+             }
++            b'S' | b'B' => {} // no augmentation data
++            _ => return None,
++        }
++        if cur > aug_end {
++            return None;
          }
      }
+-
+-    // Default: absolute pointer encoding
+-    0x00
++    Some(0x00)
+ }
  
--    /// DEBUG-ONLY: classify the just-completed line and bump the shadow
--    /// epoch when it writes any part of %rax. A no-op compiled out of
--    /// release builds (the call sites stay unconditional; this body
-+    /// DEBUG-ONLY: classify every emitted-but-not-yet-classified complete
-+    /// line and bump the shadow epoch for each %rax write. A no-op compiled
-+    /// out of release builds (the call sites stay unconditional; this body
-     /// collapses to nothing).
-+    ///
-+    /// Multi-line by design: a scan call covers everything from the last
-+    /// scanned offset, so a method that pushes two lines before scanning,
-+    /// or an `emit` carrying an embedded newline, is classified exactly
-+    /// once per line instead of silently losing the earlier ones. The tail
-+    /// form ("classify just the line just completed") is subsumed: the
-+    /// common case is exactly one pending line.
-     #[inline]
-     pub(crate) fn debug_scan_tail(&mut self) {
-         #[cfg(debug_assertions)]
-@@ -1411,18 +1436,62 @@ impl AsmOutput {
-             if !self.rax_epoch_active {
-                 return;
-             }
--            let buf = &self.buf;
--            if buf.is_empty() || !buf.ends_with('\n') {
-+            // The exploratory dual-layout emission truncates the buffer and
-+            // re-emits from the mark; the replaced tail was already counted,
-+            // so rewind the scan offset to the truncation point.
-+            if self.scanned_len > self.buf.len() {
-+                self.scanned_len = self.buf.len();
+ /// Decode an eh_frame pointer value based on its encoding.
+@@ -357,7 +345,7 @@ fn decode_eh_pointer(
+         }
+         0x01 => {
+             // DW_EH_PE_uleb128
+-            let (v, _) = read_uleb128(data, offset);
++            let (v, _) = read_uleb128(data, offset)?;
+             (v as i64, 0)
+         }
+         0x02 => {
+@@ -386,7 +374,7 @@ fn decode_eh_pointer(
+         }
+         0x09 => {
+             // DW_EH_PE_sleb128
+-            let (v, _) = read_sleb128(data, offset);
++            let (v, _) = read_sleb128(data, offset)?;
+             (v, 0)
+         }
+         0x0A => {
+@@ -459,46 +447,32 @@ fn write_i32_le(data: &mut [u8], off: usize, val: i32) {
+     data[off..off + 4].copy_from_slice(&b);
+ }
+ 
+-fn read_uleb128(data: &[u8], mut off: usize) -> (u64, usize) {
+-    let start = off;
+-    let mut result = 0u64;
+-    let mut shift = 0;
+-    loop {
+-        if off >= data.len() {
+-            return (result, off - start);
+-        }
+-        let byte = data[off];
+-        off += 1;
+-        result |= ((byte & 0x7F) as u64) << shift;
++/// Bounded LEB readers: malformed inputs must not truncate modulo 64 bits or
++/// borrow bytes from the next CIE/FDE.  A 64-bit number needs at most 10 bytes.
++fn read_uleb128(data: &[u8], off: usize) -> Option<(u64, usize)> {
++    let mut result = 0u128;
++    for (i, &byte) in data.get(off..)?.iter().take(10).enumerate() {
++        result |= u128::from(byte & 0x7f) << (i * 7);
+         if byte & 0x80 == 0 {
+-            break;
++            return Some((u64::try_from(result).ok()?, i + 1));
+         }
+-        shift += 7;
+     }
+-    (result, off - start)
++    None
+ }
+ 
+-fn read_sleb128(data: &[u8], mut off: usize) -> (i64, usize) {
+-    let start = off;
+-    let mut result = 0i64;
+-    let mut shift = 0;
+-    let mut byte;
+-    loop {
+-        if off >= data.len() {
+-            return (result, off - start);
+-        }
+-        byte = data[off];
+-        off += 1;
+-        result |= ((byte & 0x7F) as i64) << shift;
+-        shift += 7;
++fn read_sleb128(data: &[u8], off: usize) -> Option<(i64, usize)> {
++    let mut result = 0i128;
++    for (i, &byte) in data.get(off..)?.iter().take(10).enumerate() {
++        let shift = (i + 1) * 7;
++        result |= i128::from(byte & 0x7f) << (i * 7);
+         if byte & 0x80 == 0 {
+-            break;
++            if byte & 0x40 != 0 {
++                result |= -1i128 << shift;
 +            }
-+            let start = self.scanned_len;
-+            if start >= self.buf.len() {
-                 return;
-             }
--            let end = buf.len() - 1;
--            let start = match buf[..end].rfind('\n') {
--                Some(p) => p + 1,
--                None => 0,
--            };
--            if end > start && asm_line_writes_rax(&buf[start..end]) {
--                self.rax_write_epoch += 1;
-+            let mut writes = 0u64;
-+            let mut end = start;
-+            for line in self.buf[start..].split_inclusive('\n') {
-+                if let Some(complete) = line.strip_suffix('\n') {
-+                    if asm_line_writes_rax(complete) {
-+                        writes += 1;
-+                    }
-+                    end += line.len();
-+                }
-+                // A trailing fragment without its newline is mid-construction;
-+                // its completer's scan classifies it.
-             }
-+            self.rax_write_epoch += writes;
-+            self.scanned_len = end;
-+        }
++            return Some((i64::try_from(result).ok()?, i + 1));
+         }
+     }
+-    if shift < 64 && byte & 0x40 != 0 {
+-        result |= -(1i64 << shift);
+-    }
+-    (result, off - start)
++    None
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -540,27 +514,15 @@ pub fn scan_eh_frame_records(data: &[u8]) -> Vec<EhFrameRecord> {
+     let mut out = Vec::new();
+     let mut pos = 0usize;
+     while pos + 4 <= data.len() {
+-        let length = read_u32_le(data, pos) as u64;
++        let length = read_u32_le(data, pos);
+         if length == 0 {
+-            // Zero terminator (input sections are concatenated with padding).
+             pos += 4;
+             continue;
+         }
+-        let is_extended = length == 0xFFFF_FFFF;
+-        let (actual_length, header_size, id_size) = if is_extended {
+-            if pos + 12 > data.len() {
+-                break;
+-            }
+-            (read_u64_le(data, pos + 4), 12usize, 8usize)
+-        } else {
+-            (length, 4usize, 4usize)
+-        };
+-        let data_start = pos + header_size;
+-        let end = data_start + actual_length as usize;
+-        if end > data.len() || data_start + id_size > data.len() {
++        let Some((data_start, end, id_size)) = record_bounds(data, pos, length) else {
+             break;
+-        }
+-        let cie_id = if is_extended {
++        };
++        let cie_id = if id_size == 8 {
+             read_u64_le(data, data_start)
+         } else {
+             read_u32_le(data, data_start) as u64
+@@ -906,7 +868,8 @@ mod tests {
+             ]);
+             if id != 0 {
+                 let cie_pos = id_off - id as usize;
+-                let enc = parse_cie_fde_encoding(data, cie_pos, true);
++                let enc = parse_cie_fde_encoding(data, cie_pos, true)
++                    .expect("reference CIE must be valid");
+                 let iloc_off = id_off + 4;
+                 if let Some(v) =
+                     decode_eh_pointer(data, iloc_off, enc, base_vaddr + iloc_off as u64, true)
+@@ -1277,6 +1240,124 @@ mod tests {
+         assert_eq!(count_eh_frame_fdes(&objects[0].section_data[0]), 2);
+     }
+ 
++    /// A damaged CIE pointer must not turn a PC-relative FDE into an
++    /// apparently valid *absolute* PC and poison the header's search table.
++    #[test]
++    fn invalid_cie_pointer_cannot_fabricate_a_header_entry() {
++        let mut data = synth_eh_frame(1, PCREL_SDATA4);
++        let id_off = scan_eh_frame_records(&data)[1].id_offset;
++        data[id_off..id_off + 4].copy_from_slice(&1u32.to_le_bytes());
++        assert!(parse_eh_frame_fdes(&data, 0x400000, true).is_empty());
++        let hdr = build_eh_frame_hdr(&data, 0x400000, 0x3f0000, true);
++        assert_eq!(&hdr[8..12], &0u32.to_le_bytes());
 +    }
 +
-+    /// DEBUG-ONLY: assert that every byte pushed to the buffer has been
-+    /// classified — i.e. no emit method completed a line without a
-+    /// `debug_scan_tail()`. Called once at the module handoff, where the
-+    /// buffer is final. This is the mechanical form of the "every public
-+    /// emit method ends in `debug_scan_tail()`" banner: a future sink that
-+    /// pushes lines without scanning fails here instead of silently
-+    /// blinding the epoch validator. Scoped to opted-in targets (foreign
-+    /// ISAs never scan by design).
-+    #[inline]
-+    pub(crate) fn debug_assert_fully_scanned(&self) {
-+        #[cfg(debug_assertions)]
-+        {
-+            if !self.rax_epoch_active {
-+                return;
-+            }
++    /// Extended lengths must be checked *before* converting/adding them.
++    /// On 64-bit release builds this length wraps the end offset to 11:
++    /// an FDE is counted even though its record is outside the input.
++    #[test]
++    fn oversized_extended_record_is_not_an_fde() {
++        let mut data = vec![0u8; 32];
++        data[..4].copy_from_slice(&u32::MAX.to_le_bytes());
++        data[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
++        data[12..20].copy_from_slice(&1u64.to_le_bytes());
++        assert_eq!(count_eh_frame_fdes(&data), 0);
++        assert!(scan_eh_frame_records(&data).is_empty());
++        assert!(parse_eh_frame_fdes(&data, 0x400000, true).is_empty());
++    }
++
++    /// Long or truncated LEBs from an object must not panic the linker or
++    /// be interpreted as a truncated, apparently valid pointer/length.
++    #[test]
++    fn malformed_leb_does_not_panic() {
++        for data in [vec![0x80; 11], vec![0xff; 10], vec![0x80; 1]] {
++            assert_eq!(read_uleb128(&data, 0), None);
++            assert_eq!(read_sleb128(&data, 0), None);
++        }
++        let mut unsigned_max = vec![0xff; 9];
++        unsigned_max.push(1);
++        assert_eq!(read_uleb128(&unsigned_max, 0), Some((u64::MAX, 10)));
++        let mut signed_min = vec![0x80; 9];
++        signed_min.push(0x7f);
++        assert_eq!(read_sleb128(&signed_min, 0), Some((i64::MIN, 10)));
++        assert_eq!(read_uleb128(&[0xff; 9], 0), None);
++        assert_eq!(read_sleb128(&[0xff; 9], 0), None);
++    }
++
++    #[test]
++    fn extended_cie_fde_uses_its_own_encoding() {
++        // DWARF64 .eh_frame, CIE v1 with zR augmentation and pcrel/sdata4.
++        // Both structural scan and relocated decode must agree on the FDE.
++        let mut data = Vec::new();
++        let cie = [
++            0u8, 0, 0, 0, 0, 0, 0, 0, // 8-byte CIE id
++            1, b'z', b'R', 0, 1, 0x78, 16, 1, 0x1b,
++        ];
++        data.extend(u32::MAX.to_le_bytes());
++        data.extend((cie.len() as u64).to_le_bytes());
++        data.extend(cie);
++        let fde_start = data.len();
++        data.extend(u32::MAX.to_le_bytes());
++        data.extend(16u64.to_le_bytes()); // 8-byte CIE pointer + 4 + 4
++        data.extend(((fde_start + 12) as u64).to_le_bytes());
++        data.extend(0x100i32.to_le_bytes()); // PC-relative initial location
++        data.extend(4u32.to_le_bytes());
++        assert_eq!(count_eh_frame_fdes(&data), 1);
++        let records = scan_eh_frame_records(&data);
++        assert_eq!(records.len(), 2);
++        assert_eq!(records[1].iloc_offset, Some(fde_start + 20));
++        for is_64bit in [true, false] {
++            let fdes = parse_eh_frame_fdes(&data, 0x400000, is_64bit);
++            assert_eq!(fdes.len(), 1);
 +            assert_eq!(
-+                self.scanned_len,
-+                self.buf.len(),
-+                "x86 codegen: {} unclassified output byte(s) at module handoff — an emit \
-+                 method pushed a complete line without debug_scan_tail(). The epoch \
-+                 validator is blind to that text; route the push through a scanned \
-+                 emit method (first offender from the handoff point: {:?}).",
-+                self.buf.len() - self.scanned_len,
-+                self.buf[self.scanned_len..].lines().next(),
++                fdes[0].initial_location,
++                0x400000 + fde_start as u64 + 20 + 0x100
 +            );
 +        }
-+        #[cfg(not(debug_assertions))]
-+        {
-+            let _ = self;
-         }
-     }
- 
-@@ -1440,11 +1509,15 @@ impl AsmOutput {
-     }
- 
-     /// DEBUG-ONLY: the most recent unclassified line, for diagnostics.
-+    /// Sourced from the classifier's thread-local record: the
-+    /// `last_unclassified` field this used to read was declared but never
-+    /// written, so the assertion's context always printed None. Owned
-+    /// return: the thread-local borrow cannot outlive `with`.
-     #[inline]
--    pub(crate) fn debug_last_unclassified(&self) -> Option<&str> {
-+    pub(crate) fn debug_last_unclassified(&self) -> Option<String> {
-         #[cfg(debug_assertions)]
-         {
--            self.last_unclassified.as_deref()
-+            LAST_UNCLASSIFIED_LINE.with(|c| c.borrow().clone())
-         }
-         #[cfg(not(debug_assertions))]
-         {
-@@ -1569,6 +1642,14 @@ impl AsmOutput {
-             write_i64_fast(&mut self.buf, offset);
-             self.buf.push_str("(%rbp)\n");
-         }
-+        // This method is the sink that falsified the "every public emit
-+        // method ends in debug_scan_tail()" banner (PR #637 audit, F2): a
-+        // completed line without a scan is a line the epoch validator is
-+        // blind to — and `debug_assert_fully_scanned` now fails the module
-+        // handoff if any such sink exists. Today the line is a `cmp` (flags
-+        // only, no %rax write); the scan is what keeps that true
-+        // mechanically if the method ever grows a %rax-writing form.
-+        self.debug_scan_tail();
-     }
- 
-     /// Emit: `    {mnemonic} %{reg}, {offset}(%rbp)` (or rsp-relative when frame pointer omitted)
-@@ -3476,7 +3557,7 @@ mod value_type_map_tests {
- 
- #[cfg(test)]
- mod rax_epoch_analyzer_tests {
--    use super::asm_line_writes_rax;
-+    use super::{AsmOutput, asm_line_writes_rax};
- 
-     #[test]
-     fn explicit_destination_writes() {
-@@ -3593,3 +3674,112 @@ mod rax_epoch_analyzer_tests {
-         assert!(!asm_line_writes_rax("Lfoo:"));
-     }
- }
-+
-+#[cfg(all(test, debug_assertions))]
-+mod rax_epoch_sink_coverage_tests {
-+    use super::{AsmOutput, asm_line_writes_rax};
-+
-+    /// F2 regression (PR #637 audit): `emit_cmp_zero_mem` used to complete
-+    /// its line WITHOUT a `debug_scan_tail()` — the one sink that falsified
-+    /// the "every public emit method ends in debug_scan_tail()" banner. The
-+    /// contract now: the method scans (so a future %rax-writing form of it
-+    /// cannot slip past the epoch validator), the epoch does not move (a
-+    /// compare writes flags only), and the module-handoff completeness
-+    /// assert (`debug_assert_fully_scanned`) sees full byte coverage.
-+    #[test]
-+    fn cmp_zero_mem_is_scanned_and_moves_no_epoch() {
-+        let mut out = AsmOutput::new();
-+        out.rax_epoch_active = true;
-+        let before = out.debug_rax_epoch();
-+        out.emit("    movq %rbx, %rax"); // a real write first
-+        let after_write = out.debug_rax_epoch();
-+        assert_eq!(after_write, before + 1);
-+        out.emit_cmp_zero_mem(-16);
-+        out.emit_cmp_zero_mem_sized(-24, "cmpq");
-+        assert_eq!(
-+            out.debug_rax_epoch(),
-+            after_write,
-+            "compares write flags only — the epoch must not move"
-+        );
-+        // Byte coverage: nothing pending at handoff time.
-+        out.debug_assert_fully_scanned();
++        // Truncate inside the FDE's location: it must not borrow bytes from
++        // a later record even if the input slice contains them.
++        let short = &data[..fde_start + 12];
++        assert_eq!(count_eh_frame_fdes(short), 0);
++        assert!(parse_eh_frame_fdes(short, 0x400000, true).is_empty());
 +    }
 +
-+    /// The completeness assert catches the escape-hatch class by
-+    /// construction: a raw buf push of a complete line without any scan
-+    /// leaves unscanned bytes that the handoff assert refuses, and the
-+    /// next scan covers them (no double-count).
++    /// Deterministic length/pointer fuzzing of the three independent EH
++    /// walkers.  An invalid record cannot cause a backwards scan, fabricate
++    /// an FDE, index another record, or trap on an oversized LEB.
 +    #[test]
-+    fn unscanned_sink_is_caught_and_next_scan_recovers() {
-+        let mut out = AsmOutput::new();
-+        out.rax_epoch_active = true;
-+        out.emit("    movq $1, %rax");
-+        let scanned_ok = out.scanned_len;
-+        // Simulate the F2 class: a raw complete-line push, no scan.
-+        out.buf.push_str("    movq $2, %rax\n");
-+        let epoch_before = out.debug_rax_epoch();
-+        assert_eq!(epoch_before, 1, "the raw push is invisible until scanned");
-+        // The handoff assert must refuse.
-+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+            out.debug_assert_fully_scanned();
-+        }));
-+        assert!(refused.is_err(), "unscanned bytes must fail the handoff");
-+        // A subsequent scan classifies the pending line exactly once.
-+        out.emit("    movq %rbx, %rcx"); // benign line, triggers the scan
-+        assert_eq!(
-+            out.debug_rax_epoch(),
-+            2,
-+            "the pending write is counted once"
-+        );
-+        assert_eq!(
-+            out.scanned_len,
-+            scanned_ok + "    movq $2, %rax\n".len() + "    movq %rbx, %rcx\n".len()
-+        );
-+        out.debug_assert_fully_scanned();
-+    }
-+
-+    /// An `emit` carrying an embedded newline classifies BOTH lines (the
-+    /// old tail-only scan silently lost the first).
-+    #[test]
-+    fn embedded_newline_emits_classify_every_line() {
-+        let mut out = AsmOutput::new();
-+        out.rax_epoch_active = true;
-+        out.emit("    pushq %rax\n    popq %rax");
-+        assert_eq!(
-+            out.debug_rax_epoch(),
-+            1,
-+            "pushq reads (NEVER table), popq writes — exactly one epoch bump"
-+        );
-+        out.debug_assert_fully_scanned();
-+    }
-+
-+    /// The classifier records the full line text for an unknown mnemonic
-+    /// with a rax-shaped destination, and `debug_last_unclassified`
-+    /// surfaces it (the previously-dead diagnostic now carries data).
-+    #[test]
-+    fn unknown_mnemonic_line_is_recorded_for_diagnostics() {
-+        // NB: the probe must avoid the f- prefix (x87 quiet rule) and j-
-+        // prefix (jump family) — any other unknown token is fail-loud.
-+        assert!(asm_line_writes_rax("    zbork %rax"));
-+        let recorded = AsmOutput::new().debug_last_unclassified();
-+        assert_eq!(
-+            recorded.as_deref(),
-+            // The classifier trims leading indentation before analysis and
-+            // records the trimmed form (no indentation noise in diagnostics).
-+            Some("zbork %rax"),
-+            "the assertion's last-line context must name the actual line"
-+        );
-+        assert!(!asm_line_writes_rax("    zbork %rbx"));
-+        // The record holds the most recent line classified through the
-+        // generic dest-last rule whose token is outside the explicit
-+        // tables — by design, since that rule is what covers the regular
-+        // vocabulary (mov/add/...), and a NEW vocabulary member appearing
-+        // here is the signal to audit it into a table.
-+        assert!(asm_line_writes_rax("    movq %rbx, %rax"));
-+        assert_eq!(
-+            AsmOutput::new().debug_last_unclassified().as_deref(),
-+            Some("movq %rbx, %rax"),
-+            "the most recent generic-rule line is what the assertion names"
-+        );
-+    }
-+}
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 5e71dffc..3bb029e7 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -3456,6 +3456,16 @@ pub fn generate_module(
-     // (the count check would catch it, but draining closes the class).
-     crate::passes::block_layout::clear_chain_candidates();
- 
-+    // Debug-only mechanical closure of the sink-coverage invariant: every
-+    // byte the backends emitted was classified by the shadow-epoch scanner.
-+    // An emit method that completes a line without debug_scan_tail() (the
-+    // emit_cmp_zero_mem_sized escape hatch the PR #637 audit found) fails
-+    // HERE, at the only point where "nothing else will touch the buffer"
-+    // is guaranteed, instead of silently blinding the validator to its
-+    // text. Release builds compile this away with the rest of the epoch
-+    // machinery; foreign-ISA targets return immediately (they never scan).
-+    cg.state().out.debug_assert_fully_scanned();
-+
-     std::mem::take(&mut cg.state().out.buf)
- }
- 
--- 
-2.47.3
-
-
-From 1c085a00d93ebacd151e8b1aae152beae0f6ebaa Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Sat, 26 Sep 2026 21:30:47 +0000
-Subject: [PATCH 4/5] test: serialize the backend tri-state flag windows and
- restore the true previous state
-
-F3 fix (PR #637 audit): the flag flip tests
-(set_commuted_acc_for_tests / set_hidden_read_copy_chain_for_tests)
-flipped a process-global atomic by hand and restored a FORCED state:
-set(false); run; set(true) leaked "forced ON" past any assertion
-failure between the pair (nothing restores on panic), and even on the
-success path the restore target was wrong - the tri-state contract is
--1 = env-follow, so a suite run with CCC_NO_COMMUTED_ACC or
-CCC_HIDDEN_READ_COPY_CHAIN set produced outcomes that depended on test
-order. Nothing serialized the windows either: cargo runs tests on a
-shared thread pool, so a flip window was concurrent with every other
-test reading the flag.
-
-This adopts the repo's existing test_support discipline (the module
-exists precisely because hand-restored shared state leaks under the
-pool) for the backend flags:
-
-- test_support::BACKEND_FLAG_LOCK: one process-wide lock for both
-  override atomics (module-local locks would serialize each module
-  against itself and nothing else), with ENV_WINDOW_DEPTH-style
-  reentrancy (a precise-mode pin held across asserts while a
-  conservative window scopes a second compute is a real shape).
-- test_support::TriStateFlagWindow: sets the atomic on acquire, restores
-  the PREVIOUS value on drop - panic-safe, correct across env contexts,
-  holding the lock for its whole lifetime so flip windows are mutually
-  exclusive.
-- The three flip tests use windows; the flag-shaped default-mode tests
-  (commuted-RHS eligibility, narrow-width M2 coverage, precise
-  hidden-read walk) pin the mode they assert (forced-commuted /
-  forced-precise) so their outcome no longer depends on the environment
-  or on scheduling. The hand-rolled bool setters are gone.
-
-Acceptance: cargo test -- --test-threads=8 green repeatedly in ALL FOUR
-env contexts (knobs unset, NO_COMMUTED_ACC set, HIDDEN_READ_COPY_CHAIN
-set, both set) - previously the knob-set runs were order-dependent;
-the bisection knobs keep working for real compilations.
----
- src/backend/liveness.rs                     | 40 +++++++++---
- src/backend/stack_layout/copy_coalescing.rs | 34 +++++++---
- src/test_support.rs                         | 69 +++++++++++++++++++++
- 3 files changed, 125 insertions(+), 18 deletions(-)
-
-diff --git a/src/backend/liveness.rs b/src/backend/liveness.rs
-index e37a6281..3c8c6b2c 100644
---- a/src/backend/liveness.rs
-+++ b/src/backend/liveness.rs
-@@ -1383,12 +1383,6 @@ static HIDDEN_READ_COPY_CHAIN_ENV: std::sync::OnceLock<bool> = std::sync::OnceLo
- static HIDDEN_READ_COPY_CHAIN_OVERRIDE: std::sync::atomic::AtomicI8 =
-     std::sync::atomic::AtomicI8::new(-1);
- 
--/// Test-only override for [`hidden_read_copy_chain_enabled`].
--#[cfg(test)]
--fn set_hidden_read_copy_chain_for_tests(follow: bool) {
--    HIDDEN_READ_COPY_CHAIN_OVERRIDE.store(follow as i8, std::sync::atomic::Ordering::Relaxed);
--}
--
- /// Extend `start_id` and (when `follow_copies`) every Copy-chain source (all
- /// phi-elim preds) to `point`.
- ///
-@@ -2566,6 +2560,12 @@ mod tests {
-         let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-         hidden.insert(4, vec![6]);
-         hidden.insert(5, vec![8]);
-+        // Pin FORCED-PRECISE for this assertion: the outcome is the precise
-+        // walk contract, which must hold regardless of any bisection env
-+        // knob; this also serializes the test against the flip windows on
-+        // the shared backend-flag lock (see test_support::TriStateFlagWindow).
-+        let _pin =
-+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
-         let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
-         let covers = |r: &LivenessResult, v: u32, p: u32| {
-             r.segments
-@@ -2618,9 +2618,13 @@ mod tests {
-         );
-         // The conservative chain walk (bisection knob) still pins the pred:
-         // the model difference is statable, not accidental.
--        set_hidden_read_copy_chain_for_tests(true);
-+        // Tri-state window: forces the conservative walk for the compute
-+        // below and restores the previous override state (-1 env-follow)
-+        // on drop — panic-safe and order-independent under the shared
-+        // backend-flag lock (see test_support::TriStateFlagWindow).
-+        let _conservative =
-+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 1);
-         let conservative = compute_live_intervals_with_hidden_reads(&func, &hidden);
--        set_hidden_read_copy_chain_for_tests(false);
-         assert!(
-             covers(&conservative, 3, 8),
-             "conservative chain walk pins the entry pred at the access"
-@@ -2680,6 +2684,12 @@ mod tests {
- 
-         let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-         hidden.insert(4, vec![6]);
-+        // Pin FORCED-PRECISE for this assertion: the outcome is the precise
-+        // walk contract, which must hold regardless of any bisection env
-+        // knob; this also serializes the test against the flip windows on
-+        // the shared backend-flag lock (see test_support::TriStateFlagWindow).
-+        let _pin =
-+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
-         let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
-         let covers = |r: &LivenessResult, v: u32, p: u32| {
-             r.segments
-@@ -2712,9 +2722,13 @@ mod tests {
-         // The same covering property under the conservative chain walk —
-         // the model difference is the COST (the pred is pinned to the
-         // access), never the contiguity.
--        set_hidden_read_copy_chain_for_tests(true);
-+        // Tri-state window: forces the conservative walk for the compute
-+        // below and restores the previous override state (-1 env-follow)
-+        // on drop — panic-safe and order-independent under the shared
-+        // backend-flag lock (see test_support::TriStateFlagWindow).
-+        let _conservative =
-+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 1);
-         let conservative = compute_live_intervals_with_hidden_reads(&func, &hidden);
--        set_hidden_read_copy_chain_for_tests(false);
-         for p in 0..=3 {
-             assert!(
-                 covers(&conservative, 3, p) || covers(&conservative, 4, p),
-@@ -2832,6 +2846,12 @@ mod tests {
- 
-         let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-         hidden.insert(1, vec![5]);
-+        // Pin FORCED-PRECISE for this assertion: the outcome is the precise
-+        // walk contract, which must hold regardless of any bisection env
-+        // knob; this also serializes the test against the flip windows on
-+        // the shared backend-flag lock (see test_support::TriStateFlagWindow).
-+        let _pin =
-+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
-         let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
-         for p in 1..=7 {
-             assert!(covers(&r, 1, p), "v1 must be live at {p}");
-diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
-index 2e596acb..dca79458 100644
---- a/src/backend/stack_layout/copy_coalescing.rs
-+++ b/src/backend/stack_layout/copy_coalescing.rs
-@@ -1528,12 +1528,6 @@ static COMMUTED_ACC_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
- /// environment, 0 = forced LHS-only, 1 = forced commuted-RHS (tests).
- static COMMUTED_ACC_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
- 
--/// Test-only override for [`commuted_acc_enabled`].
--#[cfg(test)]
--fn set_commuted_acc_for_tests(follow: bool) {
--    COMMUTED_ACC_OVERRIDE.store(follow as i8, std::sync::atomic::Ordering::Relaxed);
--}
--
- fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: bool) -> bool {
-     match inst {
-         Instruction::Store {
-@@ -3399,6 +3393,11 @@ mod cfg_copy_coalesce_tests {
-     /// write-only deferred slots (the dead park stores).
-     #[test]
-     fn immediately_consumed_commutative_rhs_on_lhs_first() {
-+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
-+        // asserted here is the commuted arm (commuted-RHS eligibility is the behavior under test), and a concurrent
-+        // flip window must not change it. Also serializes this test against
-+        // the flip windows on the shared backend-flag lock.
-+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
-         let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
-         // v1 := 6; v0 := 4; v2 := And(v1, v0)  [v0 consumed as RHS, adjacent]
-         func.blocks.push(block(
-@@ -3449,9 +3448,13 @@ mod cfg_copy_coalesce_tests {
-             ],
-             Terminator::Return(Some(Operand::Value(Value(2)))),
-         ));
--        set_commuted_acc_for_tests(false);
-+        // The window restores the PREVIOUS override state (-1 env-follow by
-+        // default) on drop — panic-safe, and it restores the DEFAULT rather
-+        // than a forced-ON state, so a suite run with CCC_NO_COMMUTED_ACC
-+        // set produces order-independent outcomes. Held under the shared
-+        // backend-flag lock, so flip windows are mutually exclusive.
-+        let _lhs_only = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 0);
-         let skip = compute_immediately_consumed(&func, true);
--        set_commuted_acc_for_tests(true); // restore before any panic path
-         assert!(
-             !skip.contains(&0),
-             "the override must restore the LHS-only contract"
-@@ -3472,6 +3475,11 @@ mod cfg_copy_coalesce_tests {
-     /// class with no slot and no fallback.
-     #[test]
-     fn immediately_consumed_commutative_rhs_narrow_widths() {
-+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
-+        // asserted here is the commuted arm (narrow-width commuted eligibility (audit M2 coverage)), and a concurrent
-+        // flip window must not change it. Also serializes this test against
-+        // the flip windows on the shared backend-flag lock.
-+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
-         let narrow_def = |dest: u32, value: i32, ty: IrType| Instruction::BinOp {
-             dest: Value(dest),
-             op: IrBinOp::Add,
-@@ -3514,6 +3522,11 @@ mod cfg_copy_coalesce_tests {
-     /// (i686) keeps the LHS-only rule for the same shape.
-     #[test]
-     fn immediately_consumed_commutative_rhs_rejected_when_not_lhs_first() {
-+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
-+        // asserted here is the commuted arm (the commuted arm is what must reject here), and a concurrent
-+        // flip window must not change it. Also serializes this test against
-+        // the flip windows on the shared backend-flag lock.
-+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
-         let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
-         func.blocks.push(block(
-             0,
-@@ -3542,6 +3555,11 @@ mod cfg_copy_coalesce_tests {
-     /// even on lhs-first backends — the sdivm3 `0 - (v/3)` class.
-     #[test]
-     fn immediately_consumed_non_commutative_rhs_rejected_on_lhs_first() {
-+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
-+        // asserted here is the commuted arm (rejection is independent of the commuted arm, but the outcome is still flag-shaped), and a concurrent
-+        // flip window must not change it. Also serializes this test against
-+        // the flip windows on the shared backend-flag lock.
-+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
-         let mut func = IrFunction::new("sub".to_string(), IrType::I32, vec![], false);
-         func.blocks.push(block(
-             0,
-diff --git a/src/test_support.rs b/src/test_support.rs
-index a8f048d3..ab46ba8e 100644
---- a/src/test_support.rs
-+++ b/src/test_support.rs
-@@ -20,6 +20,75 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
- /// discharge the obligation and one process-wide lock does.
- static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
- 
-+/// The one lock that serializes every test flipping the backend tri-state
-+/// override atomics (`COMMUTED_ACC_OVERRIDE` in copy_coalescing,
-+/// `HIDDEN_READ_COPY_CHAIN_OVERRIDE` in liveness). Same reasoning as
-+/// `ENV_LOCK`: the flags are process-global state read by codegen walks on
-+/// the shared test thread pool, so a flip window must be mutually
-+/// exclusive — module-local locks serialized each module against itself
-+/// and nothing else.
-+static BACKEND_FLAG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-+
-+pub(crate) fn backend_flag_lock() -> MutexGuard<'static, ()> {
-+    BACKEND_FLAG_LOCK
-+        .get_or_init(|| Mutex::new(()))
-+        .lock()
-+        // A poisoned lock means a test panicked while holding it. The
-+        // window's `Drop` restores the flag regardless, so the state is
-+        // not left inconsistent and the remaining tests should still run.
-+        .unwrap_or_else(std::sync::PoisonError::into_inner)
-+}
-+
-+thread_local! {
-+    /// Flag-window nesting depth for THIS thread. `Mutex` is not reentrant,
-+    /// and nesting is a real shape (a precise-mode pin held across asserts
-+    /// while a conservative-mode window scopes the second compute), so
-+    /// depth 0 takes the lock and every deeper level inherits it — the
-+    /// same contract as `ENV_WINDOW_DEPTH` above.
-+    static FLAG_WINDOW_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-+}
-+
-+/// Serialized tri-state override window for one backend flag atomic.
-+///
-+/// Sets `flag` to `value` on acquire and restores the PREVIOUS value on
-+/// drop — panic-safe, unlike the hand-restored pairs this replaces:
-+/// `set(flag, false); run(); set(flag, true)` leaked "forced ON" past any
-+/// assertion failure between the two, and even on the success path it
-+/// restored a forced state instead of the `-1` env-follow default, so a
-+/// suite run with `CCC_NO_COMMUTED_ACC`/`CCC_HIDDEN_READ_COPY_CHAIN` set
-+/// produced outcomes that depended on test order. Holding the lock for the
-+/// window's whole lifetime also makes flip windows mutually exclusive.
-+pub(crate) struct TriStateFlagWindow {
-+    _guard: Option<MutexGuard<'static, ()>>,
-+    flag: &'static std::sync::atomic::AtomicI8,
-+    previous: i8,
-+}
-+
-+impl TriStateFlagWindow {
-+    pub(crate) fn new(flag: &'static std::sync::atomic::AtomicI8, value: i8) -> Self {
-+        let depth = FLAG_WINDOW_DEPTH.with(|d| {
-+            let n = d.get();
-+            d.set(n + 1);
-+            n
-+        });
-+        let guard = (depth == 0).then(backend_flag_lock);
-+        let previous = flag.load(std::sync::atomic::Ordering::Relaxed);
-+        flag.store(value, std::sync::atomic::Ordering::Relaxed);
-+        Self {
-+            _guard: guard,
-+            flag,
-+            previous,
++    fn arbitrary_records_do_not_escape_their_bounds() {
++        let mut seed = 0x9e3779b97f4a7c15u64;
++        for case in 0..2048 {
++            let n = case % 113;
++            let mut data = vec![0; n];
++            for byte in &mut data {
++                seed ^= seed << 13;
++                seed ^= seed >> 7;
++                seed ^= seed << 17;
++                *byte = seed as u8;
++            }
++            if case % 4 == 0 && n >= 12 {
++                data[..4].copy_from_slice(&u32::MAX.to_le_bytes());
++                data[4..12].copy_from_slice(&seed.to_le_bytes());
++            }
++            let records = scan_eh_frame_records(&data);
++            assert_eq!(
++                count_eh_frame_fdes(&data),
++                records.iter().filter(|r| r.is_fde).count(),
++                "case {case}"
++            );
++            let mut prev_end = 0;
++            for r in records {
++                assert!(r.start >= prev_end && r.end > r.start && r.end <= n);
++                assert!(r.id_offset + r.id_size <= r.end);
++                prev_end = r.end;
++            }
++            for is_64bit in [true, false] {
++                let _ = build_eh_frame_hdr(&data, 0x400000, 0x3f0000, is_64bit);
++            }
 +        }
 +    }
++
+     /// Malformed input must terminate, not hang or panic. The zero-length and
+     /// truncated cases are what a fuzzer hits first.
+     #[test]
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index a20d310..81c6959 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -960,6 +960,10 @@ pub(crate) fn run_passes(
+     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
+     // 128-bit SSE2 instead of disabling vectorization outright.
+     vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41, x86_avx512vl);
++    // Vec*I64x2 map intrinsics are implemented only by the x86-64 backend.
++    // Refresh the per-thread gate for every TU: a worker may compile i686
++    // immediately after x86-64 in the same process.
++    vectorize::set_x86_map_i64_available(target == crate::backend::Target::X86_64);
+     // Pass B (two-block guard-free unroll) kill switch, resolved once here for
+     // the same reason as the ISA gates above: the unroller is a hot path and
+     // must not read the process environment per call, and per-thread state
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index 57d54de..816cb61 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -138,6 +138,18 @@ thread_local! {
+     // backend emit vprold for every rotate amount.  Default FALSE: the
+     // driver opts in per TU, failing closed exactly like the other gates.
+     static X86_AVX512VL_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++    // The I64 map lowering uses register-based Vec*I64x2 operations.  i686's
++    // stack-based vector backend does not implement those operations.  This
++    // target bit is set by the driver per translation unit, not by host cfg.
++    static X86_MAP_I64_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 +}
 +
-+impl Drop for TriStateFlagWindow {
-+    fn drop(&mut self) {
-+        self.flag
-+            .store(self.previous, std::sync::atomic::Ordering::Relaxed);
++pub(crate) fn set_x86_map_i64_available(available: bool) {
++    X86_MAP_I64_AVAILABLE.with(|cell| cell.set(available));
++}
++
++fn x86_map_i64_available() -> bool {
++    X86_MAP_I64_AVAILABLE.with(|cell| cell.get())
+ }
+ 
+ /// Record the x86 SIMD ISA profile for the current translation unit.
+@@ -662,6 +674,11 @@ fn vectorize_with_analysis_mode(
+                     && !force_two_wide
+                     && std::env::var("LCCC_FORCE_MAP_SSE").is_err()
+                     && x86_avx2_available();
++                // I64/U64 map intrinsics are two-lane XMM operations even on
++                // AVX2 targets.  Advertising four lanes here advances the IV
++                // by 32 bytes but only loads/stores 16, silently dropping
++                // every other pair of elements.
++                let avx2 = avx2 && !matches!(map_pattern.elem_ty, IrType::I64 | IrType::U64);
+                 if debug {
+                     eprintln!(
+                         "[VEC] Map pattern matched! Transforming to {}-bit {:?}",
+@@ -6312,14 +6329,16 @@ fn analyze_map_pattern(
+     // loop scalar; FP division is IEEE-defined elementwise (no trap) and is
+     // parsed into the map expression tree.
+     const MAP_MAX_STREAMS: usize = 4;
++    let i64_map = !neon && x86_map_i64_available() && x86_simd_available();
+     let mut load_infos: Vec<(usize, Value, Value, IrType)> = Vec::new();
+     let mut store_info = None; // (block, ptr value, stored val, element type)
+     for &block_idx in &loop_info.body {
+         for inst in &func.blocks[block_idx].instructions {
+             match inst {
+                 Instruction::Load { dest, ptr, ty, .. } => {
+-                    // Packed I32/U32/F32/F64 all have native forms; I8/U8
+-                    // enters through the byte-lane demotion path (OP-05d),
++                    // Packed I32/U32/F32/F64 all have native forms; I64/U64
++                    // use x86-64's two-lane register-based SSE2 lowering.
++                    // I8/U8 enter through the byte-lane demotion path (OP-05d),
+                     // which re-parses the promoted 32-bit tree and proves it
+                     // byte-exact before any narrow op is emitted.
+                     if !matches!(
+@@ -6332,7 +6351,8 @@ fn analyze_map_pattern(
+                             | IrType::U8
+                             | IrType::I16
+                             | IrType::U16
+-                    ) || load_infos.len() >= MAP_MAX_STREAMS
++                    ) && !(i64_map && matches!(*ty, IrType::I64 | IrType::U64))
++                        || load_infos.len() >= MAP_MAX_STREAMS
+                     {
+                         if debug {
+                             eprintln!("[VEC-MAP] BAIL: bad load ty/streams");
+@@ -6352,7 +6372,8 @@ fn analyze_map_pattern(
+                             | IrType::U8
+                             | IrType::I16
+                             | IrType::U16
+-                    ) || store_info.is_some()
++                    ) && !(i64_map && matches!(*ty, IrType::I64 | IrType::U64))
++                        || store_info.is_some()
+                     {
+                         if debug {
+                             eprintln!("[VEC-MAP] BAIL: bad store ty/dup");
+@@ -23825,6 +23846,8 @@ pub(crate) fn vectorize_const_trip_map_loops(
+             let avx2 = std::env::var("LCCC_FORCE_MAP_SSE").is_err()
+                 && std::env::var("LCCC_FORCE_SSE2").is_err()
+                 && x86_avx2_available();
++            // The I64/U64 intrinsic family has only two-lane XMM forms.
++            let avx2 = avx2 && !matches!(pattern.elem_ty, IrType::I64 | IrType::U64);
+             let n = transform_map_vector(func, &pattern, avx2, fp_contract);
+             if n > 0 {
+                 if debug {
+diff --git a/tests/bench/k_map64_sub.c b/tests/bench/k_map64_sub.c
+new file mode 100644
+index 0000000..9f4e004
+--- /dev/null
++++ b/tests/bench/k_map64_sub.c
+@@ -0,0 +1,26 @@
++/* 64-bit elementwise map with a genuine dependent output.  This fixture
++ * measures the x86-64 two-lane XMM lowering against CCC_NO_MAP_VEC=1 in
++ * scripts/bench_kernels.py; the mutation keeps successive calls distinct. */
++#include <stdint.h>
++#include <stddef.h>
++#include "bench.h"
++
++#define N 1024
++static uint64_t a[N], b[N], d[N];
++static unsigned t;
++
++void bench_setup(void) {
++    t = 0;
++    for (unsigned i = 0; i < N; ++i) {
++        a[i] = (uint64_t)i * UINT64_C(0x123456789abcd);
++        b[i] = ((uint64_t)i + 7u) * UINT64_C(0x1234567);
 +    }
 +}
 +
- fn env_lock() -> MutexGuard<'static, ()> {
-     ENV_LOCK
-         .get_or_init(|| Mutex::new(()))
--- 
-2.47.3
-
-
-From 1efa444a4797b877d1a1e389a24d962f73bb217a Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Sat, 26 Sep 2026 21:36:32 +0000
-Subject: [PATCH 5/5] x86: stage D32 call arguments width-exact; guard the
- GNU-ld relief flag behind uname
-
-F4 (PR #637 audit, the two nits):
-
-1. Call-argument staging selected the move form by F32-vs-everything:
-   a D32 (4-byte) argument with a fresh XMM home took the F64 branch and
-   emitted vmovsd/movapd/movq (8-byte) instead of vmovss/movaps/movd
-   (4-byte). Correct - staging is a bit move and the consumer reads only
-   the low 32 bits - but one byte wider and it reads garbage lanes no
-   consumer can observe. The width selection now matches
-   F32|D32 in all three arms (AVX scalar, SSE full-copy, GPR bit-cast),
-   keeping the width-exactness doctrine the staging fix introduced.
-
-2. tests/regression/check_peephole_whitespace.sh passed
-   -C link-arg=-Wl,--no-keep-memory unconditionally. It is a GNU-ld flag;
-   a non-GNU ld rejects it and the gate would read a linker error as a
-   test failure. Guarded behind uname -s == Linux (the repository targets
-   Linux per BUILDING_LINUX.txt; the guard is portability hygiene).
----
- src/backend/x86/codegen/calls.rs              | 15 ++++++++++++---
- tests/regression/check_peephole_whitespace.sh | 10 +++++++++-
- 2 files changed, 21 insertions(+), 4 deletions(-)
-
-diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
-index c1be34fb..f5218b2b 100644
---- a/src/backend/x86/codegen/calls.rs
-+++ b/src/backend/x86/codegen/calls.rs
-@@ -1146,7 +1146,15 @@ impl X86Codegen {
-                                         let name = super::emit::phys_reg_name(home);
-                                         if name != xmm_regs[reg_idx] {
-                                             if self.isa.avx {
--                                                let mv = if ty == IrType::F32 {
-+                                                // D32 is a 4-byte datum like
-+                                                // F32: the scalar 32-bit move
-+                                                // is width-exact (vmovsd would
-+                                                // copy 8 bytes - correct, but
-+                                                // one byte wider and it reads
-+                                                // garbage lanes the consumer
-+                                                // can never observe).
-+                                                let mv = if matches!(ty, IrType::F32 | IrType::D32)
-+                                                {
-                                                     "vmovss"
-                                                 } else {
-                                                     "vmovsd"
-@@ -1156,7 +1164,8 @@ impl X86Codegen {
-                                                     mv, name, name, xmm_regs[reg_idx]
-                                                 ));
-                                             } else {
--                                                let mv = if ty == IrType::F32 {
-+                                                let mv = if matches!(ty, IrType::F32 | IrType::D32)
-+                                                {
-                                                     "movaps"
-                                                 } else {
-                                                     "movapd"
-@@ -1171,7 +1180,7 @@ impl X86Codegen {
-                                     } else {
-                                         let gpr = super::emit::phys_reg_name(home);
-                                         let gpr32 = super::emit::phys_reg_name_32(home);
--                                        if ty == IrType::F32 {
-+                                        if matches!(ty, IrType::F32 | IrType::D32) {
-                                             self.state.emit_fmt(format_args!(
-                                                 "    movd %{}, %{}",
-                                                 gpr32, xmm_regs[reg_idx]
-diff --git a/tests/regression/check_peephole_whitespace.sh b/tests/regression/check_peephole_whitespace.sh
-index d8dc3278..ff8867fe 100644
---- a/tests/regression/check_peephole_whitespace.sh
-+++ b/tests/regression/check_peephole_whitespace.sh
-@@ -76,8 +76,16 @@ cargo_test() { # cargo_test <filter> [extra cargo-test args...]
-         total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
-         [[ -n "$total_mb" && "$total_mb" -lt 6000 ]] && jobs=1
-     fi
-+    # --no-keep-memory is a GNU-ld flag; non-GNU linkers (e.g. macOS ld)
-+    # reject it and the gate would read a linker error as a test failure.
-+    # The repository targets Linux (BUILDING_LINUX.txt), so this guard is
-+    # for portability hygiene, not a supported configuration.
-+    local ld_flags=""
-+    if [[ "$(uname -s)" == "Linux" ]]; then
-+        ld_flags="-C link-arg=-Wl,--no-keep-memory"
-+    fi
-     CARGO_PROFILE_FASTBUILD_DEBUG=0 CARGO_INCREMENTAL=0 \
--    RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--no-keep-memory" \
-+    RUSTFLAGS="${RUSTFLAGS:-} ${ld_flags}" \
-         timeout 1800 cargo test --profile "$PROFILE" --lib --locked -j "$jobs" \
-         "$filter" -- "$@" 2>&1
- }
--- 
-2.47.3
-
++unsigned long long bench_run(void) {
++    for (size_t i = 0; i < N; ++i) d[i] = a[i] - b[i];
++    uint64_t sample = d[t & (N - 1)];
++    a[t & (N - 1)] += t | 1u;
++    ++t;
++    return sample;
++}
+diff --git a/tests/regression/check_map_i64_two_lane.sh b/tests/regression/check_map_i64_two_lane.sh
+new file mode 100644
+index 0000000..04be668
+--- /dev/null
++++ b/tests/regression/check_map_i64_two_lane.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++# Runtime/differential and codegen gate for the two-lane x86-64 I64 map path.
++set -euo pipefail
++CCC=${CCC:-target/fastbuild/lccc}
++source_file=tests/regression/map_i64_two_lane.c
++tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-map64.XXXXXX")
++trap 'rm -rf "$tmp"' EXIT
++
++for arch in x86-64-v3 x86-64; do
++    flags=(-O2 "-march=$arch")
++    "$CCC" "${flags[@]}" "$source_file" -o "$tmp/lccc"
++    gcc "${flags[@]}" "$source_file" -o "$tmp/gcc"
++    CCC_NO_MAP_VEC=1 "$CCC" "${flags[@]}" "$source_file" -o "$tmp/scalar"
++    "$tmp/lccc" > "$tmp/lccc.txt"
++    "$tmp/gcc" > "$tmp/gcc.txt"
++    "$tmp/scalar" > "$tmp/scalar.txt"
++    cmp "$tmp/lccc.txt" "$tmp/gcc.txt"
++    cmp "$tmp/lccc.txt" "$tmp/scalar.txt"
++    "$CCC" "${flags[@]}" -S "$source_file" -o "$tmp/vector.s"
++    CCC_NO_MAP_VEC=1 "$CCC" "${flags[@]}" -S "$source_file" -o "$tmp/scalar.s"
++    python3 - "$arch" "$tmp/vector.s" "$tmp/scalar.s" <<'PY'
++import re, sys
++arch, vector, scalar = sys.argv[1:]
++def body(path):
++    text = open(path, encoding='utf8').read()
++    match = re.search(r'(?ms)^sub64:\n(.*?)^\.size sub64,', text)
++    if match is None:
++        raise SystemExit('missing sub64 assembly')
++    return match.group(1)
++v, s = body(vector), body(scalar)
++needle = 'vpsubq' if arch == 'x86-64-v3' else 'psubq'
++if not re.search(r'\b' + needle + r'\b', v):
++    raise SystemExit(f'{arch}: expected {needle} in two-lane sub64')
++if '%ymm' in v:
++    raise SystemExit(f'{arch}: 64-bit map advanced by four lanes but only used XMM')
++if re.search(r'\b(?:vpsubq|psubq)\b', s):
++    raise SystemExit('scalar kill switch did not suppress packed subtraction')
++PY
++done
++
++# i686 has no register-based Vec*I64x2 lowering. Even with SSE2 enabled it
++# must emit scalar code and successfully assemble; do not accidentally gate
++# on the compiler host architecture instead of the target translation unit.
++"$CCC" -O2 -m32 -msse2 -S "$source_file" -o "$tmp/i686.s"
++"$CCC" -O2 -m32 -msse2 -c "$source_file" -o "$tmp/i686.o"
++if grep -Eq '\b(vpsubq|psubq)\b' "$tmp/i686.s"; then
++    echo 'i686 unexpectedly emitted a packed I64 map operation' >&2
++    exit 1
++fi
++echo 'map-i64-two-lane: x86-64 AVX2/SSE2 runtime+GCC+scalar, i686 scalar assembly PASS'
+diff --git a/tests/regression/map_i64_two_lane.c b/tests/regression/map_i64_two_lane.c
+new file mode 100644
+index 0000000..676fb2d
+--- /dev/null
++++ b/tests/regression/map_i64_two_lane.c
+@@ -0,0 +1,89 @@
++/* I64/U64 elementwise maps use two XMM lanes even under AVX2.  Exercise
++ * zero/single/odd/even trip counts, wraparound, invariant broadcasts and
++ * dependence-distance fallback.  The i686 backend must leave these scalar. */
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#define N 259
++static uint64_t a[N], b[N], out[N], ref[N];
++static uint64_t overlap[N + 8], shadow[N + 8];
++
++__attribute__((noinline)) void sub64(uint64_t *restrict d, const uint64_t *restrict x,
++                                      const uint64_t *restrict y, unsigned long n) {
++    for (unsigned long i = 0; i < n; ++i) d[i] = x[i] - y[i];
++}
++__attribute__((noinline)) void rsub64(uint64_t *restrict d, const uint64_t *restrict x,
++                                       uint64_t k, unsigned long n) {
++    for (unsigned long i = 0; i < n; ++i) d[i] = k - x[i];
++}
++__attribute__((noinline)) void add64(uint64_t *restrict d, const uint64_t *restrict x,
++                                      const uint64_t *restrict y, unsigned long n) {
++    for (unsigned long i = 0; i < n; ++i) d[i] = x[i] + y[i];
++}
++/* Without restrict, writing ahead of an input read must take the scalar
++ * path.  In-place (distance zero) is legal to vectorize. */
++__attribute__((noinline)) void shifted64(uint64_t *d, const uint64_t *x,
++                                          unsigned long n) {
++    for (unsigned long i = 0; i < n; ++i) d[i] = x[i] - 4u;
++}
++
++static int check(const char *what, unsigned long n) {
++    for (unsigned long i = 0; i < N; ++i)
++        if (out[i] != ref[i]) {
++            printf("FAIL %s n=%lu i=%lu got=%llu want=%llu\n", what, n, i,
++                   (unsigned long long)out[i], (unsigned long long)ref[i]);
++            return 1;
++        }
++    return 0;
++}
++int main(void) {
++    for (unsigned long i = 0; i < N; ++i) {
++        a[i] = UINT64_MAX - (uint64_t)i * UINT64_C(0x123456789abcdef);
++        b[i] = ((uint64_t)i + 17u) * UINT64_C(0xfedcba987654321);
++    }
++    for (unsigned long n = 0; n <= N; ++n) {
++        for (unsigned long i = 0; i < N; ++i)
++            ref[i] = UINT64_C(0xa5a5a5a5a5a5a5a5);
++        memcpy(out, ref, sizeof out);
++        sub64(out, a, b, n);
++        for (unsigned long i = 0; i < n; ++i) {
++            volatile uint64_t x = a[i], y = b[i];
++            ref[i] = x - y;
++        }
++        if (check("sub", n)) return 1;
++        memcpy(out, ref, sizeof out);
++        rsub64(out, a, UINT64_C(0xdeadbeef01234567), n);
++        for (unsigned long i = 0; i < n; ++i) {
++            volatile uint64_t x = a[i];
++            ref[i] = UINT64_C(0xdeadbeef01234567) - x;
++        }
++        if (check("rsub", n)) return 1;
++        memcpy(out, ref, sizeof out);
++        add64(out, a, b, n);
++        for (unsigned long i = 0; i < n; ++i) {
++            volatile uint64_t x = a[i], y = b[i];
++            ref[i] = x + y;
++        }
++        if (check("add", n)) return 1;
++    }
++    for (unsigned long offset = 0; offset < 5; ++offset) {
++        for (unsigned long n = 0; n < 32; ++n) {
++            for (unsigned long i = 0; i < N + 8; ++i)
++                shadow[i] = overlap[i] = (uint64_t)i * UINT64_C(0x5555555500112233);
++            uint64_t *d = overlap + 3 + offset;
++            const uint64_t *x = overlap + 4;
++            uint64_t *expected = shadow + 3 + offset;
++            const uint64_t *input = shadow + 4;
++            shifted64(d, x, n);
++            for (unsigned long i = 0; i < n; ++i) expected[i] = input[i] - 4u;
++            for (unsigned long i = 0; i < N + 8; ++i)
++                if (overlap[i] != shadow[i]) {
++                    printf("FAIL alias shift=%lu n=%lu i=%lu\n", offset, n, i);
++                    return 1;
++                }
++        }
++    }
++    puts("OK map_i64_two_lane");
++    return 0;
++}
