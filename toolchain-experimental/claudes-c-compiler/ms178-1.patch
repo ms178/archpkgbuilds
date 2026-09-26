@@ -496,6 +496,410 @@ index b22a380..c57b8a3 100644
      /// LCCC-SQLITE-WPS shape: the SIB fold peels `aLoop[nLoop-1]` down to the
      /// U8 load `v1`, whose last IR use (the `nLoop == 2` Cmp) sits in a block
      /// laid out AFTER the access block. Without the hidden read `v1` has a
+diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
+index da6df6d..1414d5e 100644
+--- a/src/backend/stack_layout/copy_coalescing.rs
++++ b/src/backend/stack_layout/copy_coalescing.rs
+@@ -1522,7 +1522,9 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
+             src: Operand::Value(v),
+             ..
+         } => v.0 == value_id,
+-        Instruction::BinOp { lhs, rhs, ty, .. } => {
++        Instruction::BinOp {
++            op, lhs, rhs, ty, ..
++        } => {
+             if ty.is_float() || ty.is_long_double() {
+                 return false;
+             }
+@@ -1536,7 +1538,33 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
+             // into %rcx or a memory operand from its HOME. Skipping that home
+             // made the load read zero (alu_peepholes sdivm3: `0 - (v/3)`
+             // returned 0 instead of the negated quotient).
+-            operand_is_value(lhs, value_id) && (operand_is_const(rhs) || lhs_first_binop)
++            if operand_is_value(lhs, value_id) {
++                return operand_is_const(rhs) || lhs_first_binop;
++            }
++            // COMMUTED-RHS PRODUCERS (sha256 MAJ temporaries): on lhs-first
++            // backends the emitter commutes a commutative integer binop
++            // whose RHS is accumulator-resident — `And(c, x)` with x in %rax
++            // emits `andl <c-home>, %eax`, reading the OTHER operand from
++            // its own home — so the RHS of Add/Mul/And/Or/Xor is an equally
++            // safe sole consumer. Without this arm `a^b` and `(a^b)&c`
++            // (single-use, adjacent, RHS-consumed) were assigned deferred
++            // slots whose definition parks (`movl %eax, N(%rsp)`) are never
++            // read: pure dead stores whenever the peephole's never-read
++            // analysis fails closed on an indexed `disp(%rsp,%rX,s)` access
++            // (the LEA→memory fold creates those). The emitter's
++            // acc-resident read path already serves these consumers; the
++            // slot was write-only. Non-commutative ops keep the LHS-only
++            // contract, and so does every AccumulatorCentric backend
++            // (i686: its consumer order does not promise the commute).
++            // CCC_NO_COMMUTED_ACC restores the LHS-only contract for
++            // bisection.
++            lhs_first_binop
++                && std::env::var_os("CCC_NO_COMMUTED_ACC").is_none()
++                && matches!(
++                    op,
++                    IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
++                )
++                && operand_is_value(rhs, value_id)
+         }
+         Instruction::Cmp { lhs, rhs, ty, .. } => {
+             if ty.is_float() || ty.is_long_double() {
+@@ -3334,6 +3362,95 @@ mod cfg_copy_coalesce_tests {
+         assert!(skip.contains(&0));
+     }
+ 
++    /// Commuted-RHS producers (the sha256 MAJ shape `maj = (a&b) ^ ((a^b)&c)`:
++    /// `a^b` is the RHS of the And, `(a^b)&c` the RHS of the Xor). On
++    /// lhs-first backends the emitter commutes (`andl <other-home>, %eax`),
++    /// so these are safe accumulator consumers and must NOT be given
++    /// write-only deferred slots (the dead park stores).
++    #[test]
++    fn immediately_consumed_commutative_rhs_on_lhs_first() {
++        let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
++        // v1 := 6; v0 := 4; v2 := And(v1, v0)  [v0 consumed as RHS, adjacent]
++        func.blocks.push(block(
++            0,
++            vec![
++                scalar_def(1, 6),
++                scalar_def(0, 4),
++                Instruction::BinOp {
++                    dest: Value(2),
++                    op: IrBinOp::And,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Value(Value(0)),
++                    ty: IrType::I32,
++                },
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        ));
++        let skip = compute_immediately_consumed(&func, true);
++        assert!(
++            skip.contains(&0),
++            "commutative RHS consumer must be acc-eligible on lhs-first"
++        );
++        // v1's use is the And but its def is NOT adjacent (v0 sits between):
++        // only the adjacent producer is acc-consumable.
++        assert!(!skip.contains(&1));
++    }
++
++    /// The commute contract is lhs-first-only: an AccumulatorCentric backend
++    /// (i686) keeps the LHS-only rule for the same shape.
++    #[test]
++    fn immediately_consumed_commutative_rhs_rejected_when_not_lhs_first() {
++        let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(block(
++            0,
++            vec![
++                scalar_def(1, 6),
++                scalar_def(0, 4),
++                Instruction::BinOp {
++                    dest: Value(2),
++                    op: IrBinOp::And,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Value(Value(0)),
++                    ty: IrType::I32,
++                },
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        ));
++        let skip = compute_immediately_consumed(&func, false);
++        assert!(
++            !skip.contains(&0),
++            "RHS consumption is NOT acc-safe without the lhs-first commute contract"
++        );
++    }
++
++    /// Non-commutative consumers (`Sub(X, v)`: x86-64 stages the LHS into
++    /// %rax and subtracts <v> loaded from its HOME) keep the LHS-only rule
++    /// even on lhs-first backends — the sdivm3 `0 - (v/3)` class.
++    #[test]
++    fn immediately_consumed_non_commutative_rhs_rejected_on_lhs_first() {
++        let mut func = IrFunction::new("sub".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(block(
++            0,
++            vec![
++                scalar_def(1, 6),
++                scalar_def(0, 4),
++                Instruction::BinOp {
++                    dest: Value(2),
++                    op: IrBinOp::Sub,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Value(Value(0)),
++                    ty: IrType::I32,
++                },
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        ));
++        let skip = compute_immediately_consumed(&func, true);
++        assert!(
++            !skip.contains(&0),
++            "Sub RHS is not commutable: the producer needs a home"
++        );
++    }
++
+     #[test]
+     fn immediately_consumed_copy_rename_chain() {
+         let mut func = IrFunction::new("rename".to_string(), IrType::I32, vec![], false);
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 05c7378..3cdb3b4 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -1206,66 +1206,53 @@ impl X86Codegen {
+                     && !self.state.is_alloca(rhs_val.0)
+                     && (use_32bit || !self.state.is_small_slot(rhs_val.0))
+                 {
+-                    if let Some(slot) = self.state.get_slot(rhs_val.0) {
+-                        // ACC-RESIDENT SOURCE: the accumulator may already hold
+-                        // rhs_val (its own computation, or a `store_eax_to`
+-                        // park). Folding the slot in that state is an exposed
+-                        // store-to-load forward (measured ~5% end-to-end on
+-                        // sha256_transform's MAJ chain) — and staging lhs
+-                        // into %eax first would destroy the resident copy.
+-                        // Consume %eax in place instead, sourcing the OTHER
+-                        // operand without touching the accumulator:
+-                        // immediate, register home, or %ecx staging.
+-                        // Sub is excluded: `sub src, %eax` would compute
+-                        // rhs-lhs, not lhs-rhs (non-commutative).
+-                        if !matches!(op, IrBinOp::Sub)
+-                            && self.state.reg_cache.acc_has(rhs_val.0, false)
++                    // ACC-RESIDENT SOURCE (slot-independent): the accumulator
++                    // may already hold rhs_val (its own computation, or a
++                    // historical `store_eax_to` park). Folding the slot in
++                    // that state is an exposed store-to-load forward
++                    // (measured ~5% end-to-end on sha256_transform's MAJ
++                    // chain) — and staging lhs into %eax first would destroy
++                    // the resident copy. Consume %eax in place instead,
++                    // sourcing the OTHER operand without touching the
++                    // accumulator: immediate, register home, or %ecx staging.
++                    // Sub is excluded: `sub src, %eax` would compute rhs-lhs,
++                    // not lhs-rhs (non-commutative).
++                    // The check is deliberately UNGATED from the slot lookup
++                    // below: an acc-hinted sole-consumer value (the commuted
++                    // RHS class, is_safe_sole_consumer) has NO slot — its
++                    // slot was the write-only park this arm makes redundant —
++                    // and the acc residency is a complete source of truth on
++                    // its own (the cache entry was set by the producer's
++                    // store, nothing between the adjacent def and this
++                    // consumer can have evicted it without the cache knowing).
++                    if !matches!(op, IrBinOp::Sub) && self.state.reg_cache.acc_has(rhs_val.0, false)
++                    {
++                        let suffix = if use_32bit { "l" } else { "q" };
++                        let acc = if use_32bit { "eax" } else { "rax" };
++                        let src_reg = if let Some(imm) = Self::const_as_imm32_typed(lhs, use_32bit)
+                         {
+-                            let suffix = if use_32bit { "l" } else { "q" };
+-                            let acc = if use_32bit { "eax" } else { "rax" };
+-                            let src_reg =
+-                                if let Some(imm) = Self::const_as_imm32_typed(lhs, use_32bit) {
+-                                    self.state.emit_fmt(format_args!(
+-                                        "    {}{} ${}, %{}",
+-                                        mnem, suffix, imm, acc
+-                                    ));
+-                                    if use_32bit {
+-                                        self.store_eax_to(dest);
+-                                    } else {
+-                                        self.store_rax_to(dest);
+-                                    }
+-                                    return;
+-                                } else if let Some(lreg) = self
+-                                    .operand_reg(lhs)
+-                                    .filter(|r| !super::emit::is_xmm_reg(*r))
+-                                {
+-                                    let name = if use_32bit {
+-                                        super::emit::phys_reg_name_32(lreg)
+-                                    } else {
+-                                        super::emit::phys_reg_name(lreg)
+-                                    };
+-                                    self.state.emit_fmt(format_args!(
+-                                        "    {}{} %{}, %{}",
+-                                        mnem, suffix, name, acc
+-                                    ));
+-                                    if use_32bit {
+-                                        self.store_eax_to(dest);
+-                                    } else {
+-                                        self.store_rax_to(dest);
+-                                    }
+-                                    return;
+-                                } else {
+-                                    // %ecx staging: the last resort that still
+-                                    // avoids the exposed forward. The staging
+-                                    // never writes %rax, so the resident copy
+-                                    // survives to be consumed here.
+-                                    self.operand_to_rcx(lhs);
+-                                    "ecx"
+-                                };
+-                            let src_name = if use_32bit { src_reg } else { "rcx" };
++                            self.state.emit_fmt(format_args!(
++                                "    {}{} ${}, %{}",
++                                mnem, suffix, imm, acc
++                            ));
++                            if use_32bit {
++                                self.store_eax_to(dest);
++                            } else {
++                                self.store_rax_to(dest);
++                            }
++                            return;
++                        } else if let Some(lreg) = self
++                            .operand_reg(lhs)
++                            .filter(|r| !super::emit::is_xmm_reg(*r))
++                        {
++                            let name = if use_32bit {
++                                super::emit::phys_reg_name_32(lreg)
++                            } else {
++                                super::emit::phys_reg_name(lreg)
++                            };
+                             self.state.emit_fmt(format_args!(
+                                 "    {}{} %{}, %{}",
+-                                mnem, suffix, src_name, acc
++                                mnem, suffix, name, acc
+                             ));
+                             if use_32bit {
+                                 self.store_eax_to(dest);
+@@ -1273,7 +1260,29 @@ impl X86Codegen {
+                                 self.store_rax_to(dest);
+                             }
+                             return;
++                        } else {
++                            // %ecx staging: the last resort that still
++                            // avoids the exposed forward. The staging
++                            // never writes %rax, so the resident copy
++                            // survives to be consumed here.
++                            self.operand_to_rcx(lhs);
++                            "ecx"
++                        };
++                        let src_name = if use_32bit { src_reg } else { "rcx" };
++                        self.state.emit_fmt(format_args!(
++                            "    {}{} %{}, %{}",
++                            mnem, suffix, src_name, acc
++                        ));
++                        if use_32bit {
++                            self.store_eax_to(dest);
++                        } else {
++                            self.store_rax_to(dest);
+                         }
++                        return;
++                    }
++                    // Slot-homed (and NOT acc-resident): fold the slot as a
++                    // memory source — the historical path.
++                    if let Some(slot) = self.state.get_slot(rhs_val.0) {
+                         if use_32bit {
+                             self.operand_to_eax(lhs);
+                         } else {
+@@ -1307,55 +1316,43 @@ impl X86Codegen {
+                         && !self.state.is_alloca(lhs_val.0)
+                         && (use_32bit || !self.state.is_small_slot(lhs_val.0))
+                     {
+-                        if let Some(slot) = self.state.get_slot(lhs_val.0) {
+-                            // ACC-RESIDENT SOURCE (the commutative mirror of
+-                            // the rhs path above): the accumulator holds
+-                            // lhs_val; consume it in place and source rhs
+-                            // without touching the accumulator. `op src,
+-                            // %eax` computes rhs OP lhs — equal to lhs OP
+-                            // rhs for every commutative op that reaches
+-                            // here (Sub is excluded above).
+-                            if self.state.reg_cache.acc_has(lhs_val.0, false) {
+-                                let suffix = if use_32bit { "l" } else { "q" };
+-                                let acc = if use_32bit { "eax" } else { "rax" };
+-                                if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+-                                    self.state.emit_fmt(format_args!(
+-                                        "    {}{} ${}, %{}",
+-                                        mnem, suffix, imm, acc
+-                                    ));
+-                                    if use_32bit {
+-                                        self.store_eax_to(dest);
+-                                    } else {
+-                                        self.store_rax_to(dest);
+-                                    }
+-                                    return;
+-                                }
+-                                if let Some(rreg) = self
+-                                    .operand_reg(rhs)
+-                                    .filter(|r| !super::emit::is_xmm_reg(*r))
+-                                {
+-                                    let name = if use_32bit {
+-                                        super::emit::phys_reg_name_32(rreg)
+-                                    } else {
+-                                        super::emit::phys_reg_name(rreg)
+-                                    };
+-                                    self.state.emit_fmt(format_args!(
+-                                        "    {}{} %{}, %{}",
+-                                        mnem, suffix, name, acc
+-                                    ));
+-                                    if use_32bit {
+-                                        self.store_eax_to(dest);
+-                                    } else {
+-                                        self.store_rax_to(dest);
+-                                    }
+-                                    return;
++                        // ACC-RESIDENT SOURCE (the commutative mirror of the
++                        // rhs path above, equally slot-independent): the
++                        // accumulator holds lhs_val; consume it in place and
++                        // source rhs without touching the accumulator.
++                        // `op src, %eax` computes rhs OP lhs — equal to
++                        // lhs OP rhs for every commutative op that reaches
++                        // here (Sub is excluded above). An acc-hinted
++                        // sole-consumer lhs has no slot (the commuted-RHS
++                        // class of is_safe_sole_consumer never got one), so
++                        // the residency check must not require one.
++                        if self.state.reg_cache.acc_has(lhs_val.0, false) {
++                            let suffix = if use_32bit { "l" } else { "q" };
++                            let acc = if use_32bit { "eax" } else { "rax" };
++                            if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
++                                self.state.emit_fmt(format_args!(
++                                    "    {}{} ${}, %{}",
++                                    mnem, suffix, imm, acc
++                                ));
++                                if use_32bit {
++                                    self.store_eax_to(dest);
++                                } else {
++                                    self.store_rax_to(dest);
+                                 }
+-                                // %ecx staging (never writes %rax).
+-                                self.operand_to_rcx(rhs);
+-                                let src_name = if use_32bit { "ecx" } else { "rcx" };
++                                return;
++                            }
++                            if let Some(rreg) = self
++                                .operand_reg(rhs)
++                                .filter(|r| !super::emit::is_xmm_reg(*r))
++                            {
++                                let name = if use_32bit {
++                                    super::emit::phys_reg_name_32(rreg)
++                                } else {
++                                    super::emit::phys_reg_name(rreg)
++                                };
+                                 self.state.emit_fmt(format_args!(
+                                     "    {}{} %{}, %{}",
+-                                    mnem, suffix, src_name, acc
++                                    mnem, suffix, name, acc
+                                 ));
+                                 if use_32bit {
+                                     self.store_eax_to(dest);
+@@ -1364,6 +1361,22 @@ impl X86Codegen {
+                                 }
+                                 return;
+                             }
++                            // %ecx staging (never writes %rax).
++                            self.operand_to_rcx(rhs);
++                            let src_name = if use_32bit { "ecx" } else { "rcx" };
++                            self.state.emit_fmt(format_args!(
++                                "    {}{} %{}, %{}",
++                                mnem, suffix, src_name, acc
++                            ));
++                            if use_32bit {
++                                self.store_eax_to(dest);
++                            } else {
++                                self.store_rax_to(dest);
++                            }
++                            return;
++                        }
++                        // Slot-homed (and NOT acc-resident): fold the slot.
++                        if let Some(slot) = self.state.get_slot(lhs_val.0) {
+                             if use_32bit {
+                                 self.operand_to_eax(rhs);
+                             } else {
 diff --git a/src/backend/x86/codegen/peephole/passes/liveness.rs b/src/backend/x86/codegen/peephole/passes/liveness.rs
 index 46d5ddd..e23a8c5 100644
 --- a/src/backend/x86/codegen/peephole/passes/liveness.rs
@@ -1000,3 +1404,31 @@ index 6571e99..ef71a04 100644
          if let Some((params, variadic)) = func_info {
              self.register_block_func_meta(
                  &declarator.name,
+diff --git a/tests/regression/check_vector_copy_elimination.sh b/tests/regression/check_vector_copy_elimination.sh
+index 2bb1b8a..1c75b70 100644
+--- a/tests/regression/check_vector_copy_elimination.sh
++++ b/tests/regression/check_vector_copy_elimination.sh
+@@ -409,10 +409,20 @@ EOF
+         # zeroed upper bits a 128-bit read genuinely needs (refusing them is
+         # correct), and the rest are the FMA form-selection cases that belong to
+         # instruction selection.  The ratchet is here so neither grows silently.
+-        if [[ "$n_copies" -le 42 ]]; then
+-            ok "runtime kernel carries $n_copies vector register copies (budget 42, inventoried in FOLLOWUP-2026-09-19E)"
++        # 2026-09-26 (PR #631 follow-up): 42 -> 47.  The +5 are NOT spills:
++        # they are direct `movsd %xmmK, %xmm{0,1,2}` FP-ARGUMENT STAGING
++        # sites where the previous tree paid a two-instruction %rax relay
++        # (`movq %xmmK,%rax; movq %rax,%xmmN`, invisible to this counter
++        # because neither line is an xmm->xmm copy). The relay-fold now
++        # collapses those pairs into the single direct move GCC and Clang
++        # emit for FP argument staging — a net -5 instructions on this
++        # kernel, zero new spill traffic. Every one of the 5 was verified
++        # against the pre-change tree: movsd xmm8/9/10 -> xmm0/1/2 (the
++        # fmaf_add call) and movsd xmm11/4 -> xmm0/1 (the printf pair).
++        if [[ "$n_copies" -le 47 ]]; then
++            ok "runtime kernel carries $n_copies vector register copies (budget 47: 42 residual + 5 direct arg-staging forms that replaced two-instruction %rax relays, net -5 instructions)"
+         else
+-            bad "runtime kernel carries $n_copies vector register copies, budget is 42"
++            bad "runtime kernel carries $n_copies vector register copies, budget is 47"
+             insns "$work/runtime.s" | grep -E "$COPY_RE" | head -10 | note
+         fi
+     fi
