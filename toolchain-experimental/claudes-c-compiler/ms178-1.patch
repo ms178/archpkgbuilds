@@ -1,1897 +1,489 @@
-diff --git a/engineering/FOLLOWUP-2026-09-27-map-i64-performance.md b/engineering/FOLLOWUP-2026-09-27-map-i64-performance.md
-index 12c1cb940..4b1a111a2 100644
---- a/engineering/FOLLOWUP-2026-09-27-map-i64-performance.md
-+++ b/engineering/FOLLOWUP-2026-09-27-map-i64-performance.md
-@@ -1,43 +1,144 @@
--# Follow-up: measured x86-64 I64 map lowering and remaining codegen gaps
-+# Follow-up: measured x86-64 I64/U64 map lowering and unroll cost
-+
-+**Base:** upstream `origin/main` `e9f572eb36f5cd98c9ea1f077bc2922bd001177e` (PR #640, including the initial two-lane I64/U64 map admission). This follow-up is limited to generated-code performance and correctness; it does not change the ABI, vector lane width, or the `.eh_frame` work in the base.
-+
-+## Decision and implementation
-+
-+The x86-64 I64/U64 map lowering remains deliberately **two 64-bit lanes in a
-+128-bit XMM register**, including when AVX2 is enabled. A 256-bit I64 intrinsic
-+would require a complete intrinsic contract, register allocator/backend
-+lowering, ABI treatment, and differential corpus before it could be considered;
-+this change does not take that shortcut. i686 continues to use the scalar path.
-+
-+A two-lane operation leaves memory-level parallelism on the table for a simple
-+map, so `src/passes/vectorize.rs` now uses an adaptive unroll factor:
-+
-+| Map-expression size | Two-lane copies per counted iteration | Elements covered | Byte step |
-+| --- | ---: | ---: | ---: |
-+| 0–3 expression nodes (load/op/load and invariant variants) | 4 | 8 | 64 |
-+| 4–8 nodes | 2 | 4 | 32 |
-+| 9+ nodes | 1 | 2 | 16 |
-+
-+The complete `packed_width`, rather than the single-intrinsic width, drives the
-+small-trip guard, quotient and signed-bias arithmetic, byte IV step, fused
-+remainder start, remainder call, stride and alias window. Every unrolled copy
-+clears the offset-sensitive load/expression cache and receives a fresh
-+expression value. Invariant broadcasts use a separate cache and are emitted
-+once in the preheader. Thus the optimization cannot silently reuse lane zero or
-+skip every other pair of elements.
-+
-+For x86 vector memory operations, the unrolled copy offset is passed as an
-+optional constant displacement to `VecLoadI64x2` and `VecStoreI64x2`. The x86
-+emitter folds 16, 32 and 48 bytes into `disp(base,index)`, so the hot loop keeps
-+one byte-IV register and does not materialize `byte_iv + displacement` with a
-+per-copy LEA. The AArch64 path does not consume this x86-only optional argument;
-+its map lowering remains conservative, and the transform retains an SSA offset
-+there if a NEON two-lane map reaches that path. No target receives a fake
-+four-lane I64 operation.
-+
-+`CCC_NO_MAP_I64_UNROLL=1` disables only this adaptive I64/U64 unroll decision,
-+which makes an apples-to-apples runtime A/B possible. `CCC_NO_MAP_VEC=1` remains
-+the complete scalar fallback and is used by the correctness gate.
-+
-+## Correctness gate
-+
-+`tests/regression/map_i64_two_lane.c` and
-+`tests/regression/check_map_i64_two_lane.sh` are the release gate. The runtime
-+program sweeps every trip count from 0 through 259 and checks against volatile
-+scalar references. It covers unsigned 64-bit wraparound, invariant subtraction,
-+untouched tails, and shifted/overlapping destinations. The gate compares LCCC
-+with both GCC and the `CCC_NO_MAP_VEC=1` LCCC control for `-march=x86-64-v3`
-+and baseline `-march=x86-64`, then assembles the i686 `-m32 -msse2` form.
-+
-+The assembly contract additionally requires, for `sub64`, exactly four
-+independent `vpsubq` operations on AVX2 and four `psubq` operations on SSE2,
-+a 64-byte vector-loop step, no `%ymm` register in the I64 map, and no
-+16/32/48-byte displacement LEA in the vector body. This pins the intended
-+four-copy/two-lane implementation without asserting a wider lane ABI. The
-+validated result was:
- 
--**Base:** upstream `origin/main` `8624a5d069f9473adeefdaae26378f69681d8bb4` (PR #639; fetched again 2026-09-27). The `.eh_frame` hardening was rebased onto this base; see `FOLLOWUP-2026-09-26-pr638-eh-frame-bounds.md`. This follow-up concerns **generated-code performance**, not an unwinder-speed claim. The patch is relative to this base, not to the old `a89e685` checkout.
--
--## Finding and change
--
--`VecSubI64x2` was already wired to x86-64 SSE2 `psubq` (VEX `vpsubq` when enabled), but the map analyzer rejected I64/U64 loads and stores. Simply admitting them under AVX2 would be **incorrect**: the map transform computed `32 / 8 = 4` elements per iteration while every I64 load/sub/store intrinsic handled only **two**. It would silently skip half the destination. No such transform was active before this change. Admit I64/U64 only on the **x86-64 target**, use 16-byte/two-lane XMM operations even with AVX2, and retain the original scalar fallback for i686 (whose backend cannot lower the register-based Vec*I64x2 family), NEON, SIMD-disabled targets, and shapes outside the existing conservative map grammar. The target permission is refreshed per translation unit rather than inferred from the compiler-host architecture. This enables subtraction, addition and supported existing elementwise operations without changing the arithmetic semantics or the alias/dependence guard.
--
--`tests/regression/map_i64_two_lane.c` checks every trip count from 0 through 259, unsigned 64-bit wraparound, operand order with invariant subtraction, untouched tails, and overlapping/shifted destinations against volatile scalar references. `check_map_i64_two_lane.sh`, installed as a **fast CI gate**, checks runtime output against both GCC and LCCC's `CCC_NO_MAP_VEC=1` control on `-march=x86-64-v3` and baseline `-march=x86-64`; pins `vpsubq`/`psubq` in the generated `sub64`, verifies that AVX2 did not accidentally use YMM, and assembles the **i686** control (`-m32 -msse2`) without a packed I64 map operation. The existing `vectorize_int_map_lanes.c` regression also exercises I64/U64 output against GCC under `-O3`. This is a target-specific, recoverable speed improvement; the switch permits an A/B and an emergency scalar fallback. After the change, `-O2 -march=x86-64-v3` assembly for each of the four existing gzip CRC32, zlib-ng Adler32, Expat XML scan and SQLite varint proxy programs was **byte-identical** between the default and `CCC_NO_MAP_VEC=1` control: this particular optimization does not change their codegen. A second seven-round correctness-checked runtime screen passed all four; the Expat LCCC/Clang paired ratio was 1.311 (pre-change 1.312), despite noisy absolute times. Saved output: `/home/user/research/workloads-map64-final.json`. This does not establish that unrelated map-heavy real programs have no regressions.
--
--## Reproducible A/B measurement
-+```
-+map-i64-two-lane: x86-64 AVX2/SSE2 runtime+GCC+scalar, i686 scalar assembly PASS
-+```
- 
--Run from repository root after the `fastbuild` (`-O1`, `-j2`) build:
-+The targeted regression corpus also passed the I64 map tests and
-+`vectorize_int_map_lanes.c` with `CCC_VALIDATE_SSA=1`.
- 
--```sh
--python3 scripts/bench_kernels.py --kernels map64_sub \
--  --lccc-alt-env CCC_NO_MAP_VEC=1 --reps 9 --inner 10000 \
--  --flags='-O2 -march=x86-64-v3' --save map64-bench.json
--bash tests/regression/check_map_i64_two_lane.sh
--```
-+## Assembly and oracle evidence
- 
--The committed deterministic kernel `tests/bench/k_map64_sub.c` performs 1,024 64-bit subtracts per `bench_run`, reads an output and mutates an input to prevent hoisting. The common reference-compiled driver, identical compiler flags, output check, CPU-0 pinning, interleaved arms and nine samples are handled by `bench_kernels.py`. In this **Xeon 2.60 GHz hypervisor VM**, with no usable PMU and no i7-14700KF, best-of-nine times were:
-+For `tests/regression/map_i64_two_lane.c::sub64` at `-O2 -march=x86-64-v3`,
-+the current LCCC assembly has four `movdqu`/`vpsubq`/store groups at offsets
-+0, 16, 32 and 48, increments the byte IV by 64, and then enters the scalar
-+remainder. The current compiler-explorer static survey reports these
-+instruction counts:
- 
--| Arm | Time (ms) | Relative to LCCC scalar |
--| --- | ---: | ---: |
--| LCCC two-lane (new) | **1.601** | **1.61× faster** |
--| LCCC `CCC_NO_MAP_VEC=1` | 2.571 | baseline |
--| host GCC **14.2** | 0.910 | faster than the new LCCC path |
--| host Clang **19.1** | 1.301 | faster than the new LCCC path |
-+| Compiler | Static instructions | Interpretation |
-+| --- | ---: | --- |
-+| LCCC local | 55 | two-lane XMM body plus scalar remainder |
-+| GCC 16.2 | 33 | 256-bit YMM body plus scalar remainder |
-+| Clang 23.1.0 | 50 | 256-bit/YMM multi-copy body |
-+| ICC 2021.10.0 | 74 | alignment/peel and XMM multi-copy variants |
-+| ICX latest | 25 | 256-bit YMM body plus compact remainder |
- 
--Exact times and distinct timed-function code hashes are in `engineering/evidence/map64-bench-2026-09-27.json`; the harness refuses a result mismatch. The speed gain is **only this kernel on this VM**. It does not establish superiority over GCC/Clang, on different memory sizes, or on the user's i7-14700KF. The i686 lowering is deliberately scalar; the test compiles/assembles that target but does not time it. No regression on the four existing workloads was inferred from this synthetic microbenchmark.
-+These are static assembly counts, not throughput claims. Full oracle output is
-+committed in `engineering/evidence/map64-oracle-2026-09-27.json`. It was
-+collected with `scripts/codegen_oracle.py` and the requested GCC 16.2, Clang
-+23.1, ICC 2021.10 and ICX latest oracles.
- 
--## Other workload and oracle evidence (pre-optimization tree)
-+## Runtime A/B evidence
- 
--A four-workload paired-median screen with seven randomized, pinned rounds and output checks used `-O2 -march=x86-64-v3` and host GCC 14.2 / Clang 19.1. LCCC divided by the fastest reference: gzip CRC32 **0.879** (faster); zlib-ng Adler32 **1.094** (slower); Expat XML scan **1.312** (slower); SQLite varint **1.162** (slower). Expat and several others varied by >5% across rounds, so treat their ordering and magnitudes as *screening*, not a statistically robust hardware result. Source: `/home/user/research/workloads-pr639.json` and `.md` from `tests/benchmark/run_benchmarks.py`. An existing timed-kernel screen also gave Adler DO8 0.307 ms vs GCC 3.318 ms / Clang 3.223 ms, but memchr was 6.949 ms vs Clang 4.018 ms; no universal win is claimed. Different fixtures and timing protocols must not be merged into one aggregate.
-+The reproducible harness is `scripts/bench_kernels.py`. It compiles one kernel
-+translation unit per arm, links one common GCC-compiled driver, interleaves
-+arms, pins timed children to CPU 0, checks the volatile result, and reports the
-+best of 15 samples with 10,000 kernel calls per sample. The sandbox is a Xeon
-+2.60 GHz hypervisor VM with no usable PMU; it is not the target i7-14700KF.
- 
--The **separate, untimed** Compiler Explorer survey (`scripts/codegen_oracle.py`, GCC **16.2**, Clang **23.1**, ICC, ICX; four workload files) found an Expat `main` count of 154 LCCC vs 94 GCC, predominantly corpus initialization: GCC emits two YMM stores per 60-byte fragment, whereas LCCC copies each byte. Switching both oracles to `-fPIE` gave 154 vs 98, so the gap is not solely a PIE/non-PIE addressing artifact. It is **not proof** that the initialization dominates the 64-pass scan. SQLite `sqlite_get_varint` was 121 vs 115 Clang instructions; a small count gap alone does not explain the measured whole-program difference. Survey artifacts: `/home/user/research/oracle-pr639.json`, `/home/user/research/expat-fpie/`. No GCC 16.2, Clang 23.1, ICC or ICX **runtime** timing was available; their oracle results are static assembly comparisons, not throughput claims.
-+At `-O2 -march=x86-64-v3`, the adaptive unroll versus the same compiler with
-+`CCC_NO_MAP_I64_UNROLL=1` measured:
- 
--## Validation boundary and next investigation
-+| Arm | Best time | Relative result |
-+| --- | ---: | ---: |
-+| LCCC adaptive unroll | 1.676 ms | 1.454× faster than rolled LCCC |
-+| LCCC rolled two-lane | 2.438 ms | control |
-+| host GCC 14.2 | 1.384 ms | faster than LCCC in this VM |
-+
-+The same protocol with `CCC_NO_MAP_VEC=1` measured LCCC at 1.648 ms versus
-+3.442 ms for the scalar control (2.089×), while GCC 14.2 measured 1.442 ms.
-+With baseline `-march=x86-64`, LCCC measured 1.613 ms versus 3.412 ms scalar
-+(2.115×); host GCC 14.2 measured 2.412 ms. These runs support the narrower
-+claim that the two-lane map and the adaptive unroll improve this synthetic
-+kernel against their local LCCC controls. They do **not** establish superiority
-+over GCC/Clang, package-wide gains, or native Raptor Lake throughput. The raw
-+unroll result is committed in
-+`engineering/evidence/map64-unroll-run-2026-09-27.json`; the normalized
-+metadata and limitations are in
-+`engineering/evidence/map64-unroll-displacement-2026-09-27.json`.
-+
-+The local image has GCC 14.2 and no installed Clang binary for this runtime
-+screen. GCC 16.2, Clang 23.1, ICC 2021.10 and ICX latest therefore remain
-+static oracles here, not runtime timing arms. Hardware PMU measurements on an
-+i7-14700KF and larger gzip/zlib-ng/Expat/SQLite/Linux/glibc workload screens
-+remain follow-up work rather than implied evidence.
-+
-+## Reproduction
-+
-+From the repository root, after the project-policy fastbuild (`-O1`, maximum
-+`-j2`) build:
- 
--A rebased **pre-map-change** fast CI was 83 pass / 0 fail / 3 skip and was saved as S05. The first map-change fast CI exposed a missing **hosted CI mirror** for the new local gate (83 pass / 1 fail / 3 skip); the workflow was fixed, not bypassed. The next exact-tree run passed **84 / 0 / 3** and was snapshotted as S06. After this final documentation update, only the matching `target/ci_local.pass` and `/home/user/artifacts/SNAPSHOT_LEDGER.md` certify the delivered tree; do not substitute S05 or S06 for a later edit. The fast profile intentionally skips slow SSA/corpus/benchmark-output gates; a full slow CI, cross-target ARM/RISC-V runtime, full upstream zlib-ng/gzip/Expat/SQLite projects, glibc and kernel builds, native Raptor Lake PMU counters, and runtime linker-oracle differentials remain **unperformed**. The reported benchmark programs are realistic kernels/proxies, not full package builds.
-+```sh
-+./scripts/build_lccc_fast.sh
-+CCC=target/fastbuild/lccc bash tests/regression/check_map_i64_two_lane.sh
-+CCC_VALIDATE_SSA=1 python3 tests/regression/run_regression.py \
-+  --lccc target/fastbuild/lccc --filter vectorize_int_map_lanes -j 2
-+python3 scripts/bench_kernels.py --kernels map64_sub \
-+  --lccc-alt-env CCC_NO_MAP_I64_UNROLL=1 --reps 15 --inner 10000 \
-+  --flags='-O2 -march=x86-64-v3'
-+python3 scripts/codegen_oracle.py tests/regression/map_i64_two_lane.c \
-+  --function sub64 --local target/fastbuild/lccc \
-+  --flags '-O2 -march=x86-64-v3' --local-flags '-O2 -march=x86-64-v3' \
-+  --oracles gcc16.2,clang,icc,icx --artifact-dir /tmp/oracle-map64
-+```
- 
--For further optimization, first localize Expat's 64-pass scan and SQLite's decoder using controlled per-function measurements and inspect their assembly/spill costs; do not optimize a `main` initialization merely because it has more static instructions. On the I64 map kernel, GCC 14.2 and Clang 19.1 remain faster: the two-lane limitation and scalar remainder/unrolling are candidates for profiling, **not** permission to change lane width without a complete 256-bit I64 intrinsic/ABI implementation and differential tests. Re-run exact-tree fast CI and atomically snapshot every validated change before any further experiment.
-+The full local CI mirror remains the release gate. A fastbuild/test pass is
-+necessary but does not replace `ci_local.sh`, Clippy, the snapshot apply-check,
-+or the final patch/bundle/ledger publication.
-diff --git a/engineering/FOLLOWUP-2026-09-27-pr640-pr629-redteam.md b/engineering/FOLLOWUP-2026-09-27-pr640-pr629-redteam.md
+diff --git a/engineering/FOLLOWUP-2026-09-27-map64-review.md b/engineering/FOLLOWUP-2026-09-27-map64-review.md
 new file mode 100644
-index 000000000..91ffda8b2
+index 00000000..e4aae8c1
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-27-pr640-pr629-redteam.md
-@@ -0,0 +1,351 @@
-+# Follow-up — PR #640…#629 semantic red-team audit
-+
-+**Session date:** 2026-09-27 (UTC)
-+
-+**Repository:** `ms178/lccc`
-+
-+**Audited tree:** `e9f572eb36f5cd98c9ea1f077bc2922bd001177e` (`origin/main` at
-+session start), plus the corrective commit
-+`a5600dd203721054f8c5837a1e4ad1005f53d837` and the durable follow-up
-+commits `370767c3abcf41b067792d06c7cc8cc9b0c25ade` and
-+`a14be90d0a736065b344998251cfde6b1460a483` and
-+`71903f1c38c53d048b67919cc000c14b613373ec`.
-+
-+**Deliverable:** `/home/user/ms178-1.patch`
-+
-+**Snapshot continuity:** the authoritative snapshot tag, base/head, SHA-256
-+hashes, CI gate, and `APPLIES-CLEAN` result are recorded in
-+`/home/user/artifacts/SNAPSHOT_LEDGER.md`; the current canonical patch is
-+`/home/user/ms178-1.patch`. The full 87-gate run was green immediately before
-+the final wording-only refresh, and every exact-tree refresh after it passed
-+the fast mirror.
-+
-+---
-+
-+## 1. Executive result
-+
-+The ten most recent merged PRs on `main` were audited as a connected change
-+set, not as ten isolated diffs. The audit covered the frontend/IR/backend
-+boundaries affected by the PRs, x86-64 and i686 code generation, the in-tree
-+linkers, CFI and `.eh_frame`, assembler encoding, liveness/register-cache
-+contracts, and the regression/oracle wiring that claims to validate them.
-+
-+One real semantic defect was found and fixed:
-+
-+> The shared `.eh_frame` CIE parser treated a DWARF v4 CIE as a v1/v3 CIE.
-+> DWARF v4 inserts `address_size` and `segment_selector_size` between the
-+> augmentation string and the alignment factors. The old parser therefore
-+> read the wrong bytes as the alignment and return-address fields and could
-+> reject a valid CIE or assign its FDEs the wrong pointer encoding.
-+
-+The same audit found two related fail-closed defects in the EH-frame path and
-+fixed them in the same commit:
-+
-+* unsigned absolute pointers were forced through `i64` (bad for 32-bit
-+  addresses with bit 31 set and for high-half 64-bit `udata8` values);
-+* unsupported text/data-relative and indirect encodings were treated as if
-+  their base were zero, and fixed-width header displacements were silently
-+  truncated to `i32`.
-+
-+The corrective implementation now rejects unrepresentable/unsupported values
-+instead of manufacturing a plausible but wrong unwind-table entry.
-+
-+No other production defect was demonstrated by the available evidence. The
-+remaining optimization gap is recorded rather than hidden: the new two-lane
-+I64 map path is correct and wins the local runtime experiment against GCC
-+14.2, but static Godbolt instruction counts still show a clear opportunity for
-+unroll/epilogue work against GCC 16.2 and ICX.
-+
-+---
-+
-+## 2. Exact PRs audited
-+
-+| PR | merge commit | topic commit | primary area | verdict |
-+|---:|---|---|---|---|
-+| #640 | `e9f572e` | `9b02dfd` | I64/U64 map vectorization; shared `.eh_frame` reader hardening | **fixed: DWARF v4, pointer and range defects** |
-+| #639 | `8624a5d` | `7b7bb8a` | x86-family `%rax` epoch scope; sink coverage; x86 D32 moves | no residual defect demonstrated |
-+| #638 | `a89e685` | `af57893` | CFI from final code; real `.eh_frame`; ARX/reassociation | no residual defect demonstrated |
-+| #637 | `57ce949` | `b026ddd` | accumulator invalidation; SSE staging; thunk-reference scan | no residual defect demonstrated |
-+| #635 | `9bbf681` | `d39611c` | indexed GEP order; hidden-read liveness; coalescing; return pointers | no residual defect demonstrated |
-+| #633 | `0cc06e8` | `e11ec99` | revert of PR #632 | revert correctly neutralizes #632 |
-+| #632 | `5a71853` | `cac4a28` | folded-GEP/hidden-read/retpoline experiment | audited as reverted; no active code remains |
-+| #631 | `43c3cd4` | `8b1b99e` | SQLite miscompile fixes; assembler hardening; CI parity | no residual defect demonstrated |
-+| #630 | `a066f0c` | `737e98a` | x86/i686 VEX selection and EVEX operand validation | no residual defect demonstrated |
-+| #629 | `9c806fe` | `4f94abf` | GAS 2.47 EVEX/VEX parity and strict reciprocal stress | no residual defect demonstrated |
-+
-+The full parent-to-topic diffs were retained during the audit under the
-+session's ephemeral `/home/user/audit/` directory; only the useful corrective
-+source and this durable report are in the deliverable.
-+
-+---
-+
-+## 3. Corrective change details
-+
-+### 3.1 DWARF v4 CIE layout
-+
-+`parse_cie_fde_encoding` now:
-+
-+1. accepts only CIE versions 1 through 4;
-+2. for version 4, consumes and validates `address_size` and
-+   `segment_selector_size` before reading the alignment factors;
-+3. requires the CIE address size to agree with the output ELF class;
-+4. rejects non-zero segment selector sizes because this decoder does not have
-+   a segmented-address model.
-+
-+This is deliberately fail-closed. Returning an FDE with a wrong encoding is
-+worse than omitting one entry: the unwinder's binary search can select a
-+semantically unrelated frame description.
-+
-+### 3.2 Pointer decoding
-+
-+`decode_eh_pointer` now keeps `(raw_value, signedness)` instead of coercing all
-+encodings through `i64`:
-+
-+* `absptr`, `uleb128`, `udata2/4/8` remain unsigned;
-+* `sleb128`, `sdata2/4/8` remain signed;
-+* signed PC-relative values use checked signed addition;
-+* unsigned PC-relative values use checked unsigned addition;
-+* indirect, text-relative, and data-relative encodings return `None`, because
-+  the section-only decoder has no relocated image/text/data base to dereference
-+  or apply;
-+* all byte-range checks use subtraction/checked bounds and cannot wrap an
-+  offset before indexing.
-+
-+### 3.3 Header field range law
-+
-+`.eh_frame_hdr` explicitly uses `sdata4` for its pointer/table entries and
-+`udata4` for its count. Header construction now returns an empty header when a
-+count, allocation size, or displacement cannot be represented, rather than
-+casting with `as i32` and emitting a wrapped search table.
-+
-+The FDE virtual-address calculation is checked as well.
-+
-+### 3.4 Tests added
-+
-+The linker-common unit suite now includes:
-+
-+* a valid DWARF v4 `zR` CIE/FDE fixture;
-+* truncated and unknown-version v4 rejection;
-+* 32-bit high-bit absolute pointer decoding;
-+* high-half 64-bit `udata8` decoding;
-+* high-canonical-address PC-relative arithmetic;
-+* rejection of unsupported data-relative and indirect encodings;
-+* rejection of an unrepresentable `.eh_frame_hdr` displacement.
-+
-+The existing malformed-record, extended-length, bounded-LEB, CIE-cache,
-+compaction, pruning, and arbitrary-record tests continue to pass.
-+
-+---
-+
-+## 4. Red-team evidence
-+
-+### 4.1 Build and lint policy
-+
-+* 8 GiB `/swapfile` is active (`/proc/swaps`), with the repository's
-+  `ensure_swap.sh` policy in place.
-+* Rust 1.98.1 / Edition 2024.
-+* LCCC built with the repository fastbuild preset, `-O1`, and `-j2`.
-+* `-D warnings` was used for targeted builds and the CI build gate.
-+* `cargo fmt --all -- --check`: **PASS**.
-+* `cargo clippy` through `ci_local.sh`: **PASS**, zero warnings.
-+
-+The first fast-CI attempt was not treated as a code result: the disposable VM
-+lacked 32-bit libc headers, so the i686 portions of the new map and no-CFI
-+gates failed during preprocessing. `gcc-multilib` and `libc6-dev-i386` were
-+installed, the two gates were rerun directly, and both passed. The clean
-+post-fix fast run below is the authoritative result.
-+
-+### 4.2 CI mirrors
-+
-+`./scripts/ci_local.sh --fast` on the corrective source tree passed first:
-+
-+```text
-+84 passed, 0 failed, 3 skipped
-+ALL GATES GREEN
-+```
-+
-+The three skips are the script's intentional `--fast` skips:
-+
-+* regression corpus with SSA validation;
-+* benchmark-output oracle;
-+* peephole whitespace invariance.
-+
-+The final documented tree was then run through the complete
-+`./scripts/ci_local.sh` (no `--fast`):
-+
-+```text
-+87 passed, 0 failed, 0 skipped
-+ALL GATES GREEN
-+pass stamp: target/ci_local.pass (full)
-+```
-+
-+The slow gates supplied the missing evidence: **815/815** regression-corpus
-+cases passed with SSA validation, the benchmark-output oracle reported
-+**204 PASS / 0 FAIL / 0 SKIP**, and the whitespace-invariance gate completed
-+its in-tree, operand-matrix, and generated-assembly phases successfully.
-+All other gates passed as well, including cargo tests, differential
-+correctness, fuzz smoke, CFI/eh-frame unwind, assembler/GAS 2.47 parity, all
-+BB-SLP red-team gates, vectorization gates, cross-backend atomics, codegen
-+quality, rustfmt, and clippy.
-+
-+Targeted post-fix results:
-+
-+```text
-+linker_common::eh_frame::tests: 16 passed, 0 failed
-+check_eh_frame_unwind.sh: PASS
-+check_cfi_invariants.sh: PASS (8538 functions, 9139 returns)
-+check_map_i64_two_lane.sh: PASS
-+check_nocfi_peephole_parity.sh: PASS
-+```
-+
-+### 4.3 I64/U64 map stress
-+
-+A separate deterministic stress fixture exercised signed and unsigned 64-bit
-+maps, add/sub/mul/bitwise/shift/div/modulo, invariant broadcasts, conditional
-+maps, three-stream maps, tails from zero through 72 elements, larger trip
-+counts, unaligned destinations, signed `int64_t`, and legal non-`restrict`
-+overlap. It passed at:
-+
-+```text
-+-O0/-O1/-O2/-O3 × x86-64 and x86-64-v3
-+```
-+
-+The overlap test was deliberately corrected to remove `restrict`; the initial
-+version was testing undefined behaviour, and GCC -O3 failed it too. The final
-+fixture and the compiler's scalar-kill-switch comparison both passed.
-+
-+### 4.4 Godbolt oracle
-+
-+`scripts/godbolt.py audit` passed and resolved the requested aliases:
-+
-+```text
-+gcc16.2    -> x86-64 gcc 16.2
-+clang23.1  -> x86-64 clang 23.1.0
-+icc        -> x86-64 icc 2021.10.0
-+icx        -> x86-64 icx (latest)
-+```
-+
-+The standalone map reproducer was compared with all four remote oracles. The
-+recorded instruction counts are static counts, not a runtime claim:
-+
-+| flags | LCCC | GCC 16.2 | Clang 23.1 | ICC | ICX |
-+|---|---:|---:|---:|---:|---:|
-+| `-O2 -march=x86-64` | 47 | 11 | 28 | 74 | 55 |
-+| `-O2 -march=x86-64-v3` | 46 | 33 | 50 | 74 | 25 |
-+
-+This is an honest remaining code-quality gap: LCCC's two-lane path is not yet
-+unrolled as aggressively as the best remote implementations. The local
-+runtime harness (`scripts/bench_kernels.py`, best-of 5, inner 200, unpinned
-+VM) measured `map64_sub` at **1.486x faster than local GCC 14.2**. That result
-+is useful evidence for this VM only; it is not presented as a Raptor Lake or
-+PMU result.
-+
-+Oracle artifacts are in `/home/user/artifacts/godbolt-map64/` and include the
-+source hash, flags, resolved compiler IDs, and manifest.
-+
-+---
-+
-+## 5. Per-PR adjudication
-+
-+### PR #640 — fixed finding
-+
-+The map gate and shared EH-frame parser were read together because the PR
-+changes both target-gated optimization and linker metadata. The map gate
-+covers target reset (x86-64 then i686), SSE2/AVX2 width selection, tails,
-+scalar kill-switch, alias fallback, and runtime equality. The EH-frame audit
-+found the v4/pointer/range defects described above and fixed them with unit
-+fixtures.
-+
-+### PR #639 — accepted after audit
-+
-+The `%rax` epoch scanner is debug-only and opt-in only for x86-64/i686. The
-+review checked the implicit writer table (`div`, `idiv`, one-operand `imul`,
-+`mul`, calls, string ops, compare-exchange, system instructions), generic
-+AT&T destination rules, xchg/xadd/mulx operand classes, embedded-newline
-+scanning, truncation/re-emission, and the final full-buffer assertion. Existing
-+classifier and sink-coverage tests plus the full fast mirror passed.
-+
-+### PR #638 — accepted after audit
-+
-+The final-code CFI derivation, x86/i686 CFI emission, `.eh_frame` synthesis,
-+ARX frame selection, and reassociation paths were checked against the CFI
-+invariant and unwind gates. The critical invariant is derived from final
-+machine code, not a pre-peephole estimate; the tested output had 8,538
-+functions and 9,139 returns with no invariant violation.
-+
-+### PR #637 — accepted after audit
-+
-+The audit followed the accumulator-cache dataflow through call staging,
-+casts, comparisons, floating-point paths, memory paths, return paths, GVN,
-+and both x86-family backends. Width-exact SSE staging and code-only
-+retpoline/thunk scans are covered by their dedicated regression gates. No
-+uncovered write or stale cache use was demonstrated.
-+
-+### PR #635 — accepted after audit
-+
-+Indexed-GEP emission order was checked for def-before-use, hidden reads were
-+checked in liveness and peephole replay, commuted-RHS coalescing was checked
-+against type/width constraints, and slot-independent accumulator sourcing was
-+checked against the debug epoch contract. The vector-copy and replay/phi
-+contracts passed.
-+
-+### PRs #632 and #633 — accepted as a revert pair
-+
-+#632's folded-GEP/hidden-read/retpoline experiment was immediately reverted by
-+#633. Both diffs were audited so the review did not accidentally reason about
-+#632 as production code. The effective main-tree behavior is the #633 revert;
-+no #632-only optimization is claimed in this report.
-+
-+### PR #631 — accepted after audit
-+
-+The audit covered the SQLite reproducer family, function-pointer/type-scope
-+regressions, IV-widen exit bounds, displacement composition, callee-saved
-+relay across calls, tentative incomplete arrays, CI gate parity, and the
-+assembler modes inherited from the preceding PR. Differential correctness,
-+SSA validation where enabled by the gate, and the cross-PR red-team gate
-+passed.
-+
-+### PR #630 — accepted after audit
-+
-+VEX direction/hint handling and EVEX operand validation were compared against
-+GAS 2.47 for x86-64 and i686. The merged PR629 follow-up casefiles passed:
-+90/90 x86-64 cases and 568/568 i686 cases in the fast mirror.
-+
-+### PR #629 — accepted after audit
-+
-+The audit covered EVEX promotion, disp8-N scaling, tuple/operand validation,
-+VEX direction, strict computed reciprocal packing, and the added LZ4 benchmark
-+fixture. GAS 2.47 parity and the strict reciprocal codegen gate passed. No
-+unsupported instruction was accepted by the tested encoder paths.
-+
-+---
-+
-+## 6. Known limits and follow-up queue
-+
-+1. **Keep the full 87-gate result reproducible.** The final documented tree
-+   is currently stamped `ci_local-full-PASS`; any source or documentation edit
-+   must be followed by a fresh exact-tree pass before publishing another
-+   delivery snapshot.
-+2. **Close the I64 map instruction-count gap.** Prototype a two- or four-iteration
-+   unroll only when the cost model predicts enough trip count to amortize the
-+   extra epilogue/branch work; validate against the same scalar fallback and
-+   Godbolt set. Do not optimize the static count at the expense of small loops.
-+3. **Run on the requested i7-14700KF.** This VM has an Intel Xeon virtual CPU,
-+   no `perf`/PMU interface, and no P/E-core topology. The current evidence is
-+   deterministic correctness plus wall-clock best-of sampling, not hardware
-+   counter evidence.
-+4. **Keep ICX/ICC manifests fresh.** The oracle audit currently resolves all
-+   aliases; every future claim must preserve the resolved IDs in its artifact
-+   manifest.
-+5. **Consider a structured result type for EH-frame header construction.** The
-+   current public API historically uses an empty vector for “cannot build”; a
-+   future linker API could distinguish “empty valid section” from “rejected
-+   malformed input” without changing the current fail-closed behavior.
-+6. **Retain the multilib preflight in session restore.** The missing i386 libc
-+   headers were an environment failure, not a compiler failure, but without
-+   the preflight the regression gates report a misleading red result.
-+
-+No performance win is accepted merely because an IR shape or instruction
-+count looks better. The next map optimization must carry a reproducer,
-+assembly, correctness differential, runtime distribution, and (on real
-+hardware) counters.
-diff --git a/engineering/evidence/map64-oracle-2026-09-27.json b/engineering/evidence/map64-oracle-2026-09-27.json
++++ b/engineering/FOLLOWUP-2026-09-27-map64-review.md
+@@ -0,0 +1,68 @@
++# I64 map review follow-up
++
++Base: `563fb0bcb39488a97a6aa69858458196cf91710c` (merged #653).
++
++## Findings, not scores
++
++* F1 is partly valid. The transform rejected constant trips <= its unrolled
++  width, but the claim that 3..8 necessarily remain scalar is false on this
++  main: compiling restrict subtraction at baseline x86-64 gives 1, 2, and 4
++  `psubq` instructions for 3, 4, and 8 respectively via unroll/SLP. The early
++  map analyzer also independently rejects <=4, so changing only the proposed
++  transform threshold cannot make that entry handle 3/4. Preserve the existing
++  SLP route. Shrink the factor for known trips; within the existing <=16 tiny
++  loop window, additionally shrink until at most one scalar I64 tail remains.
++  For 15 the suggested width-only repair would do nothing and retain seven
++  scalar elements. The additional remainder-cost condition fixes that case
++  without changing remainder construction or overlap checks.
++* F2 identifies a worthwhile separate project, not a demonstrated defect or
++  automatic 2x speedup. Width is a complete intrinsic/backend contract, not a
++  load/store naming change. AVX2 DOES support 64-bit equality/signed greater
++  compares, logical qword shifts (including variable forms), and bitwise mask
++  selection; it lacks native general qword multiply and arithmetic right
++  shift. Unsigned comparisons require appropriate lowering. Any wider path
++  needs operation-specific legality, register-allocation coverage, differential
++  tests, and 15-sample 256x2 versus 128x4 measurements before selection. No
++  256-bit path or ABI change is included here.
++* F3 is valid. Snapshot the presence-based switch with `var_os` in run_passes,
++  refresh per TU, and consult it only for I64/U64 on x86. A unit test pins the
++  true-to-false same-worker refresh. Internal pass callers remain responsible
++  for setting policy/ISA state; environment lookup is not an internal API.
++* F4: no ARM performance evidence supports the new unroll. Explicitly leave
++  NEON rolled; this is containment, not a claim of ARM acceleration.
++* F5: the single shell gate already exercises multiple runtime functions and
++  counts 0..259, so “one case” understates coverage. Its label split really is
++  fragile. The replacement finds a backward branch enclosing packed ops,
++  asserts actual displaced loads AND stores, and tests renamed labels and
++  deliberately corrupted offsets/opcodes. It pins the rolled switch, x2 tier
++  (two sub PLUS two add instructions, not two total), and a single hoisted
++  invariant broadcast. Fixed-trip runtime and codegen tests cover every count
++  3..16; the original runtime fixture now also checks tier2 and invariant maps.
++* F6 is a reasonable heuristic refinement, not measured proof of regression:
++  invariant broadcast work is not replicated. Separate unroll_cost from the
++  unchanged syntax/node budget. Invariants still occupy registers, and the
++  heuristic is not an exact pressure or throughput model.
++* Minor items: checked arithmetic/expect documents internal bounded invariants,
++  not untrusted-input panic paths. Debug-string cache keys remain unchanged:
++  replacing them with ordinary floating Operand equality could conflate +0/-0
++  and mishandle NaNs in this shared FP/integer emitter. That deserves a bitwise
++  structural-key change with its own tests, not an incidental rewrite.
++
++## Validation and limits
++
++The expanded AVX2/SSE2 runtime/GCC/scalar/rolled and i686 codegen gate passes.
++Pure policy tests cover counts 0..259, powers of two, small-tail bounds and
++invariant cost versus syntax count. Overlap/remainder construction is unchanged.
++
++Fresh 15-sample `bench_kernels.py` run, same synthetic 1024-element kernel:
++`--kernels map64_sub --reps 15 --inner 2000 --flags '-O2 -march=x86-64-v3'
++--lccc-alt-env CCC_NO_MAP_I64_UNROLL=1`. Best samples: default 0.303 ms,
++rolled 0.317 ms, GCC 0.176 ms (raw distributions in the accompanying JSON).
++This VM run does NOT reproduce the old 1.45x magnitude: only 1.047x here, and
++GCC remains faster. No Raptor Lake or PMU claim is warranted. The large-trip
++subtraction policy is unchanged; these numbers do not establish a performance
++win from this follow-up. Its concrete improvements are policy consistency,
++short fixed-trip packed coverage, ARM containment and regression sensitivity.
++
++Full CI status is recorded by the exact-tree snapshot ledger, not inferred
++from a successful focused gate. Fastbuild uses -O1 / -j2 and active 8 GiB swap.
+diff --git a/engineering/evidence/map64-review-unroll-2026-09-27.json b/engineering/evidence/map64-review-unroll-2026-09-27.json
 new file mode 100644
-index 000000000..494bf2436
+index 00000000..4861bab2
 --- /dev/null
-+++ b/engineering/evidence/map64-oracle-2026-09-27.json
-@@ -0,0 +1,394 @@
-+[
-+  {
-+    "source": "tests/regression/map_i64_two_lane.c",
-+    "function": "sub64",
-+    "arch": "x86",
-+    "records": [
-+      {
-+        "key": "lccc",
-+        "id": "/home/user/lccc/target/fastbuild/lccc",
-+        "name": "local LCCC",
-+        "flags": "-O2 -march=x86-64-v3",
-+        "elapsed_s": 0.15533149400005186,
-+        "instructions": 55,
-+        "loads": 27,
-+        "stores": 0,
-+        "spills": 0,
-+        "branches": 10,
-+        "vectors": 4,
-+        "assembly": [
-+          "sub64:",
-+          ".cfi_startproc",
-+          "    pushq %rbp",
-+          "    .cfi_def_cfa_offset 16",
-+          "    .cfi_offset %rbp, -16",
-+          "    # LCCC_RET_XMM 0",
-+          "    # LCCC_RET_RDX 0",
-+          "    # LCCC_RET_RAX 0",
-+          "    movq %rcx, %r9",
-+          "    shrq $3, %r9",
-+          "    shlq $6, %r9",
-+          "    xorl %r11d, %r11d",
-+          ".LBB1:",
-+          "    cmpq %r9, %r11",
-+          "jae .LBB4",
-+          ".p2align 5,,15",
-+          ".p2align 4",
-+          ".LBB2:",
-+          "    movdqu (%rsi,%r11), %xmm14",
-+          "    vpsubq (%rdx,%r11), %xmm14, %xmm14",
-+          "    movdqu %xmm14, (%rdi,%r11)",
-+          "    movdqu 16(%rsi,%r11), %xmm15",
-+          "    vpsubq 16(%rdx,%r11), %xmm15, %xmm15",
-+          "    movdqu %xmm15, 16(%rdi,%r11)",
-+          "    movdqu 32(%rsi,%r11), %xmm14",
-+          "    vpsubq 32(%rdx,%r11), %xmm14, %xmm14",
-+          "    movdqu %xmm14, 32(%rdi,%r11)",
-+          "    movdqu 48(%rsi,%r11), %xmm15",
-+          "    vpsubq 48(%rdx,%r11), %xmm15, %xmm15",
-+          "    movdqu %xmm15, 48(%rdi,%r11)",
-+          "    addq $64, %r11",
-+          "    cmpq %r9, %r11",
-+          "jb .LBB2",
-+          "    jmp .LBB4",
-+          ".LBB3:",
-+          "    popq %rbp",
-+          "    .cfi_def_cfa_offset 8",
-+          "    ret",
-+          ".LBB4:",
-+          "    .cfi_def_cfa_offset 16",
-+          "    movq %r11, %r10",
-+          "    shrq $3, %r10",
-+          ".LBB5:",
-+          "    cmpq %rcx, %r10",
-+          "jae .LBB3",
-+          ".p2align 4,,10",
-+          ".p2align 3",
-+          ".LBB6:",
-+          "    movq (%rsi, %r10, 8), %rax",
-+          "    subq (%rdx, %r10, 8), %rax",
-+          "    movq %rax, (%rdi, %r10, 8)",
-+          "    leaq 1(%r10), %r9",
-+          "    cmpq %rcx, %r9",
-+          "jae .LBB3",
-+          ".LBB7:",
-+          "    movq 8(%rsi, %r10, 8), %rbp",
-+          "    movq %rbp, %rax",
-+          "    subq 8(%rdx, %r10, 8), %rax",
-+          "    movq %rax, 8(%rdi, %r10, 8)",
-+          "    leaq 2(%r10), %r9",
-+          "    cmpq %rcx, %r9",
-+          "jae .LBB3",
-+          ".LBB8:",
-+          "    movq 16(%rsi, %r10, 8), %rax",
-+          "    subq 16(%rdx, %r10, 8), %rax",
-+          "    movq %rax, 16(%rdi, %r10, 8)",
-+          "    leaq 3(%r10), %r9",
-+          "    cmpq %rcx, %r9",
-+          "jae .LBB3",
-+          ".LBB9:",
-+          "    movq 24(%rsi, %r10, 8), %rax",
-+          "    subq 24(%rdx, %r10, 8), %rax",
-+          "    movq %rax, 24(%rdi, %r10, 8)",
-+          "    addq $4, %r10",
-+          "    cmpq %rcx, %r10",
-+          "jb .LBB6",
-+          "    jmp .LBB3"
-+        ],
-+        "ratio_vs_best": 2.2
-+      },
-+      {
-+        "key": "gcc16.2",
-+        "id": "cg162",
-+        "name": "x86-64 gcc 16.2",
-+        "semver": "16.2",
-+        "compilerType": "",
-+        "flags": "-O2 -march=x86-64-v3",
-+        "elapsed_s": 0.5830680880000045,
-+        "instructions": 33,
-+        "loads": 8,
-+        "stores": 0,
-+        "spills": 0,
-+        "branches": 8,
-+        "vectors": 5,
-+        "assembly": [
-+          "sub64:",
-+          "  movq %rdx, %r8",
-+          "  movq %rcx, %r9",
-+          "  testq %rcx, %rcx",
-+          "  je .L13",
-+          "  leaq -1(%rcx), %rax",
-+          "  cmpq $2, %rax",
-+          "  jbe .L6",
-+          "  movq %rcx, %rdx",
-+          "  xorl %eax, %eax",
-+          "  shrq $2, %rdx",
-+          "  movq %rdx, %rcx",
-+          "  salq $5, %rcx",
-+          ".L4:",
-+          "  vmovdqu (%rsi,%rax), %ymm0",
-+          "  vpsubq (%r8,%rax), %ymm0, %ymm0",
-+          "  vmovdqu %ymm0, (%rdi,%rax)",
-+          "  addq $32, %rax",
-+          "  cmpq %rcx, %rax",
-+          "  jne .L4",
-+          "  leaq 0(,%rdx,4), %rax",
-+          "  cmpq %rax, %r9",
-+          "  je .L15",
-+          "  vzeroupper",
-+          ".L5:",
-+          "  movq (%rsi,%rax,8), %rdx",
-+          "  subq (%r8,%rax,8), %rdx",
-+          "  movq %rdx, (%rdi,%rax,8)",
-+          "  addq $1, %rax",
-+          "  cmpq %r9, %rax",
-+          "  jb .L5",
-+          ".L13:",
-+          "  ret",
-+          ".L15:",
-+          "  vzeroupper",
-+          "  ret",
-+          ".L6:",
-+          "  xorl %eax, %eax",
-+          "  jmp .L5"
-+        ],
-+        "ratio_vs_best": 1.32
-+      },
-+      {
-+        "key": "clang",
-+        "id": "cclang2310",
-+        "name": "x86-64 clang 23.1.0",
-+        "semver": "23.1.0",
-+        "compilerType": "clang",
-+        "flags": "-O2 -march=x86-64-v3",
-+        "elapsed_s": 0.4738557530000662,
-+        "instructions": 50,
-+        "loads": 18,
-+        "stores": 0,
-+        "spills": 0,
-+        "branches": 12,
-+        "vectors": 16,
-+        "assembly": [
-+          "sub64:",
-+          "  testq %rcx, %rcx",
-+          "  je .LBB0_13",
-+          "  cmpq $4, %rcx",
-+          "  jae .LBB0_4",
-+          "  xorl %eax, %eax",
-+          "  jmp .LBB0_3",
-+          ".LBB0_4:",
-+          "  cmpq $16, %rcx",
-+          "  jae .LBB0_6",
-+          "  xorl %eax, %eax",
-+          "  jmp .LBB0_10",
-+          ".LBB0_6:",
-+          "  movq %rcx, %rax",
-+          "  andq $-16, %rax",
-+          "  xorl %r8d, %r8d",
-+          ".LBB0_7:",
-+          "  vmovdqu (%rsi,%r8,8), %ymm0",
-+          "  vmovdqu 32(%rsi,%r8,8), %ymm1",
-+          "  vmovdqu 64(%rsi,%r8,8), %ymm2",
-+          "  vmovdqu 96(%rsi,%r8,8), %ymm3",
-+          "  vpsubq (%rdx,%r8,8), %ymm0, %ymm0",
-+          "  vpsubq 32(%rdx,%r8,8), %ymm1, %ymm1",
-+          "  vpsubq 64(%rdx,%r8,8), %ymm2, %ymm2",
-+          "  vpsubq 96(%rdx,%r8,8), %ymm3, %ymm3",
-+          "  vmovdqu %ymm0, (%rdi,%r8,8)",
-+          "  vmovdqu %ymm1, 32(%rdi,%r8,8)",
-+          "  vmovdqu %ymm2, 64(%rdi,%r8,8)",
-+          "  vmovdqu %ymm3, 96(%rdi,%r8,8)",
-+          "  addq $16, %r8",
-+          "  cmpq %r8, %rax",
-+          "  jne .LBB0_7",
-+          "  cmpq %rax, %rcx",
-+          "  je .LBB0_13",
-+          "  testb $12, %cl",
-+          "  je .LBB0_3",
-+          ".LBB0_10:",
-+          "  movq %rax, %r8",
-+          "  movq %rcx, %rax",
-+          "  andq $-4, %rax",
-+          ".LBB0_11:",
-+          "  vmovdqu (%rsi,%r8,8), %ymm0",
-+          "  vpsubq (%rdx,%r8,8), %ymm0, %ymm0",
-+          "  vmovdqu %ymm0, (%rdi,%r8,8)",
-+          "  addq $4, %r8",
-+          "  cmpq %r8, %rax",
-+          "  jne .LBB0_11",
-+          "  jmp .LBB0_12",
-+          ".LBB0_3:",
-+          "  movq (%rsi,%rax,8), %r8",
-+          "  subq (%rdx,%rax,8), %r8",
-+          "  movq %r8, (%rdi,%rax,8)",
-+          "  incq %rax",
-+          ".LBB0_12:",
-+          "  cmpq %rax, %rcx",
-+          "  jne .LBB0_3",
-+          ".LBB0_13:",
-+          "  vzeroupper",
-+          "  retq",
-+          ""
-+        ],
-+        "ratio_vs_best": 2.0
-+      },
-+      {
-+        "key": "icc",
-+        "id": "cicc2021100",
-+        "name": "x86-64 icc 2021.10.0",
-+        "semver": "2021.10.0",
-+        "compilerType": "",
-+        "flags": "-O2 -march=x86-64-v3",
-+        "elapsed_s": 0.5350657980000051,
-+        "instructions": 74,
-+        "loads": 31,
-+        "stores": 1,
-+        "spills": 0,
-+        "branches": 14,
-+        "vectors": 8,
-+        "assembly": [
-+          "sub64:",
-+          "..B4.1: # Preds ..B4.0",
-+          "  movq %rdi, %r8 #13.84",
-+          "  testq %rcx, %rcx #14.35",
-+          "  jbe ..B4.19 # Prob 50% #14.35",
-+          "..B4.2: # Preds ..B4.1",
-+          "  cmpq $8, %rcx #14.5",
-+          "  jb ..B4.20 # Prob 10% #14.5",
-+          "..B4.3: # Preds ..B4.2",
-+          "  movq %r8, %rdi #14.5",
-+          "  andq $15, %rdi #14.5",
-+          "  je ..B4.7 # Prob 50% #14.5",
-+          "..B4.4: # Preds ..B4.3",
-+          "  testq $7, %rdi #14.5",
-+          "  jne ..B4.20 # Prob 10% #14.5",
-+          "..B4.5: # Preds ..B4.4",
-+          "  cmpq $9, %rcx #14.5",
-+          "  jb ..B4.20 # Prob 10% #14.5",
-+          "..B4.6: # Preds ..B4.5",
-+          "  movq (%rsi), %r9 #14.50",
-+          "  lea -1(%rcx), %rax #14.5",
-+          "  andq $7, %rax #14.5",
-+          "  movl $1, %edi #14.5",
-+          "  subq (%rdx), %r9 #14.50",
-+          "  negq %rax #14.5",
-+          "  movq %r9, (%r8) #14.43",
-+          "  addq %rcx, %rax #14.5",
-+          "  jmp ..B4.8 # Prob 100% #14.5",
-+          "..B4.7: # Preds ..B4.3",
-+          "  movq %rcx, %rax #14.5",
-+          "  andq $7, %rax #14.5",
-+          "  negq %rax #14.5",
-+          "  addq %rcx, %rax #14.5",
-+          "..B4.8: # Preds ..B4.6 ..B4.7",
-+          "  lea (%rdx,%rdi,8), %r9 #14.57",
-+          "  testq $15, %r9 #14.5",
-+          "  je ..B4.13 # Prob 60% #14.5",
-+          "..B4.10: # Preds ..B4.8 ..B4.10",
-+          "  movdqu (%rsi,%rdi,8), %xmm1 #14.50",
-+          "  movdqu 16(%rsi,%rdi,8), %xmm3 #14.50",
-+          "  movdqu 32(%rsi,%rdi,8), %xmm5 #14.50",
-+          "  movdqu 48(%rsi,%rdi,8), %xmm7 #14.50",
-+          "  movdqu (%rdx,%rdi,8), %xmm0 #14.57",
-+          "  movdqu 16(%rdx,%rdi,8), %xmm2 #14.57",
-+          "  psubq %xmm0, %xmm1 #14.50",
-+          "  psubq %xmm2, %xmm3 #14.50",
-+          "  movdqu 32(%rdx,%rdi,8), %xmm4 #14.57",
-+          "  movdqu 48(%rdx,%rdi,8), %xmm6 #14.57",
-+          "  psubq %xmm4, %xmm5 #14.50",
-+          "  psubq %xmm6, %xmm7 #14.50",
-+          "  movdqu %xmm1, (%r8,%rdi,8) #14.43",
-+          "  movdqu %xmm3, 16(%r8,%rdi,8) #14.43",
-+          "  movdqu %xmm5, 32(%r8,%rdi,8) #14.43",
-+          "  movdqu %xmm7, 48(%r8,%rdi,8) #14.43",
-+          "  addq $8, %rdi #14.5",
-+          "  cmpq %rax, %rdi #14.5",
-+          "  jb ..B4.10 # Prob 82% #14.5",
-+          "  jmp ..B4.15 # Prob 100% #14.5",
-+          "..B4.13: # Preds ..B4.8 ..B4.13",
-+          "  movdqu (%rsi,%rdi,8), %xmm0 #14.50",
-+          "  movdqu 16(%rsi,%rdi,8), %xmm1 #14.50",
-+          "  psubq (%rdx,%rdi,8), %xmm0 #14.50",
-+          "  psubq 16(%rdx,%rdi,8), %xmm1 #14.50",
-+          "  movdqu 32(%rsi,%rdi,8), %xmm2 #14.50",
-+          "  movdqu 48(%rsi,%rdi,8), %xmm3 #14.50",
-+          "  psubq 32(%rdx,%rdi,8), %xmm2 #14.50",
-+          "  psubq 48(%rdx,%rdi,8), %xmm3 #14.50",
-+          "  movdqu %xmm0, (%r8,%rdi,8) #14.43",
-+          "  movdqu %xmm1, 16(%r8,%rdi,8) #14.43",
-+          "  movdqu %xmm2, 32(%r8,%rdi,8) #14.43",
-+          "  movdqu %xmm3, 48(%r8,%rdi,8) #14.43",
-+          "  addq $8, %rdi #14.5",
-+          "  cmpq %rax, %rdi #14.5",
-+          "  jb ..B4.13 # Prob 82% #14.5",
-+          "..B4.15: # Preds ..B4.13 ..B4.10 ..B4.20",
-+          "  cmpq %rcx, %rax #14.5",
-+          "  jae ..B4.19 # Prob 9% #14.5",
-+          "..B4.17: # Preds ..B4.15 ..B4.17",
-+          "  movq (%rsi,%rax,8), %rdi #14.50",
-+          "  subq (%rdx,%rax,8), %rdi #14.50",
-+          "  movq %rdi, (%r8,%rax,8) #14.43",
-+          "  incq %rax #14.5",
-+          "  cmpq %rcx, %rax #14.5",
-+          "  jb ..B4.17 # Prob 82% #14.5",
-+          "..B4.19: # Preds ..B4.17 ..B4.15 ..B4.1",
-+          "  ret #15.1",
-+          "..B4.20: # Preds ..B4.2 ..B4.4 ..B4.5",
-+          "  xorl %eax, %eax #14.5",
-+          "  jmp ..B4.15 # Prob 100% #14.5"
-+        ],
-+        "ratio_vs_best": 2.96
-+      },
-+      {
-+        "key": "icx",
-+        "id": "cicxlatest",
-+        "name": "x86-64 icx (latest)",
-+        "semver": "(latest)",
-+        "compilerType": "clang-intel",
-+        "flags": "-O2 -march=x86-64-v3",
-+        "elapsed_s": 0.6276757690000068,
-+        "instructions": 25,
-+        "loads": 7,
-+        "stores": 0,
-+        "spills": 0,
-+        "branches": 7,
-+        "vectors": 4,
-+        "assembly": [
-+          "sub64:",
-+          "  testq %rcx, %rcx",
-+          "  je .LBB0_7",
-+          "  movq %rcx, %rax",
-+          "  andq $-4, %rax",
-+          "  je .LBB0_2",
-+          "  leaq -1(%rax), %r8",
-+          "  xorl %r9d, %r9d",
-+          ".LBB0_4:",
-+          "  vmovdqu (%rsi,%r9,8), %ymm0",
-+          "  vpsubq (%rdx,%r9,8), %ymm0, %ymm0",
-+          "  vmovdqu %ymm0, (%rdi,%r9,8)",
-+          "  addq $4, %r9",
-+          "  cmpq %r8, %r9",
-+          "  jbe .LBB0_4",
-+          "  cmpq %rcx, %rax",
-+          "  jne .LBB0_6",
-+          "  jmp .LBB0_7",
-+          ".LBB0_2:",
-+          "  xorl %eax, %eax",
-+          ".LBB0_6:",
-+          "  movq (%rsi,%rax,8), %r8",
-+          "  subq (%rdx,%rax,8), %r8",
-+          "  movq %r8, (%rdi,%rax,8)",
-+          "  incq %rax",
-+          "  cmpq %rax, %rcx",
-+          "  jne .LBB0_6",
-+          ".LBB0_7:",
-+          "  vzeroupper",
-+          "  retq",
-+          ""
-+        ],
-+        "ratio_vs_best": 1.0
-+      }
-+    ],
-+    "errors": []
-+  }
-+]
-diff --git a/engineering/evidence/map64-unroll-displacement-2026-09-27.json b/engineering/evidence/map64-unroll-displacement-2026-09-27.json
-new file mode 100644
-index 000000000..637327d38
---- /dev/null
-+++ b/engineering/evidence/map64-unroll-displacement-2026-09-27.json
-@@ -0,0 +1,101 @@
-+{
-+  "date": "2026-09-27",
-+  "base": "e9f572eb36f5cd98c9ea1f077bc2922bd001177e",
-+  "target": "x86-64 I64/U64 map; two-lane XMM lowering",
-+  "kernel": "tests/bench/k_map64_sub.c",
-+  "method": {
-+    "harness": "scripts/bench_kernels.py",
-+    "samples": 15,
-+    "inner": 10000,
-+    "selection": "best-of",
-+    "pinning": "taskset CPU 0",
-+    "driver": "one common GCC-compiled driver; interleaved arms; volatile sink/output check",
-+    "host": "sandbox VM; PMU unavailable; not Raptor Lake"
-+  },
-+  "runtime_ab": {
-+    "flags": "-O2 -march=x86-64-v3",
-+    "default_vs_no_i64_unroll": {
-+      "lccc_ms": 1.676165,
-+      "ccc_no_map_i64_unroll_ms": 2.437622,
-+      "gcc_14_2_ms": 1.383508,
-+      "default_speedup_vs_rolled": 1.454,
-+      "default_ratio_vs_gcc": 0.825,
-+      "timed_function_hashes": {
-+        "lccc": "f628dbb95a21eed6",
-+        "ccc_no_map_i64_unroll": "ec3b5e4ee0be604f",
-+        "gcc": "f7dd282bdf26e3f2"
-+      }
-+    },
-+    "default_vs_scalar": {
-+      "lccc_ms": 1.647828,
-+      "ccc_no_map_vec_ms": 3.442241,
-+      "gcc_14_2_ms": 1.441977,
-+      "default_speedup_vs_scalar": 2.089,
-+      "default_ratio_vs_gcc": 0.875,
-+      "timed_function_hashes": {
-+        "lccc": "f628dbb95a21eed6",
-+        "ccc_no_map_vec": "99ba0b9dc0043948",
-+        "gcc": "f7dd282bdf26e3f2"
-+      }
-+    }
-+  },
-+  "runtime_baseline_isa": {
-+    "flags": "-O2 -march=x86-64",
-+    "lccc_ms": 1.613023,
-+    "ccc_no_map_vec_ms": 3.412215,
-+    "gcc_14_2_ms": 2.411559,
-+    "speedup_vs_scalar": 2.115,
-+    "ratio_vs_gcc": 1.495
-+  },
-+  "static_oracle": {
-+    "source": "tests/regression/map_i64_two_lane.c",
-+    "function": "sub64",
-+    "flags": "-O2 -march=x86-64-v3",
-+    "instruction_counts": {
-+      "lccc": 55,
-+      "gcc16.2": 33,
-+      "clang23.1.0": 50,
-+      "icc2021.10.0": 74,
-+      "icx_latest": 25
-+    },
-+    "artifact": "scratch/oracle-map64.json",
-+    "interpretation": "static code shape only; not a throughput ranking"
-+  },
-+  "assembly_contract": {
-+    "x86_64_v3": {
-+      "packed_ops_in_sub64": 4,
-+      "packed_op": "vpsubq",
-+      "vector_byte_step": 64,
-+      "vector_register_width": 128,
-+      "unrolled_displacement_lea": 0
-+    },
-+    "x86_64_sse2": {
-+      "packed_ops_in_sub64": 4,
-+      "packed_op": "psubq",
-+      "vector_byte_step": 64,
-+      "vector_register_width": 128,
-+      "unrolled_displacement_lea": 0
-+    },
-+    "i686": "scalar assembly; no packed I64 map operation"
-+  },
-+  "correctness": {
-+    "gate": "tests/regression/check_map_i64_two_lane.sh",
-+    "trip_counts": "0..259",
-+    "cases": [
-+      "unsigned 64-bit wraparound",
-+      "invariant subtraction",
-+      "untouched tails",
-+      "shifted/overlapping destination alias guard",
-+      "GCC and CCC_NO_MAP_VEC output differential",
-+      "x86-64-v3 and x86-64/SSE2",
-+      "i686 -m32 -msse2 assembly"
-+    ],
-+    "result": "PASS"
-+  },
-+  "limitations": [
-+    "No native i7-14700KF/Raptor Lake PMU or hardware timing was available.",
-+    "The local VM has GCC 14.2; GCC 16.2, Clang 23.1, ICC 2021.10 and ICX latest were used as static Compiler Explorer oracles only.",
-+    "A 256-bit I64 intrinsic or ABI change remains out of scope.",
-+    "The runtime numbers are for one synthetic 1024-element kernel and do not establish package-wide gains."
-+  ]
-+}
-diff --git a/engineering/evidence/map64-unroll-run-2026-09-27.json b/engineering/evidence/map64-unroll-run-2026-09-27.json
-new file mode 100644
-index 000000000..cc6110851
---- /dev/null
-+++ b/engineering/evidence/map64-unroll-run-2026-09-27.json
++++ b/engineering/evidence/map64-review-unroll-2026-09-27.json
 @@ -0,0 +1,10 @@
 +{
 +  "map64_sub": {
 +    "_hash_gcc": "f7dd282bdf26e3f2",
-+    "_hash_lccc": "f628dbb95a21eed6",
-+    "_hash_lccc-alt": "ec3b5e4ee0be604f",
-+    "gcc": 0.001383508,
-+    "lccc": 0.001676165,
-+    "lccc-alt": 0.002437622
++    "_hash_lccc": "08ff1a3fcdb6f669",
++    "_hash_lccc-alt": "1bfe87549e6e4077",
++    "gcc": 0.000175858,
++    "lccc": 0.000302672,
++    "lccc-alt": 0.000316783
 +  }
 +}
-diff --git a/src/backend/linker_common/eh_frame.rs b/src/backend/linker_common/eh_frame.rs
-index d10b17f1a..98e66688a 100644
---- a/src/backend/linker_common/eh_frame.rs
-+++ b/src/backend/linker_common/eh_frame.rs
-@@ -81,10 +81,26 @@ pub fn build_eh_frame_hdr(
-     // Parse .eh_frame to find all FDEs and their initial_location values
-     let fdes = parse_eh_frame_fdes(eh_frame_data, eh_frame_vaddr, is_64bit);
- 
--    // Header: 4 bytes + eh_frame_ptr (4 bytes) + fde_count (4 bytes)
--    let header_size = 4 + 4 + 4;
--    let table_entry_size = 8; // two i32s per entry
--    let total_size = header_size + fdes.len() * table_entry_size;
-+    // Header: 4 bytes + eh_frame_ptr (4 bytes) + fde_count (4 bytes).
-+    // Every table displacement is explicitly sdata4/udata4.  Never truncate
-+    // an address or count into those fields: a wrapped entry makes the
-+    // unwinder's binary search return an unrelated FDE.  The caller treats an
-+    // empty result as "no usable header" and can fall back to linear scans.
-+    let header_size = 4usize + 4 + 4;
-+    let table_entry_size = 8usize; // two i32s per entry
-+    let Some(table_size) = fdes.len().checked_mul(table_entry_size) else {
-+        return Vec::new();
-+    };
-+    let Some(total_size) = header_size.checked_add(table_size) else {
-+        return Vec::new();
-+    };
-+    let eh_frame_ptr = i128::from(eh_frame_vaddr) - (i128::from(eh_frame_hdr_vaddr) + 4);
-+    let Ok(eh_frame_ptr) = i32::try_from(eh_frame_ptr) else {
-+        return Vec::new();
-+    };
-+    let Ok(fde_count) = u32::try_from(fdes.len()) else {
-+        return Vec::new();
-+    };
-     let mut data = vec![0u8; total_size];
- 
-     // Version
-@@ -96,21 +112,25 @@ pub fn build_eh_frame_hdr(
-     // table encoding: DW_EH_PE_datarel | DW_EH_PE_sdata4
-     data[3] = 0x3b;
- 
--    // eh_frame_ptr: PC-relative offset from &data[4] to eh_frame
--    let eh_frame_ptr = eh_frame_vaddr as i64 - (eh_frame_hdr_vaddr as i64 + 4);
--    write_i32_le(&mut data, 4, eh_frame_ptr as i32);
--
-+    // eh_frame_ptr: PC-relative offset from &data[4] to .eh_frame.
-+    write_i32_le(&mut data, 4, eh_frame_ptr);
-     // fde_count
--    write_i32_le(&mut data, 8, fdes.len() as i32);
-+    write_u32_le(&mut data, 8, fde_count);
- 
--    // Table entries: sorted by initial_location
--    // Each entry is (initial_location - eh_frame_hdr_vaddr, fde_address - eh_frame_hdr_vaddr)
-+    // Table entries: sorted by initial_location.  Each entry is
-+    // (initial_location - eh_frame_hdr_vaddr, fde_address - eh_frame_hdr_vaddr).
-     for (i, fde) in fdes.iter().enumerate() {
-         let off = header_size + i * table_entry_size;
--        let loc_rel = fde.initial_location as i64 - eh_frame_hdr_vaddr as i64;
--        let fde_rel = fde.fde_vaddr as i64 - eh_frame_hdr_vaddr as i64;
--        write_i32_le(&mut data, off, loc_rel as i32);
--        write_i32_le(&mut data, off + 4, fde_rel as i32);
-+        let loc_rel = i128::from(fde.initial_location) - i128::from(eh_frame_hdr_vaddr);
-+        let fde_rel = i128::from(fde.fde_vaddr) - i128::from(eh_frame_hdr_vaddr);
-+        let Ok(loc_rel) = i32::try_from(loc_rel) else {
-+            return Vec::new();
-+        };
-+        let Ok(fde_rel) = i32::try_from(fde_rel) else {
-+            return Vec::new();
-+        };
-+        write_i32_le(&mut data, off, loc_rel);
-+        write_i32_le(&mut data, off + 4, fde_rel);
-     }
- 
-     data
-@@ -191,7 +211,10 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
-                 continue;
-             }
- 
--            let fde_vaddr = base_vaddr + entry_start as u64;
-+            let Some(fde_vaddr) = base_vaddr.checked_add(entry_start as u64) else {
-+                pos = entry_end;
-+                continue;
-+            };
- 
-             // Decode initial_location based on the CIE's FDE encoding
-             let initial_location = decode_eh_pointer(
-@@ -244,6 +267,13 @@ fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, is_64bit: bool) -> Option
-     let Some(&version) = data.get(start + id_size).filter(|_| start + id_size < end) else {
-         return None;
-     };
-+    // `.eh_frame` CIEs in the supported DWARF32/DWARF64 formats use the
-+    // v1/v3/v4 layouts below.  Treat unknown versions as malformed rather
-+    // than interpreting a v5 CIE with the v3 layout and returning a plausible
-+    // but wrong FDE encoding.
-+    if !matches!(version, 1..=4) {
-+        return None;
-+    }
-     let aug_start = start + id_size + 1;
-     let Some(aug_len) = data[aug_start..end].iter().position(|&b| b == 0) else {
-         return None;
-@@ -252,6 +282,27 @@ fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, is_64bit: bool) -> Option
-     let mut cur = aug_start + aug_len + 1;
-     let cie = &data[..end];
- 
-+    // DWARF v4 inserts address_size and segment_selector_size between the
-+    // augmentation string and the alignment factors.  Omitting these two
-+    // bytes (the old v1/v3-only parser did) shifts every subsequent read: a
-+    // valid v4 zR CIE is then either rejected or, worse, assigned an
-+    // unrelated FDE encoding.  We do not support segmented EH pointers, and
-+    // the CIE address size must agree with the output ELF class used by the
-+    // decoder, so fail closed on either case.
-+    if version == 4 {
-+        let Some(&address_size) = cie.get(cur) else {
-+            return None;
-+        };
-+        let Some(&segment_selector_size) = cie.get(cur + 1) else {
-+            return None;
-+        };
-+        let expected_address_size = if is_64bit { 8 } else { 4 };
-+        if address_size != expected_address_size || segment_selector_size != 0 {
-+            return None;
-+        }
-+        cur += 2;
-+    }
-+
-     // The return-address column is a byte in CIE v1, ULEB in v3/v4.
-     let Some((_, n)) = read_uleb128(cie, cur) else {
-         return None;
-@@ -328,91 +379,112 @@ fn decode_eh_pointer(
-     let base_enc = encoding & 0x0F;
-     let rel = encoding & 0x70;
- 
--    let (raw_val, _size) = match base_enc {
-+    // Indirect encodings require dereferencing a relocated address in the
-+    // output image.  This parser only has the section bytes, not the final
-+    // address space, so accepting one would manufacture the slot address as
-+    // the function PC.  Fail closed instead.
-+    if encoding & 0x80 != 0 {
-+        return None;
-+    }
-+
-+    // Keep the raw value unsigned plus an explicit signedness bit.  The old
-+    // implementation forced udata4/udata8 through `i64`; a perfectly valid
-+    // 32-bit absolute address >= 0x8000_0000 was then sign-extended, and a
-+    // 64-bit udata8 with bit 63 set could overflow during a PC-relative add.
-+    // Signed encodings are sign-extended only when the relative base is
-+    // applied; unsigned encodings remain unsigned all the way through.
-+    let (raw_val, signed) = match base_enc {
-         0x00 => {
-             // DW_EH_PE_absptr
-             if is_64bit {
--                if offset + 8 > data.len() {
-+                if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
-                     return None;
-                 }
--                (read_u64_le(data, offset) as i64, 8)
-+                (read_u64_le(data, offset), false)
-             } else {
--                if offset + 4 > data.len() {
-+                if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
-                     return None;
-                 }
--                (read_u32_le(data, offset) as i32 as i64, 4)
-+                (u64::from(read_u32_le(data, offset)), false)
-             }
-         }
-         0x01 => {
-             // DW_EH_PE_uleb128
-             let (v, _) = read_uleb128(data, offset)?;
--            (v as i64, 0)
-+            (v, false)
-         }
-         0x02 => {
-             // DW_EH_PE_udata2
--            if offset + 2 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 2) {
-                 return None;
-             }
-             (
--                u16::from_le_bytes([data[offset], data[offset + 1]]) as i64,
--                2,
-+                u64::from(u16::from_le_bytes([data[offset], data[offset + 1]])),
-+                false,
-             )
-         }
-         0x03 => {
-             // DW_EH_PE_udata4
--            if offset + 4 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
-                 return None;
-             }
--            (read_u32_le(data, offset) as i64, 4)
-+            (u64::from(read_u32_le(data, offset)), false)
-         }
-         0x04 => {
-             // DW_EH_PE_udata8
--            if offset + 8 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
-                 return None;
-             }
--            (read_u64_le(data, offset) as i64, 8)
-+            (read_u64_le(data, offset), false)
-         }
-         0x09 => {
-             // DW_EH_PE_sleb128
-             let (v, _) = read_sleb128(data, offset)?;
--            (v, 0)
-+            (v as u64, true)
-         }
-         0x0A => {
-             // DW_EH_PE_sdata2
--            if offset + 2 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 2) {
-                 return None;
-             }
-             (
--                i16::from_le_bytes([data[offset], data[offset + 1]]) as i64,
--                2,
-+                i16::from_le_bytes([data[offset], data[offset + 1]]) as i64 as u64,
-+                true,
-             )
-         }
-         0x0B => {
-             // DW_EH_PE_sdata4
--            if offset + 4 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
-                 return None;
-             }
--            (read_i32_le(data, offset) as i64, 4)
-+            (read_i32_le(data, offset) as i64 as u64, true)
-         }
-         0x0C => {
-             // DW_EH_PE_sdata8
--            if offset + 8 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
-                 return None;
-             }
--            (read_u64_le(data, offset) as i64, 8)
-+            (read_u64_le(data, offset) as i64 as u64, true)
-         }
-         _ => return None,
-     };
- 
--    let base_val = match rel {
--        0x00 => 0i64,      // DW_EH_PE_absptr
--        0x10 => pc as i64, // DW_EH_PE_pcrel
--        0x20 => 0i64,      // DW_EH_PE_textrel (not commonly used)
--        0x30 => 0i64,      // DW_EH_PE_datarel
--        _ => 0i64,
--    };
--
--    Some((base_val + raw_val) as u64)
-+    match rel {
-+        0x00 => Some(raw_val), // DW_EH_PE_absptr
-+        0x10 => {
-+            // DW_EH_PE_pcrel.  Use checked arithmetic: malformed relocation
-+            // data must be rejected, never wrap to an unrelated FDE.
-+            if signed {
-+                pc.checked_add_signed(raw_val as i64)
-+            } else {
-+                pc.checked_add(raw_val)
-+            }
-+        }
-+        // The caller does not provide text/data bases, and treating either
-+        // encoding as absolute silently produces a wrong search table.
-+        0x20 | 0x30 => None, // DW_EH_PE_textrel/datarel
-+        _ => None,
-+    }
- }
- 
- /// Return the byte size of an encoded pointer.
-@@ -447,6 +519,11 @@ fn write_i32_le(data: &mut [u8], off: usize, val: i32) {
-     data[off..off + 4].copy_from_slice(&b);
- }
- 
-+fn write_u32_le(data: &mut [u8], off: usize, val: u32) {
-+    let b = val.to_le_bytes();
-+    data[off..off + 4].copy_from_slice(&b);
-+}
-+
- /// Bounded LEB readers: malformed inputs must not truncate modulo 64 bits or
- /// borrow bytes from the next CIE/FDE.  A 64-bit number needs at most 10 bytes.
- fn read_uleb128(data: &[u8], off: usize) -> Option<(u64, usize)> {
-@@ -1284,6 +1361,108 @@ mod tests {
-         assert_eq!(read_sleb128(&[0xff; 9], 0), None);
-     }
- 
-+    /// Build a DWARF v4 CIE/FDE pair.  Version 4 has two fields that v1/v3
-+    /// do not: address_size and segment_selector_size.  The parser must skip
-+    /// them before reading the alignment factors and the `zR` augmentation
-+    /// payload.
-+    fn synth_dwarf4_eh_frame(fde_enc: u8) -> Vec<u8> {
-+        let mut data = Vec::new();
-+        let mut cie = Vec::new();
-+        cie.extend_from_slice(&0u32.to_le_bytes()); // CIE id
-+        cie.push(4); // DWARF v4
-+        cie.extend_from_slice(b"zR\0");
-+        cie.push(8); // address_size for an ELF64 output
-+        cie.push(0); // segment_selector_size
-+        cie.push(1); // code alignment factor
-+        cie.push(0x78); // data alignment factor (-8)
-+        cie.push(16); // return-address register (ULEB128)
-+        cie.push(1); // augmentation data length
-+        cie.push(fde_enc);
-+        while (cie.len() + 4) % 8 != 0 {
-+            cie.push(0); // DW_CFA_nop padding
-+        }
-+        data.extend_from_slice(&(cie.len() as u32).to_le_bytes());
-+        data.extend_from_slice(&cie);
-+
-+        let fde_start = data.len();
-+        let mut fde = Vec::new();
-+        fde.extend_from_slice(&((fde_start + 4) as u32).to_le_bytes());
-+        fde.extend_from_slice(&0x100i32.to_le_bytes()); // pcrel initial_location
-+        fde.extend_from_slice(&0x20u32.to_le_bytes()); // address_range
-+        fde.push(0); // z augmentation data length
-+        while (fde.len() + 4) % 8 != 0 {
-+            fde.push(0);
-+        }
-+        data.extend_from_slice(&(fde.len() as u32).to_le_bytes());
-+        data.extend_from_slice(&fde);
-+        data
-+    }
-+
-+    #[test]
-+    fn pointer_decoding_preserves_unsigned_addresses_and_rejects_unsupported_bases() {
-+        // A 32-bit absolute pointer with bit 31 set is still an address, not
-+        // a negative signed displacement.
-+        assert_eq!(
-+            decode_eh_pointer(&0x8000_0000u32.to_le_bytes(), 0, 0x00, 0, false),
-+            Some(0x8000_0000)
-+        );
-+        // Likewise, udata8 is allowed to use the high half of the address
-+        // space; it must not pass through i64 and wrap.
-+        assert_eq!(
-+            decode_eh_pointer(&u64::MAX.to_le_bytes(), 0, 0x04, 0, true),
-+            Some(u64::MAX)
-+        );
-+        // Signed PC-relative offsets are applied without signed-overflow
-+        // traps, even when the PC is in the high canonical address range.
-+        assert_eq!(
-+            decode_eh_pointer(
-+                &(-0x100i32).to_le_bytes(),
-+                0,
-+                PCREL_SDATA4,
-+                0xffff_ffff_ffff_1000,
-+                true
-+            ),
-+            Some(0xffff_ffff_ffff_0f00)
-+        );
-+        // No text/data base is available to this section-only decoder.
-+        assert_eq!(
-+            decode_eh_pointer(&0u32.to_le_bytes(), 0, 0x3b, 0x400000, true),
-+            None
-+        );
-+        // Indirect encodings need a relocated image dereference and therefore
-+        // cannot be decoded from the section byte slice alone.
-+        assert_eq!(
-+            decode_eh_pointer(&0u32.to_le_bytes(), 0, 0x9b, 0x400000, true),
-+            None
-+        );
-+
-+        // The fixed-width header fields must reject an unrepresentable
-+        // displacement rather than truncating it modulo 2^32.
-+        let data = synth_eh_frame(1, PCREL_SDATA4);
-+        assert!(build_eh_frame_hdr(&data, 0, 0x1_0000_0000, true).is_empty());
-+    }
-+
-+    #[test]
-+    fn dwarf4_cie_skips_address_and_segment_sizes() {
-+        let data = synth_dwarf4_eh_frame(PCREL_SDATA4);
-+        assert_eq!(count_eh_frame_fdes(&data), 1);
-+        let fdes = parse_eh_frame_fdes(&data, 0x400000, true);
-+        assert_eq!(fdes.len(), 1);
-+        let fde_start = scan_eh_frame_records(&data)[1].start;
-+        let iloc = 0x400000 + (fde_start + 8) as u64 + 0x100;
-+        assert_eq!(fdes[0].initial_location, iloc);
-+
-+        // A truncated v4 prefix and an unsupported DWARF version must fail
-+        // closed instead of borrowing the following record's bytes.
-+        let mut truncated = data.clone();
-+        let cie_len = u32::from_le_bytes(truncated[..4].try_into().unwrap()) as usize;
-+        truncated.truncate(4 + cie_len - 1);
-+        assert!(parse_eh_frame_fdes(&truncated, 0x400000, true).is_empty());
-+        let mut unknown = data;
-+        unknown[8] = 5; // version byte: length(4) + CIE id(4)
-+        assert!(parse_eh_frame_fdes(&unknown, 0x400000, true).is_empty());
-+    }
-+
-     #[test]
-     fn extended_cie_fde_uses_its_own_encoding() {
-         // DWARF64 .eh_frame, CIE v1 with zR augmentation and pcrel/sdata4.
 diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 81c69592c..f6f7c2be5 100644
+index 601170e6..d5b90bcb 100644
 --- a/src/passes/mod.rs
 +++ b/src/passes/mod.rs
-@@ -1042,6 +1042,12 @@ pub(crate) fn run_passes(
+@@ -1130,12 +1130,14 @@ pub(crate) fn run_passes(
          _ => false,
      });
      let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
-+    // Snapshot the map kill switch once, like the other pass-pipeline policy
-+    // knobs.  Both the pre-unroll constant-trip entry and the main vectorizer
-+    // must make the same decision without re-reading the environment per
-+    // function.
-+    let no_map_vec = std::env::var("CCC_NO_MAP_VEC").is_ok();
-+    vectorize::set_no_map_vec(no_map_vec);
+-    // Snapshot the map kill switch once, like the other pass-pipeline policy
++    // Snapshot the map policy switches once, like the other pass-pipeline
+     // knobs.  Both the pre-unroll constant-trip entry and the main vectorizer
+     // must make the same decision without re-reading the environment per
+-    // function.
++    // function or candidate loop.
+     let no_map_vec = std::env::var("CCC_NO_MAP_VEC").is_ok();
++    let no_map_i64_unroll = std::env::var_os("CCC_NO_MAP_I64_UNROLL").is_some();
+     vectorize::set_no_map_vec(no_map_vec);
++    vectorize::set_no_map_i64_unroll(no_map_i64_unroll);
      // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
      // and only six generally usable GPRs.  On the real linux-cachymod setup
      // corpus these four transformations increase final machine-code size by
-@@ -1543,7 +1549,7 @@ pub(crate) fn run_passes(
-                     &dirty,
-                     &mut changed,
-                     |f: &mut crate::ir::reexports::IrFunction| {
--                        vectorize::vectorize_const_trip_map_loops(f, fp_contract)
-+                        vectorize::vectorize_const_trip_map_loops(f, fp_contract, no_map_vec)
-                     }
-                 )
-             );
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 816cb61f8..975ea919e 100644
+index 975ea919..4625c1de 100644
 --- a/src/passes/vectorize.rs
 +++ b/src/passes/vectorize.rs
-@@ -142,6 +142,10 @@ thread_local! {
-     // stack-based vector backend does not implement those operations.  This
-     // target bit is set by the driver per translation unit, not by host cfg.
-     static X86_MAP_I64_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-+    // The map kill switch is resolved once by the pass runner and refreshed
-+    // for every translation unit, so early and main map entries agree without
-+    // reading the process environment for every function.
-+    static NO_MAP_VEC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+@@ -146,6 +146,10 @@ thread_local! {
+     // for every translation unit, so early and main map entries agree without
+     // reading the process environment for every function.
+     static NO_MAP_VEC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++    // The focused I64/U64 unroll kill switch is also a per-translation-unit
++    // policy bit.  Keeping it beside the map switch avoids an environment
++    // lookup in every candidate loop and makes the early/main entries agree.
++    static NO_MAP_I64_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
  }
  
  pub(crate) fn set_x86_map_i64_available(available: bool) {
-@@ -152,6 +156,14 @@ fn x86_map_i64_available() -> bool {
-     X86_MAP_I64_AVAILABLE.with(|cell| cell.get())
+@@ -160,10 +164,18 @@ pub(crate) fn set_no_map_vec(disabled: bool) {
+     NO_MAP_VEC.with(|cell| cell.set(disabled));
  }
  
-+pub(crate) fn set_no_map_vec(disabled: bool) {
-+    NO_MAP_VEC.with(|cell| cell.set(disabled));
++pub(crate) fn set_no_map_i64_unroll(disabled: bool) {
++    NO_MAP_I64_UNROLL.with(|cell| cell.set(disabled));
 +}
 +
-+fn no_map_vec() -> bool {
-+    NO_MAP_VEC.with(|cell| cell.get())
+ fn no_map_vec() -> bool {
+     NO_MAP_VEC.with(|cell| cell.get())
+ }
+ 
++fn no_map_i64_unroll() -> bool {
++    NO_MAP_I64_UNROLL.with(|cell| cell.get())
 +}
 +
  /// Record the x86 SIMD ISA profile for the current translation unit.
  ///
  /// `simd` gates every x86 vector lowering (xmm *or* ymm); `avx2` gates the
-@@ -653,7 +665,7 @@ fn vectorize_with_analysis_mode(
-                 }
-                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
-             }
--        } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
-+        } else if !no_map_vec() {
-             // Conditional-store statement forms (`if (c1 && c2) s[i] = f(s[i]);`)
-             // are not map-shaped until the guarded store becomes a select
-             // against the dominating same-address load.  Rewrite first
-@@ -686,7 +698,7 @@ fn vectorize_with_analysis_mode(
-                         map_pattern.elem_ty
-                     );
-                 }
--                total_changes += transform_map_vector(func, &map_pattern, avx2, fp_contract);
-+                total_changes += transform_map_vector(func, &map_pattern, avx2, neon, fp_contract);
-             } else if std::env::var("CCC_NO_STENCIL_VEC").is_err() {
-                 // OP-05a: generalized non-reduction FP loops (stencils and
-                 // multi-load maps with constant tap offsets). AArch64's NEON
-@@ -4153,6 +4165,10 @@ impl MapExpr {
- struct MapEmitCtx<'a> {
-     src_bases: &'a [Value],
-     byte_iv: Value,
-+    /// Constant displacement for the current unrolled copy.  The x86 memory
-+    /// emitters fold it into `disp(base,index)`; keeping it separate from the
-+    /// SSA byte IV avoids a per-copy LEA in the hot loop.
-+    byte_disp: i64,
-     load_op: IntrinsicOp,
-     broadcast_op: IntrinsicOp,
-     sqrt_op: Option<IntrinsicOp>,
-@@ -4181,6 +4197,12 @@ struct MapEmitCtx<'a> {
-     /// or the SSE2 unpack chains).  `None` on dword/FP paths.
-     byte_broadcast_op: Option<IntrinsicOp>,
-     node_cache: Vec<(String, Value)>,
-+    /// Broadcast values are shared across separately emitted unrolled copies
-+    /// of the same map expression.  `node_cache` is deliberately cleared
-+    /// between copies because loads and all derived nodes use a different
-+    /// byte offset; invariant broadcasts, however, are loop-invariant and
-+    /// must be emitted exactly once in the preheader.
-+    broadcast_cache: Vec<(String, Value)>,
-     preheader_insts: Vec<Instruction>,
-     vec_insts: Vec<Instruction>,
-     next_val_id: u32,
-@@ -4209,20 +4231,35 @@ impl<'a> MapEmitCtx<'a> {
-         match expr {
-             MapExpr::Load(stream) => {
-                 let dest = self.fresh();
-+                let mut args = vec![
-+                    Operand::Value(self.src_bases[*stream]),
-+                    Operand::Value(self.byte_iv),
-+                ];
-+                if self.byte_disp != 0 {
-+                    args.push(Operand::Const(IrConst::I64(self.byte_disp)));
-+                }
-                 self.vec_insts.push(Instruction::Intrinsic {
-                     dest: Some(dest),
-                     op: self.load_op,
-                     dest_ptr: None,
--                    args: vec![
--                        Operand::Value(self.src_bases[*stream]),
--                        Operand::Value(self.byte_iv),
--                    ],
-+                    args,
-                 });
-                 Some(dest)
-             }
-             MapExpr::Invariant(operand) => {
-                 // Broadcasts live in the PREHEADER so they are hoisted out
--                // of the packed loop (register-allocated once).
-+                // of the packed loop (register-allocated once).  Unrolled
-+                // map copies clear `node_cache` between lanes because their
-+                // loads must be re-emitted at a new byte offset; invariant
-+                // broadcasts are instead shared through `broadcast_cache`.
-+                let cache_key = format!("{:?}", operand);
-+                if let Some(&(_, cached)) = self
-+                    .broadcast_cache
-+                    .iter()
-+                    .find(|(key, _)| *key == cache_key)
-+                {
-+                    return Some(cached);
-+                }
-                 //
-                 // Byte lanes splat through the DWORD broadcast, so a
-                 // constant must be replicated into all four bytes here --
-@@ -4254,6 +4291,7 @@ impl<'a> MapEmitCtx<'a> {
-                     dest_ptr: None,
-                     args: vec![operand],
-                 });
-+                self.broadcast_cache.push((cache_key, dest));
-                 Some(dest)
-             }
-             MapExpr::Sqrt(x) => {
-@@ -8382,6 +8420,7 @@ fn transform_byte_count_reduction_inner(
-         let mut ctx = MapEmitCtx {
-             src_bases: &p.src_bases,
-             byte_iv,
-+            byte_disp: 0,
-             load_op: IntrinsicOp::VecLoadI32x8,
-             broadcast_op: IntrinsicOp::VecBroadcastI32x8,
-             sqrt_op: None,
-@@ -8394,6 +8433,7 @@ fn transform_byte_count_reduction_inner(
-             narrow_const_bytes: Some(1),
-             byte_broadcast_op: Some(IntrinsicOp::VecBroadcastI8x32),
-             node_cache: Vec::new(),
-+            broadcast_cache: Vec::new(),
-             preheader_insts: Vec::new(),
-             vec_insts: Vec::new(),
-             next_val_id: *next_val_id,
-@@ -21671,6 +21711,7 @@ fn transform_map_vector(
-     func: &mut IrFunction,
-     pattern: &MapPattern,
-     avx2: bool,
-+    neon: bool,
-     fp_contract: crate::common::fp_contract::FpContract,
- ) -> usize {
-     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-@@ -21682,10 +21723,35 @@ fn transform_map_vector(
-         return 0;
-     };
-     let vec_width: u64 = u64::from(if avx2 { 32 / elem_size } else { 16 / elem_size });
-+    // I64/U64 has a deliberate two-lane XMM lowering even when AVX2 is
-+    // available.  A small fixed unroll restores the missing four/eight-byte
-+    // memory-level parallelism without pretending that a 128-bit intrinsic
-+    // handles four lanes.  Keep larger expression trees rolled: every extra
-+    // copy multiplies their live range and can turn the speed win into spills.
-+    // The simple three-node load/op/load maps are the hot path and can safely
-+    // use four two-lane operations per counted iteration; modest trees use
-+    // two, and complex trees retain the conservative rolled body.  The
-+    // environment kill switch is intentionally scoped to this I64/U64
-+    // unroll decision so A/B runs can separate unroll benefit from the
-+    // underlying two-lane vectorization.
-+    let vector_unroll: u64 = if std::env::var_os("CCC_NO_MAP_I64_UNROLL").is_some() {
-+        1
-+    } else if matches!(pattern.elem_ty, IrType::I64 | IrType::U64) {
-+        match pattern.expr.node_count() {
-+            0..=3 => 4,
-+            4..=8 => 2,
-+            _ => 1,
-+        }
-+    } else {
-+        1
-+    };
-+    let packed_width = vec_width
-+        .checked_mul(vector_unroll)
-+        .expect("map packed width must fit in u64");
- 
-     // A zero-iteration vector loop plus scalar remainder only adds overhead.
-     if matches!(&pattern.limit, Operand::Const(c)
--        if c.to_i64().is_some_and(|n| n <= vec_width as i64))
-+        if c.to_i64().is_some_and(|n| n <= packed_width as i64))
-     {
-         return 0;
-     }
-@@ -22107,7 +22173,7 @@ fn transform_map_vector(
-         func,
-         pattern,
-         &expr,
--        vec_width,
-+        packed_width,
-         byte_iv,
-         elem_size,
-         &mut next_val_id,
-@@ -22141,10 +22207,10 @@ fn transform_map_vector(
- 
-     // Divide the loop bound by the packed width (constant folded or dynamic).
-     let divided_limit = match &pattern.limit {
--        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
--        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width as i64)),
-+        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / packed_width as i32)),
-+        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / packed_width as i64)),
-         Operand::Value(limit_val) => {
--            let shift = vec_width.trailing_zeros() as i64;
-+            let shift = packed_width.trailing_zeros() as i64;
-             let int_const = |n: i64| match pattern.iv_ty {
-                 IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
-                 _ => IrConst::I64(n),
-@@ -22180,7 +22246,7 @@ fn transform_map_vector(
-                     dest: bias,
-                     op: IrBinOp::And,
-                     lhs: Operand::Value(sign),
--                    rhs: Operand::Const(int_const(vec_width as i64 - 1)),
-+                    rhs: Operand::Const(int_const(packed_width as i64 - 1)),
-                     ty: pattern.iv_ty,
-                 });
-                 quotient_insts.push(Instruction::BinOp {
-@@ -22274,7 +22340,7 @@ fn transform_map_vector(
-             dest: byte_iv_next,
-             op: IrBinOp::Add,
-             lhs: Operand::Value(byte_iv),
--            rhs: Operand::Const(IrConst::I64((elem_size as u64 * vec_width) as i64)),
-+            rhs: Operand::Const(IrConst::I64((elem_size as u64 * packed_width) as i64)),
-             ty: IrType::I64,
-         });
-     changes += 2;
-@@ -22308,7 +22374,7 @@ fn transform_map_vector(
-     // guaranteed by construction: `T <= limit` and the loop already indexes
-     // `limit * elem_size` bytes of real memory, so `T * S <= limit *
-     // elem_size` fits in the address space.
--    let stride_bytes = i64::from(elem_size) * vec_width as i64;
-+    let stride_bytes = i64::from(elem_size) * packed_width as i64;
-     let fused_iv = {
-         // The exit comparison lives in the loop and tests an IV-derived value
-         // against `divided_limit`.  Find it; if its shape is not the one the
-@@ -22430,8 +22496,6 @@ fn transform_map_vector(
+@@ -4157,6 +4169,27 @@ impl MapExpr {
+             MapExpr::Fma { l, r, a, .. } => 1 + l.node_count() + r.node_count() + a.node_count(),
          }
      }
- 
--    let dst_address = (dst_base, Operand::Value(byte_iv));
--
-     // Mask-arithmetic strength reduction (see `strength_reduce_mask_select`)
-     // is a PACKED-ONLY lowering: it treats a compare result as an all-ones
-     // lane mask, which is what `vpcmpgt*` produces but NOT what a scalar
-@@ -22464,10 +22528,19 @@ fn transform_map_vector(
- 
-     // Replace the scalar store with only the packed operations present in the
-     // source expression.  DCE removes the now-unreachable scalar dataflow.
-+    //
-+    // I64/U64 is intentionally emitted as several independent two-lane
-+    // operations in one counted iteration.  Each copy gets a fresh byte
-+    // offset and a fresh expression cache; only invariant broadcasts are
-+    // shared.  This is the critical distinction from advertising a fake
-+    // four-lane I64 intrinsic: every memory access still covers exactly one
-+    // 128-bit vector, while the loop/latch advances by the complete unrolled
-+    // chunk.
-     {
-         let mut ctx = MapEmitCtx {
-             src_bases: &src_bases,
-             byte_iv,
-+            byte_disp: 0,
-             load_op,
-             broadcast_op,
-             sqrt_op,
-@@ -22491,30 +22564,67 @@ fn transform_map_vector(
-                 _ => None,
-             },
-             node_cache: Vec::new(),
-+            broadcast_cache: Vec::new(),
-             preheader_insts: Vec::new(),
-             vec_insts: Vec::new(),
-             next_val_id,
-             changes: &mut changes,
-         };
--        let Some(current) = ctx.emit(&packed_expr) else {
--            if debug {
--                eprintln!("[VEC-MAP]   Tree emission failed");
-+        for copy_index in 0..vector_unroll {
-+            let offset_bytes = copy_index
-+                .checked_mul(vec_width)
-+                .and_then(|lanes| lanes.checked_mul(u64::from(elem_size)))
-+                .and_then(|bytes| i64::try_from(bytes).ok())
-+                .expect("map unroll offset must fit in i64");
-+            // The x86 vector memory emitters accept a constant displacement
-+            // as a fourth argument.  Keep the induction variable in one GPR
-+            // and fold 16/32/48-byte offsets into the load/store SIB instead
-+            // of materialising `byte_iv + offset` with a LEA per copy.  NEON's
-+            // emitter predates that optional argument, so keep a real SSA
-+            // offset there; otherwise every ARM copy would address lane zero.
-+            let byte_offset = if neon && offset_bytes != 0 {
-+                let offset = ctx.fresh();
-+                ctx.vec_insts.push(Instruction::BinOp {
-+                    dest: offset,
-+                    op: IrBinOp::Add,
-+                    lhs: Operand::Value(byte_iv),
-+                    rhs: Operand::Const(IrConst::I64(offset_bytes)),
-+                    ty: IrType::I64,
-+                });
-+                offset
-+            } else {
-+                byte_iv
-+            };
-+            ctx.byte_iv = byte_offset;
-+            ctx.byte_disp = if neon { 0 } else { offset_bytes };
-+            // Loads and all expression nodes are lane-offset-specific.  Do
-+            // not let the cache return lane 0's value for lane 1; invariant
-+            // broadcasts use the separate cache and remain hoisted once.
-+            ctx.node_cache.clear();
-+            let Some(current) = ctx.emit(&packed_expr) else {
-+                if debug {
-+                    eprintln!("[VEC-MAP]   Tree emission failed");
-+                }
-+                return changes;
-+            };
-+            let mut store_args = vec![
-+                Operand::Value(current),
-+                Operand::Value(dst_base),
-+                Operand::Value(byte_offset),
-+            ];
-+            if !neon && offset_bytes != 0 {
-+                store_args.push(Operand::Const(IrConst::I64(offset_bytes)));
-             }
--            return changes;
--        };
--        let store_args = vec![
--            Operand::Value(current),
--            Operand::Value(dst_address.0),
--            dst_address.1.clone(),
--        ];
--        ctx.vec_insts.push(Instruction::Intrinsic {
--            dest: None,
--            op: store_op,
--            dest_ptr: Some(dst_address.0),
--            args: store_args,
--        });
-+            ctx.vec_insts.push(Instruction::Intrinsic {
-+                dest: None,
-+                op: store_op,
-+                dest_ptr: Some(dst_base),
-+                args: store_args,
-+            });
++
++    /// Estimate the work repeated for each unrolled copy of the map body.
++    ///
++    /// Invariants are broadcast once in the preheader and reused through
++    /// `MapEmitCtx::broadcast_cache`; charging them here made an expression
++    /// such as `(x[i] + y[i]) + k` look more expensive than the work that is
++    /// actually copied.  Keep `node_count` as the syntax/compile-time budget
++    /// metric and use this separate metric only for the I64/U64 unroll choice.
++    fn unroll_cost(&self) -> usize {
++        match self {
++            MapExpr::Load(_) => 1,
++            MapExpr::Invariant(_) => 0,
++            MapExpr::BinOp(_, l, r) => 1 + l.unroll_cost() + r.unroll_cost(),
++            MapExpr::Sqrt(x) => 1 + x.unroll_cost(),
++            MapExpr::Cmp(_, l, r) => 1 + l.unroll_cost() + r.unroll_cost(),
++            MapExpr::Select(c, t, f) => 1 + c.unroll_cost() + t.unroll_cost() + f.unroll_cost(),
++            MapExpr::MinMax { l, r, .. } => 1 + l.unroll_cost() + r.unroll_cost(),
++            MapExpr::MaskConj { l, r, .. } => 1 + l.unroll_cost() + r.unroll_cost(),
++            MapExpr::Fma { l, r, a, .. } => 1 + l.unroll_cost() + r.unroll_cost() + a.unroll_cost(),
 +        }
-         // Broadcasts live in the preheader so they are hoisted out of the
--        // packed loop (register-allocated once, reused across iterations).
-+        // packed loop (register-allocated once, reused by every unrolled
-+        // copy).
-         func.blocks[preheader_idx]
-             .instructions
-             .extend(ctx.preheader_insts);
-@@ -22712,7 +22822,7 @@ fn transform_map_vector(
-             dst_base_g,
-             0,
-             &checks,
--            elem_size as i64 * vec_width as i64,
-+            elem_size as i64 * packed_width as i64,
-             elem_size as i64,
-             rem_header_label,
-             rem_iv_phi,
-@@ -23781,6 +23891,7 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
- pub(crate) fn vectorize_const_trip_map_loops(
++    }
+ }
+ 
+ /// Emission context for the elementwise map tree (OP-05a). Owns the fresh
+@@ -6337,12 +6370,10 @@ fn analyze_map_pattern(
+         return None;
+     }
+ 
+-    // Constant trip counts of 4 or fewer are better left scalar.
++    // Tiny loops are handled by complete unrolling followed by SLP. Keep
++    // this existing profitability boundary separate from map unroll policy.
+     if let Operand::Const(c) = &limit {
+         if c.to_i64().is_some_and(|n| n <= 4) {
+-            if debug {
+-                eprintln!("[VEC-MAP] BAIL: const trip <= 4");
+-            }
+             return None;
+         }
+     }
+@@ -21707,6 +21738,56 @@ fn const_of(e: &MapExpr) -> Option<i64> {
+     }
+ }
+ 
++/// Shrink by powers of two so the count-division shift remains exact.
++fn map_constant_unroll(width: u64, mut unroll: u64, count: u64) -> u64 {
++    while unroll > 1
++        && (count <= width * unroll || (count <= 16 && count % (width * unroll) >= width))
++    {
++        unroll >>= 1;
++    }
++    unroll
++}
++
++#[cfg(test)]
++mod map_unroll_policy_tests {
++    use super::*;
++
++    #[test]
++    fn constant_trips_preserve_packed_work_and_small_tails() {
++        for count in 0..=259 {
++            let unroll = map_constant_unroll(2, 4, count);
++            assert!(matches!(unroll, 1 | 2 | 4));
++            if count > 2 {
++                assert!(2 * unroll < count);
++            }
++            if count <= 16 {
++                assert!(count % (2 * unroll) < 2);
++            }
++        }
++        assert_eq!(map_constant_unroll(2, 4, 1024), 4);
++        assert_eq!(map_constant_unroll(2, 4, 15), 1);
++        assert_eq!(map_constant_unroll(2, 4, 9), 4);
++    }
++
++    #[test]
++    fn invariant_cost_is_separate_from_tree_budget() {
++        let k = MapExpr::Invariant(Operand::Value(Value(42)));
++        let expr = MapExpr::BinOp(IrBinOp::Sub, Box::new(MapExpr::Load(0)), Box::new(k));
++        assert_eq!(expr.node_count(), 3);
++        assert_eq!(expr.unroll_cost(), 2);
++    }
++
++    #[test]
++    fn unroll_policy_refreshes_on_the_same_worker() {
++        let previous = no_map_i64_unroll();
++        set_no_map_i64_unroll(true);
++        assert!(no_map_i64_unroll());
++        set_no_map_i64_unroll(false);
++        assert!(!no_map_i64_unroll());
++        set_no_map_i64_unroll(previous);
++    }
++}
++
+ fn transform_map_vector(
      func: &mut IrFunction,
-     fp_contract: FpContract,
-+    no_map_vec: bool,
- ) -> usize {
-     // ISA gate FIRST.  This entry runs before the main vectorizer and
-     // therefore needs its own gate: it emits the same Vec* intrinsics, but the
-@@ -23795,6 +23906,8 @@ pub(crate) fn vectorize_const_trip_map_loops(
-     // -mgeneral-regs-only` contract) otherwise pays a DynAlloca scan, a
-     // volatile-access scan and an `env::var` allocation for every function in
-     // the module to reach a test that was already decided before the pass ran.
-+    // The caller snapshots CCC_NO_MAP_VEC once per compilation and passes it
-+    // here, so this early entry and the main vectorizer cannot disagree.
-     // All four guards are pure `return 0`, so the ordering is semantic-free.
-     if !x86_simd_available() {
-         return 0;
-@@ -23813,7 +23926,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
-     if func_has_volatile_loop_access(func) {
-         return 0;
-     }
--    if std::env::var("CCC_NO_MAP_VEC").is_ok() {
-+    if no_map_vec {
-         return 0;
-     }
-     // Same diamond pre-conversion as the main vectorizer (see there).
-@@ -23848,7 +23961,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
-                 && x86_avx2_available();
-             // The I64/U64 intrinsic family has only two-lane XMM forms.
-             let avx2 = avx2 && !matches!(pattern.elem_ty, IrType::I64 | IrType::U64);
--            let n = transform_map_vector(func, &pattern, avx2, fp_contract);
-+            let n = transform_map_vector(func, &pattern, avx2, false, fp_contract);
-             if n > 0 {
-                 if debug {
-                     eprintln!(
+     pattern: &MapPattern,
+@@ -21734,17 +21815,35 @@ fn transform_map_vector(
+     // environment kill switch is intentionally scoped to this I64/U64
+     // unroll decision so A/B runs can separate unroll benefit from the
+     // underlying two-lane vectorization.
+-    let vector_unroll: u64 = if std::env::var_os("CCC_NO_MAP_I64_UNROLL").is_some() {
+-        1
+-    } else if matches!(pattern.elem_ty, IrType::I64 | IrType::U64) {
+-        match pattern.expr.node_count() {
+-            0..=3 => 4,
+-            4..=8 => 2,
+-            _ => 1,
++    // The focused unroll is x86-only: AArch64's NEON lowering is currently
++    // one packed operation per counted iteration, and its displacement/offset
++    // handling is intentionally kept out of this policy.  Check the element
++    // type before consulting the kill switch so CCC_NO_MAP_I64_UNROLL cannot
++    // affect unrelated map families.
++    let is_i64_map = matches!(pattern.elem_ty, IrType::I64 | IrType::U64);
++    let mut vector_unroll: u64 = if !neon && is_i64_map {
++        if no_map_i64_unroll() {
++            1
++        } else {
++            match pattern.expr.unroll_cost() {
++                0..=3 => 4,
++                4..=8 => 2,
++                _ => 1,
++            }
+         }
+     } else {
+         1
+     };
++
++    // Keep a useful packed body for fixed trips. For the tiny-loop window,
++    // also avoid buying fewer vector iterations with several scalar tails.
++    // Only the unroll choice changes: remainder and alias-guard construction
++    // continue to consume the same packed_width contract.
++    if let Operand::Const(c) = &pattern.limit {
++        if let Some(n) = c.to_i64().filter(|n| *n > 0) {
++            vector_unroll = map_constant_unroll(vec_width, vector_unroll, n as u64);
++        }
++    }
+     let packed_width = vec_width
+         .checked_mul(vector_unroll)
+         .expect("map packed width must fit in u64");
+diff --git a/tests/regression/check_map_i64_shapes.py b/tests/regression/check_map_i64_shapes.py
+new file mode 100644
+index 00000000..15f3b1ff
+--- /dev/null
++++ b/tests/regression/check_map_i64_shapes.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""Check semantic assembly regions, never compiler-assigned block numbers."""
++import re
++import sys
++from pathlib import Path
++
++
++def function(text, name):
++    match = re.search(r'(?ms)^' + name + r':\n(.*?)^\.size\s+' + name + ',', text)
++    assert match, f'missing function {name}'
++    return match[1]
++
++
++def packed_loop(body):
++    labels = {m.group(1): m.start() for m in re.finditer(r'(?m)^([.\w]+):', body)}
++    loops = []
++    for jump in re.finditer(r'(?m)^\s*j\w+\s+([.\w]+)\s*$', body):
++        start = labels.get(jump.group(1), len(body))
++        if start < jump.start():
++            region = body[start:jump.end()]
++            if re.search(r'\bv?p(?:sub|add)q\b', region):
++                loops.append((start, region))
++    assert len(loops) == 1, f'expected one packed backedge, found {len(loops)}'
++    return loops[0]
++
++
++def shape(text, name, copies, step, additions=0):
++    body = function(text, name)
++    start, loop = packed_loop(body)
++    assert len(re.findall(r'\bv?psubq\b', loop)) == copies, name
++    assert len(re.findall(r'\bv?paddq\b', loop)) == additions, name
++    assert re.search(r'\baddq\s+\$' + str(step) + r'\s*,', loop), name
++    assert '%ymm' not in body, name
++    assert not re.search(r'\bleaq\s+(?:16|32|48)\(', loop), name
++    for offset in range(16, step, 16):
++        # Pin both a load and a store with the displacement: result tests
++        # independently catch dropped offsets and incorrect stream bases.
++        address = str(offset) + r'\(%\w+,\s*%\w+(?:,\s*1)?\)'
++        assert re.search(r'\bv?movdqu\s+' + address + r',\s*%xmm', loop), name
++        assert re.search(r'\bv?movdqu\s+%xmm\d+,\s*' + address, loop), name
++    return body, start, loop
++
++
++def main():
++    vector, rolled, scalar, small = [Path(p).read_text() for p in sys.argv[1:]]
++    shape(vector, 'sub64', 4, 64)
++    shape(rolled, 'sub64', 1, 16)
++    shape(vector, 'tier2', 2, 32, 2)  # Two sub AND two add instructions.
++    body, start, loop = shape(vector, 'invariant64', 4, 64)
++    assert len(re.findall(r'\b(?:unpcklpd|vpbroadcastq)\b', body[:start])) == 1
++    assert not re.search(r'\b(?:unpcklpd|vpbroadcastq)\b', loop)
++    assert not re.search(r'\bv?psubq\b', function(scalar, 'sub64'))
++    for count in range(3, 17):
++        assert re.search(r'\bv?psubq\b', function(small, f'small{count}')), count
++    # The region finder must not depend on label numbering.
++    renamed = re.sub(r'\.LBB(\d+)', lambda m: '.Lrenamed' + str(int(m[1])+901), vector)
++    shape(renamed, 'sub64', 4, 64)
++    # Negative controls: missing displacement or operation must be detected.
++    for broken in (vector.replace('16(', '0('), vector.replace('psubq', 'paddq')):
++        try:
++            shape(broken, 'sub64', 4, 64)
++        except AssertionError:
++            pass
++        else:
++            raise AssertionError('shape checker accepted a mutation')
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/tests/regression/check_map_i64_two_lane.sh b/tests/regression/check_map_i64_two_lane.sh
-index 04be668f4..90176a81c 100644
+index 90176a81..9a45a315 100644
 --- a/tests/regression/check_map_i64_two_lane.sh
 +++ b/tests/regression/check_map_i64_two_lane.sh
-@@ -1,5 +1,9 @@
- #!/usr/bin/env bash
- # Runtime/differential and codegen gate for the two-lane x86-64 I64 map path.
-+# The codegen assertions also pin the adaptive four-copy unroll: four 128-bit
-+# operations, one 64-byte loop step, and displacement operands rather than
-+# per-copy LEAs.  This is deliberately a shape contract, not a fake 256-bit
-+# lane-width contract.
- set -euo pipefail
- CCC=${CCC:-target/fastbuild/lccc}
- source_file=tests/regression/map_i64_two_lane.c
-@@ -29,8 +33,14 @@ def body(path):
-     return match.group(1)
- v, s = body(vector), body(scalar)
- needle = 'vpsubq' if arch == 'x86-64-v3' else 'psubq'
--if not re.search(r'\b' + needle + r'\b', v):
--    raise SystemExit(f'{arch}: expected {needle} in two-lane sub64')
-+packed = re.findall(r'\b' + needle + r'\b', v)
-+if len(packed) != 4:
-+    raise SystemExit(f'{arch}: expected four independent two-lane {needle} operations, got {len(packed)}')
-+vector_body = v.split('.LBB4:', 1)[0]
-+if 'addq $64' not in vector_body:
-+    raise SystemExit(f'{arch}: I64 map did not advance by the four-copy 64-byte chunk')
-+if re.search(r'\bleaq\s+(?:16|32|48)\(', vector_body):
-+    raise SystemExit(f'{arch}: unrolled I64 map materialized a displacement with LEA')
- if '%ymm' in v:
-     raise SystemExit(f'{arch}: 64-bit map advanced by four lanes but only used XMM')
- if re.search(r'\b(?:vpsubq|psubq)\b', s):
+@@ -22,30 +22,26 @@ for arch in x86-64-v3 x86-64; do
+     cmp "$tmp/lccc.txt" "$tmp/scalar.txt"
+     "$CCC" "${flags[@]}" -S "$source_file" -o "$tmp/vector.s"
+     CCC_NO_MAP_VEC=1 "$CCC" "${flags[@]}" -S "$source_file" -o "$tmp/scalar.s"
+-    python3 - "$arch" "$tmp/vector.s" "$tmp/scalar.s" <<'PY'
+-import re, sys
+-arch, vector, scalar = sys.argv[1:]
+-def body(path):
+-    text = open(path, encoding='utf8').read()
+-    match = re.search(r'(?ms)^sub64:\n(.*?)^\.size sub64,', text)
+-    if match is None:
+-        raise SystemExit('missing sub64 assembly')
+-    return match.group(1)
+-v, s = body(vector), body(scalar)
+-needle = 'vpsubq' if arch == 'x86-64-v3' else 'psubq'
+-packed = re.findall(r'\b' + needle + r'\b', v)
+-if len(packed) != 4:
+-    raise SystemExit(f'{arch}: expected four independent two-lane {needle} operations, got {len(packed)}')
+-vector_body = v.split('.LBB4:', 1)[0]
+-if 'addq $64' not in vector_body:
+-    raise SystemExit(f'{arch}: I64 map did not advance by the four-copy 64-byte chunk')
+-if re.search(r'\bleaq\s+(?:16|32|48)\(', vector_body):
+-    raise SystemExit(f'{arch}: unrolled I64 map materialized a displacement with LEA')
+-if '%ymm' in v:
+-    raise SystemExit(f'{arch}: 64-bit map advanced by four lanes but only used XMM')
+-if re.search(r'\b(?:vpsubq|psubq)\b', s):
+-    raise SystemExit('scalar kill switch did not suppress packed subtraction')
+-PY
++    CCC_NO_MAP_I64_UNROLL=1 "$CCC" "${flags[@]}" -S "$source_file" -o "$tmp/rolled.s"
++    CCC_NO_MAP_I64_UNROLL=1 "$CCC" "${flags[@]}" "$source_file" -o "$tmp/rolled"
++    "$tmp/rolled" > "$tmp/rolled.txt"
++    cmp "$tmp/lccc.txt" "$tmp/rolled.txt"
++    small=tests/regression/map_i64_small_trip.c
++    "$CCC" "${flags[@]}" -S "$small" -o "$tmp/small.s"
++    for mode in vector rolled scalar; do
++        case $mode in
++            vector) env_args=();;
++            rolled) env_args=(CCC_NO_MAP_I64_UNROLL=1);;
++            scalar) env_args=(CCC_NO_MAP_VEC=1);;
++        esac
++        env "${env_args[@]}" "$CCC" "${flags[@]}" "$small" -o "$tmp/small"
++        "$tmp/small" > "$tmp/small-$mode.txt"
++    done
++    gcc "${flags[@]}" "$small" -o "$tmp/small-gcc"
++    "$tmp/small-gcc" > "$tmp/small-gcc.txt"
++    for mode in vector rolled scalar; do cmp "$tmp/small-gcc.txt" "$tmp/small-$mode.txt"; done
++    python3 tests/regression/check_map_i64_shapes.py "$tmp/vector.s" "$tmp/rolled.s" "$tmp/scalar.s" "$tmp/small.s"
++
+ done
+ 
+ # i686 has no register-based Vec*I64x2 lowering. Even with SSE2 enabled it
+diff --git a/tests/regression/map_i64_small_trip.c b/tests/regression/map_i64_small_trip.c
+new file mode 100644
+index 00000000..9b7d5d91
+--- /dev/null
++++ b/tests/regression/map_i64_small_trip.c
+@@ -0,0 +1,26 @@
++/* Fixed-trip maps: wraparound and every untouched tail, including SLP's
++ * tiny-loop path. Keep each trip visible to the optimizer. */
++#include <stdint.h>
++#include <stdio.h>
++#define F(N) \
++__attribute__((noinline)) void small##N(uint64_t *restrict d, \
++ const uint64_t *restrict a, const uint64_t *restrict b) { \
++ for (unsigned i=0; i<N; ++i) d[i]=a[i]-b[i]; }
++F(3) F(4) F(5) F(6) F(7) F(8) F(9) F(10) F(11) F(12) F(13) F(14) F(15) F(16)
++int main(void) {
++ uint64_t a[20], b[20], d[20];
++ void (*fs[])(uint64_t *,const uint64_t *,const uint64_t *) = {
++ small3,small4,small5,small6,small7,small8,small9,small10,small11,
++ small12,small13,small14,small15,small16};
++ for (unsigned t=0;t<14;++t) {
++  for (unsigned i=0;i<20;++i) { a[i]=UINT64_MAX-i*17; b[i]=i*31+99; d[i]=123; }
++  fs[t](d,a,b);
++  for (unsigned i=0;i<20;++i) {
++   volatile uint64_t x=a[i], y=b[i];
++   uint64_t want=i<t+3 ? x-y : 123;
++   if (d[i]!=want) { printf("FAIL trip=%u lane=%u\n",t+3,i); return 1; }
++  }
++ }
++ puts("OK map_i64_small_trip");
++ return 0;
++}
+diff --git a/tests/regression/map_i64_two_lane.c b/tests/regression/map_i64_two_lane.c
+index 676fb2d6..a57fbdc7 100644
+--- a/tests/regression/map_i64_two_lane.c
++++ b/tests/regression/map_i64_two_lane.c
+@@ -21,6 +21,14 @@ __attribute__((noinline)) void add64(uint64_t *restrict d, const uint64_t *restr
+                                       const uint64_t *restrict y, unsigned long n) {
+     for (unsigned long i = 0; i < n; ++i) d[i] = x[i] + y[i];
+ }
++__attribute__((noinline)) void tier2(uint64_t *restrict d, const uint64_t *restrict x,
++ const uint64_t *restrict y, const uint64_t *restrict z, unsigned long n) {
++ for (unsigned long i=0;i<n;++i) d[i]=x[i]-y[i]+z[i];
++}
++__attribute__((noinline)) void invariant64(uint64_t *restrict d, const uint64_t *restrict x,
++ uint64_t k, unsigned long n) {
++ for (unsigned long i=0;i<n;++i) d[i]=x[i]-k;
++}
+ /* Without restrict, writing ahead of an input read must take the scalar
+  * path.  In-place (distance zero) is legal to vectorize. */
+ __attribute__((noinline)) void shifted64(uint64_t *d, const uint64_t *x,
+@@ -66,6 +74,19 @@ int main(void) {
+             ref[i] = x + y;
+         }
+         if (check("add", n)) return 1;
++        tier2(out, a, b, a, n);
++        for (unsigned long i=0;i<n;++i) {
++            volatile uint64_t x=a[i], y=b[i];
++            ref[i]=x-y+x;
++        }
++        if (check("tier2", n)) return 1;
++        invariant64(out, a, UINT64_C(0xdeadbeef01234567), n);
++        for (unsigned long i=0;i<n;++i) {
++            volatile uint64_t x=a[i];
++            ref[i]=x-UINT64_C(0xdeadbeef01234567);
++        }
++        if (check("invariant", n)) return 1;
++
+     }
+     for (unsigned long offset = 0; offset < 5; ++offset) {
+         for (unsigned long n = 0; n < 32; ++n) {
