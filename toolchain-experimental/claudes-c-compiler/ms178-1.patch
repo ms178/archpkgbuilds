@@ -1,747 +1,1743 @@
-diff --git a/engineering/FOLLOWUP-2026-09-27-pr640-pr629-redteam.md b/engineering/FOLLOWUP-2026-09-27-pr640-pr629-redteam.md
+diff --git a/engineering/DECISIONS.md b/engineering/DECISIONS.md
+index 8ca01699..fa6565da 100644
+--- a/engineering/DECISIONS.md
++++ b/engineering/DECISIONS.md
+@@ -2743,3 +2743,72 @@ matters, and the rule set is target-neutral except the `andn` fold).
+ **Known cost.** sqlite_varint executes +3.8% instructions (reg-reg copies
+ from coalescing around the reshaped trees; no spills) while running 4%
+ faster — a copy-coalescing follow-up, not a reason to narrow the pass.
++
++## PERF-REASSOC-LAG / CI-MIRROR (2026-09-27) — rotation lags, register residency; the PR #638 CI failure
++
++**What failed.** PR #638 (S24) went red in GitHub CI at step 59
++(`check_phi_acyclic_order.sh`, "rot() beats gcc on size"): lccc 56
++instructions vs Ubuntu 24.04's GCC 13.2 at 56; the check is strict.  The
++local mirror ran the same gate against Debian's GCC 14.2 (71 instructions)
++and passed.  Root cause in the compiler: `reassoc_lat` treated every carried
++header phi as available at time 0, so in the SHA-style state rotation
++(`h = g; g = f; f = e`) it combined `((e + f) + g) + (k + h)` and lost the
++`addl (mem)` fold (55 → 56).
++
++**Decision 1: rotation lags.**  A pure-rotation phi trails the computed
++value it is copied from by `lag` iterations; it starts at `r = -lag` (h 3,
++g 2, f 1; b 1, c 2, d 3).  Rounds repeat to a fixpoint (a' = t1 + t2 is only
++worth re-planning once t1 arrives earlier), and a single-use load leaf is
++always the second operand, the position x86 folds into `add mem, reg`.
++rot(): 55 instructions (GCC 13.2 56, GCC 14.2 71), recurrence bound 4 → 2
++(pass off: 5), wall clock 0.932 of S24 (21 interleaved runs, 19 faster) and
++0.753 of GCC 14.  SHA-256 at baseline x86-64: bound 6 → 5 (Ch = ((f^g)&e)^g
++is 2 deep from e once f and g lag), 0.955 of pass-off wall clock.  The x86
++peephole also folds a register-addend `mov + add` into `lea`.
++The single extra instruction against the pass disabled (54) is the load
++that no longer folds: it now joins a carried phi whose register stays
++live.  Scaling lags by the loop's II would let the load join last at no
++model cost (FOLLOWUP); the 2.5x shorter recurrence is worth more than the
++instruction.  llvm-mca is NOT an oracle
++for this loop shape: it reports 7 cycles for the 2-cycle loop.
++
++**Decision 2: register residency.**  The corpus A/B at `-m32` caught the
++lag model making i686 SHA-256 slower: 1.058 [1.034, 1.070] (paired runs,
++bootstrap 95% CI; identical-binary control 0.994 [0.970, 1.018]).  The
++model times a register-resident recurrence; i686 has 6 allocatable GPRs
++and SHA's eight rotating words, so the recurrence runs through stack slots
++and store-forwarding round trips the model cannot see.  Rule: a tree is
++left alone when the loop's live recurrent values (exact SSA liveness,
++weighted by GPRs occupied) exceed the allocatable GPRs across its whole
++span.  Rejected discriminators, each refuted by data: block peak pressure
++and the integral of block excess pressure (identical for the losing and the
++winning SHA order), and total span pressure (x86-64 lz4_compress is 14/13
++and gains 0.947 [0.919, 0.997]; i686 bitops is 7/6 and gains 0.974
++[0.947, 0.996]).  Recurrent pressure separates every measured case: i686
++SHA 8/6 and rot 8/6 (both now byte-identical to the pass disabled; rot was
++0.897 of S24, whose reshape had cost i686 11%) vs bitops 6/6, lz4 4/13,
++x86-64 SHA 8/13.
++
++**CI mirror.**  `scripts/ci_ubuntu_chroot.sh` runs any command, typically
++the full `scripts/ci_local.sh`, in an Ubuntu 24.04 debootstrap with `$HOME`
++bound at the same path, so the GCC/binutils/glibc oracles are the CI
++runner's.  `ci_local.sh` records `os=<ID-VERSION_ID>` in its stamp and
++the snapshot script records `ci_local-full-PASS@<os>` and warns off-Ubuntu.
++The parity check is now bidirectional: every hosted script, cargo
++subcommand and `--config` build mode must run in ci_local
++(`ci_hosted_only.txt` lists reviewed measurement-only exceptions).  PR
++#639 had added the debug-assertions test and corpus runs to CI alone.
++
++**Rejected.**  Weakening the "beats gcc" check (it caught a real
++regression); an environment knob for the lag model; trusting llvm-mca for
++rotation loops; an i686 special case instead of the pressure rule (the
++rule is about whether the recurrence fits, and fires identically on any
++target with the same pressure).
++
++**Tests.**  reassoc_latency unit tests (lag propagation incl. a swap
++cycle, rot tree order, exact restricted liveness, GPR weights, residency
++with fitting and x86-64 controls; the residency and lag tests fail when
++their rule is mutated away); `check_reassoc_latency.sh` checks 5 (rot
++bound <= 2, pass-off 5) and 6 (-m32 SHA/rot identical to pass-off, -m32
++bitops and x86-64 rot still rewritten); lea fold and refusal unit tests;
++seven parity-check unit tests.
+diff --git a/scripts/README.md b/scripts/README.md
+index 607dde04..b86a1ec8 100644
+--- a/scripts/README.md
++++ b/scripts/README.md
+@@ -25,7 +25,9 @@ Developer and research tooling. None of these are needed to build LCCC.
+ | `reproduce_historical_peephole_utf8.py` | Extracts and executes the exact historical UTF-8-corrupting helper. It resolves the current Rust channel from `rust-toolchain.toml` even though the intentionally historical snippet is compiled with its original Rust-2021 semantics. |
+ | `aarch64_execute_suite.py` | GCC `gcc.c-torture/execute` differential runner: LCCC assembly is validated by a mandatory GAS 2.47, linked for AArch64, and executed against GCC/optional Clang under QEMU. |
+ | `x86_gcc_torture.py` | Full native x86-64 GCC `gcc.c-torture/execute` matrix. Splits compilation and linking so every PASS covers LCCC object generation **and standalone `lccc-ld`**, uses GCC only as eligibility/CRT oracle, understands unconditional `dg-options`, enforces timeouts, and writes deterministic JSON/failure logs. `--from-list FILE` re-runs only the tests named in a previous report (one JSON `test` value per line, blank/`#` lines ignored, unknown names warn+skip, intersects positional tests and `--filter`); the partial-run JSON gains a `from_list` field so evidence tooling can see the filtering. |
+-| `lccc-snapshot.sh` | Harness-wipe-resistant autosave: commits then atomically publishes a verified squashed `ms178-1.patch`, series, tarball, bundle, and ledger with SHA-256 records. Set `LCCC_BASE_REF` when re-anchoring a new session after an upstream rebase. |
++| `lccc-snapshot.sh` | Harness-wipe-resistant autosave: commits then atomically publishes a verified squashed `ms178-1.patch`, series, tarball, bundle, and ledger with SHA-256 records. Set `LCCC_BASE_REF` when re-anchoring a new session after an upstream rebase. Refuses a tree without a matching **`mode=full`** `ci_local.sh` stamp: `--fast` skips the slow gates GitHub runs on every PR (the SSA-validated corpus, the benchmark-output oracle, and the debug-assertions test and corpus runs), so a full stamp comes from a full run or from `--fast` then `--slow` on the unchanged tree; `LCCC_SNAPSHOT_ALLOW_PARTIAL=1` labels an interim autosave `PARTIAL-NOT-DELIVERABLE`. |
++| `ci_ubuntu_chroot.sh` | Runs a command -- normally the full `ci_local.sh` -- in an Ubuntu 24.04 debootstrap (the GitHub runner's userland: GCC 13.2, glibc, binutils) with `$HOME` bound at the same path. The system GCC is an oracle for several gates; PR #638 passed ci_local on Debian's GCC 14.2 and failed CI on Ubuntu's 13.2. `--setup-only` builds the chroot; `LCCC_CI_CHROOT`/`LCCC_CI_MIRROR` override its path and mirror. |
++| `check_ci_gate_parity.py` | Both directions of the ci_local.sh / workflow mirror: every local gate runs in hosted CI, every hosted script, cargo subcommand and `--config` build mode runs locally (comments do not count on either side), and no `tests/regression/check_*.sh` is wired into nothing. Exceptions: `ci_gate_allowlist.txt` (orphans) and `ci_hosted_only.txt` (hosted-only measurements); both may only shrink. Self-test: `test_ci_gate_parity.py`. |
+ | `bench_kernels.py` | Separate-TU kernel timing harness. Supports a CPU-pinned, AB/BA-balanced `lccc-alt` compiler arm via `--lccc-alt-env NAME=VALUE`, verifies checksums, and hashes only the timed function. |
+ | `fuzz_diff.py` | Unified differential-testing harness and single entry point for every differential engine (`synthetic`, `csmith`, `yarpgen`, `stress_suite` + the nine absorbed `tests/fuzz` engines `differential`, `phi_cfg`, `intcmp_thread`, `m32`, `regparm`, `slot_rmw`, `alias_m32`, `alu_torture`, `aarch64`). Compiles every generated program with LCCC **and all selected references** across the requested `-O` levels, compares stdout/stderr/exit status, and saves miscompile reproducers. The `stress_suite` engine sweeps `--count` seeds per generator and evaluates every case under the cartesian product of repeatable `--config-env KEY=VALUE` axes; a case where the reference AND lccc die by the same signal is a GEN-BUG failure (generator bug, never a silent skip). The generator-config engines import the historical `tests/fuzz` generators (historical flags, seeds, and gcc oracle preserved; `Oz` maps to `-Os` on references); the standalone-pipeline engines (nostdlib int80 or cross-compilation) are forwarded to their `tests/fuzz` script and adopt its exit code, SKIPping cleanly when the host lacks ELF32/int80 or the cross toolchain (int80-blocked hosts fall back to compile-only validation). `--check-engines` is the CI wiring guard against stub engines. |
+ | `x86_gcc_torture_i686.py` | Compatibility wrapper: forwards to `scripts/x86_gcc_torture.py --arch=i686` (all flags, including `--from-list`, pass through unchanged). |
+diff --git a/scripts/check_ci_gate_parity.py b/scripts/check_ci_gate_parity.py
+index 48be1183..760b1f71 100644
+--- a/scripts/check_ci_gate_parity.py
++++ b/scripts/check_ci_gate_parity.py
+@@ -225,6 +225,75 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
+     return 0
+ 
+ 
++HOSTED_ONLY = ROOT / "scripts" / "ci_hosted_only.txt"
++CARGO_SUBCOMMAND = re.compile(r"\bcargo\s+(?:\+\S+\s+)?([a-z][a-z-]*)")
++CARGO_CONFIG = re.compile(r"""--config[\s=]+(['"]?)([A-Za-z0-9_.-]+=[^'"\s]+)\1""")
++
++
++def check_hosted_steps_mirrored(local_text: str, hosted: str) -> int:
++    """The reverse direction: everything hosted CI executes runs locally too.
++
++    main() proves every ci_local gate is also hosted; nothing proved the
++    converse, so a step added to a workflow alone (PR #639's two
++    debug-assertions steps, the inline-asm UTF-8 check) left ci_local
++    green on a tree CI could fail.  Checked: every gate/helper script a
++    workflow executes, every cargo subcommand, and every `--config` build
++    mode (a different profile is a different compiler: debug-assertions
++    compile in the %rax shadow-epoch validator).  Exceptions live in
++    ci_hosted_only.txt with a reason; like the orphan allowlist it can only
++    shrink -- an entry that ci_local now mirrors must be deleted.
++    """
++    # Execution semantics on the local side too: a ci_local comment that
++    # names a script or a build mode runs nothing.
++    kept = []
++    for line in local_text.splitlines():
++        if line.lstrip().startswith("#"):
++            continue
++        cut = re.search(r"\s#", line)
++        kept.append(line[: cut.start()] if cut else line)
++    local_text = "\n".join(kept)
++    allow = set()
++    if HOSTED_ONLY.exists():
++        for line in HOSTED_ONLY.read_text().splitlines():
++            entry = line.split("#", 1)[0].strip()
++            if entry:
++                allow.add(entry)
++    missing = []
++    for path in sorted(set(COMMAND.findall(hosted))):
++        if path not in local_text and path not in allow:
++            missing.append(f"script {path}")
++    local_subs = set(CARGO_SUBCOMMAND.findall(local_text))
++    for sub in sorted(set(CARGO_SUBCOMMAND.findall(hosted))):
++        if sub not in local_subs and f"cargo {sub}" not in allow:
++            missing.append(f"cargo {sub}")
++    local_cfg = {m[1] for m in CARGO_CONFIG.findall(local_text)}
++    for cfg in sorted({m[1] for m in CARGO_CONFIG.findall(hosted)}):
++        if cfg not in local_cfg and f"--config {cfg}" not in allow:
++            missing.append(f"--config {cfg}")
++    stale = sorted(
++        e
++        for e in allow
++        if e in local_text
++        or (e.startswith("cargo ") and e[6:] in local_subs)
++        or (e.startswith("--config ") and e[9:] in local_cfg)
++    )
++    if missing:
++        print("ci_local.sh does not mirror these hosted CI steps:", file=sys.stderr)
++        for item in missing:
++            print(f"  {item}", file=sys.stderr)
++        print(
++            "  mirror them in scripts/ci_local.sh (or, for a measurement that has"
++            " no local meaning, record it with a reason in"
++            " scripts/ci_hosted_only.txt)",
++            file=sys.stderr,
++        )
++    if stale:
++        print("ci_hosted_only.txt entries ci_local.sh now mirrors (delete them):", file=sys.stderr)
++        for item in stale:
++            print(f"  {item}", file=sys.stderr)
++    return 1 if missing or stale else 0
++
++
+ def main() -> int:
+     local_text = LOCAL.read_text()
+     local_paths = set(COMMAND.findall(local_text))
+@@ -243,9 +312,11 @@ def main() -> int:
+         return rc
+     if check_asmdiff_gate_parity(local_text, hosted) != 0:
+         return 1
++    if check_hosted_steps_mirrored(local_text, hosted) != 0:
++        return 1
+     print(
+         f"CI/local standalone gate parity: PASS ({len(local_paths)} commands, "
+-        "2 mode/corpus-specific asm-diff gates)"
++        "2 mode/corpus-specific asm-diff gates, hosted steps mirrored)"
+     )
+     return 0
+ 
+diff --git a/scripts/ci_hosted_only.txt b/scripts/ci_hosted_only.txt
 new file mode 100644
-index 0000000..91ffda8
+index 00000000..6776a954
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-27-pr640-pr629-redteam.md
-@@ -0,0 +1,351 @@
-+# Follow-up — PR #640…#629 semantic red-team audit
-+
-+**Session date:** 2026-09-27 (UTC)
-+
-+**Repository:** `ms178/lccc`
-+
-+**Audited tree:** `e9f572eb36f5cd98c9ea1f077bc2922bd001177e` (`origin/main` at
-+session start), plus the corrective commit
-+`a5600dd203721054f8c5837a1e4ad1005f53d837` and the durable follow-up
-+commits `370767c3abcf41b067792d06c7cc8cc9b0c25ade` and
-+`a14be90d0a736065b344998251cfde6b1460a483` and
-+`71903f1c38c53d048b67919cc000c14b613373ec`.
-+
-+**Deliverable:** `/home/user/ms178-1.patch`
-+
-+**Snapshot continuity:** the authoritative snapshot tag, base/head, SHA-256
-+hashes, CI gate, and `APPLIES-CLEAN` result are recorded in
-+`/home/user/artifacts/SNAPSHOT_LEDGER.md`; the current canonical patch is
-+`/home/user/ms178-1.patch`. The full 87-gate run was green immediately before
-+the final wording-only refresh, and every exact-tree refresh after it passed
-+the fast mirror.
-+
-+---
-+
-+## 1. Executive result
-+
-+The ten most recent merged PRs on `main` were audited as a connected change
-+set, not as ten isolated diffs. The audit covered the frontend/IR/backend
-+boundaries affected by the PRs, x86-64 and i686 code generation, the in-tree
-+linkers, CFI and `.eh_frame`, assembler encoding, liveness/register-cache
-+contracts, and the regression/oracle wiring that claims to validate them.
-+
-+One real semantic defect was found and fixed:
-+
-+> The shared `.eh_frame` CIE parser treated a DWARF v4 CIE as a v1/v3 CIE.
-+> DWARF v4 inserts `address_size` and `segment_selector_size` between the
-+> augmentation string and the alignment factors. The old parser therefore
-+> read the wrong bytes as the alignment and return-address fields and could
-+> reject a valid CIE or assign its FDEs the wrong pointer encoding.
-+
-+The same audit found two related fail-closed defects in the EH-frame path and
-+fixed them in the same commit:
-+
-+* unsigned absolute pointers were forced through `i64` (bad for 32-bit
-+  addresses with bit 31 set and for high-half 64-bit `udata8` values);
-+* unsupported text/data-relative and indirect encodings were treated as if
-+  their base were zero, and fixed-width header displacements were silently
-+  truncated to `i32`.
-+
-+The corrective implementation now rejects unrepresentable/unsupported values
-+instead of manufacturing a plausible but wrong unwind-table entry.
-+
-+No other production defect was demonstrated by the available evidence. The
-+remaining optimization gap is recorded rather than hidden: the new two-lane
-+I64 map path is correct and wins the local runtime experiment against GCC
-+14.2, but static Godbolt instruction counts still show a clear opportunity for
-+unroll/epilogue work against GCC 16.2 and ICX.
-+
-+---
-+
-+## 2. Exact PRs audited
-+
-+| PR | merge commit | topic commit | primary area | verdict |
-+|---:|---|---|---|---|
-+| #640 | `e9f572e` | `9b02dfd` | I64/U64 map vectorization; shared `.eh_frame` reader hardening | **fixed: DWARF v4, pointer and range defects** |
-+| #639 | `8624a5d` | `7b7bb8a` | x86-family `%rax` epoch scope; sink coverage; x86 D32 moves | no residual defect demonstrated |
-+| #638 | `a89e685` | `af57893` | CFI from final code; real `.eh_frame`; ARX/reassociation | no residual defect demonstrated |
-+| #637 | `57ce949` | `b026ddd` | accumulator invalidation; SSE staging; thunk-reference scan | no residual defect demonstrated |
-+| #635 | `9bbf681` | `d39611c` | indexed GEP order; hidden-read liveness; coalescing; return pointers | no residual defect demonstrated |
-+| #633 | `0cc06e8` | `e11ec99` | revert of PR #632 | revert correctly neutralizes #632 |
-+| #632 | `5a71853` | `cac4a28` | folded-GEP/hidden-read/retpoline experiment | audited as reverted; no active code remains |
-+| #631 | `43c3cd4` | `8b1b99e` | SQLite miscompile fixes; assembler hardening; CI parity | no residual defect demonstrated |
-+| #630 | `a066f0c` | `737e98a` | x86/i686 VEX selection and EVEX operand validation | no residual defect demonstrated |
-+| #629 | `9c806fe` | `4f94abf` | GAS 2.47 EVEX/VEX parity and strict reciprocal stress | no residual defect demonstrated |
-+
-+The full parent-to-topic diffs were retained during the audit under the
-+session's ephemeral `/home/user/audit/` directory; only the useful corrective
-+source and this durable report are in the deliverable.
-+
-+---
-+
-+## 3. Corrective change details
-+
-+### 3.1 DWARF v4 CIE layout
-+
-+`parse_cie_fde_encoding` now:
-+
-+1. accepts only CIE versions 1 through 4;
-+2. for version 4, consumes and validates `address_size` and
-+   `segment_selector_size` before reading the alignment factors;
-+3. requires the CIE address size to agree with the output ELF class;
-+4. rejects non-zero segment selector sizes because this decoder does not have
-+   a segmented-address model.
-+
-+This is deliberately fail-closed. Returning an FDE with a wrong encoding is
-+worse than omitting one entry: the unwinder's binary search can select a
-+semantically unrelated frame description.
-+
-+### 3.2 Pointer decoding
-+
-+`decode_eh_pointer` now keeps `(raw_value, signedness)` instead of coercing all
-+encodings through `i64`:
-+
-+* `absptr`, `uleb128`, `udata2/4/8` remain unsigned;
-+* `sleb128`, `sdata2/4/8` remain signed;
-+* signed PC-relative values use checked signed addition;
-+* unsigned PC-relative values use checked unsigned addition;
-+* indirect, text-relative, and data-relative encodings return `None`, because
-+  the section-only decoder has no relocated image/text/data base to dereference
-+  or apply;
-+* all byte-range checks use subtraction/checked bounds and cannot wrap an
-+  offset before indexing.
-+
-+### 3.3 Header field range law
-+
-+`.eh_frame_hdr` explicitly uses `sdata4` for its pointer/table entries and
-+`udata4` for its count. Header construction now returns an empty header when a
-+count, allocation size, or displacement cannot be represented, rather than
-+casting with `as i32` and emitting a wrapped search table.
-+
-+The FDE virtual-address calculation is checked as well.
-+
-+### 3.4 Tests added
-+
-+The linker-common unit suite now includes:
-+
-+* a valid DWARF v4 `zR` CIE/FDE fixture;
-+* truncated and unknown-version v4 rejection;
-+* 32-bit high-bit absolute pointer decoding;
-+* high-half 64-bit `udata8` decoding;
-+* high-canonical-address PC-relative arithmetic;
-+* rejection of unsupported data-relative and indirect encodings;
-+* rejection of an unrepresentable `.eh_frame_hdr` displacement.
-+
-+The existing malformed-record, extended-length, bounded-LEB, CIE-cache,
-+compaction, pruning, and arbitrary-record tests continue to pass.
-+
-+---
-+
-+## 4. Red-team evidence
-+
-+### 4.1 Build and lint policy
-+
-+* 8 GiB `/swapfile` is active (`/proc/swaps`), with the repository's
-+  `ensure_swap.sh` policy in place.
-+* Rust 1.98.1 / Edition 2024.
-+* LCCC built with the repository fastbuild preset, `-O1`, and `-j2`.
-+* `-D warnings` was used for targeted builds and the CI build gate.
-+* `cargo fmt --all -- --check`: **PASS**.
-+* `cargo clippy` through `ci_local.sh`: **PASS**, zero warnings.
-+
-+The first fast-CI attempt was not treated as a code result: the disposable VM
-+lacked 32-bit libc headers, so the i686 portions of the new map and no-CFI
-+gates failed during preprocessing. `gcc-multilib` and `libc6-dev-i386` were
-+installed, the two gates were rerun directly, and both passed. The clean
-+post-fix fast run below is the authoritative result.
-+
-+### 4.2 CI mirrors
-+
-+`./scripts/ci_local.sh --fast` on the corrective source tree passed first:
-+
-+```text
-+84 passed, 0 failed, 3 skipped
-+ALL GATES GREEN
-+```
-+
-+The three skips are the script's intentional `--fast` skips:
-+
-+* regression corpus with SSA validation;
-+* benchmark-output oracle;
-+* peephole whitespace invariance.
-+
-+The final documented tree was then run through the complete
-+`./scripts/ci_local.sh` (no `--fast`):
-+
-+```text
-+87 passed, 0 failed, 0 skipped
-+ALL GATES GREEN
-+pass stamp: target/ci_local.pass (full)
-+```
-+
-+The slow gates supplied the missing evidence: **815/815** regression-corpus
-+cases passed with SSA validation, the benchmark-output oracle reported
-+**204 PASS / 0 FAIL / 0 SKIP**, and the whitespace-invariance gate completed
-+its in-tree, operand-matrix, and generated-assembly phases successfully.
-+All other gates passed as well, including cargo tests, differential
-+correctness, fuzz smoke, CFI/eh-frame unwind, assembler/GAS 2.47 parity, all
-+BB-SLP red-team gates, vectorization gates, cross-backend atomics, codegen
-+quality, rustfmt, and clippy.
-+
-+Targeted post-fix results:
-+
-+```text
-+linker_common::eh_frame::tests: 16 passed, 0 failed
-+check_eh_frame_unwind.sh: PASS
-+check_cfi_invariants.sh: PASS (8538 functions, 9139 returns)
-+check_map_i64_two_lane.sh: PASS
-+check_nocfi_peephole_parity.sh: PASS
-+```
-+
-+### 4.3 I64/U64 map stress
-+
-+A separate deterministic stress fixture exercised signed and unsigned 64-bit
-+maps, add/sub/mul/bitwise/shift/div/modulo, invariant broadcasts, conditional
-+maps, three-stream maps, tails from zero through 72 elements, larger trip
-+counts, unaligned destinations, signed `int64_t`, and legal non-`restrict`
-+overlap. It passed at:
-+
-+```text
-+-O0/-O1/-O2/-O3 × x86-64 and x86-64-v3
-+```
-+
-+The overlap test was deliberately corrected to remove `restrict`; the initial
-+version was testing undefined behaviour, and GCC -O3 failed it too. The final
-+fixture and the compiler's scalar-kill-switch comparison both passed.
-+
-+### 4.4 Godbolt oracle
-+
-+`scripts/godbolt.py audit` passed and resolved the requested aliases:
-+
-+```text
-+gcc16.2    -> x86-64 gcc 16.2
-+clang23.1  -> x86-64 clang 23.1.0
-+icc        -> x86-64 icc 2021.10.0
-+icx        -> x86-64 icx (latest)
-+```
-+
-+The standalone map reproducer was compared with all four remote oracles. The
-+recorded instruction counts are static counts, not a runtime claim:
-+
-+| flags | LCCC | GCC 16.2 | Clang 23.1 | ICC | ICX |
-+|---|---:|---:|---:|---:|---:|
-+| `-O2 -march=x86-64` | 47 | 11 | 28 | 74 | 55 |
-+| `-O2 -march=x86-64-v3` | 46 | 33 | 50 | 74 | 25 |
-+
-+This is an honest remaining code-quality gap: LCCC's two-lane path is not yet
-+unrolled as aggressively as the best remote implementations. The local
-+runtime harness (`scripts/bench_kernels.py`, best-of 5, inner 200, unpinned
-+VM) measured `map64_sub` at **1.486x faster than local GCC 14.2**. That result
-+is useful evidence for this VM only; it is not presented as a Raptor Lake or
-+PMU result.
-+
-+Oracle artifacts are in `/home/user/artifacts/godbolt-map64/` and include the
-+source hash, flags, resolved compiler IDs, and manifest.
-+
-+---
-+
-+## 5. Per-PR adjudication
-+
-+### PR #640 — fixed finding
-+
-+The map gate and shared EH-frame parser were read together because the PR
-+changes both target-gated optimization and linker metadata. The map gate
-+covers target reset (x86-64 then i686), SSE2/AVX2 width selection, tails,
-+scalar kill-switch, alias fallback, and runtime equality. The EH-frame audit
-+found the v4/pointer/range defects described above and fixed them with unit
-+fixtures.
-+
-+### PR #639 — accepted after audit
-+
-+The `%rax` epoch scanner is debug-only and opt-in only for x86-64/i686. The
-+review checked the implicit writer table (`div`, `idiv`, one-operand `imul`,
-+`mul`, calls, string ops, compare-exchange, system instructions), generic
-+AT&T destination rules, xchg/xadd/mulx operand classes, embedded-newline
-+scanning, truncation/re-emission, and the final full-buffer assertion. Existing
-+classifier and sink-coverage tests plus the full fast mirror passed.
-+
-+### PR #638 — accepted after audit
-+
-+The final-code CFI derivation, x86/i686 CFI emission, `.eh_frame` synthesis,
-+ARX frame selection, and reassociation paths were checked against the CFI
-+invariant and unwind gates. The critical invariant is derived from final
-+machine code, not a pre-peephole estimate; the tested output had 8,538
-+functions and 9,139 returns with no invariant violation.
-+
-+### PR #637 — accepted after audit
-+
-+The audit followed the accumulator-cache dataflow through call staging,
-+casts, comparisons, floating-point paths, memory paths, return paths, GVN,
-+and both x86-family backends. Width-exact SSE staging and code-only
-+retpoline/thunk scans are covered by their dedicated regression gates. No
-+uncovered write or stale cache use was demonstrated.
-+
-+### PR #635 — accepted after audit
-+
-+Indexed-GEP emission order was checked for def-before-use, hidden reads were
-+checked in liveness and peephole replay, commuted-RHS coalescing was checked
-+against type/width constraints, and slot-independent accumulator sourcing was
-+checked against the debug epoch contract. The vector-copy and replay/phi
-+contracts passed.
-+
-+### PRs #632 and #633 — accepted as a revert pair
-+
-+#632's folded-GEP/hidden-read/retpoline experiment was immediately reverted by
-+#633. Both diffs were audited so the review did not accidentally reason about
-+#632 as production code. The effective main-tree behavior is the #633 revert;
-+no #632-only optimization is claimed in this report.
-+
-+### PR #631 — accepted after audit
-+
-+The audit covered the SQLite reproducer family, function-pointer/type-scope
-+regressions, IV-widen exit bounds, displacement composition, callee-saved
-+relay across calls, tentative incomplete arrays, CI gate parity, and the
-+assembler modes inherited from the preceding PR. Differential correctness,
-+SSA validation where enabled by the gate, and the cross-PR red-team gate
-+passed.
-+
-+### PR #630 — accepted after audit
-+
-+VEX direction/hint handling and EVEX operand validation were compared against
-+GAS 2.47 for x86-64 and i686. The merged PR629 follow-up casefiles passed:
-+90/90 x86-64 cases and 568/568 i686 cases in the fast mirror.
-+
-+### PR #629 — accepted after audit
-+
-+The audit covered EVEX promotion, disp8-N scaling, tuple/operand validation,
-+VEX direction, strict computed reciprocal packing, and the added LZ4 benchmark
-+fixture. GAS 2.47 parity and the strict reciprocal codegen gate passed. No
-+unsupported instruction was accepted by the tested encoder paths.
-+
-+---
-+
-+## 6. Known limits and follow-up queue
-+
-+1. **Keep the full 87-gate result reproducible.** The final documented tree
-+   is currently stamped `ci_local-full-PASS`; any source or documentation edit
-+   must be followed by a fresh exact-tree pass before publishing another
-+   delivery snapshot.
-+2. **Close the I64 map instruction-count gap.** Prototype a two- or four-iteration
-+   unroll only when the cost model predicts enough trip count to amortize the
-+   extra epilogue/branch work; validate against the same scalar fallback and
-+   Godbolt set. Do not optimize the static count at the expense of small loops.
-+3. **Run on the requested i7-14700KF.** This VM has an Intel Xeon virtual CPU,
-+   no `perf`/PMU interface, and no P/E-core topology. The current evidence is
-+   deterministic correctness plus wall-clock best-of sampling, not hardware
-+   counter evidence.
-+4. **Keep ICX/ICC manifests fresh.** The oracle audit currently resolves all
-+   aliases; every future claim must preserve the resolved IDs in its artifact
-+   manifest.
-+5. **Consider a structured result type for EH-frame header construction.** The
-+   current public API historically uses an empty vector for “cannot build”; a
-+   future linker API could distinguish “empty valid section” from “rejected
-+   malformed input” without changing the current fail-closed behavior.
-+6. **Retain the multilib preflight in session restore.** The missing i386 libc
-+   headers were an environment failure, not a compiler failure, but without
-+   the preflight the regression gates report a misleading red result.
-+
-+No performance win is accepted merely because an IR shape or instruction
-+count looks better. The next map optimization must carry a reproducer,
-+assembly, correctness differential, runtime distribution, and (on real
-+hardware) counters.
-diff --git a/src/backend/linker_common/eh_frame.rs b/src/backend/linker_common/eh_frame.rs
-index d10b17f..98e6668 100644
---- a/src/backend/linker_common/eh_frame.rs
-+++ b/src/backend/linker_common/eh_frame.rs
-@@ -81,10 +81,26 @@ pub fn build_eh_frame_hdr(
-     // Parse .eh_frame to find all FDEs and their initial_location values
-     let fdes = parse_eh_frame_fdes(eh_frame_data, eh_frame_vaddr, is_64bit);
++++ b/scripts/ci_hosted_only.txt
+@@ -0,0 +1,7 @@
++# Commands hosted CI executes that scripts/ci_local.sh deliberately does not.
++# check_ci_gate_parity.py fails on a hosted script, cargo subcommand or
++# `--config` build mode that ci_local does not mirror unless it is listed
++# here, and on an entry ci_local mirrors after all, so the list can only
++# shrink.  Only a measurement with no local meaning belongs here; a
++# contract (anything that can fail) must be mirrored.
++.github/scripts/ci-bench.py  # timed benchmark run on the runner's hardware; its pass/fail is output-only, which ci_local's benchmark-output-oracle checks
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index f6316c9d..f77f5f85 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -24,8 +24,19 @@
+ #                                      # rustfmt and clippy ALWAYS run — they
+ #                                      # are the CI lint jobs, and skipping
+ #                                      # them locally is how a red PR ships.
++#   ./scripts/ci_local.sh --slow       # ONLY the three slow gates (plus the
++#                                      # build).  If a --fast stamp for the SAME
++#                                      # tree exists, a green --slow run upgrades
++#                                      # it to mode=full: fast + slow on one tree
++#                                      # is every gate GitHub runs.
+ #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
+ #
++# A --fast pass is NOT CI-equivalent: GitHub runs all three slow gates on every
++# PR.  PR #638 (S24) went red on check_peephole_whitespace.sh after a green
++# --fast run, because the snapshot gate accepted a fast stamp.  lccc-snapshot.sh
++# therefore demands mode=full; obtain it with a full run or with --fast then
++# --slow on the unchanged tree.
++#
+ #   CI_LOCAL_JOBS=N   parallelism for the clippy gate (default 2).  Set 1 on
+ #                     low-memory hosts: `cargo clippy --all-targets` peaks
+ #                     near 1.6 GB resident for this crate, and OOM-killing
+@@ -45,10 +56,12 @@ export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+ export PATH="$CARGO_HOME/bin:$PATH"
  
--    // Header: 4 bytes + eh_frame_ptr (4 bytes) + fde_count (4 bytes)
--    let header_size = 4 + 4 + 4;
--    let table_entry_size = 8; // two i32s per entry
--    let total_size = header_size + fdes.len() * table_entry_size;
-+    // Header: 4 bytes + eh_frame_ptr (4 bytes) + fde_count (4 bytes).
-+    // Every table displacement is explicitly sdata4/udata4.  Never truncate
-+    // an address or count into those fields: a wrapped entry makes the
-+    // unwinder's binary search return an unrelated FDE.  The caller treats an
-+    // empty result as "no usable header" and can fall back to linear scans.
-+    let header_size = 4usize + 4 + 4;
-+    let table_entry_size = 8usize; // two i32s per entry
-+    let Some(table_size) = fdes.len().checked_mul(table_entry_size) else {
-+        return Vec::new();
-+    };
-+    let Some(total_size) = header_size.checked_add(table_size) else {
-+        return Vec::new();
-+    };
-+    let eh_frame_ptr = i128::from(eh_frame_vaddr) - (i128::from(eh_frame_hdr_vaddr) + 4);
-+    let Ok(eh_frame_ptr) = i32::try_from(eh_frame_ptr) else {
-+        return Vec::new();
-+    };
-+    let Ok(fde_count) = u32::try_from(fdes.len()) else {
-+        return Vec::new();
-+    };
-     let mut data = vec![0u8; total_size];
+ FAST=0
++SLOW_ONLY=0
+ ONLY=""
+ for arg in "$@"; do
+     case "$arg" in
+         --fast) FAST=1 ;;
++        --slow) SLOW_ONLY=1 ;;
+         --only) ONLY="__NEXT__" ;;
+         *) if [ "$ONLY" = "__NEXT__" ]; then ONLY="$arg"; else
+                echo "unknown argument: $arg" >&2; exit 2
+@@ -64,8 +77,23 @@ LCCC=target/fastbuild/lccc
+ # a run that does not finish green leaves no proof behind.
+ STAMP=target/ci_local.pass
+ mkdir -p target
+-rm -f "$STAMP"
++if [ "$FAST" = 1 ] && [ "$SLOW_ONLY" = 1 ]; then
++    echo "--fast and --slow are complementary halves; run them one after the other" >&2
++    exit 2
++fi
+ TREE_START=$(bash scripts/worktree_tree.sh 2>/dev/null || true)
++# --fast and --slow are complementary halves.  Remember the complementary
++# half's stamp before it is removed: only both halves green on ONE tree may
++# claim mode=full.
++PRIOR_HALF_TREE=""
++COMPLEMENT=""
++[ "$FAST" = 1 ] && COMPLEMENT=slow
++[ "$SLOW_ONLY" = 1 ] && COMPLEMENT=fast
++if [ -n "$COMPLEMENT" ] && [ -z "$ONLY" ] && [ -r "$STAMP" ] &&
++    [ "$(sed -n 's/^mode=//p' "$STAMP" | head -1)" = "$COMPLEMENT" ]; then
++    PRIOR_HALF_TREE=$(sed -n 's/^tree=//p' "$STAMP" | head -1)
++fi
++rm -f "$STAMP"
+ FAILED=()
+ PASSED=0
+ SKIPPED=0
+@@ -84,6 +112,10 @@ gate() {
+         SKIPPED=$((SKIPPED + 1))
+         return 0
+     fi
++    # --slow keeps the build: every slow gate drives the freshly built lccc.
++    if [ "$SLOW_ONLY" = "1" ] && [ "$slow" != "slow" ] && [ "$name" != "build" ]; then
++        return 0
++    fi
+     hr
+     echo "GATE  $name"
+     hr
+@@ -181,6 +213,25 @@ cargo_test_repeated() {
  
-     // Version
-@@ -96,21 +112,25 @@ pub fn build_eh_frame_hdr(
-     // table encoding: DW_EH_PE_datarel | DW_EH_PE_sdata4
-     data[3] = 0x3b;
+ gate "cargo-test" fast cargo_test_repeated
  
--    // eh_frame_ptr: PC-relative offset from &data[4] to eh_frame
--    let eh_frame_ptr = eh_frame_vaddr as i64 - (eh_frame_hdr_vaddr as i64 + 4);
--    write_i32_le(&mut data, 4, eh_frame_ptr as i32);
--
-+    // eh_frame_ptr: PC-relative offset from &data[4] to .eh_frame.
-+    write_i32_le(&mut data, 4, eh_frame_ptr);
-     // fde_count
--    write_i32_le(&mut data, 8, fdes.len() as i32);
-+    write_u32_le(&mut data, 8, fde_count);
++# CI's second test run: the fastbuild profile inherits `release`, which
++# compiles every debug_assert! out -- the %rax shadow-epoch validator, the
++# GVN span-lockstep check and every other debug-only invariant.  Same
++# --config overrides as ci.yml ("Run tests (debug-assertions on)"), so the
++# shipped fastbuild build stays assertion-free and the artifacts are cached
++# under their own fingerprints.  Memory heuristics as cargo_test_repeated.
++DBGASSERT_CONFIG=(--config 'profile.fastbuild.debug-assertions=true'
++    --config 'profile.fastbuild.incremental=false'
++    --config 'profile.fastbuild.debug=0')
++cargo_test_dbgassert() {
++    local flags="" jobs=2 total_mb
++    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
++    total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
++    [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ] && jobs=1
++    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo test --profile fastbuild \
++        --all-targets --locked -j "$jobs" "${DBGASSERT_CONFIG[@]}"
++}
++gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
++
+ # CCC_VALIDATE_SSA is what CI sets; without it the corpus does not verify SSA
+ # form after every pass and a malformed-IR bug can hide behind a correct
+ # result.
+@@ -323,6 +374,11 @@ gate "dep-files" fast \
+ gate "i686-boot-asm" fast \
+     bash tests/regression/check_i686_boot_asm.sh
  
--    // Table entries: sorted by initial_location
--    // Each entry is (initial_location - eh_frame_hdr_vaddr, fde_address - eh_frame_hdr_vaddr)
-+    // Table entries: sorted by initial_location.  Each entry is
-+    // (initial_location - eh_frame_hdr_vaddr, fde_address - eh_frame_hdr_vaddr).
-     for (i, fde) in fdes.iter().enumerate() {
-         let off = header_size + i * table_entry_size;
--        let loc_rel = fde.initial_location as i64 - eh_frame_hdr_vaddr as i64;
--        let fde_rel = fde.fde_vaddr as i64 - eh_frame_hdr_vaddr as i64;
--        write_i32_le(&mut data, off, loc_rel as i32);
--        write_i32_le(&mut data, off + 4, fde_rel as i32);
-+        let loc_rel = i128::from(fde.initial_location) - i128::from(eh_frame_hdr_vaddr);
-+        let fde_rel = i128::from(fde.fde_vaddr) - i128::from(eh_frame_hdr_vaddr);
-+        let Ok(loc_rel) = i32::try_from(loc_rel) else {
-+            return Vec::new();
-+        };
-+        let Ok(fde_rel) = i32::try_from(fde_rel) else {
-+            return Vec::new();
-+        };
-+        write_i32_le(&mut data, off, loc_rel);
-+        write_i32_le(&mut data, off + 4, fde_rel);
-     }
++# ci.yml "Verify inline-asm UTF-8 assembly text".
++gate "inline-asm-utf8" fast \
++    python3 scripts/check_inline_asm_utf8.py --lccc "$LCCC" --expect preserved \
++        --json target/inline-asm-utf8.json
++
+ # Byte-exact assembler differentials have ONE oracle: GNU as 2.47, exactly as
+ # hosted CI. Distro assemblers are not interchangeable -- GAS 2.44 orders the
+ # i386 lea-NOP remainder after the long NOP, 2.47 before it -- so an unpinned
+@@ -588,6 +644,10 @@ gate "peephole-whitespace-invariance" slow \
+ # dynamic path is exercised on a real compile.  Sub-second, so: fast.
+ gate "peephole-trace-bisect" fast \
+     env CCC=target/fastbuild/lccc bash tests/regression/check_peephole_trace_bisect.sh
++# ci.yml also runs the tool's parser self-test directly, so a broken parser
++# fails even when the wrapper gate is skipped.
++gate "peephole-trace-bisect-selftest" fast \
++    python3 scripts/peephole_trace_bisect.py --selftest
  
-     data
-@@ -191,7 +211,10 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
-                 continue;
-             }
+ # The one-move phi-diamond preinitialisation hoists the cheap incoming
+ # above the branch. A memory-source init may fault on the path it lands
+@@ -619,6 +679,10 @@ fi
+ # if-combine pass was predicating short-circuit chains in a UTF-8 scanner that
+ # can never be vectorized.  A mirror that covers only one workflow is not a
+ # mirror.
++# bench.yml "Gate self-test (stackmem accounting)": the gate's own unit tests.
++gate "codegen-gate-self-test" fast \
++    python3 .github/scripts/test_ci_codegen_gate.py
++
+ gate "codegen-quality-gate" fast \
+     python3 .github/scripts/ci-codegen-gate.py --lccc "$LCCC"
  
--            let fde_vaddr = base_vaddr + entry_start as u64;
-+            let Some(fde_vaddr) = base_vaddr.checked_add(entry_start as u64) else {
-+                pos = entry_end;
+@@ -632,6 +696,27 @@ gate "rustfmt" fast cargo fmt --all -- --check
+ gate "clippy" fast \
+     cargo clippy --all-targets --profile fastbuild --locked -j "${CI_LOCAL_JOBS:-2}" -- -D warnings
+ 
++# ci.yml's closing step "Regression corpus (debug-assertions compiler)": the
++# corpus gates above run an assertion-free compiler, so no debug-only
++# invariant (the %rax shadow-epoch validator above all) ever observes real
++# codegen without this.  CI overwrites target/fastbuild/lccc with the
++# assertions-ON binary because nothing after it uses the path; here later
++# work does, so the binary is run from a copy and the shipping build is
++# relinked from its still-cached artifacts afterwards.
++regression_corpus_dbgassert() {
++    local flags="" rc=0
++    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
++    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo build --profile fastbuild \
++        --bin lccc --locked -j 2 "${DBGASSERT_CONFIG[@]}" || return 1
++    cp -f target/fastbuild/lccc target/lccc-dbgassert || return 1
++    CCC_VALIDATE_SSA=1 python3 tests/regression/run_regression.py \
++        --lccc target/lccc-dbgassert -j 2 \
++        --json target/regression-dbgassert-results.json || rc=1
++    ./scripts/build_lccc_fast.sh >/dev/null || rc=1
++    return $rc
++}
++gate "regression-corpus-debug-assertions" slow regression_corpus_dbgassert
++
+ # ------------------------------------------------------------------ done ---
+ hr
+ echo "SUMMARY: ${PASSED} passed, ${#FAILED[@]} failed, ${SKIPPED} skipped"
+@@ -646,11 +731,26 @@ else
+     TREE_END=$(bash scripts/worktree_tree.sh 2>/dev/null || true)
+     if [ -n "$TREE_START" ] && [ "$TREE_START" = "$TREE_END" ]; then
+         mode=full
+-        [ "$FAST" = 1 ] && mode=fast
+-        printf 'tree=%s\nmode=%s\nutc=%s\nhead=%s\n' "$TREE_END" "$mode" \
+-            "$(date -u +%Y%m%dT%H%M%SZ)" "$(git rev-parse HEAD)" >"$STAMP.tmp" &&
++        if [ -n "$COMPLEMENT" ]; then
++            half=fast
++            [ "$SLOW_ONLY" = 1 ] && half=slow
++            if [ -n "$PRIOR_HALF_TREE" ] && [ "$PRIOR_HALF_TREE" = "$TREE_END" ]; then
++                echo "both halves green on tree $TREE_END (--$COMPLEMENT earlier, --$half now)"
++            else
++                mode=$half
++                echo "NOTE: stamp is mode=$half -- NOT CI-equivalent and not" \
++                     "delivery-grade until --$COMPLEMENT also passes on this tree" >&2
++            fi
++        fi
++        # The userland matters as much as the gate list: system gcc/as/ld/
++        # glibc differ between hosts, and PR #638 was green on Debian 13 and
++        # red on the Ubuntu runner (scripts/ci_ubuntu_chroot.sh mirrors it).
++        os=$( (. /etc/os-release 2>/dev/null && echo "${ID:-unknown}-${VERSION_ID:-unknown}") ||
++            echo unknown)
++        printf 'tree=%s\nmode=%s\nutc=%s\nhead=%s\nos=%s\n' "$TREE_END" "$mode" \
++            "$(date -u +%Y%m%dT%H%M%SZ)" "$(git rev-parse HEAD)" "$os" >"$STAMP.tmp" &&
+             mv -f "$STAMP.tmp" "$STAMP"
+-        echo "pass stamp: $STAMP (tree $TREE_END, $mode)"
++        echo "pass stamp: $STAMP (tree $TREE_END, $mode, $os)"
+     else
+         echo "WARNING: the worktree changed during the run" \
+              "(${TREE_START:-?} -> ${TREE_END:-?}); no pass stamp" >&2
+diff --git a/scripts/ci_ubuntu_chroot.sh b/scripts/ci_ubuntu_chroot.sh
+new file mode 100755
+index 00000000..5578c2fb
+--- /dev/null
++++ b/scripts/ci_ubuntu_chroot.sh
+@@ -0,0 +1,126 @@
++#!/usr/bin/env bash
++# Run a command inside the userland GitHub's `ubuntu-latest` runner uses.
++#
++# WHY THIS EXISTS
++# ---------------
++# ci_local.sh mirrors the GATES of .github/workflows/ci.yml, but on the
++# developer's host userland.  Many gates hand lccc output to the SYSTEM
++# gcc / as / ld / objdump / glibc, and those differ between hosts: PR #638
++# (S24) was green under ci_local.sh on Debian 13 (gcc 14, binutils 2.44,
++# glibc 2.41) and red on the Ubuntu 24.04 runner (gcc 13, binutils 2.42,
++# glibc 2.39).  A gate mirror without an environment mirror is half a mirror.
++#
++# This script builds (once, idempotently) a minimal Ubuntu chroot carrying the
++# packages ci.yml installs on top of the runner image, bind-mounts the calling
++# user's HOME at the SAME path (so the repo, rustup/cargo, ~/.cache and any
++# pinned tool such as GNU as 2.47 resolve exactly as on the host), and runs
++# the given command in the repo as the calling user.  It needs root (sudo)
++# for debootstrap, mount and chroot.
++#
++# Usage:
++#   scripts/ci_ubuntu_chroot.sh [--suite noble] -- CMD [ARGS...]
++#   scripts/ci_ubuntu_chroot.sh --setup-only
++#   scripts/ci_ubuntu_chroot.sh -- bash scripts/ci_local.sh --only i686
++#   scripts/ci_ubuntu_chroot.sh -- bash scripts/ci_local.sh    # the full mirror
++#
++# target/ is shared with the host: binaries built inside link against the
++# chroot's older glibc and run on the host too, but cargo's fingerprints see a
++# different C toolchain, so switching between host and chroot builds rebuilds.
++#
++# Environment:
++#   LCCC_CI_CHROOT   chroot directory (default /srv/lccc-ci-<suite>; keep it
++#                    OUTSIDE the repo so it never lands in a snapshot)
++#   LCCC_CI_MIRROR   Ubuntu archive (default http://archive.ubuntu.com/ubuntu)
++#
++# The runner migrates `ubuntu-latest` to Ubuntu 26.04 on 2026-10-19; pass
++# `--suite` accordingly (and keep noble around for the transition window).
++set -euo pipefail
++
++SUITE=noble
++SETUP_ONLY=0
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --suite) SUITE=$2; shift 2 ;;
++        --setup-only) SETUP_ONLY=1; shift ;;
++        --) shift; break ;;
++        *) echo "usage: $0 [--suite S] [--setup-only] -- CMD..." >&2; exit 2 ;;
++    esac
++done
++if [[ $SETUP_ONLY == 0 && $# -eq 0 ]]; then
++    echo "usage: $0 [--suite S] [--setup-only] -- CMD..." >&2
++    exit 2
++fi
++
++REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
++ROOT=${LCCC_CI_CHROOT:-/srv/lccc-ci-$SUITE}
++MIRROR=${LCCC_CI_MIRROR:-http://archive.ubuntu.com/ubuntu}
++case $REPO in
++    "$HOME"/*) ;;
++    *) echo "the repo ($REPO) must live under \$HOME ($HOME), which is what is bind-mounted" >&2
++       exit 2 ;;
++esac
++# What the runner image provides that the gates use (compiler, binutils, make,
++# python3, git, file), plus what ci.yml's "Install i686 C runtime" step adds.
++PACKAGES=build-essential,gcc-multilib,libc6-dev-i386,python3,python3-yaml,git,file,binutils,make,bc,xz-utils,ca-certificates,perl
++
++stamp=$ROOT/.lccc-ci-ready
++if [[ ! -e $stamp ]]; then
++    # /usr/sbin is on sudo's secure_path but often not on a user PATH.
++    command -v debootstrap >/dev/null || [[ -x /usr/sbin/debootstrap ]] ||
++        { echo "debootstrap missing: sudo apt-get install debootstrap ubuntu-keyring" >&2; exit 1; }
++    echo "[ci-chroot] bootstrapping Ubuntu $SUITE into $ROOT (one-time, ~1 GB)"
++    # debootstrap does not retry a failed download, and one transient miss
++    # among ~300 packages aborts it (seen: libsemanage-common); a partial
++    # root cannot be resumed reliably, so each attempt starts clean.  No
++    # mount exists yet (the binds are made below, after the stamp).
++    ok=0
++    for attempt in 1 2 3; do
++        sudo rm -rf --one-file-system "$ROOT"
++        sudo mkdir -p "$ROOT"
++        if sudo debootstrap --variant=minbase --components=main,universe \
++            --include="$PACKAGES" "$SUITE" "$ROOT" "$MIRROR"; then
++            ok=1
++            break
++        fi
++        echo "[ci-chroot] debootstrap attempt $attempt failed; retrying" >&2
++        sleep $((attempt * 10))
++    done
++    [[ $ok == 1 ]] || { echo "[ci-chroot] debootstrap failed 3 times" >&2; exit 1; }
++    # The calling user, with the same uid/gid, so files written into the
++    # bind-mounted repo keep their ownership.
++    uid=$(id -u) gid=$(id -g) name=$(id -un)
++    sudo chroot "$ROOT" sh -c "getent group $gid >/dev/null || groupadd -g $gid $name;
++        getent passwd $uid >/dev/null || useradd -m -u $uid -g $gid -s /bin/bash $name"
++    sudo touch "$stamp"
++fi
++[[ $SETUP_ONLY == 1 ]] && { echo "[ci-chroot] ready: $ROOT"; exit 0; }
++
++# Bind mounts are torn down on every exit path; a leaked /proc mount would
++# keep the chroot busy.
++mounts=()
++cleanup() {
++    local i
++    for ((i = ${#mounts[@]} - 1; i >= 0; i--)); do
++        sudo umount -l "${mounts[$i]}" 2>/dev/null || true
++    done
++}
++trap cleanup EXIT
++bind() { # bind SRC DST-inside-root
++    sudo mkdir -p "$ROOT$2"
++    sudo mount --bind "$1" "$ROOT$2"
++    mounts+=("$ROOT$2")
++}
++bind /proc /proc
++bind /dev /dev
++bind /sys /sys
++bind /dev/shm /dev/shm
++bind "$HOME" "$HOME"
++sudo mkdir -p "$ROOT/tmp" && sudo chmod 1777 "$ROOT/tmp"
++
++cmd=$(printf '%q ' "$@")
++sudo chroot --userspec="$(id -u):$(id -g)" "$ROOT" /usr/bin/env -i \
++    HOME="$HOME" USER="$(id -un)" LANG=C.UTF-8 TERM=dumb \
++    CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
++    PATH="${CARGO_HOME:-$HOME/.cargo}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
++    CI=true GITHUB_ACTIONS=true \
++    bash -c "cd $(printf '%q' "$REPO") && $cmd"
+diff --git a/scripts/lccc-snapshot.sh b/scripts/lccc-snapshot.sh
+index 29e8abdb..9cd84221 100755
+--- a/scripts/lccc-snapshot.sh
++++ b/scripts/lccc-snapshot.sh
+@@ -22,7 +22,10 @@
+ # Usage:  ./lccc-snapshot.sh "<slug>" "<one-line description>"
+ # Env:    LCCC_REPO, LCCC_ARTIFACTS, LCCC_DELIVERABLE
+ #         LCCC_CI_STAMP — ci_local.sh pass stamp (default target/ci_local.pass);
+-#                         the snapshot refuses a tree without a matching one.
++#                         the snapshot refuses a tree without a matching
++#                         mode=full one (--fast alone is not CI-equivalent).
++#         LCCC_SNAPSHOT_ALLOW_PARTIAL=1 — accept a --fast/--slow stamp for an
++#                         interim autosave (ledger: *-PARTIAL-NOT-DELIVERABLE).
+ #         LCCC_SNAPSHOT_UNGATED=1 — emergency pre-wipe save without that proof
+ #                         (ledger ci_gate=UNGATED; never a delivery candidate).
+ #         LCCC_BASE_REF — explicit upstream base for a rebase/new session.
+@@ -198,23 +201,42 @@ tree_now=$(bash "$REPO/scripts/worktree_tree.sh" "$REPO") ||
+   { echo "unable to hash the worktree" >&2; exit 1; }
+ # Read only an existing stamp: under `set -euo pipefail` a failing sed in the
+ # substitution would abort the script without the explanation below.
+-stamp_tree='' stamp_mode=''
++stamp_tree='' stamp_mode='' stamp_os=''
+ if [[ -r $CI_STAMP ]]; then
+   stamp_tree=$(sed -n 's/^tree=//p' "$CI_STAMP" | head -1)
+   stamp_mode=$(sed -n 's/^mode=//p' "$CI_STAMP" | head -1)
++  stamp_os=$(sed -n 's/^os=//p' "$CI_STAMP" | head -1)
+ fi
+-if [[ -n $stamp_tree && $stamp_tree == "$tree_now" ]]; then
+-  ci_gate="ci_local-${stamp_mode:-unknown}-PASS"
++if [[ -n $stamp_tree && $stamp_tree == "$tree_now" && $stamp_mode == full ]]; then
++  # Recorded, not enforced: GitHub's ubuntu-latest moves (24.04 -> 26.04 on
++  # 2026-10-19) and not every host can run the chroot mirror. A non-Ubuntu
++  # userland is shown in the ledger so a reviewer knows what was mirrored.
++  ci_gate="ci_local-full-PASS@${stamp_os:-unknown-os}"
++  if [[ ${stamp_os:-} != ubuntu-* ]]; then
++    echo "WARNING: gates ran on ${stamp_os:-an unrecorded userland}, not the Ubuntu" \
++         "runner's; scripts/ci_ubuntu_chroot.sh -- bash scripts/ci_local.sh mirrors it." >&2
++  fi
++elif [[ -n $stamp_tree && $stamp_tree == "$tree_now" &&
++        ${LCCC_SNAPSHOT_ALLOW_PARTIAL:-0} == 1 ]]; then
++  # A --fast (or --slow) stamp covers only part of what GitHub runs: S24 went
++  # red on PR #638 in check_peephole_whitespace.sh, a gate --fast skips, after
++  # this script had accepted its fast stamp. Partial stamps are therefore only
++  # an interim autosave, labelled as such in the ledger, never a delivery.
++  ci_gate="ci_local-${stamp_mode:-unknown}-PARTIAL-NOT-DELIVERABLE"
++  echo "WARNING: tree $tree_now has only a mode=${stamp_mode:-unknown} stamp;" \
++       "recorded as $ci_gate." >&2
+ elif [[ ${LCCC_SNAPSHOT_UNGATED:-0} == 1 ]]; then
+   ci_gate="UNGATED"
+   echo "WARNING: snapshot of tree $tree_now WITHOUT a matching ci_local.sh pass;" \
+        "recorded as UNGATED -- not a delivery candidate." >&2
+ else
+   cat >&2 <<MSG
+-refusing to snapshot: tree $tree_now has no matching ci_local.sh pass stamp
+-  stamp: $CI_STAMP (tree=${stamp_tree:-none})
+-Run ./scripts/ci_local.sh --fast (or full) on this exact tree first, or set
+-LCCC_SNAPSHOT_UNGATED=1 for an emergency pre-wipe save (ledger: UNGATED).
++refusing to snapshot: tree $tree_now has no matching FULL ci_local.sh pass
++  stamp: $CI_STAMP (tree=${stamp_tree:-none}, mode=${stamp_mode:-none})
++GitHub CI runs every gate, so only mode=full is delivery-grade. Run
++./scripts/ci_local.sh (full), or --fast and then --slow on this exact tree.
++Interim autosave with a partial stamp: LCCC_SNAPSHOT_ALLOW_PARTIAL=1.
++Emergency pre-wipe save without any stamp: LCCC_SNAPSHOT_UNGATED=1.
+ MSG
+   exit 3
+ fi
+diff --git a/scripts/test_ci_gate_parity.py b/scripts/test_ci_gate_parity.py
+index 66641024..32233e57 100644
+--- a/scripts/test_ci_gate_parity.py
++++ b/scripts/test_ci_gate_parity.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+ 
+ from contextlib import redirect_stderr
+ from io import StringIO
++from pathlib import Path
++import tempfile
+ import unittest
+ 
+ import check_ci_gate_parity as parity
+@@ -89,5 +91,89 @@ class AsmDiffParityTest(unittest.TestCase):
+                 self.local.replace(needle, "echo installer removed", 1), self.hosted), 1)
+ 
+ 
++class HostedStepsMirroredTest(unittest.TestCase):
++    """check_hosted_steps_mirrored: every hosted command must run locally."""
++
++    HOSTED = (
++        "python3 scripts/check_inline_asm_utf8.py --lccc x\n"
++        "cargo test --profile fastbuild --config 'profile.fastbuild.debug-assertions=true'\n"
++        "python3 .github/scripts/ci-bench.py\n"
++    )
++    LOCAL = (
++        "gate utf8 fast python3 scripts/check_inline_asm_utf8.py\n"
++        "CFG=(--config 'profile.fastbuild.debug-assertions=true')\n"
++        "cargo test \"${CFG[@]}\"\n"
++    )
++
++    def setUp(self) -> None:
++        self.dir = tempfile.TemporaryDirectory()
++        self.saved = parity.HOSTED_ONLY
++        parity.HOSTED_ONLY = Path(self.dir.name) / "hosted_only.txt"
++        self.allow(".github/scripts/ci-bench.py  # measurement")
++
++    def tearDown(self) -> None:
++        parity.HOSTED_ONLY = self.saved
++        self.dir.cleanup()
++
++    def allow(self, *entries: str) -> None:
++        parity.HOSTED_ONLY.write_text("# header\n" + "".join(e + "\n" for e in entries))
++
++    def check(self, local: str, hosted: str | None = None) -> tuple[int, str]:
++        err = StringIO()
++        with redirect_stderr(err):
++            rc = parity.check_hosted_steps_mirrored(local, self.HOSTED if hosted is None else hosted)
++        return rc, err.getvalue()
++
++    def test_mirrored_tree_passes(self) -> None:
++        self.assertEqual(self.check(self.LOCAL), (0, ""))
++
++    def test_hosted_only_script_fails(self) -> None:
++        rc, err = self.check(self.LOCAL.replace("scripts/check_inline_asm_utf8.py", "x"))
++        self.assertEqual(rc, 1)
++        self.assertIn("script scripts/check_inline_asm_utf8.py", err)
++
++    def test_comment_does_not_mirror_a_script_or_a_build_mode(self) -> None:
++        local = (
++            "# python3 scripts/check_inline_asm_utf8.py\n"
++            "cargo test  # --config 'profile.fastbuild.debug-assertions=true'\n"
++        )
++        rc, err = self.check(local)
++        self.assertEqual(rc, 1)
++        self.assertIn("script scripts/check_inline_asm_utf8.py", err)
++        self.assertIn("--config profile.fastbuild.debug-assertions=true", err)
++
++    def test_missing_build_mode_fails_in_every_spelling(self) -> None:
++        local = self.LOCAL.replace("debug-assertions=true", "debug-assertions=false")
++        for hosted in (
++            "cargo test --config 'profile.fastbuild.debug-assertions=true'",
++            'cargo test --config "profile.fastbuild.debug-assertions=true"',
++            "cargo test --config=profile.fastbuild.debug-assertions=true",
++        ):
++            rc, err = self.check(local, hosted)
++            self.assertEqual(rc, 1, hosted)
++            self.assertIn("--config profile.fastbuild.debug-assertions=true", err)
++
++    def test_missing_cargo_subcommand_fails(self) -> None:
++        rc, err = self.check(self.LOCAL, self.HOSTED + "cargo build --bin lccc\n")
++        self.assertEqual(rc, 1)
++        self.assertIn("cargo build", err)
++
++    def test_allowlist_exempts_and_must_shrink(self) -> None:
++        self.allow(".github/scripts/ci-bench.py", "scripts/check_inline_asm_utf8.py")
++        rc, err = self.check(self.LOCAL)
++        self.assertEqual(rc, 1)
++        self.assertIn("now mirrors (delete them)", err)
++        self.allow()
++        rc, err = self.check(self.LOCAL)
++        self.assertEqual(rc, 1)
++        self.assertIn("script .github/scripts/ci-bench.py", err)
++
++    def test_repository_is_mirrored(self) -> None:
++        local = parity.LOCAL.read_text()
++        hosted = "\n".join(parity.run_script_bodies(p) for p in sorted(parity.WORKFLOWS.glob("*.yml")))
++        parity.HOSTED_ONLY = self.saved
++        self.assertEqual(self.check(local, hosted), (0, ""))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+index 7f6243dd..97d9d2c6 100644
+--- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
++++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+@@ -3,7 +3,8 @@
+ //! Three transforms that need an explicit model of the EFLAGS lifetime, which
+ //! the other peephole passes deliberately avoid touching:
+ //!
+-//! 1. [`fold_copy_add_into_lea`] — `movl %A,%D; addl $imm,%D` → `leal imm(%A),%D`.
++//! 1. [`fold_copy_add_into_lea`] — `movl %A,%D; addl $imm,%D` → `leal imm(%A),%D`,
++//!    and `movl %A,%D; addl %R,%D` → `leal (%A,%R),%D`.
+ //!    One instruction less, and — crucially — `lea` does not write flags, which
+ //!    is what makes transform 2 applicable to the loop bodies the backend emits.
+ //! 2. [`fold_setcc_test_cmov`] — the backend materialises a comparison as a
+@@ -486,7 +487,9 @@ fn names_family_at_width(text: &str, fam: RegId, wide: bool) -> bool {
+ // ── 1. copy + add-immediate → lea ────────────────────────────────────────────
+ 
+ /// `movl %A, %D` + `addl $imm, %D` → `leal imm(%A), %D` (same for `q`, and for
+-/// `sub` with the displacement negated).
++/// `sub` with the displacement negated), and the register-addend form
++/// `movl %A, %D` + `addl %R, %D` → `leal (%A,%R), %D` (`add` only: `lea` has
++/// no subtracted index).
+ ///
+ /// Saves one instruction and — the reason this pass exists — removes a flags
+ /// write from between a comparison and its consumer, which is what lets
+@@ -523,9 +526,8 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
+             i += 1;
+             continue;
+         };
+-        // %rsp/%rbp as the LEA destination is never worth the risk, and a
+-        // self-copy is not this pattern.
+-        if src_fam == dst_fam || dst_fam == 4 || dst_fam == 5 {
++        // A self-copy is not this pattern, and %rsp is never a destination.
++        if src_fam == dst_fam || dst_fam == 4 {
+             i += 1;
+             continue;
+         }
+@@ -567,9 +569,43 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
+             continue;
+         }
+         let Some(mut imm) = imm_value(imm_text) else {
+-            i += 1;
++            // Register addend: `movl %A, %D; addl %R, %D` -> `leal (%A,%R), %D`.
++            // R must be named at the add's width (a `%r8b` addend is not a
++            // 32-bit add) and must not be D (after the copy D holds A; that
++            // aliasing case is left alone) or %rsp (not encodable as index).
++            let Some(r_fam) = plain_gp_operand(imm_text) else {
++                i += 1;
 +                continue;
 +            };
- 
-             // Decode initial_location based on the CIE's FDE encoding
-             let initial_location = decode_eh_pointer(
-@@ -244,6 +267,13 @@ fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, is_64bit: bool) -> Option
-     let Some(&version) = data.get(start + id_size).filter(|_| start + id_size < end) else {
-         return None;
-     };
-+    // `.eh_frame` CIEs in the supported DWARF32/DWARF64 formats use the
-+    // v1/v3/v4 layouts below.  Treat unknown versions as malformed rather
-+    // than interpreting a v5 CIE with the v3 layout and returning a plausible
-+    // but wrong FDE encoding.
-+    if !matches!(version, 1..=4) {
-+        return None;
-+    }
-     let aug_start = start + id_size + 1;
-     let Some(aug_len) = data[aug_start..end].iter().position(|&b| b == 0) else {
-         return None;
-@@ -252,6 +282,27 @@ fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, is_64bit: bool) -> Option
-     let mut cur = aug_start + aug_len + 1;
-     let cie = &data[..end];
- 
-+    // DWARF v4 inserts address_size and segment_selector_size between the
-+    // augmentation string and the alignment factors.  Omitting these two
-+    // bytes (the old v1/v3-only parser did) shifts every subsequent read: a
-+    // valid v4 zR CIE is then either rejected or, worse, assigned an
-+    // unrelated FDE encoding.  We do not support segmented EH pointers, and
-+    // the CIE address size must agree with the output ELF class used by the
-+    // decoder, so fail closed on either case.
-+    if version == 4 {
-+        let Some(&address_size) = cie.get(cur) else {
-+            return None;
-+        };
-+        let Some(&segment_selector_size) = cie.get(cur + 1) else {
-+            return None;
-+        };
-+        let expected_address_size = if is_64bit { 8 } else { 4 };
-+        if address_size != expected_address_size || segment_selector_size != 0 {
-+            return None;
-+        }
-+        cur += 2;
-+    }
-+
-     // The return-address column is a byte in CIE v1, ULEB in v3/v4.
-     let Some((_, n)) = read_uleb128(cie, cur) else {
-         return None;
-@@ -328,91 +379,112 @@ fn decode_eh_pointer(
-     let base_enc = encoding & 0x0F;
-     let rel = encoding & 0x70;
- 
--    let (raw_val, _size) = match base_enc {
-+    // Indirect encodings require dereferencing a relocated address in the
-+    // output image.  This parser only has the section bytes, not the final
-+    // address space, so accepting one would manufacture the slot address as
-+    // the function PC.  Fail closed instead.
-+    if encoding & 0x80 != 0 {
-+        return None;
-+    }
-+
-+    // Keep the raw value unsigned plus an explicit signedness bit.  The old
-+    // implementation forced udata4/udata8 through `i64`; a perfectly valid
-+    // 32-bit absolute address >= 0x8000_0000 was then sign-extended, and a
-+    // 64-bit udata8 with bit 63 set could overflow during a PC-relative add.
-+    // Signed encodings are sign-extended only when the relative base is
-+    // applied; unsigned encodings remain unsigned all the way through.
-+    let (raw_val, signed) = match base_enc {
-         0x00 => {
-             // DW_EH_PE_absptr
-             if is_64bit {
--                if offset + 8 > data.len() {
-+                if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
-                     return None;
-                 }
--                (read_u64_le(data, offset) as i64, 8)
-+                (read_u64_le(data, offset), false)
-             } else {
--                if offset + 4 > data.len() {
-+                if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
-                     return None;
-                 }
--                (read_u32_le(data, offset) as i32 as i64, 4)
-+                (u64::from(read_u32_le(data, offset)), false)
-             }
-         }
-         0x01 => {
-             // DW_EH_PE_uleb128
-             let (v, _) = read_uleb128(data, offset)?;
--            (v as i64, 0)
-+            (v, false)
-         }
-         0x02 => {
-             // DW_EH_PE_udata2
--            if offset + 2 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 2) {
-                 return None;
-             }
-             (
--                u16::from_le_bytes([data[offset], data[offset + 1]]) as i64,
--                2,
-+                u64::from(u16::from_le_bytes([data[offset], data[offset + 1]])),
-+                false,
-             )
-         }
-         0x03 => {
-             // DW_EH_PE_udata4
--            if offset + 4 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
-                 return None;
-             }
--            (read_u32_le(data, offset) as i64, 4)
-+            (u64::from(read_u32_le(data, offset)), false)
-         }
-         0x04 => {
-             // DW_EH_PE_udata8
--            if offset + 8 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
-                 return None;
-             }
--            (read_u64_le(data, offset) as i64, 8)
-+            (read_u64_le(data, offset), false)
-         }
-         0x09 => {
-             // DW_EH_PE_sleb128
-             let (v, _) = read_sleb128(data, offset)?;
--            (v, 0)
-+            (v as u64, true)
-         }
-         0x0A => {
-             // DW_EH_PE_sdata2
--            if offset + 2 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 2) {
-                 return None;
-             }
-             (
--                i16::from_le_bytes([data[offset], data[offset + 1]]) as i64,
--                2,
-+                i16::from_le_bytes([data[offset], data[offset + 1]]) as i64 as u64,
-+                true,
-             )
-         }
-         0x0B => {
-             // DW_EH_PE_sdata4
--            if offset + 4 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
-                 return None;
-             }
--            (read_i32_le(data, offset) as i64, 4)
-+            (read_i32_le(data, offset) as i64 as u64, true)
-         }
-         0x0C => {
-             // DW_EH_PE_sdata8
--            if offset + 8 > data.len() {
-+            if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
-                 return None;
-             }
--            (read_u64_le(data, offset) as i64, 8)
-+            (read_u64_le(data, offset) as i64 as u64, true)
-         }
-         _ => return None,
-     };
- 
--    let base_val = match rel {
--        0x00 => 0i64,      // DW_EH_PE_absptr
--        0x10 => pc as i64, // DW_EH_PE_pcrel
--        0x20 => 0i64,      // DW_EH_PE_textrel (not commonly used)
--        0x30 => 0i64,      // DW_EH_PE_datarel
--        _ => 0i64,
--    };
--
--    Some((base_val + raw_val) as u64)
-+    match rel {
-+        0x00 => Some(raw_val), // DW_EH_PE_absptr
-+        0x10 => {
-+            // DW_EH_PE_pcrel.  Use checked arithmetic: malformed relocation
-+            // data must be rejected, never wrap to an unrelated FDE.
-+            if signed {
-+                pc.checked_add_signed(raw_val as i64)
-+            } else {
-+                pc.checked_add(raw_val)
++            // `movq %rsp, %rbp` is the frame setup, whatever follows it.
++            if neg
++                || (dst_fam == 5 && src_fam == 4)
++                || r_fam == dst_fam
++                || r_fam == 4
++                || !names_family_at_width(imm_text, r_fam, add_wide)
++                || !flags_dead_after(store, infos, j + 1)
++            {
++                i += 1;
++                continue;
 +            }
++            let mnemonic = if add_wide { "leaq" } else { "leal" };
++            let dst_name = REG_NAMES[if add_wide { 0 } else { 1 }][dst_fam as usize];
++            let new_line = format!(
++                "    {} ({},{}), {}",
++                mnemonic, REG_NAMES[0][src_fam as usize], REG_NAMES[0][r_fam as usize], dst_name
++            );
++            mark_nop(&mut infos[i]);
++            replace_line(store, &mut infos[j], j, new_line);
++            changed = true;
++            i = j + 1;
+             continue;
+         };
++        // The immediate form keeps its %rbp-destination exclusion (an
++        // immediate adjustment of %rbp is the frame idiom, never a value).
++        if dst_fam == 5 {
++            i += 1;
++            continue;
 +        }
-+        // The caller does not provide text/data bases, and treating either
-+        // encoding as absolute silently produces a wrong search table.
-+        0x20 | 0x30 => None, // DW_EH_PE_textrel/datarel
-+        _ => None,
-+    }
- }
- 
- /// Return the byte size of an encoded pointer.
-@@ -447,6 +519,11 @@ fn write_i32_le(data: &mut [u8], off: usize, val: i32) {
-     data[off..off + 4].copy_from_slice(&b);
- }
- 
-+fn write_u32_le(data: &mut [u8], off: usize, val: u32) {
-+    let b = val.to_le_bytes();
-+    data[off..off + 4].copy_from_slice(&b);
-+}
-+
- /// Bounded LEB readers: malformed inputs must not truncate modulo 64 bits or
- /// borrow bytes from the next CIE/FDE.  A 64-bit number needs at most 10 bytes.
- fn read_uleb128(data: &[u8], off: usize) -> Option<(u64, usize)> {
-@@ -1284,6 +1361,108 @@ mod tests {
-         assert_eq!(read_sleb128(&[0xff; 9], 0), None);
+         if neg {
+             imm = -imm;
+         }
+@@ -1992,6 +2028,78 @@ mod tests {
+         assert!(!out.contains("addl $1, %r8d"), "{out}");
      }
  
-+    /// Build a DWARF v4 CIE/FDE pair.  Version 4 has two fields that v1/v3
-+    /// do not: address_size and segment_selector_size.  The parser must skip
-+    /// them before reading the alignment factors and the `zR` augmentation
-+    /// payload.
-+    fn synth_dwarf4_eh_frame(fde_enc: u8) -> Vec<u8> {
-+        let mut data = Vec::new();
-+        let mut cie = Vec::new();
-+        cie.extend_from_slice(&0u32.to_le_bytes()); // CIE id
-+        cie.push(4); // DWARF v4
-+        cie.extend_from_slice(b"zR\0");
-+        cie.push(8); // address_size for an ELF64 output
-+        cie.push(0); // segment_selector_size
-+        cie.push(1); // code alignment factor
-+        cie.push(0x78); // data alignment factor (-8)
-+        cie.push(16); // return-address register (ULEB128)
-+        cie.push(1); // augmentation data length
-+        cie.push(fde_enc);
-+        while (cie.len() + 4) % 8 != 0 {
-+            cie.push(0); // DW_CFA_nop padding
-+        }
-+        data.extend_from_slice(&(cie.len() as u32).to_le_bytes());
-+        data.extend_from_slice(&cie);
-+
-+        let fde_start = data.len();
-+        let mut fde = Vec::new();
-+        fde.extend_from_slice(&((fde_start + 4) as u32).to_le_bytes());
-+        fde.extend_from_slice(&0x100i32.to_le_bytes()); // pcrel initial_location
-+        fde.extend_from_slice(&0x20u32.to_le_bytes()); // address_range
-+        fde.push(0); // z augmentation data length
-+        while (fde.len() + 4) % 8 != 0 {
-+            fde.push(0);
-+        }
-+        data.extend_from_slice(&(fde.len() as u32).to_le_bytes());
-+        data.extend_from_slice(&fde);
-+        data
++    /// The rotation loop of check_phi_acyclic_order.sh: a copy into an
++    /// allocatable %rbp plus a register add, with the flags dead (the next
++    /// flags reader is preceded by a writer).
++    #[test]
++    fn copy_plus_register_add_becomes_two_source_lea() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movq %r12, %rbp\n",
++            "    addl %edi, %ebp\n",
++            "    movq %rbx, %r8\n",
++            "    addq %rsi, %r8\n",
++            "    cmpq %rbp, %r8\n",
++            "    jl .L1\n",
++            ".L1:\n",
++            "    movq %rsi, %rax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("leal (%r12,%rdi), %ebp"), "{out}");
++        assert!(out.contains("leaq (%rbx,%rsi), %r8"), "{out}");
++        assert!(!out.contains("movq %r12, %rbp"), "{out}");
++        assert!(!out.contains("addl %edi, %ebp"), "{out}");
 +    }
 +
++    /// Every case the register form must refuse: flags read by the next
++    /// instruction, a `sub` (no negated index), a narrower copy than the add,
++    /// an addend that is the destination or %rsp, a byte-register addend, and
++    /// the frame setup `movq %rsp, %rbp`.
 +    #[test]
-+    fn pointer_decoding_preserves_unsigned_addresses_and_rejects_unsupported_bases() {
-+        // A 32-bit absolute pointer with bit 31 set is still an address, not
-+        // a negative signed displacement.
-+        assert_eq!(
-+            decode_eh_pointer(&0x8000_0000u32.to_le_bytes(), 0, 0x00, 0, false),
-+            Some(0x8000_0000)
-+        );
-+        // Likewise, udata8 is allowed to use the high half of the address
-+        // space; it must not pass through i64 and wrap.
-+        assert_eq!(
-+            decode_eh_pointer(&u64::MAX.to_le_bytes(), 0, 0x04, 0, true),
-+            Some(u64::MAX)
-+        );
-+        // Signed PC-relative offsets are applied without signed-overflow
-+        // traps, even when the PC is in the high canonical address range.
-+        assert_eq!(
-+            decode_eh_pointer(
-+                &(-0x100i32).to_le_bytes(),
-+                0,
-+                PCREL_SDATA4,
-+                0xffff_ffff_ffff_1000,
-+                true
++    fn copy_plus_register_add_refusals() {
++        for (pair, why) in [
++            (
++                "    movl %ebx, %r8d\n    addl %ecx, %r8d\n    jc .L1\n",
++                "carry read",
 +            ),
-+            Some(0xffff_ffff_ffff_0f00)
-+        );
-+        // No text/data base is available to this section-only decoder.
-+        assert_eq!(
-+            decode_eh_pointer(&0u32.to_le_bytes(), 0, 0x3b, 0x400000, true),
-+            None
-+        );
-+        // Indirect encodings need a relocated image dereference and therefore
-+        // cannot be decoded from the section byte slice alone.
-+        assert_eq!(
-+            decode_eh_pointer(&0u32.to_le_bytes(), 0, 0x9b, 0x400000, true),
-+            None
-+        );
-+
-+        // The fixed-width header fields must reject an unrepresentable
-+        // displacement rather than truncating it modulo 2^32.
-+        let data = synth_eh_frame(1, PCREL_SDATA4);
-+        assert!(build_eh_frame_hdr(&data, 0, 0x1_0000_0000, true).is_empty());
++            ("    movl %ebx, %r8d\n    subl %ecx, %r8d\n", "sub"),
++            (
++                "    movl %ebx, %r8d\n    addq %rcx, %r8\n",
++                "narrow copy, wide add",
++            ),
++            (
++                "    movl %ebx, %r8d\n    addl %r8d, %r8d\n",
++                "addend is the destination",
++            ),
++            ("    movq %rbx, %r8\n    addq %rsp, %r8\n", "rsp index"),
++            ("    movl %ebx, %r8d\n    addb %cl, %r8b\n", "byte add"),
++            ("    movq %rsp, %rbp\n    addq %rcx, %rbp\n", "frame setup"),
++        ] {
++            let asm = format!(
++                "foo:\n.cfi_startproc\n{pair}    testq %r8, %r8\n    jne .L1\n.L1:\n    ret\n.cfi_endproc\n"
++            );
++            let out = run(&asm);
++            assert!(!out.contains("lea"), "{why}: {out}");
++        }
 +    }
 +
++    /// The immediate form still folds a copy of %rsp (address of a stack
++    /// slot) -- the register form's frame-setup refusal must not leak.
 +    #[test]
-+    fn dwarf4_cie_skips_address_and_segment_sizes() {
-+        let data = synth_dwarf4_eh_frame(PCREL_SDATA4);
-+        assert_eq!(count_eh_frame_fdes(&data), 1);
-+        let fdes = parse_eh_frame_fdes(&data, 0x400000, true);
-+        assert_eq!(fdes.len(), 1);
-+        let fde_start = scan_eh_frame_records(&data)[1].start;
-+        let iloc = 0x400000 + (fde_start + 8) as u64 + 0x100;
-+        assert_eq!(fdes[0].initial_location, iloc);
-+
-+        // A truncated v4 prefix and an unsupported DWARF version must fail
-+        // closed instead of borrowing the following record's bytes.
-+        let mut truncated = data.clone();
-+        let cie_len = u32::from_le_bytes(truncated[..4].try_into().unwrap()) as usize;
-+        truncated.truncate(4 + cie_len - 1);
-+        assert!(parse_eh_frame_fdes(&truncated, 0x400000, true).is_empty());
-+        let mut unknown = data;
-+        unknown[8] = 5; // version byte: length(4) + CIE id(4)
-+        assert!(parse_eh_frame_fdes(&unknown, 0x400000, true).is_empty());
++    fn copy_of_rsp_plus_immediate_still_becomes_lea() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movq %rsp, %rax\n",
++            "    addq $8, %rax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("leaq 8(%rsp), %rax"), "{out}");
 +    }
 +
      #[test]
-     fn extended_cie_fde_uses_its_own_encoding() {
-         // DWARF64 .eh_frame, CIE v1 with zR augmentation and pcrel/sdata4.
+     fn copy_plus_add_keeps_flags_when_read() {
+         // The hazard pinned here is the flag-free `leal`: with `je` reading
+diff --git a/src/backend/x86/codegen/peephole/passes/frame_compact_tests.rs b/src/backend/x86/codegen/peephole/passes/frame_compact_tests.rs
+index 0bd338e3..3329557c 100644
+--- a/src/backend/x86/codegen/peephole/passes/frame_compact_tests.rs
++++ b/src/backend/x86/codegen/peephole/passes/frame_compact_tests.rs
+@@ -53,8 +53,14 @@ fn a_dead_leaf_frame_with_one_paired_epilogue_folds() {
+     )));
+     assert_eq!(count(&out, "subq $16, %rsp"), 0, "{}", out);
+     assert_eq!(count(&out, "addq $16, %rsp"), 0, "{}", out);
+-    // The body itself must survive.
+-    assert_eq!(count(&out, "addl %esi, %eax"), 1, "{}", out);
++    // The body itself must survive: as written, or as the equivalent
++    // two-source lea the copy+add fold makes of it (flags dead at `ret`).
++    assert_eq!(
++        count(&out, "addl %esi, %eax") + count(&out, "leal (%rdi,%rsi), %eax"),
++        1,
++        "{}",
++        out
++    );
+ }
+ 
+ #[test]
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index 3d9180ac..a6d8fe99 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -4633,11 +4633,19 @@ mod regression_tests {
+         ]);
+         let result = peephole_optimize(asm);
+         eprintln!("sib_direct result: {:?}", result);
++        // Scale 1 and neither register is %rsp: base and index commute (the
++        // copy+add fold may form the lea as (%r14,%rbx) before this fold).
+         assert!(
+-            result.contains("(%rbx, %r14)") || result.contains("(%rbx,%r14)"),
++            ["(%rbx, %r14)", "(%rbx,%r14)", "(%r14, %rbx)", "(%r14,%rbx)"]
++                .iter()
++                .any(|a| result.contains(&format!("movb $0, {a}"))),
+             "should fold to SIB indexed addressing: {}",
+             result
+         );
++        assert!(
++            !result.contains("(%rax)"),
++            "store still through %rax: {result}"
++        );
+     }
+ 
+     #[test]
+diff --git a/src/backend/x86/codegen/peephole/passes/vector_copy.rs b/src/backend/x86/codegen/peephole/passes/vector_copy.rs
+index d7a2c3cf..6d8c3791 100644
+--- a/src/backend/x86/codegen/peephole/passes/vector_copy.rs
++++ b/src/backend/x86/codegen/peephole/passes/vector_copy.rs
+@@ -1716,7 +1716,11 @@ mod tests {
+             "    movq %rdi, %rax\n    addq %rsi, %rax\n    movsd %xmm0, %xmm1\n    vaddsd %xmm1, %xmm2, %xmm0\n    ret\n",
+         );
+         let out = run(&asm);
+-        assert!(out.contains("addq %rsi, %rax"), "{out}");
++        // The GP sum survives, as written or as the copy+add fold's lea.
++        assert!(
++            out.contains("addq %rsi, %rax") || out.contains("leaq (%rdi,%rsi), %rax"),
++            "{out}"
++        );
+     }
+ 
+     #[test]
+diff --git a/src/passes/reassoc_latency.rs b/src/passes/reassoc_latency.rs
+index 3ff3c2f7..42a9596a 100644
+--- a/src/passes/reassoc_latency.rs
++++ b/src/passes/reassoc_latency.rs
+@@ -49,6 +49,20 @@
+ //! deep from `e`, not 3, and is added before the 3-deep Σ1; without BMI1
+ //! both are 3 deep and their order does not change the bound).
+ //!
++//! ## Rotation lags
++//!
++//! SHA-256-style state rotation (`h = g; g = f; f = e; e = d + t1`) makes
++//! some carried phis pure copies of other carried phis.  Such a phi holds a
++//! value computed `lag` iterations ago (h: 3, g: 2, f: 1, e: 0), so it is
++//! ready long before this iteration's computed words: it starts at
++//! `r = -lag`.  Timing every carried phi at 0 instead made the pass combine
++//! `((e + f) + g) + (k + h)` in the rotation loop of
++//! `tests/regression/check_phi_acyclic_order.sh` -- the recurrence did not
++//! get shorter, but the folded `add (mem), reg` was lost (55 -> 56
++//! instructions, one more than GCC 13.2; that is the PR #638 CI failure).
++//! Lags compose along copy chains; a phi on a pure copy cycle (a genuine
++//! swap) has no computed source and keeps lag 0.
++//!
+ //! # Transformation
+ //!
+ //! A *tree* is a maximal set of `BinOp`s with the same associative,
+@@ -94,6 +108,29 @@
+ //! registers (a 9-product 3x3 convolution sum balanced by depth spilled:
+ //! +24% dynamic instructions before this rule).
+ //!
++//! Each node puts a single-use load leaf second, the operand position x86
++//! folds into `add mem, reg`.  Rewrites repeat to a fixpoint (at most
++//! `MAX_ROUNDS`): once `t1` is earlier, `a' = t1 + t2` may be worth
++//! re-planning.  Every accepted rewrite strictly lowers its root's
++//! recurrence time, so the rounds terminate on their own.
++//!
++//! # Register residency
++//!
++//! The model times a *register-resident* recurrence.  When the values live
++//! on the loop's recurrences do not fit the allocatable GPRs, the
++//! recurrence runs through stack slots and store-to-load forwarding the
++//! model cannot see, and a reshaped tree moves spill traffic onto it:
++//! i686 SHA-256 (8 rotating words, 6 GPRs) measured 1.058 [1.034, 1.070]
++//! of the source shape.  A tree is therefore left alone when the live
++//! recurrent values (exact SSA liveness restricted to the loop's tainted
++//! values, weighted by the GPRs each occupies) exceed the GPR budget at
++//! *every* point of its span: somewhere in the span the recurrence must be
++//! partly memory-resident.  Measured separation (recurrent / budget):
++//! i686 SHA 8/6 and the rotation loop 8/6 lose; i686 bitops 6/6, x86-64
++//! lz4_compress 4/13 and SHA 8/13 gain.  Block peak pressure, the integral
++//! of excess pressure, and total (not just recurrent) span pressure were
++//! tried and each misclassified a measured case.
++//!
+ //! Pass name for CCC_DISABLE_PASSES: "reassoc_lat".
+ 
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+@@ -106,11 +143,44 @@ use crate::passes::loop_analysis;
+ /// count; real associative chains have a handful of leaves.
+ const MAX_LEAVES: usize = 64;
+ 
++/// Fixpoint bound.  Each accepted rewrite strictly lowers a root's
++/// recurrence time, so this only caps pathological inputs.
++const MAX_ROUNDS: usize = 8;
++
++// ELF machines (local, as in backedge_pre: passes do not depend on the
++// backend crate modules).
++const EM_386: u16 = 3;
++const EM_AARCH64: u16 = 183;
++const EM_RISCV: u16 = 243;
++
++/// Allocatable general-purpose registers of the target, excluding the
++/// stack/frame pointers and the reserved scratch registers.
++fn gpr_budget() -> u32 {
++    match crate::common::types::target_elf_machine() {
++        EM_386 => 6,
++        EM_AARCH64 | EM_RISCV => 26,
++        _ => 13,
++    }
++}
++
++/// GPRs a value of `ty` occupies (floating point: none).
++fn gpr_weight(ty: Option<IrType>) -> u32 {
++    let word = match crate::common::types::target_ptr_size() {
++        0 => 8,
++        w => w,
++    };
++    match ty {
++        Some(t) if t.is_float() || t == IrType::Void => 0,
++        Some(t) => t.size().div_ceil(word).max(1) as u32,
++        None => 1,
++    }
++}
++
+ /// Availability of a value: `r` is `None` when the value is off every
+ /// loop-carried chain (free), `l` the local depth.
+ #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+ struct Avail {
+-    r: Option<u32>,
++    r: Option<i32>,
+     l: u32,
+ }
+ 
+@@ -119,7 +189,7 @@ impl Avail {
+ 
+     fn after(self, other: Avail, lat: u32) -> Avail {
+         Avail {
+-            r: self.r.max(other.r).map(|r| r + lat),
++            r: self.r.max(other.r).map(|r| r + lat as i32),
+             l: self.l.max(other.l) + lat,
+         }
+     }
+@@ -254,8 +324,166 @@ fn tainted_values(
+     }
+ }
+ 
+-/// Run the pass over one function.  Returns the number of trees rewritten.
++/// Rotation lag of each recurrent phi that is a pure copy of other
++/// recurrent phis around the back edge(s): `lag(p) = 1 + min lag(q)` over
++/// its in-loop incomings `q` (the latest source bounds availability), 0 for
++/// a phi fed by a computed value.  Phis on a pure copy cycle keep 0.  Only
++/// positive lags are returned.
++fn rotation_lags(
++    func: &IrFunction,
++    lp: &loop_analysis::NaturalLoop,
++    rec: &FxHashSet<u32>,
++    label_to_idx: &FxHashMap<crate::ir::reexports::BlockId, usize>,
++) -> FxHashMap<u32, i32> {
++    // For each recurrent phi: its in-loop sources if they are all recurrent
++    // phis, None otherwise.
++    let mut srcs: FxHashMap<u32, Option<Vec<u32>>> = FxHashMap::default();
++    for inst in &func.blocks[lp.header].instructions {
++        let Instruction::Phi { dest, incoming, .. } = inst else {
++            continue;
++        };
++        if !rec.contains(&dest.0) {
++            continue;
++        }
++        let mut all: Option<Vec<u32>> = Some(Vec::new());
++        for (op, pred) in incoming {
++            if !label_to_idx.get(pred).is_some_and(|p| lp.body.contains(p)) {
++                continue;
++            }
++            match (op, all.as_mut()) {
++                (Operand::Value(v), Some(list)) if rec.contains(&v.0) && v.0 != dest.0 => {
++                    list.push(v.0)
++                }
++                _ => all = None,
++            }
++        }
++        srcs.insert(dest.0, all.filter(|l| !l.is_empty()));
++    }
++    // Forward propagation from the computed sources: a phi whose sources
++    // all have a lag gets 1 + their minimum.  Monotone (each phi is
++    // assigned once), so it ends after at most |phis| sweeps; phis left
++    // unassigned sit on (or are fed only by) pure copy cycles: lag 0.
++    let mut memo: FxHashMap<u32, i32> = srcs
++        .iter()
++        .filter(|(_, s)| s.is_none())
++        .map(|(&p, _)| (p, 0))
++        .collect();
++    let mut keys: Vec<u32> = srcs.keys().copied().collect();
++    keys.sort_unstable();
++    loop {
++        let mut progress = false;
++        for &p in &keys {
++            if memo.contains_key(&p) {
++                continue;
++            }
++            let Some(Some(qs)) = srcs.get(&p) else {
++                continue;
++            };
++            let lags: Option<Vec<i32>> = qs.iter().map(|q| memo.get(q).copied()).collect();
++            if let Some(min) = lags.and_then(|l| l.into_iter().min()) {
++                memo.insert(p, min + 1);
++                progress = true;
++            }
++        }
++        if !progress {
++            break;
++        }
++    }
++    memo.retain(|_, l| *l > 0);
++    memo
++}
++
++/// Live-out sets of every block, restricted to the values in `track`
++/// (exact SSA liveness: a phi operand is live out of its predecessor only).
++fn live_out_restricted(
++    func: &IrFunction,
++    succs: &analysis::FlatAdj,
++    label_to_idx: &FxHashMap<crate::ir::reexports::BlockId, usize>,
++    track: &FxHashSet<u32>,
++) -> Vec<FxHashSet<u32>> {
++    let n = func.blocks.len();
++    let mut upward: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n];
++    let mut defs: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n];
++    // phi_out[b]: tracked phi operands flowing out of b along its edges.
++    let mut phi_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n];
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for inst in &block.instructions {
++            if let Instruction::Phi { incoming, .. } = inst {
++                for (op, pred) in incoming {
++                    if let (Operand::Value(v), Some(&p)) = (op, label_to_idx.get(pred))
++                        && track.contains(&v.0)
++                    {
++                        phi_out[p].insert(v.0);
++                    }
++                }
++            } else {
++                inst.for_each_used_value(|v| {
++                    if track.contains(&v) && !defs[bi].contains(&v) {
++                        upward[bi].insert(v);
++                    }
++                });
++            }
++            if let Some(d) = inst.dest()
++                && track.contains(&d.0)
++            {
++                defs[bi].insert(d.0);
++            }
++        }
++        block.terminator.for_each_used_value(|v| {
++            if track.contains(&v) && !defs[bi].contains(&v) {
++                upward[bi].insert(v);
++            }
++        });
++    }
++    let mut live_in: Vec<FxHashSet<u32>> = upward.clone();
++    let mut live_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n];
++    // Both families of sets only grow (unions of growing sets), so a size
++    // change is exactly a content change.
++    let mut changed = true;
++    while changed {
++        changed = false;
++        for bi in (0..n).rev() {
++            let mut out = phi_out[bi].clone();
++            for &s in succs.row(bi) {
++                out.extend(live_in[s as usize].iter().copied());
++            }
++            let mut inn = upward[bi].clone();
++            inn.extend(out.iter().filter(|v| !defs[bi].contains(v)).copied());
++            if out.len() != live_out[bi].len() {
++                live_out[bi] = out;
++                changed = true;
++            }
++            if inn.len() != live_in[bi].len() {
++                live_in[bi] = inn;
++                changed = true;
++            }
++        }
++    }
++    live_out
++}
++
++/// Per-loop facts shared by the loop's blocks.
++struct LoopFacts {
++    tainted: FxHashSet<u32>,
++    lags: FxHashMap<u32, i32>,
++    live_out: Vec<FxHashSet<u32>>,
++}
++
++/// Run the pass over one function to a fixpoint.  Returns the number of
++/// trees rewritten.
+ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
++    let mut total = 0;
++    for _ in 0..MAX_ROUNDS {
++        let r = run_round(func);
++        total += r;
++        if r == 0 {
++            break;
++        }
++    }
++    total
++}
++
++fn run_round(func: &mut IrFunction) -> usize {
+     let n = func.blocks.len();
+     if n == 0 {
+         return 0;
+@@ -292,8 +520,26 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+             .for_each_used_value(|v| *uses.entry(v).or_insert(0) += 1);
+     }
+ 
++    // Value types for the residency weights (a Copy takes its source's).
++    let mut types: FxHashMap<u32, IrType> = FxHashMap::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Some(d) = inst.dest() {
++                if let Some(t) = inst.result_type() {
++                    types.insert(d.0, t);
++                } else if let Instruction::Copy {
++                    src: Operand::Value(s),
++                    ..
++                } = inst
++                    && let Some(&t) = types.get(&s.0)
++                {
++                    types.insert(d.0, t);
++                }
++            }
++        }
++    }
+     let mut next_id = func.sound_next_value_id();
+-    let mut taint_cache: FxHashMap<usize, FxHashSet<u32>> = FxHashMap::default();
++    let mut facts_cache: FxHashMap<usize, LoopFacts> = FxHashMap::default();
+     let mut rewrites = 0usize;
+     for bi in 0..n {
+         let Some(li) = innermost[bi] else { continue };
+@@ -304,16 +550,24 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+         {
+             continue;
+         }
+-        let tainted = taint_cache.entry(li).or_insert_with(|| {
++        let facts = facts_cache.entry(li).or_insert_with(|| {
+             let seeds = recurrent_phis(func, &loops[li], &def_block, &label_to_idx);
+-            tainted_values(func, &loops[li], &seeds)
++            let lags = rotation_lags(func, &loops[li], &seeds, &label_to_idx);
++            let tainted = tainted_values(func, &loops[li], &seeds);
++            let live_out = live_out_restricted(func, &succs, &label_to_idx, &tainted);
++            LoopFacts {
++                tainted,
++                lags,
++                live_out,
++            }
+         });
+         let in_loop = |v: u32| {
+             def_block
+                 .get(&v)
+                 .is_some_and(|b| loops[li].body.contains(b))
+         };
+-        rewrites += rewrite_block(func, bi, tainted, &in_loop, &uses, &mut next_id);
++        let weight = |v: u32| gpr_weight(types.get(&v).copied());
++        rewrites += rewrite_block(func, bi, facts, &in_loop, &weight, &uses, &mut next_id);
+     }
+     if rewrites > 0 {
+         func.next_value_id = next_id;
+@@ -334,11 +588,17 @@ struct Tree {
+ fn rewrite_block(
+     func: &mut IrFunction,
+     bi: usize,
+-    tainted: &FxHashSet<u32>,
++    facts: &LoopFacts,
+     in_loop: &dyn Fn(u32) -> bool,
++    weight: &dyn Fn(u32) -> u32,
+     uses: &FxHashMap<u32, u32>,
+     next_id: &mut u32,
+ ) -> usize {
++    let tainted = &facts.tainted;
++    let carried_start = |v: u32| Avail {
++        r: Some(-facts.lags.get(&v).copied().unwrap_or(0)),
++        l: 0,
++    };
+     let insts = &func.blocks[bi].instructions;
+     // Local def index and availability of every value defined in the block.
+     let mut local: FxHashMap<u32, usize> = FxHashMap::default();
+@@ -349,7 +609,7 @@ fn rewrite_block(
+         }
+         // Defined elsewhere: on the recurrence iff tainted inside the loop.
+         if tainted.contains(&v) && in_loop(v) {
+-            Avail { r: Some(0), l: 0 }
++            carried_start(v)
+         } else {
+             Avail::FREE
+         }
+@@ -386,7 +646,7 @@ fn rewrite_block(
+         local.insert(d.0, ii);
+         let a = if let Instruction::Phi { .. } = inst {
+             if tainted.contains(&d.0) {
+-                Avail { r: Some(0), l: 0 }
++                carried_start(d.0)
+             } else {
+                 Avail::FREE
+             }
+@@ -402,7 +662,7 @@ fn rewrite_block(
+             };
+             Avail {
+                 r: if tainted.contains(&d.0) {
+-                    a.r.map(|r| r + lat)
++                    a.r.map(|r| r + lat as i32)
+                 } else {
+                     None
+                 },
+@@ -534,6 +794,41 @@ fn rewrite_block(
+             Operand::Const(_) => -1,
+         }
+     };
++    // Recurrent register pressure after each instruction of the block
++    // (computed on first need; the block is not modified until the end).
++    let mut pressure: Option<Vec<u32>> = None;
++    let recurrent_pressure = || -> Vec<u32> {
++        let mut live: FxHashSet<u32> = facts.live_out[bi].clone();
++        func.blocks[bi].terminator.for_each_used_value(|v| {
++            if tainted.contains(&v) {
++                live.insert(v);
++            }
++        });
++        let mut out = vec![0u32; insts.len()];
++        for ii in (0..insts.len()).rev() {
++            out[ii] = live.iter().map(|&v| weight(v)).sum();
++            if let Some(d) = insts[ii].dest() {
++                live.remove(&d.0);
++            }
++            if !matches!(insts[ii], Instruction::Phi { .. }) {
++                insts[ii].for_each_used_value(|v| {
++                    if tainted.contains(&v) {
++                        live.insert(v);
++                    }
++                });
++            }
++        }
++        out
++    };
++    let budget = gpr_budget();
++    // A single-use load defined in this block: the backend folds it into
++    // the second operand of an ALU op.
++    let foldable_load = |o: &Operand| match o {
++        Operand::Value(v) => local.get(&v.0).is_some_and(|&d| {
++            matches!(insts[d], Instruction::Load { .. }) && uses.get(&v.0) == Some(&1)
++        }),
++        Operand::Const(_) => false,
++    };
+     let mut rewrites = 0;
+     for t in &trees {
+         let root = *t.nodes.last().unwrap();
+@@ -613,6 +908,11 @@ fn rewrite_block(
+                 }
+             }
+             sunk.sort_unstable();
++            let (lhs, rhs) = if foldable_load(&o0) && !foldable_load(&o1) {
++                (o1, o0)
++            } else {
++                (o0, o1)
++            };
+             planned.push(NewNode {
+                 anchor,
+                 root,
+@@ -620,8 +920,8 @@ fn rewrite_block(
+                 inst: Instruction::BinOp {
+                     dest,
+                     op: t.op,
+-                    lhs: o0,
+-                    rhs: o1,
++                    lhs,
++                    rhs,
+                     ty: t.ty,
+                 },
+             });
+@@ -634,6 +934,12 @@ fn rewrite_block(
+         if new_root.r >= current.r {
+             continue;
+         }
++        // Register residency: skip when the recurrence cannot be register
++        // resident anywhere in the tree's span.
++        let p = pressure.get_or_insert_with(recurrent_pressure);
++        if (t.nodes[0]..=root).all(|ii| p[ii] > budget) {
++            continue;
++        }
+         debug_assert!(work[0].3 <= root as isize);
+         *next_id += planned.len() as u32 - 1;
+         deleted.extend(t.nodes.iter().copied());
+@@ -900,7 +1206,11 @@ mod tests {
+         let Instruction::BinOp { lhs, rhs, .. } = def(&f, inner.0) else {
+             panic!("inner node is not a BinOp")
+         };
+-        assert_eq!((lhs, rhs), (&v(14), &v(3)), "free load first, then h");
++        assert_eq!(
++            (lhs, rhs),
++            (&v(3), &v(14)),
++            "the free load joins h first, as the second operand (folds into add mem)"
++        );
+         // The superseded interior node is gone, the id cache is advanced.
+         assert!(
+             f.blocks
+@@ -999,6 +1309,276 @@ mod tests {
+         assert_eq!(format!("{:?}", f.blocks), before);
+     }
+ 
++    /// An `n`-word state rotation (`w[k] = w[k-1]` for k >= 1, `w[0] = t`)
++    /// with `t = ((((w[n-1] + w[0]) + w[1]) + ...) + w[n-2]) + K[i]`, the
++    /// check_phi_acyclic_order.sh `rot()` shape.  Value ids: IV 40, IV' 41,
++    /// cmp 42, K 43, index 44, gep 45, load 46, words 1..=n, tree 60.., and
++    /// the last tree node (t) is returned by `rot_root`.  With `swap`, two
++    /// extra carried phis 30/31 exchange values (a pure copy cycle).
++    fn rot_fn(n: u32, swap: bool) -> IrFunction {
++        assert!(n >= 3);
++        let mut f = IrFunction::new("rot".to_string(), IrType::U32, vec![], false);
++        let root = rot_root(n);
++        let mut phis = vec![Instruction::Phi {
++            dest: Value(40),
++            ty: IrType::I64,
++            incoming: vec![
++                (Operand::Const(IrConst::I64(0)), BlockId(0)),
++                (v(41), BlockId(2)),
++            ],
++        }];
++        for k in 0..n {
++            let back = if k == 0 { v(root) } else { v(k) }; // w[k] <- w[k-1]
++            phis.push(Instruction::Phi {
++                dest: Value(k + 1),
++                ty: IrType::U32,
++                incoming: vec![
++                    (Operand::Const(IrConst::I32(k as i32)), BlockId(0)),
++                    (back, BlockId(2)),
++                ],
++            });
++        }
++        if swap {
++            for (d, other) in [(30, 31), (31, 30)] {
++                phis.push(Instruction::Phi {
++                    dest: Value(d),
++                    ty: IrType::U32,
++                    incoming: vec![
++                        (Operand::Const(IrConst::I32(d as i32)), BlockId(0)),
++                        (v(other), BlockId(2)),
++                    ],
++                });
++            }
++        }
++        phis.push(Instruction::Cmp {
++            dest: Value(42),
++            op: crate::ir::reexports::IrCmpOp::Slt,
++            lhs: v(40),
++            rhs: Operand::Const(IrConst::I64(64)),
++            ty: IrType::I64,
++        });
++        let mut body = vec![];
++        // ((w[n-1] + w[0]) + w[1]) + ... + w[n-2]
++        body.push(bin(60, IrBinOp::Add, v(n), v(1), IrType::U32));
++        let mut last = 60;
++        for k in 1..n - 1 {
++            body.push(bin(last + 1, IrBinOp::Add, v(last), v(k + 1), IrType::U32));
++            last += 1;
++        }
++        body.push(bin(
++            44,
++            IrBinOp::Shl,
++            v(40),
++            Operand::Const(IrConst::I64(2)),
++            IrType::I64,
++        ));
++        body.push(Instruction::GetElementPtr {
++            dest: Value(45),
++            base: Value(43),
++            offset: v(44),
++            ty: IrType::Ptr,
++        });
++        body.push(Instruction::Load {
++            dest: Value(46),
++            ptr: Value(45),
++            ty: IrType::U32,
++            seg_override: Default::default(),
++            volatile: false,
++        });
++        body.push(bin(root, IrBinOp::Add, v(last), v(46), IrType::U32));
++        body.push(bin(
++            41,
++            IrBinOp::Add,
++            v(40),
++            Operand::Const(IrConst::I64(1)),
++            IrType::I64,
++        ));
++        f.blocks = vec![
++            blk(
++                0,
++                vec![Instruction::GlobalAddr {
++                    dest: Value(43),
++                    name: "K".to_string(),
++                }],
++                Terminator::Branch(BlockId(1)),
++            ),
++            blk(
++                1,
++                phis,
++                Terminator::CondBranch {
++                    cond: v(42),
++                    true_label: BlockId(2),
++                    false_label: BlockId(3),
++                },
++            ),
++            blk(2, body, Terminator::Branch(BlockId(1))),
++            blk(3, vec![], Terminator::Return(Some(v(1)))),
++        ];
++        f.next_value_id = root + 1;
++        f.next_label = 4;
++        f
++    }
++
++    fn rot_root(n: u32) -> u32 {
++        60 + n - 1
++    }
++
++    fn loop_of(
++        f: &IrFunction,
++    ) -> (
++        loop_analysis::NaturalLoop,
++        FxHashMap<crate::ir::reexports::BlockId, usize>,
++    ) {
++        let label_to_idx = analysis::build_label_map(f);
++        let (preds, succs) = analysis::build_cfg(f, &label_to_idx);
++        let idom = analysis::compute_dominators(f.blocks.len(), &preds, &succs);
++        let mut loops = loop_analysis::find_natural_loops(f.blocks.len(), &preds, &succs, &idom);
++        assert_eq!(loops.len(), 1);
++        (loops.remove(0), label_to_idx)
++    }
++
++    fn def_blocks(f: &IrFunction) -> FxHashMap<u32, usize> {
++        let mut m = FxHashMap::default();
++        for (bi, b) in f.blocks.iter().enumerate() {
++            for i in &b.instructions {
++                if let Some(d) = i.dest() {
++                    m.insert(d.0, bi);
++                }
++            }
++        }
++        m
++    }
++
++    /// Sets the thread's target for the duration of a test.
++    struct Target;
++    impl Target {
++        fn set(machine: u16, ptr: usize) -> Target {
++            crate::common::types::set_target_elf_machine(machine);
++            crate::common::types::set_target_ptr_size(ptr);
++            Target
++        }
++    }
++    impl Drop for Target {
++        fn drop(&mut self) {
++            crate::common::types::set_target_elf_machine(62);
++            crate::common::types::set_target_ptr_size(8);
++        }
++    }
++
++    #[test]
++    fn rotation_lags_follow_copy_chains() {
++        let f = rot_fn(8, true);
++        let (lp, label_to_idx) = loop_of(&f);
++        let rec = recurrent_phis(&f, &lp, &def_blocks(&f), &label_to_idx);
++        assert!((1..=8).all(|k| rec.contains(&k)) && rec.contains(&30) && rec.contains(&31));
++        let lags = rotation_lags(&f, &lp, &rec, &label_to_idx);
++        for k in 1..8u32 {
++            assert_eq!(lags.get(&(k + 1)), Some(&(k as i32)), "w[{k}] lags {k}");
++        }
++        assert!(!lags.contains_key(&1), "w[0] is computed: lag 0");
++        assert!(
++            !lags.contains_key(&30) && !lags.contains_key(&31),
++            "a pure swap cycle has no computed source: lag 0"
++        );
++    }
++
++    /// The PR #638 regression: with every carried phi at time 0 the pass
++    /// reshaped rot() without shortening its recurrence and lost the load
++    /// fold.  With lags, the computed word w[0] is combined last (one add
++    /// after it), and the load is the second operand of its node.
++    #[test]
++    fn rotation_combines_the_computed_word_last() {
++        let n = 4;
++        let mut f = rot_fn(n, false);
++        assert_eq!(run_function(&mut f), 1);
++        assert_valid(&f);
++        // Each level combines one leaf with the partial sum below it:
++        // w[0] (lag 0) last, then w[1], w[2], and (w[3] + load) first.
++        let split = |x: &Operand, leaf: Operand| -> Operand {
++            let Operand::Value(x) = x else { panic!("node") };
++            let Instruction::BinOp { lhs, rhs, .. } = def(&f, x.0) else {
++                panic!("node is not a BinOp")
++            };
++            if *lhs == leaf {
++                rhs.clone()
++            } else {
++                assert_eq!(*rhs, leaf, "leaf at this level");
++                lhs.clone()
++            }
++        };
++        let mut cur = split(&v(rot_root(n)), v(1));
++        for leaf in [v(2), v(3)] {
++            cur = split(&cur, leaf);
++        }
++        let Operand::Value(x) = cur else {
++            panic!("first node")
++        };
++        let Instruction::BinOp { lhs, rhs, .. } = def(&f, x.0) else {
++            panic!("first node")
++        };
++        assert_eq!(
++            (lhs, rhs),
++            (&v(4), &v(46)),
++            "the load is the folded second operand"
++        );
++        assert_eq!(run_function(&mut f), 0, "fixpoint reached");
++    }
++
++    #[test]
++    fn recurrent_liveness_is_exact() {
++        let f = rot_fn(4, false);
++        let (lp, label_to_idx) = loop_of(&f);
++        let rec = recurrent_phis(&f, &lp, &def_blocks(&f), &label_to_idx);
++        let tainted = tainted_values(&f, &lp, &rec);
++        let (_, succs) = analysis::build_cfg(&f, &label_to_idx);
++        let live = live_out_restricted(&f, &succs, &label_to_idx, &tainted);
++        let mut body: Vec<u32> = live[2].iter().copied().collect();
++        body.sort_unstable();
++        // w[0..3] feed the next words' phis, t feeds w[0]'s; w[3] dies in
++        // the tree and the tree's interior nodes are single-use temporaries.
++        assert_eq!(body, vec![1, 2, 3, rot_root(4)]);
++        let mut header: Vec<u32> = live[1].iter().copied().collect();
++        header.sort_unstable();
++        assert_eq!(header, vec![1, 2, 3, 4], "all words live into the body");
++        assert!(live[3].is_empty(), "nothing is live out of the exit");
++    }
++
++    #[test]
++    fn gpr_weights_follow_the_target_word() {
++        {
++            let _t = Target::set(EM_386, 4);
++            assert_eq!(gpr_weight(Some(IrType::I64)), 2, "i686 pairs");
++            assert_eq!(gpr_weight(Some(IrType::U32)), 1);
++            assert_eq!(gpr_weight(Some(IrType::F64)), 0);
++            assert_eq!(gpr_budget(), 6);
++        }
++        assert_eq!(gpr_weight(Some(IrType::I64)), 1);
++        assert_eq!(gpr_weight(Some(IrType::I128)), 2);
++        assert_eq!(gpr_weight(Some(IrType::U8)), 1);
++        assert_eq!(gpr_budget(), 13);
++    }
++
++    /// Register residency: eight rotating words cannot stay in i686's six
++    /// GPRs, so the recurrence runs through memory and the reshape is left
++    /// out (measured 1.058x slower on SHA-256).  Four words fit, and x86-64
++    /// holds all eight: both are rewritten.
++    #[test]
++    fn memory_resident_rotation_is_left_alone() {
++        {
++            let _t = Target::set(EM_386, 4);
++            let mut f = rot_fn(8, false);
++            let before = format!("{:?}", f.blocks);
++            assert_eq!(run_function(&mut f), 0, "8 words / 6 GPRs: left alone");
++            assert_eq!(format!("{:?}", f.blocks), before);
++            let mut f = rot_fn(4, false);
++            assert_eq!(run_function(&mut f), 1, "4 words fit i686");
++            assert_valid(&f);
++        }
++        let mut f = rot_fn(8, false);
++        assert_eq!(run_function(&mut f), 1, "8 words fit x86-64");
++        assert_valid(&f);
++    }
++
+     #[test]
+     fn availability_order_is_lexicographic() {
+         let free_late = Avail { r: None, l: 9 };
+diff --git a/tests/regression/check_reassoc_latency.sh b/tests/regression/check_reassoc_latency.sh
+index 6ba2bf2e..071fecaa 100644
+--- a/tests/regression/check_reassoc_latency.sh
++++ b/tests/regression/check_reassoc_latency.sh
+@@ -23,7 +23,16 @@
+ #      sums and a multi-use interior node print the same as GCC's build;
+ #   4. the rewritten IR passes the structural verifier (CCC_VERIFY_IR=abort
+ #      armed for the differential builds), and the pass really fires on the
+-#      differential program.  Idempotence is a unit test.
++#      differential program.  Idempotence is a unit test;
++#   5. rotation lags: in check_phi_acyclic_order.sh's rot() (SHA's
++#      h=g; g=f; f=e state rotation) the rotating words are ready 1-3
++#      iterations early; the recurrence bound is 2 cycles with the pass and
++#      5 without it (timing every carried phi at 0 reshaped rot() without
++#      shortening it and cost the PR #638 CI run);
++#   6. register residency: at -m32 (6 GPRs) SHA-256 and rot() keep eight
++#      rotating words live, their recurrences are memory-resident, and the
++#      pass leaves both byte-identical to the pass disabled; bitops (whose
++#      recurrence fits) and x86-64 rot() are still rewritten (controls).
+ set -euo pipefail
+ CCC=${CCC:-./target/fastbuild/lccc}
+ GCC=${GCC_BIN:-gcc}
+@@ -37,7 +46,7 @@ fail=0
+ sha="$repo/tests/benchmark/programs/sha256_transform.c"
+ bound_of() { $lat "$1" --function sha256_transform | sed -n 's/.*bound \([0-9.]*\) .*/\1/p'; }
+ 
+-for cfg in ":v3:5" "-march=x86-64:x86-64:6"; do
++for cfg in ":v3:5" "-march=x86-64:x86-64:5"; do
+   flag=${cfg%%:*}
+   rest=${cfg#*:}
+   name=${rest%%:*}
+@@ -155,4 +164,48 @@ if cmp -s "$tmp/d_on.s" "$tmp/d_off.s"; then
+ else
+   echo "PASS: reassoc_lat rewrites trees in the differential program"
+ fi
++
++# 5. Rotation lags (rot() from check_phi_acyclic_order.sh).
++cat >"$tmp/rot.c" <<'C'
++unsigned rot(unsigned *st, const unsigned *k, int n) {
++    unsigned a = st[0], b = st[1], c = st[2], d = st[3];
++    unsigned e = st[4], f = st[5], g = st[6], h = st[7];
++    for (int i = 0; i < n; i++) {
++        unsigned t1 = h + e + f + g + k[i];
++        unsigned t2 = a + b + c;
++        h = g; g = f; f = e; e = d + t1;
++        d = c; c = b; b = a; a = t1 + t2;
++    }
++    return a ^ b ^ c ^ d ^ e ^ f ^ g ^ h;
++}
++C
++$CCC -O2 -S -o "$tmp/rot_on.s" "$tmp/rot.c"
++CCC_DISABLE_PASSES=reassoc_lat $CCC -O2 -S -o "$tmp/rot_off.s" "$tmp/rot.c"
++rb() { $lat "$1" --function rot | sed -n 's/.*bound \([0-9.]*\) .*/\1/p'; }
++r_on=$(rb "$tmp/rot_on.s")
++r_off=$(rb "$tmp/rot_off.s")
++if awk -v a="$r_on" -v b="$r_off" 'BEGIN { exit !(a + 0 <= 2 && b + 0 > 2) }'; then
++  echo "PASS: rot() recurrence $r_on cycles (<= 2); pass disabled $r_off"
++else
++  echo "FAIL: rot() recurrence $r_on (want <= 2), pass disabled $r_off (want > 2)"
++  fail=1
++fi
++
++# 6. Register residency.
++same_as_off() { # $1 = flags, $2 = source
++  $CCC -O2 $1 -S -o "$tmp/res_on.s" "$2"
++  CCC_DISABLE_PASSES=reassoc_lat $CCC -O2 $1 -S -o "$tmp/res_off.s" "$2"
++  cmp -s "$tmp/res_on.s" "$tmp/res_off.s"
++}
++bitops="$repo/tests/benchmark/programs/bitops.c"
++res_ok=1
++same_as_off -m32 "$sha" || { echo "FAIL: -m32 sha256_transform reshaped (memory-resident recurrence)"; res_ok=0; }
++same_as_off -m32 "$tmp/rot.c" || { echo "FAIL: -m32 rot() reshaped (memory-resident recurrence)"; res_ok=0; }
++same_as_off -m32 "$bitops" && { echo "FAIL: -m32 bitops no longer rewritten (its recurrence fits)"; res_ok=0; }
++same_as_off "" "$tmp/rot.c" && { echo "FAIL: x86-64 rot() no longer rewritten"; res_ok=0; }
++if [ "$res_ok" = 1 ]; then
++  echo "PASS: residency: -m32 SHA-256/rot() left alone, -m32 bitops and x86-64 rot() rewritten"
++else
++  fail=1
++fi
+ exit $fail
