@@ -1,3 +1,422 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index d22c3715..dd30c981 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -29,7 +29,7 @@ jobs:
+         run: |
+           sudo dpkg --add-architecture i386
+           sudo apt-get update
+-          sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386
++          sudo apt-get install -y --no-install-recommends gcc-multilib g++-multilib libc6-dev-i386
+ 
+       - name: Cache cargo registry
+         uses: actions/cache@v6
+@@ -682,31 +682,47 @@ jobs:
+             --iters 64 \
+             --seed "$FUZZ_SEED"
+ 
+-      # ELF32/i386 userspace links through lccc-ld, driven by `gcc -m32`
+-      # with lccc-ld as its `ld` (tests/linker/i386_userspace.py): the TLS
+-      # transition matrix (4-way reference/LCCC exe x .so, lazy and
+-      # LD_BIND_NOW binding), DSO chains with DT_NEEDED and archive members
+-      # satisfying DSO references, positional archive semantics, and the
+-      # option -> ELF entry/dynamic-tag parity against GNU ld.  The job
+-      # installs gcc-multilib above, so LCCC_REQUIRE_I386=1 turns the
+-      # multilib probe's SKIP into a FAIL: an unusable -m32 toolchain here
+-      # is a broken runner, not a reason to test nothing.
+-      - name: Verify i386 userspace linking (lccc-ld vs GNU ld)
+-        env:
+-          LCCC_REQUIRE_I386: "1"
++      # arch/x86/tools/relocs, the kernel's own consumer of --emit-relocs,
++      # built from SHA-256-pinned v6.12 sources (emit_relocs_kernel_relocs_tool).
++      - name: Cache kernel relocs tool
++        uses: actions/cache@v6
++        with:
++          path: ~/.cache/lccc-kernel-tools
++          key: ${{ runner.os }}-kernel-tools-${{ hashFiles('tests/linker/setup_kernel_tools.sh') }}
++
++      - name: Build kernel relocs tool
++        run: bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
++
++      # The whole linker suite (x86-64 and ELF32/i386; executables, PIE,
++      # shared objects, scripts, relocatable links, TLS, GOT relaxation,
++      # eh_frame/GC, malformed input) against the GNU ld reference.
++      # --strict fails on any SKIP or WARN: this job installs every tool the
++      # suite uses (gcc/g++ multilib, GNU ld, the relocs tool), so a test
++      # that did not run is a broken runner or harness, never a pass.
++      # LCCC_REQUIRE_I386=1 does the same for the i386 multilib probe.
++      # Fixtures assemble with the pinned GNU as 2.47 installed above (APX
++      # REX2 / R_X86_64_CODE_4_* encodings), not the runner's older gas.
++      - name: Linker test suite (lccc-ld vs GNU ld, x86-64 + i386)
++        env:
+           LCCC_I386_SCRATCH_ROOT: ${{ runner.temp }}/i386-linker-scratch
+         run: |
+-          python3 tests/linker/run_linker_tests.py \
+-            --lccc target/fastbuild/lccc --filter i386_ -v
++          PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
++          LCCC_REQUIRE_I386=1 \
++          LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
++            python3 tests/linker/run_linker_tests.py \
++              --lccc target/fastbuild/lccc --strict -v \
++              --json "$RUNNER_TEMP/linker-results.json"
+ 
+       # Passing cases delete their scratch directories, so what remains is
+       # the sources, objects, links and outputs of exactly the failing cases.
+-      - name: Upload i386 linker scratch on failure
++      - name: Upload linker results and i386 scratch on failure
+         if: failure()
+         uses: actions/upload-artifact@v7
+         with:
+-          name: i386-linker-scratch
+-          path: ${{ runner.temp }}/i386-linker-scratch
++          name: linker-test-failures
++          path: |
++            ${{ runner.temp }}/linker-results.json
++            ${{ runner.temp }}/i386-linker-scratch
+           if-no-files-found: ignore
+ 
+       # Every corpus gate above runs a compiler binary whose fastbuild
+diff --git a/engineering/FOLLOWUP-2026-09-28-x86-i686-linker-dso.md b/engineering/FOLLOWUP-2026-09-28-x86-i686-linker-dso.md
+new file mode 100644
+index 00000000..b6c489a8
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-28-x86-i686-linker-dso.md
+@@ -0,0 +1,115 @@
++# Follow-up: x86-64 / i686 linker, review of PR #661 (S24) — 2026-09-28
++
++Base: ms178/lccc `main` @ 6f8ace9c (PR #661 merged).  Scope: the x86-64 and
++i686 backends and their linkers only.
++
++## Review of the S24 audit: verdicts
++
++| # | Finding | Verdict | Outcome |
++|---|---------|---------|---------|
++| 1 | Only a small part of the linker suite runs in CI | **Agree, and it was worse.** CI ran `run_linker_tests.py --filter i386_` (a handful of tests). The parity checker did not track `tests/linker/*` at all, so dropping the step would have passed. | Fixed (see "CI") |
++| 2 | Undefined symbols with non-default visibility | Plausible: the DSO match in `link.rs` ignores hidden visibility, and `emit_shared` zero-fills a strong hidden undefined symbol. | **Open** (needs a strong/weak × visibility × location × reference-kind matrix) |
++| 3 | GOTPCRELX relaxation trusts the relocation type, not the bytes | **Agree.** The linker never checked that the promised REX/REX2 prefix is really there. The rewrite kept REX.B, so `49 8b 05` became a move to `%r8`. GNU ld 2.47 still has this bug; measured. | Fixed |
++| 4 | Linker-created absolute symbols are treated as addresses | **Agree.** Constant `--defsym` values got RELATIVE relocs / were slid by relaxation in PIE, and address `--defsym`s in a `.so` got no RELATIVE reloc. | Fixed |
++| 5 | Version-script `local:` precedence | Plausible (`emit_shared.rs` export filter vs. GNU precedence). | **Open** |
++| 6 | Executables have no GOT slots for local symbols; opcode-guessing fallback | **Agree.** | Fixed |
++| 7 | `real_workloads.py` scoring (wrong outputs not disqualified, RSS, naming) | Plausible. | **Open** |
++
++Found while fixing 3/6: in IE→LE for local symbols the immediate was
++`tpoff + A`, which is 4 bytes low (`A` is the -4 of a pc-relative field).
++Every local initial-exec TLS access in an executable read the wrong address.
++Fixed, and covered by `ie_to_le_local`.
++
++## Done this session
++
++- **x86 lccc-ld** (`elf.rs`, `plt_got.rs`, `emit_exec.rs`, `emit_shared.rs`,
++  `link.rs`, `types.rs`, `linker_common/defsym.rs`):
++  - GOTPCRELX/REX/REX2 relaxation checks the prefix inside the section, and
++    the rewrite moves REX.B to REX.R.
++  - REX/REX2 `call`/`jmp *GOT` are not relaxed.
++  - `GotTarget::{Image, Absolute}`: absolute targets relax only to
++    immediates, and only when the value fits.
++  - Executables get local GOT slots (section symbols included); local GOT64
++    works.
++  - `GlobalSymbol::absolute` and GNU-style `--defsym` classification
++    (`is_address_expression`). In PIE: no RELATIVE reloc for absolute GOT
++    slots or `.quad`, and the dynsym entry is `SHN_ABS`. In a `.so`: address
++    defsyms get a RELATIVE reloc and a real section.
++- **Tests.** Each one fails on the previous build:
++  - `gotpcrel_edges`: `7 55 1 1 1 1 1`
++  - `absolute_symbols_pic`
++  - `ie_to_le_local`: `11 22 33 33`
++  - new unit tests in `backend::x86::linker` and `linker_common`
++- **Linker test harness** (`tests/linker/run_linker_tests.py`):
++  - Every test is a registry entry with declared names and tags, so
++    `--filter`, `--tag` and the new `--list` are exact.
++  - A result whose name is undeclared or duplicated is reported as FAIL.
++  - A declared test that its runner silently did not report is reported as
++    SKIP.
++  - `--strict` fails on SKIP or WARN. `--json FILE` writes the results.
++- **Test gaps closed:**
++  - The "R_X86_64_32S" range case really emitted R_X86_64_32 (`.long`), under
++    a duplicate name. It now uses `.reloc` and checks 0x80000000.
++  - The C++ parts of the DSO tests reported PASS when `g++` was missing.
++    They now report SKIP.
++  - Reference-link failures used to drop results silently. They are now
++    reported.
++- `tests/linker/setup_kernel_tools.sh`: the v6.12 sources are pinned by
++  SHA-256, and the default prefix is `$HOME/tools`.
++- **CI:**
++  - `ci.yml` and `ci_local.sh` run the whole suite: `--strict`,
++    `LCCC_REQUIRE_I386=1`, the kernel relocs tool, and the pinned GNU as 2.47
++    first in `PATH` (APX/REX2 fixtures).
++  - The job installs `g++-multilib`, which the i386 C++ DSO test needs.
++  - `check_ci_gate_parity.py` tracks `tests/linker/*`.
++    `check_linker_suite_parity` rejects every weaker spelling; it has mutation
++    tests in `test_ci_gate_parity.py`.
++
++Validation on the rebased tree:
++- Linker suite 274 pass / 0 fail / 0 warn / 0 skip, both with the system
++  toolchain and with the exact CI command (GNU as 2.47).
++- rustfmt and `cargo clippy --all-targets -D warnings` are clean.
++- `ci_local.sh --fast` ran (see the session log).
++
++## To do
++
++1. **Finding 2.** Undefined-symbol visibility matrix. Then make hidden
++   undefined references refuse to bind to DSO definitions, and error on a
++   strong hidden undefined symbol in `-shared`, as GNU does.
++2. **Finding 5.** Version-script `local:` with GNU precedence (exact name >
++   wildcard, `global` over `local` at equal rank).
++3. **Finding 7.** `real_workloads.py`: disqualify wrong outputs, report RSS as
++   N/A when it is not measured, rename `loaded_bytes`.
++4. **lccc-ld drops `--disable-new-dtags`/`--enable-new-dtags`** when called
++   as `ld` by a GCC driver (`src/bin/lccc_ld.rs` falls through to "ignoring
++   unknown option"). A plain `-rpath` then always gives DT_RUNPATH.
++   - The `-Wl,` path through the lccc driver is correct, and so is the
++     existing x86-64 test.
++   - Fix: forward both spellings. Test: an i386 and x86-64 matrix over
++     enable, disable and default.
++5. **GOTPCRELX fixtures under older assemblers.** `gotpcrel_edges` reads
++   `7 55 1 1 0 1 1` when the fixture is assembled with GNU as 2.42. CI pins
++   2.47, so this does not affect CI. Worth checking whether 2.42 emits a
++   different but valid encoding that lccc-ld should accept.
++6. Earlier open items:
++   - -fPIC regression test ("5 20", no PC32).
++   - `-Bsymbolic-functions` with copy relocations.
++   - `-z` keyword coverage.
++   - `.so` RELRO.
++   - PC32 refusal.
++   - `DT_SYMBOLIC` through lccc_ld.
++   - x86 `--dynamic-list`.
++   - i686 `@GOTOFF` against preemptible symbols.
++7. Carried over (x86):
++   - `.plt.got`.
++   - Relaxation in `emit_script`.
++   - `DF_STATIC_TLS` in `.so`.
++   - RW `.rela.dyn` in `.so`.
++   - Linker-created absolutes are never relaxed.
++   - Negative absolute immediates.
++   - REX2/CODE_4 GOTTPOFF on locals.
++8. Carried over (i686):
++   - GOT32X on named globals.
++   - `.so` versioning / PIE.
++   - IFUNC in `.so`.
++   - `--dynamic-list` / `--version-script`.
+diff --git a/scripts/check_ci_gate_parity.py b/scripts/check_ci_gate_parity.py
+index 921ac953..5cfe2905 100644
+--- a/scripts/check_ci_gate_parity.py
++++ b/scripts/check_ci_gate_parity.py
+@@ -25,6 +25,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
+ 
+ COMMAND = re.compile(
+     r"(?:tests/regression/[A-Za-z0-9_./-]+\.sh|"
++    r"tests/linker/[A-Za-z0-9_./-]+\.(?:py|sh)|"
+     r"scripts/[A-Za-z0-9_./-]+\.py|"
+     r"\.github/scripts/[A-Za-z0-9_./-]+\.py)"
+ )
+@@ -227,6 +228,84 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
+     return 0
+ 
+ 
++def shell_commands(script: str, program: str) -> list[list[str]]:
++    """Tokens of every logical shell line that executes `program`.
++
++    `\\` continuations are joined first, so an environment assignment on a
++    line of its own still belongs to the command it prefixes.  Only a
++    command position counts: leading `env`/`gate NAME fast env` wrappers,
++    VAR=value assignments and the interpreter may precede it, prose may not.
++    """
++    commands = []
++    lines = script.splitlines()
++    i = 0
++    while i < len(lines):
++        line = lines[i]
++        i += 1
++        while line.rstrip().endswith("\\") and i < len(lines):
++            line = line.rstrip()[:-1] + " " + lines[i]
++            i += 1
++        if program not in line:
++            continue
++        try:
++            tokens = shlex.split(line, comments=True)
++        except ValueError:
++            continue
++        if program not in tokens:
++            continue
++        head = tokens[: tokens.index(program)]
++        if head[:1] == ["gate"]:
++            head = head[3:]  # gate NAME fast|slow
++        if head[:1] == ["env"]:
++            head = head[1:]
++        if head and head[-1] in ("python3", "bash"):
++            head = head[:-1]
++        if all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t) for t in head):
++            commands.append(tokens)
++    return commands
++
++
++def check_linker_suite_parity(local_text: str, hosted: str) -> int:
++    """Both sides run the WHOLE linker suite, strictly, i386 included.
++
++    Path parity alone accepted `run_linker_tests.py --filter i386_` -- a
++    handful of the suite's tests -- as "the linker suite runs in CI".
++    Require on each side a real invocation with --strict (SKIP/WARN fail),
++    no --filter/--tag/--list, LCCC_REQUIRE_I386=1, the kernel relocs tool
++    and the pinned GNU as 2.47 first in PATH.
++    """
++    program = "tests/linker/run_linker_tests.py"
++    missing = []
++    for where, text in (("local", local_text), ("hosted", hosted)):
++        ok = False
++        for tokens in shell_commands(text, program):
++            args = tokens[tokens.index(program) + 1 :]
++            env = tokens[: tokens.index(program)]
++            if (
++                "--strict" in args
++                and not any(a.split("=", 1)[0] in ("--filter", "--tag", "--list") for a in args)
++                and "LCCC_REQUIRE_I386=1" in env
++                and any(t.startswith("LCCC_RELOCS_TOOL=") for t in env)
++                and any(
++                    t.startswith("PATH=") and "gas-2.47-x86_64-linux-gnu/bin:" in t for t in env
++                )
++            ):
++                ok = True
++        if not ok:
++            missing.append(
++                f"{where}: full-suite `{program} --strict` with LCCC_REQUIRE_I386=1, "
++                "LCCC_RELOCS_TOOL and the GNU as 2.47 PATH (no --filter/--tag)"
++            )
++        if not shell_commands(text, "tests/linker/setup_kernel_tools.sh"):
++            missing.append(f"{where}: bash tests/linker/setup_kernel_tools.sh")
++    if missing:
++        print("linker suite is not run in full on both sides:", file=sys.stderr)
++        for item in missing:
++            print(f"  {item}", file=sys.stderr)
++        return 1
++    return 0
++
++
+ HOSTED_ONLY = ROOT / "scripts" / "ci_hosted_only.txt"
+ CARGO_SUBCOMMAND = re.compile(r"\bcargo\s+(?:\+\S+\s+)?([a-z][a-z-]*)")
+ CARGO_CONFIG = re.compile(r"""--config[\s=]+(['"]?)([A-Za-z0-9_.-]+=[^'"\s]+)\1""")
+@@ -316,9 +395,12 @@ def main() -> int:
+         return 1
+     if check_hosted_steps_mirrored(local_text, hosted) != 0:
+         return 1
++    if check_linker_suite_parity(local_text, hosted) != 0:
++        return 1
+     print(
+         f"CI/local standalone gate parity: PASS ({len(local_paths)} commands, "
+-        "2 mode/corpus-specific asm-diff gates, hosted steps mirrored)"
++        "2 mode/corpus-specific asm-diff gates, strict full linker suite, "
++        "hosted steps mirrored)"
+     )
+     return 0
+ 
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 7108255b..7a0c0481 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -683,13 +683,20 @@ if [ -x target/fastbuild/lccc-ld ]; then
+     gate "linker-elf-grammar-fuzz" fast \
+         python3 tests/linker/fuzz_elf_grammar.py \
+             --lccc "$PWD/target/fastbuild/lccc-ld" --iters 64 --seed 20260906
+-    # ELF32/i386 userspace links through lccc-ld (mirrors the ci.yml step):
+-    # LCCC_REQUIRE_I386=1 makes a missing -m32 toolchain a FAIL, not a SKIP.
+-    gate "i386-userspace-link" fast env LCCC_REQUIRE_I386=1 \
+-        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter i386_
++    # The whole linker suite, x86-64 + i386 (mirrors the ci.yml step;
++    # ci-gate-parity requires --strict, LCCC_REQUIRE_I386=1 and the relocs
++    # tool on both sides, and no --filter/--tag).  --strict fails on SKIP.
++    # Fixtures assemble with the pinned GNU as 2.47 (installed above).
++    gate "kernel-relocs-tool" fast \
++        bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
++    gate "linker-suite" fast env \
++        PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
++        LCCC_REQUIRE_I386=1 \
++        LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
++        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict
+ else
+-    echo "SKIP  linker fuzz + i386 userspace link (target/fastbuild/lccc-ld not built)"
+-    SKIPPED=$((SKIPPED + 3))
++    echo "SKIP  linker fuzz + linker suite (target/fastbuild/lccc-ld not built)"
++    SKIPPED=$((SKIPPED + 4))
+ fi
+ 
+ # Torture-corpus provisioning contract: stamp trust, integrity manifest,
+diff --git a/scripts/test_ci_gate_parity.py b/scripts/test_ci_gate_parity.py
+index 1275caa4..deeee146 100644
+--- a/scripts/test_ci_gate_parity.py
++++ b/scripts/test_ci_gate_parity.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Mutation tests: distinct asm-diff mode/corpus gates must stay hosted."""
++"""Mutation tests: CI/local gate parity (asm-diff modes, hosted mirror, linker suite)."""
+ from __future__ import annotations
+ 
+ from contextlib import redirect_stderr
+@@ -181,5 +181,66 @@ class HostedStepsMirroredTest(unittest.TestCase):
+         self.assertEqual(self.check(local, hosted), (0, ""))
+ 
+ 
++class LinkerSuiteParityTest(unittest.TestCase):
++    """The whole linker suite, strictly, on both sides (review of PR #661)."""
++
++    LOCAL = (
++        'gate "kernel-relocs-tool" fast \\\n'
++        '    bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/k"\n'
++        'gate "linker-suite" fast env \\\n'
++        '    PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \\\n'
++        "    LCCC_REQUIRE_I386=1 \\\n"
++        '    LCCC_RELOCS_TOOL="$HOME/.cache/k/bin/relocs" \\\n'
++        "    python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict\n"
++    )
++    HOSTED = (
++        'bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/k"\n'
++        'PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \\\n'
++        "LCCC_REQUIRE_I386=1 \\\n"
++        'LCCC_RELOCS_TOOL="$HOME/.cache/k/bin/relocs" \\\n'
++        "  python3 tests/linker/run_linker_tests.py \\\n"
++        "    --lccc target/fastbuild/lccc --strict -v\n"
++    )
++
++    def check(self, local: str, hosted: str) -> int:
++        with redirect_stderr(StringIO()):
++            return parity.check_linker_suite_parity(local, hosted)
++
++    def test_full_strict_suite_passes(self) -> None:
++        self.assertEqual(self.check(self.LOCAL, self.HOSTED), 0)
++
++    def test_repository_runs_the_full_suite(self) -> None:
++        hosted = "\n".join(parity.run_script_bodies(p) for p in sorted(parity.WORKFLOWS.glob("*.yml")))
++        self.assertEqual(self.check(parity.LOCAL.read_text(), hosted), 0)
++
++    def test_every_weakening_fails_on_either_side(self) -> None:
++        mutations = (
++            ("--strict", ""),                                   # SKIPs would pass
++            ("--strict", "--strict --filter i386_"),            # the old CI subset
++            ("--strict", "--strict --tag dynamic"),
++            ("--strict", "--strict --list"),                    # runs nothing
++            ("LCCC_REQUIRE_I386=1", "LCCC_REQUIRE_I386=0"),
++            ("LCCC_RELOCS_TOOL=", "LCCC_RELOCS_TOOX="),
++            ("gas-2.47-x86_64-linux-gnu/bin:", "gas-2.42/bin:"),  # unpinned assembler
++            ("python3 tests/linker/run_linker_tests.py", "echo python3 tests/linker/run_linker_tests.py"),
++            ("bash tests/linker/setup_kernel_tools.sh", "echo tests/linker/setup_kernel_tools.sh"),
++        )
++        for old, new in mutations:
++            for side in ("local", "hosted"):
++                with self.subTest(side=side, old=old, new=new):
++                    local = self.LOCAL.replace(old, new) if side == "local" else self.LOCAL
++                    hosted = self.HOSTED.replace(old, new) if side == "hosted" else self.HOSTED
++                    self.assertNotEqual((local, hosted), (self.LOCAL, self.HOSTED))
++                    self.assertEqual(self.check(local, hosted), 1)
++
++    def test_comment_is_not_an_invocation(self) -> None:
++        hosted = "\n".join("# " + line for line in self.HOSTED.splitlines())
++        self.assertEqual(self.check(self.LOCAL, hosted), 1)
++
++    def test_linker_scripts_are_path_tracked(self) -> None:
++        self.assertEqual(parity.COMMAND.findall("python3 tests/linker/fuzz_ld.py"),
++                         ["tests/linker/fuzz_ld.py"])
++
++
+ if __name__ == "__main__":
+     unittest.main()
 diff --git a/src/backend/i686/linker/options.rs b/src/backend/i686/linker/options.rs
 index e9c70a24..869b270f 100644
 --- a/src/backend/i686/linker/options.rs
@@ -5481,10 +5900,18 @@ index 8f26065f..6786b60f 100644
          defsym_defs,
      )
 diff --git a/tests/linker/run_linker_tests.py b/tests/linker/run_linker_tests.py
-index 294c7296..83a5209d 100644
+index 294c7296..42eb4ee2 100644
 --- a/tests/linker/run_linker_tests.py
 +++ b/tests/linker/run_linker_tests.py
-@@ -510,6 +510,68 @@ case("gc_sections_keeps_eh_frame",
+@@ -24,6 +24,7 @@ Usage:
+ 
+ import argparse
+ import ctypes
++import json
+ import os
+ import struct
+ import re
+@@ -510,6 +511,68 @@ case("gc_sections_keeps_eh_frame",
      expect_stdout="1\n",
      tags=("sections", "gc", "unwind"))
  
@@ -5553,7 +5980,7 @@ index 294c7296..83a5209d 100644
  case("gc_sections_export_dynamic_dlsym",
      # Regression: with --export-dynamic an exported global is reachable only
      # from *outside* the image, so a reachability sweep collected it.  The
-@@ -3851,6 +3913,27 @@ def _dso_emit_semantics_test(args, oracles):
+@@ -3851,6 +3914,27 @@ def _dso_emit_semantics_test(args, oracles):
          ndx = defined.get("counter", ("", ""))[1]
          if not ndx.isdigit() or "W" not in flags.get(int(ndx), ""):
              return Result(name, "FAIL", f"counter's st_shndx {ndx} is not a writable section")
@@ -5581,22 +6008,42 @@ index 294c7296..83a5209d 100644
          if "GNU_EH_FRAME" not in sh(["readelf", "-W", "-l", "libdse.so"], cwd=td).stdout.decode():
              return Result(name, "FAIL", "no PT_GNU_EH_FRAME")
          # Local-Exec TLS cannot be linked into a shared object.
-@@ -3868,6 +3951,11 @@ def _dso_emit_semantics_test(args, oracles):
-             ver = sh(["readelf", "-V", "libcx.so"], cwd=td)
-             if ver.stderr.strip():
-                 return Result(name, "FAIL", f"readelf -V: {ver.stderr.decode()[:200]}")
-+            # A strong reference makes a GLOBAL import (a WEAK one would let
-+            # the program run on with a null typeinfo).
-+            cxs = sh(["readelf", "-W", "--dyn-syms", "libcx.so"], cwd=td).stdout.decode()
-+            if not re.search(r"NOTYPE\s+GLOBAL\s+DEFAULT\s+UND\s+_ZTISt13runtime_error@", cxs):
-+                return Result(name, "FAIL", "_ZTISt13runtime_error not a GLOBAL NOTYPE import")
-             r = sh([cxx, "-O1", "cxxmain.cc", "-L.", "-lcx", "-o", "cx"], cwd=td)
-             if r.returncode != 0:
-                 return Result(name, "FAIL", f"GNU ld vs lccc C++ DSO: {r.stderr.decode()[:300]}")
-@@ -3881,6 +3969,534 @@ def _dso_emit_semantics_test(args, oracles):
-             shutil.rmtree(td, ignore_errors=True)
- 
- 
+@@ -3859,23 +3943,558 @@ def _dso_emit_semantics_test(args, oracles):
+             return Result(name, "FAIL", "local-exec TLS in a shared object was not refused")
+         # C++: exception through the library; GNU ld must accept its
+         # version tables when linking the executable.
+-        cxx = shutil.which("g++")
+-        if cxx:
+-            r = sh([cxx, "-B" + shim, "-shared", "-fPIC", "-O1", "cxxlib.cc", "-o", "libcx.so"],
+-                   cwd=td)
++        cxx = shutil.which(CXX)
++        if not cxx:
++            return Result(name, "SKIP", f"C part passed; C++ part needs {CXX}")
++        r = sh([cxx, "-B" + shim, "-shared", "-fPIC", "-O1", "cxxlib.cc", "-o", "libcx.so"],
++               cwd=td)
++        if r.returncode != 0:
++            return Result(name, "FAIL", f"c++ lib link: {r.stderr.decode()[:300]}")
++        ver = sh(["readelf", "-V", "libcx.so"], cwd=td)
++        if ver.stderr.strip():
++            return Result(name, "FAIL", f"readelf -V: {ver.stderr.decode()[:200]}")
++        # A strong reference makes a GLOBAL import (a WEAK one would let
++        # the program run on with a null typeinfo).
++        cxs = sh(["readelf", "-W", "--dyn-syms", "libcx.so"], cwd=td).stdout.decode()
++        if not re.search(r"NOTYPE\s+GLOBAL\s+DEFAULT\s+UND\s+_ZTISt13runtime_error@", cxs):
++            return Result(name, "FAIL", "_ZTISt13runtime_error not a GLOBAL NOTYPE import")
++        r = sh([cxx, "-O1", "cxxmain.cc", "-L.", "-lcx", "-o", "cx"], cwd=td)
++        if r.returncode != 0:
++            return Result(name, "FAIL", f"GNU ld vs lccc C++ DSO: {r.stderr.decode()[:300]}")
++        run = sh([os.path.join(td, "cx")], cwd=td, env=env)
++        if run.returncode != 0 or run.stdout.decode() != "caught boom\n":
++            return Result(name, "FAIL", f"c++ exception through the DSO: rc={run.returncode} "
++                          f"{run.stdout.decode()!r} {run.stderr.decode()[:200]!r}")
++        return Result(name, "PASS")
++    finally:
++        if not args.keep:
++            shutil.rmtree(td, ignore_errors=True)
++
++
 +def _dso_emit_semantics_i386_test(args, oracles):
 +    """The i386 counterpart of `dso_emit_semantics`.
 +
@@ -5672,20 +6119,21 @@ index 294c7296..83a5209d 100644
 +            return Result(name, "FAIL", f"counter's st_shndx {ndx} is not a writable section")
 +        if "GNU_EH_FRAME" not in out:
 +            return Result(name, "FAIL", "no PT_GNU_EH_FRAME")
-+        cxx = shutil.which("g++")
-+        if cxx:
-+            r = sh([cxx, "-m32", "-B" + shim, "-shared", "-fPIC", "-O1", "cxxlib.cc",
-+                    "-o", "libcx.so"], cwd=td)
-+            if r.returncode != 0:
-+                return Result(name, "FAIL", f"c++ lib link: {r.stderr.decode()[:300]}")
-+            r = sh([cxx, "-m32", "-O1", "cxxmain.cc", "-L.", "-lcx", "-o", "cx"], cwd=td)
-+            if r.returncode != 0:
-+                return Result(name, "FAIL", f"GNU ld vs lccc C++ DSO: {r.stderr.decode()[:300]}")
-+            run = sh([os.path.join(td, "cx")], cwd=td, env=env)
-+            if run.returncode != 0 or run.stdout.decode() != "caught boom\n":
-+                return Result(name, "FAIL", f"c++ exception through the DSO: rc={run.returncode} "
-+                              f"{run.stdout.decode()!r} {run.stderr.decode()[:200]!r}")
-+        return Result(name, "PASS", "" if cxx else "g++ missing: C++ part skipped")
++        cxx = shutil.which(CXX)
++        if not cxx:
++            return Result(name, "SKIP", f"C part passed; C++ part needs {CXX}")
++        r = sh([cxx, "-m32", "-B" + shim, "-shared", "-fPIC", "-O1", "cxxlib.cc",
++                "-o", "libcx.so"], cwd=td)
++        if r.returncode != 0:
++            return Result(name, "FAIL", f"c++ lib link: {r.stderr.decode()[:300]}")
++        r = sh([cxx, "-m32", "-O1", "cxxmain.cc", "-L.", "-lcx", "-o", "cx"], cwd=td)
++        if r.returncode != 0:
++            return Result(name, "FAIL", f"GNU ld vs lccc C++ DSO: {r.stderr.decode()[:300]}")
++        run = sh([os.path.join(td, "cx")], cwd=td, env=env)
++        if run.returncode != 0 or run.stdout.decode() != "caught boom\n":
++            return Result(name, "FAIL", f"c++ exception through the DSO: rc={run.returncode} "
++                          f"{run.stdout.decode()!r} {run.stderr.decode()[:200]!r}")
++        return Result(name, "PASS")
 +    finally:
 +        if not args.keep:
 +            shutil.rmtree(td, ignore_errors=True)
@@ -5815,7 +6263,12 @@ index 294c7296..83a5209d 100644
 +        cf = ["-O1", "-ffunction-sections"]
 +        for src in ("t1.cc", "t2.cc", "main.cc"):
 +            r = sh([CXX, *cf, "-c", src], cwd=td)
-+            if r.returncode != 0:
+             if r.returncode != 0:
+-                return Result(name, "FAIL", f"c++ lib link: {r.stderr.decode()[:300]}")
+-            ver = sh(["readelf", "-V", "libcx.so"], cwd=td)
+-            if ver.stderr.strip():
+-                return Result(name, "FAIL", f"readelf -V: {ver.stderr.decode()[:200]}")
+-            r = sh([cxx, "-O1", "cxxmain.cc", "-L.", "-lcx", "-o", "cx"], cwd=td)
 +                return Result(name, "FAIL", f"{src}: {r.stderr.decode()[:300]}")
 +        r = sh([CC, *cf, "-c", "walk.c"], cwd=td)
 +        if r.returncode != 0:
@@ -6017,7 +6470,13 @@ index 294c7296..83a5209d 100644
 +            return Result(name, "FAIL", f"fixture libext: {r.stderr.decode()[:200]}")
 +        for s_ in ("probe.s", "probe_x.s"):
 +            r = sh([CC, "-c", s_], cwd=td)
-+            if r.returncode != 0:
+             if r.returncode != 0:
+-                return Result(name, "FAIL", f"GNU ld vs lccc C++ DSO: {r.stderr.decode()[:300]}")
+-            run = sh([os.path.join(td, "cx")], cwd=td, env=env)
+-            if run.returncode != 0 or run.stdout.decode() != "caught boom\n":
+-                return Result(name, "FAIL", f"c++ exception through the DSO: rc={run.returncode} "
+-                              f"{run.stdout.decode()!r} {run.stderr.decode()[:200]!r}")
+-        return Result(name, "PASS", "" if cxx else "g++ missing: C++ part skipped")
 +                return Result(name, "FAIL", f"assemble {s_}: {r.stderr.decode()[:200]}")
 +        linkers = (("gnu", []), ("lccc", ["-B" + shim]))
 +        for model in ("large", "medium"):
@@ -6120,15 +6579,10 @@ index 294c7296..83a5209d 100644
 +                        return Result(name, "FAIL", f"{exe}: abs_marker {ents['abs_marker']}, "
 +                                      f"hook {ents['hook']}, dflt {ents['dflt']}")
 +        return Result(name, "PASS")
-+    finally:
-+        if not args.keep:
-+            shutil.rmtree(td, ignore_errors=True)
-+
-+
- _PEQ_EXTRA_S32 = """\t.text
- \t.globl asm_puts
- asm_puts:
-@@ -4083,6 +4699,453 @@ def _gotpcrelx_relax_test(args, oracles):
+     finally:
+         if not args.keep:
+             shutil.rmtree(td, ignore_errors=True)
+@@ -4083,6 +4702,453 @@ def _gotpcrelx_relax_test(args, oracles):
              shutil.rmtree(td, ignore_errors=True)
  
  
@@ -6582,7 +7036,149 @@ index 294c7296..83a5209d 100644
  def _build_id_note_test(args, oracles):
      """--build-id must emit a content-derived .note.gnu.build-id.
  
-@@ -7301,9 +8364,17 @@ def _reloc_field_range_tests(args, oracles):
+@@ -5422,20 +6488,21 @@ def _so_shared_flags_test(args, oracles):
+ 
+         # --- --defsym on a shared library, compared against bfd ---
+         bfd = shutil.which("ld.bfd")
++        if not bfd:
++            return Result(name, "SKIP", "ld.bfd (the --defsym reference) not found")
+         r = sh([ld, "-shared", "--defsym=alias_sym=keep_me", "-o", "d.so", "lib.o"], cwd=td)
+         if r.returncode != 0:
+             return Result(name, "FAIL", f"--defsym link failed: {r.stderr.decode()[:200]}")
+         got = sh(["readelf", "--dyn-syms", "-W", "d.so"], cwd=td).stdout.decode(errors="replace")
+         n_lccc = got.count("alias_sym")
+-        if bfd:
+-            sh([bfd, "-shared", "--defsym=alias_sym=keep_me", "-o", "db.so", "lib.o"], cwd=td)
+-            ref = sh(["readelf", "--dyn-syms", "-W", "db.so"], cwd=td).stdout.decode(errors="replace")
+-            n_bfd = ref.count("alias_sym")
+-            if n_lccc != n_bfd:
+-                return Result(name, "FAIL",
+-                    f"--defsym alias count {n_lccc} != bfd {n_bfd}")
+-        elif n_lccc == 0:
+-            return Result(name, "FAIL", "--defsym produced no alias symbol")
++        rb = sh([bfd, "-shared", "--defsym=alias_sym=keep_me", "-o", "db.so", "lib.o"], cwd=td)
++        if rb.returncode != 0:
++            return Result(name, "SKIP", f"ld.bfd refused the reference link: "
++                                        f"{rb.stderr.decode()[:200]}")
++        ref = sh(["readelf", "--dyn-syms", "-W", "db.so"], cwd=td).stdout.decode(errors="replace")
++        n_bfd = ref.count("alias_sym")
++        if n_lccc == 0 or n_lccc != n_bfd:
++            return Result(name, "FAIL", f"--defsym alias count {n_lccc} != bfd {n_bfd}")
+         return Result(name, "PASS")
+     except Exception as e:
+         return Result(name, "FAIL", f"harness exception: {e!r}")
+@@ -5488,8 +6555,8 @@ def _cxx_eh_local_type_test(args, oracles):
+ 
+ def _cxx_eh_test(args, oracles):
+     name = "cxx_exceptions_unwind"
+-    if shutil.which("g++") is None:
+-        return Result(name, "SKIP", "no g++")
++    if shutil.which(CXX) is None:
++        return Result(name, "SKIP", f"no {CXX}")
+     td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+     try:
+         with open(os.path.join(td, "ex.cpp"), "w") as f:
+@@ -6139,6 +7206,11 @@ def _segment_packing_test(args, _oracles):
+ # binary with code silently missing.  Refusing is the correct answer, and the
+ # message must name the file and the fix.
+ 
++# GCC driver options lccc-ld must accept without an "ignoring" diagnostic.
++_DRIVER_SILENT_FLAGS = ("--push-state", "--pop-state", "--eh-frame-hdr",
++                        "--no-warn-execstack", "-plugin-opt=whatever")
++
++
+ def _driver_option_noise_test(args, _oracles):
+     td = tempfile.mkdtemp(prefix="lnk.optnoise.")
+     ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+@@ -6172,8 +7244,7 @@ def _driver_option_noise_test(args, _oracles):
+ 
+         # Explicitly check the individual flags too, so a future refactor that
+         # drops one of them from the allow-list is caught by name.
+-        for flag in ("--push-state", "--pop-state", "--eh-frame-hdr",
+-                     "--no-warn-execstack", "-plugin-opt=whatever"):
++        for flag in _DRIVER_SILENT_FLAGS:
+             rr = sh([ld, flag, "-o", os.path.join(td, "b.out"), "n.o"], cwd=td)
+             msg = rr.stderr.decode(errors="replace")
+             if "ignoring unknown option" in msg:
+@@ -6545,9 +7616,16 @@ def _emit_relocs_test(args, _oracles):
+         # from GNU ld's, the KASLR boot path will work. Nothing short of this
+         # proves the feature; the tool is fetched by
+         # tests/linker/setup_kernel_tools.sh and skipped if unavailable.
+-        relocs_tool = os.environ.get("LCCC_RELOCS_TOOL",
+-                                     "/home/user/tools/bin/relocs")
+-        if os.path.exists(relocs_tool) and bfd:
++        relocs_tool = os.environ.get("LCCC_RELOCS_TOOL") or os.path.join(
++            os.environ.get("LCCC_ORACLE_PREFIX") or os.path.expanduser("~/tools"),
++            "bin", "relocs")
++        if not os.path.exists(relocs_tool):
++            out.append(Result("emit_relocs_kernel_relocs_tool", "SKIP",
++                              f"{relocs_tool} missing: run tests/linker/setup_kernel_tools.sh"))
++        elif not bfd:
++            out.append(Result("emit_relocs_kernel_relocs_tool", "SKIP",
++                              "no GNU ld for the reference image"))
++        else:
+             def reloc_targets(binary):
+                 """Relocation targets as SECTION-RELATIVE strings.
+ 
+@@ -6768,6 +7846,11 @@ def _export_dynamic_test(args, _oracles):
+                 else:
+                     out.append(Result("export_dynamic_matches_gnu_ld", "PASS",
+                         f"both export {sorted(bnames & user)}"))
++            else:
++                out.append(Result("export_dynamic_matches_gnu_ld", "SKIP",
++                                  f"GNU ld reference link failed: {r.stderr.decode()[:200]}"))
++        else:
++            out.append(Result("export_dynamic_matches_gnu_ld", "SKIP", "ld.bfd not found"))
+         return out
+     except Exception as e:
+         return [Result("export_dynamic", "FAIL", f"harness exception: {e!r}")]
+@@ -7254,15 +8337,21 @@ def run_bin(path, args, td, env=None):
+         return None, "<timeout>"
+ 
+ # field kind -> (assembly directive, symbol, in-range value, out-of-range value)
++# (relocation, directive, symbol, a value that fits, one that does not).
++# `.long sym` is always R_X86_64_32 to GAS, so R_X86_64_32S needs an explicit
++# `.reloc`; its bad value 0x80000000 fits an R_X86_64_32 and is exactly the
++# one the signed field must refuse.  The good value of R_X86_64_32 is the
++# largest one only the unsigned field holds.
+ _FIELD_CASES = [
+-    ("R_X86_64_32", ".long", "far32", 0x1000, 0x1_0000_0000),
+-    ("R_X86_64_32S", ".long", "far32s", 0x1000, 0x1_0000_0000),
+-    ("R_X86_64_16", ".word", "far16", 0x1000, 0x1_0000),
+-    ("R_X86_64_8", ".byte", "far8", 0x40, 0x100),
++    ("R_X86_64_32", ".long {sym}", "far32", 0xFFFF_FFFF, 0x1_0000_0000),
++    ("R_X86_64_32S", ".reloc ., R_X86_64_32S, {sym}\n        .long 0", "far32s",
++     0x7FFF_FFFF, 0x8000_0000),
++    ("R_X86_64_16", ".word {sym}", "far16", 0x1000, 0x1_0000),
++    ("R_X86_64_8", ".byte {sym}", "far8", 0x40, 0x100),
+ ]
+ 
+ 
+-def _reloc_range_fixture(td, directive, sym, signed=False):
++def _reloc_range_fixture(td, directive, sym):
+     """Assemble one object whose single relocation is `directive sym`.
+ 
+     Returns the object path, or None if the toolchain refused (reported as SKIP
+@@ -7270,14 +8359,14 @@ def _reloc_range_fixture(td, directive, sym, signed=False):
+     linker defect).
+     """
+     src = os.path.join(td, "f.s")
+-    # `.long sym - .` is the PC-relative spelling; a plain `.long sym` is the
+-    # absolute one. GAS picks R_X86_64_PC32 for the former and R_X86_64_32/32S
+-    # for the latter depending on whether the section is writable.
++    # `directive` is a template over `{sym}`: `.long sym - .` is the
++    # PC-relative spelling; a plain `.long sym` is R_X86_64_32 whatever the
++    # section, so the signed field is requested with `.reloc`.
+     with open(src, "w") as f:
+         f.write(
+             "        .section .data.rel.ro,\"aw\"\n"
+             "        .globl slot\n"
+-            f"slot:   {directive} {sym}\n"
++            f"slot:   {directive.format(sym=sym)}\n"
+             "        .text\n"
+             "        .globl probe\n"
+             "probe:  ret\n"
+@@ -7301,9 +8390,17 @@ def _reloc_field_range_tests(args, oracles):
      if not os.path.exists(lccc_ld):
          return [Result("reloc_field_range", "SKIP", "lccc-ld not built")]
  
@@ -6603,7 +7199,7 @@ index 294c7296..83a5209d 100644
      td = tempfile.mkdtemp(prefix="lnk.reloc_pc32.")
      try:
          with open(os.path.join(td, "p.s"), "w") as f:
-@@ -7315,7 +8386,22 @@ def _reloc_field_range_tests(args, oracles):
+@@ -7315,7 +8412,22 @@ def _reloc_field_range_tests(args, oracles):
                  "        .globl probe\n"
                  "probe:  ret\n"
              )
@@ -6627,7 +7223,7 @@ index 294c7296..83a5209d 100644
              results.append(Result("reloc_pc32_fixture", "SKIP", "assembler refused"))
          elif "R_X86_64_PC32" not in _kinds_in(os.path.join(td, "p.o")):
              results.append(Result("reloc_pc32_fixture", "SKIP",
-@@ -7327,25 +8413,25 @@ def _reloc_field_range_tests(args, oracles):
+@@ -7327,25 +8439,25 @@ def _reloc_field_range_tests(args, oracles):
                          "  .data.rel.ro : { *(.data.rel.ro) }\n}\n")
              far = "0x7fff00000000"     # outside +/- 2 GiB of any image address
              paths = [
@@ -6663,7 +7259,7 @@ index 294c7296..83a5209d 100644
                      results.append(Result(
                          name, "FAIL",
                          f"{label} path failed but did not name the type and the "
-@@ -7353,26 +8439,63 @@ def _reloc_field_range_tests(args, oracles):
+@@ -7353,26 +8465,63 @@ def _reloc_field_range_tests(args, oracles):
                      continue
                  # The oracle must refuse the same input, or this is lccc
                  # inventing a restriction rather than conforming.
@@ -6736,23 +7332,483 @@ index 294c7296..83a5209d 100644
      except Exception as e:
          results.append(Result("reloc_pc32_out_of_range", "FAIL", f"harness: {e!r}"))
      finally:
-@@ -7882,7 +9005,15 @@ def main():
-         for tname, runner in (("dso_pointer_equality", _dso_pointer_equality_test),
-                               ("i386_dso_pointer_equality", _dso_pointer_equality_i386_test),
-                               ("gotpcrelx_relax_vs_bfd", _gotpcrelx_relax_test),
--                              ("dso_emit_semantics", _dso_emit_semantics_test)):
-+                              ("dso_emit_semantics", _dso_emit_semantics_test),
-+                              ("i386_dso_emit_semantics", _dso_emit_semantics_i386_test),
-+                              ("code_model_large_medium", _code_model_large_medium_test),
-+                              ("exe_exports_dso_names", _exe_exports_dso_names_test),
-+                              ("so_bound_ifunc", _so_bound_ifunc_test),
-+                              ("eh_frame_packing", _eh_frame_packing_test),
-+                              ("gotpcrel_edges", _gotpcrel_edges_test),
-+                              ("absolute_symbols_pic", _absolute_symbols_pic_test),
-+                              ("ie_to_le_local", _ie_to_le_local_test)):
-             if not args.filter or args.filter in tname:
-                 results.append(runner(args, oracles))
+@@ -7388,12 +8537,12 @@ def _reloc_field_range_tests(args, oracles):
+                                       "assembler refused the fixture"))
+                 continue
+             kinds = _kinds_in(obj)
+-            if not kinds:
+-                results.append(Result(f"reloc_{sym}_fixture", "SKIP",
+-                                      "fixture produced no relocation"))
++            if kinds != {kind}:
++                results.append(Result(f"reloc_{sym}_fixture", "FAIL",
++                                      f"fixture produced {sorted(kinds)}, not {kind}"))
+                 continue
+             # out of range: must be diagnosed, and the oracle must agree
+-            name = f"reloc_out_of_range_diagnosed_{sorted(kinds)[0].lower()}"
++            name = f"reloc_out_of_range_diagnosed_{kind.lower()}"
+             r = sh([lccc_ld, "--defsym", f"{sym}={bad:#x}", os.path.basename(obj),
+                     "-o", "bad.exe", "--no-dynamic-linker"], cwd=td)
+             if r.returncode == 0:
+@@ -7419,7 +8568,7 @@ def _reloc_field_range_tests(args, oracles):
+                         results.append(Result(name, "PASS"))
  
+             # in range: must link, and the field must hold the value
+-            name = f"reloc_in_range_accepted_{sorted(kinds)[0].lower()}"
++            name = f"reloc_in_range_accepted_{kind.lower()}"
+             r = sh([lccc_ld, "--defsym", f"{sym}={good:#x}", os.path.basename(obj),
+                     "-o", "good.exe", "--no-dynamic-linker"], cwd=td)
+             if r.returncode != 0:
+@@ -7431,7 +8580,7 @@ def _reloc_field_range_tests(args, oracles):
+                 dump = sh(["readelf", "-x", ".data.rel.ro", "good.exe"],
+                           cwd=td).stdout.decode()
+                 want = "".join(f"{(good >> (8 * i)) & 0xff:02x}" for i in range(4))
+-                width = {"R_X86_64_8": 1, "R_X86_64_16": 2}.get(sorted(kinds)[0], 4)
++                width = {"R_X86_64_8": 1, "R_X86_64_16": 2}.get(kind, 4)
+                 want = want[:width * 2]
+                 if want not in dump.replace(" ", ""):
+                     results.append(Result(
+@@ -7826,6 +8975,159 @@ def _defsym_layout_test(args, oracles):
+     return results
+ 
+ 
++class _Entry:
++    """One registered test (or group of tests sharing a fixture).
++
++    `names` are the result names the runner reports and the only thing
++    `--filter` matches and `--list` prints; `aux` are extra names it may report
++    instead when its fixture cannot be built (group-level SKIP/FAIL).  main()
++    turns any other reported name into a failure, so the registry cannot drift
++    from the runners.
++    """
++
++    def __init__(self, names, runner, tags=(), aux=()):
++        self.names = tuple(names)
++        self.runner = runner
++        self.tags = tuple(tags)
++        self.aux = tuple(aux)
++
++    def selected(self, args):
++        if args.tag and args.tag not in self.tags:
++            return False
++        return not args.filter or any(args.filter in n for n in self.names)
++
++    def declares(self, name):
++        return name in self.names or name in self.aux
++
++
++def _registry(args, oracles):
++    """Every test, in execution order."""
++    import i386_userspace  # noqa: PLC0415 - sibling module (ELF32 userspace via gcc -m32)
++
++    def one(name, fn, *tags, aux=()):
++        return _Entry((name,), lambda: fn(args, oracles), tags, aux)
++
++    def group(names, fn, *tags, aux=()):
++        return _Entry(names, lambda: fn(args, oracles), tags, aux)
++
++    reg = [_Entry((c.name,), (lambda c=c: run_case(c, args, oracles)), c.tags)
++           for c in CASES]
++    reg += [_Entry((name,), (lambda t=(name, script, csrc, expect):
++                             _script_test(*t)(args, oracles)), ("script",))
++            for (name, script, csrc, expect) in SCRIPT_TESTS]
++    for entry in REL_TESTS:
++        reg.append(_Entry((entry[0],), (lambda e=entry: _rel_test(
++            e[0], e[1], e[2], compile_flags=e[3] if len(e) > 3 else None)(args, oracles)),
++            ("rel",)))
++    reg += [
++        one("reloc_whole_archive_thin_and_regular", _whole_archive_r_test, "rel"),
++        one("file_mode_libs_r_and_T", _file_mode_libs_test, "rel"),
++    ]
++    for tname, runner in (("dso_pointer_equality", _dso_pointer_equality_test),
++                          ("i386_dso_pointer_equality", _dso_pointer_equality_i386_test),
++                          ("gotpcrelx_relax_vs_bfd", _gotpcrelx_relax_test),
++                          ("dso_emit_semantics", _dso_emit_semantics_test),
++                          ("i386_dso_emit_semantics", _dso_emit_semantics_i386_test),
++                          ("code_model_large_medium", _code_model_large_medium_test),
++                          ("exe_exports_dso_names", _exe_exports_dso_names_test),
++                          ("so_bound_ifunc", _so_bound_ifunc_test),
++                          ("eh_frame_packing", _eh_frame_packing_test),
++                          ("gotpcrel_edges", _gotpcrel_edges_test),
++                          ("absolute_symbols_pic", _absolute_symbols_pic_test),
++                          ("ie_to_le_local", _ie_to_le_local_test)):
++        reg.append(one(tname, runner, "dynamic"))
++    reg += [
++        one("cxx_exceptions_unwind", _cxx_eh_test, "ehframe"),
++        one("cxx_exceptions_local_typeinfo", _cxx_eh_local_type_test, "ehframe"),
++        one("script_pie_base0", _pie_script_test, "script"),
++        one("script_undefined_pulls_archive", _script_undefined_archive_test, "script"),
++        one("script_undefined_pulls_archive_i386", _script_undefined_archive_test_i386,
++            "script"),
++        _Entry(tuple(n for n, _ in i386_userspace.CASES),
++               lambda: i386_userspace.run_all(args, CC, Result), ("shared",)),
++        one("script_vdso_dynamic", _vdso_script_test, "script"),
++        one("script_vdso_declared_note_phdrs", _vdso_note_phdr_test, "script"),
++        one("script_elf32_i386_relocations", _elf32_script_test, "script", "kernel"),
++        one("script_elf32_gc_keep", _elf32_script_gc_keep_test, "script", "kernel"),
++        one("script_elf32_vdso_multiversion", _elf32_vdso_test, "script", "kernel"),
++        one("gc_eh_frame_invariant", _gc_eh_frame_invariant_test, "gc", "sections"),
++        one("build_id_note", _build_id_note_test, "notes"),
++        one("relro_nobits_pad", _relro_nobits_pad_test, "layout"),
++        one("note_run_merge", _note_run_merge_test, "notes"),
++        one("gnu_hash_sizing", _gnu_hash_sizing_test, "dynamic"),
++        one("crossarch_gnu_hash_relro", _crossarch_gnu_hash_relro_test, "dynamic"),
++        one("static_pie_refused", _static_pie_refusal_test, "driver"),
++        one("emit_relocs_warns_when_unimplemented", _emit_relocs_warns_test, "kernel"),
++        one("dyn_init_fini_shared", _dyn_init_fini_shared_test, "dynamic"),
++        one("script_hidden_not_exported", _script_hidden_visibility_test, "script"),
++        one("script_pic_gotpcrel_relaxation", _script_pic_gotpcrel_test, "script"),
++        one("script_tls_initial_exec", _script_tls_test, "script"),
++        one("script_tls_gd_ld_relaxation", _script_tls_gd_ld_test, "script"),
++        one("script_overlay_shared_vma", _script_overlay_test, "script"),
++        one("as_needed_positional_dt_needed", _as_needed_positional_test, "driver"),
++        one("bstatic_positional_search", _bstatic_positional_test, "driver"),
++        one("print_map_to_stdout", _print_map_test, "map"),
++        one("version_script_multiple_nodes", _multi_version_node_test, "exports"),
++        one("comdat_group_dedup", _comdat_dedup_test, "sections"),
++        one("section_header_index_consistency", _section_header_index_consistency_test,
++            "layout"),
++        one("script_nonalloc_debug_payload", _script_nonalloc_section_test,
++            "script", "kernel"),
++        _Entry(("so_default_interposable",),
++               lambda: _interpose_test(args, oracles, "so_default_interposable", [], "101\n"),
++               ("shared",)),
++        _Entry(("so_bsymbolic_binds_local",),
++               lambda: _interpose_test(args, oracles, "so_bsymbolic_binds_local",
++                                       ["-Wl,-Bsymbolic"], "43\n"),
++               ("shared",)),
++        one("so_z_defs_rejects_undefined", _zdefs_test, "shared"),
++        one("so_shared_flag_parity", _so_shared_flags_test, "shared"),
++        group(("export_dynamic_exports_globals", "export_dynamic_dlopen_callback",
++               "export_dynamic_version_script", "export_dynamic_matches_gnu_ld"),
++              _export_dynamic_test, "exports", aux=("export_dynamic",)),
++        group(("emit_relocs_sections_present", "emit_relocs_header_wiring",
++               "emit_relocs_matches_gnu_ld", "emit_relocs_does_not_perturb_image",
++               "emit_relocs_kernel_relocs_tool"),
++              _emit_relocs_test, "kernel", aux=("emit_relocs",)),
++        group(("exclude_libs_control", "exclude_libs_hides_symbols",
++               "exclude_libs_lib_still_works", "exclude_libs_no_null_jumpslot",
++               "exclude_libs_ALL"),
++              _exclude_libs_test, "exports", aux=("exclude_libs",)),
++        group(("driver_option_noise",)
++              + tuple(f"driver_flag_silent[{f}]" for f in _DRIVER_SILENT_FLAGS)
++              + ("lto_bytecode_refused",),
++              _driver_option_noise_test, "driver"),
++        group(("segment_congruence", "segment_no_page_padding", "relro_ends_on_page_boundary",
++               "shared_lib_segment_congruence", "shared_lib_no_page_padding",
++               "shared_lib_still_loads", "output_not_larger_than_bfd"),
++              _segment_packing_test, "layout", aux=("segment_packing",)),
++        one("map_file_matches_binary", _map_file_test, "map"),
++        one("map_file_two_arg_spelling", _map_file_spellings_test, "map"),
++        group(tuple(n for n, _ in MALFORMED_CASES), _robustness_tests, "robustness",
++              aux=("robustness",)),
++        group(tuple(f"reloc_pc32_out_of_range_diagnosed_on_{label}_path"
++                    for label in ("exec", "script"))
++              + ("reloc_32_out_of_range_diagnosed_on_shared_path",
++                 "reloc_32_preemptible_abs_in_shared_refused",
++                 "reloc_pc32_abs_in_shared_is_dynamic")
++              + tuple(f"reloc_{v}_{k.lower()}"
++                      for k, *_ in _FIELD_CASES
++                      for v in ("out_of_range_diagnosed", "in_range_accepted"))
++              + ("reloc_64_accepts_above_4g",),
++              _reloc_field_range_tests, "reloc",
++              aux=("reloc_field_range", "reloc_pc32_fixture", "reloc_pc32_out_of_range")
++              + tuple(f"reloc_{sym}{sfx}" for _, _, sym, *_ in _FIELD_CASES
++                      for sfx in ("", "_fixture"))),
++        group(("reloc_offset_text_w4", "reloc_offset_wrap_text",
++               "reloc_offset_data.rel.ro_w8", "reloc_offset_wrap_data.rel.ro"),
++              _reloc_offset_tests, "reloc", aux=("reloc_offset",)),
++        group(("defsym_layout_plus", "defsym_layout_arith", "defsym_layout_end_final",
++               "defsym_layout_reloc_reference", "defsym_layout_shared"),
++              _defsym_layout_test, "defsym", aux=("defsym_layout_expr",)),
++    ]
++    return reg
++
++
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--lccc", default=DEFAULT_LCCC)
+@@ -7833,6 +9135,11 @@ def main():
+     ap.add_argument("--tag", default="")
+     ap.add_argument("-v", "--verbose", action="store_true")
+     ap.add_argument("--keep", action="store_true", help="keep temp dirs")
++    ap.add_argument("--list", action="store_true",
++                    help="print the selected test names (and tags) without running them")
++    ap.add_argument("--json", metavar="FILE", help="also write the results as JSON")
++    ap.add_argument("--strict", action="store_true",
++                    help="fail on SKIP and WARN results too (CI mode)")
+     args = ap.parse_args()
+     # Many cases execute the driver from a temporary working directory. Keep a
+     # caller-supplied relative path anchored to the invocation directory.
+@@ -7848,157 +9155,41 @@ def main():
+         wildpath = shutil.which("wild")
+         oracles.append(("wild", [CC, f"-B{os.path.dirname(_wild_shim(wildpath))}"]))
+ 
++    registry = _registry(args, oracles)
++    if args.list:
++        for e in registry:
++            if e.selected(args):
++                for n in e.names:
++                    if not args.filter or args.filter in n:
++                        print(f"{n}\t{','.join(e.tags)}")
++        return
+     results = []
+-    for c in CASES:
+-        if args.filter and args.filter not in c.name:
+-            continue
+-        if args.tag and args.tag not in c.tags:
+-            continue
+-        results.append(run_case(c, args, oracles))
+-
+-    for (name, script, csrc, expect) in SCRIPT_TESTS:
+-        if args.filter and args.filter not in name:
++    seen = set()
++    for e in registry:
++        if not e.selected(args):
+             continue
+-        if args.tag and args.tag != "script":
+-            if args.tag:
+-                continue
+-        results.append(_script_test(name, script, csrc, expect)(args, oracles))
+-
+-    for entry in REL_TESTS:
+-        name, sources, expect = entry[0], entry[1], entry[2]
+-        cflags = entry[3] if len(entry) > 3 else None
+-        if args.filter and args.filter not in name:
+-            continue
+-        if args.tag and args.tag != "rel":
+-            if args.tag:
+-                continue
+-        results.append(_rel_test(name, sources, expect,
+-                                 compile_flags=cflags)(args, oracles))
+-    results.append(_whole_archive_r_test(args, oracles))
+-    if (not args.filter or "file_mode" in args.filter) and (not args.tag or args.tag == "rel"):
+-        results.append(_file_mode_libs_test(args, oracles))
+-
+-    if not args.tag or args.tag == "dynamic":
+-        for tname, runner in (("dso_pointer_equality", _dso_pointer_equality_test),
+-                              ("i386_dso_pointer_equality", _dso_pointer_equality_i386_test),
+-                              ("gotpcrelx_relax_vs_bfd", _gotpcrelx_relax_test),
+-                              ("dso_emit_semantics", _dso_emit_semantics_test)):
+-            if not args.filter or args.filter in tname:
+-                results.append(runner(args, oracles))
+-
+-    if (not args.filter or "cxx" in args.filter) and (not args.tag or args.tag == "ehframe"):
+-        results.append(_cxx_eh_test(args, oracles))
+-        results.append(_cxx_eh_local_type_test(args, oracles))
+-
+-    if (not args.filter or "pie" in args.filter) and (not args.tag or args.tag == "script"):
+-        results.append(_pie_script_test(args, oracles))
+-    if (not args.filter or "undefined" in args.filter or "efi" in args.filter) \
+-            and (not args.tag or args.tag == "script"):
+-        results.append(_script_undefined_archive_test(args, oracles))
+-        results.append(_script_undefined_archive_test_i386(args, oracles))
+-    if not args.tag or args.tag == "shared":
+-        # ELF32/i386 userspace links through `gcc -m32` (sibling module).
+-        import i386_userspace  # noqa: PLC0415 - sibling module
+-        results.extend(i386_userspace.run_all(args, CC, Result))
+-    if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
+-        results.append(_vdso_script_test(args, oracles))
+-        results.append(_vdso_note_phdr_test(args, oracles))
+-    if (not args.filter or "elf32" in args.filter or "kernel" in args.filter) \
+-            and (not args.tag or args.tag in ("script", "kernel")):
+-        results.append(_elf32_script_test(args, oracles))
+-        results.append(_elf32_script_gc_keep_test(args, oracles))
+-        results.append(_elf32_vdso_test(args, oracles))
+-    if (not args.tag or args.tag in ("gc", "sections")):
+-        results.append(_gc_eh_frame_invariant_test(args, oracles))
+-    results.append(_build_id_note_test(args, oracles))
+-    if (not args.filter or "relro" in args.filter) and not args.tag:
+-        results.append(_relro_nobits_pad_test(args, oracles))
+-    if (not args.filter or "note" in args.filter) and not args.tag:
+-        results.append(_note_run_merge_test(args, oracles))
+-    if (not args.filter or "gnu_hash" in args.filter or "hash" in args.filter) \
+-            and (not args.tag or args.tag == "dynamic"):
+-        results.append(_gnu_hash_sizing_test(args, oracles))
+-    if (not args.filter or "crossarch" in args.filter or "relro" in args.filter
+-            or "gnu_hash" in args.filter or "hash" in args.filter) \
+-            and (not args.tag or args.tag == "dynamic"):
+-        results.append(_crossarch_gnu_hash_relro_test(args, oracles))
+-    results.append(_static_pie_refusal_test(args, oracles))
+-    results.append(_emit_relocs_warns_test(args, oracles))
+-    if (not args.filter or "dyn_init_fini" in args.filter) and (not args.tag or args.tag == "dynamic"):
+-        results.append(_dyn_init_fini_shared_test(args, oracles))
+-    if (not args.filter or "hidden" in args.filter) and (not args.tag or args.tag == "script"):
+-        results.append(_script_hidden_visibility_test(args, oracles))
+-    if (not args.filter or "gotpcrel" in args.filter) and (not args.tag or args.tag == "script"):
+-        results.append(_script_pic_gotpcrel_test(args, oracles))
+-    if (not args.filter or "tls" in args.filter) and (not args.tag or args.tag == "script"):
+-        results.append(_script_tls_test(args, oracles))
+-    if (not args.filter or "tls" in args.filter) and (not args.tag or args.tag == "script"):
+-        results.append(_script_tls_gd_ld_test(args, oracles))
+-    if (not args.filter or "overlay" in args.filter) and (not args.tag or args.tag == "script"):
+-        results.append(_script_overlay_test(args, oracles))
+-    if (not args.filter or "as_needed" in args.filter) and not args.tag:
+-        results.append(_as_needed_positional_test(args, oracles))
+-    if (not args.filter or "bstatic" in args.filter) and not args.tag:
+-        results.append(_bstatic_positional_test(args, oracles))
+-    if (not args.filter or "print_map" in args.filter) and not args.tag:
+-        results.append(_print_map_test(args, oracles))
+-    if (not args.filter or "version" in args.filter) and not args.tag:
+-        results.append(_multi_version_node_test(args, oracles))
+-    if (not args.filter or "comdat" in args.filter) and not args.tag:
+-        results.append(_comdat_dedup_test(args, oracles))
+-    if (not args.filter or "section_header" in args.filter) and not args.tag:
+-        results.append(_section_header_index_consistency_test(args, oracles))
+-    if (not args.filter or "nonalloc" in args.filter or "debug_payload" in args.filter) \
+-            and (not args.tag or args.tag in ("script", "kernel")):
+-        results.append(_script_nonalloc_section_test(args, oracles))
+-
+-    if (not args.filter or "so_" in args.filter) and not args.tag:
+-        results.append(_interpose_test(args, oracles,
+-            "so_default_interposable", [], "101\n"))
+-        results.append(_interpose_test(args, oracles,
+-            "so_bsymbolic_binds_local", ["-Wl,-Bsymbolic"], "43\n"))
+-        results.append(_zdefs_test(args, oracles))
+-        results.append(_so_shared_flags_test(args, oracles))
+-
+-    if not args.tag or args.tag == "exports":
+-        if not args.filter or "export_dynamic" in args.filter or "rdynamic" in args.filter:
+-            results.extend(_export_dynamic_test(args, oracles))
+-
+-    if not args.tag or args.tag == "kernel":
+-        if not args.filter or "emit_relocs" in args.filter or "kernel" in args.filter:
+-            results.extend(_emit_relocs_test(args, oracles))
+-
+-    if not args.tag or args.tag == "exports":
+-        if not args.filter or "exclude" in args.filter:
+-            results.extend(_exclude_libs_test(args, oracles))
+-
+-    if not args.tag or args.tag == "driver":
+-        if not args.filter or "driver" in args.filter or "lto" in args.filter:
+-            results.extend(_driver_option_noise_test(args, oracles))
+-
+-    if not args.tag or args.tag == "layout":
+-        if not args.filter or "segment" in args.filter or "relro" in args.filter \
+-                or "shared_lib" in args.filter \
+-                or "output_not" in args.filter:
+-            results.extend(_segment_packing_test(args, oracles))
+-
+-    if not args.tag or args.tag == "map":
+-        if not args.filter or "map" in args.filter:
+-            results.append(_map_file_test(args, oracles))
+-            results.append(_map_file_spellings_test(args, oracles))
+-
+-    if not args.tag or args.tag == "robustness":
+-        if not args.filter or "malformed" in args.filter or "robust" in args.filter:
+-            results.extend(_robustness_tests(args, oracles))
+-
+-    if not args.tag or args.tag == "reloc":
+-        if not args.filter or "reloc" in args.filter:
+-            results.extend(_reloc_field_range_tests(args, oracles))
+-            results.extend(_reloc_offset_tests(args, oracles))
+-
+-    if not args.tag or args.tag == "defsym":
+-        if not args.filter or "defsym" in args.filter:
+-            results.extend(_defsym_layout_test(args, oracles))
++        out = e.runner()
++        out = out if isinstance(out, list) else [out]
++        # A declared test its runner silently did not report (an optional
++        # tool was missing, a reference link failed) did not run: that is a
++        # SKIP, which --strict refuses, unless a group-level result stands in.
++        reported = {r.name for r in out}
++        if not any(n in reported for n in e.aux):
++            out += [Result(n, "SKIP", "not reported by its runner (did not run)")
++                    for n in e.names if n not in reported]
++        for r in out:
++            # Every result must be one the registry declares: that is what
++            # makes `--filter`/`--list` exact.  A misnamed or duplicated one
++            # is a harness defect, reported as a failure, never dropped.
++            if not e.declares(r.name):
++                r = Result(r.name, "FAIL",
++                           f"undeclared result name (declare it in _registry): "
++                           f"{r.status} {r.detail}")
++            elif r.name in seen:
++                r = Result(r.name, "FAIL", f"duplicate result name: {r.status} {r.detail}")
++            seen.add(r.name)
++            if not args.filter or args.filter in r.name:
++                results.append(r)
+ 
+     npass = sum(1 for r in results if r.status == "PASS")
+     nfail = sum(1 for r in results if r.status == "FAIL")
+@@ -8010,6 +9201,19 @@ def main():
+             print(f"[{r.status}] {r.name}" + (f"\n    {r.detail}" if r.detail else ""))
+     print(f"\n== linker tests: {npass} pass, {nfail} fail, {nwarn} warn, {nskip} skip "
+           f"(oracles: bfd{' mold' if have_mold else ''}{' wild' if have_wild else ''}) ==")
++    if args.json:
++        with open(args.json, "w") as f:
++            json.dump([{"name": r.name, "status": r.status, "detail": r.detail}
++                       for r in results], f, indent=1)
++    if args.filter and not results:
++        print(f"error: --filter {args.filter!r} selected no test", file=sys.stderr)
++        sys.exit(1)
++    # --strict: a SKIP is a test that did not run (a missing compiler, a
++    # fixture the toolchain refused) and a WARN a known defect; in CI, where
++    # the job installs every tool, both are failures to be fixed, not parked.
++    if args.strict and (nskip or nwarn):
++        print(f"error: --strict: {nskip} skipped and {nwarn} warned test(s)", file=sys.stderr)
++        sys.exit(1)
+     sys.exit(1 if nfail else 0)
+ 
+ _WILD_SHIM_DIR = None
+diff --git a/tests/linker/setup_kernel_tools.sh b/tests/linker/setup_kernel_tools.sh
+index b0842198..5674fe49 100644
+--- a/tests/linker/setup_kernel_tools.sh
++++ b/tests/linker/setup_kernel_tools.sh
+@@ -23,21 +23,34 @@
+ #   tests/linker/setup_kernel_tools.sh [--kver v6.12] [--prefix DIR]
+ #
+ # The suite picks the tool up from $LCCC_RELOCS_TOOL, defaulting to
+-# <prefix>/bin/relocs, and SKIPs cleanly when it is absent.
++# ${LCCC_ORACLE_PREFIX:-$HOME/tools}/bin/relocs; without it the test reports
++# SKIP, which `run_linker_tests.py --strict` (CI) turns into a failure.
++#
++# Every fetched file is pinned by SHA-256 (the v6.12 contents), so a changed
++# tag, a proxy or an HTML error page fails here instead of building something
++# else.  Another --kver needs its own pins: --no-verify is for exploration
++# only, never CI.
+ # ============================================================================
+ set -euo pipefail
+ 
+ KVER=${KVER:-v6.12}
+-PREFIX=${LCCC_ORACLE_PREFIX:-/home/user/tools}
++PREFIX=${LCCC_ORACLE_PREFIX:-$HOME/tools}
++VERIFY=1
+ 
+ while [[ $# -gt 0 ]]; do
+   case $1 in
+     --kver)   KVER=$2; shift 2 ;;
+     --prefix) PREFIX=$2; shift 2 ;;
++    --no-verify) VERIFY=0; shift ;;
+     *) echo "unknown option: $1" >&2; exit 2 ;;
+   esac
+ done
+ 
++if [[ $VERIFY == 1 && $KVER != v6.12 ]]; then
++  echo "error: no SHA-256 pins for $KVER (pins cover v6.12; --no-verify to explore)" >&2
++  exit 1
++fi
++
+ BIN="$PREFIX/bin"
+ SRC="$PREFIX/kernel-tools"
+ mkdir -p "$BIN" "$SRC/tools"
+@@ -65,6 +78,17 @@ if ! head -1 "$SRC/relocs.c" | grep -q "SPDX-License-Identifier"; then
+   exit 1
+ fi
+ 
++if [[ $VERIFY == 1 ]]; then
++  ( cd "$SRC" && sha256sum -c --quiet - ) <<'PINS' || { echo "error: kernel tool sources do not match the v6.12 pins" >&2; exit 1; }
++e23d46f4cb098aef1c80862a4aaa176c21b53ba12699576ec23e366428897f8f  relocs.c
++61783eeddcf582c6f8c74c63f8f5170df51e34819a8b8dad9af68117f5c185d0  relocs.h
++a49f30d39b362c29bdd27f19cadffdcfefefe5ad35511dd4b8f00d002a1cf08f  relocs_common.c
++ae8b4ffcfe0367bb457a73b9a9534bf2ec495e2f7d99e23b1257b0009d693680  relocs_32.c
++88e45459755585c934a9e24ebb9f6b71fd27f8d10c2fa9cc4a4d51fe3719166b  relocs_64.c
++87b40e54fed5b27a9acd784e41521d8bbf95922448d07bea17be6b4bb5fa7925  tools/le_byteshift.h
++PINS
++fi
++
+ echo "building relocs"
+ ( cd "$SRC" && cc -O2 -I. -o relocs relocs_common.c relocs_32.c relocs_64.c )
+ install -m755 "$SRC/relocs" "$BIN/relocs"
 diff --git a/tools/linker/setup_oracles.sh b/tools/linker/setup_oracles.sh
 index 907db274..7625da60 100755
 --- a/tools/linker/setup_oracles.sh
