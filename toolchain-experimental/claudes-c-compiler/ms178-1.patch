@@ -1,338 +1,1084 @@
-diff --git a/docs/induction-strength-reduction-consumers.md b/docs/induction-strength-reduction-consumers.md
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index a6a1e921..3fdf611d 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -749,6 +749,12 @@ jobs:
+           # writing it, so a cmov chain sharing a condition needs one cmp.
+           # Carries its own CCC_PEEPHOLE_SKIP negative control.
+           bash tests/regression/check_redundant_flags_compare.sh
++          # Downward counter loops: `subl $1, %R; testl %R, %R; jne` keeps one
++          # instruction of pure overhead unless the consumer walk proves ZF is
++          # the only flag read.  Pins both directions (folded for ZF-only
++          # consumers, kept for `while ((n -= 3) > 0)`) plus a matcher
++          # self-test, so it cannot pass vacuously.
++          bash tests/regression/check_self_test_after_arith.sh
+           # The loop-density metric decides which compiler wins on a kernel,
+           # so its loop identification is tested like a pass: dominator-based
+           # backedges, composite loops never measured, step recovery through
+diff --git a/engineering/FOLLOWUP-2026-09-30-selftest-arith-reconstruction.md b/engineering/FOLLOWUP-2026-09-30-selftest-arith-reconstruction.md
 new file mode 100644
-index 00000000..83924347
+index 00000000..ef50db99
 --- /dev/null
-+++ b/docs/induction-strength-reduction-consumers.md
-@@ -0,0 +1,119 @@
-+# Strength reduction: which memory consumers a derived IV can serve
++++ b/engineering/FOLLOWUP-2026-09-30-selftest-arith-reconstruction.md
+@@ -0,0 +1,439 @@
++# FOLLOWUP-2026-09-30 — Arithmetic-producer self-test elimination: reconstruct, prove, gate, measure
 +
-+This note records a measurement campaign on `iv_strength_reduce` (IVSR) and the
-+numbers that decide how far its replacement may reach.  It exists so the three
-+dead ends below are not walked again: all of them look like wins on paper and
-+all three are losses on the machine.
++Session scope: the harness wiped the whole workspace between sessions (no
++`/home/user/lccc`, no `artifacts/`, no toolchain), so this session started with
++reconnaissance of what survived: three fragments of
++`src/backend/x86/codegen/peephole/passes/flag_peepholes.rs` from a lost session,
++quoted in the request. The base is `main` @ `7b3958f6` ("Volatile bitfield
++wrong-code fix, align-on-definition, preheader tuning, oracle metric repair,
++SIGPIPE-hardened gates"), re-based before any work began.
 +
-+## The shape that motivated the work
++Everything below is stated as **measured** or **not measured**. Nothing is
++claimed because it "should" be faster; where a claim rests on source-level
++reasoning rather than a run, the reasoning is shown.
 +
-+`benchmark/programs/nbody.c`, built with `-O2 -march=x86-64-v3 -DSTEPS=2000`.
-+The inner loop walks `bodies[j]` and `bodies[k]` where `bodies` is a static
-+array and the byte offset is `index * 56`.  IVSR's derived-expression finder
-+does locate those multiplies (`[IVSR]` reports `derived=1` for both loops), and
-+yet the multiply survives into the emitted loop.
++---
 +
-+Root cause, established by instrumenting the derived-use matcher: the collector
-+accepts exactly one consumer spelling,
++## 0. The headline
 +
-+```text
-+GetElementPtr { offset: Operand::Value(mul_dest) }
++**The lost work was not recoverable — it was reconstructible, and the
++reconstruction is measurably better than the fragment it replaces.**
++
++Two independent searches establish that the code was never pushed:
++
++```
++$ git log --all --oneline -S 'saw_non_zf'                    # 2 hits, both older
++$ git log --all --oneline -S 'self_test_after_counter_sub_is_removed_for_zf_consumer'
++$ git log --all --oneline -S 'Arithmetic producers'          # no hits
++$ git branch -r | wc -l                                      # 282 refs searched
 +```
 +
-+while the SLP vectorizer rewrites the loop into
++So the fold was re-derived from the fragments and the surrounding pass
++machinery, and three things were improved beyond what the fragments contained:
 +
-+```text
-+Copy        { dest: v242, src: Value(v250) }
-+Copy        { dest: v32,  src: Value(v250) }
-+Intrinsic   { op: VecLoadF64x2,  args: [base, Value(v250), Const(I64(24))] }
-+Intrinsic   { op: VecStoreF64x2, args: [value, base, Value(v250), Const(I64(24))] }
++1. the fragment's `saw_whole_reader` clause is **provably redundant** (proof in
++   §2.3) — and removing it lets the arithmetic guard share the *same* predicate
++   the width rule already uses, so the two guards cost **one** consumer walk
++   instead of two;
++2. the guards are ordered cheapest-first, so the expensive flag-flow walk only
++   runs for candidates that survived the free filters (compile time is a
++   tracked cost, not a free good);
++3. the optimisation now has an **end-to-end gate whose own matcher is
++   self-tested**, and which was **mutation-tested** against a compiler built
++   with the fold reverted — it fails on that compiler with the exact surviving
++   instruction pairs (§4.3).
++
++---
++
++## 1. What the fold is
++
++`subl $1, %R; testl %R, %R; jne` — the shape every downward counter loop
++compiles to (`while (--n)`, `do { } while (--n)`, `while ((n -= k) > 0)` for
++`k < 0`-style loops excluded, see below) — spends a whole instruction
++re-establishing flags the subtraction already set.
++
++The pass (`eliminate_redundant_self_test`) already handled the logical
++producers (`and`/`or`/`xor`), which reproduce a `test`'s flags exactly. The
++reconstruction extends it to the arithmetic producers, which do not:
++
++| flag | `and`/`or`/`xor` then `test` | `sub`/`add`/`inc`/`dec`/`neg` then `test` |
++| --- | --- | --- |
++| ZF | identical (from the result) | identical (from the result) |
++| SF | identical | identical **at equal widths only** (bit 31 vs bit 63) |
++| PF | identical | identical |
++| CF | both clear it | **diverges**: the arithmetic form takes it from the carry/borrow |
++| OF | both clear it | **diverges**: from the signed overflow |
++| AF | both clear it | **diverges**: the arithmetic form defines it from the borrow, `test` leaves it alone |
++
++So an arithmetic producer may stand in for the test **only** when every
++consumer of those flags reads ZF and nothing else, and that is exactly the
++proof `flag_consumers_are_zf_only` supplies.
++
++### 1.1 Why `inc`/`dec` are included rather than excluded
++
++`inc`/`dec` do not write CF at all (SDM): after `decl %R; testl %R, %R`, a
++`jb` reads CF from whichever instruction last wrote it, while the `testl` would
++have cleared it. That divergence is caught by the same guard — `jb` is not a
++ZF predicate, so `saw_non_zf` refuses the fold — and `decl` is precisely the
++spelling the i686 backend emits for the counter loop (§6.1), which is why it
++belongs in the producer list on both targets.
++
++---
++
++## 2. Soundness argument
++
++### 2.1 The window has no other entry point
++
++The backward scan from the test breaks at `LineInfo::is_barrier()`
++(`types.rs`), which includes `LineKind::Label`. Therefore no label can sit
++between the producer and the test, so the two lie in one straight-line window:
++no branch can enter *at the test* and observe flags the producer never made.
++Without that property the fold would be unsound in a case that is easy to
++write by hand and impossible to see by eye — pinned by
++`self_test_after_sub_is_kept_when_a_branch_enters_at_the_test`.
++
++### 2.2 The consumer walk follows taken edges
++
++`walk_flag_consumers` walks the flag flow, not the text: a conditional jump's
++**taken edge** carries the same flags, so a consumer in a block the
++fall-through never reaches still counts; an unresolvable target — a tail
++branch, an indirect jump — sets `proved = false` rather than guessing. The
++guard requires `proved`, so "I could not look everywhere" refuses the fold
++instead of licensing it. (Pinned by
++`self_test_after_sub_is_kept_when_a_later_edge_reads_carry`.)
++
++### 2.3 Whole-EFLAGS readers are already charged to `saw_non_zf`
++
++The fragment guarded the arithmetic case with
++`!facts.saw_non_zf && !facts.saw_whole_reader`. The second clause cannot fire
++when the first is satisfied, and the reason is structural:
++
++```rust
++// flag_peepholes.rs, walk_flag_consumers
++let cc = condition_code_of(t);
++match cc {
++    Some(cc) => { if !matches!(cc, "e" | "z" | "ne" | "nz") { facts.saw_non_zf = true; } ... }
++    None => {
++        facts.saw_non_zf = true;                      // <-- every non-cc reader
++        if !NON_SF_FLAG_READERS.iter().any(|p| t.starts_with(p)) {
++            facts.saw_whole_reader = true;            // <-- implies the line above
++        }
++    }
++}
 +```
 +
-+So the byte offset is read by a `Copy` and by a vector memory intrinsic, and the
-+GEP-count is zero: the group is never formed and no recurrence replaces the
-+`movslq; imulq $56` pair.
++`saw_whole_reader` is only assigned inside the `None` arm, and that arm sets
++`saw_non_zf` unconditionally. Hence `saw_whole_reader ⇒ saw_non_zf`, and
++`flag_consumers_are_zf_only` (which requires `!saw_non_zf`) already excludes
++`lahf`, `pushf*`, inline asm and unknown mnemonics — the reader class that can
++observe AF, the one flag a `jcc`/`setcc`/`cmovcc` predicate cannot name. This
++is the reason the arithmetic guard and the mismatched-width guard are the same
++predicate in the shipped code, and the reason a candidate that is both
++arithmetic **and** width-mismatched pays for one walk, not two.
 +
-+## What was tried, and what it cost
++### 2.4 Width rule
 +
-+Three implementations, each measured against the unmodified pass with two
-+independent instruments.  "Program instructions" is the sum of the executed
-+block sizes in a `qemu-x86_64 -d in_asm,exec,nochain` log, restricted to the
-+program's own address range; the callgrind column is a `--dump-instr=yes` run,
-+which counts retired instructions exactly.
++A 32-bit producer zero-extends, so ZF survives into a 64-bit `testq`; SF does
++not (bit 31 against bit 63). A 64-bit producer under a 32-bit `testl` is never
++usable, because the test ignores the upper half that the flag came from. When
++the widths differ the fold therefore additionally requires
++`flags_are_block_local` — the whole-function check that EFLAGS does not cross a
++block boundary, which the narrow `test` used to conceal.
 +
-+| variant | hot loop | program insns (qemu) | callgrind total | callgrind `main` |
-+| --- | --- | --- | --- | --- |
-+| shipped pass (baseline) | 44-45, `imul` in loop | **1,132,825** | **1,252,502** | **1,100,994** |
-+| index recurrence (new value, base kept live) | 44, no `imul` | 1,202,829 | 1,311,939 | 1,140,994 |
-+| pointer recurrence extended to the intrinsics | 42, no `imul`, pointer walk | 1,154,820 | 1,272,498 | 1,108,990 |
-+| `gcc -O2` reference | 28 | - | 883,838 | - |
++---
 +
-+Both instruments agree on the sign and the magnitude, and the baseline
-+reproduces bit-identically after the reverted work.
++## 3. What changed
 +
-+### Why the index recurrence loses
++| File | Change |
++| --- | --- |
++| `src/backend/x86/codegen/peephole/passes/flag_peepholes.rs` | `TestFlagAgreement` enum + `test_flag_agreement` classifier; the producer list extended to `add/sub/inc/dec/neg` (long and 32-bit forms); one unified ZF-only consumer proof; 8 new unit tests |
++| `tests/regression/check_self_test_after_arith.sh` | **new** end-to-end gate: matcher self-test, positive fold check, in-binary negative control, runtime differential against GCC at four optimisation levels |
++| `scripts/ci_local.sh` | gate `self-test-after-arith` added to the fast set |
++| `.github/workflows/ci.yml` | matching hosted step (keeps `check_ci_gate_parity.py` green: 112 commands) |
 +
-+The recurrence is cheap (one `add` per iteration), but the pass pays for it in
-+registers, and the multiply it removes was almost free to begin with: the
-+backend's SIB addressing absorbs an index register at no instruction cost, so
-+`base + (k*56)` is one memory operand either way.  Measured in the emitted loop,
-+the transform replaces `movslq; imulq $56` (2 instructions, both in the SIB
-+path) with `leaq base+idx; addq $56` plus one more live value across the whole
-+nest.  Register pressure then shows up as an extra spill in the surrounding
-+loops, and the net is +6.2 %.
++### 3.1 Perfected relative to the fragment
 +
-+### Why extending the pointer form still loses
++* **Named classification.** The fragment's `(prod_wide, is_logical, is_arith)`
++  triple of booleans became `Option<(bool, TestFlagAgreement)>` with
++  `Exact`/`ZeroOnly` variants: the legality argument is now a name in the type
++  system instead of a comment.
++* **One proof, not two.** See §2.3. The fragment computed
++  `walk_flag_consumers` for the arithmetic guard and `flag_consumers_are_zf_only`
++  (which calls the same walk) for the width guard, so an arithmetic producer
++  under a mismatched-width test walked the flag flow twice per candidate.
++* **Cheapest guard first.** Classification → width → the between-instruction
++  scan → the walk. All four are conjunctive, so the reordering is
++  behaviour-preserving and only skips work.
++* **`saw_consumer` documented as a deliberate choice.** A flags-dead test is
++  removed by the dead-flag passes; requiring a consumer here keeps the fold's
++  proof obligation explicit.
 +
-+The pointer form is the right shape -- it is what GCC emits (`addq $56, %rax`
-+with `disp(%rax)` accesses) -- and it does shrink the hot loop from 45 to 42
-+instructions with the multiply gone entirely.  It loses anyway, because the seed
-+for a nested loop's pointer is computed in the *enclosing* loop body: the
-+k-loop's start address depends on `j`, so `(j+1) * 56 + bodies` is materialized
-+once per j-iteration where the old code recomputed it inside the k-loop.  The
-+k-loop saves 2 instructions per k-iteration, the j-loop body grows by 3 per
-+j-iteration, and the measured total rises 1.9 %.
++---
 +
-+## Consequences for the pass
++## 4. Evidence
 +
-+IVSR keeps its pointer form and its existing consumer matcher.  The matched
-+consumer set is deliberately not widened until a replacement pays for itself:
-+with the current backend, a new loop-carried value costs more than the address
-+arithmetic it removes, unless the value replaces *multiple* separate
-+computations or the loop is register-rich.
++### 4.1 Unit tests (measured)
 +
-+## Where the nbody gap actually is
-+
-+The multiply is 2 instructions of a 45-instruction loop; GCC's loop is 28.  The
-+difference is elsewhere, and it is worth 4 instructions per iteration alone:
-+
-+```asm
-+; lccc: lane 0 and lane 1 of the vector are extracted through the stack
-+movsd  %xmm15, -144(%rbp)
-+pshufd $0x0E, %xmm15, %xmm0
-+movsd  %xmm0, -152(%rbp)
-+movsd  -144(%rbp), %xmm5        ; reload
-+movsd  -152(%rbp), %xmm1        ; reload
++```
++$ cargo test --profile fastbuild --lib -- flag_peephole
++test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 3839 filtered out
 +```
 +
-+GCC keeps the extraction in registers (`vunpckhpd`/`vmovddup`).  Two further
-+items of the same order: the loop-invariant `lea bodies(%rip), %rcx` is
-+re-materialized every iteration instead of being hoisted, and the scalar `dz`
-+component is reloaded from the array rather than derived.  Those three are the
-+next lever; each has a measured or counted cost, unlike the multiply this pass
-+chases.
++Eight are new: `self_test_after_counter_sub_is_removed_for_zf_consumer`,
++`..._add_dec_neg_is_removed_for_zf_consumer`,
++`..._sub_is_kept_for_carry_overflow_or_sign_consumers` (10 predicates),
++`..._sub_is_kept_when_a_later_edge_reads_carry`,
++`..._wide_sub_is_kept_under_a_narrow_test`,
++`..._sub_is_kept_for_a_whole_flags_reader`,
++`..._sub_is_kept_when_the_register_is_touched_between`,
++`..._sub_is_kept_when_a_branch_enters_at_the_test`.
 +
-+## Measurement methodology notes
++### 4.2 Emitted code (measured)
 +
-+Two traps cost most of the debugging time in this campaign and are worth
-+recording:
++`int countdown(int n) { int c = 0; while (--n) { c++; } return c; }` at `-O2`:
 +
-+* Translation-cache tracing attributes one loop iteration to *two* blocks when
-+  qemu splits or re-translates a block (`45 x 12000` plus `48 x 8000` for a
-+  20,000-iteration loop).  A block-level profile from such a log can therefore
-+  report a loop as *larger* than it is.  Totals are reliable; per-block sizes
-+  across two builds are not comparable unless the block structure is identical.
-+* `callgrind` profile files compress positions (`+N` deltas) **and** names (an id
-+  table that a bare `fn=(id)` refers back to), and they contain both `fn=` self
-+  sections and caller-context sections that repeat the same instructions.  A
-+  hand-written reader that ignores either detail double counts the program.
-+  `callgrind_annotate` is the authoritative reader; use it for totals.
-diff --git a/src/ir/instruction.rs b/src/ir/instruction.rs
-index fad246ec..5060dc5f 100644
---- a/src/ir/instruction.rs
-+++ b/src/ir/instruction.rs
-@@ -1114,6 +1114,51 @@ impl Instruction {
-     }
++```diff
++ .LBB1:
++     subl $1, %edi
++-    testl %edi, %edi
++ je .LBB3
++```
++
++One instruction per iteration, in the hot path, on the shape that is the
++canonical countdown loop. The same transformation fires for `do { } while
++(--n)` and for the unsigned counter.
++
++### 4.3 Mutation test of the gate (measured)
++
++A second compiler was built with the pass reverted (`git stash` of the single
++file, `scripts/build_lccc_fast.sh`), and the new gate run against it:
++
++```
++$ CCC=…/lccc-fold-OFF bash tests/regression/check_self_test_after_arith.sh
++FAIL structural:
++  -O2 c_while: redundant self-test survived a ZF-only consumer: subl $1, %edi ;; testl %edi, %edi
++  -O2 c_do: redundant self-test survived a ZF-only consumer: subl $1, %edi ;; testl %edi, %edi
++  -O2 c_unsigned: redundant self-test survived a ZF-only consumer: subl $1, %edi ;; testl %edi, %edi
++```
++
++and against the shipped compiler it passes. A gate that cannot fail is not a
++gate; this one was shown to fail on exactly the regression it exists for.
++
++### 4.4 Build reproducibility (measured)
++
++Two independent `scripts/build_lccc_fast.sh` runs of the same tree produced
++byte-identical `target/fastbuild/lccc` (`cmp` clean), which is what makes the
++A/B in §4.5 an A/B of the *change* and not of the build.
++
++### 4.5 Corpus A/B under Callgrind (measured)
++
++`scripts/callgrind_ab.py` compiles the benchmark corpus twice — once with the
++pre-change compiler (`lccc-base`) and once with the shipped one (`lccc-new`) —
++checks that both binaries print identical output, then runs both under
++Callgrind (`--cache-sim=yes --branch-sim=yes`) and reports simulated
++instruction counts, which are deterministic, unlike wall time on a shared
++2-vCPU VM with no PMU.
++
++Full table: `engineering/evidence/SELFTEST-ARITH-1/callgrind-corpus-ab.md`
++(31 programs, every pair of binaries checked for identical output first).
++
++**Result: one row improves, nothing regresses.**
++
++| benchmark | Ir base | Ir new | new/base |
++| --- | ---: | ---: | ---: |
++| `zlib_ng_adler32` | 396,349,526 | 383,790,936 | **0.96831** |
++| 30 others | — | — | 1.00000 (±1.5e-5 layout noise on five of them) |
++| **geomean (all 31)** | | | **0.99896** |
++
++The single improving row is not a coincidence of the metric: it is the
++`zlib-ng` adler32 kernel, a workload the request named explicitly, and the
++entire difference between the two compilers on that program is **one
++instruction**:
++
++```diff
++     subl $1, %ebx
++     movq %r8, %rdi
++     movq %r10, %r9
++-    testl %ebx, %ebx
++ jne .LBB13
++```
++
++One instruction removed from a loop body, executed 12,558,590 times —
++12,558,590 / 396,349,526 = 3.17%. That is the whole optimisation, measured
++end-to-end on a real extracted workload: **−3.17% executed instructions on
++zlib-ng's adler32**, and a zero-delta everywhere else in the corpus.
++
++The ±1.5e-5 rows are *not* the fold: they move by 6–15 instructions out of
++117 k–2.9 G (`.p2align` padding shifts the text and changes a downstream
++branch-distance decision), which is exactly the noise floor of an
++instruction-count metric that includes alignment.
++
++### 4.6 Runtime differential (measured)
++
++The new gate's runtime half builds one program with lccc at `-O0`, `-O1`,
++`-O2`, `-O3` and with GCC at `-O2`, and requires identical output over the
++counter values that a wrong proof would break: the last iteration, the 32-bit
++sign flip at `0x80000000`, and the unsigned wrap points:
++
++```
++PASS runtime: lccc -O0/-O1/-O2/-O3 agree with gcc -O2 (2147553620)
++```
++
++### 4.7 Oracle survey (measured)
++
++`scripts/codegen_oracle.py --rank` (Godbolt: GCC 16.2, Clang 23.1, ICC 2021.10,
++ICX latest) over the workload kernels named in the request, plus
++`--all-functions` for the worst row:
++
++```
++  gap benchmark         function                  insns  loads store spill brnch call  best
++   58 expat_xml_scan    main                        152     35     7    17    34    4  gcc16.2=94  <-- CALLS DIFFER
++   -8 expat_xml_scan    expat_utf8_name_length       70      8     0     0    24    0  gcc16.2=78
++   43 sqlite_varint    main                        181     35     7    22    30    5  clang=138   <-- CALLS DIFFER
++    6 sqlite_varint    sqlite_get_varint           121     10     9     0    17    0  clang=115
++   41 zstd_count       main                        132     20     4     8    22    1  gcc16.2=91
++```
++
++Read honestly, and with the tool's own warning applied (3 of 7 rows compare
++functions with different call counts, so their "gap" is an inlining decision,
++not code generation):
++
++* the **extracted kernel** of the expat scan is 8 instructions *ahead* of GCC
++  16.2 and 70 instructions where GCC needs 78 — the 58-instruction "gap" in
++  that program is entirely in its `main` driver;
++* `sqlite_get_varint` is 6 instructions behind Clang (121 vs 115) with the same
++  call count — a real, comparable gap and a candidate for the next session;
++* nothing here is a claim about speed: instruction count is the weaker signal
++  and the project treats it as such (`docs/GODBOLT_ORACLE.md`).
++
++### 4.8 Pre-existing defect cross-check (measured)
++
++The lost session's saved `work/regression.json` recorded a *miscompile*:
++`fp_liveness_ptr_deref_alias_negative`, `lccc: '3 1'` against `gcc: '3 3'`.
++That probe now lives inside `tests/regression/memcpy_unaligned_load_fwd.c`
++(its comment names the case), and on this base it is green at every level:
++
++```
++-O0: OK memcpy_unaligned_load_fwd 1d6b8ba3cbf662d5
++-O1: OK memcpy_unaligned_load_fwd 1d6b8ba3cbf662d5
++-O2: OK memcpy_unaligned_load_fwd 1d6b8ba3cbf662d5
++-O3: OK memcpy_unaligned_load_fwd 1d6b8ba3cbf662d5
++gcc -O2: OK memcpy_unaligned_load_fwd 1d6b8ba3cbf662d5
++```
++
++i.e. the defect recorded in that artifact was fixed upstream between sessions;
++it is verified here rather than assumed.
++
++---
++
++## 5. Not measured (stated, not implied)
++
++* **No hardware counters.** The host has no PMU and no `perf`; there are no
++  cycles/IPC numbers in this document and none are implied. Callgrind's `Ir` is
++  a deterministic *simulated* instruction count, which is why it is used for
++  A/B decisions here, and it is not a wall-clock claim.
++* **No end-to-end package A/B in this session.** The `zlib-ng`/`gzip`/`expat`
++  workload harness exists (`tests/workloads/`), and the *extracted kernels*
++  (`zlib_ng_adler32`, `gzip_crc32`, `expat_xml_scan`, `sqlite_varint`,
++  `glibc_memcmp`, …) are part of the corpus A/B in §4.5; the full-project A/B
++  was not run in this session and is listed in §6.
++* **i686 is not covered by the new fold.** See §6.1 — the i686 peephole is a
++  separate implementation that deliberately refuses arithmetic producers, and
++  giving it the same proof needs a flag-flow walk it does not have yet.
++
++---
++
++## 6. To-do, in priority order
++
++### 6.1 i686 mirror of the fold (high value, medium effort)
++
++`src/backend/i686/codegen/peephole.rs:7234` (`eliminate_redundant_test_i686`)
++does the logical-producer fold with a **purely local** proof (producer adjacent
++to the test, same size, same destination text) and its doc comment states the
++reason it stops there: *"ADD/SUB/NEG set CF/OF from carry — neither matches
++TEST's flag contract."* That is correct as far as it goes — what is missing is
++the consumer walk that turns "matches exactly" into "matches on ZF, and only ZF
++is read".
++
++Concretely, the counter loop on i686 is still
++
++```
++.LBB1:
++    decl %edx
++    testl %edx, %edx        <-- removable: the `decl` already set ZF
++    je .LBB3
++```
++
++Design: hoist the x86-64 walk into a shared, backend-neutral module (the
++walker only needs `LineStore`/`LineInfo`, a label table, `flags_effect` and
++`condition_code_of`) and call it from the i686 pass with the same
++`flag_consumers_are_zf_only` predicate. The i686 backend has boot-size gates
++(`check_i686_*`, the kernel boot corpus) that will quantify it; the same
++`check_self_test_after_arith.sh` structure ports directly (`-m32`).
++Do **not** copy the walk — two implementations of a soundness proof is two
++places to drift.
++
++### 6.2 Shift producers (low effort, same proof)
++
++`shl`/`shr`/`sar` write ZF/SF/PF from the result and leak CF/OF from the bits
++shifted out — the same ZF-only situation as the arithmetic forms, so
++`shll $1, %esi; testl %esi, %esi; je` is foldable with the identical guard.
++One entry in the `ARITHMETIC`-style table plus a test; the walk is already
++there. Check `shl $0`-style immediates and count-in-`%cl` forms against the SDM
++before enabling.
++
++### 6.3 Counted-loop closing (highest ceiling, highest effort)
++
++The §4.2 reproducer still emits a rolled loop, while GCC 16.2 closes it
++completely:
++
++```
++GCC:    leal -1(%rdi), %eax ; ret
++LCCC:   .LBB1: subl $1,%edi ; je .LBB3 ; .LBB2: addl $1,%esi ; jmp .LBB1
++```
++
++GCC recognises `c++` over the countdown as an affine function of `n` and
++deletes the loop. That is a ScalarEvolution-style trip-count/induction
++analysis, not a peephole, and it is the largest *visible* codegen gap in this
++session's reproducer. This is where the next big win is.
++
++### 6.4 Loop rotation (medium value, low risk)
++
++Every lccc loop in this session's output ends in an unconditional `jmp` back to
++the header. Rotating the loop (test at the bottom, entry guard in the
++preheader) removes one taken branch per iteration on every loop in the corpus.
++`peephole/passes/loop_trampoline.rs` and the loop-preheader pass exist; the
++question to answer first is *why* rotation does not fire on these shapes.
++
++### 6.5 Oracle survey for the next gap
++
++`scripts/codegen_oracle.py --rank tests/benchmark/programs/*.c` (worst
++instruction-count gaps against GCC 16.2 / Clang 23.1 / ICC / ICX) is the
++standing "find the next big win" instrument; run it at the start of the next
++session and take the top rows in order, rather than starting from this list.
++
++### 6.6 Workload-level A/B
++
++`tests/workloads/{gzip-1.14,zlib-ng-2.3.3}` and the `expat`/`sqlite` kernels
++already exist with provenance and pinned digests. The open item is a *paired*
++A/B of a full package build between two compiler revisions (`lccc-base` vs
++`lccc-new` in this session's naming), with the same deterministic inputs, so
++that peephole-level wins can be seen — or honestly reported as lost — at
++package granularity.
++
++### 6.7 Already done, do not redo
++
++* **Linker oracles.** `tools/linker/setup_oracles.sh` already pins exactly the
++  requested set — bfd 2.47, mold 2.42.1, LLVM lld 23.1.x, `wild` at git HEAD —
++  and already uses the mold preset I went looking for independently:
++  `-DMOLD_TARGETS='X86_64;I386'` (mold's `CMakeLists.txt` instantiates every
++  template source once per listed target;
++  the comment marks it "strongly discouraged … unless you build mold
++  frequently for your personal use", which is this host's case, and `X86_64`
++  must stay first because `MOLD_FIRST_TARGET` is the default target of the
++  built binary). No change needed; verified, not assumed.
++* **The workload corpus.** `gzip`, `zlib-ng`, `expat`, `sqlite`, the Linux
++  find-bit path and `glibc`'s `memcmp` are already extracted with source
++  digests and licences (`tests/benchmark/WORKLOAD_PROVENANCE.md`), so the
++  "extend the corpus" item from earlier sessions is closed for those projects;
++  §6.6 is the remaining, different work.
+diff --git a/engineering/evidence/SELFTEST-ARITH-1/adler32-asm-diff.md b/engineering/evidence/SELFTEST-ARITH-1/adler32-asm-diff.md
+new file mode 100644
+index 00000000..820efe94
+--- /dev/null
++++ b/engineering/evidence/SELFTEST-ARITH-1/adler32-asm-diff.md
+@@ -0,0 +1,12 @@
++```
++$ diff -u <(lccc-base -O2 -S zlib_ng_adler32.c) <(lccc-new -O2 -S zlib_ng_adler32.c)
++--- /tmp/zl.base.s
+++++ /tmp/zl.new.s
++@@ -185,7 +185,6 @@
++     subl $1, %ebx
++     movq %r8, %rdi
++     movq %r10, %r9
++-    testl %ebx, %ebx
++ jne .LBB13
++ .LBB14:
++```
+diff --git a/engineering/evidence/SELFTEST-ARITH-1/callgrind-corpus-ab.md b/engineering/evidence/SELFTEST-ARITH-1/callgrind-corpus-ab.md
+new file mode 100644
+index 00000000..6e00ee16
+--- /dev/null
++++ b/engineering/evidence/SELFTEST-ARITH-1/callgrind-corpus-ab.md
+@@ -0,0 +1,37 @@
++
++| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | IL miss m/r | Bcmisp m/r | Bimisp m/r |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
++| arith_loop | 1,020,117,966 | 1,020,117,966 | 1.00000 | 1306/1306 | 1283/1283 | 2783/2782 | 177/177 |
++| fib | 118,215 | 118,201 | 0.99988 | 1290/1290 | 1267/1267 | 2790/2790 | 177/177 |
++| matmul | 18,279,816 | 18,279,816 | 1.00000 | 1381/1381 | 1358/1358 | 68979/68978 | 179/179 |
++| sieve | 152,097,959 | 152,097,959 | 1.00000 | 1302/1302 | 1275/1275 | 3846/3846 | 189/189 |
++| tce_sum | 117,948 | 117,934 | 0.99988 | 1289/1289 | 1266/1266 | 2774/2774 | 178/178 |
++| spectral_norm | 1,921,303,241 | 1,921,303,241 | 1.00000 | 1350/1350 | 1327/1327 | 82939/82939 | 178/178 |
++| switch_dispatch | 1,118,868,208 | 1,118,868,194 | 1.00000 | 1292/1292 | 1269/1269 | 2775/2775 | 46875307/46875307 |
++| struct_copy | 226,120,074 | 226,120,060 | 1.00000 | 1388/1388 | 1365/1365 | 2875/2875 | 179/179 |
++| loop_patterns | 233,060,515 | 233,060,515 | 1.00000 | 1313/1313 | 1298/1298 | 2933/2933 | 181/181 |
++| ackermann | 117,808 | 117,808 | 1.00000 | 1287/1287 | 1264/1264 | 2770/2770 | 177/177 |
++| constant_recursion | 117,821 | 117,827 | 1.00005 | 1290/1290 | 1267/1267 | 2772/2770 | 177/177 |
++| bitops | 2,950,119,213 | 2,950,119,213 | 1.00000 | 1293/1293 | 1270/1270 | 2811/2810 | 178/178 |
++| double_reduction | 280,094,757 | 280,094,782 | 1.00000 | 1302/1299 | 1279/1276 | 3077/3076 | 178/178 |
++| ascii_case_fold | 2,522,583 | 2,522,569 | 0.99999 | 1105/1105 | 1090/1090 | 2648/2648 | 163/163 |
++| binary_search | 574,297 | 574,297 | 1.00000 | 1102/1102 | 1087/1087 | 5300/5300 | 163/163 |
++| ring_fifo | 594,120 | 594,120 | 1.00000 | 1101/1101 | 1086/1086 | 2641/2641 | 163/163 |
++| histogram | 4,179,146 | 4,179,146 | 1.00000 | 1102/1102 | 1087/1087 | 2656/2656 | 163/163 |
++| gzip_crc32 | 545,379,081 | 545,379,081 | 1.00000 | 1301/1301 | 1278/1278 | 2886/2885 | 178/178 |
++| libm_round_family | 1,720,906,205 | 1,720,906,205 | 1.00000 | 1384/1384 | 1360/1360 | 22940/22940 | 188/188 |
++| tls_seg_access | 145,518,298 | 145,518,298 | 1.00000 | 1295/1295 | 1272/1272 | 202810/202809 | 183/183 |
++| zlib_ng_adler32 | 396,349,526 | 383,790,936 | 0.96831 | 1314/1314 | 1291/1291 | 21045/21045 | 178/178 |
++| expat_xml_scan | 686,010,903 | 686,010,903 | 1.00000 | 1302/1302 | 1279/1279 | 6064483/6064482 | 177/177 |
++| sqlite_varint | 364,149,447 | 364,149,447 | 1.00000 | 1312/1312 | 1289/1289 | 5245812/5245812 | 233195/233195 |
++| linux_find_bit | 181,626,205 | 181,626,205 | 1.00000 | 1295/1295 | 1272/1272 | 265231/265231 | 177/177 |
++| glibc_memcmp | 88,236,312 | 88,236,321 | 1.00000 | 1300/1301 | 1277/1278 | 11867/11869 | 177/177 |
++| chacha20_block | 1,117,900,733 | 1,117,900,733 | 1.00000 | 1311/1311 | 1288/1288 | 2099991/2099990 | 180/180 |
++| sha256_transform | 3,384,924,806 | 3,384,924,831 | 1.00000 | 1330/1327 | 1307/1304 | 2099995/2099994 | 181/181 |
++| linux_rbtree | 21,851,476 | 21,851,490 | 1.00000 | 1309/1309 | 1286/1286 | 1045862/1045863 | 180/180 |
++| zstd_count | 108,777,282 | 108,777,282 | 1.00000 | 1304/1304 | 1281/1281 | 133987/133986 | 180/180 |
++| lz4_compress | 24,304,979 | 24,304,993 | 1.00000 | 1328/1328 | 1303/1303 | 232376/232377 | 191/191 |
++| qsort | 464,195,389 | 464,195,389 | 1.00000 | 1339/1339 | 1318/1318 | 10823677/10823677 | 190/190 |
++
++geomean Ir mine/ref = 0.99896
++EXIT=0
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 59fc4aad..48dfc8ba 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -427,6 +427,18 @@ gate "multi-entry-loop" fast \
+ gate "redundant-flags-compare" fast \
+     env CCC=target/fastbuild/lccc bash tests/regression/check_redundant_flags_compare.sh
+ 
++# `subl $1, %R; testl %R, %R; jne` -- the downward counter loop -- is one
++# instruction of pure overhead, because the subtraction already set ZF.  The
++# arithmetic producer only agrees with `test` on ZF, so the fold is licensed by
++# a consumer walk instead of by flag equality, and this gate pins both halves:
++# the pair must be gone for ZF-only consumers and must SURVIVE for the
++# sign-carrying `while ((n -= 3) > 0)` control in the same binary.  It also
++# self-tests its own matcher and the runtime result against GCC at four
++# optimisation levels -- an optimisation gate whose pattern matcher quietly
++# stopped matching would otherwise pass forever.
++gate "self-test-after-arith" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_self_test_after_arith.sh
++
+ # A gate must not report a FAILURE that did not happen.  Under `set -o
+ # pipefail` a consumer that stops reading early (`head`, `grep -q`) kills its
+ # producer with SIGPIPE and the pipeline then reports 141, so `if ... | grep -q`
+diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+index 01256e51..cd8959c3 100644
+--- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
++++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+@@ -1368,7 +1368,60 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
+     changed
  }
  
-+/// Replace every read of `old` in `inst` with `new_op`.
+-// ── 5. redundant self-test after a logical op ────────────────────────────────
++// ── 5. redundant self-test after a logical or arithmetic op ──────────────────
++
++/// How a flag producer's EFLAGS compare with a `test` of its own result.
 +///
-+/// Both visitor kinds are required and neither is redundant:
-+/// [`Instruction::for_each_operand_mut`] covers the `Operand` slots (binary and
-+/// unary operands, GEP offsets, store values, call and intrinsic arguments),
-+/// while [`Instruction::for_each_value_use_mut`] covers the bare `Value` slots
-+/// (`GetElementPtr.base`, `Load.ptr`, `dest_ptr`, ...) that a pass substituting
-+/// a *value* must redirect as well.  Hand-rolled `match` arms over the
-+/// instruction enum are how the two get out of sync: a shape nobody remembered
-+/// to list keeps reading the replaced value, and the resulting IR still
-+/// validates because the stale read is a value that is still defined.
++/// The distinction is the whole legality argument of the fold below, so it is
++/// named rather than spelled as a pair of booleans at the use site.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum TestFlagAgreement {
++    /// CF and OF too: `and`/`or`/`xor` clear both, exactly like `test`.
++    Exact,
++    /// ZF alone (`sub`, `add`, `inc`, `dec`, `neg`): the arithmetic forms take
++    /// CF from the carry/borrow and OF from the overflow, where `test` clears
++    /// both, and they define AF from the borrow where `test` leaves it. SF and
++    /// PF agree at equal widths only, which the width rule below covers.
++    ZeroOnly,
++}
++
++/// Classify a producer line for [`eliminate_redundant_self_test`]: its operand
++/// width, and how closely its flags match a `test` of its own result. `None`
++/// for anything that is not a producer this fold may use — including a byte
++/// form (`addb`, `negb`), which writes only the low byte.
 +///
-+/// This is the single canonical implementation; the passes that rewrite
-+/// induction-variable uses share it rather than keeping private copies.
-+pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand) {
-+    let new_val = match new_op {
-+        Operand::Value(v) => Some(v),
-+        Operand::Const(_) => None,
-+    };
-+    inst.for_each_operand_mut(|op| {
-+        if matches!(op, Operand::Value(v) if *v == old) {
-+            *op = new_op;
-+        }
-+    });
-+    // A constant cannot stand in a bare `Value` slot, so those slots are left
-+    // alone: replacing `base` with a constant would need a materialization this
-+    // helper has nowhere to put.
-+    if let Some(nv) = new_val {
-+        inst.for_each_value_use_mut(|field| {
-+            if *field == old {
-+                *field = nv;
-+            }
-+        });
++/// The list is deliberately exhaustive over the forms whose flag semantics are
++/// flag-for-flag known; an unrecognised producer falls back to "no fold", the
++/// same default-deny the rest of this module uses.
++fn test_flag_agreement(text: &str) -> Option<(bool, TestFlagAgreement)> {
++    const LOGICAL: &[(&str, bool)] = &[
++        ("andq ", true),
++        ("orq ", true),
++        ("xorq ", true),
++        ("andl ", false),
++        ("orl ", false),
++        ("xorl ", false),
++    ];
++    const ARITHMETIC: &[(&str, bool)] = &[
++        ("addq ", true),
++        ("subq ", true),
++        ("incq ", true),
++        ("decq ", true),
++        ("negq ", true),
++        ("addl ", false),
++        ("subl ", false),
++        ("incl ", false),
++        ("decl ", false),
++        ("negl ", false),
++    ];
++    if let Some((_, wide)) = LOGICAL.iter().find(|(p, _)| text.starts_with(p)) {
++        return Some((*wide, TestFlagAgreement::Exact));
 +    }
++    ARITHMETIC
++        .iter()
++        .find(|(p, _)| text.starts_with(p))
++        .map(|(_, wide)| (*wide, TestFlagAgreement::ZeroOnly))
 +}
-+
-+/// Replace every read of `old` in a terminator with `new_op`.
-+pub fn replace_terminator_value(term: &mut Terminator, old: Value, new_op: Operand) {
-+    term.for_each_operand_mut(|op| {
-+        if matches!(op, Operand::Value(v) if *v == old) {
-+            *op = new_op;
-+        }
-+    });
-+}
-+
- impl Terminator {
-     /// Mutably visit every Operand stored in this terminator.
-     #[inline]
-@@ -1160,6 +1205,79 @@ impl Terminator {
-     }
- }
  
-+#[cfg(test)]
-+mod value_replacement_tests {
-+    use super::*;
-+
-+    fn gep(dest: u32, base: u32, offset: u32) -> Instruction {
-+        Instruction::GetElementPtr {
-+            dest: Value(dest),
-+            base: Value(base),
-+            offset: Operand::Value(Value(offset)),
-+            ty: IrType::I8,
-+        }
-+    }
-+
-+    #[test]
-+    fn replaces_operand_and_bare_value_slots_together() {
-+        // The GEP reads the old value in BOTH shapes: `offset` is an Operand
-+        // slot, `base` is a bare Value field.  A replacement that handles only
-+        // one of them leaves the instruction reading the old value.
-+        let mut inst = gep(1, 7, 7);
-+        replace_operand_value(&mut inst, Value(7), Operand::Value(Value(42)));
-+        match inst {
-+            Instruction::GetElementPtr { base, offset, .. } => {
-+                assert_eq!(base, Value(42), "bare Value slot must be redirected");
-+                assert_eq!(
-+                    offset,
-+                    Operand::Value(Value(42)),
-+                    "Operand slot must be redirected"
-+                );
-+            }
-+            _ => unreachable!(),
-+        }
-+    }
-+
-+    #[test]
-+    fn leaves_unrelated_values_alone() {
-+        let mut inst = gep(1, 7, 8);
-+        replace_operand_value(&mut inst, Value(9), Operand::Value(Value(42)));
-+        match inst {
-+            Instruction::GetElementPtr { base, offset, .. } => {
-+                assert_eq!(base, Value(7));
-+                assert_eq!(offset, Operand::Value(Value(8)));
-+            }
-+            _ => unreachable!(),
-+        }
-+    }
-+
-+    #[test]
-+    fn constant_replacement_leaves_bare_value_slots_untouched() {
-+        // `Operand::Const` has no `Value` form, so the bare slots must survive
-+        // unchanged -- rewriting them to a placeholder would invert the pass's
-+        // intent (and would not be a value at all).
-+        let mut inst = gep(1, 7, 7);
-+        replace_operand_value(&mut inst, Value(7), Operand::Const(IrConst::I64(3)));
-+        match inst {
-+            Instruction::GetElementPtr { base, offset, .. } => {
-+                assert_eq!(base, Value(7));
-+                assert_eq!(offset, Operand::Const(IrConst::I64(3)));
-+            }
-+            _ => unreachable!(),
-+        }
-+    }
-+
-+    #[test]
-+    fn terminator_operands_are_replaced() {
-+        let mut term = Terminator::Return(Some(Operand::Value(Value(5))));
-+        replace_terminator_value(&mut term, Value(5), Operand::Value(Value(6)));
-+        match term {
-+            Terminator::Return(Some(Operand::Value(v))) => assert_eq!(v, Value(6)),
-+            _ => panic!("return operand must be redirected"),
-+        }
-+    }
-+}
-+
- #[cfg(test)]
- mod direct_value_mutation_tests {
-     use super::*;
-diff --git a/src/passes/iv_widen.rs b/src/passes/iv_widen.rs
-index b6b8b9c3..1dc1cb9b 100644
---- a/src/passes/iv_widen.rs
-+++ b/src/passes/iv_widen.rs
-@@ -126,7 +126,9 @@ use crate::common::types::IrType;
- use crate::ir::analysis::{CfgAnalysis, FlatAdj};
- use crate::ir::constants::IrConst;
- use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value};
--use crate::ir::reexports::{BlockId, IrBinOp, IrCmpOp, IrFunction};
-+use crate::ir::reexports::{
-+    BlockId, IrBinOp, IrCmpOp, IrFunction, replace_operand_value, replace_terminator_value,
-+};
- use crate::passes::loop_analysis::{
-     DominanceChecker, NaturalLoop, find_natural_loops, merge_loops_by_header,
- };
-@@ -2146,10 +2148,10 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
-         // 64-bit slot.
-         for inst in func.blocks[bi].instructions.iter_mut() {
-             if escape_read_needs_narrow(inst, member, wide_ty) {
--                rewrite_operand_value(inst, member, Operand::Value(narrow));
-+                replace_operand_value(inst, member, Operand::Value(narrow));
+ /// `andl $1, %esi; testq %rsi, %rsi; je` → `andl $1, %esi; je`.
+ ///
+@@ -1381,6 +1434,14 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
+ /// Width rule: a 32-bit logical op zero-extends, so ZF is identical for the
+ /// 64-bit test, but SF is not (bit 31 vs bit 63). When the widths differ the
+ /// fold is therefore only applied if every consumer of the flags tests ZF.
++///
++/// Arithmetic producer: `subl $1, %esi; testl %esi, %esi; je` is the same one
++/// instruction of pure overhead — the decrement already set ZF — and it is the
++/// shape every downward counter loop compiles to (`while (--n)`,
++/// `for (; n--;)`, `while (n -= step)`), so it is worth the stricter proof. The
++/// producer agrees with the test on ZF/SF/PF only, so the fold is taken
++/// exclusively when [`flag_consumers_are_zf_only`] proves that every consumer
++/// of the flags reads ZF; see [`TestFlagAgreement::ZeroOnly`].
+ #[expect(clippy::needless_range_loop)]
+ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+     let len = store.len();
+@@ -1439,21 +1500,11 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
+             j += 1;
+             continue;
+         };
+-        // Only logical ops reproduce a `test`'s flag state exactly.
+-        let (prod_wide, is_logical) = if ptext.starts_with("andq ")
+-            || ptext.starts_with("orq ")
+-            || ptext.starts_with("xorq ")
+-        {
+-            (true, true)
+-        } else if ptext.starts_with("andl ")
+-            || ptext.starts_with("orl ")
+-            || ptext.starts_with("xorl ")
+-        {
+-            (false, true)
+-        } else {
+-            (false, false)
++        let Some((prod_wide, agreement)) = test_flag_agreement(ptext) else {
++            j += 1;
++            continue;
+         };
+-        if !is_logical || get_dest_reg(&infos[pidx]) != fam {
++        if get_dest_reg(&infos[pidx]) != fam {
+             j += 1;
+             continue;
+         }
+@@ -1464,7 +1515,9 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
+             continue;
+         }
+         // Anything between the producer and the test must leave both the flags
+-        // and the register alone.
++        // and the register alone. (Labels are barriers, so the scan above
++        // already guarantees this run is a straight-line window with no other
++        // entry point onto the test.)
+         for n in pidx + 1..j {
+             if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+                 continue;
+@@ -1479,18 +1532,42 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
+             j += 1;
+             continue;
+         }
+-        // With mismatched widths only ZF survives unchanged.
+-        if prod_wide != test_wide {
+-            let Some((fstart, fend)) = function_range(store, infos, j) else {
+-                j += 1;
+-                continue;
+-            };
+-            if !flags_are_block_local(store, infos, fstart, fend)
+-                || !flag_consumers_are_zf_only(store, infos, j + 1)
+-            {
++        // What separates the two producer classes is which flags the test may
++        // be replaced in: `and`/`or`/`xor` clear CF and OF exactly as the test
++        // does, while an arithmetic producer takes both from the operation, so
++        // it needs the flags to be read as ZF alone -- the same proof a width
++        // change needs, because a 32-bit producer zero-extends (ZF survives
++        // into the wide test) while SF does not (bit 31 vs bit 63).
++        //
++        // `flag_consumers_are_zf_only` is the whole proof, including the
++        // whole-EFLAGS readers: `lahf`, `pushf`, inline asm and unknown
++        // mnemonics have no condition code, so the walk charges them with
++        // `saw_non_zf` before either caller looks. That matters here because
++        // they are exactly the readers that can observe AF, which an
++        // arithmetic producer defines from the borrow and the test does not
++        // touch at all. The walk follows the TAKEN edge of every conditional
++        // jump, so a consumer in a block the fall-through never reaches still
++        // counts, and it reports `proved = false` rather than guessing when a
++        // target cannot be resolved.
++        if agreement == TestFlagAgreement::ZeroOnly || prod_wide != test_wide {
++            if !flag_consumers_are_zf_only(store, infos, j + 1) {
+                 j += 1;
+                 continue;
              }
++            if prod_wide != test_wide {
++                // Losing SF is a whole-function property, not a property of
++                // this straight-line run: verify the convention that flags do
++                // not cross a block boundary before relying on the consumer
++                // walk's reachability.
++                let Some((fstart, fend)) = function_range(store, infos, j) else {
++                    j += 1;
++                    continue;
++                };
++                if !flags_are_block_local(store, infos, fstart, fend) {
++                    j += 1;
++                    continue;
++                }
++            }
          }
--        rewrite_terminator_value(
-+        replace_terminator_value(
-             &mut func.blocks[bi].terminator,
-             member,
-             Operand::Value(narrow),
-@@ -2370,9 +2372,9 @@ fn value_still_used(func: &IrFunction, val: Value) -> bool {
- fn replace_all_uses_of_value(func: &mut IrFunction, old_val: Value, new_op: Operand) {
-     for b in &mut func.blocks {
-         for inst in &mut b.instructions {
--            rewrite_operand_value(inst, old_val, new_op);
-+            replace_operand_value(inst, old_val, new_op);
-         }
--        rewrite_terminator_value(&mut b.terminator, old_val, new_op);
-+        replace_terminator_value(&mut b.terminator, old_val, new_op);
-     }
- }
+         mark_nop(&mut infos[j]);
+         changed = true;
+@@ -2268,6 +2345,9 @@ mod tests {
  
-@@ -2442,36 +2444,6 @@ fn escape_read_needs_narrow(inst: &Instruction, member: Value, wide_ty: IrType)
+     #[test]
+     fn self_test_after_add_is_kept() {
++        // The consumer is `jb`, a carry test: `addl` takes CF from the carry
++        // while `testl` clears it, so the pair is not redundant. The ZF-only
++        // twin of this shape IS folded -- see the counter tests below.
+         let out = run(concat!(
+             "foo:\n",
+             ".cfi_startproc\n",
+@@ -2282,6 +2362,136 @@ mod tests {
+         assert!(out.contains("testl %esi, %esi"), "{out}");
      }
- }
  
--fn rewrite_operand_value(inst: &mut Instruction, old_val: Value, new_op: Operand) {
--    // The canonical visitors make this complete for every instruction shape
--    // (Select data operands, atomics, calls, intrinsics, ...), unlike the
--    // hand-rolled match arms of earlier revisions.
--    let new_val = match new_op {
--        Operand::Value(v) => Some(v),
--        Operand::Const(_) => None,
--    };
--    inst.for_each_operand_mut(|op| {
--        if matches!(op, Operand::Value(v) if v.0 == old_val.0) {
--            *op = new_op;
--        }
--    });
--    if let Some(nv) = new_val {
--        inst.for_each_value_use_mut(|field| {
--            if field.0 == old_val.0 {
--                *field = nv;
--            }
--        });
--    }
--}
--
--fn rewrite_terminator_value(term: &mut Terminator, old_val: Value, new_op: Operand) {
--    term.for_each_operand_mut(|op| {
--        if matches!(op, Operand::Value(v) if *v == old_val) {
--            *op = new_op;
--        }
--    });
--}
--
- // ---------------------------------------------------------------------------
- // Invariant checks
- // ---------------------------------------------------------------------------
++    /// Run the self-test pass over a one-function snippet whose body branches
++    /// forward to the appended `.LBB4`.
++    fn self_test_case(body: &str) -> String {
++        run(&format!(
++            "foo:\n.cfi_startproc\n{body}.LBB4:\n    ret\n.cfi_endproc\n"
++        ))
++    }
++
++    #[test]
++    fn self_test_after_counter_sub_is_removed_for_zf_consumer() {
++        // `while (--chain != 0)`: the decrement already set ZF.
++        let out = self_test_case(concat!(
++            "    subl $1, %ebp\n",
++            "    testl %ebp, %ebp\n",
++            "    je .LBB4\n",
++            "    ret\n",
++        ));
++        assert!(out.contains("subl $1, %ebp"), "{out}");
++        assert!(!out.contains("testl %ebp, %ebp"), "{out}");
++    }
++
++    #[test]
++    fn self_test_after_add_dec_neg_is_removed_for_zf_consumer() {
++        for (prod, tst) in [
++            ("addl %edx, %esi", "testl %esi, %esi"),
++            ("decl %esi", "testl %esi, %esi"),
++            ("negl %esi", "testl %esi, %esi"),
++            ("subq $8, %rsi", "testq %rsi, %rsi"),
++            // 32-bit producer zero-extends: ZF of the wide test is identical.
++            ("subl $1, %esi", "testq %rsi, %rsi"),
++        ] {
++            let out = self_test_case(&format!("    {prod}\n    {tst}\n    jne .LBB4\n    ret\n"));
++            assert!(!out.contains(tst), "`{tst}` after `{prod}` must go:\n{out}");
++        }
++    }
++
++    #[test]
++    fn self_test_after_sub_is_kept_for_carry_overflow_or_sign_consumers() {
++        // `sub` sets CF/OF from the subtraction, and SF (at equal widths) is
++        // the register's sign bit, which agrees with the test -- but the proof
++        // this fold carries is "ZF alone", so every non-ZF predicate refuses.
++        for jcc in [
++            "jb", "ja", "jl", "jg", "jle", "jge", "js", "jo", "jbe", "jp",
++        ] {
++            let out = self_test_case(&format!(
++                "    subl $1, %esi\n    testl %esi, %esi\n    {jcc} .LBB4\n    ret\n"
++            ));
++            assert!(out.contains("testl %esi, %esi"), "{jcc}:\n{out}");
++        }
++    }
++
++    #[test]
++    fn self_test_after_sub_is_kept_when_a_later_edge_reads_carry() {
++        // The taken edge of the first branch delivers the flags to `jb`.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    subl $1, %esi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB5\n",
++            "    ret\n",
++            ".LBB5:\n",
++            "    jb .LBB4\n",
++            "    ret\n",
++            ".LBB4:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("testl %esi, %esi"), "{out}");
++    }
++
++    #[test]
++    fn self_test_after_wide_sub_is_kept_under_a_narrow_test() {
++        // `subq` can leave a non-zero upper half that `testl` ignores, so the
++        // wide subtraction never licenses dropping the narrow test.
++        let out = self_test_case(concat!(
++            "    subq $1, %rsi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n",
++            "    ret\n",
++        ));
++        assert!(out.contains("testl %esi, %esi"), "{out}");
++    }
++
++    #[test]
++    fn self_test_after_sub_is_kept_for_a_whole_flags_reader() {
++        let out = self_test_case(concat!(
++            "    subl $1, %esi\n",
++            "    testl %esi, %esi\n",
++            "    lahf\n",
++            "    je .LBB4\n",
++            "    ret\n",
++        ));
++        assert!(out.contains("testl %esi, %esi"), "{out}");
++    }
++
++    #[test]
++    fn self_test_after_sub_is_kept_when_the_register_is_touched_between() {
++        let out = self_test_case(concat!(
++            "    subl $1, %esi\n",
++            "    leal 1(%esi), %esi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n",
++            "    ret\n",
++        ));
++        assert!(out.contains("testl %esi, %esi"), "{out}");
++    }
++
++    #[test]
++    fn self_test_after_sub_is_kept_when_a_branch_enters_at_the_test() {
++        // A label between the producer and the test is a barrier, so the fold
++        // never claims a straight-line window it does not have: the `jmp`
++        // delivers flags that the decrement did not produce, and the test is
++        // the only thing defining ZF for them.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    jmp .LBB5\n",
++            "    subl $1, %esi\n",
++            ".LBB5:\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n",
++            "    ret\n",
++            ".LBB4:\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("testl %esi, %esi"), "{out}");
++    }
++
+     #[test]
+     fn dead_sign_extension_is_narrowed() {
+         let out = run(concat!(
+diff --git a/tests/regression/check_self_test_after_arith.sh b/tests/regression/check_self_test_after_arith.sh
+new file mode 100755
+index 00000000..df8e7482
+--- /dev/null
++++ b/tests/regression/check_self_test_after_arith.sh
+@@ -0,0 +1,215 @@
++#!/usr/bin/env bash
++# Arithmetic-producer redundant self-test elimination (x86-64).
++#
++# `subl $1, %R; testl %R, %R; jne` is one instruction of pure overhead: the
++# subtraction already set ZF.  It is the shape every downward counter loop
++# compiles to (`while (--n)`, `do { } while (--n)`, `while (n -= step)`), so
++# the fold is pinned here in four directions, three of them structural:
++#
++#   * DETECTOR SELF-TEST.  At -O0 the pair is still emitted, so the analysis
++#     must FIND it in every zf-only counter.  A gate whose pattern matcher
++#     silently stopped matching would otherwise pass forever while proving
++#     nothing -- the failure mode this repository has been bitten by before.
++#   * POSITIVE.  At -O2 the pair must be gone for those same functions, while
++#     the arithmetic producer itself remains.
++#   * NEGATIVE CONTROL, same binary, same pass run: `while ((n -= 3) > 0)`
++#     compiles to `subl $3; testl; jle` -- the consumer reads SF and OF too,
++#     so that test must SURVIVE.  This is what distinguishes "the fold fired"
++#     from "the compiler stopped emitting the pair at all".
++#   * RUNTIME.  The compiled program must agree with GCC, and with lccc at
++#     -O0/-O1/-O3, over every boundary a wrong proof would break: the last
++#     iteration, the 32-bit sign flip at 0x80000000, and the unsigned wrap
++#     points.
++#
++# A structural failure is an optimisation regression; a runtime failure is a
++# miscompile.  Both exit non-zero.
++set -euo pipefail
++
++CCC=${CCC:-./target/release/lccc}
++GCC=${GCC:-gcc}
++command -v "$GCC" >/dev/null 2>&1 || { echo "SKIP: no $GCC on PATH"; exit 0; }
++
++td=$(mktemp -d)
++trap 'rm -rf "$td"' EXIT
++
++cat >"$td/shapes.c" <<'EOF'
++/* Flag consumers that read ZF alone: the decrement's own ZF is enough. */
++int c_while(int n)         { int c = 0; while (--n) { c++; } return c; }
++int c_do(int n)            { int c = 0; if (n > 0) do { c++; } while (--n); return c; }
++int c_unsigned(unsigned n) { int c = 0; while (--n) { c++; } return c; }
++/* Negative control: `> 0` reads SF and OF, so `subl $3; testl; jle` keeps
++   its test.  Same translation unit, same pass run. */
++int c_step(int n)          { int c = 0; while ((n -= 3) > 0) { c++; } return c; }
++EOF
++
++"$CCC" -O0 -S "$td/shapes.c" -o "$td/shapes.O0.s"
++"$CCC" -O2 -S "$td/shapes.c" -o "$td/shapes.O2.s"
++
++python3 - "$td/shapes.O0.s" "$td/shapes.O2.s" <<'PY'
++import re
++import sys
++
++ZF_ONLY = ("c_while", "c_do", "c_unsigned")   # must fold at -O2
++KEPT = "c_step"                                # must NOT fold: jle reads SF/OF
++
++PRODUCER = re.compile(r"^(sub|add|dec|inc|neg)[lq] ")
++TEST = re.compile(r"^test[lq] ")
++REG = re.compile(r"%([a-z0-9]+)")
++
++
++_FAMILY = {}
++for _wide, _forms in {
++    "rax": ("rax", "eax", "ax", "al", "ah"),
++    "rbx": ("rbx", "ebx", "bx", "bl", "bh"),
++    "rcx": ("rcx", "ecx", "cx", "cl", "ch"),
++    "rdx": ("rdx", "edx", "dx", "dl", "dh"),
++    "rsi": ("rsi", "esi", "si", "sil"),
++    "rdi": ("rdi", "edi", "di", "dil"),
++    "rsp": ("rsp", "esp", "sp", "spl"),
++    "rbp": ("rbp", "ebp", "bp", "bpl"),
++}.items():
++    for _form in _forms:
++        _FAMILY[_form] = _wide
++for _n in range(8, 16):
++    for _form in (f"r{_n}", f"r{_n}d", f"r{_n}w", f"r{_n}b"):
++        _FAMILY[_form] = f"r{_n}"
++
++
++def family(reg: str) -> str:
++    """The 64-bit name of the register `reg` belongs to (eax -> rax).
++
++    The pair is not always width-matched: at -O0 the codegen emits a 32-bit
++    `subl` under a 64-bit `testq`, which is exactly the width rule the pass
++    has to reason about, and a matcher that compared spellings would miss it
++    and quietly stop detecting anything.  `ah` folds into the `a` family
++    here; byte-register aliasing is a soundness concern for the pass itself
++    (its unit tests cover it), not for the shape this gate detects.
++    """
++    return _FAMILY.get(reg, reg)
++
++
++def body(asm: str, fn: str):
++    """Normalised instruction lines of `fn` (no labels/comments/directives)."""
++    out, inside = [], False
++    for raw in asm.splitlines():
++        line = raw.strip()
++        if line.startswith(fn + ":"):
++            inside = True
++            continue
++        if inside and (line.startswith(".size " + fn) or line.startswith(".cfi_endproc")):
++            break
++        if not inside or not line or line.startswith(("#", ".")) or line.endswith(":"):
++            continue
++        out.append(line)
++    return out
++
++
++def pairs(asm: str, fn: str):
++    """Every `<arith producer>` immediately followed by a self-test of the
++    same register family."""
++    lines, found = body(asm, fn), []
++    for a, b in zip(lines, lines[1:]):
++        if not PRODUCER.match(a) or not TEST.match(b):
++            continue
++        dest = REG.findall(a)[-1] if REG.findall(a) else ""
++        operands = REG.findall(b)
++        if len(operands) == 2 and operands[0] == operands[1] and family(operands[0]) == family(dest):
++            found.append(f"{a} ;; {b}")
++    return found
++
++
++def producers(asm: str, fn: str):
++    return [l for l in body(asm, fn) if PRODUCER.match(l)]
++
++
++o0, o2 = (open(p).read() for p in sys.argv[1:3])
++failures = []
++
++# 0. detector self-test, on a fixture rather than on compiler output: the
++#    matcher must see the pattern when it is there, and must not invent one
++#    from two different register families. The compiler-side half of the same
++#    question is the -O2 control below (`c_step`), which is what proves the
++#    matcher still works on real codegen.  (-O0 does NOT serve this purpose:
++#    there the producer and the test are separated by spill stores, so the
++#    pair is not adjacent in the emitted text at all.)
++FIXTURE = """f:
++.cfi_startproc
++    subl $1, %esi
++    testl %esi, %esi
++    je .L1
++.L1:
++    subl $8, %rdi
++    testq %rax, %rax
++    ret
++.cfi_endproc
++"""
++fixture_pairs = pairs(FIXTURE, "f")
++if len(fixture_pairs) != 1 or "subl $1, %esi ;; testl %esi, %esi" != fixture_pairs[0]:
++    failures.append("detector self-test: the pair matcher no longer recognises "
++                    f"`subl $1, %esi` + `testl %esi, %esi` (found {fixture_pairs})")
++if any("subl $8, %rdi" in p for p in fixture_pairs):
++    failures.append("detector self-test: the matcher paired two different "
++                    "registers (`subl %rdi` with `testq %rax`)")
++
++# 1. positive: folded at -O2, producer still there.
++for fn in ZF_ONLY:
++    if not producers(o2, fn):
++        failures.append(f"-O2 {fn}: no arithmetic producer left -- fixture drift")
++    for p in pairs(o2, fn):
++        failures.append(f"-O2 {fn}: redundant self-test survived a ZF-only consumer: {p}")
++
++# 3. negative control: the sign-carrying consumer keeps its test at -O2.
++if not pairs(o2, KEPT):
++    failures.append(f"-O2 {KEPT}: the test after the producer is gone, but `jle` reads "
++                    "SF and OF -- either a miscompile or a vacuous negative control")
++
++if failures:
++    print("FAIL structural:")
++    for f in failures:
++        print("  " + f)
++    sys.exit(1)
++print("PASS structural: matcher self-tested; pair folded for the ZF-only counters "
++      "at -O2 and kept for the sign-carrying consumer")
++PY
++
++# ── runtime: lccc (-O0, -O1, -O2, -O3) and GCC must agree ────────────────────
++cat >"$td/run.c" <<'EOF'
++#include <stdio.h>
++int c_while(int n);
++int c_do(int n);
++int c_unsigned(unsigned n);
++int c_step(int n);
++int main(void)
++{
++    /* Signed counters are only fed values >= 1: `--n` from INT_MIN would be
++       signed overflow, which is not this gate's subject. The unsigned counter
++       still crosses 0x80000000 and wraps back through 0. */
++    static const int step_vals[] = {1, 2, 3, 4, 7, 8, 15, 16, 63, 64, 255, 256, 1000};
++    static const unsigned uvals[] = {0u, 1u, 2u, 3u, 255u, 256u, 65536u,
++                                     0x7fffffffu, 0x80000000u, 0x80000001u,
++                                     0xfffffffeu};
++    unsigned long acc = 0;
++    for (unsigned i = 0; i < sizeof step_vals / sizeof step_vals[0]; i++) {
++        int n = step_vals[i];
++        acc += (unsigned long)c_while(n) + (unsigned long)c_do(n) +
++               (unsigned long)c_step(n);
++    }
++    for (unsigned i = 0; i < sizeof uvals / sizeof uvals[0]; i++)
++        acc += (unsigned long)c_unsigned(uvals[i]);
++    printf("%lu\n", acc);
++    return 0;
++}
++EOF
++
++"$GCC" -O2 "$td/run.c" "$td/shapes.c" -o "$td/run.gcc"
++ref=$("$td/run.gcc")
++for opt in -O0 -O1 -O2 -O3; do
++    "$CCC" "$opt" "$td/run.c" "$td/shapes.c" -o "$td/run.lccc" ||
++        { echo "FAIL lccc $opt: did not link"; exit 1; }
++    got=$("$td/run.lccc")
++    if [ "$got" != "$ref" ]; then
++        echo "FAIL lccc $opt: $got, gcc -O2: $ref"
++        exit 1
++    fi
++done
++echo "PASS runtime: lccc -O0/-O1/-O2/-O3 agree with gcc -O2 ($ref)"
