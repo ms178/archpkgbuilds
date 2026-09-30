@@ -1,1054 +1,2376 @@
-diff --git a/scripts/vectorize_stress.py b/scripts/vectorize_stress.py
-new file mode 100755
-index 0000000..e1fadfe
+diff --git a/.github/workflows/bench.yml b/.github/workflows/bench.yml
+index af2c8734..68e6f754 100644
+--- a/.github/workflows/bench.yml
++++ b/.github/workflows/bench.yml
+@@ -6,12 +6,23 @@ on:
+   pull_request:
+     branches: [main]
+ 
++# Supersede an in-flight benchmark when the same ref is pushed again: the run is
++# ~9 minutes of timed corpus, and a newer revision invalidates its numbers anyway.
++# Safe because nothing here publishes a result the repository consumes (the
++# artifacts are per-run).
++concurrency:
++  group: bench-${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: true
++
+ permissions:
+   contents: read
+ 
+ jobs:
+   benchmark:
+     name: LCCC vs GCC
++    # A hung compiler in the corpus step would otherwise burn the default six
++    # hours before failing; the timed corpus is ~9 minutes on a good day.
++    timeout-minutes: 45
+     runs-on: ubuntu-latest
+     steps:
+       - name: Checkout
+@@ -63,6 +74,24 @@ jobs:
+           echo "Running (includes fib(90) — impossible without rec2iter)..."
+           /tmp/fib_rec2iter
+ 
++      # MS-01a codegen-quality gate. The runtime gate above can only catch
++      # what the timed benchmarks measure; this one pins static, noise-free
++      # codegen metrics (insns / stackmem / pushes / ymm / fma) for the six
++      # golden workloads against .github/scripts/ci-codegen-baseline.json
++      # with per-workload tolerance bands. It was written for bench.yml but
++      # never wired (the v3 audit found it orphaned — the workflow only ran
++      # ci-bench.py); wiring it now closes the "runtime-only gate" hole the
++      # audit flagged. Baseline refreshes go through --update-baseline in
++      # the PR that lands the improvement, per the gate's header contract.
++      - name: Gate self-test (stackmem accounting)
++        run: python3 .github/scripts/test_ci_codegen_gate.py
++
++      - name: Codegen quality gate (golden workloads)
++        run: |
++          set -o pipefail
++          python3 .github/scripts/ci-codegen-gate.py \
++            --lccc target/fastbuild/lccc 2>&1 | tee codegen-gate.txt
++
+       - name: Run complete benchmark corpus
+         run: |
+           # GitHub's default Linux shell for `run:` steps is `bash -e`
+@@ -89,24 +118,6 @@ jobs:
+         if: always()
+         run: cat bench-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+ 
+-      # MS-01a codegen-quality gate. The runtime gate above can only catch
+-      # what the timed benchmarks measure; this one pins static, noise-free
+-      # codegen metrics (insns / stackmem / pushes / ymm / fma) for the six
+-      # golden workloads against .github/scripts/ci-codegen-baseline.json
+-      # with per-workload tolerance bands. It was written for bench.yml but
+-      # never wired (the v3 audit found it orphaned — the workflow only ran
+-      # ci-bench.py); wiring it now closes the "runtime-only gate" hole the
+-      # audit flagged. Baseline refreshes go through --update-baseline in
+-      # the PR that lands the improvement, per the gate's header contract.
+-      - name: Gate self-test (stackmem accounting)
+-        run: python3 .github/scripts/test_ci_codegen_gate.py
+-
+-      - name: Codegen quality gate (golden workloads)
+-        run: |
+-          set -o pipefail
+-          python3 .github/scripts/ci-codegen-gate.py \
+-            --lccc target/fastbuild/lccc 2>&1 | tee codegen-gate.txt
+-
+       - name: Upload benchmark results
+         if: always()
+         uses: actions/upload-artifact@v7
+diff --git a/docs/SESSION_FOLLOWUP_CANON_REWRITERS.md b/docs/SESSION_FOLLOWUP_CANON_REWRITERS.md
+new file mode 100644
+index 00000000..ebb011bb
 --- /dev/null
-+++ b/scripts/vectorize_stress.py
-@@ -0,0 +1,641 @@
-+#!/usr/bin/env python3
-+"""Differential stress test + missed-vectorization census for LCCC's vectorizer.
-+
-+The research VM has no PMU, so evidence for `src/passes/vectorize.rs`,
-+`slp_vectorizer.rs`, `iv_widen.rs` and the IV strength-reduction passes has to
-+come from *coverage of the input space*.  This tool enumerates the loop-shape
-+space those passes pattern-match on and checks every point with three arms:
-+
-+    gcc -O0                                                    independent reference
-+    lccc <flags>                                               vectorizer ON
-+    lccc <flags> + CCC_DISABLE_PASSES=vectorize,slp,slp_late,iv_widen   OFF
-+
-+ON-vs-OFF isolates the vectorizer from the rest of the pipeline; the GCC arm
-+catches shared frontend bugs.  Any divergence is a miscompile and is reported
-+with a self-contained reproducer (``--keep DIR``).
-+
-+Enumerated dimensions
-+---------------------
-+  * kernel       : reductions (sum, dot, sad, min, max, xor/or/and, masked
-+                   count, conditional sum, argmin, early-exit search,
-+                   ordered FP sum, two accumulators), maps (copy, add, mul,
-+                   shifts, abs, clamp, select, masked store, reverse,
-+                   interleave/deinterleave, 3-point stencil, in-place,
-+                   gather/scatter/histogram), loop-carried recurrences
-+                   (prefix sum, a[i+1]=a[i]) and width conversions.
-+  * element type : i8 u8 i16 u16 i32 u32 i64 u64 float double
-+  * IV type/form : int / unsigned / long / size_t  x  {lt, start1, step2, down}
-+  * trip count   : 0..9, 15..17, 31..33, 63..65, 100, 127..129, 255..257, 500
-+  * placement    : 4 (a,b,c) misalignment triples, plus -- for every map --
-+                   overlapping-buffer calls (a = p+off, b = p) with offsets in
-+                   {-4,-2,-1,0,1,2,3,5,8,9,16} that force the dependence /
-+                   alias analysis to decide correctly.
-+  * data profile : `full` range (extremes injected) for ops that cannot
-+                   overflow, `small` range otherwise, exact-integer floats
-+                   for reassociation-safe FP, and adversarial non-exact FP
-+                   (`fp_adv`) for the ordered-sum kernels: any illegal FP
-+                   reassociation changes the bits.
-+
-+Every program hashes *entire* buffers including guard pads after each call, so
-+an out-of-range vector store, a masked store that wrote a false lane, or a
-+remainder-loop bug all change the checksum.
-+
-+Missed-optimisation census
-+--------------------------
-+``--census`` additionally compiles each kernel with ``gcc -O3`` (same -march)
-+and counts packed-SIMD instructions inside the ``kernel`` symbol for both
-+compilers.  Kernels where GCC vectorizes and LCCC does not are ranked -- this
-+is the data-driven worklist for the vectorizer.
-+
-+Usage (repo root, after a fastbuild)::
-+
-+    scripts/vectorize_stress.py --lccc target/fastbuild/lccc-x86
-+    scripts/vectorize_stress.py --lccc target/fastbuild/lccc-x86 --census \
-+        --lccc-flags "-O3 -march=x86-64-v3" --json results/vec-census.json
-+    scripts/vectorize_stress.py --lccc target/fastbuild/lccc-x86 --filter sum --keep /tmp/vs
-+
-+Exit status is 0 only when every configuration agrees across all arms.
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import concurrent.futures as cf
-+import json
-+import os
-+import random
-+import re
-+import shlex
-+import shutil
-+import subprocess
-+import sys
-+import tempfile
-+from dataclasses import dataclass
-+from pathlib import Path
-+from typing import Callable, Dict, List, Optional, Sequence, Tuple
-+
-+# ── Type model ────────────────────────────────────────────────────────────────
-+
-+
-+@dataclass(frozen=True)
-+class Elem:
-+    tag: str  # short id
-+    c: str  # C spelling
-+    bits: int
-+    signed: bool
-+    fp: bool = False
-+
-+    @property
-+    def wide(self) -> str:
-+        """Accumulator type that cannot overflow for n <= 500 on small data."""
-+        if self.fp:
-+            return "double"
-+        return "long long" if self.signed else "unsigned long long"
-+
-+
-+ELEMS = [
-+    Elem("i8", "int8_t", 8, True),
-+    Elem("u8", "uint8_t", 8, False),
-+    Elem("i16", "int16_t", 16, True),
-+    Elem("u16", "uint16_t", 16, False),
-+    Elem("i32", "int32_t", 32, True),
-+    Elem("u32", "uint32_t", 32, False),
-+    Elem("i64", "int64_t", 64, True),
-+    Elem("u64", "uint64_t", 64, False),
-+    Elem("f32", "float", 32, True, True),
-+    Elem("f64", "double", 64, True, True),
-+]
-+BY_TAG = {e.tag: e for e in ELEMS}
-+
-+IV_TYPES = ["int", "unsigned", "long", "size_t"]
-+FORMS = ["lt", "start1", "step2", "down"]
-+
-+TRIPS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65,
-+         100, 127, 128, 129, 255, 256, 257, 500]
-+PLACEMENTS = [(0, 0, 0), (1, 0, 0), (0, 3, 1), (3, 2, 5)]
-+ALIAS_OFFSETS = [-4, -2, -1, 0, 1, 2, 3, 5, 8, 9, 16]
-+
-+PAD = 32  # guard elements on either side of every buffer
-+NBUF = 1200  # payload elements per buffer
-+
-+
-+# ── Kernel description ───────────────────────────────────────────────────────
-+
-+
-+@dataclass(frozen=True)
-+class Kernel:
-+    name: str
-+    kind: str  # "red" | "map" | "rec"
-+    body: str  # C body using $-placeholders (see expand)
-+    types: Callable[[Elem], bool] = lambda e: True
-+    profile: str = "small"  # "full" | "small" | "fp_adv"
-+    acc: str = "wide"  # accumulator spelling: "wide" | "T"
-+    loop: bool = True  # supports IV-type/form rotation
-+    alias: bool = True  # maps: also run overlapping-buffer placements
-+
-+
-+def _any(_e: Elem) -> bool:
-+    return True
-+
-+
-+def _int(e: Elem) -> bool:
-+    return not e.fp
-+
-+
-+def _uint(e: Elem) -> bool:
-+    return (not e.fp) and (not e.signed)
-+
-+
-+def _signed_or_fp(e: Elem) -> bool:
-+    return e.signed
-+
-+
-+def _fp(e: Elem) -> bool:
-+    return e.fp
-+
-+
-+# Placeholders: $T element type, $A accumulator type, $LOOP loop head (index i),
-+# $K small mid constant, $MAX / $MIN limits of T.
-+KERNELS: List[Kernel] = [
-+    # ── reductions ─────────────────────────────────────────────────────────
-+    Kernel("sum", "red", "$A s = 0; $LOOP s += b[i]; return s;"),
-+    Kernel("sum_T", "red", "$T s = 0; $LOOP s += b[i]; return s;", _any, "small", "T"),
-+    Kernel("sumsq", "red", "$A s = 0; $LOOP s += ($A)b[i] * b[i]; return s;"),
-+    Kernel("dot", "red", "$A s = 0; $LOOP s += ($A)b[i] * c[i]; return s;"),
-+    Kernel("sad", "red",
-+           "$A s = 0; $LOOP s += b[i] > c[i] ? ($A)(b[i] - c[i]) : ($A)(c[i] - b[i]); return s;"),
-+    Kernel("min", "red", "$T m = $MAX; $LOOP if (b[i] < m) m = b[i]; return m;", _any, "full"),
-+    Kernel("max", "red", "$T m = $MIN; $LOOP m = b[i] > m ? b[i] : m; return m;", _any, "full"),
-+    Kernel("xor", "red", "$T x = 0; $LOOP x ^= b[i]; return x;", _int, "full"),
-+    Kernel("or", "red", "$T x = 0; $LOOP x |= b[i]; return x;", _int, "full"),
-+    Kernel("and", "red", "$T x = ($T)-1; $LOOP x &= b[i]; return x;", _int, "full"),
-+    Kernel("count_nz", "red", "int cnt = 0; $LOOP if (b[i]) cnt++; return cnt;", _any, "full"),
-+    Kernel("count_gt", "red", "int cnt = 0; $LOOP if (b[i] > ($T)$K) cnt++; return cnt;", _any, "full"),
-+    Kernel("count_eq", "red", "int cnt = 0; $LOOP cnt += (b[i] == c2[0]); return cnt;", _any, "full"),
-+    Kernel("condsum", "red", "$A s = 0; $LOOP if (b[i] > ($T)$K) s += b[i]; return s;"),
-+    Kernel("condsum_sel", "red", "$A s = 0; $LOOP s += b[i] > ($T)$K ? b[i] : 0; return s;"),
-+    Kernel("twoacc", "red", "$A s = 0, t = 0; $LOOP { s += b[i]; t += c[i]; } return s * 31 + t;"),
-+    Kernel("argmin", "red",
-+           "$T m = $MAX; long ix = -1; $LOOP if (b[i] < m) { m = b[i]; ix = i; } return ix * 7 + (long long)m;",
-+           _any, "full"),
-+    Kernel("find", "red", "$LOOP if (b[i] == c2[0]) return i; return -1;", _any, "full"),
-+    Kernel("fsum_ordered", "red", "$T s = 0; $LOOP s += b[i]; return s;", _fp, "fp_adv", "T"),
-+    Kernel("fdot_ordered", "red", "$T s = 0; $LOOP s += b[i] * c[i]; return s;", _fp, "fp_adv", "T"),
-+    # ── maps ───────────────────────────────────────────────────────────────
-+    Kernel("copy", "map", "$LOOP a[i] = b[i];", _any, "full"),
-+    Kernel("add", "map", "$LOOP a[i] = b[i] + c[i];"),
-+    Kernel("sub", "map", "$LOOP a[i] = b[i] - c[i];"),
-+    Kernel("mul", "map", "$LOOP a[i] = b[i] * c[i];"),
-+    Kernel("scale_add", "map", "$LOOP a[i] = b[i] * 3 + 7;"),
-+    Kernel("inplace", "map", "$LOOP a[i] += b[i] * 3;"),
-+    Kernel("and_map", "map", "$LOOP a[i] = b[i] & c[i];", _int, "full"),
-+    Kernel("or_map", "map", "$LOOP a[i] = b[i] | c[i];", _int, "full"),
-+    Kernel("xor_map", "map", "$LOOP a[i] = b[i] ^ c[i];", _int, "full"),
-+    Kernel("not_map", "map", "$LOOP a[i] = ~b[i];", _int, "full"),
-+    Kernel("neg_map", "map", "$LOOP a[i] = -b[i];"),
-+    Kernel("shl", "map", "$LOOP a[i] = b[i] << 2;", _uint, "full"),
-+    Kernel("shr", "map", "$LOOP a[i] = b[i] >> 3;", _int, "full"),
-+    Kernel("shr_var", "map", "$LOOP a[i] = b[i] >> (c[i] & 7);", _uint, "full"),
-+    Kernel("abs_map", "map", "$LOOP a[i] = b[i] < 0 ? -b[i] : b[i];", _signed_or_fp),
-+    Kernel("clamp", "map",
-+           "$LOOP a[i] = b[i] < ($T)-$K ? ($T)-$K : (b[i] > ($T)$K ? ($T)$K : b[i]);",
-+           _signed_or_fp, "full"),
-+    Kernel("clamp_u", "map", "$LOOP a[i] = b[i] > ($T)$K ? ($T)$K : b[i];", _uint, "full"),
-+    Kernel("minmap", "map", "$LOOP a[i] = b[i] < c[i] ? b[i] : c[i];", _any, "full"),
-+    Kernel("maxmap", "map", "$LOOP a[i] = b[i] > c[i] ? b[i] : c[i];", _any, "full"),
-+    Kernel("select", "map", "$LOOP a[i] = b[i] > ($T)$K ? c[i] : b[i];", _any, "full"),
-+    Kernel("masked_store", "map", "$LOOP if (b[i] > ($T)$K) a[i] = c[i];", _any, "full"),
-+    Kernel("cond_inc", "map", "$LOOP a[i] += (b[i] > ($T)$K);", _int, "full"),
-+    Kernel("fill", "map", "$LOOP a[i] = ($T)$K;", _any, "full"),
-+    Kernel("reverse", "map", "$LOOP a[i] = b[n - 1 - (long)i];", _any, "full"),
-+    Kernel("interleave", "map", "$LOOP { a[2 * i] = b[i]; a[2 * i + 1] = c[i]; }", _any, "full"),
-+    Kernel("deinterleave", "map", "$LOOP a[i] = b[2 * i] + b[2 * i + 1];"),
-+    Kernel("stencil3", "map",
-+           "for (long i = 1; i + 1 < n; i++) a[i] = b[i - 1] + b[i] + b[i + 1];",
-+           _any, "small", "wide", False),
-+    Kernel("stencil_min", "map",
-+           "for (long i = 1; i + 1 < n; i++) { $T m = b[i-1] < b[i+1] ? b[i-1] : b[i+1]; a[i] = m < b[i] ? m : b[i]; }",
-+           _any, "full", "wide", False),
-+    Kernel("gather", "map", "$LOOP a[i] = b[idx[i]];", _any, "full", "wide", True, False),
-+    Kernel("scatter_perm", "map", "$LOOP a[pidx[i]] = b[i];", _any, "full", "wide", True, False),
-+    Kernel("scatter_dup", "map", "$LOOP a[idx[i]] = b[i];", _any, "full", "wide", True, False),
-+    Kernel("histogram", "map", "$LOOP a[b[i] & 15]++;", _int, "full", "wide", True, False),
-+    # ── compare results used as VALUES (0/1 in scalar C, all-ones in SIMD) ──
-+    # A packed compare yields -1/0 per lane while C's `a > b` is 0/1; every
-+    # consumer that is not a select/blend condition must demask first.
-+    Kernel("cmp_store", "map", "$LOOP a[i] = b[i] > ($T)$K;", _int, "full"),
-+    Kernel("cmp_add2", "map", "$LOOP a[i] = (b[i] > ($T)$K) + (c[i] > ($T)$K);", _int, "full"),
-+    Kernel("cmp_sub", "map", "$LOOP a[i] = b[i] - (c[i] > ($T)$K);", _int, "full"),
-+    Kernel("cmp_mul", "map", "$LOOP a[i] = b[i] * (c[i] > ($T)$K);", _int, "small"),
-+    Kernel("cmp_and_val", "map", "$LOOP a[i] = b[i] & (c[i] > ($T)$K);", _int, "full"),
-+    Kernel("cmp_or_val", "map", "$LOOP a[i] = b[i] | (c[i] > ($T)$K);", _int, "full"),
-+    Kernel("cmp_xor_val", "map", "$LOOP a[i] ^= (b[i] == c[i]);", _int, "full"),
-+    Kernel("cmp_xor2", "map", "$LOOP a[i] = (b[i] > ($T)$K) ^ (c[i] < ($T)$K);", _int, "full"),
-+    Kernel("cmp_and2", "map", "$LOOP a[i] = (b[i] > ($T)$K) & (c[i] < ($T)$K);", _int, "full"),
-+    Kernel("cmp_or2", "map", "$LOOP a[i] = (b[i] > ($T)$K) | (c[i] < ($T)$K);", _int, "full"),
-+    Kernel("cmp_neg", "map", "$LOOP a[i] = -(b[i] > ($T)$K);", _int, "full"),
-+    Kernel("cmp_not", "map", "$LOOP a[i] = !(b[i] == ($T)$K);", _int, "full"),
-+    Kernel("cmp_arm", "map", "$LOOP a[i] = c[i] > ($T)$K ? (b[i] > ($T)$K) : 2;", _int, "full"),
-+    Kernel("cmp_arm2", "map", "$LOOP a[i] = c[i] > ($T)$K ? 2 : (b[i] == c[i]);", _int, "full"),
-+    Kernel("cmp_shl", "map", "$LOOP a[i] = (b[i] > ($T)$K) << 2;", _int, "full"),
-+    Kernel("cmp_acc_map", "map", "$LOOP a[i] = a[i] + (b[i] > ($T)$K) + (b[i] < ($T)-$K);", _int, "full"),
-+    # ── loop-carried recurrences (must NOT be vectorized naively) ──────────
-+    Kernel("prefix", "rec", "for (long i = 1; i < n; i++) a[i] = a[i - 1] + b[i];",
-+           _any, "small", "wide", False, True),
-+    Kernel("propagate", "rec", "for (long i = 0; i + 1 < n; i++) a[i + 1] = a[i];",
-+           _any, "full", "wide", False, True),
-+    Kernel("shift_down", "rec", "for (long i = 0; i + 1 < n; i++) a[i] = a[i + 1];",
-+           _any, "full", "wide", False, True),
-+    Kernel("recur2", "rec", "for (long i = 2; i < n; i++) a[i] = a[i - 2] + b[i];",
-+           _any, "small", "wide", False, True),
-+]
-+
-+# (src, dst) element pairs for conversion kernels.
-+CONV_PAIRS = [("u8", "i32"), ("i8", "i32"), ("u8", "u16"), ("i8", "i16"), ("u16", "i32"),
-+              ("i16", "i32"), ("u16", "u32"), ("i32", "i64"), ("u32", "u64"), ("i32", "i8"),
-+              ("i32", "i16"), ("i64", "i32"), ("u32", "u8"), ("i32", "f32"), ("i32", "f64"),
-+              ("f32", "f64"), ("f64", "f32"), ("f32", "i32"), ("f64", "i32"), ("u8", "f32"),
-+              ("i16", "f32"), ("u32", "f64")]
-+
-+# ── Program generation ───────────────────────────────────────────────────────
-+
-+HEADER = """#include <stdint.h>
-+#include <stdio.h>
-+#include <string.h>
-+#include <stddef.h>
-+#define NBUF %d
-+#define PAD %d
-+""" % (NBUF, PAD)
-+
-+LCG = "r = r * 6364136223846793005ULL + 1442695040888963407ULL;"
-+
-+
-+def fill_code(e: Elem, prof: str, name: str) -> str:
-+    """C statements filling buffer `name` (PAD+NBUF+PAD elements) per profile."""
-+    T = e.c
-+    loop = f"for (size_t k = 0; k < NBUF + 2 * PAD; k++) {{ {LCG} "
-+    if e.fp:
-+        if prof == "fp_adv":
-+            # Wildly different magnitudes: any reassociation changes the bits.
-+            val = (f"((r & 3) == 0 ? ({T})(1e8 * (double)((r >> 8) % 7 + 1)) "
-+                   f": ({T})((double)((r >> 8) % 1000) / 7.0))")
-+        else:
-+            val = f"({T})((int)((r >> 8) % 17) - 8)"
-+        return f"{loop}{name}[k] = {val}; }}"
-+    if prof == "full":
-+        ext = {8: "0x7f", 16: "0x7fff", 32: "0x7fffffff", 64: "0x7fffffffffffffff"}[e.bits]
-+        special = (
-+            f"if ((k % 19) == 0) {name}[k] = ({T})0; else if ((k % 23) == 1) {name}[k] = ({T})-1; "
-+            f"else if ((k % 29) == 2) {name}[k] = ({T})({ext}); "
-+            f"else if ((k % 31) == 3) {name}[k] = ({T})(-{ext} - 1);")
-+        return f"{loop}{name}[k] = ({T})(r >> 24); {special} }}"
-+    val = f"({T})((int)((r >> 24) % 17) - 8)" if e.signed else f"({T})((r >> 24) % 17)"
-+    return f"{loop}{name}[k] = {val}; }}"
-+
-+
-+def loop_head(form: str, ivt: str) -> str:
-+    if form == "lt":
-+        return f"for ({ivt} i = 0; i < ({ivt})n; i++)"
-+    if form == "start1":
-+        return f"for ({ivt} i = 1; i < ({ivt})n; i++)"
-+    if form == "step2":
-+        return f"for ({ivt} i = 0; i < ({ivt})n; i += 2)"
-+    if form == "down":
-+        return f"for ({ivt} i = ({ivt})n; i-- > 0;)"
-+    raise ValueError(form)
-+
-+
-+def expand(k: Kernel, e: Elem, form: str, ivt: str) -> str:
-+    acc = e.c if k.acc == "T" else e.wide
-+    if e.fp:
-+        mx, mn = ("3.4e38f", "-3.4e38f") if e.bits == 32 else ("1.7e308", "-1.7e308")
-+    else:
-+        mx = {8: "INT8_MAX", 16: "INT16_MAX", 32: "INT32_MAX", 64: "INT64_MAX"}[e.bits] if e.signed else \
-+            {8: "UINT8_MAX", 16: "UINT16_MAX", 32: "UINT32_MAX", 64: "UINT64_MAX"}[e.bits]
-+        mn = {8: "INT8_MIN", 16: "INT16_MIN", 32: "INT32_MIN", 64: "INT64_MIN"}[e.bits] if e.signed else "0"
-+    kmid = "3" if (e.bits <= 8 and not e.signed) or e.fp else "5"
-+    body = k.body.replace("$LOOP", loop_head(form, ivt) if k.loop else "")
-+    return (body.replace("$T", e.c).replace("$A", acc).replace("$MAX", f"({e.c}){mx}")
-+            .replace("$MIN", f"({e.c}){mn}").replace("$K", kmid))
-+
-+
-+def gen_program(k: Kernel, e: Elem, form: str, ivt: str) -> str:
-+    """One self-contained C program exercising kernel `k` at element type `e`."""
-+    T = e.c
-+    body = expand(k, e, form, ivt)
-+    returns = "return" in body
-+    if not returns:
-+        ret_t = "void"
-+    elif e.fp and k.acc == "T":
-+        ret_t = "double"
-+    else:
-+        ret_t = "long long"
-+    sig = f"{T} *a, const {T} *b, const {T} *c, const {T} *c2, const int *idx, const int *pidx, long n"
-+    uses_idx = "idx[" in body
-+    call_ret = {"void": "", "double": "double rv = ", "long long": "long long rv = "}[ret_t]
-+    mix_ret = "" if ret_t == "void" else "mix(&rv, sizeof rv);"
-+    trips = ", ".join(str(t) for t in TRIPS)
-+    placements = ", ".join("{%d,%d,%d}" % p for p in PLACEMENTS)
-+    aliases = ", ".join(str(a) for a in ALIAS_OFFSETS)
-+    alias_block = ""
-+    if k.kind in ("map", "rec") and k.alias and not uses_idx:
-+        # Overlapping source/destination: b aliases a (and c aliases a at a
-+        # second offset) -- the dependence analysis must be exact.
-+        alias_block = f"""    for (size_t ai = 0; ai < sizeof al / sizeof *al; ai++) {{
-+      memcpy(A, A0, sizeof A);
-+      {T} *p = A + PAD + 16;
-+      kernel(p + al[ai], p, p + (al[ai] < 0 ? 2 : -2), C2, IDX + PAD, PIDX + PAD, n);
-+      mix(A, sizeof A);
-+    }}
-+"""
-+    return HEADER + f"""
-+__attribute__((noinline)) {ret_t} kernel({sig}) {{
-+  (void)a; (void)b; (void)c; (void)c2; (void)idx; (void)pidx;
-+  {body}
-+}}
-+static uint64_t h = 1469598103934665603ULL;
-+static void mix(const void *p, size_t n) {{
-+  const unsigned char *q = p;
-+  for (size_t k = 0; k < n; k++) {{ h ^= q[k]; h *= 1099511628211ULL; }}
-+}}
-+static {T} A[NBUF + 2 * PAD], B[NBUF + 2 * PAD], C[NBUF + 2 * PAD], A0[NBUF + 2 * PAD], C2[8];
-+static int IDX[NBUF + 2 * PAD], PIDX[NBUF + 2 * PAD];
-+static uint64_t r = 88172645463325252ULL;
-+
-+int main(void) {{
-+  static const int trips[] = {{{trips}}};
-+  static const int pl[][3] = {{{placements}}};
-+  static const int al[] = {{{aliases}}};
-+  {fill_code(e, k.profile, "B")}
-+  {fill_code(e, k.profile, "C")}
-+  {fill_code(e, k.profile, "A0")}
-+  for (int k = 0; k < NBUF + 2 * PAD; k++) {{
-+    {LCG}
-+    IDX[k] = (int)((r >> 33) % 97);
-+  }}
-+  /* permutation of [0, 500): stride 7 is coprime with 500 */
-+  for (int k = 0; k < 500; k++) PIDX[PAD + k] = (k * 7 + 3) % 500;
-+  for (int k = 0; k < 8; k++) C2[k] = C[PAD + 3 + k];
-+  for (size_t ti = 0; ti < sizeof trips / sizeof *trips; ti++) {{
-+    long n = trips[ti];
-+    for (size_t pi = 0; pi < sizeof pl / sizeof *pl; pi++) {{
-+      memcpy(A, A0, sizeof A);
-+      {call_ret}kernel(A + PAD + pl[pi][0], B + PAD + pl[pi][1], C + PAD + pl[pi][2], C2,
-+                       IDX + PAD, PIDX + PAD, n);
-+      mix(A, sizeof A); {mix_ret}
-+    }}
-+{alias_block}  }}
-+  printf("%016llx\\n", (unsigned long long)h);
-+  return 0;
-+}}
-+"""
-+
-+
-+def gen_conv_program(src: Elem, dst: Elem) -> str:
-+    """Conversion kernels: a[i] = (DST)b[i]; plus a widening-accumulate form."""
-+    S, D = src.c, dst.c
-+    fp = src.fp or dst.fp
-+    # FP<->int needs in-range inputs to stay defined; int narrowing is a
-+    # defined (unsigned) / wrapping (signed, GCC-documented) truncation.
-+    prof = "small" if fp else "full"
-+    acc_t = "double" if fp else "long long"
-+    trips = ", ".join(str(t) for t in TRIPS)
-+    return HEADER + f"""
-+__attribute__((noinline)) void kernel({D} *a, const {S} *b, long n) {{
-+  for (long i = 0; i < n; i++) a[i] = ({D})b[i];
-+}}
-+__attribute__((noinline)) {acc_t} kernel_acc(const {S} *b, long n) {{
-+  {acc_t} s = 0;
-+  for (long i = 0; i < n; i++) s += ({acc_t})({D})b[i];
-+  return s;
-+}}
-+static uint64_t h = 1469598103934665603ULL;
-+static void mix(const void *p, size_t n) {{
-+  const unsigned char *q = p;
-+  for (size_t k = 0; k < n; k++) {{ h ^= q[k]; h *= 1099511628211ULL; }}
-+}}
-+static {S} B[NBUF + 2 * PAD];
-+static {D} A[NBUF + 2 * PAD];
-+static uint64_t r = 88172645463325252ULL;
-+int main(void) {{
-+  static const int trips[] = {{{trips}}};
-+  {fill_code(src, prof, "B")}
-+  for (size_t ti = 0; ti < sizeof trips / sizeof *trips; ti++) {{
-+    for (int off = 0; off < 4; off++) {{
-+      memset(A, 0x5a, sizeof A);
-+      kernel(A + PAD + off, B + PAD + (off ^ 1), trips[ti]);
-+      mix(A, sizeof A);
-+      {acc_t} s = kernel_acc(B + PAD + off, trips[ti]);
-+      mix(&s, sizeof s);
-+    }}
-+  }}
-+  printf("%016llx\\n", (unsigned long long)h);
-+  return 0;
-+}}
-+"""
-+
-+
-+# ── Case enumeration ─────────────────────────────────────────────────────────
-+
-+
-+@dataclass
-+class Case:
-+    cid: str
-+    src: str
-+    kernel: str
-+
-+
-+def enumerate_cases(args: argparse.Namespace) -> List[Case]:
-+    rng = random.Random(args.seed)
-+    cases: List[Case] = []
-+    flt = re.compile(args.filter) if args.filter else None
-+    for k in KERNELS:
-+        for e in ELEMS:
-+            if not k.types(e):
-+                continue
-+            if flt and not flt.search(f"{k.name}_{e.tag}"):
-+                continue
-+            if not k.loop:
-+                forms = [("lt", "int")]
-+            elif args.exhaustive_forms:
-+                forms = [(f, t) for f in FORMS for t in IV_TYPES
-+                         if not (f == "down" and t in ("unsigned", "size_t"))]
-+            else:
-+                # Deterministic rotation: every (form, ivt) pair is hit across
-+                # the kernel set; `--seed` reshuffles.  The canonical
-+                # `int`/`lt` spelling is always included.
-+                f = rng.choice(FORMS)
-+                t = rng.choice([t for t in IV_TYPES if not (f == "down" and t in ("unsigned", "size_t"))])
-+                forms = [("lt", "int")] + ([(f, t)] if (f, t) != ("lt", "int") else [])
-+            for f, t in forms:
-+                cases.append(Case(f"{k.name}_{e.tag}_{f}_{t}", gen_program(k, e, f, t), k.name))
-+    if not args.no_conv:
-+        for s, d in CONV_PAIRS:
-+            if flt and not flt.search(f"conv_{s}_{d}"):
-+                continue
-+            cases.append(Case(f"conv_{s}_{d}", gen_conv_program(BY_TAG[s], BY_TAG[d]), "conv"))
-+    if args.limit:
-+        rng.shuffle(cases)
-+        cases = cases[: args.limit]
-+    return cases
-+
-+
-+# ── Execution ────────────────────────────────────────────────────────────────
-+
-+# Packed-SIMD census heuristic: a vector-register instruction that is not a
-+# scalar move/zero idiom.  Deliberately conservative (scalar `*sd`/`*ss` forms
-+# are excluded unless they touch ymm/zmm).
-+SCALAR_MOV = re.compile(r"^(v?mov[dq]|v?movs[sd]|vzeroupper|v?pxor|v?xorp[sd])$")
-+PACKED_MN = re.compile(r"^(v?p[a-z0-9]+|v[a-z0-9]+p[sd]|[a-z0-9]+p[sd]|v?cvt[a-z0-9]*|vbroadcast\w+|vinserti\w+|vextracti\w+)$")
-+
-+
-+def sh(cmd: Sequence[str], env: Optional[dict] = None, timeout: int = 180) -> subprocess.CompletedProcess:
-+    return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout, env=env)
-+
-+
-+def compile_run(compiler: str, flags: Sequence[str], src: Path, exe: Path,
-+                env_extra: Optional[dict]) -> Tuple[str, str]:
-+    env = dict(os.environ)
-+    if env_extra:
-+        env.update(env_extra)
-+    try:
-+        c = sh([compiler, *flags, str(src), "-o", str(exe)], env=env)
-+    except subprocess.TimeoutExpired:
-+        return "COMPILE-TIMEOUT", ""
-+    if c.returncode != 0:
-+        return "COMPILE-FAIL", (c.stderr or c.stdout)[-400:]
-+    try:
-+        r = sh([str(exe)], timeout=60)
-+    except subprocess.TimeoutExpired:
-+        return "RUN-TIMEOUT", ""
-+    if r.returncode != 0:
-+        return f"RUN-FAIL({r.returncode})", (r.stderr or "")[-200:]
-+    return "OK", r.stdout.strip()
-+
-+
-+def simd_count(obj: Path, symbol: str = "kernel") -> Optional[int]:
-+    """Packed-SIMD instructions inside `symbol` (heuristic, see PACKED_MN)."""
-+    d = sh(["objdump", "-d", "--no-show-raw-insn", f"--disassemble={symbol}", str(obj)])
-+    if d.returncode != 0:
-+        return None
-+    n = 0
-+    for line in d.stdout.splitlines():
-+        m = re.match(r"^\s+[0-9a-f]+:\s+(\S+)\s*(.*)$", line)
-+        if not m:
-+            continue
-+        mn, ops = m.group(1), m.group(2)
-+        if SCALAR_MOV.match(mn):
-+            continue
-+        wide = "ymm" in ops or "zmm" in ops
-+        if mn.endswith(("sd", "ss")) and not wide:
-+            continue
-+        if (wide or "xmm" in ops) and PACKED_MN.match(mn):
-+            n += 1
-+    return n
-+
-+
-+def run_case(case: Case, args: argparse.Namespace, workdir: Path) -> dict:
-+    d = workdir / case.cid
-+    d.mkdir(parents=True, exist_ok=True)
-+    src = d / "t.c"
-+    src.write_text(case.src)
-+    lflags = shlex.split(args.lccc_flags)
-+    res: Dict[str, Tuple[str, str]] = {
-+        "gcc-O0": compile_run(args.gcc, ["-O0", "-w"], src, d / "ref", None),
-+        "lccc-on": compile_run(args.lccc, lflags, src, d / "on", None),
-+        "lccc-off": compile_run(args.lccc, lflags, src, d / "off",
-+                                {"CCC_DISABLE_PASSES": "vectorize,slp,slp_late,iv_widen"}),
-+    }
-+    status, detail = "PASS", ""
-+    ref = res["gcc-O0"]
-+    if ref[0] != "OK":
-+        status, detail = "REF-FAIL", f"gcc -O0: {ref}"
-+    else:
-+        for arm in ("lccc-on", "lccc-off"):
-+            if res[arm] != ref:
-+                status = "MISCOMPILE" if res[arm][0] == "OK" else "FAIL"
-+                detail += f"{arm}: {res[arm][0]} {res[arm][1]!r} vs ref {ref[1]!r}; "
-+    census = None
-+    if args.census and status == "PASS":
-+        lo, go = d / "l.o", d / "g.o"
-+        lc = sh([args.lccc, *lflags, "-c", str(src), "-o", str(lo)])
-+        gflags = [f for f in lflags if f.startswith(("-march", "-mavx", "-ffp-contract"))]
-+        gc = sh([args.gcc, "-O3", "-w", *gflags, "-c", str(src), "-o", str(go)])
-+        if lc.returncode == 0 and gc.returncode == 0:
-+            census = {"lccc": simd_count(lo), "gcc": simd_count(go)}
-+    if status != "PASS" and args.keep:
-+        dst = Path(args.keep) / case.cid
-+        shutil.copytree(d, dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("ref", "on", "off", "*.o"))
-+    if status == "PASS" and args.keep_all and args.keep:
-+        shutil.copytree(d, Path(args.keep) / case.cid, dirs_exist_ok=True,
-+                        ignore=shutil.ignore_patterns("ref", "on", "off", "*.o"))
-+    shutil.rmtree(d, ignore_errors=True)
-+    return {"id": case.cid, "kernel": case.kernel, "status": status, "detail": detail, "census": census}
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-+    ap.add_argument("--lccc", default="target/fastbuild/lccc-x86")
-+    ap.add_argument("--gcc", default=os.environ.get("CC", "gcc"))
-+    # -ffp-contract=off: lccc (like gcc -march=x86-64-v3) contracts a*b+c into FMA
-+    # by default, which legitimately changes FP bits versus the -O0 reference.
-+    # The stress test compares bits, so contraction is pinned off in every arm.
-+    ap.add_argument("--lccc-flags", default="-O3 -march=x86-64-v3 -ffp-contract=off")
-+    ap.add_argument("--filter", help="regex on <kernel>_<type> (conv_<src>_<dst> for conversions)")
-+    ap.add_argument("--limit", type=int, default=0, help="random subset of N cases (with --seed)")
-+    ap.add_argument("--seed", type=int, default=1)
-+    ap.add_argument("--exhaustive-forms", action="store_true",
-+                    help="every (loop form x IV type) pair per kernel/type (large)")
-+    ap.add_argument("--no-conv", action="store_true")
-+    ap.add_argument("--census", action="store_true",
-+                    help="also rank kernels where gcc -O3 vectorizes and lccc does not")
-+    ap.add_argument("--json", help="write full results to this file")
-+    ap.add_argument("--keep", help="copy failing reproducers into this directory")
-+    ap.add_argument("--keep-all", action="store_true", help="with --keep: also keep passing sources")
-+    ap.add_argument("-j", "--jobs", type=int, default=2)
-+    args = ap.parse_args()
-+
-+    cases = enumerate_cases(args)
-+    if not cases:
-+        print("no cases matched", file=sys.stderr)
-+        return 2
-+    print(f"vectorize_stress: {len(cases)} programs, lccc flags: {args.lccc_flags}", flush=True)
-+    work = Path(tempfile.mkdtemp(prefix="vecstress-"))
-+    results: List[dict] = []
-+    try:
-+        with cf.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
-+            futs = [ex.submit(run_case, c, args, work) for c in cases]
-+            for done, f in enumerate(cf.as_completed(futs), 1):
-+                r = f.result()
-+                results.append(r)
-+                if r["status"] != "PASS":
-+                    print(f"  [{r['status']}] {r['id']}: {r['detail']}", flush=True)
-+                elif done % 50 == 0:
-+                    print(f"  ... {done}/{len(cases)}", flush=True)
-+    finally:
-+        shutil.rmtree(work, ignore_errors=True)
-+
-+    bad = [r for r in results if r["status"] != "PASS"]
-+    print(f"\n{len(results) - len(bad)}/{len(results)} programs agree across all arms")
-+    if args.census:
-+        rows: Dict[str, Dict[str, int]] = {}
-+        for r in results:
-+            c = r.get("census")
-+            if not c or c["lccc"] is None or c["gcc"] is None:
-+                continue
-+            m = rows.setdefault(r["kernel"], {"n": 0, "gcc": 0, "lccc": 0, "gap": 0})
-+            m["n"] += 1
-+            m["gcc"] += c["gcc"] > 0
-+            m["lccc"] += c["lccc"] > 0
-+            m["gap"] += c["gcc"] > 0 and c["lccc"] == 0
-+        print("\nMissed-vectorization census (gcc -O3 emits packed SIMD in `kernel`, lccc does not):")
-+        print(f"{'kernel':<16} {'n':>4} {'gcc-vec':>8} {'lccc-vec':>9} {'gap':>4}")
-+        for name, m in sorted(rows.items(), key=lambda kv: (-kv[1]["gap"], kv[0])):
-+            print(f"{name:<16} {m['n']:>4} {m['gcc']:>8} {m['lccc']:>9} {m['gap']:>4}")
-+    if args.json:
-+        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
-+        Path(args.json).write_text(json.dumps(sorted(results, key=lambda r: r["id"]), indent=1))
-+    return 1 if bad else 0
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 2d20a1f..b994a90 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -6870,11 +6870,13 @@ fn analyze_map_pattern(
-                 store_val.0, parsed
-             );
-         }
--        let Some((byte_expr, _)) = parsed else {
-+        let Some((byte_expr, root_range)) = parsed else {
-             set_reject("byte map: tree is not byte-exact");
-             return None;
-         };
--        byte_expr
-+        // The stored value is a VALUE: a bare compare root (`a[i] = b[i] > k`)
-+        // must store C's 0/1, not the packed all-ones lane.
-+        demask_operand(byte_expr, root_range).0
-     } else {
-         let parsed = parse_tree(store_val, 0);
-         if debug {
-@@ -6892,7 +6894,10 @@ fn analyze_map_pattern(
-     // lanes only -- `map_lane_bits` returns `None` for FP element types and
-     // the tree is left untouched.
-     let expr = match map_lane_bits(&elem_ty) {
--        Some(bits) => fold_unsigned_range_masks(&expr, bits),
-+        // Fold first (it canonicalises `and`/`or` of masks into `MaskConj`),
-+        // then demask: every mask left in a value position becomes `m & 1`
-+        // so the packed body and the scalar remainder mirror agree.
-+        Some(bits) => demask_value_positions(fold_unsigned_range_masks(&expr, bits)),
-         None => expr,
-     };
-     // 20 admits the recovered `&&`/`||` mask shapes (a two-compare
-@@ -12083,6 +12088,12 @@ fn parse_byte_map_expr(
-                     Some(MASK_RANGE),
-                 ));
++++ b/docs/SESSION_FOLLOWUP_CANON_REWRITERS.md
+@@ -0,0 +1,77 @@
++# Canonical value-rewrite walkers: slot coverage is not reach semantics
++
++**Status:** landed with the consolidation of the eleven private rewriter tables (PR #701 follow-up).
++**Audience:** anyone replacing a `match` table with `replace_operand_value` /
++`replace_values_in_inst_map` / `replace_terminator_value`.
++
++---
++
++## 1. What the canonical pair guarantees
++
++[`replace_operand_value`](../src/ir/instruction.rs) and its map-valued companion redirect **every
++read** of a value: the `Operand` slots (`for_each_operand_mut`) *and* the bare `Value` slots that are
++not `Operand`s (`GetElementPtr.base`, `Load.ptr`, `Store.ptr`, `Memcpy`, va-list pointers,
++`Intrinsic.dest_ptr`, `InlineAsm` outputs, …) via `for_each_value_use_mut`.  Destinations — the
++values an instruction *defines* — are never touched.
++
++Historic hand-rolled tables enumerated *instruction kinds* and silently missed whole positions, which
++is how two `VaEnd { .. } => {}` arms survived (a rewrite that redirected a `va_list` pointer left the
++old value in place: SSA-valid, silently wrong).  `ir::instruction::value_replacement_tests` pins the
++coverage both forms must have in common.
++
++## 2. What the canonical pair does **not** guarantee: reach
++
++A table also encodes **where** a rewrite is applied.  For a blind "redirect every read of `old` to
++`replacement`" that reach matters, and two shapes are illegal:
++
++1. **the instruction that defines `replacement`** — the vectorizer's no-remainder reduction is
++   `VecHorizontalAddI32x8(acc) -> sum`: it consumes the accumulator *and* defines the replacement.
++   Redirecting its operand produces `hadd(sum) -> sum`; the loop feeding it loses its only outside
++   reader, is eliminated, and the backend reads an uninitialised spill slot as a pointer
++   (`double_reduction` printed `0` instead of `201415680`, then faulted);
++2. **any instruction whose result feeds `replacement`** — the remainder path seeds its scalar
++   accumulator phi with `hadd(acc) -> 29`, so redirecting the seed closes the cycle
++   `29 -> phi(41) -> 42 -> 29` from the other side; the vector loop again disappears
++   (`vectorize_i32_sum` returned garbage for `n = 1`).
++
++Both are the same defect: *the rewrite puts the replacement behind itself*.  The general rule is a
++data-dependency question, not an instruction-kind question:
++
++```rust
++let (def_block, def_idx) = definition_site(func, replacement)?;   // what defines it
++let producers = producer_cone(func, replacement);                 // transitive backward slice
++for each read of `old` outside the loop in block bi, instruction ii {
++    if bi == def_block && ii <= def_idx { continue; }   // not yet defined here
++    if inst.dest() ∈ producers { continue; }            // feeds it -> cycle
++    redirect;
++}
++```
++
++`vectorize::rewrite_uses_where_available` is the implementation, `outside_rewrite_availability_tests`
++is the regression suite (both shapes, the same-block cursor, and the bare-`Value` coverage that the
++migration exists for).
++
++**Block reach is deliberately broad.**  The no-remainder path *must* redirect readers in the original
++exit block, whose zero-trip bypass edge exists in the CFG but is proven dead by the trip-count guard.
++A dominance filter ("rewrite only where the definition dominates the use") was implemented, measured,
++and rejected: it left those readers on the vector accumulator and `double_reduction` printed
++`25051136`.  Reach is part of a rewriter's contract; state it and test it, do not infer it from the
++instruction kinds a table happened to list.
++
++## 3. Verification used when landing the consolidation
++
++* `scripts/check_codegen_refactor_identity.py --before <baseline> --after target/fastbuild/lccc
++  --corpus tests/regression` → `IDENTICAL=819 PGO_PID=4 DIFFERENT=0 COMPILE_FAIL=0 OF 823`
++  (the 4 are the documented `-fprofile-generate` PID nondeterminism), and the same check over
++  `tests/benchmark/programs` → `IDENTICAL=51 DIFFERENT=0`.
++* Per-pass IR dumps (`CCC_DUMP_EACH_PASS=1 CCC_DUMP_FUNC=<fn>`) and pass isolation
++  (`CCC_DISABLE_PASSES=<pass>`) localise a codegen delta to a pass without rebuilding.
++* The unit suite alone does **not** exercise these shapes: the corpus does.  Run the identity check
++  before landing a rewriter migration.
++
++## 4. Exceptions that stay tables
++
++`split_ranges::replace_values_in_inst_phi_aware` keeps its own walk because it must *suppress*
++phi-incoming rewrites (`rewrite_phi = false`) — a caller-level condition a generic visitor cannot
++express.  It is renamed to end the three-way name collision with the canonical pair, documented next
++to the table, and its coverage is kept honest by the unit test named in §1.
+diff --git a/docs/induction-strength-reduction-consumers.md b/docs/induction-strength-reduction-consumers.md
+index 83924347..3c3b2f48 100644
+--- a/docs/induction-strength-reduction-consumers.md
++++ b/docs/induction-strength-reduction-consumers.md
+@@ -7,9 +7,11 @@ all three are losses on the machine.
+ 
+ ## The shape that motivated the work
+ 
+-`benchmark/programs/nbody.c`, built with `-O2 -march=x86-64-v3 -DSTEPS=2000`.
+-The inner loop walks `bodies[j]` and `bodies[k]` where `bodies` is a static
+-array and the byte offset is `index * 56`.  IVSR's derived-expression finder
++`tests/benchmark/programs/nbody.c`, built with `-O2 -march=x86-64-v3 -DSTEPS=2000`.
++The inner pair loop walks `bodies[i]` and `bodies[j]` (the two C-level loop
++variables of `advance`; the IR renumbers them after inlining, so the sections
++below name the C variables and quote IR block labels where it matters) where
++`bodies` is a static array and the byte offset is `index * 56`.  IVSR's derived-expression finder
+ does locate those multiplies (`[IVSR]` reports `derived=1` for both loops), and
+ yet the multiply survives into the emitted loop.
+ 
+@@ -68,10 +70,32 @@ The pointer form is the right shape -- it is what GCC emits (`addq $56, %rax`
+ with `disp(%rax)` accesses) -- and it does shrink the hot loop from 45 to 42
+ instructions with the multiply gone entirely.  It loses anyway, because the seed
+ for a nested loop's pointer is computed in the *enclosing* loop body: the
+-k-loop's start address depends on `j`, so `(j+1) * 56 + bodies` is materialized
+-once per j-iteration where the old code recomputed it inside the k-loop.  The
+-k-loop saves 2 instructions per k-iteration, the j-loop body grows by 3 per
+-j-iteration, and the measured total rises 1.9 %.
++inner loop's start address depends on `i`, so `(i+1) * 56 + bodies` is
++materialized once per `i`-iteration where the old code recomputed it inside the
++inner loop, and the new pointer is live across the whole nest.
++
++The cost decomposition is measured, not modelled, because the two obvious
++per-iteration guesses do not reconcile with the counters.  For
++`NBODIES = 5`, `STEPS = 2000` the inner pair loop runs
++`C(5,2) * 2000 = 20 000` iterations while the `i`-loop runs `5 * 2000 = 10 000`
++(8 000 of which enter the inner loop).  A "saves 2 per inner iteration, adds 3
++per outer iteration" reading would predict a *net win* of roughly 10 000-16 000
++instructions; the instruments measure the opposite sign, so that reading was
++wrong and is replaced here by the dump-attributed delta:
++
++| region (callgrind, `--dump-instr=yes`) | baseline | pointer form | delta |
++| --- | --- | --- | --- |
++| `main` (caller loops) | 1 100 994 | 1 108 990 | **+7 996** = +4 per step, −4 |
++| everything outside `main` (`advance`, the hot nest) | 151 508 | 163 508 | **+12 000** = +6 per step |
++| total | 1 252 502 | 1 272 498 | +19 996 (+1.60 %) |
++
++qemu agrees on sign and size (+21 995, +1.94 %).  So the regression is *not*
++mostly in the hot loop at all: two thirds of it is +6 instructions per step
++inside `advance`, i.e. work attached to entering and leaving the nest rather
++than to the 20 000 inner iterations that the transform was supposed to make
++cheaper.  That is the accurate statement of why the pointer form loses, and it
++is the one to trust; the earlier per-iteration sentence counted instructions in
++the wrong regions.
+ 
+ ## Consequences for the pass
+ 
+diff --git a/src/backend/location_alloc/materializer.rs b/src/backend/location_alloc/materializer.rs
+index f8b7b8dd..03b25d64 100644
+--- a/src/backend/location_alloc/materializer.rs
++++ b/src/backend/location_alloc/materializer.rs
+@@ -424,7 +424,7 @@ pub(super) fn materialize(
+                 ev_idx += 1;
              }
-+            // Any OTHER use of a mask as a VALUE (`a + (b > k)`, `x & (c == d)`,
-+            // `(p > k) ^ (q < k)`, ...) must see C's 0/1 boolean, not the packed
-+            // all-ones lane: demask first, so the packed body, the scalar
-+            // remainder mirror and the range arithmetic below all agree.
-+            let (l, lr) = demask_operand(l, lr);
-+            let (r, rr) = demask_operand(r, rr);
-             Some((
-                 MapExpr::BinOp(*op, Box::new(l), Box::new(r)),
-                 range_binop(*op, lr, rr),
-@@ -12263,6 +12274,110 @@ fn parse_byte_map_expr(
+             if !matches!(inst, Instruction::Phi { .. }) && !active.is_empty() {
+-                replace_values_in_inst(&mut inst, &active, false);
++                replace_values_in_inst_phi_aware(&mut inst, &active, false);
+             }
+             out.push(inst);
+             if spanful {
+@@ -457,7 +457,7 @@ pub(super) fn materialize(
+             func.blocks[bi].source_spans = out_spans;
+         }
+         if !active.is_empty() {
+-            replace_values_in_terminator(&mut func.blocks[bi].terminator, &active);
++            replace_values_in_terminator_phi_aware(&mut func.blocks[bi].terminator, &active);
+         }
+     }
+ 
+diff --git a/src/backend/location_alloc/mod.rs b/src/backend/location_alloc/mod.rs
+index 09308e48..fef7b708 100644
+--- a/src/backend/location_alloc/mod.rs
++++ b/src/backend/location_alloc/mod.rs
+@@ -182,8 +182,8 @@ use std::sync::OnceLock;
+ use super::liveness::LivenessResult;
+ use super::split_ranges::{
+     collect_value_types, first_non_phi, insert_entry_alloca, is_simple_gpr_type, next_value,
+-    pressure_budget, pressure_min_gap, replace_values_in_inst, replace_values_in_terminator,
+-    split_debug_enabled, terminator_uses_value,
++    pressure_budget, pressure_min_gap, replace_values_in_inst_phi_aware,
++    replace_values_in_terminator_phi_aware, split_debug_enabled, terminator_uses_value,
+ };
+ 
+ // Phase 1 lives in focused modules; the glob re-exports make the cross-cut
+diff --git a/src/backend/split_ranges.rs b/src/backend/split_ranges.rs
+index 26284a82..3155870f 100644
+--- a/src/backend/split_ranges.rs
++++ b/src/backend/split_ranges.rs
+@@ -198,9 +198,19 @@ fn rewrite_value(v: &mut Value, map: &FxHashMap<u32, u32>) {
+ }
+ 
+ /// Rewrite every *use* of a mapped value. Destinations are left alone.
+-/// Phi incoming is rewritten only when `rewrite_phi` is true — callers that
+-/// just defined a replacement in *this* block must pass false (use-before-def).
+-pub(crate) fn replace_values_in_inst(
++///
++/// Phi incoming is rewritten only when `rewrite_phi` is true — callers that just
++/// defined a replacement in *this* block must pass false (use-before-def).  That
++/// conditional is why this table still exists instead of delegating to
++/// [`crate::ir::instruction::replace_values_in_inst_map`]: the canonical walk
++/// visits every operand unconditionally, and there is no way to express "visit
++/// everything except the phi arms" through it.  The two must not drift, so keep
++/// the coverage identical to `for_each_operand_mut` + `for_each_value_use_mut`:
++/// `value_replacement_tests::bare_value_slots_are_covered_by_the_canonical_walk`
++/// in `ir::instruction` is the checklist, and the `VaEnd` bug this table used to
++/// have (`va_list_ptr` grouped with the field-less variants) is exactly the kind
++/// of drift that check catches.
++pub(crate) fn replace_values_in_inst_phi_aware(
+     inst: &mut Instruction,
+     map: &FxHashMap<u32, u32>,
+     rewrite_phi: bool,
+@@ -216,8 +226,13 @@ pub(crate) fn replace_values_in_inst(
+         | Instruction::GetReturnF128Second { .. }
+         | Instruction::GetStaticChain { .. }
+         | Instruction::StackSave { .. }
+-        | Instruction::ParamRef { .. }
+-        | Instruction::VaEnd { .. } => {}
++        | Instruction::ParamRef { .. } => {}
++        // `VaEnd` is *not* field-less: `va_list_ptr` is a bare `Value`, so it
++        // belongs with the other varargs arms below.  It used to be listed with
++        // the definitions above, which silently left a stale `va_list` pointer
++        // behind whenever the map redirected one (the same class of bug the
++        // canonical walkers in `ir::instruction` exist to prevent).
++        Instruction::VaEnd { va_list_ptr } => rewrite_value(va_list_ptr, map),
+         // Nested-function support: operand rewrites.
+         Instruction::SetStaticChain { src } => rewrite_operand(src, map),
+         Instruction::InitTrampoline { buffer, chain, .. } => {
+@@ -332,7 +347,10 @@ pub(crate) fn replace_values_in_inst(
      }
  }
  
-+/// Is this node a lane MASK (all-ones / all-zeros per packed lane, a 0/1
-+/// `setcc` in the scalar remainder mirror)?
-+fn is_lane_mask(e: &MapExpr) -> bool {
-+    matches!(e, MapExpr::Cmp(..) | MapExpr::MaskConj { .. })
-+}
-+
-+/// `m & 1`: a lane mask converted to C's 0/1 boolean value.
-+///
-+/// Exact in BOTH interpreter worlds: a packed mask is all-ones or zero, so
-+/// `m & 1` is that lane's 0/1; a scalar `setcc` is already 0/1, so `m & 1`
-+/// is the `setcc`.  (Any other constant would NOT be world-independent --
-+/// `m & k` is `-1 & k` packed but `1 & k` scalar -- which is why the
-+/// strength-reducer's `m & k` rewrite is restricted to the packed tree.)
-+fn mask_to_bool(m: MapExpr) -> MapExpr {
-+    MapExpr::BinOp(
-+        IrBinOp::And,
-+        Box::new(m),
-+        Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(1)))),
-+    )
-+}
-+
-+/// Is `e` the canonical demasked boolean `mask & 1` produced by
-+/// [`mask_to_bool`]?  Used to keep [`demask_value_positions`] idempotent.
-+fn is_demasked_bool(e: &MapExpr) -> bool {
-+    let MapExpr::BinOp(IrBinOp::And, m, one) = e else {
-+        return false;
-+    };
-+    is_lane_mask(m)
-+        && matches!(
-+            one.as_ref(),
-+            MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1)
-+        )
-+}
-+
-+/// Demask a parsed operand that is consumed as a VALUE: a mask-ranged
-+/// operand becomes `mask & 1` with the exact 0/1 range; anything else is
-+/// returned unchanged.
-+fn demask_operand(e: MapExpr, range: WideRange) -> (MapExpr, WideRange) {
-+    if range == Some(MASK_RANGE) {
-+        (mask_to_bool(e), Some((0, 1)))
-+    } else {
-+        (e, range)
-+    }
-+}
-+
-+/// Rewrite every lane mask that appears in a VALUE position into `mask & 1`.
-+///
-+/// A packed compare produces -1/0 per lane while C's `a > b` is the 0/1
-+/// boolean, and the same `MapExpr` is lowered twice: once to packed
-+/// instructions and once to the scalar remainder mirror.  The two worlds
-+/// agree on a mask only where it is *consumed as a condition* (`Select`
-+/// condition, `MaskConj` operand).  Everywhere else (arithmetic operand,
-+/// `Select` arm, stored root, compare operand) the mask must first become
-+/// its boolean value -- otherwise `a[i] += (b[i] > k)` adds -1 in the vector
-+/// body and +1 in the remainder.
-+///
-+/// Root positions count as values: the tree's result is stored.  Idempotent.
-+fn demask_value_positions(expr: MapExpr) -> MapExpr {
-+    fn go(e: MapExpr, want_value: bool) -> MapExpr {
-+        match e {
-+            MapExpr::Load(_) | MapExpr::Invariant(_) => e,
-+            MapExpr::Cmp(op, l, r) => {
-+                let rebuilt = MapExpr::Cmp(op, Box::new(go(*l, true)), Box::new(go(*r, true)));
-+                if want_value { mask_to_bool(rebuilt) } else { rebuilt }
-+            }
-+            MapExpr::MaskConj { is_and, l, r } => {
-+                let rebuilt = MapExpr::MaskConj {
-+                    is_and,
-+                    l: Box::new(go(*l, false)),
-+                    r: Box::new(go(*r, false)),
-+                };
-+                if want_value { mask_to_bool(rebuilt) } else { rebuilt }
-+            }
-+            MapExpr::Select(c, t, f) => MapExpr::Select(
-+                Box::new(go(*c, false)),
-+                Box::new(go(*t, true)),
-+                Box::new(go(*f, true)),
-+            ),
-+            MapExpr::BinOp(op, l, r) => {
-+                // Already-canonical `mask & 1`: keep the mask in condition
-+                // position instead of demasking it a second time.
-+                if op == IrBinOp::And
-+                    && ((is_lane_mask(&l) && !is_lane_mask(&r))
-+                        || (is_lane_mask(&r) && !is_lane_mask(&l)))
-+                    && (matches!(&*r, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1))
-+                        || matches!(&*l, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1)))
-+                {
-+                    let (m, one) = if is_lane_mask(&l) { (*l, *r) } else { (*r, *l) };
-+                    return MapExpr::BinOp(IrBinOp::And, Box::new(go(m, false)), Box::new(one));
-+                }
-+                MapExpr::BinOp(op, Box::new(go(*l, true)), Box::new(go(*r, true)))
-+            }
-+            MapExpr::MinMax { is_max, l, r } => MapExpr::MinMax {
-+                is_max,
-+                l: Box::new(go(*l, true)),
-+                r: Box::new(go(*r, true)),
-+            },
-+            MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(go(*x, true))),
-+            MapExpr::Fma { .. } => e,
-+        }
-+    }
-+    go(expr, true)
-+}
-+
- /// If `v` is the integer promotion of a byte-typed value, return that byte
- /// value together with the range the promotion guarantees.
- ///
-@@ -27017,6 +27132,110 @@ mod map_expr_interpreter_tests {
-         );
+-pub(crate) fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
++pub(crate) fn replace_values_in_terminator_phi_aware(
++    term: &mut Terminator,
++    map: &FxHashMap<u32, u32>,
++) {
+     match term {
+         Terminator::Return(Some(op)) => rewrite_operand(op, map),
+         Terminator::CondBranch { cond, .. } => rewrite_operand(cond, map),
+@@ -739,9 +757,9 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
+                 for inst in &mut block.instructions {
+                     // Never rewrite Phis: incoming is a pred-side use and
+                     // `new_val` is defined *after* the phis in the exit block.
+-                    replace_values_in_inst(inst, &map, false);
++                    replace_values_in_inst_phi_aware(inst, &map, false);
+                 }
+-                replace_values_in_terminator(&mut block.terminator, &map);
++                replace_values_in_terminator_phi_aware(&mut block.terminator, &map);
+             }
+             splits += 1;
+         }
+@@ -996,9 +1014,9 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
+         // load sits at ci+2 after both inserts
+         let first_after_load = (ci + 3).min(block.instructions.len());
+         for inst in block.instructions[first_after_load..].iter_mut() {
+-            replace_values_in_inst(inst, &map, false);
++            replace_values_in_inst_phi_aware(inst, &map, false);
+         }
+-        replace_values_in_terminator(&mut block.terminator, &map);
++        replace_values_in_terminator_phi_aware(&mut block.terminator, &map);
+         wrapped += 1;
      }
  
-+    /// REGRESSION (cond_inc miscompile, found by `scripts/vectorize_stress.py`):
-+    /// `a[i] += (b[i] > k)` at byte/word/dword lanes added the packed
-+    /// all-ones mask (-1) in the vector body but the scalar `setcc` (+1) in
-+    /// the remainder.  `demask_value_positions` rewrites every mask used as a
-+    /// VALUE into `mask & 1`, which both interpreters evaluate identically.
-+    /// Each tree below diverges before the rewrite and agrees after, at every
-+    /// lane width, over a domain including both signed extremes.
-+    #[test]
-+    fn demasked_value_position_masks_agree_across_interpreters() {
-+        let k = |v: i32| MapExpr::Invariant(Operand::Const(IrConst::I32(v)));
-+        let cmp = |op: IrCmpOp, s: usize, v: i32| {
-+            MapExpr::Cmp(op, Box::new(MapExpr::Load(s)), Box::new(k(v)))
-+        };
-+        let bin = |op: IrBinOp, l: MapExpr, r: MapExpr| MapExpr::BinOp(op, Box::new(l), Box::new(r));
-+        let trees: Vec<(&str, MapExpr)> = vec![
-+            ("a + (b > k)", bin(IrBinOp::Add, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5))),
-+            ("a - (b > k)", bin(IrBinOp::Sub, MapExpr::Load(0), cmp(IrCmpOp::Ult, 1, 5))),
-+            ("a & (b > k)", bin(IrBinOp::And, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5))),
-+            ("a | (b > k)", bin(IrBinOp::Or, MapExpr::Load(0), cmp(IrCmpOp::Eq, 1, 3))),
-+            ("(a > k) ^ (b < k)", bin(IrBinOp::Xor, cmp(IrCmpOp::Slt, 0, 5), cmp(IrCmpOp::Ult, 1, 7))),
-+            ("(a > k) + (b < k)", bin(IrBinOp::Add, cmp(IrCmpOp::Slt, 0, 5), cmp(IrCmpOp::Sle, 1, 7))),
-+            ("root Cmp", cmp(IrCmpOp::Slt, 0, 5)),
-+            (
-+                "root MaskConj",
-+                MapExpr::MaskConj {
-+                    is_and: true,
-+                    l: Box::new(cmp(IrCmpOp::Slt, 0, 5)),
-+                    r: Box::new(cmp(IrCmpOp::Ule, 1, 9)),
-+                },
-+            ),
-+            (
-+                "select arm mask",
-+                MapExpr::Select(
-+                    Box::new(cmp(IrCmpOp::Slt, 0, 5)),
-+                    Box::new(cmp(IrCmpOp::Eq, 1, 3)),
-+                    Box::new(k(2)),
-+                ),
-+            ),
-+            (
-+                "mask compared with a load",
-+                MapExpr::Cmp(
-+                    IrCmpOp::Slt,
-+                    Box::new(cmp(IrCmpOp::Slt, 0, 5)),
-+                    Box::new(MapExpr::Load(1)),
-+                ),
-+            ),
-+        ];
-+        let mut diverged_before = 0usize;
-+        for bits in [8u32, 16, 32] {
-+            let m = (1i64 << bits) - 1;
-+            let sign = 1i64 << (bits - 1);
-+            let mut lane_sets: Vec<[i64; 2]> = Vec::new();
-+            for a in [0, 1, 2, 3, 5, 6, 7, 9, 10, m, sign, sign - 1, sign + 1] {
-+                for b in [0, 1, 3, 4, 5, 6, 8, 9, 10, m, sign, sign - 1, sign + 1] {
-+                    let sx = |v: i64| {
-+                        let v = v & m;
-+                        if v & sign != 0 { v - (1i64 << bits) } else { v }
-+                    };
-+                    lane_sets.push([sx(a), sx(b)]);
-+                }
-+            }
-+            for (name, tree) in &trees {
-+                let fixed = demask_value_positions(tree.clone());
-+                assert_eq!(
-+                    demask_value_positions(fixed.clone()),
-+                    fixed,
-+                    "{name}: demask must be idempotent"
-+                );
-+                for lanes in &lane_sets {
-+                    if eval_packed(tree, lanes, bits) != eval_mirror(tree, lanes, bits) {
-+                        diverged_before += 1;
-+                    }
-+                    assert_eq!(
-+                        eval_packed(&fixed, lanes, bits),
-+                        eval_mirror(&fixed, lanes, bits),
-+                        "{name}: packed/mirror divergence after demask at {bits}-bit lanes, lanes={lanes:?}\n  fixed = {fixed:?}"
-+                    );
-+                }
+@@ -1327,14 +1345,14 @@ mod tests {
+         };
+         let mut map = FxHashMap::default();
+         map.insert(1, 99);
+-        replace_values_in_inst(&mut inst, &map, false);
++        replace_values_in_inst_phi_aware(&mut inst, &map, false);
+         match &inst {
+             Instruction::Phi { incoming, .. } => {
+                 assert!(matches!(incoming[0].0, Operand::Value(v) if v.0 == 1));
+             }
+             _ => panic!("phi vanished"),
+         }
+-        replace_values_in_inst(&mut inst, &map, true);
++        replace_values_in_inst_phi_aware(&mut inst, &map, true);
+         match &inst {
+             Instruction::Phi { incoming, .. } => {
+                 assert!(matches!(incoming[0].0, Operand::Value(v) if v.0 == 99));
+@@ -2083,7 +2101,7 @@ fn apply_block_splits(
+         if !active.is_empty() {
+             // `rewrite_phi = false`: a phi in THIS block reads on the
+             // incoming edge, never at the top of the body.
+-            replace_values_in_inst(&mut inst, &active, false);
++            replace_values_in_inst_phi_aware(&mut inst, &active, false);
+         }
+         out.push(inst);
+     }
+@@ -2109,7 +2127,7 @@ fn apply_block_splits(
+     }
+     func.blocks[bi].instructions = out;
+     if !active.is_empty() {
+-        replace_values_in_terminator(&mut func.blocks[bi].terminator, &active);
++        replace_values_in_terminator_phi_aware(&mut func.blocks[bi].terminator, &active);
+     }
+ 
+     // Successor phi operands coming from THIS block: the reload dominates
+diff --git a/src/ir/instruction.rs b/src/ir/instruction.rs
+index 5060dc5f..d3e3c56e 100644
+--- a/src/ir/instruction.rs
++++ b/src/ir/instruction.rs
+@@ -1,6 +1,7 @@
+ use super::constants::IrConst;
+ use super::intrinsics::IntrinsicOp;
+ use super::ops::{AtomicOrdering, AtomicRmwOp, IrBinOp, IrCmpOp, IrUnaryOp};
++use crate::common::fx_hash::FxHashMap;
+ /// IR instruction definitions: the core SSA instruction set.
+ ///
+ /// This module defines the SSA IR instruction enum with 38 variants covering
+@@ -1126,9 +1127,27 @@ impl Instruction {
+ /// to list keeps reading the replaced value, and the resulting IR still
+ /// validates because the stale read is a value that is still defined.
+ ///
+-/// This is the single canonical implementation; the passes that rewrite
+-/// induction-variable uses share it rather than keeping private copies.
+-pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand) {
++/// Returns the number of slots rewritten, so a caller that has to decide
++/// whether its transformation fired can use the count directly.  The return
++/// is deliberately **not** `#[must_use]`: most callers only want the effect.
++///
++/// The reach rules a caller must respect (a rewrite may not put the replacement behind itself) are
++/// in `docs/SESSION_FOLLOWUP_CANON_REWRITERS.md`; the vectorizer's outside-the-loop rewriters
++/// implement them in `rewrite_uses_where_available`.
++///
++/// This pair is the canonical form of the two-walk rewrite.  The passes that
++/// rewrite induction-variable uses route through it instead of keeping private
++/// copies (`iv_widen`, `iv_strength_reduce`, `quadratic_sr`,
++/// `loop_unroll`/`loop_rotate`, `range_check`, `nested_functions`, `vectorize`,
++/// `loop_memory_promote`); the map-valued form is
++/// [`replace_values_in_inst_map`].  The one deliberate exception is
++/// `split_ranges`, whose table must suppress phi-incoming rewrites
++/// (`rewrite_phi = false`), which a generic visitor cannot express — it carries
++/// that note beside the table, and `value_replacement_tests` pins the coverage
++/// both forms must have in common.
++#[inline]
++pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand) -> usize {
++    let mut rewritten = 0usize;
+     let new_val = match new_op {
+         Operand::Value(v) => Some(v),
+         Operand::Const(_) => None,
+@@ -1136,6 +1155,7 @@ pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand
+     inst.for_each_operand_mut(|op| {
+         if matches!(op, Operand::Value(v) if *v == old) {
+             *op = new_op;
++            rewritten += 1;
+         }
+     });
+     // A constant cannot stand in a bare `Value` slot, so those slots are left
+@@ -1145,18 +1165,62 @@ pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand
+         inst.for_each_value_use_mut(|field| {
+             if *field == old {
+                 *field = nv;
++                rewritten += 1;
+             }
+         });
+     }
++    rewritten
++}
++
++/// The map-valued form of [`Instruction::replace_operand_value`]: every read of
++/// a value present as a key in `map` is redirected to that key's replacement.
++/// Both walks, for the reason above; destinations are never rewritten.
++#[inline]
++pub fn replace_values_in_inst_map(inst: &mut Instruction, map: &FxHashMap<u32, u32>) -> usize {
++    let mut rewritten = 0usize;
++    inst.for_each_operand_mut(|op| {
++        if let Operand::Value(v) = op {
++            if let Some(&to) = map.get(&v.0) {
++                *op = Operand::Value(Value(to));
++                rewritten += 1;
 +            }
 +        }
-+        assert!(
-+            diverged_before > 0,
-+            "the un-demasked trees must diverge, or this test proves nothing"
-+        );
-+    }
-+
-+    /// The byte parser's range arithmetic must see a compare used as a value
-+    /// as the boolean range [0, 1], never the packed-lane range [-1, 0].
-+    #[test]
-+    fn demask_operand_reports_boolean_range() {
-+        let m = MapExpr::Cmp(
-+            IrCmpOp::Slt,
-+            Box::new(MapExpr::Load(0)),
-+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(5)))),
-+        );
-+        let (e, r) = demask_operand(m.clone(), Some(MASK_RANGE));
-+        assert_eq!(r, Some((0, 1)));
-+        assert!(is_demasked_bool(&e));
-+        // Non-mask operands pass through untouched.
-+        let (same, r2) = demask_operand(MapExpr::Load(0), Some((0, 255)));
-+        assert_eq!(same, MapExpr::Load(0));
-+        assert_eq!(r2, Some((0, 255)));
-+    }
-+
-     /// Every tree the range fusion and the strength reduction produce must
-     /// still satisfy the condition-position invariant — the strength
-     /// reduction in particular rewrites `Select(m, x+k, x)` into
-diff --git a/tests/regression/vec_mask_value_demask.c b/tests/regression/vec_mask_value_demask.c
-new file mode 100644
-index 0000000..5f46117
---- /dev/null
-+++ b/tests/regression/vec_mask_value_demask.c
-@@ -0,0 +1,127 @@
-+/* REGRESSION: a compare used as a VALUE inside a vectorized elementwise map.
-+ *
-+ * A packed compare yields all-ones (-1) per true lane, while C's `a > b` is
-+ * the 0/1 boolean.  The map vectorizer lowers one expression tree twice --
-+ * packed body and scalar remainder -- and the byte-lane parser (and the
-+ * dword parser) accepted a mask as an ARITHMETIC operand, so
-+ * `a[i] += (b[i] > k)` added -1 per true lane in the vector body but +1 in
-+ * the remainder loop.  Found by scripts/vectorize_stress.py (cond_inc_i8).
-+ *
-+ * Every shape below consumes a compare as a value (add/sub/and/or/xor
-+ * operand, stored root, select arm, negation, `!`), at byte, word and dword
-+ * lanes, for trip counts that straddle every vector/remainder boundary and
-+ * for misaligned pointers.  Output is compared against GCC by the suite. */
-+#include <stdint.h>
-+#include <stdio.h>
-+#include <string.h>
-+
-+#define N 200
-+#define PAD 8
-+
-+#define DEFINE_KERNELS(T, SFX)                                                              \
-+    __attribute__((noinline)) static void cond_inc_##SFX(T *a, const T *b, long n) {        \
-+        for (long i = 0; i < n; i++) a[i] += (b[i] > (T)5);                                 \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void add2_##SFX(T *a, const T *b, const T *c, long n) {\
-+        for (long i = 0; i < n; i++) a[i] = (b[i] > (T)5) + (c[i] < (T)7);                  \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void sub_##SFX(T *a, const T *b, const T *c, long n) { \
-+        for (long i = 0; i < n; i++) a[i] = b[i] - (c[i] > (T)5);                           \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void and_val_##SFX(T *a, const T *b, const T *c,       \
-+                                                        long n) {                           \
-+        for (long i = 0; i < n; i++) a[i] = b[i] & (c[i] > (T)5);                           \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void or_val_##SFX(T *a, const T *b, const T *c,        \
-+                                                       long n) {                            \
-+        for (long i = 0; i < n; i++) a[i] = b[i] | (c[i] > (T)5);                           \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void xor_eq_##SFX(T *a, const T *b, const T *c,        \
-+                                                       long n) {                            \
-+        for (long i = 0; i < n; i++) a[i] ^= (b[i] == c[i]);                                \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void and2_##SFX(T *a, const T *b, const T *c, long n) {\
-+        for (long i = 0; i < n; i++) a[i] = (b[i] > (T)5) & (c[i] < (T)7);                  \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void or2_##SFX(T *a, const T *b, const T *c, long n) { \
-+        for (long i = 0; i < n; i++) a[i] = (b[i] > (T)5) | (c[i] < (T)7);                  \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void xor2_##SFX(T *a, const T *b, const T *c, long n) {\
-+        for (long i = 0; i < n; i++) a[i] = (b[i] > (T)5) ^ (c[i] < (T)7);                  \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void store_##SFX(T *a, const T *b, long n) {           \
-+        for (long i = 0; i < n; i++) a[i] = b[i] > (T)5;                                    \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void neg_##SFX(T *a, const T *b, long n) {             \
-+        for (long i = 0; i < n; i++) a[i] = -(b[i] > (T)5);                                 \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void not_##SFX(T *a, const T *b, long n) {             \
-+        for (long i = 0; i < n; i++) a[i] = !(b[i] == (T)5);                                \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void arm_##SFX(T *a, const T *b, const T *c, long n) { \
-+        for (long i = 0; i < n; i++) a[i] = c[i] > (T)5 ? (b[i] > (T)5) : 2;                \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void arm2_##SFX(T *a, const T *b, const T *c, long n) {\
-+        for (long i = 0; i < n; i++) a[i] = c[i] > (T)5 ? 2 : (b[i] == c[i]);               \
-+    }                                                                                       \
-+    __attribute__((noinline)) static void acc_##SFX(T *a, const T *b, long n) {             \
-+        for (long i = 0; i < n; i++) a[i] = a[i] + (b[i] > (T)5) + (b[i] < (T)-5);          \
-+    }                                                                                       \
-+    static uint64_t run_##SFX(void) {                                                       \
-+        static T A[N + 2 * PAD], A0[N + 2 * PAD], B[N + 2 * PAD], C[N + 2 * PAD];           \
-+        uint64_t h = 1469598103934665603ULL, r = 88172645463325252ULL;                      \
-+        for (int k = 0; k < N + 2 * PAD; k++) {                                             \
-+            r = r * 6364136223846793005ULL + 1442695040888963407ULL;                        \
-+            B[k] = (T)((r >> 24) % 13 - 3);                                                 \
-+            r = r * 6364136223846793005ULL + 1442695040888963407ULL;                        \
-+            C[k] = (T)((r >> 24) % 13 - 3);                                                 \
-+            A0[k] = (T)(k * 7);                                                             \
-+        }                                                                                   \
-+        B[PAD + 5] = (T)-128; /* extremes: the biased-compare constants wrap */             \
-+        C[PAD + 6] = (T)127;                                                                \
-+        for (long n = 0; n <= 70; n++) {                                                    \
-+            for (int off = 0; off < 3; off++) {                                             \
-+                T *a = A + PAD + off, *b = B + PAD + (off ^ 1), *c = C + PAD + off * 2;     \
-+                void (*k2[])(T *, const T *, const T *, long) = {                           \
-+                    add2_##SFX, sub_##SFX, and_val_##SFX, or_val_##SFX, xor_eq_##SFX,       \
-+                    and2_##SFX, or2_##SFX, xor2_##SFX, arm_##SFX, arm2_##SFX};              \
-+                void (*k1[])(T *, const T *, long) = {cond_inc_##SFX, store_##SFX,          \
-+                                                      neg_##SFX,      not_##SFX,            \
-+                                                      acc_##SFX};                           \
-+                for (size_t q = 0; q < sizeof k2 / sizeof *k2; q++) {                       \
-+                    memcpy(A, A0, sizeof A);                                                \
-+                    k2[q](a, b, c, n);                                                      \
-+                    for (size_t x = 0; x < sizeof A; x++) {                                 \
-+                        h ^= ((unsigned char *)A)[x];                                       \
-+                        h *= 1099511628211ULL;                                              \
-+                    }                                                                       \
-+                }                                                                           \
-+                for (size_t q = 0; q < sizeof k1 / sizeof *k1; q++) {                       \
-+                    memcpy(A, A0, sizeof A);                                                \
-+                    k1[q](a, b, n);                                                         \
-+                    for (size_t x = 0; x < sizeof A; x++) {                                 \
-+                        h ^= ((unsigned char *)A)[x];                                       \
-+                        h *= 1099511628211ULL;                                              \
-+                    }                                                                       \
-+                }                                                                           \
-+            }                                                                               \
-+        }                                                                                   \
-+        return h;                                                                           \
-+    }
-+
-+DEFINE_KERNELS(int8_t, i8)
-+DEFINE_KERNELS(uint8_t, u8)
-+DEFINE_KERNELS(int16_t, i16)
-+DEFINE_KERNELS(uint16_t, u16)
-+DEFINE_KERNELS(int32_t, i32)
-+DEFINE_KERNELS(uint32_t, u32)
-+
-+int main(void) {
-+    printf("i8  %016llx\n", (unsigned long long)run_i8());
-+    printf("u8  %016llx\n", (unsigned long long)run_u8());
-+    printf("i16 %016llx\n", (unsigned long long)run_i16());
-+    printf("u16 %016llx\n", (unsigned long long)run_u16());
-+    printf("i32 %016llx\n", (unsigned long long)run_i32());
-+    printf("u32 %016llx\n", (unsigned long long)run_u32());
-+    return 0;
++    });
++    inst.for_each_value_use_mut(|field| {
++        if let Some(&to) = map.get(&field.0) {
++            field.0 = to;
++            rewritten += 1;
++        }
++    });
++    rewritten
+ }
+ 
+ /// Replace every read of `old` in a terminator with `new_op`.
+-pub fn replace_terminator_value(term: &mut Terminator, old: Value, new_op: Operand) {
++#[inline]
++pub fn replace_terminator_value(term: &mut Terminator, old: Value, new_op: Operand) -> usize {
++    let mut rewritten = 0usize;
+     term.for_each_operand_mut(|op| {
+         if matches!(op, Operand::Value(v) if *v == old) {
+             *op = new_op;
++            rewritten += 1;
+         }
+     });
++    rewritten
 +}
-diff --git a/tests/regression/vec_mask_value_demask.flags b/tests/regression/vec_mask_value_demask.flags
-new file mode 100644
-index 0000000..cd11b1e
---- /dev/null
-+++ b/tests/regression/vec_mask_value_demask.flags
-@@ -0,0 +1 @@
-+-O3 -march=x86-64-v3
++
++/// The map-valued form of [`Terminator::replace_terminator_value`].
++#[inline]
++pub fn replace_values_in_terminator_map(term: &mut Terminator, map: &FxHashMap<u32, u32>) -> usize {
++    let mut rewritten = 0usize;
++    term.for_each_operand_mut(|op| {
++        if let Operand::Value(v) = op {
++            if let Some(&to) = map.get(&v.0) {
++                *op = Operand::Value(Value(to));
++                rewritten += 1;
++            }
++        }
++    });
++    rewritten
+ }
+ 
+ impl Terminator {
+@@ -1276,6 +1340,118 @@ mod value_replacement_tests {
+             _ => panic!("return operand must be redirected"),
+         }
+     }
++
++    #[test]
++    fn returns_the_number_of_slots_rewritten() {
++        // GEP reads the old value twice (offset + base) plus once in the
++        // terminator: the count is what a caller uses to decide it fired.
++        let mut inst = gep(1, 7, 7);
++        assert_eq!(
++            replace_operand_value(&mut inst, Value(7), Operand::Value(Value(42))),
++            2
++        );
++        let mut term = Terminator::Switch {
++            val: Operand::Value(Value(42)),
++            cases: vec![],
++            default: BlockId(0),
++            ty: IrType::I32,
++        };
++        assert_eq!(
++            replace_terminator_value(&mut term, Value(42), Operand::Value(Value(9))),
++            1
++        );
++        // A value the instruction does not read is reported as zero rewrites.
++        let mut other = gep(1, 3, 3);
++        assert_eq!(
++            replace_operand_value(&mut other, Value(7), Operand::Value(Value(42))),
++            0
++        );
++    }
++
++    /// The bare-`Value` slots that the hand-rolled tables historically forgot.
++    /// `VaEnd`, `VaStart`, `VaCopy`, `Memcpy`, `StackRestore`, `InlineAsm`
++    /// outputs and `Intrinsic::dest_ptr` all hold a `Value` that is *not* an
++    /// `Operand`, so only the second walk reaches them; a table that groups them
++    /// with the field-less variants (`VaEnd { .. } => {}`) silently keeps the old
++    /// value.  Two such tables were found in the tree and fixed.
++    #[test]
++    fn bare_value_slots_are_covered_by_the_canonical_walk() {
++        let cases: Vec<Instruction> = vec![
++            Instruction::VaEnd {
++                va_list_ptr: Value(7),
++            },
++            Instruction::VaStart {
++                va_list_ptr: Value(7),
++            },
++            Instruction::VaCopy {
++                dest_ptr: Value(7),
++                src_ptr: Value(7),
++            },
++            Instruction::Memcpy {
++                dest: Value(9),
++                src: Value(7),
++                size: 8,
++            },
++            Instruction::StackRestore { ptr: Value(7) },
++            Instruction::InlineAsm {
++                template: String::new(),
++                inputs: vec![],
++                outputs: vec![("=r".to_string(), Value(7), None)],
++                clobbers: vec![],
++                operand_types: vec![IrType::I64],
++                goto_labels: vec![],
++                input_symbols: vec![],
++                seg_overrides: vec![],
++            },
++            Instruction::Intrinsic {
++                dest: None,
++                op: IntrinsicOp::Storedqu,
++                dest_ptr: Some(Value(7)),
++                args: vec![],
++            },
++        ];
++        for mut inst in cases {
++            let name = format!("{inst:?}");
++            let n = replace_operand_value(&mut inst, Value(7), Operand::Value(Value(70)));
++            assert!(n >= 1, "canonical walk missed a bare Value slot: {name}");
++            assert!(
++                !format!("{inst:?}").contains("Value(7)"),
++                "stale Value(7) survived the rewrite: {inst:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn map_form_matches_the_single_value_form() {
++        let mut map = FxHashMap::default();
++        map.insert(7u32, 70u32);
++        map.insert(8u32, 80u32);
++        let mut gep_inst = gep(1, 7, 8);
++        assert_eq!(replace_values_in_inst_map(&mut gep_inst, &map), 2);
++        match gep_inst {
++            Instruction::GetElementPtr { base, offset, .. } => {
++                assert_eq!(base, Value(70));
++                assert_eq!(offset, Operand::Value(Value(80)));
++            }
++            _ => unreachable!(),
++        }
++        let mut ender = Instruction::VaEnd {
++            va_list_ptr: Value(8),
++        };
++        assert_eq!(replace_values_in_inst_map(&mut ender, &map), 1);
++        let mut term = Terminator::CondBranch {
++            cond: Operand::Value(Value(7)),
++            true_label: BlockId(1),
++            false_label: BlockId(2),
++        };
++        assert_eq!(replace_values_in_terminator_map(&mut term, &map), 1);
++        match term {
++            Terminator::CondBranch { cond, .. } => {
++                assert_eq!(cond, Operand::Value(Value(70)));
++            }
++            _ => unreachable!(),
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/ir/lowering/nested_functions.rs b/src/ir/lowering/nested_functions.rs
+index 497b13be..4bfefeb7 100644
+--- a/src/ir/lowering/nested_functions.rs
++++ b/src/ir/lowering/nested_functions.rs
+@@ -35,7 +35,10 @@ use crate::frontend::parser::ast::{
+     BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, Initializer, SizeofArg, Stmt,
+     TypeSpecifier,
+ };
+-use crate::ir::reexports::{Instruction, IrConst, Operand, Terminator, Value};
++use crate::ir::reexports::{
++    Instruction, IrConst, Operand, Terminator, Value, replace_operand_value,
++    replace_terminator_value,
++};
+ 
+ /// Result of the capture analysis over a nested-function subtree.
+ #[derive(Default, Debug)]
+@@ -555,42 +558,15 @@ impl Lowerer {
+     fn rewrite_value_uses(&mut self, old: u32, new: Value) {
+         // The current block being built buffers its instructions in `instrs`
+         // (they move into `blocks` at the next terminator): rewrite BOTH.
++        // Canonical pair: operand slots and bare-Value slots in one place.
+         for inst in self.func_mut().instrs.iter_mut() {
+-            inst.for_each_value_use_mut(|v| {
+-                if v.0 == old {
+-                    *v = new;
+-                }
+-            });
+-            inst.for_each_operand_mut(|op| {
+-                if let Operand::Value(v) = op {
+-                    if v.0 == old {
+-                        *op = Operand::Value(new);
+-                    }
+-                }
+-            });
++            replace_operand_value(inst, Value(old), Operand::Value(new));
+         }
+         for block in self.func_mut().blocks.iter_mut() {
+             for inst in block.instructions.iter_mut() {
+-                inst.for_each_value_use_mut(|v| {
+-                    if v.0 == old {
+-                        *v = new;
+-                    }
+-                });
+-                inst.for_each_operand_mut(|op| {
+-                    if let Operand::Value(v) = op {
+-                        if v.0 == old {
+-                            *op = Operand::Value(new);
+-                        }
+-                    }
+-                });
++                replace_operand_value(inst, Value(old), Operand::Value(new));
+             }
+-            block.terminator.for_each_operand_mut(|op| {
+-                if let Operand::Value(v) = op {
+-                    if v.0 == old {
+-                        *op = Operand::Value(new);
+-                    }
+-                }
+-            });
++            replace_terminator_value(&mut block.terminator, Value(old), Operand::Value(new));
+         }
+     }
+ 
+diff --git a/src/passes/iv_strength_reduce.rs b/src/passes/iv_strength_reduce.rs
+index d67e0b09..a5e27a49 100644
+--- a/src/passes/iv_strength_reduce.rs
++++ b/src/passes/iv_strength_reduce.rs
+@@ -641,27 +641,19 @@ fn reduce_loop(
+                             rewritten += 1;
+                         }
+                     });
+-                    match rinst {
+-                        Instruction::Load { ptr, .. } => {
+-                            if muls.contains(ptr) {
+-                                *ptr = j_val;
+-                                rewritten += 1;
+-                            }
+-                        }
+-                        Instruction::Store { ptr, .. } => {
+-                            if muls.contains(ptr) {
+-                                *ptr = j_val;
+-                                rewritten += 1;
+-                            }
+-                        }
+-                        Instruction::GetElementPtr { base, .. } => {
+-                            if muls.contains(base) {
+-                                *base = j_val;
+-                                rewritten += 1;
+-                            }
++                    // Bare-`Value` slots (Load/Store ptr, GEP base, Memcpy,
++                    // va_list, inline-asm outputs, intrinsic dest_ptr, ...): the
++                    // exhaustive walker, never a hand-rolled match.  The three-arm
++                    // version this replaces covered only Load/Store/GEP-base and
++                    // silently left every other shape reading the grouped multiply
++                    // — a missed rewrite, invisible to SSA validation because the
++                    // old value is still defined.
++                    rinst.for_each_value_use_mut(|v| {
++                        if v.0 != 0 && muls.contains(v) {
++                            *v = j_val;
++                            rewritten += 1;
+                         }
+-                        _ => {}
+-                    }
++                    });
+                 }
+                 block.terminator.for_each_operand_mut(|o| {
+                     if matches!(o, Operand::Value(v) if v.0 != 0 && muls.contains(v)) {
+diff --git a/src/passes/loop_memory_promote.rs b/src/passes/loop_memory_promote.rs
+index baa71222..64511afa 100644
+--- a/src/passes/loop_memory_promote.rs
++++ b/src/passes/loop_memory_promote.rs
+@@ -38,6 +38,7 @@ use crate::common::types::{AddressSpace, IrType};
+ use crate::ir::analysis::CfgAnalysis;
+ use crate::ir::reexports::{
+     BasicBlock, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
++    replace_operand_value, replace_terminator_value,
+ };
+ use std::sync::OnceLock;
+ 
+@@ -809,153 +810,22 @@ fn subst_operand(op: &Operand, from: u32, to: u32) -> Operand {
+     }
+ }
+ 
+-fn rewrite_operand(op: &mut Operand, from: u32, to: u32) {
+-    if let Operand::Value(v) = op {
+-        if v.0 == from {
+-            v.0 = to;
+-        }
+-    }
+-}
+-
+-fn rewrite_value(v: &mut Value, from: u32, to: u32) {
+-    if v.0 == from {
+-        v.0 = to;
+-    }
+-}
+-
++/// Rewrite every *read* of `from` in `inst` to `to`; destinations are untouched.
++///
++/// This was a 135-line hand-rolled table until it was replaced by the canonical
++/// two-walk helpers.  The table was exhaustive, but its
++/// `VaEnd { .. } => {}` arm sat in the group of field-less variants while
++/// `VaEnd` actually holds a bare `va_list_ptr: Value` — so a promoted slot whose
++/// value was redirected left one stale `va_end` pointer behind.  A table cannot
++/// be audited as easily as a visitor pair that the compiler checks exhaustively;
++/// the canonical form covers every slot the table covered plus the ones it forgot.
+ fn rewrite_uses_in_inst(inst: &mut Instruction, from: u32, to: u32) {
+-    match inst {
+-        Instruction::Alloca { .. }
+-        | Instruction::PgoCounterInc { .. }
+-        | Instruction::GlobalAddr { .. }
+-        | Instruction::Fence { .. }
+-        | Instruction::LabelAddr { .. }
+-        | Instruction::GetReturnF64Second { .. }
+-        | Instruction::GetReturnF32Second { .. }
+-        | Instruction::GetReturnF128Second { .. }
+-        | Instruction::GetStaticChain { .. }
+-        | Instruction::StackSave { .. }
+-        | Instruction::ParamRef { .. }
+-        | Instruction::VaEnd { .. } => {}
+-        Instruction::SetStaticChain { src } => rewrite_operand(src, from, to),
+-        Instruction::InitTrampoline { buffer, chain, .. } => {
+-            rewrite_value(buffer, from, to);
+-            rewrite_operand(chain, from, to);
+-        }
+-        Instruction::NonlocalGotoSave { frame, .. } => rewrite_value(frame, from, to),
+-        Instruction::NonlocalGoto { chain, .. } => rewrite_operand(chain, from, to),
+-        Instruction::DynAlloca { size, .. } => rewrite_operand(size, from, to),
+-        Instruction::Store { val, ptr, .. } => {
+-            rewrite_operand(val, from, to);
+-            rewrite_value(ptr, from, to);
+-        }
+-        Instruction::Load { ptr, .. } => rewrite_value(ptr, from, to),
+-        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
+-            rewrite_operand(lhs, from, to);
+-            rewrite_operand(rhs, from, to);
+-        }
+-        Instruction::UnaryOp { src, .. }
+-        | Instruction::Cast { src, .. }
+-        | Instruction::Copy { src, .. } => rewrite_operand(src, from, to),
+-        Instruction::Call { info, .. } => {
+-            for a in &mut info.args {
+-                rewrite_operand(a, from, to);
+-            }
+-        }
+-        Instruction::CallIndirect { func_ptr, info } => {
+-            rewrite_operand(func_ptr, from, to);
+-            for a in &mut info.args {
+-                rewrite_operand(a, from, to);
+-            }
+-        }
+-        Instruction::GetElementPtr { base, offset, .. } => {
+-            rewrite_value(base, from, to);
+-            rewrite_operand(offset, from, to);
+-        }
+-        Instruction::Memcpy { dest, src, .. } => {
+-            rewrite_value(dest, from, to);
+-            rewrite_value(src, from, to);
+-        }
+-        Instruction::VaArg { va_list_ptr, .. } | Instruction::VaStart { va_list_ptr } => {
+-            rewrite_value(va_list_ptr, from, to);
+-        }
+-        Instruction::VaCopy { dest_ptr, src_ptr } => {
+-            rewrite_value(dest_ptr, from, to);
+-            rewrite_value(src_ptr, from, to);
+-        }
+-        Instruction::VaArgStruct {
+-            dest_ptr,
+-            va_list_ptr,
+-            ..
+-        } => {
+-            rewrite_value(dest_ptr, from, to);
+-            rewrite_value(va_list_ptr, from, to);
+-        }
+-        Instruction::AtomicRmw { ptr, val, .. } | Instruction::AtomicStore { ptr, val, .. } => {
+-            rewrite_operand(ptr, from, to);
+-            rewrite_operand(val, from, to);
+-        }
+-        Instruction::AtomicInc { ptr, .. } | Instruction::AtomicLoad { ptr, .. } => {
+-            rewrite_operand(ptr, from, to);
+-        }
+-        Instruction::AtomicCmpxchg {
+-            ptr,
+-            expected,
+-            desired,
+-            ..
+-        } => {
+-            rewrite_operand(ptr, from, to);
+-            rewrite_operand(expected, from, to);
+-            rewrite_operand(desired, from, to);
+-        }
+-        Instruction::Phi { incoming, .. } => {
+-            for (op, _) in incoming {
+-                rewrite_operand(op, from, to);
+-            }
+-        }
+-        Instruction::SetReturnF64Second { src }
+-        | Instruction::SetReturnF32Second { src }
+-        | Instruction::SetReturnF128Second { src } => rewrite_operand(src, from, to),
+-        Instruction::InlineAsm {
+-            inputs, outputs, ..
+-        } => {
+-            for (_, op, _) in inputs {
+-                rewrite_operand(op, from, to);
+-            }
+-            for (_, v, _) in outputs {
+-                rewrite_value(v, from, to);
+-            }
+-        }
+-        Instruction::Intrinsic { args, dest_ptr, .. } => {
+-            for a in args {
+-                rewrite_operand(a, from, to);
+-            }
+-            if let Some(dp) = dest_ptr {
+-                rewrite_value(dp, from, to);
+-            }
+-        }
+-        Instruction::Select {
+-            cond,
+-            true_val,
+-            false_val,
+-            ..
+-        } => {
+-            rewrite_operand(cond, from, to);
+-            rewrite_operand(true_val, from, to);
+-            rewrite_operand(false_val, from, to);
+-        }
+-        Instruction::StackRestore { ptr } => rewrite_value(ptr, from, to),
+-    }
++    replace_operand_value(inst, Value(from), Operand::Value(Value(to)));
+ }
+ 
++/// Terminator half of [`rewrite_uses_in_inst`].
+ fn rewrite_uses_in_terminator(term: &mut Terminator, from: u32, to: u32) {
+-    match term {
+-        Terminator::Return(Some(op)) => rewrite_operand(op, from, to),
+-        Terminator::CondBranch { cond, .. } => rewrite_operand(cond, from, to),
+-        Terminator::IndirectBranch { target, .. } => rewrite_operand(target, from, to),
+-        Terminator::Switch { val, .. } => rewrite_operand(val, from, to),
+-        _ => {}
+-    }
++    replace_terminator_value(term, Value(from), Operand::Value(Value(to)));
+ }
+ 
+ /// Value that must be written on the unique exit so memory matches the
+diff --git a/src/passes/loop_rotate.rs b/src/passes/loop_rotate.rs
+index 542aa42e..7cc6833b 100644
+--- a/src/passes/loop_rotate.rs
++++ b/src/passes/loop_rotate.rs
+@@ -68,12 +68,12 @@
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::common::types::IrType;
+ use crate::ir::analysis::CfgAnalysis;
+-use crate::ir::reexports::{BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value};
+-use crate::passes::loop_analysis::{NaturalLoop, find_natural_loops, merge_loops_by_header};
+-use crate::passes::loop_unroll::{
+-    rename_inst_dest, subst_value_in_terminator, subst_value_with_operand,
++use crate::ir::reexports::{
++    BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value, replace_operand_value,
++    replace_terminator_value, replace_values_in_inst_map,
+ };
+-use crate::passes::tail_call_elim::replace_values_in_inst;
++use crate::passes::loop_analysis::{NaturalLoop, find_natural_loops, merge_loops_by_header};
++use crate::passes::loop_unroll::rename_inst_dest;
+ 
+ /// Per-function entry point for the dirty-tracking pipeline.
+ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+@@ -830,7 +830,7 @@ fn try_rotate_loop(
+     for inst in latch_block.instructions.iter_mut().skip(n_new_phis) {
+         for (&old_phi, &new_phi) in &new_loop_phis {
+             let repl = Operand::Value(Value(new_phi));
+-            subst_value_with_operand(inst, old_phi, &repl);
++            replace_operand_value(inst, Value(old_phi), repl.clone());
+         }
+     }
+ 
+@@ -886,7 +886,7 @@ fn try_rotate_loop(
+             for inst in latch_block.instructions.iter_mut() {
+                 for (&old_phi, &new_phi) in &new_loop_phis {
+                     let repl = Operand::Value(Value(old_phi));
+-                    subst_value_with_operand(inst, new_phi, &repl);
++                    replace_operand_value(inst, Value(new_phi), repl.clone());
+                 }
+             }
+             // Defensive: bump the watermark past the now-unused IDs so
+@@ -993,7 +993,7 @@ fn try_rotate_loop(
+                 for inst in latch_block.instructions.iter_mut() {
+                     for (&old_phi, &new_phi) in &new_loop_phis {
+                         let repl = Operand::Value(Value(old_phi));
+-                        subst_value_with_operand(inst, new_phi, &repl);
++                        replace_operand_value(inst, Value(new_phi), repl.clone());
+                     }
+                 }
+                 func.next_value_id = next_val;
+@@ -1060,13 +1060,17 @@ fn try_rotate_loop(
+                         for inst in block.instructions.iter_mut().skip(n_exit_phis) {
+                             for (&old_phi, &new_phi) in &exit_merge_map {
+                                 let repl = Operand::Value(Value(new_phi));
+-                                subst_value_with_operand(inst, old_phi, &repl);
++                                replace_operand_value(inst, Value(old_phi), repl.clone());
+                             }
+                         }
+                         // Also rewrite the exit block's terminator.
+                         for (&old_phi, &new_phi) in &exit_merge_map {
+                             let repl = Operand::Value(Value(new_phi));
+-                            subst_value_in_terminator(&mut block.terminator, old_phi, &repl);
++                            replace_terminator_value(
++                                &mut block.terminator,
++                                Value(old_phi),
++                                repl.clone(),
++                            );
+                         }
+                     }
+                     continue;
+@@ -1074,12 +1078,12 @@ fn try_rotate_loop(
+                 for inst in &mut block.instructions {
+                     for (&old_phi, &new_phi) in &exit_merge_map {
+                         let repl = Operand::Value(Value(new_phi));
+-                        subst_value_with_operand(inst, old_phi, &repl);
++                        replace_operand_value(inst, Value(old_phi), repl.clone());
+                     }
+                 }
+                 for (&old_phi, &new_phi) in &exit_merge_map {
+                     let repl = Operand::Value(Value(new_phi));
+-                    subst_value_in_terminator(&mut block.terminator, old_phi, &repl);
++                    replace_terminator_value(&mut block.terminator, Value(old_phi), repl.clone());
+                 }
+             }
+         }
+@@ -1109,12 +1113,12 @@ fn try_rotate_loop(
+         // their fresh IDs. This handles references BETWEEN cloned
+         // instructions (e.g. `BinOp And(c1, c2)` where both c1 and c2 are
+         // cloned). `replace_values_in_inst` only touches operands, not dest.
+-        replace_values_in_inst(&mut cloned, &clone_map);
++        replace_values_in_inst_map(&mut cloned, &clone_map);
+         // Second: rewrite phi references → latch-edge incoming operands.
+         // Phi references are NOT in clone_map (phis are not cloned), so
+         // `replace_values_in_inst` left them untouched.
+         for (&phi_id, latch_op) in &phi_latch_val {
+-            subst_value_with_operand(&mut cloned, phi_id, latch_op);
++            replace_operand_value(&mut cloned, Value(phi_id), (latch_op).clone());
+         }
+         // Third: rename the dest to the fresh ID.
+         if new_dest_opt.is_some() {
+@@ -1228,7 +1232,7 @@ fn is_dominated_by(block_idx: usize, dom_idx: usize, cfg: &CfgAnalysis) -> bool
+ ///
+ /// NOTE: Phi is deliberately EXCLUDED. Header phis are NOT cloned into
+ /// the latch — they are REWRITTEN to their latch-edge incoming values
+-/// (step 7's `subst_value_with_operand` via `phi_latch_val`). If a Phi
++/// (step 7's `replace_operand_value` via `phi_latch_val`). If a Phi
+ /// were cloned, the cloned Cmp would reference the cloned Phi (a
+ /// duplicate self-loop phi) instead of the post-increment `i_next`,
+ /// producing an off-by-one (the test reads the phi's stale value).
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 6d0495b2..09e55837 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -34,7 +34,8 @@ use crate::common::types::IrType;
+ use crate::ir::analysis::CfgAnalysis;
+ use crate::ir::reexports::{
+     BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator,
+-    Value,
++    Value, replace_operand_value, replace_terminator_value, replace_values_in_inst_map,
++    replace_values_in_terminator_map,
+ };
+ 
+ thread_local! {
+@@ -1747,13 +1748,13 @@ impl LoopPhiModel {
+ /// Substitute every header phi of `env` in one instruction / terminator.
+ fn apply_env_inst(inst: &mut Instruction, env: &FxHashMap<u32, Operand>) {
+     for (&id, repl) in env {
+-        subst_value_with_operand(inst, id, repl);
++        replace_operand_value(inst, Value(id), (repl).clone());
+     }
+ }
+ 
+ fn apply_env_term(term: &mut Terminator, env: &FxHashMap<u32, Operand>) {
+     for (&id, repl) in env {
+-        subst_value_in_terminator(term, id, repl);
++        replace_terminator_value(term, Value(id), (repl).clone());
+     }
+ }
+ 
+@@ -1806,12 +1807,16 @@ fn rewrite_outside_uses(
+         for inst in &mut block.instructions {
+             apply_env_inst(inst, final_env);
+             for (&old, &new) in extra_final {
+-                subst_value_with_operand(inst, old, &Operand::Value(Value(new)));
++                replace_operand_value(inst, Value(old), (&Operand::Value(Value(new))).clone());
+             }
+         }
+         apply_env_term(&mut block.terminator, final_env);
+         for (&old, &new) in extra_final {
+-            subst_value_in_terminator(&mut block.terminator, old, &Operand::Value(Value(new)));
++            replace_terminator_value(
++                &mut block.terminator,
++                Value(old),
++                (&Operand::Value(Value(new))).clone(),
++            );
+         }
+     }
+ }
+@@ -2228,8 +2233,8 @@ fn try_complete_unroll_general(
+             // header_extra → this guard's own fresh outputs first, then the
+             // last clone's values, then substitute the header phis with the
+             // failing-entry environment.
+-            replace_values_in_inst(&mut cloned, &fg_vmap);
+-            replace_values_in_inst(&mut cloned, last_vmap);
++            replace_values_in_inst_map(&mut cloned, &fg_vmap);
++            replace_values_in_inst_map(&mut cloned, last_vmap);
+             rename_inst_dest(&mut cloned, &fg_vmap);
+             apply_env_inst(&mut cloned, &env_fg);
+             fg_insts.push(cloned);
+@@ -2273,7 +2278,7 @@ fn try_complete_unroll_general(
+                 // Clone 1's env values are ORIGINAL body ids also present in
+                 // this clone's vmap; substituting first would let the rename
+                 // rewrite them into this clone's own definitions.
+-                replace_values_in_inst(&mut cloned, &plan.vmap);
++                replace_values_in_inst_map(&mut cloned, &plan.vmap);
+                 rename_inst_dest(&mut cloned, &plan.vmap);
+                 apply_env_inst(&mut cloned, &plan.env);
+                 insts.push(cloned);
+@@ -2299,7 +2304,7 @@ fn try_complete_unroll_general(
+                     continue; // dead IV increment
+                 }
+                 let mut cloned = inst.clone();
+-                replace_values_in_inst(&mut cloned, &plan.vmap);
++                replace_values_in_inst_map(&mut cloned, &plan.vmap);
+                 rename_inst_dest(&mut cloned, &plan.vmap);
+                 apply_env_inst(&mut cloned, &plan.env);
+                 if let Instruction::Phi { incoming, .. } = &mut cloned {
+@@ -2314,7 +2319,7 @@ fn try_complete_unroll_general(
+                 insts.push(cloned);
+             }
+             let mut term = orig.terminator.clone();
+-            replace_values_in_terminator(&mut term, &plan.vmap);
++            replace_values_in_terminator_map(&mut term, &plan.vmap);
+             if bi == latch {
+                 if let Terminator::Branch(lbl) = &mut term {
+                     if *lbl == header_label {
+@@ -2723,9 +2728,9 @@ fn try_complete_unroll_two_block(
+                 // Rename first, then substitute the header-phi environment.
+                 // The env values are consts / invariants / previous-clone ids,
+                 // none of which are keys in this clone's rename map.
+-                replace_values_in_inst(&mut cloned, &vmap);
++                replace_values_in_inst_map(&mut cloned, &vmap);
+                 rename_inst_dest(&mut cloned, &vmap);
+-                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
++                replace_operand_value(&mut cloned, iv_phi, iv_const.clone());
+                 apply_env_inst(&mut cloned, &env);
+                 new_insts.push(cloned);
+             }
+@@ -3456,9 +3461,9 @@ fn try_partial_unroll_two_block(
+                 for (&old, &new) in &vmaps[j] {
+                     combined.insert(old, new);
+                 }
+-                replace_values_in_inst(&mut cloned, &combined);
++                replace_values_in_inst_map(&mut cloned, &combined);
+             } else {
+-                replace_values_in_inst(&mut cloned, &vmaps[j]);
++                replace_values_in_inst_map(&mut cloned, &vmaps[j]);
+             }
+             rename_inst_dest(&mut cloned, &vmaps[j]);
+             body_insts.push(cloned);
+@@ -3534,33 +3539,6 @@ fn try_partial_unroll_two_block(
+     true
+ }
+ 
+-pub(crate) fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operand) {
+-    inst.for_each_operand_mut(|operand| {
+-        if matches!(operand, Operand::Value(value) if value.0 == old_id) {
+-            *operand = new_op.clone();
+-        }
+-    });
+-    if let Operand::Value(replacement) = new_op {
+-        inst.for_each_value_use_mut(|value| {
+-            if value.0 == old_id {
+-                *value = *replacement;
+-            }
+-        });
+-    }
+-}
+-
+-pub(crate) fn subst_value_in_terminator(
+-    terminator: &mut Terminator,
+-    old_id: u32,
+-    new_op: &Operand,
+-) {
+-    terminator.for_each_operand_mut(|operand| {
+-        if matches!(operand, Operand::Value(value) if value.0 == old_id) {
+-            *operand = new_op.clone();
+-        }
+-    });
+-}
+-
+ /// Evaluate an operand as an integer constant by looking through a bounded
+ /// chain of pure integer Copy/Cast/BinOp(Add/Sub/Mul) definitions.
+ ///
+@@ -4287,9 +4265,9 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
+                 .iter()
+                 .map(|inst| {
+                     let mut cloned = inst.clone();
+-                    replace_values_in_inst(&mut cloned, vmap);
++                    replace_values_in_inst_map(&mut cloned, vmap);
+                     for (hid, prev) in &prev_carried {
+-                        subst_value_with_operand(&mut cloned, *hid, prev);
++                        replace_operand_value(&mut cloned, Value(*hid), (prev).clone());
+                     }
+                     rename_inst_dest(&mut cloned, vmap);
+                     cloned
+@@ -4297,7 +4275,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
+                 .collect();
+ 
+             let mut new_term = orig.terminator.clone();
+-            replace_values_in_terminator(&mut new_term, vmap);
++            replace_values_in_terminator_map(&mut new_term, vmap);
+             replace_block_ids(&mut new_term, &blk_map);
+ 
+             // Redirect latch edge from pre-latch block.
+@@ -4609,7 +4587,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
+                         if matches!(inst, Instruction::Phi { .. }) {
+                             continue; // other blocks' phis select per-edge
+                         }
+-                        subst_value_with_operand(inst, dest.0, &Operand::Value(new_phi));
++                        replace_operand_value(inst, *dest, Operand::Value(new_phi));
+                     }
+                     // The terminator can also USE the carried value: a
+                     // `Return(H)` after a counted loop is the canonical
+@@ -4619,10 +4597,10 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
+                     // the phi's PREHEADER value — 0 instead of 30 — because
+                     // every early exit-check edge read the un-updated
+                     // header phi).
+-                    subst_value_in_terminator(
++                    replace_terminator_value(
+                         &mut func.blocks[bi].terminator,
+-                        dest.0,
+-                        &Operand::Value(new_phi),
++                        *dest,
++                        Operand::Value(new_phi),
+                     );
+                 }
+                 let succs: Vec<BlockId> = match &func.blocks[bi].terminator {
+@@ -4742,15 +4720,6 @@ fn replace_op(op: &mut Operand, map: &FxHashMap<u32, u32>) {
+     }
+ }
+ 
+-fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
+-    inst.for_each_operand_mut(|operand| replace_op(operand, map));
+-    inst.for_each_value_use_mut(|value| replace_val(value, map));
+-}
+-
+-fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
+-    term.for_each_operand_mut(|operand| replace_op(operand, map));
+-}
+-
+ // ── Tests ─────────────────────────────────────────────────────────────────────
+ 
+ #[cfg(test)]
+@@ -7905,7 +7874,11 @@ mod tests {
+         ];
+         for instruction in &mut instructions {
+             for old in 1..=23 {
+-                subst_value_with_operand(instruction, old, &Operand::Value(Value(old + 1000)));
++                replace_operand_value(
++                    instruction,
++                    Value(old),
++                    (&Operand::Value(Value(old + 1000))).clone(),
++                );
+             }
+         }
+         let mut uses: Vec<u32> = instructions
+@@ -7923,8 +7896,16 @@ mod tests {
+                 false_label: BlockId(2),
+             },
+         ];
+-        subst_value_in_terminator(&mut terminators[0], 24, &Operand::Value(Value(1024)));
+-        subst_value_in_terminator(&mut terminators[1], 25, &Operand::Value(Value(1025)));
++        replace_terminator_value(
++            &mut terminators[0],
++            Value(24),
++            (&Operand::Value(Value(1024))).clone(),
++        );
++        replace_terminator_value(
++            &mut terminators[1],
++            Value(25),
++            (&Operand::Value(Value(1025))).clone(),
++        );
+         assert_eq!(terminators[0].used_values(), vec![1024]);
+         assert_eq!(terminators[1].used_values(), vec![1025]);
+     }
+diff --git a/src/passes/quadratic_sr.rs b/src/passes/quadratic_sr.rs
+index 417c288e..e5f22bb7 100644
+--- a/src/passes/quadratic_sr.rs
++++ b/src/passes/quadratic_sr.rs
+@@ -32,7 +32,10 @@ use super::loop_analysis;
+ use crate::common::fx_hash::FxHashSet;
+ use crate::common::types::IrType;
+ use crate::ir::analysis::CfgAnalysis;
+-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
++use crate::ir::reexports::{
++    Instruction, IrBinOp, IrConst, IrFunction, Operand, Value, replace_operand_value,
++    replace_terminator_value,
++};
+ 
+ pub(crate) fn run(func: &mut IrFunction) -> usize {
+     if std::env::var("CCC_NO_QUAD_SR").is_ok() {
+@@ -432,37 +435,21 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
+         });
+     }
+ 
+-    // Replace uses of final_val with idx_phi within the loop.
++    // Replace uses of final_val with idx_phi within the loop.  Both walks: a
++    // consumer in an `i8` GEP offset, a `Select`, a call argument or a terminator
++    // is as much a use as a binary operand, and the six-arm match this replaces
++    // left every one of them reading `final_val` while the recurrence phi it had
++    // just built had no readers left to serve (SSA stayed valid, so nothing
++    // complained — the transform simply did not do what it says).
+     for &bi in &lp.body {
+         for inst in &mut func.blocks[bi].instructions {
+-            let replace = |op: &mut Operand| {
+-                if let Operand::Value(v) = op {
+-                    if *v == final_val {
+-                        *v = idx_phi;
+-                    }
+-                }
+-            };
+-            match inst {
+-                Instruction::BinOp { lhs, rhs, .. } => {
+-                    replace(lhs);
+-                    replace(rhs);
+-                }
+-                Instruction::Cmp { lhs, rhs, .. } => {
+-                    replace(lhs);
+-                    replace(rhs);
+-                }
+-                Instruction::Cast { src, .. }
+-                | Instruction::Copy { src, .. }
+-                | Instruction::UnaryOp { src, .. } => {
+-                    replace(src);
+-                }
+-                Instruction::Store { val, .. } => {
+-                    replace(val);
+-                }
+-                Instruction::Load { .. } => {}
+-                _ => {}
+-            }
++            replace_operand_value(inst, final_val, Operand::Value(idx_phi));
+         }
++        replace_terminator_value(
++            &mut func.blocks[bi].terminator,
++            final_val,
++            Operand::Value(idx_phi),
++        );
+     }
+ 
+     func.next_value_id = next_id;
+diff --git a/src/passes/range_check.rs b/src/passes/range_check.rs
+index f90fc012..bf49c8a6 100644
+--- a/src/passes/range_check.rs
++++ b/src/passes/range_check.rs
+@@ -63,6 +63,7 @@
+ use crate::common::types::IrType;
+ use crate::ir::reexports::{
+     Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
++    replace_operand_value, replace_terminator_value,
+ };
+ 
+ /// A comparison, canonicalized to `value OP const` with an explicit role.
+@@ -1105,36 +1106,16 @@ fn fold_phi_diamonds(
+         }
+         match replacement {
+             DiamondReplacement::Value(replacement) => {
+-                // Replace every use of phi_dest with the replacement.
++                // Replace every use of phi_dest with the replacement, through the
++                // canonical pair: operand slots AND the bare-Value slots (Store ptr,
++                // GEP base, ...), because the phi is deleted below and anything naming
++                // it here has to be redirected with it (the contract the long-form
++                // comment spelled out; the helper enforces it for every IR shape).
+                 for block in &mut func.blocks {
+                     for inst in &mut block.instructions {
+-                        inst.for_each_operand_mut(|op: &mut Operand| {
+-                            if let Operand::Value(v) = op {
+-                                if v.0 == phi_dest.0 {
+-                                    *op = replacement;
+-                                }
+-                            }
+-                        });
+-                        // Bare-Value positions (Store ptr, GEP base, ...) are
+-                        // not Operands: the phi is deleted below, so any
+-                        // naming it here must be rewritten too (same two-walk
+-                        // contract as loop_memset; the replacement is always
+-                        // a Value).
+-                        if let Operand::Value(replacement_val) = replacement {
+-                            inst.for_each_value_use_mut(|v: &mut Value| {
+-                                if v.0 == phi_dest.0 {
+-                                    *v = replacement_val;
+-                                }
+-                            });
+-                        }
++                        replace_operand_value(inst, phi_dest, replacement.clone());
+                     }
+-                    block.terminator.for_each_operand_mut(|op: &mut Operand| {
+-                        if let Operand::Value(v) = op {
+-                            if v.0 == phi_dest.0 {
+-                                *op = replacement;
+-                            }
+-                        }
+-                    });
++                    replace_terminator_value(&mut block.terminator, phi_dest, replacement.clone());
+                 }
+                 // Drop the phi from Bmerge; collapse every other phi's
+                 // duplicate Bcheck arm (proven equal above).
+diff --git a/src/passes/redundant_loads.rs b/src/passes/redundant_loads.rs
+index 8c5f2c0c..ffe5f951 100644
+--- a/src/passes/redundant_loads.rs
++++ b/src/passes/redundant_loads.rs
+@@ -263,7 +263,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
+     if !all_rewrites.is_empty() {
+         for block in func.blocks.iter_mut() {
+             for inst in block.instructions.iter_mut() {
+-                super::tail_call_elim::replace_values_in_inst(inst, &all_rewrites);
++                crate::ir::instruction::replace_values_in_inst_map(inst, &all_rewrites);
+             }
+             match &mut block.terminator {
+                 Terminator::CondBranch { cond, .. } => {
+diff --git a/src/passes/tail_call_elim.rs b/src/passes/tail_call_elim.rs
+index 3a560611..fa77a456 100644
+--- a/src/passes/tail_call_elim.rs
++++ b/src/passes/tail_call_elim.rs
+@@ -46,6 +46,7 @@
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::ir::reexports::{
+     BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
++    replace_values_in_inst_map, replace_values_in_terminator_map,
+ };
+ 
+ /// Replace the canonical tail-recursive integer sum with a closed form.
+@@ -653,9 +654,9 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
+                     }
+                 }
+             }
+-            replace_values_in_inst(inst, &replace_map);
++            replace_values_in_inst_map(inst, &replace_map);
+         }
+-        replace_values_in_terminator(&mut block.terminator, &replace_map);
++        replace_values_in_terminator_map(&mut block.terminator, &replace_map);
+     }
+ 
+     // ── 10. Build and push the loop header block ────────────────────────────
+@@ -678,13 +679,13 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
+ 
+     // Moved entry instructions: apply renaming.
+     for mut inst in move_to_header {
+-        replace_values_in_inst(&mut inst, &replace_map);
++        replace_values_in_inst_map(&mut inst, &replace_map);
+         header_instructions.push(inst);
+     }
+ 
+     // Loop header terminator = original entry terminator, with renaming applied.
+     let mut header_terminator = entry_original_terminator;
+-    replace_values_in_terminator(&mut header_terminator, &replace_map);
++    replace_values_in_terminator_map(&mut header_terminator, &replace_map);
+ 
+     // Span list: dummy spans for phi nodes, original spans for moved instructions.
+     let header_source_spans: Vec<crate::common::source::Span> = if has_spans {
+@@ -726,174 +727,6 @@ fn replace_op(op: &mut Operand, map: &FxHashMap<u32, u32>) {
+     }
+ }
+ 
+-/// Replace all *uses* of values in `map` within an instruction.
+-/// Does not touch ParamRef (definition) or the phi nodes it creates.
+-pub(crate) fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
+-    match inst {
+-        Instruction::PgoCounterInc { .. } => {}
+-        // ── Definitions with no operands to replace ──────────────────────
+-        Instruction::ParamRef { .. }
+-        | Instruction::Alloca { .. }
+-        | Instruction::GlobalAddr { .. }
+-        | Instruction::LabelAddr { .. }
+-        | Instruction::Fence { .. }
+-        | Instruction::StackSave { .. }
+-        | Instruction::GetReturnF64Second { .. }
+-        | Instruction::GetReturnF32Second { .. }
+-        | Instruction::GetReturnF128Second { .. }
+-        | Instruction::GetStaticChain { .. } => {}
+-        Instruction::SetStaticChain { src } => replace_op(src, map),
+-        Instruction::InitTrampoline { buffer, chain, .. } => {
+-            replace_val(buffer, map);
+-            replace_op(chain, map);
+-        }
+-        Instruction::NonlocalGotoSave { frame, .. } => replace_val(frame, map),
+-        Instruction::NonlocalGoto { chain, .. } => replace_op(chain, map),
+-
+-        // ── Memory ───────────────────────────────────────────────────────
+-        Instruction::Store { val, ptr, .. } => {
+-            replace_op(val, map);
+-            replace_val(ptr, map);
+-        }
+-        Instruction::Load { ptr, .. } => replace_val(ptr, map),
+-        Instruction::Memcpy { dest, src, .. } => {
+-            replace_val(dest, map);
+-            replace_val(src, map);
+-        }
+-
+-        // ── Arithmetic / logic ───────────────────────────────────────────
+-        Instruction::BinOp { lhs, rhs, .. } => {
+-            replace_op(lhs, map);
+-            replace_op(rhs, map);
+-        }
+-        Instruction::UnaryOp { src, .. } => replace_op(src, map),
+-        Instruction::Cmp { lhs, rhs, .. } => {
+-            replace_op(lhs, map);
+-            replace_op(rhs, map);
+-        }
+-
+-        // ── Pointer / address ────────────────────────────────────────────
+-        Instruction::GetElementPtr { base, offset, .. } => {
+-            replace_val(base, map);
+-            replace_op(offset, map);
+-        }
+-        Instruction::DynAlloca { size, .. } => replace_op(size, map),
+-        Instruction::StackRestore { ptr } => replace_val(ptr, map),
+-
+-        // ── Conversions ──────────────────────────────────────────────────
+-        Instruction::Cast { src, .. } => replace_op(src, map),
+-        Instruction::Copy { src, .. } => replace_op(src, map),
+-
+-        // ── Calls ────────────────────────────────────────────────────────
+-        Instruction::Call { info, .. } => {
+-            for arg in &mut info.args {
+-                replace_op(arg, map);
+-            }
+-        }
+-        Instruction::CallIndirect { func_ptr, info } => {
+-            replace_op(func_ptr, map);
+-            for arg in &mut info.args {
+-                replace_op(arg, map);
+-            }
+-        }
+-
+-        // ── Phi ──────────────────────────────────────────────────────────
+-        Instruction::Phi { incoming, .. } => {
+-            for (op, _) in incoming {
+-                replace_op(op, map);
+-            }
+-        }
+-
+-        // ── Select ───────────────────────────────────────────────────────
+-        Instruction::Select {
+-            cond,
+-            true_val,
+-            false_val,
+-            ..
+-        } => {
+-            replace_op(cond, map);
+-            replace_op(true_val, map);
+-            replace_op(false_val, map);
+-        }
+-
+-        // ── Atomics ──────────────────────────────────────────────────────
+-        Instruction::AtomicRmw { ptr, val, .. } => {
+-            replace_op(ptr, map);
+-            replace_op(val, map);
+-        }
+-        Instruction::AtomicInc { ptr, .. } => replace_op(ptr, map),
+-        Instruction::AtomicCmpxchg {
+-            ptr,
+-            expected,
+-            desired,
+-            ..
+-        } => {
+-            replace_op(ptr, map);
+-            replace_op(expected, map);
+-            replace_op(desired, map);
+-        }
+-        Instruction::AtomicLoad { ptr, .. } => replace_op(ptr, map),
+-        Instruction::AtomicStore { ptr, val, .. } => {
+-            replace_op(ptr, map);
+-            replace_op(val, map);
+-        }
+-
+-        // ── varargs ──────────────────────────────────────────────────────
+-        Instruction::VaArg { va_list_ptr, .. } => replace_val(va_list_ptr, map),
+-        Instruction::VaArgStruct {
+-            dest_ptr,
+-            va_list_ptr,
+-            ..
+-        } => {
+-            replace_val(dest_ptr, map);
+-            replace_val(va_list_ptr, map);
+-        }
+-        Instruction::VaStart { va_list_ptr } => replace_val(va_list_ptr, map),
+-        Instruction::VaEnd { va_list_ptr } => replace_val(va_list_ptr, map),
+-        Instruction::VaCopy { dest_ptr, src_ptr } => {
+-            replace_val(dest_ptr, map);
+-            replace_val(src_ptr, map);
+-        }
+-
+-        // ── Inline assembly ──────────────────────────────────────────────
+-        Instruction::InlineAsm {
+-            outputs, inputs, ..
+-        } => {
+-            for (_, ptr, _) in outputs {
+-                replace_val(ptr, map);
+-            }
+-            for (_, op, _) in inputs {
+-                replace_op(op, map);
+-            }
+-        }
+-
+-        // ── Intrinsics ───────────────────────────────────────────────────
+-        Instruction::Intrinsic { dest_ptr, args, .. } => {
+-            if let Some(ptr) = dest_ptr {
+-                replace_val(ptr, map);
+-            }
+-            for arg in args {
+-                replace_op(arg, map);
+-            }
+-        }
+-
+-        // ── Complex-return helpers ────────────────────────────────────────
+-        Instruction::SetReturnF64Second { src } => replace_op(src, map),
+-        Instruction::SetReturnF32Second { src } => replace_op(src, map),
+-        Instruction::SetReturnF128Second { src } => replace_op(src, map),
+-    }
+-}
+-
+-fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
+-    match term {
+-        Terminator::Return(Some(op)) => replace_op(op, map),
+-        Terminator::CondBranch { cond, .. } => replace_op(cond, map),
+-        Terminator::IndirectBranch { target, .. } => replace_op(target, map),
+-        Terminator::Switch { val, .. } => replace_op(val, map),
+-        Terminator::Return(None) | Terminator::Branch(_) | Terminator::Unreachable => {}
+-    }
+-}
+-
+ // ── Tests ─────────────────────────────────────────────────────────────────────
+ 
+ #[cfg(test)]
+@@ -1362,7 +1195,7 @@ mod tests {
+             input_symbols: vec![None],
+             seg_overrides: vec![AddressSpace::Default, AddressSpace::Default],
+         };
+-        replace_values_in_inst(&mut asm, &map);
++        replace_values_in_inst_map(&mut asm, &map);
+         match asm {
+             Instruction::InlineAsm {
+                 outputs, inputs, ..
+@@ -1379,7 +1212,7 @@ mod tests {
+             dest_ptr: Some(Value(9)),
+             args: vec![Operand::Value(Value(8))],
+         };
+-        replace_values_in_inst(&mut intrinsic, &map);
++        replace_values_in_inst_map(&mut intrinsic, &map);
+         match intrinsic {
+             Instruction::Intrinsic { dest_ptr, args, .. } => {
+                 assert_eq!(dest_ptr, Some(Value(90)));
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index 2d20a1fd..dea023db 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -83,7 +83,7 @@ use crate::ir::analysis::CfgAnalysis;
+ use crate::ir::instruction::{BasicBlock, BlockId, Instruction, Operand, Terminator, Value};
+ use crate::ir::intrinsics::IntrinsicOp;
+ use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
+-use crate::ir::reexports::{IrConst, IrFunction};
++use crate::ir::reexports::{IrConst, IrFunction, replace_operand_value, replace_terminator_value};
+ use crate::passes::loop_analysis;
+ 
+ // Per-loop rejection reason for the "why was this not vectorized" diagnostic
+@@ -3655,7 +3655,7 @@ fn deduplicate_vector_loads(func: &mut IrFunction, loop_blocks: &FxHashSet<usize
+     // the earlier canonical load in the same block.
+     for block in func.blocks.iter_mut() {
+         for inst in &mut block.instructions {
+-            crate::passes::tail_call_elim::replace_values_in_inst(inst, &replace);
++            crate::ir::instruction::replace_values_in_inst_map(inst, &replace);
+         }
+         match &mut block.terminator {
+             Terminator::CondBranch { cond, .. } => {
+@@ -3893,239 +3893,167 @@ fn rewrite_reduction_body(
+     (init_zero_value, vec_sum_value, changes)
+ }
+ 
+-/// Rewrite uses of the value `id` outside the given loop blocks AND
+-/// outside the blocks whose labels are in `skip_labels`.  Unlike
+-/// [`rewrite_accumulator_uses_outside_loop`] this covers EVERY
+-/// instruction kind including `Intrinsic` consumers (a later packed op
+-/// reading the value) — it exists for the counting epic's IV
+-/// materialisation, where the new transform-owned blocks (which the
+-/// label set excludes) deliberately keep reading the original phi.
+-fn rewrite_value_uses_outside(
++/// Where `v` is defined, as `(block index, instruction index)`.
++///
++/// `None` when no instruction defines it.  Callers that redirect *reads* to
++/// `v` treat `None` as "refuse": a rewrite target with no visible definition is
++/// never available, and refusing leaves valid IR behind.
++fn definition_site(func: &IrFunction, v: Value) -> Option<(usize, usize)> {
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for (ii, inst) in block.instructions.iter().enumerate() {
++            if inst.dest() == Some(v) {
++                return Some((bi, ii));
++            }
++        }
++    }
++    None
++}
++
++/// The value ids that (transitively) feed the definition of `value`.
++///
++/// A read of the old accumulator may be redirected to `replacement` only when
++/// the reading instruction's own result is NOT on this chain; otherwise the
++/// rewrite puts the replacement behind itself.  Both breaks observed in the
++/// A/B run are instances of that: the no-remainder path's `hadd(acc) -> sum`
++/// re-reading `sum`, and the remainder path's seed `hadd(acc) -> 29` re-reading
++/// the phi the seed initialises (`41`), which left the vector loop without a
++/// single outside reader and let it be eliminated.
++fn producer_cone(func: &IrFunction, value: Value) -> FxHashSet<u32> {
++    let mut def_of: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for (ii, inst) in block.instructions.iter().enumerate() {
++            if let Some(dest) = inst.dest() {
++                def_of.insert(dest.0, (bi, ii));
++            }
++        }
++    }
++    let mut cone: FxHashSet<u32> = FxHashSet::default();
++    let mut work = vec![value.0];
++    while let Some(v) = work.pop() {
++        if !cone.insert(v) {
++            continue;
++        }
++        if let Some(&(bi, ii)) = def_of.get(&v) {
++            for read in func.blocks[bi].instructions[ii].used_values() {
++                work.push(read);
++            }
++        }
++    }
++    cone
++}
++
++/// The one implementation behind both outside-the-loop rewriters.
++///
++/// Every read of `old_id` outside `loop_blocks` (and outside `skip_labels`) is
++/// redirected to `replacement` — blanket reach is the pass's contract (the
++/// no-remainder path redirects the original exit block's readers because its
++/// guard proves the zero-trip bypass edge dead, so a dominating definition is
++/// deliberately NOT required) — with ONE exception: the instruction that
++/// DEFINES `replacement` keeps reading the value it reduces.
++///
++/// That exception is what the shape tables here got right by accident and what
++/// a tableau-free walk must state explicitly.  Two shapes break otherwise, and
++/// both were observed as wrong code in the A/B run:
++///
++/// * the defining instruction itself — the no-remainder path's
++///   `VecHorizontalAddI32x8(acc) -> sum` is at once the reader that reduces the
++///   accumulator and the producer of the replacement, so redirecting its own
++///   operand turns it into `hadd(sum) -> sum` (`double_reduction` lost its
++///   correlation body, printed 0 instead of 201415680 and read an
++///   uninitialised spill slot as a pointer), and
++/// * any instruction whose result feeds the replacement — the remainder path
++///   seeds its scalar accumulator phi with `hadd(acc) -> 29`, so redirecting the
++///   seed closes the cycle `29 -> phi(41) -> ... -> 29` from the other side
++///   (the vector loop then had no outside reader left and was eliminated:
++///   `vectorize_i32_sum` returned garbage for `n = 1`).
++///
++/// Upstream's table was saved by the omission of an `Intrinsic` arm — the same
++/// omission that left every `Intrinsic` reader *after* the reduction
++/// unredirected.
++fn rewrite_uses_where_available(
+     func: &mut IrFunction,
+     loop_blocks: &FxHashSet<usize>,
+     skip_labels: &FxHashSet<u32>,
+-    id: u32,
++    old_id: u32,
+     replacement: Value,
+ ) -> usize {
+-    let mut updates = 0usize;
+-    let replace_in_operand = |op: &mut Operand| -> bool {
+-        if let Operand::Value(v) = op {
+-            if v.0 == id {
+-                *v = replacement;
+-                return true;
+-            }
+-        }
+-        false
++    let Some((def_block, def_idx)) = definition_site(func, replacement) else {
++        return 0;
+     };
++    let producers = producer_cone(func, replacement);
++    let old = Value(old_id);
++    let mut updates = 0usize;
+     for (bi, block) in func.blocks.iter_mut().enumerate() {
+         if loop_blocks.contains(&bi) || skip_labels.contains(&block.label.0) {
+             continue;
+         }
+-        for inst in &mut block.instructions {
+-            match inst {
+-                Instruction::Copy { src, .. } => {
+-                    if replace_in_operand(src) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::Store { val, .. } => {
+-                    if replace_in_operand(val) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::BinOp { lhs, rhs, .. } => {
+-                    if replace_in_operand(lhs) {
+-                        updates += 1;
+-                    }
+-                    if replace_in_operand(rhs) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::Cmp { lhs, rhs, .. } => {
+-                    if replace_in_operand(lhs) {
+-                        updates += 1;
+-                    }
+-                    if replace_in_operand(rhs) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
+-                    if replace_in_operand(src) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+-                    for a in &mut info.args {
+-                        if replace_in_operand(a) {
+-                            updates += 1;
+-                        }
+-                    }
+-                }
+-                Instruction::Intrinsic { args, .. } => {
+-                    for a in args.iter_mut() {
+-                        if replace_in_operand(a) {
+-                            updates += 1;
+-                        }
+-                    }
+-                }
+-                Instruction::Phi { incoming, .. } => {
+-                    for (op, _) in incoming {
+-                        if replace_in_operand(op) {
+-                            updates += 1;
+-                        }
+-                    }
+-                }
+-                Instruction::Select {
+-                    cond,
+-                    true_val,
+-                    false_val,
+-                    ..
+-                } => {
+-                    if replace_in_operand(cond) {
+-                        updates += 1;
+-                    }
+-                    if replace_in_operand(true_val) {
+-                        updates += 1;
+-                    }
+-                    if replace_in_operand(false_val) {
+-                        updates += 1;
+-                    }
+-                }
+-                _ => {}
+-            }
+-        }
+-        match &mut block.terminator {
+-            Terminator::Return(Some(op)) => {
+-                if replace_in_operand(op) {
+-                    updates += 1;
+-                }
++        for (ii, inst) in block.instructions.iter_mut().enumerate() {
++            if bi == def_block && ii <= def_idx {
++                continue; // the replacement does not exist yet at this point
+             }
+-            Terminator::CondBranch { cond, .. } => {
+-                if replace_in_operand(cond) {
+-                    updates += 1;
+-                }
+-            }
+-            Terminator::Switch { val, .. } => {
+-                if replace_in_operand(val) {
+-                    updates += 1;
+-                }
++            if matches!(inst.dest(), Some(dest) if producers.contains(&dest.0)) {
++                continue; // this result feeds the replacement: reading it is a cycle
+             }
+-            _ => {}
++            updates += replace_operand_value(inst, old, Operand::Value(replacement));
+         }
++        updates +=
++            replace_terminator_value(&mut block.terminator, old, Operand::Value(replacement));
+     }
+     updates
+ }
+ 
++/// Rewrite uses of the value `id` outside the given loop blocks AND
++/// outside the blocks whose labels are in `skip_labels`, where `replacement`
++/// is available — see [`rewrite_uses_where_available`].  Unlike
++/// [`rewrite_accumulator_uses_outside_loop`] this covers EVERY
++/// instruction kind including `Intrinsic` consumers (a later packed op
++/// reading the value) — it exists for the counting epic's IV
++/// materialisation, where the new transform-owned blocks (which the
++/// label set excludes) deliberately keep reading the original phi.
++///
++/// The rewrite is the canonical two-walk pair, not a table of instruction
++/// shapes: the 120-line table this replaces listed
++/// `Copy`/`Store`/`BinOp`/`Cmp`/... and stopped there, so a use in a
++/// `GetElementPtr` base, a `Load` pointer, a `Memcpy`, a va-list or an intrinsic
++/// `dest_ptr` outside the loop kept naming the value the loop no longer defines
++/// (SSA-valid, silently wrong).  The returned count is the number of rewritten
++/// use sites, which the callers report as `updates`.
++fn rewrite_value_uses_outside(
++    func: &mut IrFunction,
++    loop_blocks: &FxHashSet<usize>,
++    skip_labels: &FxHashSet<u32>,
++    id: u32,
++    replacement: Value,
++) -> usize {
++    rewrite_uses_where_available(func, loop_blocks, skip_labels, id, replacement)
++}
++
+ /// Rewrite every use of `acc_id` OUTSIDE the reduction's loop blocks to
+-/// `replacement` (the scalar remainder result).  The vector accumulator only
+-/// lives inside the loop; every outside reader must see the reduced scalar.
+-/// Returns the number of rewritten uses (diagnostic only).
++/// `replacement` (the horizontal reduction standing in for the accumulator).
++/// The vector accumulator only lives inside the loop; every outside reader that
++/// can see the replacement must see the reduced scalar.  Returns the number of
++/// rewritten uses (diagnostic only).
++///
++/// Same availability rule and same canonical slot walk as
++/// [`rewrite_value_uses_outside`]: the table it replaces enumerated shapes
++/// instead of slots, so behind the (accidentally safe) omission of the
++/// `Intrinsic` arm it also missed every bare-`Value` position — a `Load`
++/// pointer or `GetElementPtr` base outside the loop kept reading the
++/// accumulator — while an `Intrinsic` reader *after* the reduction was never
++/// redirected at all.
+ fn rewrite_accumulator_uses_outside_loop(
+     func: &mut IrFunction,
+     loop_blocks: &FxHashSet<usize>,
+     acc_id: u32,
+     replacement: Value,
+ ) -> usize {
+-    let mut updates = 0usize;
+-    let replace_in_operand = |op: &mut Operand| -> bool {
+-        if let Operand::Value(v) = op {
+-            if v.0 == acc_id {
+-                *v = replacement;
+-                return true;
+-            }
+-        }
+-        false
+-    };
+-    for (bi, block) in func.blocks.iter_mut().enumerate() {
+-        if loop_blocks.contains(&bi) {
+-            continue; // the vector accumulator lives and is consumed here
+-        }
+-        for inst in &mut block.instructions {
+-            match inst {
+-                Instruction::Copy { src, .. } => {
+-                    if replace_in_operand(src) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::Store { val, .. } => {
+-                    if replace_in_operand(val) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::BinOp { lhs, rhs, .. } => {
+-                    if replace_in_operand(lhs) {
+-                        updates += 1;
+-                    }
+-                    if replace_in_operand(rhs) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::Cmp { lhs, rhs, .. } => {
+-                    if replace_in_operand(lhs) {
+-                        updates += 1;
+-                    }
+-                    if replace_in_operand(rhs) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
+-                    if replace_in_operand(src) {
+-                        updates += 1;
+-                    }
+-                }
+-                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+-                    for a in &mut info.args {
+-                        if replace_in_operand(a) {
+-                            updates += 1;
+-                        }
+-                    }
+-                }
+-                Instruction::Phi { incoming, .. } => {
+-                    for (op, _) in incoming {
+-                        if replace_in_operand(op) {
+-                            updates += 1;
+-                        }
+-                    }
+-                }
+-                Instruction::Select {
+-                    cond,
+-                    true_val,
+-                    false_val,
+-                    ..
+-                } => {
+-                    if replace_in_operand(cond) {
+-                        updates += 1;
+-                    }
+-                    if replace_in_operand(true_val) {
+-                        updates += 1;
+-                    }
+-                    if replace_in_operand(false_val) {
+-                        updates += 1;
+-                    }
+-                }
+-                _ => {}
+-            }
+-        }
+-        match &mut block.terminator {
+-            Terminator::Return(Some(op)) => {
+-                if replace_in_operand(op) {
+-                    updates += 1;
+-                }
+-            }
+-            Terminator::CondBranch { cond, .. } => {
+-                if replace_in_operand(cond) {
+-                    updates += 1;
+-                }
+-            }
+-            Terminator::Switch { val, .. } => {
+-                if replace_in_operand(val) {
+-                    updates += 1;
+-                }
+-            }
+-            _ => {}
+-        }
+-    }
+-    updates
++    rewrite_uses_where_available(
++        func,
++        loop_blocks,
++        &FxHashSet::default(),
++        acc_id,
++        replacement,
++    )
+ }
+ 
+ /// Identity of a pointer's statically-known base object.
+@@ -14818,16 +14746,7 @@ fn strict_cfg_dominates(cfg: &CfgAnalysis, dominator: usize, block: usize) -> bo
+ }
+ 
+ fn strict_value_def_block(func: &IrFunction, value: Value) -> Option<usize> {
+-    func.blocks
+-        .iter()
+-        .enumerate()
+-        .find_map(|(block_idx, block)| {
+-            block
+-                .instructions
+-                .iter()
+-                .any(|inst| inst.dest() == Some(value))
+-                .then_some(block_idx)
+-        })
++    definition_site(func, value).map(|(block_idx, _)| block_idx)
+ }
+ 
+ /// The vector prefix starts from the scalar loop's preheader, rather than its
+@@ -18064,12 +17983,12 @@ fn rewire_escaping_iv_uses(
+                 }
+             });
+             if hit {
+-                rewrite_value_use(inst, iv, rem_iv);
++                replace_operand_value(inst, iv, Operand::Value(rem_iv));
+                 rewrites += 1;
+             }
+         }
+         if terminator_uses_value(&func.blocks[bi].terminator, iv) {
+-            rewrite_terminator_use(&mut func.blocks[bi].terminator, iv, rem_iv);
++            replace_terminator_value(&mut func.blocks[bi].terminator, iv, Operand::Value(rem_iv));
+             rewrites += 1;
+         }
+     }
+@@ -18171,24 +18090,6 @@ fn loop_escape_closed(
+     true
+ }
+ 
+-/// Replace every use of `old` in `inst` with `new`.
+-fn rewrite_value_use(inst: &mut Instruction, old: Value, new: Value) {
+-    inst.for_each_operand_mut(|op| {
+-        if matches!(op, Operand::Value(v) if *v == old) {
+-            *op = Operand::Value(new);
+-        }
+-    });
+-    // Pointer-like fields holding a bare `Value` (Store/Load ptr, GEP base,
+-    // Memcpy, va_list, ...) are not Operands; the exhaustive walker covers
+-    // them all (a hand-rolled Load/GEP-only match left Store-ptr and other
+-    // positions naming the pre-rewrite value).
+-    inst.for_each_value_use_mut(|v| {
+-        if *v == old {
+-            *v = new;
+-        }
+-    });
+-}
+-
+ fn terminator_uses_value(term: &Terminator, v: Value) -> bool {
+     let is = |op: &Operand| matches!(op, Operand::Value(x) if *x == v);
+     match term {
+@@ -18200,21 +18101,6 @@ fn terminator_uses_value(term: &Terminator, v: Value) -> bool {
+     }
+ }
+ 
+-fn rewrite_terminator_use(term: &mut Terminator, old: Value, new: Value) {
+-    let fix = |op: &mut Operand| {
+-        if matches!(op, Operand::Value(x) if *x == old) {
+-            *op = Operand::Value(new);
+-        }
+-    };
+-    match term {
+-        Terminator::Return(Some(op)) => fix(op),
+-        Terminator::CondBranch { cond, .. } => fix(cond),
+-        Terminator::Switch { val, .. } => fix(val),
+-        Terminator::IndirectBranch { target, .. } => fix(target),
+-        _ => {}
+-    }
+-}
+-
+ /// Base pointer the scalar remainder must address array A through.
+ ///
+ /// Normally the vector body GEP's base operand. Max reductions access
+@@ -27134,3 +27020,296 @@ mod no_remainder_tests {
+         assert!(!const_trip_covers_exactly(&c32(268435456), 0, 4, 8));
+     }
+ }
++
++#[cfg(test)]
++mod outside_rewrite_availability_tests {
++    use super::*;
++    use crate::ir::ops::IrBinOp;
++    use crate::ir::reexports::{IrConst, IrFunction};
++
++    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
++        BasicBlock {
++            label: BlockId(label),
++            instructions,
++            terminator,
++            source_spans: vec![],
++        }
++    }
++
++    fn binop(dest: u32, lhs: Value, rhs: i32) -> Instruction {
++        Instruction::BinOp {
++            dest: Value(dest),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(lhs),
++            rhs: Operand::Const(IrConst::I32(rhs)),
++            ty: IrType::I32,
++        }
++    }
++
++    /// The horizontal reduction that PRODUCES the replacement both reads the
++    /// accumulator it reduces and defines the value every outside reader is
++    /// redirected to.  Redirecting its own operand is a self-cycle
++    /// (`hadd(sum) -> sum`): the loop feeding it goes dead — `double_reduction`
++    /// lost its correlation body, printed 0 instead of 201415680 and read an
++    /// uninitialised spill slot as a pointer.  Blanket reach is the pass's
++    /// contract (the reader in the bypass-reachable exit block MUST be
++    /// redirected), so the defining instruction is the one exception.
++    #[test]
++    fn the_defining_instruction_keeps_reading_what_it_reduces() {
++        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
++        func.blocks
++            .push(block(0, vec![], Terminator::Branch(BlockId(1))));
++        func.blocks.push(block(
++            1,
++            vec![Instruction::Phi {
++                dest: Value(10),
++                ty: IrType::I32,
++                incoming: vec![
++                    (Operand::Const(IrConst::I32(0)), BlockId(0)),
++                    (Operand::Value(Value(11)), BlockId(2)),
++                ],
++            }],
++            Terminator::CondBranch {
++                cond: Operand::Const(IrConst::I32(1)),
++                true_label: BlockId(2),
++                false_label: BlockId(3),
++            },
++        ));
++        func.blocks.push(block(
++            2,
++            vec![binop(11, Value(10), 1)],
++            Terminator::Branch(BlockId(1)),
++        ));
++        func.blocks.push(block(
++            3,
++            vec![Instruction::Intrinsic {
++                dest: Some(Value(20)),
++                op: IntrinsicOp::VecHorizontalAddI32x8,
++                dest_ptr: None,
++                args: vec![Operand::Value(Value(10))],
++            }],
++            Terminator::Branch(BlockId(4)),
++        ));
++        func.blocks.push(block(
++            4,
++            vec![binop(21, Value(20), 0)],
++            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
++        ));
++        // The exit block is also reachable by the zero-trip bypass edge, so the
++        // reader there takes the accumulator on one path and the reduction on
++        // the other; the pass redirects it regardless (blanket reach).
++        func.blocks[4].instructions.push(Instruction::BinOp {
++            dest: Value(22),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(21)),
++            rhs: Operand::Value(Value(10)),
++            ty: IrType::I32,
++        });
++
++        let loop_blocks: FxHashSet<usize> = [1usize, 2usize].into_iter().collect();
++        let updates = rewrite_uses_where_available(
++            &mut func,
++            &loop_blocks,
++            &FxHashSet::default(),
++            10,
++            Value(20),
++        );
++
++        match &func.blocks[3].instructions[0] {
++            Instruction::Intrinsic { args, .. } => assert_eq!(
++                args,
++                &vec![Operand::Value(Value(10))],
++                "the reduction must keep reading the accumulator, not its own result"
++            ),
++            other => panic!("expected the horizontal reduce, got {other:?}"),
++        }
++        match &func.blocks[4].instructions[1] {
++            Instruction::BinOp { rhs, .. } => assert_eq!(
++                rhs,
++                &Operand::Value(Value(20)),
++                "an outside reader of the accumulator must take the replacement"
++            ),
++            other => panic!("expected a binop, got {other:?}"),
++        }
++        assert_eq!(updates, 1, "only the outside reader is an update");
++    }
++
++    /// A reader placed BEFORE the definition, in the defining block, cannot
++    /// name the replacement: it has not executed yet.
++    #[test]
++    fn reads_before_the_definition_in_its_own_block_are_left_alone() {
++        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(block(
++            0,
++            vec![
++                binop(30, Value(50), 1),
++                Instruction::Intrinsic {
++                    dest: Some(Value(60)),
++                    op: IntrinsicOp::VecHorizontalAddI32x8,
++                    dest_ptr: None,
++                    args: vec![Operand::Value(Value(50))],
++                },
++                binop(31, Value(50), 2),
++            ],
++            Terminator::Return(Some(Operand::Value(Value(31)))),
++        ));
++
++        let updates = rewrite_uses_where_available(
++            &mut func,
++            &FxHashSet::default(),
++            &FxHashSet::default(),
++            50,
++            Value(60),
++        );
++
++        let lhs_of = |i: usize| match &func.blocks[0].instructions[i] {
++            Instruction::BinOp { lhs, .. } => *lhs,
++            other => panic!("expected a binop, got {other:?}"),
++        };
++        assert_eq!(
++            lhs_of(0),
++            Operand::Value(Value(50)),
++            "a use before the definition must keep the original"
++        );
++        assert_eq!(lhs_of(2), Operand::Value(Value(60)));
++        assert_eq!(updates, 1);
++    }
++
++    /// Bare-`Value` (non-`Operand`) slots outside the loop are rewritten too: a
++    /// `Store` pointer, a `Load` pointer or a `GetElementPtr` base naming the
++    /// accumulator used to keep the stale value, because the shape table
++    /// enumerated operand-bearing instruction kinds only.
++    #[test]
++    fn bare_value_slots_outside_the_loop_are_covered() {
++        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(block(
++            0,
++            vec![
++                binop(80, Value(0), 0),
++                Instruction::Store {
++                    val: Operand::Const(IrConst::I32(1)),
++                    ptr: Value(70),
++                    ty: IrType::I32,
++                    seg_override: AddressSpace::Default,
++                    volatile: false,
++                },
++                Instruction::Load {
++                    dest: Value(81),
++                    ptr: Value(70),
++                    ty: IrType::I32,
++                    seg_override: AddressSpace::Default,
++                    volatile: false,
++                },
++                Instruction::GetElementPtr {
++                    dest: Value(82),
++                    base: Value(70),
++                    offset: Operand::Const(IrConst::I32(4)),
++                    ty: IrType::Ptr,
++                },
++            ],
++            Terminator::Return(Some(Operand::Value(Value(81)))),
++        ));
++
++        let updates = rewrite_uses_where_available(
++            &mut func,
++            &FxHashSet::default(),
++            &FxHashSet::default(),
++            70,
++            Value(80),
++        );
++        assert_eq!(updates, 3, "store ptr, load ptr and gep base are all reads");
++
++        assert!(matches!(
++            &func.blocks[0].instructions[1],
++            Instruction::Store { ptr, .. } if *ptr == Value(80)
++        ));
++        assert!(matches!(
++            &func.blocks[0].instructions[2],
++            Instruction::Load { ptr, .. } if *ptr == Value(80)
++        ));
++        assert!(matches!(
++            &func.blocks[0].instructions[3],
++            Instruction::GetElementPtr { base, .. } if *base == Value(80)
++        ));
++    }
++
++    /// The cross-block form of the same cycle.  The remainder path seeds its
++    /// scalar accumulator phi with the horizontal reduce, so the seed is on the
++    /// chain that produces the replacement and must keep reading the
++    /// accumulator — otherwise the vector loop has no outside reader left and
++    /// is eliminated (`vectorize_i32_sum` returned garbage for `n = 1`).
++    #[test]
++    fn the_chain_that_produces_the_replacement_keeps_reading_the_accumulator() {
++        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(block(
++            0,
++            vec![Instruction::Intrinsic {
++                dest: Some(Value(60)),
++                op: IntrinsicOp::VecHorizontalAddI32x8,
++                dest_ptr: None,
++                args: vec![Operand::Value(Value(50))],
++            }],
++            Terminator::Branch(BlockId(1)),
++        ));
++        func.blocks.push(block(
++            1,
++            vec![Instruction::Phi {
++                dest: Value(70),
++                ty: IrType::I32,
++                incoming: vec![
++                    (Operand::Value(Value(60)), BlockId(0)),
++                    (Operand::Value(Value(71)), BlockId(2)),
++                ],
++            }],
++            Terminator::CondBranch {
++                cond: Operand::Const(IrConst::I32(1)),
++                true_label: BlockId(2),
++                false_label: BlockId(3),
++            },
++        ));
++        func.blocks.push(block(
++            2,
++            vec![binop(71, Value(70), 1)],
++            Terminator::Branch(BlockId(1)),
++        ));
++        func.blocks.push(block(
++            3,
++            vec![binop(80, Value(70), 0)],
++            Terminator::Return(Some(Operand::Value(Value(80)))),
++        ));
++        // An outside reader that is NOT on the producer chain.
++        func.blocks[3].instructions.push(Instruction::BinOp {
++            dest: Value(81),
++            op: IrBinOp::Add,
++            lhs: Operand::Value(Value(80)),
++            rhs: Operand::Value(Value(50)),
++            ty: IrType::I32,
++        });
++
++        let updates = rewrite_uses_where_available(
++            &mut func,
++            &FxHashSet::default(),
++            &FxHashSet::default(),
++            50,
++            Value(70),
++        );
++
++        match &func.blocks[0].instructions[0] {
++            Instruction::Intrinsic { args, .. } => assert_eq!(
++                args,
++                &vec![Operand::Value(Value(50))],
++                "the seed that produces the replacement keeps the accumulator"
++            ),
++            other => panic!("expected the horizontal reduce, got {other:?}"),
++        }
++        match &func.blocks[3].instructions[1] {
++            Instruction::BinOp { rhs, .. } => assert_eq!(
++                rhs,
++                &Operand::Value(Value(70)),
++                "an off-chain outside reader still takes the replacement"
++            ),
++            other => panic!("expected a binop, got {other:?}"),
++        }
++        assert_eq!(updates, 1);
++    }
++}
