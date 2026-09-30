@@ -1,986 +1,338 @@
-diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index a6a1e921..6e3be84b 100644
---- a/.github/workflows/ci.yml
-+++ b/.github/workflows/ci.yml
-@@ -755,6 +755,10 @@ jobs:
-           # index addressing.
-           python3 scripts/test_hot_loop_metric.py
-           python3 scripts/test_godbolt_cache.py
-+          python3 scripts/test_glibc_check_triage.py
-+          python3 scripts/test_oracle_delta_gate.py
-+          python3 scripts/oracle_delta_gate.py --self-test
-+          python3 scripts/glibc_check_triage.py --self-test
-           bash tests/regression/check_copy_alias_sizes.sh
-           bash tests/regression/check_linker_notype_code.sh
-           bash tests/regression/check_got64_old_spelling.sh
-@@ -955,3 +959,38 @@ jobs:
-         env:
-           CARGO_BUILD_JOBS: "2"
-         run: cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
-+
-+  # MS-01 (competitive half): compare LCCC against GCC / Clang / ICX on
-+  # Compiler Explorer and fail on regression against the committed baseline.
-+  # Networked, so a Compiler Explorer outage is a recorded skip (exit 0), never
-+  # a red build; the self-tests in the `test` job pin the gate logic itself.
-+  oracle-delta:
-+    name: Compiler Explorer oracle delta
-+    runs-on: ubuntu-latest
-+    steps:
-+      - name: Checkout
-+        uses: actions/checkout@v7
-+        with:
-+          submodules: recursive
-+
-+      - name: Install Rust
-+        uses: dtolnay/rust-toolchain@stable
-+
-+      - name: Build LCCC (fastbuild)
-+        env:
-+          CARGO_BUILD_JOBS: "2"
-+        run: cargo build --profile fastbuild --locked -j 2 --bin lccc
-+
-+      - name: Oracle delta gate (LCCC vs GCC 16.2 / Clang / ICX)
-+        run: |
-+          python3 scripts/oracle_delta_gate.py \
-+            --local target/fastbuild/lccc \
-+            --report results/oracle-delta/report.json
-+
-+      - name: Upload oracle report
-+        if: always()
-+        uses: actions/upload-artifact@v7
-+        with:
-+          name: oracle-delta
-+          path: results/oracle-delta/
-+          if-no-files-found: ignore
-diff --git a/engineering/evidence/oracle_delta_baseline.json b/engineering/evidence/oracle_delta_baseline.json
+diff --git a/docs/induction-strength-reduction-consumers.md b/docs/induction-strength-reduction-consumers.md
 new file mode 100644
-index 00000000..61a3010b
+index 00000000..83924347
 --- /dev/null
-+++ b/engineering/evidence/oracle_delta_baseline.json
-@@ -0,0 +1,36 @@
-+{
-+  "schema": 1,
-+  "flags": "-O2 -march=x86-64-v3",
-+  "entries": {
-+    "expat_name_length": {
-+      "insns": 70,
-+      "stack": 0,
-+      "got": 0,
-+      "push": 0
-+    },
-+    "expat_scan_document": {
-+      "insns": 81,
-+      "stack": 3,
-+      "got": 0,
-+      "push": 6
-+    },
-+    "gzip_crc32_loop": {
-+      "insns": 14,
-+      "stack": 0,
-+      "got": 0,
-+      "push": 0
-+    },
-+    "ra01_global_match_probe": {
-+      "insns": 92,
-+      "stack": 2,
-+      "got": 0,
-+      "push": 6
-+    },
-+    "zlib_ng_adler32_c": {
-+      "insns": 270,
-+      "stack": 14,
-+      "got": 0,
-+      "push": 6
-+    }
-+  }
-+}
-diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index 59fc4aad..47cdbaed 100755
---- a/scripts/ci_local.sh
-+++ b/scripts/ci_local.sh
-@@ -898,6 +898,20 @@ gate "godbolt-oracle-selftest" fast \
- gate "godbolt-cache-selftest" fast \
-     python3 scripts/test_godbolt_cache.py
++++ b/docs/induction-strength-reduction-consumers.md
+@@ -0,0 +1,119 @@
++# Strength reduction: which memory consumers a derived IV can serve
++
++This note records a measurement campaign on `iv_strength_reduce` (IVSR) and the
++numbers that decide how far its replacement may reach.  It exists so the three
++dead ends below are not walked again: all of them look like wins on paper and
++all three are losses on the machine.
++
++## The shape that motivated the work
++
++`benchmark/programs/nbody.c`, built with `-O2 -march=x86-64-v3 -DSTEPS=2000`.
++The inner loop walks `bodies[j]` and `bodies[k]` where `bodies` is a static
++array and the byte offset is `index * 56`.  IVSR's derived-expression finder
++does locate those multiplies (`[IVSR]` reports `derived=1` for both loops), and
++yet the multiply survives into the emitted loop.
++
++Root cause, established by instrumenting the derived-use matcher: the collector
++accepts exactly one consumer spelling,
++
++```text
++GetElementPtr { offset: Operand::Value(mul_dest) }
++```
++
++while the SLP vectorizer rewrites the loop into
++
++```text
++Copy        { dest: v242, src: Value(v250) }
++Copy        { dest: v32,  src: Value(v250) }
++Intrinsic   { op: VecLoadF64x2,  args: [base, Value(v250), Const(I64(24))] }
++Intrinsic   { op: VecStoreF64x2, args: [value, base, Value(v250), Const(I64(24))] }
++```
++
++So the byte offset is read by a `Copy` and by a vector memory intrinsic, and the
++GEP-count is zero: the group is never formed and no recurrence replaces the
++`movslq; imulq $56` pair.
++
++## What was tried, and what it cost
++
++Three implementations, each measured against the unmodified pass with two
++independent instruments.  "Program instructions" is the sum of the executed
++block sizes in a `qemu-x86_64 -d in_asm,exec,nochain` log, restricted to the
++program's own address range; the callgrind column is a `--dump-instr=yes` run,
++which counts retired instructions exactly.
++
++| variant | hot loop | program insns (qemu) | callgrind total | callgrind `main` |
++| --- | --- | --- | --- | --- |
++| shipped pass (baseline) | 44-45, `imul` in loop | **1,132,825** | **1,252,502** | **1,100,994** |
++| index recurrence (new value, base kept live) | 44, no `imul` | 1,202,829 | 1,311,939 | 1,140,994 |
++| pointer recurrence extended to the intrinsics | 42, no `imul`, pointer walk | 1,154,820 | 1,272,498 | 1,108,990 |
++| `gcc -O2` reference | 28 | - | 883,838 | - |
++
++Both instruments agree on the sign and the magnitude, and the baseline
++reproduces bit-identically after the reverted work.
++
++### Why the index recurrence loses
++
++The recurrence is cheap (one `add` per iteration), but the pass pays for it in
++registers, and the multiply it removes was almost free to begin with: the
++backend's SIB addressing absorbs an index register at no instruction cost, so
++`base + (k*56)` is one memory operand either way.  Measured in the emitted loop,
++the transform replaces `movslq; imulq $56` (2 instructions, both in the SIB
++path) with `leaq base+idx; addq $56` plus one more live value across the whole
++nest.  Register pressure then shows up as an extra spill in the surrounding
++loops, and the net is +6.2 %.
++
++### Why extending the pointer form still loses
++
++The pointer form is the right shape -- it is what GCC emits (`addq $56, %rax`
++with `disp(%rax)` accesses) -- and it does shrink the hot loop from 45 to 42
++instructions with the multiply gone entirely.  It loses anyway, because the seed
++for a nested loop's pointer is computed in the *enclosing* loop body: the
++k-loop's start address depends on `j`, so `(j+1) * 56 + bodies` is materialized
++once per j-iteration where the old code recomputed it inside the k-loop.  The
++k-loop saves 2 instructions per k-iteration, the j-loop body grows by 3 per
++j-iteration, and the measured total rises 1.9 %.
++
++## Consequences for the pass
++
++IVSR keeps its pointer form and its existing consumer matcher.  The matched
++consumer set is deliberately not widened until a replacement pays for itself:
++with the current backend, a new loop-carried value costs more than the address
++arithmetic it removes, unless the value replaces *multiple* separate
++computations or the loop is register-rich.
++
++## Where the nbody gap actually is
++
++The multiply is 2 instructions of a 45-instruction loop; GCC's loop is 28.  The
++difference is elsewhere, and it is worth 4 instructions per iteration alone:
++
++```asm
++; lccc: lane 0 and lane 1 of the vector are extracted through the stack
++movsd  %xmm15, -144(%rbp)
++pshufd $0x0E, %xmm15, %xmm0
++movsd  %xmm0, -152(%rbp)
++movsd  -144(%rbp), %xmm5        ; reload
++movsd  -152(%rbp), %xmm1        ; reload
++```
++
++GCC keeps the extraction in registers (`vunpckhpd`/`vmovddup`).  Two further
++items of the same order: the loop-invariant `lea bodies(%rip), %rcx` is
++re-materialized every iteration instead of being hoisted, and the scalar `dz`
++component is reloaded from the array rather than derived.  Those three are the
++next lever; each has a measured or counted cost, unlike the multiply this pass
++chases.
++
++## Measurement methodology notes
++
++Two traps cost most of the debugging time in this campaign and are worth
++recording:
++
++* Translation-cache tracing attributes one loop iteration to *two* blocks when
++  qemu splits or re-translates a block (`45 x 12000` plus `48 x 8000` for a
++  20,000-iteration loop).  A block-level profile from such a log can therefore
++  report a loop as *larger* than it is.  Totals are reliable; per-block sizes
++  across two builds are not comparable unless the block structure is identical.
++* `callgrind` profile files compress positions (`+N` deltas) **and** names (an id
++  table that a bare `fn=(id)` refers back to), and they contain both `fn=` self
++  sections and caller-context sections that repeat the same instructions.  A
++  hand-written reader that ignores either detail double counts the program.
++  `callgrind_annotate` is the authoritative reader; use it for totals.
+diff --git a/src/ir/instruction.rs b/src/ir/instruction.rs
+index fad246ec..5060dc5f 100644
+--- a/src/ir/instruction.rs
++++ b/src/ir/instruction.rs
+@@ -1114,6 +1114,51 @@ impl Instruction {
+     }
+ }
  
-+# MS-11: glibc `make check` triage classifier (miscompile / unsupported /
-+# environment). Fixture-driven, offline.
-+gate "glibc-triage-selftest" fast \
-+    python3 scripts/test_glibc_check_triage.py
-+gate "glibc-triage-cli-selftest" fast \
-+    python3 scripts/glibc_check_triage.py --self-test
-+
-+# MS-01: Compiler Explorer oracle delta gate logic (metrics, tolerance,
-+# baseline handling). The networked run itself is hosted-only.
-+gate "oracle-delta-selftest" fast \
-+    python3 scripts/test_oracle_delta_gate.py
-+gate "oracle-delta-cli-selftest" fast \
-+    python3 scripts/oracle_delta_gate.py --self-test
-+
- # --------------------------------------------------------------- job:bench --
- # The bench workflow carries the CODEGEN-QUALITY gate, which the test job does
- # not.  Leaving it out of this mirror is exactly how a +24% instruction-count
-diff --git a/scripts/glibc_check_triage.py b/scripts/glibc_check_triage.py
-new file mode 100755
-index 00000000..f62a5cd0
---- /dev/null
-+++ b/scripts/glibc_check_triage.py
-@@ -0,0 +1,270 @@
-+#!/usr/bin/env python3
-+"""glibc ``make check`` triage harness (BACKLOG MS-11).
-+
-+Classifies every non-passing glibc test into exactly one bucket so a compiler
-+engineer can tell *miscompiles* (our bug) from *unsupported features* (our gap)
-+and *environment* noise (nobody's bug) without reading thousands of ``.out``
-+files by hand.
-+
-+    scripts/glibc_check_triage.py BUILD_DIR
-+    scripts/glibc_check_triage.py BUILD_DIR --baseline GCC_BUILD_DIR
-+    scripts/glibc_check_triage.py BUILD_DIR --json out.json --markdown out.md
-+    scripts/glibc_check_triage.py --self-test
-+
-+``BUILD_DIR`` is a glibc objdir after ``make check``.  Sources of truth, in
-+order of authority:
-+
-+1. ``<test>.test-result`` -- ``PASS|FAIL|XFAIL|XPASS|UNSUPPORTED|ERROR: name``
-+   (glibc's own ``evaluate-test`` output);
-+2. ``tests.sum`` -- the same lines concatenated (per-test files may be pruned);
-+3. ``<test>.out`` -- the test's stdout/stderr, scanned for evidence.
-+
-+Buckets
-+-------
-+
-+``miscompile``
-+    Failure with code-execution evidence (SIGSEGV/SIGILL/SIGBUS/SIGFPE/SIGABRT
-+    from the test child, ``Assertion ... failed``, ``support/check.h`` compare
-+    mismatches) and no environment/unsupported evidence.  With ``--baseline``
-+    it is promoted to ``miscompile-confirmed`` when the identical test PASSes
-+    in the reference (GCC) build and demoted to ``preexisting`` when it also
-+    fails there.
-+``unsupported-feature``
-+    ``UNSUPPORTED`` results, or diagnostics showing our frontend/assembler/
-+    linker refused a construct (``unsupported``, ``unknown attribute``,
-+    ``ifunc``, ``undefined reference to `__builtin``, ``not implemented``).
-+``environment``
-+    Timeouts, missing files/locales, permission/namespace failures, ENOSYS,
-+    ENOMEM, no network, read-only fs.  Outranks everything else (a SIGSEGV
-+    after "cannot open shared object" is not a miscompile).
-+``unclassified``
-+    Failure with no recognised evidence; always listed so nothing is lost.
-+
-+Exit status: 0 when the ``miscompile*`` count is within ``--allow-miscompiles``
-+(default 0), 1 otherwise, 2 on usage/IO errors.
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import json
-+import re
-+import sys
-+import tempfile
-+from collections import Counter, defaultdict
-+from dataclasses import asdict, dataclass, field
-+from pathlib import Path
-+
-+RESULT_RE = re.compile(
-+    r"^(PASS|FAIL|XFAIL|XPASS|UNSUPPORTED|ERROR):\s+(\S+)", re.MULTILINE
-+)
-+
-+SIGNAL_EVIDENCE = [
-+    (re.compile(r"got `?(Segmentation fault|SIGSEGV)"), "SIGSEGV"),
-+    (re.compile(r"got `?(Illegal instruction|SIGILL)"), "SIGILL"),
-+    (re.compile(r"got `?(Bus error|SIGBUS)"), "SIGBUS"),
-+    (re.compile(r"got `?(Floating point exception|SIGFPE)"), "SIGFPE"),
-+    (re.compile(r"got `?(Aborted|SIGABRT)"), "SIGABRT"),
-+    (re.compile(r"Didn't expect signal from child"), "signal"),
-+    (re.compile(r"Assertion [`'\"].*failed|assertion failed", re.IGNORECASE), "assert"),
-+    (re.compile(r"^error: .*\(.*\) (!=|==|<|>|<=|>=) ", re.MULTILINE), "check-mismatch"),
-+    (re.compile(r"^error: .*:\d+: .*(mismatch|unexpected|wrong)",
-+                re.MULTILINE | re.IGNORECASE), "check-mismatch"),
-+]
-+UNSUPPORTED_EVIDENCE = [
-+    re.compile(r"\bunsupported\b", re.IGNORECASE),
-+    re.compile(r"unknown attribute|attribute .* not supported", re.IGNORECASE),
-+    re.compile(r"\bifunc\b|gnu_indirect_function", re.IGNORECASE),
-+    re.compile(r"not implemented|not yet implemented|unimplemented", re.IGNORECASE),
-+    re.compile(r"undefined reference to [`']__(builtin|sync|atomic)"),
-+    re.compile(r"unknown (builtin|directive|relocation)", re.IGNORECASE),
-+    re.compile(r"__float128|_Float128|_Decimal(32|64|128)"),
-+]
-+ENVIRONMENT_EVIDENCE = [
-+    re.compile(r"Timed out|timeout|killed the child process", re.IGNORECASE),
-+    re.compile(r"cannot open shared object file|No such file or directory"),
-+    re.compile(r"Permission denied|Operation not permitted|EPERM"),
-+    re.compile(r"Function not implemented|ENOSYS"),
-+    re.compile(r"locale.*not (found|available)|cannot (set|load) locale|setlocale"),
-+    re.compile(r"unshare|user namespace|CLONE_NEW|/proc/.*(No such|cannot)"),
-+    re.compile(r"Cannot allocate memory|Out of memory|ENOMEM"),
-+    re.compile(r"Network is unreachable|Name or service not known|Temporary failure"),
-+    re.compile(r"Read-only file system|No space left on device"),
-+]
-+
-+FAILING = {"FAIL", "ERROR", "XPASS"}
-+NONFAIL = {"PASS", "XFAIL"}
-+
-+
-+@dataclass
-+class Verdict:
-+    test: str
-+    result: str
-+    bucket: str
-+    evidence: list[str] = field(default_factory=list)
-+    baseline_result: str | None = None
-+
-+
-+def parse_results(text: str) -> dict[str, str]:
-+    """``{test: result}`` from ``tests.sum``/``.test-result`` text (last wins)."""
-+    return {m.group(2): m.group(1) for m in RESULT_RE.finditer(text)}
-+
-+
-+def collect_results(build: Path) -> dict[str, str]:
-+    results: dict[str, str] = {}
-+    summary = build / "tests.sum"
-+    if summary.is_file():
-+        results.update(parse_results(summary.read_text(errors="replace")))
-+    for tr in sorted(build.rglob("*.test-result")):
-+        results.update(parse_results(tr.read_text(errors="replace")))
-+    return results
-+
-+
-+def read_out(build: Path, test: str) -> str:
-+    path = build / f"{test}.out"
-+    return path.read_text(errors="replace") if path.is_file() else ""
-+
-+
-+def classify(result: str, log: str) -> tuple[str, list[str]]:
-+    """Map one (result, log) pair to ``(bucket, evidence)``."""
-+    if result in NONFAIL:
-+        return result.lower(), []
-+    if result == "UNSUPPORTED":
-+        return "unsupported-feature", ["glibc reported UNSUPPORTED"]
-+    env = [p.pattern for p in ENVIRONMENT_EVIDENCE if p.search(log)]
-+    uns = [p.pattern for p in UNSUPPORTED_EVIDENCE if p.search(log)]
-+    sig = [name for rx, name in SIGNAL_EVIDENCE if rx.search(log)]
-+    if env:
-+        return "environment", env[:3]
-+    if uns:
-+        return "unsupported-feature", uns[:3]
-+    if sig:
-+        return "miscompile", sorted(set(sig))
-+    return "unclassified", ["no recognised evidence"]
-+
-+
-+def triage(build: Path, baseline: Path | None) -> list[Verdict]:
-+    results = collect_results(build)
-+    base = collect_results(baseline) if baseline else {}
-+    verdicts: list[Verdict] = []
-+    for test in sorted(results):
-+        result = results[test]
-+        bucket, evidence = classify(result, read_out(build, test))
-+        base_result = base.get(test) if baseline else None
-+        if baseline and bucket == "miscompile":
-+            if base_result in NONFAIL:
-+                bucket = "miscompile-confirmed"
-+                evidence.append(f"reference build: {base_result}")
-+            elif base_result in FAILING or base_result == "UNSUPPORTED":
-+                bucket = "preexisting"
-+                evidence.append(f"reference build also: {base_result}")
-+        verdicts.append(Verdict(test, result, bucket, evidence, base_result))
-+    return verdicts
-+
-+
-+def summarize(verdicts: list[Verdict]) -> dict[str, object]:
-+    counts = Counter(v.bucket for v in verdicts)
-+    by_dir: dict[str, Counter[str]] = defaultdict(Counter)
-+    for v in verdicts:
-+        if v.bucket not in ("pass", "xfail"):
-+            by_dir[v.test.split("/")[0]][v.bucket] += 1
-+    return {
-+        "total": len(verdicts),
-+        "counts": dict(sorted(counts.items())),
-+        "by_directory": {d: dict(c) for d, c in sorted(by_dir.items())},
-+        "miscompiles": sorted(v.test for v in verdicts if v.bucket.startswith("miscompile")),
-+    }
-+
-+
-+def render_markdown(verdicts: list[Verdict], summary: dict[str, object]) -> str:
-+    counts = summary["counts"]
-+    assert isinstance(counts, dict)
-+    lines = ["# glibc `make check` triage", "", "| bucket | tests |", "|---|---:|"]
-+    lines += [f"| {bucket} | {n} |" for bucket, n in counts.items()]
-+    lines += ["", "## Non-passing tests", "", "| test | result | bucket | evidence |",
-+              "|---|---|---|---|"]
-+    for v in verdicts:
-+        if v.bucket in ("pass", "xfail"):
-+            continue
-+        ev = "; ".join(e.replace("|", "\\|") for e in v.evidence)
-+        lines.append(f"| `{v.test}` | {v.result} | {v.bucket} | {ev} |")
-+    return "\n".join(lines) + "\n"
-+
-+
-+def _write(path: Path, text: str) -> None:
-+    path.parent.mkdir(parents=True, exist_ok=True)
-+    path.write_text(text)
-+
-+
-+def self_test() -> int:
-+    """Fixture-driven check of every bucket and the baseline promotion rules."""
-+    with tempfile.TemporaryDirectory() as d:
-+        root = Path(d)
-+        build, ref = root / "lccc", root / "gcc"
-+        _write(build / "tests.sum", "\n".join([
-+            "PASS: string/test-memcmp", "FAIL: string/tst-crash", "FAIL: elf/tst-ifunc",
-+            "FAIL: misc/tst-env", "UNSUPPORTED: nptl/tst-skip", "FAIL: math/test-weird",
-+            "FAIL: stdio-common/tst-both", "XFAIL: posix/tst-known"]) + "\n")
-+        _write(ref / "tests.sum", "PASS: string/tst-crash\nFAIL: stdio-common/tst-both\n")
-+        _write(build / "string/tst-crash.out",
-+               "Didn't expect signal from child: got `Segmentation fault'\n")
-+        _write(build / "elf/tst-ifunc.out",
-+               "error: ifunc relocation\nDidn't expect signal from child: got `Segmentation fault'\n")
-+        _write(build / "misc/tst-env.out", "Timed out: killed the child process\n")
-+        _write(build / "stdio-common/tst-both.out", "Assertion `x == 3' failed.\n")
-+        verdicts = {v.test: v for v in triage(build, ref)}
-+        expect = {
-+            "string/test-memcmp": "pass",
-+            "string/tst-crash": "miscompile-confirmed",
-+            "elf/tst-ifunc": "unsupported-feature",
-+            "misc/tst-env": "environment",
-+            "nptl/tst-skip": "unsupported-feature",
-+            "math/test-weird": "unclassified",
-+            "stdio-common/tst-both": "preexisting",
-+            "posix/tst-known": "xfail",
++/// Replace every read of `old` in `inst` with `new_op`.
++///
++/// Both visitor kinds are required and neither is redundant:
++/// [`Instruction::for_each_operand_mut`] covers the `Operand` slots (binary and
++/// unary operands, GEP offsets, store values, call and intrinsic arguments),
++/// while [`Instruction::for_each_value_use_mut`] covers the bare `Value` slots
++/// (`GetElementPtr.base`, `Load.ptr`, `dest_ptr`, ...) that a pass substituting
++/// a *value* must redirect as well.  Hand-rolled `match` arms over the
++/// instruction enum are how the two get out of sync: a shape nobody remembered
++/// to list keeps reading the replaced value, and the resulting IR still
++/// validates because the stale read is a value that is still defined.
++///
++/// This is the single canonical implementation; the passes that rewrite
++/// induction-variable uses share it rather than keeping private copies.
++pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand) {
++    let new_val = match new_op {
++        Operand::Value(v) => Some(v),
++        Operand::Const(_) => None,
++    };
++    inst.for_each_operand_mut(|op| {
++        if matches!(op, Operand::Value(v) if *v == old) {
++            *op = new_op;
 +        }
-+        for test, bucket in expect.items():
-+            if verdicts[test].bucket != bucket:
-+                print(f"self-test FAIL {test}: {verdicts[test].bucket} != {bucket}",
-+                      file=sys.stderr)
-+                return 1
-+        if summarize(list(verdicts.values()))["miscompiles"] != ["string/tst-crash"]:
-+            print("self-test FAIL: miscompile list", file=sys.stderr)
-+            return 1
-+    print("glibc_check_triage self-test OK")
-+    return 0
++    });
++    // A constant cannot stand in a bare `Value` slot, so those slots are left
++    // alone: replacing `base` with a constant would need a materialization this
++    // helper has nowhere to put.
++    if let Some(nv) = new_val {
++        inst.for_each_value_use_mut(|field| {
++            if *field == old {
++                *field = nv;
++            }
++        });
++    }
++}
 +
++/// Replace every read of `old` in a terminator with `new_op`.
++pub fn replace_terminator_value(term: &mut Terminator, old: Value, new_op: Operand) {
++    term.for_each_operand_mut(|op| {
++        if matches!(op, Operand::Value(v) if *v == old) {
++            *op = new_op;
++        }
++    });
++}
 +
-+def main(argv: list[str] | None = None) -> int:
-+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
-+    ap.add_argument("build", nargs="?", type=Path, help="glibc objdir after make check")
-+    ap.add_argument("--baseline", type=Path, help="reference (GCC) objdir")
-+    ap.add_argument("--json", type=Path, dest="json_out")
-+    ap.add_argument("--markdown", type=Path)
-+    ap.add_argument("--allow-miscompiles", type=int, default=0,
-+                    help="tolerated count of miscompile* tests (default 0)")
-+    ap.add_argument("--self-test", action="store_true")
-+    args = ap.parse_args(argv)
-+    if args.self_test:
-+        return self_test()
-+    if args.build is None or not args.build.is_dir():
-+        print("error: BUILD_DIR required and must exist", file=sys.stderr)
-+        return 2
-+    verdicts = triage(args.build, args.baseline)
-+    if not verdicts:
-+        print("error: no test results found (run `make check` first)", file=sys.stderr)
-+        return 2
-+    summary = summarize(verdicts)
-+    if args.json_out:
-+        args.json_out.write_text(json.dumps(
-+            {"summary": summary, "tests": [asdict(v) for v in verdicts]}, indent=2) + "\n")
-+    md = render_markdown(verdicts, summary)
-+    if args.markdown:
-+        args.markdown.write_text(md)
-+    else:
-+        sys.stdout.write(md)
-+    bad = len(summary["miscompiles"])  # type: ignore[arg-type]
-+    return 0 if bad <= args.allow_miscompiles else 1
+ impl Terminator {
+     /// Mutably visit every Operand stored in this terminator.
+     #[inline]
+@@ -1160,6 +1205,79 @@ impl Terminator {
+     }
+ }
+ 
++#[cfg(test)]
++mod value_replacement_tests {
++    use super::*;
 +
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
-diff --git a/scripts/oracle_delta_gate.py b/scripts/oracle_delta_gate.py
-new file mode 100755
-index 00000000..678c0c96
---- /dev/null
-+++ b/scripts/oracle_delta_gate.py
-@@ -0,0 +1,203 @@
-+#!/usr/bin/env python3
-+"""Compiler-Explorer oracle delta gate (BACKLOG MS-01, the "CE delta half").
-+
-+``ci-codegen-gate.py`` is the *structural* gate (local LCCC output only).  This
-+tool adds the *competitive* half: for every entry of
-+``tests/oracle/delta_corpus.json`` it compiles the function with local LCCC and
-+with GCC / Clang / ICX on Compiler Explorer (through ``scripts/godbolt.py``, so
-+the shared on-disk cache and the pinned-alias policy apply), extracts four
-+deterministic, hardware-independent metrics per compiler and
-+
-+* writes one JSON report (CI artifact; every oracle's resolved id is recorded),
-+* **fails** when LCCC regresses against the committed baseline
-+  ``engineering/evidence/oracle_delta_baseline.json`` by more than the
-+  tolerance (default +5 % instructions, +2 stack refs, +1 GOT ref, +1 push),
-+* prints the per-function gap to the *best* oracle (ratio < 1.0 == LCCC wins).
-+
-+Metrics (AT&T, function body only): ``insns`` (labels/directives excluded),
-+``stack`` (``(%rsp)``/``(%rbp)`` operands), ``got`` (``@GOTPCREL``), ``push``.
-+
-+Network policy: an unreachable Compiler Explorer is a *skip* (exit 0) unless
-+``--strict``; a gate that cannot run must not block unrelated work, but the
-+skip is loud and recorded in the report.
-+
-+    scripts/oracle_delta_gate.py                       # gate
-+    scripts/oracle_delta_gate.py --update-baseline     # refresh after a win
-+    scripts/oracle_delta_gate.py --only ra01_global_match_probe --report r.json
-+    scripts/oracle_delta_gate.py --self-test
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import json
-+import os
-+import re
-+import sys
-+from pathlib import Path
-+from typing import Any, Callable
-+
-+HERE = Path(__file__).resolve().parent
-+ROOT = HERE.parent
-+sys.path.insert(0, str(HERE))
-+
-+CORPUS = ROOT / "tests/oracle/delta_corpus.json"
-+BASELINE = ROOT / "engineering/evidence/oracle_delta_baseline.json"
-+
-+STACK_RE = re.compile(r"\(%r[sb]p\)|\(%r[sb]p,")
-+TOLERANCE = {"insns_pct": 5.0, "stack": 2, "got": 1, "push": 1}
-+
-+
-+def metrics(body: list[str], count_insns: Callable[[list[str]], int]) -> dict[str, int]:
-+    """Deterministic codegen metrics of one function body (AT&T)."""
-+    ops = [ln.strip() for ln in body]
-+    return {
-+        "insns": count_insns(body),
-+        "stack": sum(1 for ln in ops if STACK_RE.search(ln)),
-+        "got": sum(1 for ln in ops if "GOTPCREL" in ln),
-+        "push": sum(1 for ln in ops if re.match(r"push[lq]?\s", ln)),
++    fn gep(dest: u32, base: u32, offset: u32) -> Instruction {
++        Instruction::GetElementPtr {
++            dest: Value(dest),
++            base: Value(base),
++            offset: Operand::Value(Value(offset)),
++            ty: IrType::I8,
++        }
 +    }
 +
-+
-+def evaluate(rows: list[dict[str, Any]], baseline: dict[str, Any],
-+             tol: dict[str, float]) -> tuple[list[str], list[str]]:
-+    """Return ``(failures, notes)`` for measured ``rows`` against ``baseline``.
-+
-+    A row is ``{"id", "lccc": metrics, "oracles": {name: metrics}}``.  Entries
-+    absent from the baseline are notes (new corpus entry), never failures."""
-+    failures: list[str] = []
-+    notes: list[str] = []
-+    base_entries = baseline.get("entries", {})
-+    for row in rows:
-+        ident, lccc = row["id"], row["lccc"]
-+        best = min((m["insns"] for m in row["oracles"].values()), default=None)
-+        if best:
-+            notes.append(f"{ident}: lccc {lccc['insns']} insns, best oracle {best} "
-+                         f"(ratio {lccc['insns'] / best:.2f})")
-+        ref = base_entries.get(ident)
-+        if ref is None:
-+            notes.append(f"{ident}: no baseline yet (run --update-baseline)")
-+            continue
-+        limit = ref["insns"] * (1.0 + tol["insns_pct"] / 100.0)
-+        if lccc["insns"] > limit:
-+            failures.append(f"{ident}: insns {lccc['insns']} > baseline {ref['insns']} "
-+                            f"(+{tol['insns_pct']:.0f}% = {limit:.1f})")
-+        for key in ("stack", "got", "push"):
-+            if lccc[key] > ref[key] + tol[key]:
-+                failures.append(f"{ident}: {key} {lccc[key]} > baseline {ref[key]} "
-+                                f"(+{tol[key]:g})")
-+    return failures, notes
-+
-+
-+def measure(entries: list[dict[str, str]], flags: str, oracles: list[str],
-+            local: str) -> tuple[list[dict[str, Any]], list[str]]:
-+    """Compile every entry locally and on CE.  Returns ``(rows, errors)``."""
-+    import godbolt  # late: keeps --self-test and unit tests import-light
-+
-+    rows: list[dict[str, Any]] = []
-+    errors: list[str] = []
-+    compilers = godbolt.list_compilers("c")
-+    for entry in entries:
-+        src = ROOT / entry["source"]
-+        fn = entry["function"]
-+        text = src.read_text()
-+        local_body = godbolt._function_body(godbolt._compile_local(local, src, flags), fn)
-+        if local_body is None:
-+            errors.append(f"{entry['id']}: function {fn} not emitted by local LCCC")
-+            continue
-+        row: dict[str, Any] = {"id": entry["id"], "function": fn, "source": entry["source"],
-+                               "lccc": metrics(local_body, godbolt._instruction_count),
-+                               "oracles": {}, "resolved": {}}
-+        for name in oracles:
-+            cid = godbolt.resolve_compiler(name)
-+            meta = godbolt.compiler_metadata(cid, compilers=compilers)
-+            result = godbolt.compile_on_godbolt(cid, text, flags, intel=False)
-+            body = godbolt._function_body(godbolt.assembly_lines(result), fn) if result else None
-+            if body is None:
-+                errors.append(f"{entry['id']}: oracle {name} produced no body for {fn}")
-+                continue
-+            row["oracles"][name] = metrics(body, godbolt._instruction_count)
-+            row["resolved"][name] = {"id": cid, "name": meta.get("name", "")}
-+        rows.append(row)
-+    return rows, errors
-+
-+
-+def self_test() -> int:
-+    count = lambda body: sum(1 for ln in body if ln.strip() and not ln.strip().endswith(":")
-+                             and not ln.strip().startswith("."))
-+    body = ["f:", ".cfi_startproc", "  pushq %rbx", "  movq 8(%rsp), %rax",
-+            "  movq x@GOTPCREL(%rip), %rcx", "  ret"]
-+    m = metrics(body, count)
-+    assert m == {"insns": 4, "stack": 1, "got": 1, "push": 1}, m
-+    base = {"entries": {"a": {"insns": 100, "stack": 2, "got": 0, "push": 1}}}
-+    ok = {"id": "a", "lccc": {"insns": 104, "stack": 4, "got": 1, "push": 2},
-+          "oracles": {"gcc": {"insns": 60}, "icx": {"insns": 50}}}
-+    bad = {"id": "a", "lccc": {"insns": 106, "stack": 5, "got": 2, "push": 3},
-+           "oracles": {"gcc": {"insns": 60}}}
-+    new = {"id": "b", "lccc": {"insns": 10, "stack": 0, "got": 0, "push": 0}, "oracles": {}}
-+    fails, notes = evaluate([ok], base, TOLERANCE)
-+    assert not fails, fails
-+    assert any("ratio 2.08" in n for n in notes), notes
-+    fails, _ = evaluate([bad], base, TOLERANCE)
-+    assert len(fails) == 4, fails
-+    fails, notes = evaluate([new], base, TOLERANCE)
-+    assert not fails and any("no baseline" in n for n in notes)
-+    print("oracle_delta_gate self-test OK")
-+    return 0
-+
-+
-+def main(argv: list[str] | None = None) -> int:
-+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
-+    ap.add_argument("--local", default=str(ROOT / "target/fastbuild/lccc"))
-+    ap.add_argument("--corpus", type=Path, default=CORPUS)
-+    ap.add_argument("--baseline", type=Path, default=BASELINE)
-+    ap.add_argument("--only", help="comma-separated entry ids")
-+    ap.add_argument("--report", type=Path, help="write the JSON report here")
-+    ap.add_argument("--update-baseline", action="store_true")
-+    ap.add_argument("--strict", action="store_true", help="treat CE outages as failures")
-+    ap.add_argument("--insns-pct", type=float, default=TOLERANCE["insns_pct"])
-+    ap.add_argument("--self-test", action="store_true")
-+    args = ap.parse_args(argv)
-+    if args.self_test:
-+        return self_test()
-+
-+    corpus = json.loads(args.corpus.read_text())
-+    entries = corpus["entries"]
-+    if args.only:
-+        wanted = set(args.only.split(","))
-+        entries = [e for e in entries if e["id"] in wanted]
-+    if not Path(args.local).exists():
-+        print(f"error: local compiler {args.local} not built", file=sys.stderr)
-+        return 2
-+    try:
-+        rows, errors = measure(entries, corpus["flags"], corpus["oracles"], args.local)
-+    except Exception as exc:  # noqa: BLE001 - network/CE outage classification
-+        print(f"oracle gate SKIPPED: {type(exc).__name__}: {exc}", file=sys.stderr)
-+        return 1 if args.strict else 0
-+    tol = dict(TOLERANCE, insns_pct=args.insns_pct)
-+    baseline = json.loads(args.baseline.read_text()) if args.baseline.exists() else {}
-+    failures, notes = evaluate(rows, baseline, tol)
-+    if args.report:
-+        args.report.parent.mkdir(parents=True, exist_ok=True)
-+        args.report.write_text(json.dumps(
-+            {"schema": 1, "flags": corpus["flags"], "rows": rows, "errors": errors,
-+             "failures": failures}, indent=2) + "\n")
-+    for line in notes:
-+        print(line)
-+    for line in errors:
-+        print(f"error: {line}", file=sys.stderr)
-+    if args.update_baseline:
-+        merged = baseline.get("entries", {})
-+        merged.update({r["id"]: r["lccc"] for r in rows})
-+        tmp = args.baseline.with_suffix(f".tmp.{os.getpid()}")
-+        tmp.write_text(json.dumps({"schema": 1, "flags": corpus["flags"],
-+                                   "entries": dict(sorted(merged.items()))}, indent=2) + "\n")
-+        tmp.replace(args.baseline)
-+        print(f"baseline updated: {args.baseline}")
-+        return 0
-+    for line in failures:
-+        print(f"REGRESSION {line}", file=sys.stderr)
-+    return 1 if failures or (errors and args.strict) else 0
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
-diff --git a/scripts/test_glibc_check_triage.py b/scripts/test_glibc_check_triage.py
-new file mode 100644
-index 00000000..aa51c64d
---- /dev/null
-+++ b/scripts/test_glibc_check_triage.py
-@@ -0,0 +1,74 @@
-+#!/usr/bin/env python3
-+"""Unit tests for scripts/glibc_check_triage.py (BACKLOG MS-11)."""
-+from __future__ import annotations
-+
-+import json
-+import subprocess
-+import sys
-+import tempfile
-+import unittest
-+from pathlib import Path
-+
-+HERE = Path(__file__).resolve().parent
-+sys.path.insert(0, str(HERE))
-+import glibc_check_triage as t  # noqa: E402
-+
-+
-+class ClassifyTests(unittest.TestCase):
-+    def test_environment_outranks_crash(self):
-+        log = "cannot open shared object file\nDidn't expect signal from child: got `Segmentation fault'"
-+        self.assertEqual(t.classify("FAIL", log)[0], "environment")
-+
-+    def test_unsupported_outranks_crash(self):
-+        log = "ifunc unsupported\nDidn't expect signal from child: got `Segmentation fault'"
-+        self.assertEqual(t.classify("FAIL", log)[0], "unsupported-feature")
-+
-+    def test_signal_is_miscompile(self):
-+        for sig in ("Segmentation fault", "Illegal instruction", "Bus error", "Aborted"):
-+            log = f"Didn't expect signal from child: got `{sig}'"
-+            self.assertEqual(t.classify("FAIL", log)[0], "miscompile", sig)
-+
-+    def test_check_h_mismatch_is_miscompile(self):
-+        log = "error: tst-x.c:42: (a) != (b)\n"
-+        # no "got" text: support/check.h style mismatches
-+        self.assertEqual(t.classify("FAIL", "error: tst-x.c:42: value mismatch\n")[0], "miscompile")
-+        self.assertEqual(t.classify("FAIL", log)[0], "miscompile")
-+        self.assertEqual(t.classify("FAIL", "error: something else happened\n")[0], "unclassified")
-+
-+    def test_passing_buckets(self):
-+        self.assertEqual(t.classify("PASS", "")[0], "pass")
-+        self.assertEqual(t.classify("XFAIL", "")[0], "xfail")
-+        self.assertEqual(t.classify("UNSUPPORTED", "")[0], "unsupported-feature")
-+
-+    def test_last_result_wins(self):
-+        self.assertEqual(t.parse_results("FAIL: a/b\nPASS: a/b\n"), {"a/b": "PASS"})
-+
-+
-+class CliTests(unittest.TestCase):
-+    def run_cli(self, *args):
-+        return subprocess.run([sys.executable, str(HERE / "glibc_check_triage.py"), *args],
-+                              capture_output=True, text=True)
-+
-+    def test_self_test(self):
-+        self.assertEqual(self.run_cli("--self-test").returncode, 0)
-+
-+    def test_exit_codes_and_reports(self):
-+        with tempfile.TemporaryDirectory() as d:
-+            root = Path(d)
-+            (root / "string").mkdir()
-+            (root / "tests.sum").write_text("FAIL: string/tst-a\nPASS: string/tst-b\n")
-+            (root / "string/tst-a.out").write_text(
-+                "Didn't expect signal from child: got `Segmentation fault'\n")
-+            out = root / "r.json"
-+            res = self.run_cli(str(root), "--json", str(out), "--markdown", str(root / "r.md"))
-+            self.assertEqual(res.returncode, 1, res.stderr)
-+            data = json.loads(out.read_text())
-+            self.assertEqual(data["summary"]["miscompiles"], ["string/tst-a"])
-+            self.assertEqual(self.run_cli(str(root), "--allow-miscompiles", "1").returncode, 0)
-+            self.assertEqual(self.run_cli(str(root / "nope")).returncode, 2)
-+            (root / "empty").mkdir()
-+            self.assertEqual(self.run_cli(str(root / "empty")).returncode, 2)
-+
-+
-+if __name__ == "__main__":
-+    unittest.main(verbosity=1)
-diff --git a/scripts/test_oracle_delta_gate.py b/scripts/test_oracle_delta_gate.py
-new file mode 100644
-index 00000000..b28977c2
---- /dev/null
-+++ b/scripts/test_oracle_delta_gate.py
-@@ -0,0 +1,59 @@
-+#!/usr/bin/env python3
-+"""Unit tests for scripts/oracle_delta_gate.py (BACKLOG MS-01). Offline."""
-+from __future__ import annotations
-+
-+import json
-+import sys
-+import unittest
-+from pathlib import Path
-+
-+HERE = Path(__file__).resolve().parent
-+sys.path.insert(0, str(HERE))
-+import oracle_delta_gate as g  # noqa: E402
-+
-+COUNT = lambda body: sum(1 for ln in body if ln.strip() and not ln.strip().endswith(":")
-+                         and not ln.strip().startswith("."))
-+
-+
-+class GateTests(unittest.TestCase):
-+    def test_metrics(self):
-+        body = ["f:", "  pushq %rbp", "  movl %eax, -4(%rbp)", "  movl 8(%rsp,%rax), %ecx",
-+                "  movq x@GOTPCREL(%rip), %rdx", "  popq %rbp", "  ret"]
-+        self.assertEqual(g.metrics(body, COUNT),
-+                         {"insns": 6, "stack": 2, "got": 1, "push": 1})
-+
-+    def test_within_tolerance_passes(self):
-+        base = {"entries": {"k": {"insns": 100, "stack": 0, "got": 0, "push": 0}}}
-+        row = {"id": "k", "lccc": {"insns": 105, "stack": 2, "got": 1, "push": 1}, "oracles": {}}
-+        self.assertEqual(g.evaluate([row], base, g.TOLERANCE)[0], [])
-+
-+    def test_each_metric_can_fail(self):
-+        base = {"entries": {"k": {"insns": 100, "stack": 0, "got": 0, "push": 0}}}
-+        for key, val in (("insns", 106), ("stack", 3), ("got", 2), ("push", 2)):
-+            lccc = {"insns": 100, "stack": 0, "got": 0, "push": 0, key: val}
-+            fails, _ = g.evaluate([{"id": "k", "lccc": lccc, "oracles": {}}], base, g.TOLERANCE)
-+            self.assertEqual(len(fails), 1, key)
-+
-+    def test_improvement_never_fails(self):
-+        base = {"entries": {"k": {"insns": 100, "stack": 9, "got": 4, "push": 6}}}
-+        row = {"id": "k", "lccc": {"insns": 60, "stack": 0, "got": 0, "push": 1}, "oracles": {}}
-+        self.assertEqual(g.evaluate([row], base, g.TOLERANCE)[0], [])
-+
-+    def test_ratio_uses_best_oracle(self):
-+        row = {"id": "k", "lccc": {"insns": 90, "stack": 0, "got": 0, "push": 0},
-+               "oracles": {"a": {"insns": 60}, "b": {"insns": 45}}}
-+        _, notes = g.evaluate([row], {}, g.TOLERANCE)
-+        self.assertTrue(any("ratio 2.00" in n for n in notes), notes)
-+
-+    def test_corpus_is_wellformed(self):
-+        corpus = json.loads(g.CORPUS.read_text())
-+        ids = [e["id"] for e in corpus["entries"]]
-+        self.assertEqual(len(ids), len(set(ids)))
-+        for e in corpus["entries"]:
-+            src = g.ROOT / e["source"]
-+            self.assertTrue(src.is_file(), src)
-+            self.assertIn(e["function"] + "(", src.read_text(), e["id"])
-+
-+
-+if __name__ == "__main__":
-+    unittest.main(verbosity=1)
-diff --git a/tests/oracle/delta_corpus.json b/tests/oracle/delta_corpus.json
-new file mode 100644
-index 00000000..f95ba89c
---- /dev/null
-+++ b/tests/oracle/delta_corpus.json
-@@ -0,0 +1,36 @@
-+{
-+  "schema": 1,
-+  "flags": "-O2 -march=x86-64-v3",
-+  "oracles": [
-+    "gcc16.2",
-+    "clang",
-+    "icx"
-+  ],
-+  "entries": [
-+    {
-+      "id": "ra01_global_match_probe",
-+      "source": "engineering/evidence/godbolt/ra01_global_remat.c",
-+      "function": "global_match_probe"
-+    },
-+    {
-+      "id": "zlib_ng_adler32_c",
-+      "source": "tests/oracle/programs/zlib_ng_adler32_kernel.c",
-+      "function": "zlib_ng_adler32_c"
-+    },
-+    {
-+      "id": "gzip_crc32_loop",
-+      "source": "tests/oracle/programs/gzip_crc32_kernel.c",
-+      "function": "gzip_crc32_update_no_xor"
-+    },
-+    {
-+      "id": "expat_name_length",
-+      "source": "tests/oracle/programs/expat_name_scan_kernel.c",
-+      "function": "expat_utf8_name_length"
-+    },
-+    {
-+      "id": "expat_scan_document",
-+      "source": "tests/oracle/programs/expat_name_scan_kernel.c",
-+      "function": "expat_scan_document"
++    #[test]
++    fn replaces_operand_and_bare_value_slots_together() {
++        // The GEP reads the old value in BOTH shapes: `offset` is an Operand
++        // slot, `base` is a bare Value field.  A replacement that handles only
++        // one of them leaves the instruction reading the old value.
++        let mut inst = gep(1, 7, 7);
++        replace_operand_value(&mut inst, Value(7), Operand::Value(Value(42)));
++        match inst {
++            Instruction::GetElementPtr { base, offset, .. } => {
++                assert_eq!(base, Value(42), "bare Value slot must be redirected");
++                assert_eq!(
++                    offset,
++                    Operand::Value(Value(42)),
++                    "Operand slot must be redirected"
++                );
++            }
++            _ => unreachable!(),
++        }
 +    }
-+  ]
-+}
-diff --git a/tests/oracle/programs/expat_name_scan_kernel.c b/tests/oracle/programs/expat_name_scan_kernel.c
-new file mode 100644
-index 00000000..a953c71b
---- /dev/null
-+++ b/tests/oracle/programs/expat_name_scan_kernel.c
-@@ -0,0 +1,84 @@
-+/* Oracle reproducer (tests/oracle/delta_corpus.json): Expat xmltok UTF-8 name scan + document hash walk
-+ * Extracted verbatim from tests/benchmark/programs/expat_xml_scan.c; the measured
-+ * functions are exported so no compiler can inline them away.  Provenance:
-+ * tests/benchmark/WORKLOAD_PROVENANCE.md. */
 +
-+static int
-+xml_name_start(unsigned char c)
-+{
-+  return (c >= (unsigned char)'a' && c <= (unsigned char)'z')
-+      || (c >= (unsigned char)'A' && c <= (unsigned char)'Z')
-+      || c == (unsigned char)'_' || c == (unsigned char)':'
-+      || c >= 0xc2U;
-+}
-+
-+static int
-+xml_name_continue(unsigned char c)
-+{
-+  return xml_name_start(c)
-+      || (c >= (unsigned char)'0' && c <= (unsigned char)'9')
-+      || c == (unsigned char)'-' || c == (unsigned char)'.';
-+}
-+
-+/* UTF-8 specialization of Expat's BYTE_TYPE/LEAD_CASE progression. */
-+unsigned long
-+expat_utf8_name_length(const unsigned char *ptr, const unsigned char *end)
-+{
-+  const unsigned char *start = ptr;
-+
-+  while (ptr < end) {
-+    unsigned char c = *ptr;
-+    if (c < 0x80U) {
-+      if (!xml_name_continue(c))
-+        break;
-+      ptr++;
-+    } else {
-+      unsigned long width;
-+      if (c >= 0xc2U && c <= 0xdfU)
-+        width = 2UL;
-+      else if (c >= 0xe0U && c <= 0xefU)
-+        width = 3UL;
-+      else if (c >= 0xf0U && c <= 0xf4U)
-+        width = 4UL;
-+      else
-+        break;
-+      if ((unsigned long)(end - ptr) < width)
-+        break;
-+      if ((ptr[1] & 0xc0U) != 0x80U
-+          || (width > 2UL && (ptr[2] & 0xc0U) != 0x80U)
-+          || (width > 3UL && (ptr[3] & 0xc0U) != 0x80U))
-+        break;
-+      ptr += width;
++    #[test]
++    fn leaves_unrelated_values_alone() {
++        let mut inst = gep(1, 7, 8);
++        replace_operand_value(&mut inst, Value(9), Operand::Value(Value(42)));
++        match inst {
++            Instruction::GetElementPtr { base, offset, .. } => {
++                assert_eq!(base, Value(7));
++                assert_eq!(offset, Operand::Value(Value(8)));
++            }
++            _ => unreachable!(),
++        }
 +    }
-+  }
-+  return (unsigned long)(ptr - start);
-+}
 +
-+unsigned long
-+expat_scan_document(const unsigned char *ptr, const unsigned char *end)
-+{
-+  unsigned long hash = 1469598103934665603UL;
-+
-+  while (ptr < end) {
-+    unsigned char c = *ptr;
-+    if (c == (unsigned char)'"' || c == (unsigned char)'\'') {
-+      unsigned char quote = c;
-+      ptr++;
-+      while (ptr < end && *ptr != quote)
-+        ptr++;
-+      if (ptr < end)
-+        ptr++;
-+    } else if (xml_name_start(c)) {
-+      unsigned long len = expat_utf8_name_length(ptr, end);
-+      /* The caller only invokes the kernel for valid starts. */
-+      if (len == 0UL)
-+        return hash;
-+      hash ^= len + (unsigned long)c;
-+      hash *= 1099511628211UL;
-+      ptr += len;
-+    } else {
-+      ptr++;
++    #[test]
++    fn constant_replacement_leaves_bare_value_slots_untouched() {
++        // `Operand::Const` has no `Value` form, so the bare slots must survive
++        // unchanged -- rewriting them to a placeholder would invert the pass's
++        // intent (and would not be a value at all).
++        let mut inst = gep(1, 7, 7);
++        replace_operand_value(&mut inst, Value(7), Operand::Const(IrConst::I64(3)));
++        match inst {
++            Instruction::GetElementPtr { base, offset, .. } => {
++                assert_eq!(base, Value(7));
++                assert_eq!(offset, Operand::Const(IrConst::I64(3)));
++            }
++            _ => unreachable!(),
++        }
 +    }
-+  }
-+  return hash;
-+}
-diff --git a/tests/oracle/programs/gzip_crc32_kernel.c b/tests/oracle/programs/gzip_crc32_kernel.c
-new file mode 100644
-index 00000000..445029d9
---- /dev/null
-+++ b/tests/oracle/programs/gzip_crc32_kernel.c
-@@ -0,0 +1,18 @@
-+/* Oracle reproducer (tests/oracle/delta_corpus.json): GNU gzip lib/crc.c scalar table loop
-+ * Extracted verbatim from tests/benchmark/programs/gzip_crc32.c; the measured
-+ * functions are exported so no compiler can inline them away.  Provenance:
-+ * tests/benchmark/WORKLOAD_PROVENANCE.md. */
 +
-+extern const unsigned int gzip_crc32_table[256];
-+
-+unsigned int
-+gzip_crc32_update_no_xor(unsigned int crc, const unsigned char *buf,
-+                         unsigned long len)
-+{
-+  unsigned long n;
-+
-+  for (n = 0; n < len; n++)
-+    crc = gzip_crc32_table[(crc ^ buf[n]) & 0xffU] ^ (crc >> 8);
-+
-+  return crc;
-+}
-diff --git a/tests/oracle/programs/zlib_ng_adler32_kernel.c b/tests/oracle/programs/zlib_ng_adler32_kernel.c
-new file mode 100644
-index 00000000..e09805ff
---- /dev/null
-+++ b/tests/oracle/programs/zlib_ng_adler32_kernel.c
-@@ -0,0 +1,73 @@
-+/* Oracle reproducer (tests/oracle/delta_corpus.json): zlib-ng arch/generic/adler32_c.c (ADLER_DO8 + NMAX blocking)
-+ * Extracted verbatim from tests/benchmark/programs/zlib_ng_adler32.c; the measured
-+ * function is exported so no compiler can inline it away.  Provenance:
-+ * tests/benchmark/WORKLOAD_PROVENANCE.md. */
-+#define BASE 65521U
-+#define NMAX 5552U
-+
-+#define ADLER_DO1(sum1, sum2, buf, i) \
-+  { (sum1) += (buf)[(i)]; (sum2) += (sum1); }
-+#define ADLER_DO2(sum1, sum2, buf, i) \
-+  { ADLER_DO1(sum1, sum2, buf, i); ADLER_DO1(sum1, sum2, buf, (i) + 1); }
-+#define ADLER_DO4(sum1, sum2, buf, i) \
-+  { ADLER_DO2(sum1, sum2, buf, i); ADLER_DO2(sum1, sum2, buf, (i) + 2); }
-+#define ADLER_DO8(sum1, sum2, buf, i) \
-+  { ADLER_DO4(sum1, sum2, buf, i); ADLER_DO4(sum1, sum2, buf, (i) + 4); }
-+
-+static unsigned int
-+zlib_ng_adler32_len_16(unsigned int sum1, const unsigned char *buf,
-+                       unsigned long len, unsigned int sum2)
-+{
-+  while (len) {
-+    --len;
-+    sum1 += *buf++;
-+    sum2 += sum1;
-+  }
-+  sum1 %= BASE;
-+  sum2 %= BASE;
-+  return sum1 | (sum2 << 16);
++    #[test]
++    fn terminator_operands_are_replaced() {
++        let mut term = Terminator::Return(Some(Operand::Value(Value(5))));
++        replace_terminator_value(&mut term, Value(5), Operand::Value(Value(6)));
++        match term {
++            Terminator::Return(Some(Operand::Value(v))) => assert_eq!(v, Value(6)),
++            _ => panic!("return operand must be redirected"),
++        }
++    }
 +}
 +
-+static unsigned int
-+zlib_ng_adler32_len_64(unsigned int sum1, const unsigned char *buf,
-+                       unsigned long len, unsigned int sum2)
-+{
-+  while (len >= 8U) {
-+    len -= 8U;
-+    ADLER_DO8(sum1, sum2, buf, 0);
-+    buf += 8;
-+  }
-+  return zlib_ng_adler32_len_16(sum1, buf, len, sum2);
-+}
-+
-+/* Derived directly from zlib-ng's arch/generic/adler32_c.c. */
-+unsigned int
-+zlib_ng_adler32_c(unsigned int adler, const unsigned char *buf,
-+                  unsigned long len)
-+{
-+  unsigned int sum2;
-+  unsigned int n;
-+
-+  sum2 = (adler >> 16) & 0xffffU;
-+  adler &= 0xffffU;
-+
-+  if (len == 1U)
-+    return zlib_ng_adler32_len_16(adler, buf, 1U, sum2);
-+  if (buf == 0)
-+    return 1U;
-+  if (len < 16U)
-+    return zlib_ng_adler32_len_16(adler, buf, len, sum2);
-+
-+  while (len >= NMAX) {
-+    len -= NMAX;
-+    n = NMAX / 8U;
-+    do {
-+      ADLER_DO8(adler, sum2, buf, 0);
-+      buf += 8;
-+    } while (--n);
-+    adler %= BASE;
-+    sum2 %= BASE;
-+  }
-+
-+  return zlib_ng_adler32_len_64(adler, buf, len, sum2);
-+}
+ #[cfg(test)]
+ mod direct_value_mutation_tests {
+     use super::*;
+diff --git a/src/passes/iv_widen.rs b/src/passes/iv_widen.rs
+index b6b8b9c3..1dc1cb9b 100644
+--- a/src/passes/iv_widen.rs
++++ b/src/passes/iv_widen.rs
+@@ -126,7 +126,9 @@ use crate::common::types::IrType;
+ use crate::ir::analysis::{CfgAnalysis, FlatAdj};
+ use crate::ir::constants::IrConst;
+ use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value};
+-use crate::ir::reexports::{BlockId, IrBinOp, IrCmpOp, IrFunction};
++use crate::ir::reexports::{
++    BlockId, IrBinOp, IrCmpOp, IrFunction, replace_operand_value, replace_terminator_value,
++};
+ use crate::passes::loop_analysis::{
+     DominanceChecker, NaturalLoop, find_natural_loops, merge_loops_by_header,
+ };
+@@ -2146,10 +2148,10 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
+         // 64-bit slot.
+         for inst in func.blocks[bi].instructions.iter_mut() {
+             if escape_read_needs_narrow(inst, member, wide_ty) {
+-                rewrite_operand_value(inst, member, Operand::Value(narrow));
++                replace_operand_value(inst, member, Operand::Value(narrow));
+             }
+         }
+-        rewrite_terminator_value(
++        replace_terminator_value(
+             &mut func.blocks[bi].terminator,
+             member,
+             Operand::Value(narrow),
+@@ -2370,9 +2372,9 @@ fn value_still_used(func: &IrFunction, val: Value) -> bool {
+ fn replace_all_uses_of_value(func: &mut IrFunction, old_val: Value, new_op: Operand) {
+     for b in &mut func.blocks {
+         for inst in &mut b.instructions {
+-            rewrite_operand_value(inst, old_val, new_op);
++            replace_operand_value(inst, old_val, new_op);
+         }
+-        rewrite_terminator_value(&mut b.terminator, old_val, new_op);
++        replace_terminator_value(&mut b.terminator, old_val, new_op);
+     }
+ }
+ 
+@@ -2442,36 +2444,6 @@ fn escape_read_needs_narrow(inst: &Instruction, member: Value, wide_ty: IrType)
+     }
+ }
+ 
+-fn rewrite_operand_value(inst: &mut Instruction, old_val: Value, new_op: Operand) {
+-    // The canonical visitors make this complete for every instruction shape
+-    // (Select data operands, atomics, calls, intrinsics, ...), unlike the
+-    // hand-rolled match arms of earlier revisions.
+-    let new_val = match new_op {
+-        Operand::Value(v) => Some(v),
+-        Operand::Const(_) => None,
+-    };
+-    inst.for_each_operand_mut(|op| {
+-        if matches!(op, Operand::Value(v) if v.0 == old_val.0) {
+-            *op = new_op;
+-        }
+-    });
+-    if let Some(nv) = new_val {
+-        inst.for_each_value_use_mut(|field| {
+-            if field.0 == old_val.0 {
+-                *field = nv;
+-            }
+-        });
+-    }
+-}
+-
+-fn rewrite_terminator_value(term: &mut Terminator, old_val: Value, new_op: Operand) {
+-    term.for_each_operand_mut(|op| {
+-        if matches!(op, Operand::Value(v) if *v == old_val) {
+-            *op = new_op;
+-        }
+-    });
+-}
+-
+ // ---------------------------------------------------------------------------
+ // Invariant checks
+ // ---------------------------------------------------------------------------
