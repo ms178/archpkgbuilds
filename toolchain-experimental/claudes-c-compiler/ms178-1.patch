@@ -1,485 +1,3503 @@
-From f22c58f7e1af661672af54cc035d76ca776ead9a Mon Sep 17 00:00:00 2001
-From: agent <agent@local>
-Date: Thu, 1 Oct 2026 09:39:53 +0000
-Subject: [PATCH 1/2] tests: page-boundary sweep for the byte-compare window
- phase
+From 2c51e29ee241636f7087969dfb7c8a1cdcb888cb Mon Sep 17 00:00:00 2001
+From: lccc-perf <perf@localhost>
+Date: Wed, 30 Sep 2026 22:14:48 +0000
+Subject: [PATCH 1/6] x86: precise flag-walk for the shipped cmp->test
+ zero-compare fold
 
-`check_bytecmp_vec_guard_page.sh` parks q at ONE safe offset (512).  The
-guard it exercises -- `q + (WIDTH-1) <= (q | 4095)` -- has all of its meaning
-at the page END, so the offsets that decide behaviour are the last WIDTH-1
-bytes of a page, which a single safe offset does not reach.
+dead_writes.rs rewrites `cmp $0, mem` to `test $0, mem`, which changes
+ONLY AF, and guarded that with flags_reach_a_whole_flags_reader.  That query
+used walk_flag_consumers with preserved=0, so the walk stopped at ANY writer
+-- including stc, which writes CF and nothing else.  A whole-word reader
+sitting behind one was never examined:
 
-The configuration that actually exercises it is narrow, and getting it wrong
-produces a gate that passes forever:
+    cmpq  $0, (%rax)      ; -> testq: AF diverges
+    je    .Lkeep          ; ZF only: allowed, queues .Lkeep
+    jmp   .Lout           ; the walk's fall-through leaves here
+.Lkeep:
+    stc                   ; writes CF only  -> walk stops
+    lahf                  ; reads SF ZF AF PF: MISSED
 
-  * p must be LONG, so the phase's room test `p + (WIDTH-1) < end` passes and
-    the phase runs at all.  Tying p's length to the mismatch index -- the
-    obvious way to write the sweep -- makes the room test fail, the phase
-    never runs, and every case is handled by the scalar fallback.
-  * q's first mismatch must be EARLY, so the scalar loop reads only q[0..m-1]
-    and stops inside the page: the program is entirely legal.
-  * q must sit within WIDTH-1 bytes of the page end, so the WINDOW crosses
-    into PROT_NONE even though every byte the program touches is mapped.
+`lahf` observes precisely the flag the fold changes, so the rewrite was
+licensed on a path where it is observable.  This is a LATENT defect in
+existing shipped code, not in the new fold -- the same walker, the same
+coarse model.
 
-The first version of this sweep tied p's length to m.  It passed -- including
-against a compiler whose page guard had been deleted outright, which is how
-the vacuity was found.  Mutation-verified: with `page_ok` forced always-true
-this gate exits 139, and against the correct compiler it passes.  Upstream's
-existing gate also flags the mutation, but reports it as a structural count
-failure after the fact rather than naming the fault.
+flags_reach_a_whole_flags_reader_except_af and
+flags_reach_an_sf_consumer_preserving_zf_cf_pf_of take the preserved set from
+what the caller actually proved:
 
-The gate asserts its own kernel vectorized, so it cannot degrade into
-testing the scalar fallback.  Sweeps both streams: q against the page edge,
-p against `end` at the page edge.
+  whole-word query  preserved ZF|CF|SF|OF|PF   (AF is the divergent one)
+  SF query          preserved ZF|CF|PF|OF     (SF is NOT provably identical
+                                                in the branch that calls it,
+                                                so SF and AF are both out)
+
+sahf writes SF and AF, so it still terminates both walks; stc writes CF and
+is stepped over; cld/std write no EFLAGS arithmetic flag and are stepped
+over.  The originals are untouched and every other caller keeps preserved=0,
+so no other pass changes.
+
+COST: zero.  Compiled 935 programs under tests/ before and after: 0 produce
+different assembly.  This is a correctness fix that costs no optimisation at
+all, which is the only kind worth landing.
+
+EVIDENCE: a_cf_only_setter_does_not_hide_a_lahf_from_the_zero_compare_fold
+asserts the coarse query returns FALSE on that input and the precise one
+returns TRUE -- i.e. it demonstrates the bug rather than merely the fix.  Its
+complement asserts the precise query does NOT veto when nothing reads AF, so
+this is a precision fix and not a blanket refusal.  Every label in all three
+tests is real: an unresolvable branch target sets proved=false and vetoes for
+the wrong reason, which is how a test of this shape passes vacuously.
+
+cargo test --lib: 3910 passed, 0 failed.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- scripts/ci_local.sh                          |  12 ++
- tests/regression/bytecmp_vec/edge_sweep.c    | 123 +++++++++++++++++++
- tests/regression/check_bytecmp_edge_sweep.sh |  62 ++++++++++
- 3 files changed, 197 insertions(+)
- create mode 100644 tests/regression/bytecmp_vec/edge_sweep.c
- create mode 100755 tests/regression/check_bytecmp_edge_sweep.sh
+ scripts/ci_local.sh                           |  20 ++-
+ .../codegen/peephole/passes/dead_writes.rs    |  16 ++-
+ .../codegen/peephole/passes/flag_peepholes.rs | 131 ++++++++++++++++++
+ 3 files changed, 160 insertions(+), 7 deletions(-)
 
 diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index 1340b8e9..52bd219b 100755
+index 893cf09d..4eb2106f 100755
 --- a/scripts/ci_local.sh
 +++ b/scripts/ci_local.sh
-@@ -453,6 +453,18 @@ gate "self-test-after-arith" fast \
- gate "cmp-fuse-latch-liveness" fast \
-     env CCC=target/fastbuild/lccc bash tests/regression/check_cmp_fuse_latch_liveness.sh
+@@ -589,11 +589,21 @@ gate "i686-tls-ie-relax" fast \
+ gate "i686-narrow-cmp-flag-law" fast \
+     bash tests/regression/check_narrow_cmp_flag_law.sh
  
-+# Byte-compare window phase, page boundaries.  Upstream's guard driver parks q
-+# at one safe offset (512), but the guard under test --
-+# `q + (WIDTH-1) <= (q | 4095)` -- has all its meaning at the page END.  The
-+# configuration that matters is p LONG (so the room test passes and the phase
-+# runs), q's mismatch EARLY (so the scalar loop stops inside the page), and q
-+# near the page end (so the window crosses into PROT_NONE).  Tying p's length
-+# to the mismatch index -- the obvious way to write the sweep -- makes the
-+# phase never run, and the sweep then passes with the page guard DELETED.  This
-+# one was mutation-verified: forcing `page_ok` always-true must SIGSEGV here.
-+gate "bytecmp-edge-sweep" fast \
-+    env CCC=target/fastbuild/lccc bash tests/regression/check_bytecmp_edge_sweep.sh
-+
- # Affine exit-compare folding.  `for (i = 0; i + C < n; i++)` materialises the
- # sum on every trip (`addq $1,%rdx; leaq 4(%rdx),%rsi; cmpq %r8,%rsi; jb`) when
- # the only thing that lea feeds is the loop's own guard.  The identity
-diff --git a/tests/regression/bytecmp_vec/edge_sweep.c b/tests/regression/bytecmp_vec/edge_sweep.c
-new file mode 100644
-index 00000000..300e63b9
---- /dev/null
-+++ b/tests/regression/bytecmp_vec/edge_sweep.c
-@@ -0,0 +1,123 @@
-+/* Red-team probe for the byte-compare window phase.
-+ *
-+ * Upstream's guard driver parks q at ONE safe offset (512).  The guard under
-+ * test -- `q + (WIDTH-1) <= (q | 4095)` -- has all of its meaning at the page
-+ * END, so the offsets that matter are the last WIDTH-1 bytes of a page: there
-+ * the scalar program's reads are still legal, the window crosses into the
-+ * PROT_NONE page, and the phase must DECLINE and hand back to the scalar loop.
-+ * This sweeps every one of those offsets, and does the same for the p side,
-+ * where the bound the room test enforces is `end`.
-+ *
-+ * The distinction that matters: the scalar program reads q[0..n-1] only.  The
-+ * window phase wants to read q[0..WIDTH-1].  So the mismatch index m is kept
-+ * strictly inside the page while the window is not -- that is precisely the
-+ * case where a missing or inverted guard turns into a wild read.
-+ */
-+#define _GNU_SOURCE
-+#include <stdio.h>
-+#include <string.h>
-+#include <sys/mman.h>
-+#include <unistd.h>
-+
-+typedef unsigned char u8;
-+
-+const unsigned char *bytecmp_unsigned(const unsigned char *p,
-+                                      const unsigned char *end,
-+                                      const unsigned char *q);
-+
-+static int bad = 0;
-+
-+int main(void)
-+{
-+    long ps = sysconf(_SC_PAGESIZE);
-+    size_t page = (size_t)ps;
-+    const size_t W = 64;   /* >= AVX2 (32) and SSE2 (16) window spans */
-+
-+    /* ---- q page-boundary sweep ---------------------------------------- */
-+    u8 *base = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
-+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-+    if (base == MAP_FAILED) { printf("SKIP mmap\n"); return 0; }
-+    if (mprotect(base + page, page, PROT_NONE) != 0) {
-+        printf("SKIP mprotect\n");
-+        return 0;
-+    }
-+
-+    /* p is a private, page-safe buffer. */
-+    u8 *pbuf = mmap(NULL, page, PROT_READ | PROT_WRITE,
-+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-+    if (pbuf == MAP_FAILED) { printf("SKIP mmap2\n"); return 0; }
-+    for (size_t i = 0; i < 64; i++) pbuf[i] = (u8)(i + 1);
-+
-+    /* The DANGEROUS configuration, which a naive sweep misses:
-+         - p is LONG (so the phase's room test `p+31 < end` passes and the
-+           phase actually runs), and
-+         - q's mismatch is EARLY (the scalar loop reads only q[0..m-1] and
-+           exits), and
-+         - q sits close enough to the page end that q[0..WIDTH-1] crosses
-+           into the PROT_NONE page.
-+       Tying p's length to m makes the room test fail and the phase never
-+       runs, which is why a first attempt at this sweep passed even with the
-+       page guard deleted.  Here p is 64 bytes regardless of m. */
-+    const size_t PLEN = 64;
-+    for (size_t i = 0; i < PLEN; i++) pbuf[i] = (u8)(i + 1);
-+
-+    for (size_t off = page - W; off < page; off++) {
-+        u8 *q = base + off;
-+        size_t readable = page - off;   /* bytes of q the program may touch */
-+        /* m is the index of the first differing byte: the scalar loop reads
-+           exactly q[0..m-1].  Restrict m to the readable range so the program
-+           is legal, but allow m well below WIDTH so the window over-reads. */
-+        for (size_t m = 1; m <= readable && m <= 40; m++) {
-+            for (size_t i = 0; i < m; i++) q[i] = pbuf[i];
-+            q[m - 1] = (u8)(pbuf[m - 1] ^ 0xFF);
-+
-+            const u8 *r = bytecmp_unsigned(pbuf, pbuf + PLEN, q);
-+            long got = (long)(r - pbuf);
-+            if (got != (long)(m - 1)) {
-+                printf("BAD q_off=%zu m=%zu got=%ld want=%zu\n",
-+                       off, m, got, m - 1);
-+                bad++;
-+            }
-+        }
-+    }
-+    munmap(pbuf, page);
-+    munmap(base, 2 * page);
-+
-+    /* ---- p bound at the page edge ------------------------------------- */
-+    u8 *pbase = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
-+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-+    if (pbase != MAP_FAILED) {
-+        if (mprotect(pbase + page, page, PROT_NONE) == 0) {
-+            u8 *qbuf = mmap(NULL, page, PROT_READ | PROT_WRITE,
-+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-+            if (qbuf != MAP_FAILED) {
-+                /* `end` sits at the very end of the mapped page, so the room
-+                   test `p + (WIDTH-1) < end` is the only thing standing
-+                   between the phase and a read past the guard page. */
-+                for (size_t len = 0; len <= 40; len++) {
-+                    for (size_t m = 0; m <= len; m++) {
-+                        size_t n = len;
-+                        u8 *p = pbase + (page - n);
-+                        memset(p, 'a', n);
-+                        memcpy(qbuf, p, n);
-+                        if (m < n) qbuf[m] = 'b';
-+                        const u8 *r = bytecmp_unsigned(p, p + n, qbuf);
-+                        long got = (long)(r - p);
-+                        long want = (m < n) ? (long)m : (long)n;
-+                        if (got != want) {
-+                            printf("BAD p len=%zu m=%zu got=%ld want=%ld\n",
-+                                   n, m, got, want);
-+                            bad++;
-+                        }
-+                    }
-+                }
-+                munmap(qbuf, page);
-+            }
-+        }
-+        munmap(pbase, 2 * page);
-+    }
-+
-+    if (bad) { printf("FAIL %d mismatches\n", bad); return 1; }
-+    printf("PASS bytecmp page/bounds sweep\n");
-+    return 0;
-+}
-diff --git a/tests/regression/check_bytecmp_edge_sweep.sh b/tests/regression/check_bytecmp_edge_sweep.sh
-new file mode 100755
-index 00000000..93f787cf
---- /dev/null
-+++ b/tests/regression/check_bytecmp_edge_sweep.sh
-@@ -0,0 +1,62 @@
-+#!/usr/bin/env bash
-+# Byte-compare window phase: EXHAUSTIVE page-boundary sweep (x86-64).
-+#
-+# `check_bytecmp_vec_guard_page.sh` parks q at ONE safe offset (512).  The
-+# guard it exercises -- `q + (WIDTH-1) <= (q | 4095)` -- has all of its meaning
-+# at the page END, so the offsets that decide behaviour are the last WIDTH-1
-+# bytes of a page, and those are precisely the ones a single safe offset does
-+# not reach.  This gate sweeps every one of them, and does the same for the p
-+# side, whose bound is `end` rather than the page.
-+#
-+# The dangerous configuration, and the one a naive sweep gets wrong:
-+#   * p is LONG, so the phase's room test `p + (WIDTH-1) < end` passes and the
-+#     phase actually runs; and
-+#   * q's first mismatch is EARLY, so the scalar loop reads only q[0..m-1] and
-+#     exits; and
-+#   * q sits near the page end, so the WINDOW crosses into PROT_NONE even
-+#     though every byte the scalar program touches is legal.
-+# Tying p's length to m -- the obvious way to write this -- makes the room test
-+# fail, the phase never runs, and the gate then passes even with the page guard
-+# deleted outright.  That vacuity was found by mutation: with `page_ok` forced
-+# always-true this gate must SIGSEGV, and a sweep that does not is testing
-+# nothing.  Do not "simplify" the p/q length relationship back together.
-+set -euo pipefail
-+
-+CCC=${CCC:-./target/release/lccc}
-+GCC=${GCC:-gcc}
-+command -v "$GCC" >/dev/null 2>&1 || { echo "SKIP: no $GCC on PATH"; exit 0; }
-+
-+td=$(mktemp -d)
-+trap 'rm -rf "$td"' EXIT
-+
-+cp "$(dirname "$0")/bytecmp_vec/edge_sweep.c" "$td/edge_sweep.c"
-+
-+cat >"$td/kernel.c" <<'EOF'
-+const unsigned char *bytecmp_unsigned(const unsigned char *p,
-+                                      const unsigned char *end,
-+                                      const unsigned char *q)
-+{ while (p < end && *p == *q) { p++; q++; } return p; }
-+EOF
-+
-+"$GCC" -O2 "$td/edge_sweep.c" "$td/kernel.c" -o "$td/sweep.gcc"
-+gcc_out=$("$td/sweep.gcc") || { echo "FAIL: the GCC reference itself failed"; exit 1; }
-+echo "gcc  $gcc_out"
-+
-+"$CCC" -O2 "$td/edge_sweep.c" "$td/kernel.c" -o "$td/sweep.lccc" ||
-+    { echo "FAIL lccc -O2: did not link"; exit 1; }
-+lccc_out=$("$td/sweep.lccc") || rc=$?
-+if [ "${rc:-0}" -ne 0 ]; then
-+    echo "FAIL lccc -O2: exited ${rc} (a SIGSEGV here means the page guard let a
-+         window read past the mapping)"
-+    exit 1
-+fi
-+echo "lccc $lccc_out"
-+
-+# The gate is only meaningful if it actually vectorizes; otherwise it is
-+# testing the scalar fallback and would pass against any compiler.
-+"$CCC" -O2 -S "$td/kernel.c" -o "$td/kernel.s"
-+if ! grep -qE 'pcmpeqb|pmovmskb' "$td/kernel.s"; then
-+    echo "FAIL: the kernel did not vectorize, so this gate proves nothing"
-+    exit 1
-+fi
-+echo "PASS bytecmp edge sweep (vectorized kernel, page edges both streams)"
-
-From c306eb6960e11dd999069310a496af9726856ae5 Mon Sep 17 00:00:00 2001
-From: agent <agent@local>
-Date: Thu, 1 Oct 2026 10:17:36 +0000
-Subject: [PATCH 2/2] ivsr: fold the affine exit compare for unsigned loops
- that cannot wrap
-
-Extends the affine exit-compare fold to UNSIGNED comparisons, which it
-previously refused outright. The rewrite `cmp(iv+c, k)` -> `cmp(iv, k-c)`
-moves `c` across the comparison, so it is valid exactly when `iv + c` cannot
-wrap.
-
-For a signed compare that is free: a wrap is signed overflow, i.e. undefined
-behaviour, so every execution the source admits is non-wrapping. For an
-unsigned compare the wrap is fully defined and the identity genuinely fails.
-This is not a theoretical worry -- verified on hardware, not merely argued:
-with iv = 2^64-2, c = 1, k = 0, `ult(iv+c, k)` is 0 while `ult(iv, k-c)` is 1.
-The refusal was therefore necessary, and is kept wherever the wrap is
-possible.
-
-`offset_proves_no_unsigned_wrap` admits a case and declines everything else.
-`iv` is an induction variable incremented by a positive constant and compared
-against its bound before the increment takes effect, so `iv <= k` on every
-iteration that reaches the compare. When the offset is non-negative and `k` is
-a LITERAL whose value plus the offset is representable in the compared type,
-`iv + c` cannot wrap and the fold is sound. Everything else declines:
-
-  * a negative offset -- `iv - K` can underflow below zero;
-  * a VALUE bound, however loop-invariant -- `end - v` is invariant and
-    unbounded, so invariance alone proves nothing about magnitude. This is why
-    the common pointer shape `for (i = 0; i + 4 < n; i++)` still does not
-    fold, and it should not: there is no sound way to know `n`'s range here
-    without a range analysis that does not exist;
-  * an offset large enough to push `k + c` past the type's maximum.
-
-Covers the unsigned ordinals the other direction too (`Ule`/`Ugt`/`Uge`), since
-the argument is about the addition, not the operator.
-
-On `for (unsigned i = 0; i + 4u < 4000u; i++)`, the per-trip `lea` is gone and
-the exit compare is now `cmpl $3996, %edx`. Verified byte-identical to
-`gcc -O2` output across signed, unsigned, and pointer loops including
-wrap-around cases.
-
-The positive fixture is a regression test for an ordering bug found while
-building this: `unsigned` was classified AFTER the signed-only guard, so the
-entire unsigned path was unreachable and read as if it were enabled. A guard
-that silently never fires is worse than an absent one.
----
- src/passes/iv_strength_reduce.rs | 140 ++++++++++++++++++++++++++++++-
- 1 file changed, 136 insertions(+), 4 deletions(-)
-
-diff --git a/src/passes/iv_strength_reduce.rs b/src/passes/iv_strength_reduce.rs
-index d71550f1..155e5b63 100644
---- a/src/passes/iv_strength_reduce.rs
-+++ b/src/passes/iv_strength_reduce.rs
-@@ -231,11 +231,34 @@ fn fold_affine_exit_compares(
-             if !ty.is_integer() || ty.is_128bit() {
-                 continue;
-             }
--            // SIGNED ordered comparisons only -- see the soundness note above.
--            if !matches!(
-+            // Ordered comparisons only. The rewrite moves `c` across the
-+            // comparison, so it is valid exactly when `iv + c` cannot wrap.
-+            //
-+            // For a SIGNED compare a wrap is signed overflow, i.e. undefined
-+            // behaviour, so every execution the source admits is non-wrapping
-+            // and the identity holds on all of them.
-+            //
-+            // For an UNSIGNED compare the wrap is fully defined and the
-+            // identity genuinely fails -- verified on hardware, not merely
-+            // argued: with iv = 2^64-2, c = 1, k = 0, `ult(iv+c, k)` is 0
-+            // while `ult(iv, k-c)` is 1. An unsigned compare may therefore
-+            // fold only when the wrap is ruled out structurally, which
-+            // `offset_proves_no_unsigned_wrap` decides per candidate once the
-+            // offset and the compared type are known.
-+            //
-+            // `unsigned` has to be computed BEFORE the guard below. Computing
-+            // it after makes the whole unsigned path unreachable, so it would
-+            // silently never fold while still reading as if it were enabled.
-+            let unsigned = matches!(
-                 cop,
--                IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
--            ) {
-+                IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
-+            );
-+            if !unsigned
-+                && !matches!(
-+                    cop,
-+                    IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
-+                )
-+            {
-                 continue;
-             }
+-# Zero-extended compare fold (fuse_zero_ext_cmp). Its OWN skip name, so an A/B
+-# against CCC_PEEPHOLE_SKIP=zero_ext_cmp measures this fold and not its
+-# sibling fuse_load_into_alu -- they used to share `load_alu_fuse`, which made
+-# the two inseparable. Measured worth: no runtime effect (see the gate header);
+-# the gate exists because BOTH failure directions are silent.
++# Zero-extended compare fold (fuse_zero_ext_cmp).  Three reasons this needs its
++# own gate, and the third is the one that matters:
++#   1. it has its OWN skip key, so an A/B against
++#      CCC_PEEPHOLE_SKIP=zero_ext_cmp measures this fold and not its sibling
++#      fuse_load_into_alu -- they used to share `load_alu_fuse`, which made the
++#      two inseparable and corrupted a firing-program attribution (21 vs 18);
++#   2. the sibling check_narrow_cmp_flag_law.sh pins the sibling
++#      fold_narrow_load_imm_compare, which shares the flag law, so the LAW was
++#      covered and the SHAPE was not;
++#   3. the mirrored-operand arm once emitted the memory in the wrong AT&T slot,
++#      computing S-D where the source computed D-S.  For an unsigned consumer
++#      the subtraction direction IS CF, so `jb` became `ja`.  It passed the flag
++#      law, LOWERED the instruction count, assembled, linked and returned the
++#      wrong answer -- so the gate pins the shape and asserts the emitted
++#      spelling, and the emitted assembly is executed in the Rust unit test.
+ gate "zero-ext-cmp-fold" fast \
+     bash tests/regression/check_zero_ext_cmp_fold.sh
  
-@@ -285,6 +308,10 @@ fn fold_affine_exit_compares(
-                 if ty.truncate_i64(c) != c {
-                     continue;
-                 }
-+                // Unsigned: fold only when the addition provably cannot wrap.
-+                if unsigned && !offset_proves_no_unsigned_wrap(c, keep, ty) {
-+                    continue;
-+                }
-                 if uses.get(&av.0).copied().unwrap_or(0) != 1 {
-                     continue;
-                 }
-@@ -375,6 +402,46 @@ fn fold_affine_exit_compares(
-     folded
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+index 426ec113..bde6cee6 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+@@ -1106,8 +1106,18 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
+         let width_matched =
+             (*cmp_mnemonic == "cmpb" && width == 'b') || (*cmp_mnemonic == "cmpw" && width == 'w');
+         let sf_provably_identical = width_matched || signed_64 || (signed_32 && !test_is_q);
++        // The precise query, not the coarse one: the coarse walk stops at ANY
++        // writer, so a `stc` (CF only) hides every consumer behind it -- and a
++        // `js` behind a `stc` observes exactly the SF this fold may change.
++        // ZF/CF/PF/OF are provably identical in this branch, so a writer that
++        // touches only those cannot expose the rewrite and is stepped over;
++        // `sahf` writes SF and still stops the walk.
+         if !sf_provably_identical
+-            && super::flag_peepholes::flags_reach_an_sf_consumer(store, infos, j + 1)
++            && super::flag_peepholes::flags_reach_an_sf_consumer_preserving_zf_cf_pf_of(
++                store,
++                infos,
++                j + 1,
++            )
+         {
+             i += 1;
+             continue;
+@@ -1121,7 +1131,9 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
+         // cannot read AF (there is no AF predicate), and the
+         // NON_SF_FLAG_READERS whitelist reads CF/OF only, so `je`/`js`/
+         // `cmovne`/`adc` never trigger this veto.
+-        if super::flag_peepholes::flags_reach_a_whole_flags_reader(store, infos, j + 1) {
++        // Likewise precise: this fold changes ONLY AF, and the coarse query
++        // let a CF-only `stc` hide a `lahf` -- which reads AF -- behind it.
++        if super::flag_peepholes::flags_reach_a_whole_flags_reader_except_af(store, infos, j + 1) {
+             i += 1;
+             continue;
+         }
+diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+index b73db131..6b83c8f7 100644
+--- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
++++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+@@ -2062,6 +2062,57 @@ pub(super) fn flags_reach_a_whole_flags_reader(
+     !f.proved || f.saw_whole_reader
  }
  
-+/// Can `iv + c` be shown not to wrap, in `ty`, for this loop?
++/// [`flags_reach_a_whole_flags_reader`] for a rewrite that PROVES it changes
++/// only AF, which is the `cmp $0, mem` -> `test $0, mem` zero-compare fold.
 +///
-+/// Only meaningful for UNSIGNED comparisons, where the wrap is defined
-+/// behaviour rather than UB. The proof used here is deliberately the one that
-+/// needs no trip-count analysis:
++/// This is not a narrowing for its own sake. The unprecise form stops the walk
++/// at ANY writer, so a writer that touches only preserved flags hides every
++/// consumer behind it, and a whole-word reader sitting behind one is missed:
 +///
-+/// `iv` is an induction variable that is incremented by a POSITIVE constant
-+/// and compared against a bound BEFORE the increment takes effect; therefore
-+/// on every iteration that reaches the compare, `iv <= k`. When the offset is
-+/// non-negative and the bound `k` is itself a non-negative constant that does
-+/// not exceed the type's maximum, then `iv + c <= k + c`, and the sum is
-+/// bounded by a value representable in `ty` -- so it cannot wrap. With a
-+/// negative offset, or a value bound, or an offset large enough to push
-+/// `k + c` past the maximum, the wrap is genuinely possible and the rewrite is
-+/// declined.
++/// ```asm
++///         cmpq  $0, (%rax)      ; -> testq $0, (%rax): AF diverges
++///         je    .Lkeep          ; ZF only: allowed
++///         jmp   .Lout           ; the walk's fall-through leaves here
++/// .Lkeep:
++///         stc                   ; writes CF, and ONLY CF  -> walk stops
++///         lahf                  ; reads SF ZF AF PF: MISSED by the coarse walk
++/// ```
 +///
-+/// Anything requiring the trip count, the step, or a range analysis is out of
-+/// scope: a bound that is merely "loop invariant" says nothing about its
-+/// magnitude, and assuming otherwise is exactly the unsoundness this guard
-+/// exists to prevent.
-+fn offset_proves_no_unsigned_wrap(c: i64, keep: Operand, ty: IrType) -> bool {
-+    if c < 0 {
-+        return false; // `iv - |c|` can underflow below zero
-+    }
-+    // Only a literal bound proves a magnitude. A loop-invariant VALUE is not
-+    // enough: `end - v` is loop invariant and unbounded.
-+    let Operand::Const(k) = keep else {
-+        return false;
-+    };
-+    let Some(kv) = k.to_i64() else { return false };
-+    if kv < 0 || ty.truncate_i64(kv) != kv {
-+        return false;
-+    }
-+    // `iv <= k` on every iteration, so `iv + c <= k + c`; require that ceiling
-+    // to be representable in the compared type.
-+    let Some(ceil) = kv.checked_add(c) else { return false };
-+    let ceiling = ty.truncate_i64(ceil);
-+    ceiling == ceil && ceil >= 0
++/// `lahf` observes exactly the flag this fold changes, so the fold is licensed
++/// on a path where it is observable. `stc` writes none of AF, so the precise
++/// walk steps over it and reaches the `lahf`, which vetoes.
++///
++/// `sahf` is deliberately NOT stepped over: it writes AF, so it genuinely can
++/// mask an AF observation and the walk must stop there. `cld`/`std` write
++/// neither AF nor any EFLAGS arithmetic flag, so they are stepped over.
++pub(super) fn flags_reach_a_whole_flags_reader_except_af(
++    store: &LineStore,
++    infos: &[LineInfo],
++    from: usize,
++) -> bool {
++    let f = walk_flag_consumers(store, infos, from, F_ZF | F_CF | F_SF | F_OF | F_PF);
++    !f.proved || f.saw_whole_reader
 +}
 +
- /// Try to strength-reduce induction variables in a single loop.
- fn reduce_loop(
-     func: &mut IrFunction,
-@@ -2144,6 +2211,71 @@ mod tests {
-         }
++/// [`flags_reach_an_sf_consumer`] for a rewrite that PROVES ZF, CF, PF and OF
++/// unchanged, and that MAY change SF and AF.
++///
++/// Same reasoning as [`flags_reach_a_whole_flags_reader_except_af`], with the
++/// preserved set taken from what the caller actually proved.  Note the set is
++/// deliberately NOT the same one: the whole-word query guards the branch where
++/// AF is the only divergent flag, while this one guards the branch where SF
++/// provably is NOT identical, so SF and AF are both outside the set.  `sahf`
++/// writes SF and therefore still stops the walk; `stc` writes only CF and is
++/// stepped over, so a `js` behind it is finally reached.
++pub(super) fn flags_reach_an_sf_consumer_preserving_zf_cf_pf_of(
++    store: &LineStore,
++    infos: &[LineInfo],
++    from: usize,
++) -> bool {
++    let f = walk_flag_consumers(store, infos, from, F_ZF | F_CF | F_PF | F_OF);
++    !f.proved || f.saw_sf_reader
++}
++
+ /// Whole-name occurrence test: `%r8` must not match inside `%r8d`.
+ fn mentions_exact_name(line: &str, name: &str) -> bool {
+     let bytes = line.as_bytes();
+@@ -3532,6 +3583,86 @@ mod tests {
+         walk_flag_consumers(&store, &infos, at + 1, 0)
      }
  
-+    /// The unsigned refusal is not caution -- it is required. With
-+    /// iv = 2^64-2, c = 1, k = 0 the two forms disagree on hardware:
-+    /// `ult(iv+c, k)` is 0, `ult(iv, k - c)` is 1. Every unsigned fixture
-+    /// here must therefore decline unless the wrap is structurally excluded.
++    /// The `cmp $0, mem` -> `test $0, mem` fold changes ONLY AF, so a writer
++    /// that cannot touch AF must not be able to hide an AF observer.
++    ///
++    /// This is a LATENT defect in shipped code, not in the new fold: before
++    /// `flags_written_mask` existed, the walk stopped at any writer, so `stc`
++    /// (CF only) ended it and the `lahf` behind it was never examined.  The
++    /// rewrite was then licensed on a path where `lahf` observes the one flag
++    /// it changes.  Every label here is REAL -- an unresolvable target would
++    /// set `proved = false` and veto for the wrong reason, which is how a
++    /// test of this shape passes vacuously.
 +    #[test]
-+    fn unsigned_affine_exit_compare_needs_a_no_wrap_proof() {
-+        // A loop-invariant VALUE bound proves nothing about magnitude, so the
-+        // common pointer shape (`i + 4 < end`) must keep declining.
-+        let mut func = affine_exit_fixture(IrCmpOp::Ult, IrType::I64, IrType::I64);
-+        assert_eq!(
-+            run_fold(&mut func),
-+            0,
-+            "an unbounded invariant bound cannot prove the add cannot wrap"
++    fn a_cf_only_setter_does_not_hide_a_lahf_from_the_zero_compare_fold() {
++        let asm = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n\
++                   \x20   movq 8(%rdi), %rax\n    cmpq $0, (%rax)\n    je .Lkeep\n    jmp .Lout\n\
++                   .Lkeep:\n    stc\n    lahf\n    ret\n.Lout:\n    ret\n    .cfi_endproc\n    .size f, .-f\n";
++        let store = LineStore::new(asm.to_string());
++        let infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        let at = (0..store.len())
++            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
++            .expect("cmp not found");
++        let coarse = super::flags_reach_a_whole_flags_reader(&store, &infos, at + 1);
++        let precise = super::flags_reach_a_whole_flags_reader_except_af(&store, &infos, at + 1);
++        assert!(
++            !coarse,
++            "this is the bug being fixed: the coarse walk missed the lahf behind the stc"
 +        );
-+
-+        // A negative offset is the `i - K` form; under an unsigned compare
-+        // `iv - K` can underflow below zero, so it must decline even though
-+        // the same shape folds when signed.
-+        let mut func = affine_exit_fixture(IrCmpOp::Ule, IrType::I64, IrType::I64);
-+        func.blocks[2].instructions[0] = Instruction::BinOp {
-+            dest: Value(3),
-+            op: IrBinOp::Sub,
-+            lhs: Operand::Value(Value(2)),
-+            rhs: Operand::Const(IrConst::I64(4)),
-+            ty: IrType::I64,
-+        };
-+        assert_eq!(run_fold(&mut func), 0, "`iv - K` underflows under Ule");
++        assert!(precise, "the precise walk must reach the lahf and veto");
 +    }
 +
-+    /// The proof the guard accepts: a LITERAL bound with room to spare, which
-+    /// is what a constant-bound loop looks like. Regression test for the
-+    /// ordering bug: `unsigned` was originally classified after the
-+    /// signed-only guard, which made this whole path unreachable -- the code
-+    /// read as if unsigned folding were enabled while silently never firing.
++    /// The complementary direction: when there is no AF observer at all, the
++    /// precise query must still say "no observer", so the fold is not lost.
++    /// A fix that only ever refuses is not a fix.
 +    #[test]
-+    fn unsigned_folds_when_a_literal_bound_proves_no_wrap() {
-+        let mut func = affine_exit_fixture(IrCmpOp::Ult, IrType::I64, IrType::I64);
-+        // The fixture's bound is a Copy-defined VALUE. Point the compare at a
-+        // LITERAL: iv <= 100 on every iteration and 100 + 4 is representable,
-+        // so `iv + 4` provably cannot wrap.
-+        func.blocks[2].instructions[1] = Instruction::Cmp {
-+            dest: Value(4),
-+            op: IrCmpOp::Ult,
-+            lhs: Operand::Value(Value(3)),
-+            rhs: Operand::Const(IrConst::I64(100)),
-+            ty: IrType::I64,
-+        };
-+        assert_eq!(run_fold(&mut func), 1, "literal bound with headroom must fold");
++    fn a_cf_only_setter_does_not_veto_when_nothing_reads_af() {
++        let asm = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n\
++                   \x20   movq 8(%rdi), %rax\n    cmpq $0, (%rax)\n    je .Lkeep\n    clc\n\
++                   .Lkeep:\n    jne .L16\n    ret\n.L16:\n    ret\n    .cfi_endproc\n    .size f, .-f\n";
++        let store = LineStore::new(asm.to_string());
++        let infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        let at = (0..store.len())
++            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
++            .expect("cmp not found");
++        assert!(!super::flags_reach_a_whole_flags_reader_except_af(
++            &store,
++            &infos,
++            at + 1
++        ));
 +    }
 +
-+    /// ...and the same literal must be REJECTED when the offset would push the
-+    /// sum past the type's maximum: the boundary the guard exists to get right.
++    /// `sahf` writes AF, so it genuinely CAN mask an AF observation and the
++    /// walk must still stop at it.  If it were stepped over, a `lahf` behind
++    /// a `sahf` would be missed -- the same bug by a different route.
 +    #[test]
-+    fn unsigned_declines_when_the_sum_would_overflow_the_type() {
-+        let mut func = affine_exit_fixture(IrCmpOp::Ult, IrType::I64, IrType::I64);
-+        func.blocks[2].instructions[1] = Instruction::Cmp {
-+            dest: Value(4),
-+            op: IrCmpOp::Ult,
-+            lhs: Operand::Value(Value(3)),
-+            rhs: Operand::Const(IrConst::I64(i64::MAX)),
-+            ty: IrType::I64,
-+        };
-+        assert_eq!(run_fold(&mut func), 0, "MAX + 4 wraps; must decline");
++    fn sahf_still_terminates_the_walk_because_it_writes_af() {
++        let asm = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n\
++                   \x20   movq 8(%rdi), %rax\n    cmpq $0, (%rax)\n    je .Lkeep\n    jmp .Lout\n\
++                   .Lkeep:\n    sahf\n    lahf\n    ret\n.Lout:\n    ret\n    .cfi_endproc\n    .size f, .-f\n";
++        let store = LineStore::new(asm.to_string());
++        let infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        let at = (0..store.len())
++            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
++            .expect("cmp not found");
++        // The walk stops at sahf, so the lahf is unreachable and the answer
++        // is "no observer" -- which is exactly why the fail-closed `proved`
++        // flag matters: it must be reported as unproved, not as safe.
++        let f = walk_flag_consumers(
++            &store,
++            &infos,
++            at + 1,
++            super::F_ZF | super::F_CF | super::F_SF | super::F_OF | super::F_PF,
++        );
++        assert!(f.proved, "the sahf block is fully walked, so it is proved");
 +    }
 +
-     /// A `BinOp` type that disagrees with the compare's is a different
-     /// expression entirely (the compare sees a converted value), so folding
-     /// would compare the wrong quantity.
+     #[test]
+     fn walk_follows_the_taken_edge_of_a_conditional_jump() {
+         // The whole reason the walk is not a linear scan: the fall-through path
+-- 
+2.47.3
+
+From 1035507859e6666d6ff61645a125fbb553dcdc2a Mon Sep 17 00:00:00 2001
+From: lccc-perf <perf@localhost>
+Date: Wed, 30 Sep 2026 22:23:01 +0000
+Subject: [PATCH 2/6] x86: harden flags_written_mask against untrimmed input;
+ pin the SDM masks
+
+Red-team of my own flag-walk work found two gaps.
+
+1. SILENT DEGRADATION ON UNTRIMMED INPUT.  flags_written_mask splits the
+   line on spaces and matches the first token, so "    stc" yielded "",
+   missed every arm, and returned the fail-closed F_ALL.  Every current
+   caller passes an already-trimmed line, so this was harmless today -- but
+   the failure is SILENT: a caller passing a raw line would simply see its
+   folds stop happening with no diagnostic anywhere.  One trim at the top
+   removes the class.  Found by a probe test printing the mask for nine
+   input spellings, not by reading the code.
+
+2. THE MASKS WERE UNDOCUMENTED AND UNTESTED.  The SDM claims behind them
+   (stc/clc/cmc define CF alone; sahf loads SF/ZF/AF/PF/CF and does NOT
+   affect OF; cld/std touch only DF) were prose in a comment, not tests.  A
+   later edit could narrow a mask -- say, giving shld a small mask -- and
+   the result would be an unsoundness, not a missed fold.  The new test
+   asserts the SDM, not the implementation: shld/shrd/bt*/popfq/popf and
+   every unrecognised mnemonic stay F_ALL, and the three narrow families
+   get exactly their documented bits.  Operand and indentation forms are
+   covered too, which is how gap 1 was caught.
+
+Also documented the scope limit the narrow masks depend on: DF is NOT
+modelled.  cld/std are masked 0, and a pushfq after a cld and after a std
+really do differ in bit 10, so this is sound only because every rewrite
+guarded by this module changes arithmetic flags alone.  A rewrite that
+changed DF would need a seventh bit, and stating that beats leaving it to
+be inferred.
+
+NON-VACUITY: reverting the precise walk makes
+a_cf_only_setter_does_not_hide_a_lahf_from_the_zero_compare_fold FAIL, which
+is the test that demonstrates the shipped dead_writes.rs defect.  My first
+attempt at that revert silently matched nothing -- cargo fmt had collapsed
+the multi-line call -- and the suite stayed green, which is exactly the
+false-negative this project's gates keep producing.  Checking the match
+count instead of trusting the edit is what caught it.
+
+cargo test --lib: 3911 passed, 0 failed.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../codegen/peephole/passes/flag_peepholes.rs | 81 ++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+index 6b83c8f7..2514698c 100644
+--- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
++++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+@@ -59,6 +59,17 @@ pub(super) const F_ALL: u8 = F_ZF | F_CF | F_SF | F_OF | F_PF | F_AF;
+ 
+ /// The flags a writer instruction can clobber, as a bitmask.
+ ///
++/// ## SCOPE: the six ARITHMETIC flags only
++///
++/// DF is deliberately NOT modelled, and a caller must not read this function
++/// as covering it. `cld`/`std` set and clear DF, and `pushfq`/`lahf` read the
++/// flags word including bit 10, so a `pushfq` after a `cld` and after a `std`
++/// really do differ. Masking those two as 0 is sound **only** because every
++/// rewrite guarded by this module changes arithmetic flags alone. A rewrite
++/// that changed DF would need a seventh bit here, and getting that wrong is a
++/// silent miscompile rather than a lost fold -- which is why it is stated here
++/// rather than left to be inferred.
++///
+ /// [`walk_flag_consumers`] used to treat every `FlagsEffect::Writes` as a
+ /// total clobber.  That is sound but far too coarse for a rewrite that
+ /// PROVES it preserves ZF and CF, because two very common flag setters write
+@@ -85,6 +96,14 @@ pub(super) const F_ALL: u8 = F_ZF | F_CF | F_SF | F_OF | F_PF | F_AF;
+ /// which do write OF and AF, and every unrecognised mnemonic -- returns
+ /// [`F_ALL`], so no existing call can become less conservative than before.
+ pub(super) fn flags_written_mask(t: &str) -> u8 {
++    // Trim FIRST. Every current caller passes an already-trimmed line, so this
++    // is a no-op today -- but the fail-closed `_` arm means an untrimmed
++    // argument returns F_ALL, and that failure is SILENT: a caller that
++    // passes a raw line would simply see its folds stop happening, with no
++    // diagnostic anywhere. Making the function accept what a reader expects
++    // it to accept costs one line and removes a whole class of quiet
++    // degradation.
++    let t = t.trim();
+     let base = t.strip_prefix('v').unwrap_or(t);
+     let mnem = base
+         .split(|c: char| c == ' ' || c == '\t')
+@@ -2435,7 +2454,10 @@ fn strip_width_suffix<'a>(t: &'a str, base: &str) -> Option<&'a str> {
+ #[cfg(test)]
+ mod tests {
+     use super::super::super::peephole_optimize;
+-    use super::{ConsumerFacts, FlagsEffect, flags_effect, walk_flag_consumers};
++    use super::{
++        ConsumerFacts, F_AF, F_ALL, F_CF, F_OF, F_PF, F_SF, F_ZF, FlagsEffect, flags_effect,
++        flags_written_mask, walk_flag_consumers,
++    };
+     use crate::backend::x86::codegen::peephole::types::{LineInfo, LineStore, classify_line};
+ 
+     fn run(asm: &str) -> String {
+@@ -3593,6 +3615,63 @@ mod tests {
+     /// it changes.  Every label here is REAL -- an unresolvable target would
+     /// set `proved = false` and veto for the wrong reason, which is how a
+     /// test of this shape passes vacuously.
++    /// The mask must be fail-closed for every writer the peephole can emit that
++    /// this function does NOT name.  `shld`/`shrd`/`bt*` are the dangerous
++    /// ones: they DO write OF and AF, so a narrow mask for them would be a
++    /// silent unsoundness rather than a missed fold.  This pins that they
++    /// stay F_ALL, and that `popfq` -- which replaces the whole word -- does
++    /// too.
++    #[test]
++    fn only_sdk_named_flag_setters_get_a_narrow_mask() {
++        for m in [
++            "shld",
++            "shldl",
++            "shldq",
++            "shrd",
++            "shrdl",
++            "shrdq",
++            "bts",
++            "btsq",
++            "bt",
++            "btr",
++            "btrq",
++            "btc",
++            "btcq",
++            "popf",
++            "popfq",
++            "addl",
++            "subq",
++            "cmpb",
++            "testl",
++            "imulq",
++            "",
++            "nop",
++            "movq",
++            "unknownmnemonic",
++        ] {
++            assert_eq!(
++                flags_written_mask(m),
++                F_ALL,
++                "{m:?} must stay fail-closed: an unstated writer must never get a narrow mask"
++            );
++        }
++        // The three narrow families, asserted against the SDM rather than
++        // against the implementation.
++        assert_eq!(flags_written_mask("stc"), F_CF, "stc defines CF alone");
++        assert_eq!(flags_written_mask("clc"), F_CF, "clc defines CF alone");
++        assert_eq!(flags_written_mask("cmc"), F_CF, "cmc complements CF alone");
++        assert_eq!(
++            flags_written_mask("sahf"),
++            F_SF | F_ZF | F_PF | F_AF | F_CF,
++            "sahf loads SF/ZF/AF/PF/CF from AH; SDM: OF is not affected"
++        );
++        assert_eq!(flags_written_mask("cld"), 0, "cld touches DF only");
++        assert_eq!(flags_written_mask("std"), 0, "std touches DF only");
++        // Operand and indentation forms must not defeat the matcher.
++        assert_eq!(flags_written_mask("    stc"), F_CF);
++        assert_eq!(flags_written_mask("stc   "), F_CF);
++    }
++
+     #[test]
+     fn a_cf_only_setter_does_not_hide_a_lahf_from_the_zero_compare_fold() {
+         let asm = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n\
+-- 
+2.47.3
+
+From 3098989afe586fe215433c4925e58610462b0e0b Mon Sep 17 00:00:00 2001
+From: lccc-perf <perf@localhost>
+Date: Thu, 1 Oct 2026 08:46:16 +0000
+Subject: [PATCH 3/6] x86: per-path flag liveness in the flag-consumer walk
+
+The walk stopped at ANY writer, so a PARTIAL writer such as stc (CF only)
+or sahf (all but OF) hid every consumer standing behind it.  eliminate_redundant_
+self_test deletes test %R,%R based on flag_consumers_are_zf_only, so a jo
+behind an stc read the PRODUCER's OF without the walk ever seeing it and the
+fold fired:
+
+    addl $1, %eax        ; x = 0x7fffffff -> OF = 1
+    testl %eax, %eax     ; deleted, and it would clear OF
+    je .Lzero            ; ZF-only consumer, not taken
+    stc                  ; CF only -- the coarse walk stopped HERE
+    jo .Lof              ; reads the producer's OF; must veto
+
+Executed as an A/B this returns 1 originally and 0 folded: a wrong answer
+from code that lowers the instruction count, assembles, links, and passes
+every shape-only gate.
+
+Fix: thread a per-path LIVE mask through the worklist and intersect it with
+cc_reads(cc) and !preserved at each consumer.  A writer only KILLS the flags
+it defines; it no longer ends the walk, because what it does not define is
+still live from the producer.  cmc is special-cased: it COMPLEMENTS CF
+rather than defining it, so CF stays live and a jb behind it still vetoes.
+
+This is strictly more information than the old static 'preserved' compare
+and also strictly more precise, never merely more conservative: a full
+writer kills everything and the walk still stops, and a consumer of a flag
+an earlier writer retired is charged nothing, so the folds the coarse rule
+kept are still kept.
+
+Side effect: flags_reach_a_whole_flags_reader (preserved = 0) becomes
+strictly dominated by flags_reach_a_whole_flags_reader_except_af and loses
+its last production caller, so it is removed rather than left as a trap.
+
+The two callers now pass the preserved set they actually prove: F_ZF for
+flag_consumers_are_zf_only (ZF is identical across the and/or/xor, same-width
+arithmetic and zero-extending width-change classes) and F_ZF|F_CF for
+flag_consumers_are_zf_cf_only, which already documented exactly that.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../codegen/peephole/passes/flag_peepholes.rs | 469 ++++++++++++++++--
+ 1 file changed, 419 insertions(+), 50 deletions(-)
+
+diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+index 2514698c..24b20226 100644
+--- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
++++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
+@@ -1697,6 +1697,28 @@ fn flags_are_block_local(
+ /// (`b`/`ae`/`a`/`be`), the CF predicates, `o`/`no` and `p`/`np` do not.
+ const SF_CCS: &[&str] = &["s", "ns", "l", "nl", "le", "nle", "g", "ng", "ge", "nge"];
+ 
++/// The EFLAGS bits a condition code actually selects on, per SDM Vol. 1
++/// Table 3-1 ("Contents of Flags Registers") plus the Jcc/SETcc/CMOVcc
++/// definitions.  An unrecognised code falls back to `F_ALL`, so no caller can
++/// read a narrowed "this code touches nothing" out of a typo.
++fn cc_reads(cc: &str) -> u8 {
++    match cc {
++        "e" | "z" | "ne" | "nz" => F_ZF,
++        "b" | "c" | "nae" => F_CF,
++        "nb" | "nc" | "ae" => F_CF,
++        "be" | "na" | "a" | "nbe" => F_ZF | F_CF,
++        "s" | "ns" => F_SF,
++        "l" | "nl" => F_SF | F_OF,
++        "le" | "nle" => F_SF | F_OF | F_ZF,
++        "g" | "ng" => F_SF | F_OF | F_ZF,
++        "ge" | "nge" => F_SF | F_OF | F_ZF,
++        "o" | "no" => F_OF,
++        // Unrecognised: fail closed.  Every bit is charged, so an unknown code
++        // can never be mistaken for one that touches nothing.
++        _ => F_ALL,
++    }
++}
++
+ /// Condition codes that select on ZF and CF alone, with every other flag
+ /// masked out: `e/z/ne/nz` (ZF), `b/c/nae` (CF), `nb/nc/ae` (!CF) and
+ /// `be/na` (CF|ZF), `a/nbe` (!CF|!ZF).  The SF/OF group (`s`, `l`, `le`, `g`,
+@@ -1845,10 +1867,32 @@ fn walk_flag_consumers(
+         }
+     };
+ 
++    // Per-path LIVE mask: the flags whose value still comes from the
++    // instruction whose consumers we are hunting.  It starts at F_ALL and is
++    // narrowed by every writer stepped over.
++    //
++    // This is strictly more information than the static `preserved`
++    // comparison, and the difference is exactly the unsound case: a PARTIAL
++    // writer must not END the walk.  `stc` writes CF only, so after it CF is
++    // dead but OF, SF, ZF, PF and AF are still whatever the producer left --
++    // a `jo` behind the `stc` observes the PRODUCER's OF, and a rewrite that
++    // changes OF must be vetoed by it.  The old rule stopped at the `stc` and
++    // never saw the `jo`, which is a live miscompile in the self-test fold
++    // (orig returned 1 and folded returned 0 at x = 0x7fffffff).
++    //
++    // `seen` stays a plain boolean even though liveness is per-path: a path
++    // that kills every flag BREAKS out of the walk instead of pushing its
++    // successor, so it can never mark a merge block seen.  Every path that
++    // does reach a merge still has at least one live flag, so the boolean memo
++    // is exact.  `a_full_writer_arm_does_not_suppress_the_live_arm_at_a_merge`
++    // and `the_dead_arm_expanded_first_does_not_hide_the_live_arm` both pass
++    // under a liveness-aware memo too, which is the evidence for that claim
++    // rather than an assumption about it.
+     let mut seen = vec![false; fe - fs];
+-    let mut work: Vec<usize> = vec![from];
+-    while let Some(head) = work.pop() {
++    let mut work: Vec<(usize, u8)> = vec![(from, F_ALL)];
++    while let Some((head, live)) = work.pop() {
+         let mut n = head;
++        let mut live = live;
+         while n < fe {
+             if seen[n - fs] {
+                 break; // this suffix was already expanded, facts included
+@@ -1890,7 +1934,7 @@ fn walk_flag_consumers(
+                 // the target only.
+                 LineKind::Jmp => {
+                     if let Some(idx) = resolve(t, &mut facts) {
+-                        work.push(idx);
++                        work.push((idx, live));
+                     }
+                     break;
+                 }
+@@ -1908,13 +1952,44 @@ fn walk_flag_consumers(
+                 _ => {}
+             }
+             match flags_effect(t) {
+-                // The flags die here on this path -- UNLESS this writer only
+-                // clobbers flags the rewrite already proves it preserves.  A
+-                // CF-only writer cannot reveal a ZF/CF-preserving rewrite, and
+-                // stopping there would hide every consumer behind it.
++                // A writer only KILLS the flags it actually defines.  It does
++                // not end the walk, because everything it does not define is
++                // still live from the original producer and a consumer behind
++                // it can still observe it.
++                //
++                // This is the difference between a mask comparison and a
++                // liveness model.  The old test was
++                // `flags_written_mask(t) & !preserved != 0 -> break`, which
++                // conflates "this writer destroys what the rewrite preserves"
++                // with "this writer destroys something": a `stc` destroys CF
++                // only, so it ended the walk and hid every OF/SF/AF consumer
++                // standing behind it.  Narrowing instead of stopping reaches
++                // them, and the `live & reads` intersection below decides
++                // whether each can actually observe the rewrite.
++                //
++                // `cmc` is the instructive case: it COMPLEMENTS CF rather than
++                // defining it, so the value it leaves is a function of the
++                // incoming CF.  Killing CF there would claim a consumer of the
++                // OLD CF is safe, which is false, so CF stays live and any
++                // `jb` behind the `cmc` still vetoes.
+                 FlagsEffect::Writes => {
+-                    if flags_written_mask(t) & !preserved != 0 {
+-                        break;
++                    match t.split_whitespace().next().unwrap_or("") {
++                        "cmc" => {
++                            // CF is a function of the old CF, not a constant.
++                            // Nothing is retired; keep walking with `live`.
++                        }
++                        _ => {
++                            live &= !flags_written_mask(t);
++                            if live == 0 {
++                                // Nothing the caller cares about survives, so
++                                // no consumer behind here can observe the
++                                // rewrite.  Stopping is not merely an
++                                // optimisation: continuing would charge
++                                // consumers of flags that are already dead,
++                                // vetoing rewrites that are provably safe.
++                                break;
++                            }
++                        }
+                     }
+                     n += 1;
+                     continue;
+@@ -1924,25 +1999,61 @@ fn walk_flag_consumers(
+                     continue;
+                 }
+                 FlagsEffect::Reads => {
+-                    facts.saw_consumer = true;
+-                    // Condition-code consumers (`jcc`, `setcc`, `cmovcc`) name
+-                    // exactly which flags they read; everything else is a
+-                    // whole-flag or unknown reader and is charged with SF
+-                    // unless `NON_SF_FLAG_READERS` vouches for it.
++                    // A consumer is charged for the intersection of three sets:
++                    //
++                    //   cc_reads(cc)  -- what this instruction selects on
++                    //   live          -- what is still the producer's value
++                    //   !preserved    -- what the rewrite may change
++                    //
++                    // All three are needed.  Without `live` a consumer of a
++                    // flag some earlier writer already retired vetoes a
++                    // rewrite that cannot reach it, so "just walk further"
++                    // would trade one bug for its mirror image.  Without
++                    // `!preserved` the walk charges consumers of flags the
++                    // rewrite leaves alone, which is the coarse
++                    // over-approximation `preserved` exists to remove.
++                    //
++                    // `saw_consumer` comes from LIVENESS rather than from
++                    // `observed`: a ZF-only `je` is still the one consumer the
++                    // ZF-only proofs need to see, even though nothing it reads
++                    // can have been changed.
+                     let cc = condition_code_of(t);
+                     match cc {
+                         Some(cc) => {
+-                            if !matches!(cc, "e" | "z" | "ne" | "nz") {
++                            // Condition-code consumers (`jcc`, `setcc`,
++                            // `cmovcc`) name exactly which flags they read;
++                            // everything else is a whole-flag or unknown
++                            // reader and is charged with SF unless
++                            // `NON_SF_FLAG_READERS` vouches for it.
++                            let reads = cc_reads(cc);
++                            if reads & live == 0 {
++                                n += 1;
++                                continue; // every flag it wants is already dead
++                            }
++                            facts.saw_consumer = true;
++                            let observed = reads & live & !preserved;
++                            if observed & !F_ZF != 0 {
+                                 facts.saw_non_zf = true;
+                             }
+-                            if !ZF_CF_ONLY_CCS.contains(&cc) {
++                            if observed & !(F_ZF | F_CF) != 0 {
+                                 facts.saw_outside_zf_cf = true;
+                             }
+-                            if SF_CCS.contains(&cc) {
++                            if observed & F_SF != 0 {
+                                 facts.saw_sf_reader = true;
+                             }
+                         }
+                         None => {
++                            if live == 0 {
++                                break;
++                            }
++                            facts.saw_consumer = true;
++                            // A whole-word or unknown reader observes
++                            // everything still live, so it is charged unless
++                            // the rewrite preserves all of it.
++                            if live & !preserved == 0 {
++                                n += 1;
++                                continue;
++                            }
+                             facts.saw_non_zf = true;
+                             facts.saw_outside_zf_cf = true;
+                             if !NON_SF_FLAG_READERS.iter().any(|p| t.starts_with(p)) {
+@@ -1957,7 +2068,7 @@ fn walk_flag_consumers(
+                         || (t.starts_with('j') && !t.starts_with("jmp"))
+                     {
+                         if let Some(idx) = resolve(t, &mut facts) {
+-                            work.push(idx);
++                            work.push((idx, live));
+                         }
+                     }
+                     if reader_also_writes_flags(t) {
+@@ -2000,7 +2111,12 @@ pub(super) fn flag_consumers_are_zf_only(
+     infos: &[LineInfo],
+     from: usize,
+ ) -> bool {
+-    let f = walk_flag_consumers(store, infos, from, 0);
++    // `preserved = F_ZF` is the whole proof this query stands on: the caller
++    // established that the two exchanged instructions agree on ZF and on
++    // nothing else.  Passing 0 would be equally conservative for a direct
++    // consumer and strictly more so behind a partial writer (it would charge a
++    // `jo` of a dead OF), which costs folds.
++    let f = walk_flag_consumers(store, infos, from, F_ZF);
+     f.proved && f.saw_consumer && !f.saw_non_zf
+ }
+ 
+@@ -2013,7 +2129,7 @@ pub(super) fn flag_consumers_are_zf_cf_only(
+     infos: &[LineInfo],
+     from: usize,
+ ) -> bool {
+-    let f = walk_flag_consumers(store, infos, from, 0);
++    let f = walk_flag_consumers(store, infos, from, F_ZF | F_CF);
+     f.proved && f.saw_consumer && !f.saw_outside_zf_cf
+ }
+ 
+@@ -2059,34 +2175,12 @@ pub(super) fn flags_reach_an_sf_consumer(
+     !f.proved || f.saw_sf_reader
+ }
+ 
+-/// True when some consumer of the current flags reads the WHOLE EFLAGS word
+-/// (or is opaque enough that it might): `lahf`, `pushf`, inline-asm blocks,
+-/// unknown mnemonics.  This is the reader class that can observe **AF**;
+-/// condition-code consumers cannot select AF and the
+-/// [`NON_SF_FLAG_READERS`] whitelist (`adc`/`sbb`/`adox`/`rcl`/`rcr`/`cmc`/
+-/// `salc`/`into`) reads CF/OF only.  Fails closed exactly like
+-/// [`flags_reach_an_sf_consumer`]: an incomplete walk must not license an
+-/// AF-divergent rewrite.
+-///
+-/// Used by `test`→`cmp` zero-compare folds: `cmp $0, mem` DEFINES AF (a
+-/// subtraction from zero never borrows, so AF=0) while `test` leaves it
+-/// carrying the previous writer's value -- the only flag the rewrite can
+-/// change when SF/ZF/PF/CF/OF are provably identical.
+-pub(super) fn flags_reach_a_whole_flags_reader(
+-    store: &LineStore,
+-    infos: &[LineInfo],
+-    from: usize,
+-) -> bool {
+-    let f = walk_flag_consumers(store, infos, from, 0);
+-    !f.proved || f.saw_whole_reader
+-}
+-
+ /// [`flags_reach_a_whole_flags_reader`] for a rewrite that PROVES it changes
+ /// only AF, which is the `cmp $0, mem` -> `test $0, mem` zero-compare fold.
+ ///
+-/// This is not a narrowing for its own sake. The unprecise form stops the walk
+-/// at ANY writer, so a writer that touches only preserved flags hides every
+-/// consumer behind it, and a whole-word reader sitting behind one is missed:
++/// This is not a narrowing for its own sake. A walk that stops at ANY writer
++/// lets a writer that touches only preserved flags hide every consumer behind
++/// it, and a whole-word reader sitting behind one is missed:
+ ///
+ /// ```asm
+ ///         cmpq  $0, (%rax)      ; -> testq $0, (%rax): AF diverges
+@@ -2556,6 +2650,280 @@ mod tests {
+         assert!(out.contains("testq %rsi, %rsi"), "{out}");
+     }
+ 
++    /// RED-TEAM REGRESSION for a miscompile in the self-test fold.
++    ///
++    /// `eliminate_redundant_self_test` deletes `test %R,%R` after an arithmetic
++    /// producer, keeping it only when `flag_consumers_are_zf_only` proves every
++    /// consumer reads ZF alone.  That proof used to walk with `preserved = 0`,
++    /// so ANY writer stopped the walk -- and a PARTIAL writer such as `stc`
++    /// leaves OF, SF, ZF, PF and AF exactly as the producer left them.  A `jo`
++    /// behind the `stc` therefore observed the PRODUCER's OF without the walk
++    /// ever seeing it, and the fold fired:
++    ///
++    ///     addl $1, %eax      ; x = 0x7fffffff -> OF = 1
++    ///     testl %eax, %eax   ; deleted by the fold, and it would clear OF
++    ///     je .Lzero          ; ZF-only consumer, not taken
++    ///     stc                ; CF only -- the coarse walk stopped HERE
++    ///     jo .Lof            ; reads the producer's OF; must veto
++    ///
++    /// Executed as an A/B, orig returns 1 and folded returns 0 at
++    /// x = 0x7fffffff: a wrong answer from code that lowers the instruction
++    /// count, assembles, links and passes every shape-only gate.
++    #[test]
++    fn self_test_after_sub_is_kept_when_a_partial_writer_hides_an_of_reader() {
++        let out = self_test_case(concat!(
++            "    addl %edx, %esi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n", // ZF-only consumer, NOT taken when %esi != 0
++            "    stc\n",      // CF-only writer: kills CF, leaves OF live
++            "    jo .Lof\n",  // must be reached and must veto
++            "    movl $1, %eax\n",
++            "    ret\n",
++            ".Lof:\n",
++            "    movl $0, %eax\n",
++            "    ret\n",
++        ));
++        assert!(
++            out.contains("testl %esi, %esi"),
++            "the redundant test must survive: the jo behind the stc reads the \
++             producer's OF, which the fold changes.\n{out}"
++        );
++    }
++
++    /// The complement, and the reason the fix is a liveness model rather than
++    /// "never step over a writer": a consumer of a flag the partial writer
++    /// ACTUALLY killed must NOT veto.  `stc` kills CF, so a `jb` behind it is
++    /// free and the fold must still fire.  A blanket "stop at any writer" rule
++    /// would pass the security tests above and silently lose this fold.
++    #[test]
++    fn self_test_after_add_is_still_folded_when_a_cf_only_writer_precedes_a_jb() {
++        let out = self_test_case(concat!(
++            "    addl %edx, %esi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n",
++            "    stc\n",        // kills CF
++            "    jb .Lcarry\n", // reads CF only -> dead, must not veto
++            "    movl $1, %eax\n",
++            "    ret\n",
++            ".Lcarry:\n",
++            "    movl $2, %eax\n",
++            "    ret\n",
++        ));
++        assert!(
++            !out.contains("testl %esi, %esi"),
++            "jb reads only CF, which the stc already killed, so it cannot \
++             observe the fold and must not veto it.\n{out}"
++        );
++    }
++
++    /// A FULL writer really does kill everything, so consumers behind it are
++    /// unreachable and must not veto.  This is the other half of the liveness
++    /// argument and it is what keeps the walk from becoming merely more
++    /// conservative than the code it replaced.
++    #[test]
++    fn self_test_after_add_is_folded_when_a_full_writer_precedes_every_reader() {
++        let out = self_test_case(concat!(
++            "    addl %edx, %esi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n",
++            "    addl $7, %ecx\n", // defines ALL six: nothing survives
++            "    jo .Lof\n",       // reads a DEAD OF -> must not veto
++            "    js .Ls\n",        // reads a DEAD SF -> must not veto
++            "    lahf\n",          // reads a DEAD word -> must not veto
++            "    movl $1, %eax\n",
++            "    ret\n",
++            ".Lof:\n",
++            "    movl $3, %eax\n",
++            "    ret\n",
++            ".Ls:\n",
++            "    movl $4, %eax\n",
++            "    ret\n",
++        ));
++        assert!(
++            !out.contains("testl %esi, %esi"),
++            "every flag is redefined by the addl before any reader, so no \
++             consumer behind it can observe the fold.\n{out}"
++        );
++    }
++
++    /// `cmc` is the case a mask-based liveness rule gets WRONG in the unsafe
++    /// direction.  `cmc` does not define CF, it COMPLEMENTS it, so the value
++    /// it leaves is a function of the incoming CF.  Retiring CF at a `cmc`
++    /// would claim a `jb` behind it reads a dead flag; it does not.
++    #[test]
++    fn self_test_after_add_is_kept_when_a_cmc_precedes_a_jb() {
++        let out = self_test_case(concat!(
++            "    addl %edx, %esi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n",
++            "    cmc\n",        // complements CF: still a function of the producer
++            "    jb .Lcarry\n", // reads CF -> must veto
++            "    movl $1, %eax\n",
++            "    ret\n",
++            ".Lcarry:\n",
++            "    movl $2, %eax\n",
++            "    ret\n",
++        ));
++        assert!(
++            out.contains("testl %esi, %esi"),
++            "cmc complements rather than defines CF, so a jb behind it can \
++             still observe the producer's CF.\n{out}"
++        );
++    }
++
++    /// `sahf` writes SF/ZF/AF/PF/CF and leaves OF alone, so a `jo` behind it
++    /// reads the producer's OF and must veto.  This is the partial writer with
++    /// the OPPOSITE polarity to `stc`, and it catches an implementation that
++    /// only special-cases the CF-only case.
++    #[test]
++    fn self_test_after_add_is_kept_when_a_sahf_precedes_a_jo() {
++        let out = self_test_case(concat!(
++            "    addl %edx, %esi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n",
++            "    sahf\n", // leaves OF live
++            "    jo .Lof\n",
++            "    movl $1, %eax\n",
++            "    ret\n",
++            ".Lof:\n",
++            "    movl $0, %eax\n",
++            "    ret\n",
++        ));
++        assert!(
++            out.contains("testl %esi, %esi"),
++            "sahf does not affect OF, so the jo behind it reads the producer's \
++             OF and must veto.\n{out}"
++        );
++    }
++
++    /// `lahf` is the AF observer: no condition code covers AF and
++    /// `NON_SF_FLAG_READERS` does not vouch for it, so a `lahf` behind a `stc`
++    /// must veto.  Same shape as the `jo` case with a whole-word reader, and
++    /// the reason unknown readers are charged at all.
++    #[test]
++    fn self_test_after_add_is_kept_when_a_lahf_precedes_nothing() {
++        let out = self_test_case(concat!(
++            "    addl %edx, %esi\n",
++            "    testl %esi, %esi\n",
++            "    je .LBB4\n",
++            "    stc\n",
++            "    lahf\n", // reads AF, which the stc does not define
++            "    movl $1, %eax\n",
++            "    ret\n",
++        ));
++        assert!(
++            out.contains("testl %esi, %esi"),
++            "lahf observes AF, and stc does not define AF.\n{out}"
++        );
++    }
++
++    /// A merge whose two arms kill DIFFERENT flag sets must not let the
++    /// narrower arm's expansion suppress the wider arm's consumers.
++    ///
++    /// `seen` stays a boolean even though liveness is per-path, and this is the
++    /// test that justifies it: the hazard would be an arm that kills every flag
++    /// marking the merge seen so the still-live arm is skipped.  It cannot
++    /// happen, because such an arm BREAKS out of the walk instead of pushing
++    /// its successor, so it never marks a merge.  Both this test and
++    /// `the_dead_arm_expanded_first_does_not_hide_the_live_arm` pass under a
++    /// liveness-aware memo as well, which is the evidence for the claim.
++    #[test]
++    fn a_full_writer_arm_does_not_suppress_the_live_arm_at_a_merge() {
++        let asm = concat!(
++            "    .text\n",
++            "    .globl f\n",
++            "    .type f, @function\n",
++            "f:\n",
++            "    .cfi_startproc\n",
++            "    cmpq $0, (%rdi)\n",
++            "    je .Llive\n",
++            "    addl $1, %eax\n", // full writer, live -> 0
++            "    jmp .Lmerge\n",
++            ".Llive:\n",
++            "    stc\n", // CF only: ZF stays live
++            ".Lmerge:\n",
++            "    jne .Lbad\n", // charged on the CF-only arm
++            "    ret\n",
++            ".Lbad:\n",
++            "    ret\n",
++            "    .cfi_endproc\n",
++        );
++        let store = LineStore::new(asm.to_string());
++        let infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        let at = (0..store.len())
++            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
++            .expect("cmp not found");
++        let f = walk_flag_consumers(&store, &infos, at + 1, F_ZF);
++        assert!(
++            f.saw_consumer,
++            "the jne behind the merge is live on the CF-only arm and must be \
++             reported"
++        );
++    }
++
++    /// The same merge with the arms swapped, so the full writer is the one the
++    /// LIFO worklist expands first.  The result must not depend on traversal
++    /// order.
++    #[test]
++    fn the_dead_arm_expanded_first_does_not_hide_the_live_arm() {
++        let asm = concat!(
++            "    .text\n",
++            "    .globl f\n",
++            "    .type f, @function\n",
++            "f:\n",
++            "    .cfi_startproc\n",
++            "    cmpq $0, (%rdi)\n",
++            "    je .Llive\n", // pushed first  -> expanded LAST
++            "    stc\n",
++            "    jmp .Lmerge\n",
++            ".Llive:\n",
++            "    addl $1, %eax\n", // pushed second -> expanded FIRST
++            "    jmp .Lmerge\n",
++            ".Lmerge:\n",
++            "    jne .Lbad\n",
++            "    ret\n",
++            ".Lbad:\n",
++            "    ret\n",
++            "    .cfi_endproc\n",
++        );
++        let store = LineStore::new(asm.to_string());
++        let infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        let at = (0..store.len())
++            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
++            .expect("cmp not found");
++        let f = walk_flag_consumers(&store, &infos, at + 1, F_ZF);
++        assert!(f.saw_consumer, "order must not change the facts");
++    }
++
++    /// `cc_reads` is pinned to the SDM so a typo in the table cannot silently
++    /// turn a sign test into a no-op.
++    #[test]
++    fn condition_code_flag_sets_match_the_sdm() {
++        use super::cc_reads;
++        use super::{F_AF as AF, F_CF as CF, F_OF as OF, F_PF as PF, F_SF as SF, F_ZF as ZF};
++        assert_eq!(cc_reads("e") | cc_reads("ne"), ZF, "e/ne are ZF-only");
++        assert_eq!(cc_reads("b"), CF, "b is CF-only");
++        assert_eq!(cc_reads("be"), ZF | CF, "be is ZF|CF");
++        assert_eq!(cc_reads("a"), ZF | CF, "a is ZF|CF");
++        assert_eq!(cc_reads("o"), OF, "o is OF-only");
++        assert_eq!(cc_reads("s"), SF, "s is SF-only");
++        assert_eq!(cc_reads("l"), SF | OF, "l is SF|OF");
++        assert_eq!(cc_reads("le"), SF | OF | ZF, "le is SF|OF|ZF");
++        // No condition code covers PF or AF, so nothing may claim to.
++        for cc in [
++            "e", "z", "ne", "nz", "b", "c", "nae", "nb", "nc", "ae", "be", "na", "a", "nbe", "s",
++            "ns", "l", "nl", "le", "nle", "g", "ng", "ge", "nge", "o", "no",
++        ] {
++            assert_eq!(cc_reads(cc) & PF, 0, "{cc} cannot select on PF");
++            assert_eq!(cc_reads(cc) & AF, 0, "{cc} cannot select on AF");
++        }
++        assert_eq!(cc_reads("zzz"), super::F_ALL, "unknown code fails closed");
++    }
++
+     #[test]
+     fn self_test_after_add_is_kept() {
+         // The consumer is `jb`, a carry test: `addl` takes CF from the carry
+@@ -3684,13 +4052,14 @@ mod tests {
+         let at = (0..store.len())
+             .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
+             .expect("cmp not found");
+-        let coarse = super::flags_reach_a_whole_flags_reader(&store, &infos, at + 1);
+-        let precise = super::flags_reach_a_whole_flags_reader_except_af(&store, &infos, at + 1);
++        // `stc` defines CF only, so AF -- the one flag this rewrite can change
++        // -- is still live behind it and the `lahf` must veto.  A walk that
++        // stopped at the `stc` reported "no whole reader" here, which is the
++        // miss this test exists to prevent.
+         assert!(
+-            !coarse,
+-            "this is the bug being fixed: the coarse walk missed the lahf behind the stc"
++            super::flags_reach_a_whole_flags_reader_except_af(&store, &infos, at + 1),
++            "the walk must step over the CF-only stc and reach the lahf behind it"
+         );
+-        assert!(precise, "the precise walk must reach the lahf and veto");
+     }
+ 
+     /// The complementary direction: when there is no AF observer at all, the
+-- 
+2.47.3
+
+From de99d61e350b78ad5c523e4d64a451a975b89f9e Mon Sep 17 00:00:00 2001
+From: lccc-perf <perf@localhost>
+Date: Thu, 1 Oct 2026 09:34:37 +0000
+Subject: [PATCH 4/6] x86: coalesce a loop induction variable that the
+ allocator left in a slot
+
+The register allocator is a windowed linear scan, so a value whose web spans
+most of the function keeps its stack slot. In the LZ4 match-extension loop
+that makes `ip` round-trip through memory once per iteration:
+
+    .LBB14:
+        movq 112(%rsp), %rcx     <- reload the IV
+        movzbl (%rcx), %r8d
+        cmpb (%rbx), %r8b
+        jne .LBB16
+    .LBB15:
+        addq $1, %rcx
+        movq  %rcx, 112(%rsp)    <- store it back
+        addq $1, %rbx
+        cmpq 56(%rsp), %rcx
+        jb   .LBB14
+
+Seven instructions, three touching memory. The store/reload pair is a
+store-to-load forwarding round trip ON THE LOOP'S OWN RECURRENCE: ip cannot
+advance faster than the ~5-cycle forward, so the IV chain and not the two
+byte loads sets the throughput. Every oracle keeps both pointers in
+registers.
+
+Note what is NOT happening: %rcx is already live from the reload through the
+increment to the store. The allocator never lost the register; it just
+re-synchronised memory and register every iteration for nothing. So this
+needs no register allocation at all - it hoists the reload onto the loop's
+entry edge and sinks the store to the exits. Five instructions and one
+memory op fewer per iteration.
+
+The rewrite is TRANSPARENT TO THE LOOP BODY: the register holds the same
+value at every program point inside the loop. Per iteration the original
+establishes R = mem[slot], updates it and writes it back; the rewrite
+establishes R once in the preheader and carries it. Nothing in the loop
+writes the slot, so the two agree at loop entry and share every update in
+between. The obligations are therefore about the slot, not the register:
+
+  1. the slot's value at loop entry is its value in the preheader (nothing
+     writes it in between, nothing in the loop writes it, its address is
+     never taken so nothing can alias it);
+  2. nothing else in the loop READS the slot - after the first iteration it
+     holds the initial value, so a second reader would see a stale IV;
+  3. every exit writes the slot with the final value;
+  4. the reload is the header's first instruction and the header has a
+     single fallthrough entry, which makes the hoist a move across a block
+     boundary with nothing in between.
+
+The one obligation the REGISTER side imposes is that nothing in the loop may
+clobber it behind the pass's back: in the original the next iteration's
+reload repaired any stray write, in the rewrite nothing does. That is what
+`is_iv_chain_step` decides, and it is deliberately narrow.
+
+Loop identification is dominator-based, not textual: back edges are edges
+whose target dominates their source, and the natural loop is everything
+reaching the latch without passing through the header. The conditional
+branch and its fallthrough are tested as SEPARATE edges - reading "some
+successor leaves the loop" classifies the latch's own back edge as an exit,
+because the fallthrough beside it does leave.
+
+Early exits route through a store block. When an exit already targets the
+loop's fallthrough successor - the shape LZ4's `jne` has - the store block
+is placed immediately before that block's label, so the branch is redirected
+to the store's own label and falls straight through: one added mov, no extra
+jump, on a path that leaves the loop once.
+
+Generated exit labels are unique across the WHOLE unit, not the function:
+lccc inlines, so one unit can hold several textual copies of the same callee
+body and therefore of the same .LBB* labels, and two blocks sharing a label
+are silently merged by the assembler.
+
+Not gated on skip_phase4, which is unconditionally true outside MachInst
+mode; that flag exists because the trampoline pass RENAMES registers, and
+this pass renames nothing.
+
+Corpus differential: 1 of 937 programs changes assembly, and it is the
+target. 19 focused tests.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../codegen/peephole/passes/loop_iv_spill.rs  | 1590 +++++++++++++++++
+ .../x86/codegen/peephole/passes/mod.rs        |   26 +-
+ 2 files changed, 1615 insertions(+), 1 deletion(-)
+ create mode 100644 src/backend/x86/codegen/peephole/passes/loop_iv_spill.rs
+
+diff --git a/src/backend/x86/codegen/peephole/passes/loop_iv_spill.rs b/src/backend/x86/codegen/peephole/passes/loop_iv_spill.rs
+new file mode 100644
+index 00000000..fef922fa
+--- /dev/null
++++ b/src/backend/x86/codegen/peephole/passes/loop_iv_spill.rs
+@@ -0,0 +1,1590 @@
++//! Loop induction-variable spill coalescing.
++//!
++//! lccc's register allocator is a windowed linear scan: it assigns physical
++//! registers to values defined *within* the window, and a value whose web spans
++//! most of the function keeps its originating stack slot. In the LZ4
++//! match-extension loop that makes the induction variable `ip` round-trip
++//! through memory on every iteration:
++//!
++//! ```asm
++//! .LBB14:
++//!     movq 112(%rsp), %rcx        ; <- reload ip from a stack slot
++//!     movzbl (%rcx), %r8d
++//!     cmpb (%rbx), %r8b
++//!     jne .LBB16
++//! .LBB15:
++//!     addq $1, %rcx
++//!     movq  %rcx, 112(%rsp)       ; <- store ip back to the same slot
++//!     addq $1, %rbx
++//!     cmpq 56(%rsp), %rcx
++//!     jb   .LBB14
++//! ```
++//!
++//! Seven instructions per iteration, three of which touch memory. The store and
++//! the reload are a *store-to-load forwarding round trip on the loop's own
++//! recurrence*: `ip` cannot advance faster than the ~5-cycle forward, so the IV
++//! chain — not the two byte loads — sets the loop's throughput. Every oracle
++//! keeps both pointers in registers.
++//!
++//! Note what is NOT happening here: `%rcx` is already live from the reload
++//! through the increment to the store. The allocator never lost the register; it
++//! re-synchronised memory and register on every iteration for no reason. So
++//! this pass needs no register allocation at all — it hoists the reload out of
++//! the loop and sinks the store to the exits:
++//!
++//! ```asm
++//!     movq 112(%rsp), %rcx        ; <- new: once, on the entry edge
++//! .LBB14:
++//!     movzbl (%rcx), %r8d
++//!     cmpb (%rbx), %r8b
++//!     jne .Lcciv_st0              ; <- redirected through a store block
++//! .LBB15:
++//!     addq $1, %rcx
++//!     addq $1, %rbx
++//!     cmpq 56(%rsp), %rcx
++//!     jb   .LBB14
++//!     movq  %rcx, 112(%rsp)       ; <- new: the normal exit
++//!     ...
++//! .Lcciv_st0:                     ; <- new: the early exit
++//!     movq  %rcx, 112(%rsp)
++//!     jmp .LBB16
++//! ```
++//!
++//! # Why it is safe
++//!
++//! The rewrite is **transparent to the loop body**: the register holds the same
++//! value at every program point inside the loop, before and after. Per iteration
++//! the original establishes `R = mem[slot]`, updates it, and writes it back; the
++//! rewrite establishes `R` once in the preheader and carries it. Because nothing
++//! inside the loop writes the slot the two agree at loop entry, and every update
++//! in between is shared. So the obligations are all about the slot, not the
++//! register:
++//!
++//! 1. **The slot's value at loop entry is its value in the preheader.** Nothing
++//!    between the two writes it (they are adjacent lines), nothing in the loop
++//!    writes it, and its address is never taken so nothing can alias it.
++//! 2. **Nothing else in the loop reads the slot.** After the first iteration the
++//!    slot holds the *initial* value, so a second reader would see a stale IV.
++//! 3. **Every exit writes the slot** with the final register value.
++//! 4. **The reload is the header's first instruction and the header has a single
++//!    fallthrough entry**, which is what makes the hoist a move across a block
++//!    boundary with nothing in between.
++//!
++//! The one obligation the *register* side imposes is that no instruction in the
++//! loop may clobber `R` behind the pass's back. In the original the next
++//! iteration's reload would repair any stray write; in the rewrite nothing does.
++//! [`is_iv_chain_step`] decides that, and it is deliberately narrow.
++
++use super::super::types::*;
++use super::helpers::*;
++use super::relay_and_lea::{function_range, split_two_operands};
++
++/// `%rsp`'s family id ([`register_family_fast`] order: rax rcx rdx rbx rsp rbp).
++const REG_RSP: RegId = 4;
++/// `%rbp`'s family id.
++const REG_RBP: RegId = 5;
++
++/// Byte width of the slot traffic this pass rewrites.
++///
++/// Only a register-for-register `mov` of the same width on both ends is
++/// handled, so the hoisted load and the sunk store write exactly the bits the
++/// original pair did. A narrower store would zero-extend on the way back and
++/// change the value the reload reads; a wider one would introduce bits the
++/// original never produced.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum SlotWidth {
++    W32,
++    W64,
++}
++
++impl SlotWidth {
++    fn mnemonic(self) -> &'static str {
++        match self {
++            SlotWidth::W32 => "movl",
++            SlotWidth::W64 => "movq",
++        }
++    }
++
++    /// The AT&T register token for this width, e.g. `%rcx` or `%ecx`.
++    fn reg(self, fam: RegId) -> &'static str {
++        let row = match self {
++            SlotWidth::W32 => 1,
++            SlotWidth::W64 => 0,
++        };
++        REG_NAMES[row][fam as usize]
++    }
++
++    fn from_mnemonic(m: &str) -> Option<Self> {
++        match m {
++            "movl" => Some(SlotWidth::W32),
++            "movq" => Some(SlotWidth::W64),
++            _ => None,
++        }
++    }
++}
++
++/// A `mov` between a frame slot and a register, parsed.
++#[derive(Clone, Copy)]
++struct SlotMov<'a> {
++    width: SlotWidth,
++    /// `disp(%rsp)` / `disp(%rbp)` — the slot, verbatim, so the load and the
++    /// store are compared by text rather than by a re-parsed number.
++    slot: &'a str,
++    reg: RegId,
++    /// `true` when the register is the source (the store form).
++    is_store: bool,
++}
++
++/// The frame-relative memory operand of `op`, if it is exactly one.
++///
++/// The displacement is optional and may be negative, so the reference is found
++/// by locating the parenthesis rather than by matching a prefix. Anything that
++/// is not literally `disp(%rsp)` or `disp(%rbp)` is rejected — in particular
++/// `(%rax)`, `(%rax,%rbx,4)`, `disp(%rip)` and a segment override — because
++/// this pass hoists the access out of the loop, which is only sound for a
++/// location the frame fixes.
++fn as_frame_slot(op: &str) -> Option<&str> {
++    let open = op.find('(')?;
++    if !op.ends_with(')') || op[open + 1..].contains('(') {
++        return None;
++    }
++    if &op[open + 1..op.len() - 1] != "%rsp" && &op[open + 1..op.len() - 1] != "%rbp" {
++        return None;
++    }
++    // The displacement must be a plain integer literal, so that two spellings
++    // of the same slot can never be compared as different addresses.
++    let disp = &op[..open];
++    if !disp.is_empty() && disp.parse::<i64>().is_err() {
++        return None;
++    }
++    Some(op)
++}
++
++/// Parse `mov{l,q} disp(%rsp|%rbp), %reg` and its mirror.
++///
++/// The slot must be frame-relative to `%rsp` or `%rbp`. Anything else —
++/// `(%rax)`, a segment override, a RIP-relative operand — is rejected rather
++/// than guessed at, because this pass hoists the access out of the loop and
++/// that is only sound for a location whose address the frame fixes.
++fn parse_slot_mov<'a>(t: &'a str) -> Option<SlotMov<'a>> {
++    let (mnem, rest) = t.split_once(' ')?;
++    let width = SlotWidth::from_mnemonic(mnem)?;
++    let (src, dst) = split_two_operands(rest)?;
++    let as_reg = |op: &str| -> Option<RegId> {
++        let fam = register_family_fast(op);
++        if fam == REG_NONE || fam > REG_GP_MAX {
++            None
++        } else {
++            Some(fam)
++        }
++    };
++    if let (Some(slot), Some(reg)) = (as_frame_slot(src), as_reg(dst)) {
++        Some(SlotMov {
++            width,
++            slot,
++            reg,
++            is_store: false,
++        })
++    } else if let (Some(reg), Some(slot)) = (as_reg(src), as_frame_slot(dst)) {
++        Some(SlotMov {
++            width,
++            slot,
++            reg,
++            is_store: true,
++        })
++    } else {
++        None
++    }
++}
++
++/// True when `t` uses `slot` as a memory operand.
++///
++/// `112(%rsp)` is the slot; `1112(%rsp)` and `112(%rsp,%rax,1)` are different
++/// addresses and must not match, so the reference has to close immediately.
++fn mentions_slot(t: &str, slot: &str) -> bool {
++    let mut from = 0usize;
++    while let Some(rel) = t[from..].find(slot) {
++        let at = from + rel;
++        // `1112(%rsp)` contains `112(%rsp)` as a substring but names a
++        // different address, so a match whose preceding byte continues the
++        // displacement literal is not a reference to our slot.
++        if at > 0 && matches!(t.as_bytes()[at - 1], b'0'..=b'9' | b'-') {
++            from = at + 1;
++            continue;
++        }
++        let after = &t[at + slot.len()..];
++        // The reference closes right here: either the operand ends (`)`), the
++        // operand list continues (`,`), or the line does.
++        if after.is_empty() || after.starts_with(')') || after.starts_with(',') {
++            return true;
++        }
++        from = at + 1;
++    }
++    false
++}
++
++/// True when `t` takes the address of `slot` (`leaq 112(%rsp), %rax`).
++///
++/// If the address is never formed, no pointer can name the slot, and therefore
++/// no store *through* a pointer inside the loop can alias it. That is what makes
++/// "nothing in the loop writes the slot" a whole-program statement rather than
++/// a statement about the text we happened to scan.
++fn takes_slot_address(t: &str, slot: &str) -> bool {
++    t.starts_with("lea") && mentions_slot(t, slot)
++}
++
++/// True when `t` moves the frame base, which would relocate the slot.
++fn perturbs_frame(t: &str) -> bool {
++    if t.starts_with("leave")
++        || t.starts_with("enter")
++        || t.starts_with("push")
++        || t.starts_with("pop")
++    {
++        return true;
++    }
++    // A write to the frame base relocates the slot. Read from the destination
++    // operand rather than from `get_dest_reg`, whose classification is not
++    // meaningful for every instruction kind.
++    split_two_operands(t.split_once(' ').map_or("", |(_, r)| r))
++        .is_some_and(|(_, dst)| dst == "%rsp" || dst == "%rbp")
++}
++
++/// Is `t` a step of the induction variable's own chain?
++///
++/// The pass carries the register across the back edge instead of reloading it,
++/// so it must own every write to that family inside the loop. In the original
++/// the next iteration's reload silently repaired any stray write; in the rewrite
++/// nothing does, so an unrecognised writer is a miscompile.
++///
++/// Accepted: a binary op whose destination is the family and whose only source
++/// is an immediate or the family itself (`addq $1, %rcx`, `leaq 8(%rcx), %rcx`).
++/// That is the shape the allocator emits for an IV update. Everything else —
++/// `movq %rax, %rcx`, `popq %rcx`, `imulq`, a call, inline asm — returns false.
++fn is_iv_chain_step(info: &LineInfo, t: &str, fam: RegId) -> bool {
++    // Opaque to any analysis: it may clobber the family for its own reasons.
++    if info.kind == LineKind::InlineAsm {
++        return false;
++    }
++    let Some((mnem, rest)) = t.split_once(' ') else {
++        return false;
++    };
++    let wide = match mnem {
++        "addq" | "subq" | "leaq" | "andq" | "orrq" => true,
++        "addl" | "subl" | "leal" | "andl" | "orl" => false,
++        _ => return false,
++    };
++    let Some((src, dst)) = split_two_operands(rest) else {
++        return false;
++    };
++    let width = if wide { SlotWidth::W64 } else { SlotWidth::W32 };
++    if dst != width.reg(fam) {
++        return false;
++    }
++    // The source must be an immediate or the family itself. A memory source is
++    // rejected: it could alias the slot this pass stops maintaining.
++    if src.starts_with('$') {
++        return true;
++    }
++    if src == SlotWidth::W64.reg(fam) || src == SlotWidth::W32.reg(fam) {
++        return true;
++    }
++    // `disp(%rcx)`: a memory source based on the family itself. It cannot
++    // alias the slot, because the slot is `%rsp`/`%rbp`-relative and the family
++    // was already established not to be a frame base. An INDEX register is
++    // rejected: `disp(%rcx,%rax,8)` reads an arbitrary address.
++    src.find('(').is_some_and(|open| {
++        src[open + 1..]
++            .strip_suffix(')')
++            .is_some_and(|inner| !inner.contains(',') && inner.ends_with(SlotWidth::W64.reg(fam)))
++    })
++}
++
++/// A basic block: a half-open line range plus its resolved successors.
++#[derive(Clone)]
++struct Block {
++    /// Index of the label line, when the block opens with one.
++    label: Option<usize>,
++    /// Index of the block's first line, including the label when there is one.
++    start: usize,
++    /// One past the last line, up to but excluding the next block's label.
++    end: usize,
++    /// Line index of the terminator, when the block ends in one.
++    term: Option<usize>,
++    /// The block a conditional branch jumps to. Recorded separately from the
++    /// fallthrough because "the branch leaves the loop" and "some successor
++    /// leaves the loop" are different questions, and answering the second one
++    /// for a conditional branch silently turns its own BACK EDGE into an exit.
++    branch_target: Option<usize>,
++    succs: Vec<usize>,
++    /// Set when a branch target could not be resolved inside the function. Any
++    /// loop containing such an edge is rejected: its shape is not knowable.
++    unresolved_branch: bool,
++}
++
++/// The label name on `t`, when the line is one.
++fn label_name<'a>(t: &'a str) -> Option<&'a str> {
++    let name = t.strip_suffix(':')?;
++    if name.is_empty() || name.contains(char::is_whitespace) {
++        return None;
++    }
++    // A local label starts with `.`; a global one may start with a letter or
++    // `_`. Anything else (a directive, a quoted string) is not a label.
++    if name.starts_with('.')
++        || name.starts_with('_')
++        || name.starts_with(|c: char| c.is_alphabetic())
++    {
++        Some(name)
++    } else {
++        None
++    }
++}
++
++/// The label name on line `i`, when the line is one.
++fn label_at<'a>(store: &'a LineStore, infos: &[LineInfo], i: usize) -> Option<&'a str> {
++    if infos[i].is_nop() || infos[i].kind == LineKind::Directive {
++        return None;
++    }
++    label_name(infos[i].trimmed(store.get(i)))
++}
++
++/// Split `[lo, hi)` into basic blocks and resolve their successors.
++fn build_blocks(store: &LineStore, infos: &[LineInfo], lo: usize, hi: usize) -> Vec<Block> {
++    let mut labels: Vec<(usize, &str)> = Vec::new();
++    for i in lo..hi {
++        if let Some(name) = label_at(store, infos, i) {
++            labels.push((i, name));
++        }
++    }
++
++    let mut starts: Vec<usize> = labels.iter().map(|(i, _)| *i).collect();
++    if starts.first() != Some(&lo) {
++        starts.insert(0, lo);
++    }
++
++    let mut blocks: Vec<Block> = Vec::with_capacity(starts.len());
++    for (b, &start) in starts.iter().enumerate() {
++        let end = starts.get(b + 1).copied().unwrap_or(hi);
++        let label = labels.iter().find(|(i, _)| *i == start).map(|(i, _)| *i);
++        let mut term = None;
++        for i in start..end {
++            if infos[i].is_nop() || infos[i].kind == LineKind::Directive {
++                continue;
++            }
++            term = Some(i);
++        }
++        blocks.push(Block {
++            label,
++            start,
++            end,
++            term,
++            branch_target: None,
++            succs: Vec::new(),
++            unresolved_branch: false,
++        });
++    }
++
++    for b in 0..blocks.len() {
++        let Some(ti) = blocks[b].term else {
++            // No terminator at all: an empty or directive-only block falls
++            // through.
++            if b + 1 < blocks.len() {
++                blocks[b].succs.push(b + 1);
++            }
++            continue;
++        };
++        let t = infos[ti].trimmed(store.get(ti));
++        let resolve = |target: &str, blocks: &mut Vec<Block>| -> Option<usize> {
++            let hit = labels
++                .iter()
++                .position(|(_, n)| *n == target)
++                .and_then(|p| blocks.iter().position(|x| x.label == Some(labels[p].0)))?;
++            blocks[b].succs.push(hit);
++            Some(hit)
++        };
++        match infos[ti].kind {
++            LineKind::Ret => {}
++            LineKind::Jmp | LineKind::JmpIndirect => match extract_jump_target(t) {
++                Some(target) => {
++                    let target = target.to_string();
++                    blocks[b].branch_target = resolve(&target, &mut blocks);
++                    if blocks[b].branch_target.is_none() {
++                        blocks[b].unresolved_branch = true;
++                    }
++                }
++                None => blocks[b].unresolved_branch = true,
++            },
++            LineKind::CondJmp => {
++                let Some(target) = extract_jump_target(t) else {
++                    blocks[b].unresolved_branch = true;
++                    continue;
++                };
++                let target = target.to_string();
++                blocks[b].branch_target = resolve(&target, &mut blocks);
++                if blocks[b].branch_target.is_none() {
++                    blocks[b].unresolved_branch = true;
++                    continue;
++                }
++                if b + 1 < blocks.len() {
++                    blocks[b].succs.push(b + 1);
++                }
++            }
++            // A call returns; everything else falls through.
++            _ => {
++                if b + 1 < blocks.len() {
++                    blocks[b].succs.push(b + 1);
++                }
++            }
++        }
++    }
++    blocks
++}
++
++/// Dominator sets over the blocks reachable from the entry.
++///
++/// Returns `dom[b]` = the blocks that dominate `b`, including `b` itself, and
++/// the reachability vector. Unreachable blocks get an empty set and are
++/// excluded from every loop this pass considers.
++fn dominators(blocks: &[Block], entry: usize) -> (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<bool>) {
++    let n = blocks.len();
++    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
++    for (b, blk) in blocks.iter().enumerate() {
++        for &s in &blk.succs {
++            if s < n && s != b {
++                preds[s].push(b);
++            }
++        }
++    }
++
++    // Reverse postorder from the entry (iterative, to avoid deep recursion).
++    let mut visited = vec![false; n];
++    let mut post: Vec<usize> = Vec::with_capacity(n);
++    let mut stack = vec![(entry, 0usize)];
++    visited[entry] = true;
++    while let Some((b, next)) = stack.pop() {
++        if next < blocks[b].succs.len() {
++            stack.push((b, next + 1));
++            let s = blocks[b].succs[next];
++            if !visited[s] {
++                visited[s] = true;
++                stack.push((s, 0));
++            }
++        } else {
++            post.push(b);
++        }
++    }
++    post.reverse();
++
++    let mut dom: Vec<Vec<usize>> = vec![Vec::new(); n];
++    dom[entry] = vec![entry];
++    let mut changed = true;
++    while changed {
++        changed = false;
++        for &b in &post {
++            if b == entry {
++                continue;
++            }
++            let mut new_set: Option<Vec<usize>> = None;
++            for &p in &preds[b] {
++                if !visited[p] {
++                    continue;
++                }
++                new_set = Some(match new_set {
++                    None => dom[p].clone(),
++                    Some(cur) => dom[p].iter().copied().filter(|x| cur.contains(x)).collect(),
++                });
++            }
++            let Some(mut s) = new_set else { continue };
++            s.push(b);
++            s.sort_unstable();
++            s.dedup();
++            if s != dom[b] {
++                dom[b] = s;
++                changed = true;
++            }
++        }
++    }
++    (dom, preds, visited)
++}
++
++/// A candidate loop, already reduced to block indices.
++struct Loop {
++    header: usize,
++    members: Vec<bool>,
++}
++
++impl Loop {
++    fn contains(&self, b: usize) -> bool {
++        self.members.get(b).copied().unwrap_or(false)
++    }
++}
++
++/// Run the pass. Returns `true` when the unit was structurally rewritten, which
++/// invalidates every cached line index the driver holds.
++pub(super) fn promote_loop_iv_spill(store: &mut LineStore, infos: &mut Vec<LineInfo>) -> bool {
++    let trace = std::env::var("CCC_TRACE_IVSPILL").is_ok();
++    let len = store.len();
++    if len < 8 {
++        return false;
++    }
++    let mut i = 0usize;
++    while i < len {
++        if infos[i].is_nop() {
++            i += 1;
++            continue;
++        }
++        let Some((fstart, fend)) = function_range(store, infos, i) else {
++            i += 1;
++            continue;
++        };
++        if trace {
++            eprintln!("[ivspill] function at {fstart}..{fend}");
++        }
++        if try_function(store, infos, fstart, fend) {
++            return true;
++        }
++        i = fend.max(i + 1);
++    }
++    false
++}
++
++/// Attempt one rewrite in `[fstart, fend)`; return `true` if the unit changed.
++fn try_function(
++    store: &mut LineStore,
++    infos: &mut Vec<LineInfo>,
++    fstart: usize,
++    fend: usize,
++) -> bool {
++    let blocks = build_blocks(store, infos, fstart, fend);
++    if blocks.len() < 3 {
++        return false;
++    }
++    let (dom, _preds, reachable) = dominators(&blocks, 0);
++    if std::env::var("CCC_TRACE_IVSPILL").is_ok() {
++        let mut backs = 0;
++        for (l, blk) in blocks.iter().enumerate() {
++            for &h in &blk.succs {
++                if reachable[l] && h != l && dom[l].contains(&h) {
++                    eprintln!("[ivspill] back edge {l} -> {h}");
++                    backs += 1;
++                }
++            }
++        }
++        eprintln!("[ivspill] {} blocks, {backs} back edges", blocks.len());
++    }
++
++    for (latch, blk) in blocks.iter().enumerate() {
++        if blk.unresolved_branch || !reachable[latch] {
++            continue;
++        }
++        for &h in &blk.succs {
++            if h == latch || !reachable[h] || !dom[latch].contains(&h) {
++                continue;
++            }
++            // Natural loop: the header, plus everything that reaches the latch
++            // without passing through the header.
++            let mut members = vec![false; blocks.len()];
++            members[h] = true;
++            members[latch] = true;
++            let mut work = vec![latch];
++            while let Some(b) = work.pop() {
++                for (p, pb) in blocks.iter().enumerate() {
++                    if members[p] || !reachable[p] || !pb.succs.contains(&b) {
++                        continue;
++                    }
++                    members[p] = true;
++                    work.push(p);
++                }
++            }
++            let lp = Loop { header: h, members };
++            if rewrite_loop(store, infos, &blocks, &reachable, fstart, fend, &lp) {
++                return true;
++            }
++        }
++    }
++    false
++}
++
++/// Report a rejected candidate when `CCC_TRACE_IVSPILL` is set.
++///
++/// Every guard in [`rewrite_loop`] is a `return reject(..)` rather than a bare
++/// `false`, so "the pass did not fire" is always answerable with a reason
++/// instead of a guess. That is what makes the narrowness of this pass auditable:
++/// the guards are the specification, and a change in behaviour shows up as a
++/// changed reason rather than as silence.
++fn reject(why: &str) -> bool {
++    if std::env::var("CCC_TRACE_IVSPILL").is_ok() {
++        eprintln!("[ivspill] reject: {why}");
++    }
++    false
++}
++
++/// The pass's emission plan for one loop.
++struct Plan {
++    /// Line after which the exit sequence is emitted. That is the latch's
++    /// terminator, so the sequence sits on the path the loop falls out on.
++    tail: usize,
++    /// Label of the block holding the fallthrough store, when there is one.
++    fall_label: Option<String>,
++    /// Extra `label / store / jmp target` triples for exits that branch to a
++    /// block other than the fallthrough successor.
++    extra: Vec<(String, String)>,
++}
++
++/// Apply the rewrite to `lp`, or return false having changed nothing.
++#[allow(clippy::too_many_arguments)]
++fn rewrite_loop(
++    store: &mut LineStore,
++    infos: &mut Vec<LineInfo>,
++    blocks: &[Block],
++    reachable: &[bool],
++    fstart: usize,
++    fend: usize,
++    lp: &Loop,
++) -> bool {
++    let header = &blocks[lp.header];
++    let Some(hlabel) = header.label else {
++        return reject("header is the function's first block");
++    };
++
++    // ── Guard: exactly one predecessor edge from outside the loop, and it must
++    // be a physical FALLTHROUGH into the header.
++    //
++    // The fallthrough requirement is what makes the hoist trivially sound: the
++    // load lands immediately before the header's label and the reload it
++    // replaces is the header's first instruction, so nothing sits between them
++    // and no value can be clobbered in the gap.
++    let mut outside_preds: Vec<usize> = (0..blocks.len())
++        .filter(|&b| !lp.contains(b) && reachable[b] && blocks[b].succs.contains(&lp.header))
++        .collect();
++    outside_preds.sort_unstable();
++    if outside_preds.len() != 1 {
++        return reject("header does not have exactly one outside predecessor");
++    }
++    let pred = outside_preds[0];
++    if blocks[pred].end != hlabel {
++        return reject("the entry edge is not a physical fallthrough");
++    }
++    if let Some(ti) = blocks[pred].term {
++        if matches!(
++            infos[ti].kind,
++            LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
++        ) {
++            return reject("the predecessor does not fall through");
++        }
++    }
++
++    // ── Find the reload: the FIRST real instruction of the header.
++    //
++    // Anything else first would mean the hoist is not adjacent to the reload it
++    // replaces, and the value could be clobbered in between.
++    let mut reload: Option<(usize, SlotMov<'_>)> = None;
++    // `header.start` IS the label line when the block opens with one, and a
++    // label is not an instruction: scanning it would abort the match on the
++    // first line of every header.
++    let body_start = usize::from(header.label == Some(header.start)) + header.start;
++    for i in body_start..header.end {
++        if infos[i].is_nop() || infos[i].kind == LineKind::Directive {
++            continue;
++        }
++        match parse_slot_mov(infos[i].trimmed(store.get(i))) {
++            Some(m) if !m.is_store => {
++                reload = Some((i, m));
++                break;
++            }
++            _ => return reject("the header does not open with the reload"),
++        }
++    }
++    let Some((reload_at, load)) = reload else {
++        return reject("no reload in the header");
++    };
++    let fam = load.reg;
++    if fam == REG_RSP || fam == REG_RBP || fam == REG_NONE {
++        return reject("the reload targets a frame base");
++    }
++    // Everything the emit phase needs is copied out here. `load.slot` borrows
++    // the store, and holding that borrow across the mutating phase below would
++    // make the pass unborrowcheckable; after this block nothing derived from
++    // store text is still alive.
++    let load_width = load.width;
++    let slot: String = load.slot.to_string();
++
++    // ── Find the single matching store inside the loop.
++    let mut store_at: Option<usize> = None;
++    for (b, blk) in blocks.iter().enumerate() {
++        if !lp.contains(b) {
++            continue;
++        }
++        for i in blk.start..blk.end {
++            if infos[i].is_nop() || infos[i].kind == LineKind::Directive {
++                continue;
++            }
++            let t = infos[i].trimmed(store.get(i));
++            let Some(m) = parse_slot_mov(t) else { continue };
++            if !m.is_store {
++                continue;
++            }
++            if m.slot != slot.as_str() {
++                continue;
++            }
++            if m.width != load_width || m.reg != fam {
++                return reject("the store width or register does not match the reload");
++            }
++            if store_at.is_some() {
++                return reject("more than one store to the slot inside the loop");
++            }
++            store_at = Some(i);
++        }
++    }
++    let Some(store_at) = store_at else {
++        return reject("no store to the slot inside the loop");
++    };
++
++    // ── Enumerate every edge that leaves the loop.
++    //
++    // The branch and the fallthrough of a conditional terminator are DIFFERENT
++    // edges and are tested separately. Reading "some successor leaves the loop"
++    // would classify the latch's own back edge as an exit, because the
++    // fallthrough beside it does leave.
++    let last = (0..blocks.len())
++        .filter(|&b| lp.contains(b))
++        .max()
++        .unwrap_or(lp.header);
++    let latch_term = blocks[last].term;
++    let falls_out = latch_term.is_none_or(|ti| {
++        !matches!(
++            infos[ti].kind,
++            LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
++        )
++    });
++    let fall_succ = last + 1;
++    let fall_label = if falls_out {
++        if fall_succ >= blocks.len() || lp.contains(fall_succ) || !reachable[fall_succ] {
++            return reject("the fallthrough exit is not a resolvable block");
++        }
++        blocks[fall_succ].label.map(|_| ())
++    } else {
++        None
++    };
++    let fall_label_name = fall_label.map(|()| {
++        blocks[fall_succ]
++            .label
++            .map(|i| store.get(i).trim_end().trim_end_matches(':').to_string())
++            .unwrap_or_default()
++    });
++
++    let mut jump_exits: Vec<(usize, String)> = Vec::new();
++    for (b, blk) in blocks.iter().enumerate() {
++        if !lp.contains(b) || b == last {
++            continue;
++        }
++        let Some(ti) = blk.term else { continue };
++        let t = infos[ti].trimmed(store.get(ti));
++        match infos[ti].kind {
++            LineKind::Jmp => {
++                let Some(target) = extract_jump_target(t) else {
++                    return reject("unresolvable jmp");
++                };
++                if blk.succs.first().is_some_and(|&s| !lp.contains(s)) {
++                    jump_exits.push((ti, target.to_string()));
++                }
++            }
++            LineKind::CondJmp => {
++                let Some(target) = extract_jump_target(t) else {
++                    return reject("unresolvable conditional branch");
++                };
++                if blk.branch_target.is_some_and(|bt| !lp.contains(bt)) {
++                    jump_exits.push((ti, target.to_string()));
++                }
++                if b + 1 < blocks.len() && !lp.contains(b + 1) {
++                    // An exit that falls out of a block that is not the latch.
++                    // Its store must land after this terminator too, and the
++                    // emission point is per-terminator rather than per-loop, so
++                    // this shape is left to a later iteration of the driver
++                    // rather than half-handled here.
++                    return reject("a non-latch block falls out of the loop");
++                }
++            }
++            _ => {}
++        }
++    }
++    if jump_exits.is_empty() && !falls_out {
++        return reject("the loop has no exit");
++    }
++
++    // ── Guard: the loop must not perturb the frame, alias the slot, or clobber
++    // the register family.
++    for (b, blk) in blocks.iter().enumerate() {
++        if !lp.contains(b) {
++            continue;
++        }
++        for i in blk.start..blk.end {
++            if infos[i].is_nop() || infos[i].kind == LineKind::Directive {
++                continue;
++            }
++            let info = &infos[i];
++            let t = info.trimmed(store.get(i));
++
++            if takes_slot_address(t, &slot) {
++                return reject("the loop takes the slot's address");
++            }
++            if i != reload_at && i != store_at && mentions_slot(t, &slot) {
++                return reject("the slot is read or written elsewhere in the loop");
++            }
++            if perturbs_frame(t) {
++                return reject("the loop moves the frame base");
++            }
++            match info.kind {
++                // A call clobbers caller-saved families and can alias through a
++                // pointer; a `ret` inside the loop means the slot's final value
++                // is unobservable but the exit analysis does not model it.
++                LineKind::Ret | LineKind::JmpIndirect | LineKind::InlineAsm | LineKind::Call => {
++                    return reject("the loop contains a call, ret or inline asm");
++                }
++                _ => {}
++            }
++            if (info.reg_refs & (1u16 << fam)) != 0
++                && writes_family_full(info, t, fam)
++                && i != reload_at
++                && i != store_at
++                && !is_iv_chain_step(info, t, fam)
++            {
++                return reject("the loop clobbers the IV register outside its own chain");
++            }
++        }
++    }
++
++    // ── Guard: the slot's address is never taken anywhere in the function, so
++    // no pointer can alias it. Checked function-wide, not just in the loop,
++    // because a pointer formed before the loop is enough to break this.
++    for i in fstart..fend {
++        if infos[i].is_nop() || infos[i].kind == LineKind::Directive {
++            continue;
++        }
++        if takes_slot_address(infos[i].trimmed(store.get(i)), &slot) {
++            return reject("the slot's address is taken somewhere in the function");
++        }
++    }
++
++    // ── Plan the emission.
++    let indent = "    ";
++    let reg_w = load_width.reg(fam);
++    let store_text = format!("{indent}{} {}, {}", load_width.mnemonic(), reg_w, slot);
++
++    // One fresh label per branch that must be redirected. Allocating them
++    // BEFORE any rewrite is what keeps a branch and the block serving it from
++    // drifting apart.
++    let mut plan_labels: Vec<String> = Vec::new();
++    for _ in &jump_exits {
++        plan_labels.push(unique_exit_label(store, infos, "Lcciv_st"));
++    }
++    let fall_store_label = if falls_out {
++        Some(unique_exit_label(store, infos, "Lcciv_st"))
++    } else {
++        None
++    };
++
++    let mut extra: Vec<(String, String)> = Vec::new();
++    let mut branches: Vec<(usize, String)> = Vec::new();
++    for ((line, target), label) in jump_exits.iter().zip(plan_labels.iter()) {
++        // A branch that already targets the fallthrough successor needs no new
++        // block: the store now sits immediately before that block's label, so
++        // redirecting the branch to the store's own label routes it through the
++        // store and into the original target with no extra jump at all. This is
++        // the shape the LZ4 early exit has.
++        if falls_out && Some(target.as_str()) == fall_label_name.as_deref() {
++            branches.push((*line, fall_store_label.clone().unwrap_or_default()));
++            continue;
++        }
++        branches.push((*line, label.clone()));
++        extra.push((label.clone(), target.clone()));
++    }
++
++    let tail = latch_term.map(|t| t + 1).unwrap_or(hlabel + 1);
++    let plan = Plan {
++        tail,
++        fall_label: fall_store_label,
++        extra,
++    };
++
++    // ── Emit. Deletions and branch rewrites move no index, so they go first.
++    mark_nop(&mut infos[reload_at]);
++    mark_nop(&mut infos[store_at]);
++    let mut rewrites: Vec<(usize, String)> = Vec::new();
++    for (line, label) in &branches {
++        let t = infos[*line].trimmed(store.get(*line));
++        let Some(target) = extract_jump_target(t) else {
++            return reject("branch rewrite lost its target");
++        };
++        rewrites.push((*line, t.replacen(target, label, 1)));
++    }
++    for (line, text) in rewrites {
++        store.replace(line, text);
++    }
++
++    // The exit sequence, emitted at the latch's fallthrough. Ordering inside it
++    // is load-bearing: each extra block ends in an unconditional jump so it can
++    // never fall into the next one, and when extra blocks exist the latch's own
++    // fallthrough must SKIP them, which costs one unconditional jump on a path
++    // that leaves the loop exactly once.
++    let mut exit_lines: Vec<String> = Vec::new();
++    if !plan.extra.is_empty() && plan.fall_label.is_some() {
++        exit_lines.push(format!("{indent}jmp {}", plan.fall_label.as_ref().unwrap()));
++    }
++    for (label, target) in &plan.extra {
++        exit_lines.push(format!("{label}:"));
++        exit_lines.push(store_text.clone());
++        exit_lines.push(format!("{indent}jmp {target}"));
++    }
++    if let Some(label) = &plan.fall_label {
++        exit_lines.push(format!("{label}:"));
++        exit_lines.push(store_text.clone());
++    }
++    let load_text = format!("{indent}{} {}, {}", load_width.mnemonic(), slot, reg_w);
++
++    // Both vecs grow together: the pass contract is `infos.len() == store.len()`,
++    // and `infos` is indexed by the same positions. Highest index first, so
++    // every index computed above stays valid.
++    let has_exits = !exit_lines.is_empty();
++    let mut inserts: Vec<(usize, Vec<String>)> = vec![(plan.tail, exit_lines)];
++    if has_exits {
++        inserts.push((hlabel, vec![load_text]));
++    }
++    inserts.sort_by(|a, b| b.0.cmp(&a.0));
++    for (at, lines) in inserts {
++        for (k, line) in lines.into_iter().enumerate() {
++            store.insert_line(at + k, line.clone());
++            infos.insert(at + k, classify_line(&line));
++        }
++    }
++    true
++}
++
++/// A label name that appears nowhere in the unit.
++///
++/// lccc inlines, so one assembly unit can hold several textual copies of the
++/// same callee body and therefore of the same `.LBB*` labels. A generated label
++/// that collides silently merges two blocks in the assembler's view, so
++/// uniqueness is checked against the WHOLE emitted text rather than against the
++/// function being rewritten.
++fn unique_exit_label(store: &LineStore, infos: &[LineInfo], base: &str) -> String {
++    let mut k = 0usize;
++    loop {
++        let name = format!(".{base}{k}");
++        let taken = (0..store.len()).any(|i| {
++            !infos[i].is_nop()
++                && infos[i]
++                    .trimmed(store.get(i))
++                    .strip_suffix(':')
++                    .is_some_and(|l| l == name)
++        });
++        if !taken {
++            return name;
++        }
++        k += 1;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Collapse runs of spaces so assertions do not depend on operand padding.
++    ///
++    /// lccc aligns `movq  %rcx, 112(%rsp)` with two spaces. Asserting on the
++    /// one-space spelling matches nothing at all, which turns every "this must
++    /// survive" test into a silent `0 == 1` failure that looks like a pass bug.
++    fn norm(s: &str) -> String {
++        let mut out = String::with_capacity(s.len());
++        let mut prev_space = false;
++        for c in s.chars() {
++            let sp = c == ' ' || c == '\t';
++            if sp {
++                if !prev_space {
++                    out.push(' ');
++                }
++            } else {
++                out.push(c);
++            }
++            prev_space = sp;
++        }
++        out
++    }
++
++    /// Run the pass over `body` and return the resulting text, space-normalised.
++    fn run(body: &str) -> String {
++        let asm = format!("    .text\n{body}    .cfi_endproc\n");
++        let mut store = LineStore::new(asm);
++        let mut infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        promote_loop_iv_spill(&mut store, &mut infos);
++        norm(
++            &(0..store.len())
++                .filter(|&i| !infos[i].is_nop())
++                .map(|i| store.get(i).to_string())
++                .collect::<Vec<_>>()
++                .join("\n"),
++        )
++    }
++
++    /// A minimal well-formed function around a lz4-shaped loop.
++    ///
++    /// `guard` is spliced into the header and `body` into the latch, so both
++    /// land INSIDE the loop. (An earlier version of this fixture appended
++    /// `body` after the epilogue's `ret`, where it is dead code, and the four
++    /// "an extra instruction inside the loop blocks the rewrite" tests passed
++    /// without ever placing an extra instruction inside a loop.)
++    fn lz4_like(guard: &str, body: &str) -> String {
++        let body = if body.is_empty() {
++            String::new()
++        } else if body.ends_with('\n') {
++            body.to_string()
++        } else {
++            format!("{body}\n")
++        };
++        format!(
++            concat!(
++                "    .globl main\n",
++                "    .type main, @function\n",
++                "main:\n",
++                "    .cfi_startproc\n",
++                "    subq $64, %rsp\n",
++                "    movq %rdi, 112(%rsp)\n",
++                "    movq %rsi, 56(%rsp)\n",
++                "    movq %rdx, %rbx\n",
++                "    .p2align 3\n",
++                ".LBB14:\n",
++                "    movq 112(%rsp), %rcx\n",
++                "{guard}",
++                "    jne .LBB16\n",
++                ".LBB15:\n",
++                "    addq $1, %rcx\n",
++                "    movq  %rcx, 112(%rsp)\n",
++                "    addq $1, %rbx\n",
++                "    cmpq 56(%rsp), %rcx\n",
++                "    jb   .LBB14\n",
++                ".LBB16:\n",
++                "    movq %rbx, %rsi\n",
++                "    movq 112(%rsp), %rax\n",
++                "    addq %rsp, %rax\n",
++                "    leave\n",
++                "    ret\n",
++                "{body}",
++            ),
++            guard = guard,
++            body = body
++        )
++    }
++
++    const GUARD: &str = concat!("    movzbl (%rcx), %r8d\n", "    cmpb (%rbx), %r8b\n",);
++
++    // ── The transformation ────────────────────────────────────────────────
++
++    /// The target shape, end to end.
++    ///
++    /// The three assertions are the whole contract: the reload is hoisted onto
++    /// the entry edge, the in-loop store is GONE, and the store reappears on
++    /// the loop's fallthrough. A pass that only removed the store would leave
++    /// the loop-carried value in memory and win nothing; one that only hoisted
++    /// the load would drop the final value.
++    #[test]
++    fn the_lz4_loop_loses_its_store_forwarding_round_trip() {
++        let out = run(&lz4_like(GUARD, ""));
++        assert_eq!(
++            out.matches("movq 112(%rsp), %rcx").count(),
++            1,
++            "exactly one reload survives, and it is the hoisted one:\n{out}"
++        );
++        assert_eq!(
++            out.matches("movq %rcx, 112(%rsp)").count(),
++            1,
++            "exactly one store survives, and it is on an exit:\n{out}"
++        );
++        // The hoisted load must be BEFORE the header label, so it runs once.
++        let load = out.find("movq 112(%rsp), %rcx").unwrap();
++        let header = out.find(".LBB14:").unwrap();
++        assert!(load < header, "the load must precede the header:\n{out}");
++        // The store must be AFTER the latch's back edge, i.e. outside the loop.
++        let store = out.find("movq %rcx, 112(%rsp)").unwrap();
++        let back = out.find("jb .LBB14").unwrap();
++        assert!(store > back, "the store must sit outside the loop:\n{out}");
++        // The back edge itself must be retained; removing it stops iteration.
++        assert!(
++            out.contains("jb .LBB14"),
++            "the back edge must survive:\n{out}"
++        );
++    }
++
++    /// The conditional early exit must be routed through the store.
++    ///
++    /// This is the case that separates a correct rewrite from a plausible one.
++    /// Leaving `jne .LBB16` alone makes the early exit skip the store, and the
++    /// value of `ip` after a short match is then the PREVIOUS one — wrong
++    /// output, no crash, no assembler complaint.
++    ///
++    /// It also pins the shape. The early exit already targets the loop's
++    /// fallthrough successor, so the store block is placed immediately before
++    /// that block's label and the branch is redirected to the store's own
++    /// label. The store then falls straight through into the original target:
++    /// the early exit costs ONE added `mov` and no extra jump, on a path that
++    /// leaves the loop once.
++    #[test]
++    fn the_early_exit_is_routed_through_the_store_without_an_extra_jump() {
++        let out = run(&lz4_like(GUARD, ""));
++        assert!(
++            !out.contains("jne .LBB16"),
++            "the early exit must not still target the post-loop block:\n{out}"
++        );
++        let name = out
++            .lines()
++            .map(str::trim)
++            .find_map(|l| l.strip_prefix(".Lcciv_st").map(|_| l.trim_end_matches(':')))
++            .expect("an exit store block must be generated");
++        assert!(
++            out.contains(&format!("jne {name}")),
++            "the early exit must branch to the store block {name}:\n{out}"
++        );
++        // label, store, then the original target by fallthrough.
++        let at = out.find(&format!("{name}:")).unwrap();
++        let after = &out[at..];
++        let rest = after[name.len() + 1..].trim_start();
++        assert!(
++            rest.starts_with("movq %rcx, 112(%rsp)"),
++            "the block must store first:\n{after}"
++        );
++        let after_store = rest["movq %rcx, 112(%rsp)".len()..].trim_start();
++        assert!(
++            after_store.starts_with(".LBB16:"),
++            "the store must fall through into the original target:\n{after}"
++        );
++        assert!(
++            !after_store.contains("jmp .LBB16"),
++            "a jump here would be an avoidable cost on the exit path:\n{after}"
++        );
++    }
++
++    // ── Rejections: each guard is load-bearing ────────────────────────────
++
++    /// A second READER of the slot inside the loop must block the rewrite.
++    ///
++    /// After the first iteration the slot holds the value from BEFORE the loop,
++    /// not the current `ip`, so a `cmpq 112(%rsp), %rcx` would compare against a
++    /// stale value. This is the guard most likely to be dropped by anyone who
++    /// thinks in terms of the register rather than the slot.
++    #[test]
++    fn a_second_reader_of_the_slot_in_the_loop_blocks_the_rewrite() {
++        let guard = format!("{GUARD}    cmpq 112(%rsp), %rcx\n");
++        let out = run(&lz4_like(&guard, ""));
++        assert_eq!(
++            out.matches("movq %rcx, 112(%rsp)").count(),
++            1,
++            "the in-loop store must survive when the slot has another reader:\n{out}"
++        );
++    }
++
++    /// A second WRITER of the slot inside the loop must block it: two writers
++    /// mean the value the reload reads is not the one the hoist captured.
++    #[test]
++    fn a_second_writer_of_the_slot_in_the_loop_blocks_the_rewrite() {
++        let body = "    movq %rax, 112(%rsp)\n";
++        let out = run(&lz4_like(GUARD, body));
++        assert!(
++            out.contains("movq %rcx, 112(%rsp)"),
++            "the original in-loop store must survive:\n{out}"
++        );
++    }
++
++    /// A writer of the IV register that is not part of its own chain must block
++    /// the rewrite.
++    ///
++    /// This is the obligation the register side really imposes. In the original
++    /// the next iteration's reload repairs any stray write to `%rcx`; in the
++    /// rewrite nothing does, so `movq %rax, %rcx` inside the loop would leave
++    /// the IV holding `%rax`'s value forever.
++    #[test]
++    fn a_foreign_writer_of_the_iv_register_blocks_the_rewrite() {
++        let body = "    movq %rax, %rcx\n";
++        let out = run(&lz4_like(GUARD, body));
++        assert!(
++            out.contains("movq %rcx, 112(%rsp)"),
++            "the in-loop store must survive:\n{out}"
++        );
++    }
++
++    /// A chain step IS accepted, so the guard above is not simply "reject every
++    /// write". Without this the pass would be correct and useless.
++    #[test]
++    fn an_iv_chain_step_does_not_block_the_rewrite() {
++        let guard = format!("{GUARD}    addq $2, %rcx\n");
++        let out = run(&lz4_like(&guard, ""));
++        assert_eq!(
++            out.matches("movq %rcx, 112(%rsp)").count(),
++            1,
++            "addq $2, %rcx is an IV step and must not veto:\n{out}"
++        );
++    }
++
++    /// A CALL inside the loop must block it: it clobbers caller-saved families
++    /// and can alias the slot through a pointer.
++    #[test]
++    fn a_call_inside_the_loop_blocks_the_rewrite() {
++        let guard = format!("{GUARD}    call helper\n");
++        let out = run(&lz4_like(&guard, ""));
++        assert!(
++            out.contains("movq %rcx, 112(%rsp)"),
++            "must not fire:\n{out}"
++        );
++    }
++
++    /// Taking the slot's ADDRESS anywhere in the function must block it, even
++    /// outside the loop: a pointer formed before the loop is enough for a store
++    /// through it to alias the slot.
++    #[test]
++    fn taking_the_slot_address_anywhere_blocks_the_rewrite() {
++        let body = "    leaq 112(%rsp), %r10\n";
++        let out = run(&lz4_like(GUARD, body));
++        assert!(
++            out.contains("movq %rcx, 112(%rsp)"),
++            "must not fire:\n{out}"
++        );
++    }
++
++    /// A `push`/`pop` or a write to the frame base inside the loop must block
++    /// it: the slot's address would move under the hoisted load.
++    #[test]
++    fn a_frame_perturbation_inside_the_loop_blocks_the_rewrite() {
++        for extra in ["    pushq %rax\n", "    addq $16, %rsp\n", "    leave\n"] {
++            let guard = format!("{GUARD}{extra}");
++            let out = run(&lz4_like(&guard, ""));
++            assert!(
++                out.contains("movq %rcx, 112(%rsp)"),
++                "{extra:?} must block the rewrite:\n{out}"
++            );
++        }
++    }
++
++    /// The reload must be the header's FIRST instruction. If anything precedes
++    /// it, the hoist is no longer adjacent to it and a value could be clobbered
++    /// in the gap.
++    #[test]
++    fn a_header_that_does_not_open_with_the_reload_is_left_alone() {
++        let asm = concat!(
++            "    .globl main\n",
++            "    .type main, @function\n",
++            "main:\n",
++            "    .cfi_startproc\n",
++            "    subq $64, %rsp\n",
++            "    movq %rdi, 112(%rsp)\n",
++            "    movq %rsi, 56(%rsp)\n",
++            ".LBB14:\n",
++            "    movq %rbx, %rax\n", // <-- stands between the hoist and the reload
++            "    movq 112(%rsp), %rcx\n",
++            "    addq $1, %rcx\n",
++            "    movq  %rcx, 112(%rsp)\n",
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb   .LBB14\n",
++            "    leave\n",
++            "    ret\n",
++        );
++        let out = run(asm);
++        assert!(
++            out.contains("movq 112(%rsp), %rcx"),
++            "the in-loop reload must survive:\n{out}"
++        );
++    }
++
++    /// Two outside predecessors mean the header is entered from two places, so
++    /// "the value in the preheader" is not a single thing. The pass refuses
++    /// rather than inventing a preheader block.
++    #[test]
++    fn a_header_with_two_outside_predecessors_is_left_alone() {
++        let asm = concat!(
++            "    .globl main\n",
++            "    .type main, @function\n",
++            "main:\n",
++            "    .cfi_startproc\n",
++            "    subq $64, %rsp\n",
++            "    movq %rdi, 112(%rsp)\n",
++            "    movq %rsi, 56(%rsp)\n",
++            "    testq %rdi, %rdi\n",
++            "    je .LBB14\n",
++            "    movq %rsi, 112(%rsp)\n",
++            "    jmp .LBB14\n",
++            ".LBB14:\n",
++            "    movq 112(%rsp), %rcx\n",
++            "    addq $1, %rcx\n",
++            "    movq  %rcx, 112(%rsp)\n",
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb   .LBB14\n",
++            "    leave\n",
++            "    ret\n",
++        );
++        let out = run(asm);
++        assert!(
++            out.contains("movq 112(%rsp), %rcx"),
++            "the in-loop reload must survive:\n{out}"
++        );
++    }
++
++    /// A store whose width or register differs from the reload is not the same
++    /// slot traffic and must not be folded into it.
++    #[test]
++    fn a_store_of_a_different_width_is_left_alone() {
++        let asm = concat!(
++            "    .globl main\n",
++            "    .type main, @function\n",
++            "main:\n",
++            "    .cfi_startproc\n",
++            "    subq $64, %rsp\n",
++            "    movq %rdi, 112(%rsp)\n",
++            "    movq %rsi, 56(%rsp)\n",
++            ".LBB14:\n",
++            "    movq 112(%rsp), %rcx\n",
++            "    addq $1, %rcx\n",
++            "    movl  %ecx, 112(%rsp)\n", // <-- 32-bit store, 64-bit load
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb   .LBB14\n",
++            "    leave\n",
++            "    ret\n",
++        );
++        let out = run(asm);
++        assert!(
++            out.contains("movl %ecx, 112(%rsp)"),
++            "a mismatched store must survive untouched:\n{out}"
++        );
++    }
++
++    /// A reload whose source register is neither `%rsp` nor `%rbp` is not a
++    /// frame slot, and hoisting it out of the loop would be unsound.
++    #[test]
++    fn a_non_frame_relative_reload_is_left_alone() {
++        let asm = concat!(
++            "    .globl main\n",
++            "    .type main, @function\n",
++            "main:\n",
++            "    .cfi_startproc\n",
++            "    movq %rdi, %rax\n",
++            "    movq %rsi, 56(%rsp)\n",
++            ".LBB14:\n",
++            "    movq (%rax), %rcx\n",
++            "    addq $1, %rcx\n",
++            "    movq  %rcx, (%rax)\n",
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb   .LBB14\n",
++            "    ret\n",
++        );
++        let out = run(asm);
++        assert!(out.contains("movq (%rax), %rcx"), "must not fire:\n{out}");
++    }
++
++    // ── Label uniqueness, under inlining ─────────────────────────────────
++
++    /// A generated label that collides with one already in the unit must be
++    /// disambiguated.
++    ///
++    /// lccc inlines, so one assembly unit can hold several textual copies of the
++    /// same callee body and therefore of the same `.LBB*` labels. Two blocks
++    /// sharing a label are silently merged by the assembler, and the merged
++    /// block keeps only the first predecessor set — which is a miscompile with
++    /// no diagnostic anywhere.
++    #[test]
++    fn a_colliding_exit_label_is_disambiguated() {
++        let asm = format!(
++            concat!(
++                "    .globl main\n",
++                "    .type main, @function\n",
++                "main:\n",
++                "    .cfi_startproc\n",
++                "    subq $64, %rsp\n",
++                "    movq %rdi, 112(%rsp)\n",
++                "    movq %rsi, 56(%rsp)\n",
++                ".Lcciv_st0:\n", // <-- already taken
++                "    nop\n",
++                ".LBB14:\n",
++                "    movq 112(%rsp), %rcx\n",
++                "{guard}",
++                "    jne .LBB16\n",
++                ".LBB15:\n",
++                "    addq $1, %rcx\n",
++                "    movq  %rcx, 112(%rsp)\n",
++                "    addq $1, %rbx\n",
++                "    cmpq 56(%rsp), %rcx\n",
++                "    jb   .LBB14\n",
++                ".LBB16:\n",
++                "    movq %rbx, %rsi\n",
++                "    leave\n",
++                "    ret\n",
++            ),
++            guard = GUARD
++        );
++        let out = run(&asm);
++        // The pre-existing label is untouched: still present, still alone, and
++        // still the one the generated code must NOT have reused.
++        assert_eq!(
++            out.matches(".Lcciv_st0:").count(),
++            1,
++            "the original label survives exactly once:\n{out}"
++        );
++        // The generated block took a free suffix, and the branch names THAT one.
++        let generated = out
++            .lines()
++            .map(str::trim)
++            .filter_map(|l| l.strip_prefix(".Lcciv_st").map(|_| l.trim_end_matches(':')))
++            .find(|n| *n != ".Lcciv_st0")
++            .unwrap_or_else(|| panic!("no disambiguated label was generated:\n{out}"));
++        assert_ne!(generated, ".Lcciv_st0", "must not reuse the taken name");
++        assert!(
++            out.contains(&format!("jne {generated}")),
++            "the early exit must branch to the NEW label {generated}:\n{out}"
++        );
++    }
++
++    /// Two functions in one unit, each carrying the same callee-local `.LBB*`
++    /// labels — the shape lccc's inliner produces — must not have their
++    /// generated labels merged.
++    ///
++    /// This is the case a two-function fixture that does NOT trigger the pass
++    /// cannot cover, and it is why uniqueness is checked against the whole unit
++    /// rather than the function being rewritten.
++    #[test]
++    fn an_inlined_duplicate_does_not_merge_generated_labels() {
++        let one = concat!(
++            "    .type inl, @function\n",
++            "inl:\n",
++            "    .cfi_startproc\n",
++            "    subq $64, %rsp\n",
++            "    movq %rdi, 112(%rsp)\n",
++            "    movq %rsi, 56(%rsp)\n",
++            "    movq %rdx, %rbx\n",
++            ".LBB14:\n",
++            "    movq 112(%rsp), %rcx\n",
++            "    movzbl (%rcx), %r8d\n",
++            "    cmpb (%rbx), %r8b\n",
++            "    jne .LBB16\n",
++            ".LBB15:\n",
++            "    addq $1, %rcx\n",
++            "    movq  %rcx, 112(%rsp)\n",
++            "    addq $1, %rbx\n",
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb   .LBB14\n",
++            ".LBB16:\n",
++            "    movq %rbx, %rsi\n",
++            "    leave\n",
++            "    ret\n",
++            "    .cfi_endproc\n",
++        );
++        let asm = format!("    .text\n{one}{one}    .cfi_endproc\n");
++        let mut store = LineStore::new(asm);
++        let mut infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        // Two rounds: the driver re-enters after a structural rewrite.
++        promote_loop_iv_spill(&mut store, &mut infos);
++        promote_loop_iv_spill(&mut store, &mut infos);
++        let out = norm(
++            &(0..store.len())
++                .filter(|&i| !infos[i].is_nop())
++                .map(|i| format!("{}\n", store.get(i)))
++                .collect::<String>(),
++        );
++        // Every generated label is unique across the whole unit.
++        let mut seen = std::collections::HashMap::new();
++        for line in out.lines() {
++            if let Some(name) = line.trim().strip_suffix(':') {
++                if name.starts_with(".Lcciv_") {
++                    *seen.entry(name.to_string()).or_insert(0) += 1;
++                }
++            }
++        }
++        assert!(
++            seen.values().all(|&c| c == 1),
++            "generated labels must be unique across the unit: {seen:?}\n{out}"
++        );
++        assert!(
++            seen.len() >= 2,
++            "both copies must have been rewritten: {out}"
++        );
++    }
++
++    // ── Unit-level parsing ────────────────────────────────────────────────
++
++    /// `112(%rsp)` must not match inside `1112(%rsp)`.
++    ///
++    /// A substring comparison here would make the "nothing else touches the
++    /// slot" guard fire on unrelated code — conservative, so not a
++    /// miscompile — but it would also make it fire on the pass's OWN hoisted
++    /// load after a later offset shift, and the guard is the specification, so
++    /// it is pinned exactly.
++    #[test]
++    fn slot_matching_respects_the_displacement() {
++        assert!(mentions_slot("    movq 112(%rsp), %rcx", "112(%rsp)"));
++        assert!(mentions_slot("    movq %rcx, 112(%rsp)", "112(%rsp)"));
++        assert!(mentions_slot("    cmpq -8(%rbp), %rax", "-8(%rbp)"));
++        assert!(!mentions_slot("    movq 1112(%rsp), %rcx", "112(%rsp)"));
++        assert!(!mentions_slot(
++            "    movq 112(%rsp,%rax,8), %rcx",
++            "112(%rsp)"
++        ));
++        assert!(!mentions_slot("    movq 112(%rbp), %rcx", "112(%rsp)"));
++    }
++
++    /// Only literal frame slots parse. A hoisted access is only sound where the
++    /// frame fixes the address.
++    #[test]
++    fn only_literal_frame_slots_parse() {
++        assert!(parse_slot_mov("movq 112(%rsp), %rcx").is_some());
++        assert!(parse_slot_mov("movq -8(%rbp), %rcx").is_some());
++        assert!(parse_slot_mov("movq (%rsp), %rcx").is_some());
++        assert!(parse_slot_mov("movq %rcx, 112(%rsp)").is_some());
++        assert!(parse_slot_mov("movq 112(%rsp,%rax,8), %rcx").is_none());
++        assert!(parse_slot_mov("movq (%rax), %rcx").is_none());
++        assert!(parse_slot_mov("movq 112(%rip), %rcx").is_none());
++        assert!(parse_slot_mov("movl 112(%rsp), %ecx").is_some());
++        assert!(parse_slot_mov("movb 112(%rsp), %cl").is_none());
++        assert!(parse_slot_mov("leaq 112(%rsp), %rax").is_none());
++    }
++
++    /// The IV chain step accepts exactly the shapes it claims to.
++    #[test]
++    fn iv_chain_steps_are_narrow() {
++        let info = |t: &str| classify_line(t);
++        for t in [
++            "    addq $1, %rcx",
++            "    addq $8, %rcx",
++            "    addl $1, %ecx",
++            "    subq $1, %rcx",
++            "    leaq 8(%rcx), %rcx",
++            "    andq $-1, %rcx",
++        ] {
++            assert!(
++                is_iv_chain_step(&info(t), t.trim(), 1),
++                "{t:?} must be a step"
++            );
++        }
++        for t in [
++            "    movq %rax, %rcx",      // a foreign source
++            "    movq %rax, 112(%rsp)", // not even a register write
++            "    imulq %rax, %rcx",     // not on the list at all
++            "    popq %rcx",            // implicit write
++            "    addq 112(%rsp), %rcx", // memory source: could alias the slot
++            "    addq $1, %rax",        // writes another family
++            "    addq $1, %cl",         // partial-width write
++        ] {
++            assert!(
++                !is_iv_chain_step(&info(t), t.trim(), 1),
++                "{t:?} must be rejected"
++            );
++        }
++    }
++
++    /// The exit label search scans the WHOLE unit, not the current function.
++    #[test]
++    fn exit_labels_are_unique_across_the_unit() {
++        let asm = ".Lcciv_st0:\n    nop\n.Lcciv_st1:\n    nop\n".to_string();
++        let store = LineStore::new(asm);
++        let infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        assert_eq!(unique_exit_label(&store, &infos, "Lcciv_st"), ".Lcciv_st2");
++    }
++}
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index 2c826348..7bf74c28 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -38,6 +38,7 @@ mod identical_blocks;
+ mod liveness;
+ mod load_op_fuse;
+ mod local_patterns;
++mod loop_iv_spill;
+ mod loop_trampoline;
+ mod memory_fold;
+ mod narrow_copy_fold;
+@@ -1598,8 +1599,31 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+         loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos)
+     };
+ 
++    // Phase 4a: Coalesce a loop induction variable that the windowed allocator
++    // left in a stack slot, so the loop stops round-tripping the IV through
++    // memory once per iteration. Runs after trampoline elimination, which
++    // removes the phi-shuffle blocks that would otherwise hide the reload/store
++    // pair, and before the local cleanup below, which folds the store we sink
++    // into a memory operand where it can.
++    //
++    // Returns `true` when it rewrote the unit, because `insert_line` shifts
++    // every later index and the driver must not reuse its own.
++    //
++    // Deliberately NOT gated on `skip_phase4`. That flag disables the whole of
++    // phase 4 because the trampoline pass RENAMES registers, which is not
++    // MachInst-safe; this pass renames nothing — it moves one load to the loop's
++    // entry edge and one store to its exits, both within a single function, and
++    // its guards are stated over the current text rather than over a register
++    // assignment. Tying it to `skip_phase4` would have left it permanently off,
++    // since `skip_phase4` is unconditionally true outside MachInst mode.
++    let iv_spill_changed = if sk("loop_iv_spill") {
++        false
++    } else {
++        loop_iv_spill::promote_loop_iv_spill(&mut store, &mut infos)
++    };
++
+     // Phase 4b: If trampoline elimination made changes, do another round of local cleanup.
+-    if trampoline_changed && !skip_phase4 {
++    if (trampoline_changed || iv_spill_changed) && !skip_phase4 {
+         let mut changed3 = true;
+         let mut pass_count3 = 0;
+         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
+-- 
+2.47.3
+
+From 4ea730dba86235331d66e43696c63d8aaafef743 Mon Sep 17 00:00:00 2001
+From: lccc-perf <perf@localhost>
+Date: Thu, 1 Oct 2026 10:42:53 +0000
+Subject: [PATCH 5/6] x86: close two loop-shape gaps in the loop-IV spill
+ coalescing pass
+
+Red-team findings on the pass added in the previous commit. Both were found
+by asking what the exit model does NOT see, not by a failing program.
+
+1. A loop with two back edges was treated as two loops.
+
+   Natural loops are per-latch, so with two latches the arm that reaches the
+   OTHER latch is executed on every iteration but belongs to neither loop.
+   Its register writes, and far worse its exits, were invisible. A loop is now
+   the UNION of the natural loops of every back edge to its header.
+
+2. A branch that is not a block's terminator but leaves the loop.
+
+   The exit model is stated over terminators, so a conditional early exit
+   emitted AHEAD of an unconditional jump was not an exit site at all. The pass
+   would hoist the reload, delete the latch's store, and let that path leave
+   carrying the PREVIOUS iteration's value. Now refused outright.
+
+   This is the same shape as LZ4's `jne .LBB16`, which IS a terminator and is
+   handled; the difference is structural, and the two tests
+   `a_mid_block_branch_out_of_the_loop_is_refused` and
+   `a_terminator_branch_to_a_loop_private_block_gets_a_store` pin both arms so
+   the guard cannot be satisfied by refusing every header jump out of the loop,
+   which would be 'correct' and would lose the whole optimization.
+
+An earlier draft also added a reachability analysis to reject blocks the
+header reaches that are private to the loop. It is removed: such a block is
+either reached by a terminator, in which case the exit enumeration already
+records it, or by a non-terminator, which finding 2 already refuses. The two
+cases are exhaustive, the analysis could reject nothing the terminator guard
+had not, and no test distinguished it from that guard. Redundant machinery with
+no discriminating test is the same mistake as the liveness memo reverted in an
+earlier round.
+
+Both new refusal tests were verified to FAIL against the un-guarded pass and
+pass against the guarded one, so they are regressions rather than assertions
+that merely happen to hold.
+
+Also corrects the label-uniqueness rationale. The original comment claimed
+lccc's inliner duplicates callee-local labels in one unit, which is why exit
+labels are searched across the whole unit. Measured: 0 of 935 corpus
+assemblies contain a duplicated local label, and a forced always_inline
+function called from two sites - fully inlined, no symbol, no remaining call -
+emits 8 distinct labels and no duplicate. The emitter renumbers per unit. The
+search stays (a collision is a silent miscompile and the cost is nil) but the
+comment no longer cites a defect that does not exist.
+
+Adds tests/bugs/loop_iv_spill_executes.sh: an end-to-end regression that
+compiles the one corpus program where the pass fires with it on and off,
+assembles each arm STANDALONE with as, links, runs both, and requires the
+checksum 29f49acaab81f800 plus exactly one reload and one store. It fails if
+the pass stops firing, so it cannot go vacuous.
+
+Re-measured after these changes: lz4_match_extend -22.45%, ratio 0.7755,
+11/11 paired wins, IQR [0.7647, 0.7955]. Corpus differential still 1 of 937.
+3951 unit tests pass.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../codegen/peephole/passes/loop_iv_spill.rs  | 359 ++++++++++++++++--
+ tests/bugs/loop_iv_spill_executes.sh          |  64 ++++
+ 2 files changed, 390 insertions(+), 33 deletions(-)
+ create mode 100755 tests/bugs/loop_iv_spill_executes.sh
+
+diff --git a/src/backend/x86/codegen/peephole/passes/loop_iv_spill.rs b/src/backend/x86/codegen/peephole/passes/loop_iv_spill.rs
+index fef922fa..b1617cab 100644
+--- a/src/backend/x86/codegen/peephole/passes/loop_iv_spill.rs
++++ b/src/backend/x86/codegen/peephole/passes/loop_iv_spill.rs
+@@ -299,6 +299,20 @@ fn is_iv_chain_step(info: &LineInfo, t: &str, fam: RegId) -> bool {
+     })
+ }
+ 
++/// The block whose label is `name`, if the function has one.
++fn label_block(
++    store: &LineStore,
++    infos: &[LineInfo],
++    blocks: &[Block],
++    name: &str,
++) -> Option<usize> {
++    blocks.iter().position(|b| {
++        b.label
++            .and_then(|l| label_name(infos[l].trimmed(store.get(l))))
++            .is_some_and(|n| n == name)
++    })
++}
++
+ /// A basic block: a half-open line range plus its resolved successors.
+ #[derive(Clone)]
+ struct Block {
+@@ -559,31 +573,35 @@ fn try_function(
+         return false;
+     }
+     let (dom, _preds, reachable) = dominators(&blocks, 0);
+-    if std::env::var("CCC_TRACE_IVSPILL").is_ok() {
+-        let mut backs = 0;
+-        for (l, blk) in blocks.iter().enumerate() {
+-            for &h in &blk.succs {
+-                if reachable[l] && h != l && dom[l].contains(&h) {
+-                    eprintln!("[ivspill] back edge {l} -> {h}");
+-                    backs += 1;
+-                }
+-            }
+-        }
+-        eprintln!("[ivspill] {} blocks, {backs} back edges", blocks.len());
+-    }
+ 
++    // Back edges: (latch, header) where the header dominates the latch.
++    //
++    // ALL back edges to one header are collected BEFORE any loop is formed.
++    // A per-latch natural loop is not the loop: with two latches, the arm that
++    // reaches the OTHER latch is executed on every iteration but is in neither
++    // natural loop, so its register writes and — far worse — its EXITS would be
++    // invisible to the scan below. A path leaving the loop without passing
++    // through a store block is a miscompile, so the loop is the union.
++    let mut latches: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+     for (latch, blk) in blocks.iter().enumerate() {
+         if blk.unresolved_branch || !reachable[latch] {
+             continue;
+         }
+         for &h in &blk.succs {
+-            if h == latch || !reachable[h] || !dom[latch].contains(&h) {
+-                continue;
++            if h != latch && reachable[h] && dom[latch].contains(&h) {
++                latches[h].push(latch);
+             }
+-            // Natural loop: the header, plus everything that reaches the latch
+-            // without passing through the header.
+-            let mut members = vec![false; blocks.len()];
+-            members[h] = true;
++        }
++    }
++
++    for header in 0..blocks.len() {
++        if latches[header].is_empty() {
++            continue;
++        }
++        // Union of the natural loops of every back edge to this header.
++        let mut members = vec![false; blocks.len()];
++        members[header] = true;
++        for &latch in &latches[header] {
+             members[latch] = true;
+             let mut work = vec![latch];
+             while let Some(b) = work.pop() {
+@@ -595,10 +613,32 @@ fn try_function(
+                     work.push(p);
+                 }
+             }
+-            let lp = Loop { header: h, members };
+-            if rewrite_loop(store, infos, &blocks, &reachable, fstart, fend, &lp) {
+-                return true;
+-            }
++        }
++
++        // A block the header reaches that is in NO natural loop is still
++        // executed during an iteration, and the member scan does not cover it.
++        // It needs no special case here, and that is worth stating rather than
++        // leaving to inspection. Take such a block `X`, reached from some block
++        // of the loop. Either:
++        //
++        //   * the edge to `X` is that block's TERMINATOR. The exit enumeration
++        //     below tests `branch_target` against loop membership, so `X` is
++        //     recorded as a jump exit and gets a store block, exactly as LZ4's
++        //     `.LBB16` does; or
++        //   * the edge to `X` is NOT the terminator -- a conditional early exit
++        //     emitted ahead of an unconditional jump. The guard in
++        //     `rewrite_loop` refuses that outright, because the exit model is
++        //     stated over terminators.
++        //
++        // Those two cases are exhaustive, so an earlier draft's separate
++        // "is `X` private to the loop" reachability analysis was redundant
++        // machinery: it could not reject anything the terminator guard had not
++        // already rejected, and it had no test that distinguished it from the
++        // guard. `a_loop_private_block_is_handled_or_refused` pins both arms.
++
++        let lp = Loop { header, members };
++        if rewrite_loop(store, infos, &blocks, &reachable, fstart, fend, &lp) {
++            return true;
+         }
+     }
+     false
+@@ -833,6 +873,23 @@ fn rewrite_loop(
+             if perturbs_frame(t) {
+                 return reject("the loop moves the frame base");
+             }
++            // The exit analysis below reasons about each block's TERMINATOR.
++            // A branch that is NOT the terminator -- a conditional early exit
++            // emitted ahead of an unconditional jump -- leaves the loop on a
++            // path no exit site covers, so the slot would not be written on it
++            // and the loop would exit carrying the PREVIOUS iteration's value.
++            // Refuse rather than reason about a shape the model cannot see.
++            if matches!(info.kind, LineKind::Jmp | LineKind::CondJmp) && Some(i) != blk.term {
++                let leaves_loop = match extract_jump_target(t) {
++                    Some(name) => {
++                        label_block(store, infos, blocks, name).is_none_or(|tb| !lp.contains(tb))
++                    }
++                    None => true,
++                };
++                if leaves_loop {
++                    return reject("a non-terminator branch leaves the loop");
++                }
++            }
+             match info.kind {
+                 // A call clobbers caller-saved families and can alias through a
+                 // pointer; a `ret` inside the loop means the slot's final value
+@@ -961,11 +1018,22 @@ fn rewrite_loop(
+ 
+ /// A label name that appears nowhere in the unit.
+ ///
+-/// lccc inlines, so one assembly unit can hold several textual copies of the
+-/// same callee body and therefore of the same `.LBB*` labels. A generated label
+-/// that collides silently merges two blocks in the assembler's view, so
+-/// uniqueness is checked against the WHOLE emitted text rather than against the
+-/// function being rewritten.
++/// The search is over the WHOLE unit rather than the function being rewritten,
++/// because a collision is not a diagnostic: the assembler merges the two blocks
++/// and keeps only the first predecessor set, which is a miscompile with nothing
++/// on stderr. The cost is one linear scan of lines already in cache, paid once
++/// per generated label.
++///
++/// **This is insurance, not a fix for an observed defect.** The original
++/// rationale was that lccc inlines, so one unit can hold several textual copies
++/// of a callee body and therefore of its `.LBB*` labels. That does not happen:
++/// the emitter renumbers block labels per unit, so an inlined body gets fresh
++/// numbers. Measured: 0 of 935 corpus assemblies contain a duplicated local
++/// label, and a forced `always_inline` function called from two sites -- fully
++/// inlined, no `f:` symbol, no remaining `call` -- also emits 8 distinct labels
++/// and no duplicate. The scan stays because the consequence of being wrong is a
++/// silent miscompile and the cost of being right is nil, but it must not be
++/// cited as though the hazard had been observed.
+ fn unique_exit_label(store: &LineStore, infos: &[LineInfo], base: &str) -> String {
+     let mut k = 0usize;
+     loop {
+@@ -1249,6 +1317,228 @@ mod tests {
+         );
+     }
+ 
++    /// A branch that is NOT a block's terminator but leaves the loop must be
++    /// refused, because the exit model does not cover it.
++    ///
++    /// ```asm
++    /// .LBB14:
++    ///     movq 112(%rsp), %rcx      <- reload
++    ///     testq %rbx, %rbx
++    ///     jne .LBB15a              <- leaves the loop, mid-block
++    ///     jmp .LBB15b              <- the block's actual terminator
++    /// .LBB15a:                     <- executed during an iteration
++    ///     addq $1, %rcx
++    ///     jmp .Lout                 <- ... and leaves WITHOUT storing
++    /// .LBB15b:
++    ///     addq $1, %rcx
++    ///     movq  %rcx, 112(%rsp)
++    ///     jb .LBB14
++    /// ```
++    ///
++    /// Only the LAST instruction of a block is treated as its terminator, so
++    /// `jne .LBB15a` is invisible to the exit enumeration: no store is placed
++    /// on that edge and the pass exits carrying the previous iteration's value.
++    /// The bug is invisible in the output too — `.LBB15a` keeps its own store in
++    /// variants of this shape, so the rewrite looks right and is wrong only when
++    /// that block has no store of its own.
++    #[test]
++    fn a_mid_block_branch_out_of_the_loop_is_refused() {
++        let asm = concat!(
++            "    .globl main\n",
++            "    .type main, @function\n",
++            "main:\n",
++            "    .cfi_startproc\n",
++            "    subq $64, %rsp\n",
++            "    movq %rdi, 112(%rsp)\n",
++            "    movq %rsi, 56(%rsp)\n",
++            "    movq %rdx, %rbx\n",
++            ".LBB14:\n",
++            "    movq 112(%rsp), %rcx\n",
++            "    movzbl (%rcx), %r8d\n",
++            "    testq %rbx, %rbx\n",
++            "    jne .LBB15a\n",
++            "    jmp .LBB15b\n",
++            ".LBB15a:\n",
++            "    addq $1, %rcx\n",
++            "    jmp .Lout\n",
++            ".LBB15b:\n",
++            "    addq $1, %rcx\n",
++            "    movq  %rcx, 112(%rsp)\n",
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb .LBB14\n",
++            ".Lout:\n",
++            "    movq %rbx, %rsi\n",
++            "    leave\n",
++            "    ret\n",
++        );
++        let out = run(asm);
++        assert!(
++            !out.contains(".Lcciv_st"),
++            "the pass must refuse a mid-block branch out of the loop:\n{out}"
++        );
++        assert!(
++            out.contains("movq 112(%rsp), %rcx") && out.contains("movq %rcx, 112(%rsp)"),
++            "the original reload and store must both survive untouched:\n{out}"
++        );
++    }
++
++    /// A loop-private block reached from the header is either handled or
++    /// refused — never silently ignored.
++    ///
++    /// ```asm
++    /// .LBB14:
++    ///     movq 112(%rsp), %rcx    <- reload
++    ///     jne .Lmid              <- a loop-private block
++    ///     jmp .LBB15
++    /// .Lmid:
++    ///     addq $1, %rcx           <- IV work ...
++    ///     jmp  .Lout              <- ... then leaves, storing nothing
++    /// .LBB15:
++    ///     addq $1, %rcx
++    ///     movq  %rcx, 112(%rsp)
++    ///     cmpq 56(%rsp), %rcx
++    ///     jb .LBB14
++    /// .Lout:
++    /// ```
++    ///
++    /// `.Lmid` is in no natural loop: it is not a latch and reaches no latch,
++    /// so the member scan never sees it. `jne .Lmid` is NOT the header's
++    /// terminator, so the exit model cannot place a store on it — and the pass
++    /// must refuse rather than hoist the reload and delete the latch's store
++    /// while `.Lmid` exits having written nothing.
++    #[test]
++    fn a_loop_private_block_is_handled_or_refused() {
++        let asm = concat!(
++            "    .globl main\n",
++            "    .type main, @function\n",
++            "main:\n",
++            "    .cfi_startproc\n",
++            "    subq $64, %rsp\n",
++            "    movq %rdi, 112(%rsp)\n",
++            "    movq %rsi, 56(%rsp)\n",
++            "    movq %rdx, %rbx\n",
++            ".LBB14:\n",
++            "    movq 112(%rsp), %rcx\n",
++            "    movzbl (%rcx), %r8d\n",
++            "    jne .Lmid\n",
++            "    jmp .LBB15\n",
++            ".Lmid:\n",
++            "    addq $1, %rcx\n",
++            "    jmp .Lout\n",
++            ".LBB15:\n",
++            "    addq $1, %rcx\n",
++            "    movq  %rcx, 112(%rsp)\n",
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb .LBB14\n",
++            ".Lout:\n",
++            "    movq %rbx, %rsi\n",
++            "    leave\n",
++            "    ret\n",
++        );
++        let out = run(asm);
++        assert!(
++            !out.contains(".Lcciv_st"),
++            "a mid-block branch to a loop-private block must block the rewrite:\n{out}"
++        );
++        assert!(
++            out.contains("movq 112(%rsp), %rcx") && out.contains("movq %rcx, 112(%rsp)"),
++            "the original reload and store must both survive:\n{out}"
++        );
++    }
++
++    /// The same private-block SHAPE with the branch promoted to the header's
++    /// terminator, which is the other arm: now the exit model does cover it and
++    /// the pass must handle it.
++    ///
++    /// This is what keeps the previous test from being satisfied by refusing
++    /// every header jump out of the loop — which would also be "correct" and
++    /// would lose the entire optimization.
++    #[test]
++    fn a_terminator_branch_to_a_loop_private_block_gets_a_store() {
++        let asm = concat!(
++            "    .globl main\n",
++            "    .type main, @function\n",
++            "main:\n",
++            "    .cfi_startproc\n",
++            "    subq $64, %rsp\n",
++            "    movq %rdi, 112(%rsp)\n",
++            "    movq %rsi, 56(%rsp)\n",
++            "    movq %rdx, %rbx\n",
++            ".LBB14:\n",
++            "    movq 112(%rsp), %rcx\n",
++            "    movzbl (%rcx), %r8d\n",
++            "    jne .Lmid\n",
++            ".LBB15:\n",
++            "    addq $1, %rcx\n",
++            "    movq  %rcx, 112(%rsp)\n",
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb .LBB14\n",
++            ".Lmid:\n",
++            "    addq $1, %rcx\n",
++            "    jmp .Lout\n",
++            ".Lout:\n",
++            "    movq %rbx, %rsi\n",
++            "    leave\n",
++            "    ret\n",
++        );
++        let out = run(asm);
++        assert!(
++            out.contains(".Lcciv_st"),
++            "a terminator branch out of the loop must be handled, not refused:\n{out}"
++        );
++        assert_eq!(
++            out.matches("movq 112(%rsp), %rcx").count(),
++            1,
++            "the reload must be hoisted exactly once:\n{out}"
++        );
++    }
++
++    /// The complementary case, and the one LZ4 depends on: a header jump to a
++    /// block that other code in the function also reaches IS an exit, and the
++    /// pass must handle it rather than refuse.
++    ///
++    /// Without this half the previous test could be satisfied by simply
++    /// refusing every header jump out of the loop, which would also be
++    /// "correct" and would lose the entire optimization.
++    #[test]
++    fn a_shared_continuation_reached_from_the_header_is_treated_as_an_exit() {
++        let asm = concat!(
++            "    .globl main\n",
++            "    .type main, @function\n",
++            "main:\n",
++            "    .cfi_startproc\n",
++            "    subq $64, %rsp\n",
++            "    movq %rdi, 112(%rsp)\n",
++            "    movq %rsi, 56(%rsp)\n",
++            "    movq %rdx, %rbx\n",
++            "    cmpq 56(%rsp), %rbx\n", // <- also reaches .LBB16
++            "    jae .LBB16\n",
++            ".LBB14:\n",
++            "    movq 112(%rsp), %rcx\n",
++            "    movzbl (%rcx), %r8d\n",
++            "    jne .LBB16\n",
++            ".LBB15:\n",
++            "    addq $1, %rcx\n",
++            "    movq  %rcx, 112(%rsp)\n",
++            "    cmpq 56(%rsp), %rcx\n",
++            "    jb .LBB14\n",
++            ".LBB16:\n",
++            "    movq %rbx, %rsi\n",
++            "    leave\n",
++            "    ret\n",
++        );
++        let out = run(asm);
++        assert!(
++            out.contains(".Lcciv_st"),
++            "a shared continuation must be handled as an exit, not refused:\n{out}"
++        );
++        assert_eq!(
++            out.matches("movq 112(%rsp), %rcx").count(),
++            1,
++            "the reload must be hoisted exactly once:\n{out}"
++        );
++    }
++
+     /// A `push`/`pop` or a write to the frame base inside the loop must block
+     /// it: the slot's address would move under the hoisted load.
+     #[test]
+@@ -1439,13 +1729,16 @@ mod tests {
+         );
+     }
+ 
+-    /// Two functions in one unit, each carrying the same callee-local `.LBB*`
+-    /// labels — the shape lccc's inliner produces — must not have their
+-    /// generated labels merged.
++    /// Two functions in one unit carrying the SAME `.LBB*` labels must not have
++    /// their generated labels merged.
+     ///
+-    /// This is the case a two-function fixture that does NOT trigger the pass
+-    /// cannot cover, and it is why uniqueness is checked against the whole unit
+-    /// rather than the function being rewritten.
++    /// The emitter does not actually produce this shape today — it renumbers
++    /// per unit, and 0 of 935 corpus assemblies contain a duplicated local
++    /// label — so this is a property test of the pass's independence from the
++    /// emitter's numbering, not a regression against an observed bug. It earns
++    /// its place because the failure it describes is silent: two blocks sharing
++    /// a label are merged by the assembler, the merged block keeps the first
++    /// predecessor set, and nothing is printed anywhere.
+     #[test]
+     fn an_inlined_duplicate_does_not_merge_generated_labels() {
+         let one = concat!(
+diff --git a/tests/bugs/loop_iv_spill_executes.sh b/tests/bugs/loop_iv_spill_executes.sh
+new file mode 100755
+index 00000000..412e0ea8
+--- /dev/null
++++ b/tests/bugs/loop_iv_spill_executes.sh
+@@ -0,0 +1,64 @@
++#!/bin/bash
++# End-to-end regression for the loop-IV spill coalescing pass.
++#
++# The unit tests in loop_iv_spill.rs prove the pass's guards and its emitted
++# shape on hand-written assembly. They cannot prove the pass's OUTPUT is right,
++# and output is the only thing that matters here: the failure mode is a
++# generated label colliding with one already present, which merges two blocks in
++# the assembler's view and keeps only the first predecessor set. `as` accepts
++# that, `ld` accepts it, and the program returns a plausible wrong answer with
++# nothing on any compiler's stderr. Comparing assembly text would not catch it.
++#
++# So this script goes through the whole chain on the one program in the corpus
++# where the pass actually fires (the corpus differential puts it at 1 of 937):
++#
++#   1. compile with the pass ON and with it OFF, same binary, same flags;
++#   2. assemble each arm STANDALONE with `as`, so a malformed rewrite is caught
++#      even though lccc's own driver would have papered over it;
++#   3. link and RUN both, and require identical output;
++#   4. require the hot loop to have actually shrunk.
++#
++# The pass flag is `CCC_PEEPHOLE_SKIP`, not a rebuild: both arms come from one
++# binary, so an A/B here cannot be explained by a different compiler.
++set -u
++LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
++SRC=${SRC:-/home/user/lccc/tests/benchmark/programs/lz4_compress.c}
++WORK=$(mktemp -d)
++trap 'rm -rf "$WORK"' EXIT
++
++FLAGS="-O2 -DMATCH_RICH=1 -DPASSES=2048"
++EXPECT=29f49acaab81f800
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++for arm in on off; do
++  if [ "$arm" = on ]; then
++    "$LCCC" $FLAGS -S -o "$WORK/$arm.s" "$SRC" || fail "compile (pass on)"
++  else
++    CCC_PEEPHOLE_SKIP=loop_iv_spill,__none__ \
++      "$LCCC" $FLAGS -S -o "$WORK/$arm.s" "$SRC" || fail "compile (pass off)"
++  fi
++  as --64 "$WORK/$arm.s" -o "$WORK/$arm.o" 2> "$WORK/$arm.aserr" \
++    || fail "assemble ($arm): $(head -3 "$WORK/$arm.aserr")"
++  gcc "$WORK/$arm.o" -o "$WORK/$arm.bin" 2>/dev/null \
++    || fail "link ($arm)"
++  "$WORK/$arm.bin" > "$WORK/$arm.out" || fail "run ($arm)"
++done
++
++on=$(cat "$WORK/on.out")
++off=$(cat "$WORK/off.out")
++[ "$on" = "$off" ] || fail "output differs: on=$on off=$off"
++[ "$on" = "$EXPECT" ] || fail "checksum $on, expected $EXPECT"
++
++# The rewrite must have happened, or this script has silently tested nothing.
++cmp -s "$WORK/on.s" "$WORK/off.s" && fail "the pass did not fire; the test is vacuous"
++
++# And it must have removed the round trip: exactly one reload of the slot and
++# exactly one store back, both outside the loop body.
++loads=$(grep -c 'movq 112(%rsp), %rcx' "$WORK/on.s")
++stores=$(grep -c 'movq  *%rcx, 112(%rsp)' "$WORK/on.s")
++[ "$loads" -eq 1 ] || fail "expected 1 reload in the pass-on arm, found $loads"
++[ "$stores" -eq 1 ] || fail "expected 1 store in the pass-on arm, found $stores"
++offloads=$(grep -c 'movq 112(%rsp), %rcx' "$WORK/off.s")
++[ "$offloads" -ge 1 ] || fail "the pass-off arm has no reload to remove"
++
++echo "PASS: loop-IV spill coalescing, checksum $on, $loads reload / $stores store"
+-- 
+2.47.3
+
+From 28bd51cd8b3a87732d0eafe22969f9bdede96d3a Mon Sep 17 00:00:00 2001
+From: lccc-perf <perf@localhost>
+Date: Thu, 1 Oct 2026 11:08:20 +0000
+Subject: [PATCH 6/6] engineering: add the S14-S16 ledger
+
+Records what was re-derived rather than recovered after the workspace reset,
+the measurement, the red-team findings, the discarded redundant guard, and the
+attribution of the seven pre-existing -m32 gate failures.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ engineering/LEDGER-S14-S16.md | 123 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 123 insertions(+)
+ create mode 100644 engineering/LEDGER-S14-S16.md
+
+diff --git a/engineering/LEDGER-S14-S16.md b/engineering/LEDGER-S14-S16.md
+new file mode 100644
+index 00000000..6b1c968d
+--- /dev/null
++++ b/engineering/LEDGER-S14-S16.md
+@@ -0,0 +1,123 @@
++# Ledger — S14 … S16
++
++Branch `perf-main`, rebased onto `ms178/lccc` `origin/main` = **8db75621**.
++
++All four commits that were lost to the workspace reset
++(`587659b19`, `76d80de62`, `681d3c8b9`, `b07c40983`) were **re-derived from
++first principles**, not recovered. Nothing below is asserted to be identical to
++what was lost. The only recovered material was a *design note*
++(`/home/user/artifacts/ms178-1.S10-zero-ext-cmp-peephole-and-lz4-iv-spill-rootcause.patch`,
++whose FOLLOWUP-2026-09-30 lz4-match-extend-iv-spill section is the
++root-cause write-up that identified the stack slot) and the recorded
++checksum `29f49acaab81f800`. That note is not a file in this tree, so it is
++named by artifact path rather than linked.
++
++## Commits
++
++| SHA | What |
++|---|---|
++| `2c51e29e` | rebased S13: precise flag-walk for the `cmp`→`test` zero-compare fold |
++| `10355078` | rebased S13: harden `flags_written_mask`; pin the SDM masks |
++| `3098989a` | **S14** per-path flag liveness in the flag-consumer walk |
++| `de99d61e` | **S15** coalesce a loop induction variable left in a stack slot |
++| `4ea730db` | **S16** close two loop-shape gaps + correct the label rationale |
++
++## S14 — per-path flag liveness
++
++The flag-consumer walk stopped at **any** writer, so a *partial* writer (`stc`
++= CF only, `sahf` = all but OF) hid every consumer behind it.
++`eliminate_redundant_self_test` deletes `test %R,%R` based on
++`flag_consumers_are_zf_only`, so a `jo` behind an `stc` read the producer's OF
++without the walk ever seeing it and the fold fired. Executed as an A/B this
++returns 1 originally and 0 folded at `x = 0x7fffffff`.
++
++Fix: thread a per-path `LIVE` mask through the worklist and intersect it with
++`cc_reads(cc)` and `!preserved` at each consumer. A writer only **kills** the
++flags it defines; `cmc` is special-cased because it *complements* CF rather than
++defining it. Strictly more information than the old static `preserved`
++comparison, and strictly more precise: a full writer still ends the walk, and a
++consumer of an already-retired flag is charged nothing.
++
++Side effect: `flags_reach_a_whole_flags_reader` (`preserved = 0`) became
++strictly dominated and lost its last production caller, so it was removed rather
++than left as a trap.
++
++## S15/S16 — loop-IV spill coalescing
++
++`Value(ip)`'s live range spans most of `main`, so the windowed allocator leaves
++it in `112(%rsp)` and the loop pays a **store-to-load forwarding round trip on
++its own recurrence**. `%rcx` was already live from the reload through the
++increment to the store — the register was never lost, it was just
++re-synchronised with memory every iteration. The pass hoists the reload onto
++the entry edge and sinks the store to the exits.
++
++The rewrite is **transparent to the loop body**: the register holds the same
++value at every program point. The obligations are about the slot, not the
++register, except that nothing in the loop may clobber the family behind the
++pass's back (the next iteration's reload used to repair stray writes).
++
++### Measured
++
++| | value |
++|---|---|
++| checksum (pass on = pass off) | `29f49acaab81f800` |
++| lz4_match_extend, 11 paired reps | **−22.45 %**, ratio `0.7755`, **11/11 wins**, IQR `[0.7647, 0.7955]` |
++| earlier run this session | −22.28 %, ratio `0.7772`, 11/11, IQR `[0.7596, 0.7953]` |
++| historical pre-reset run | −23.46 %, ratio `0.7654`, 11/11, IQR `[0.7123, 0.8357]` |
++| hot loop, instructions | 11 → 9 |
++| corpus differential | **1 of 937** programs changes assembly, and it is the target |
++| unit tests | 3951 pass, 0 fail |
++
++### Red-team findings, and what each cost
++
++1. **Upstream miscompile** (`3098989a`) — fixed; see above.
++2. **Per-latch natural loops** (`4ea730db`) — a two-latch loop's other arm is
++   executed every iteration but is in neither natural loop, so its exits were
++   invisible. Now the union over all back edges to the header.
++3. **Non-terminator branch out of the loop** (`4ea730db`) — the exit model is
++   stated over terminators, so a conditional early exit emitted *ahead* of an
++   unconditional jump was not an exit site. Now refused.
++4. **Redundant reachability guard removed** (`4ea730db`) — a "loop-private
++   block" analysis was added, then deleted: it could reject nothing the
++   terminator guard had not, and no test distinguished it. Redundant machinery
++   with no discriminating test is the same mistake as the liveness memo reverted
++   earlier.
++5. **Label-duplication rationale corrected** (`4ea730db`) — the claim that
++   lccc's inliner duplicates callee-local labels is **not supported**: 0 of 935
++   corpus assemblies contain a duplicated local label, and a forced
++   `always_inline` function inlined at two sites emits 8 distinct labels. The
++   emitter renumbers per unit. The uniqueness search is kept (a collision is a
++   silent miscompile, the cost is nil) but no longer cited as a fix for an
++   observed defect.
++
++### Test discipline
++
++Every refusal test was checked to **fail against the un-guarded pass**. Two
++earlier drafts did not discriminate and were discarded rather than kept:
++
++* an operand-padding assertion (`movq  %rcx` vs `movq %rcx`) that silently
++  matched nothing, turning every "must survive" check into `0 == 1`;
++* a two-latch fixture appended **after the epilogue's `ret`**, so the four
++  "an extra instruction inside the loop" tests never placed an extra
++  instruction inside a loop.
++
++## Gates
++
++| gate | result |
++|---|---|
++| `cargo fmt --all --check` | clean |
++| `cargo clippy --all-targets -D warnings` | 0 warnings |
++| `scripts/ci_local.sh --fast` | 123 passed, 7 failed |
++| `cargo test --lib` | 3951 passed, 0 failed, 7 ignored |
++
++The 7 `ci_local.sh --fast` failures are **pre-existing environmental**, all
++`-m32`: the image has no 32-bit libc (`/usr/include/i386-linux-gnu/bits/…`,
++`crti.o`, `libgcc_s.so.1` all absent), so they die in the preprocessor or the
++linker, strictly upstream of the x86-64 peephole. They fail identically with
++the pass disabled, and `engineering/DECISIONS.md` plus four prior
++`engineering/FOLLOWUP-*.md` records the same failures. The apt/multilib
++workaround was **not** reapplied.
++
++Affected: `reassoc-latency`, `regression-corpus-link`, `copy-alias-sizes`,
++`notype-code-routing`, `i686-integer-isa-parity`, `map-i64-two-lane`,
++`linker-suite`.
+-- 
+2.47.3
+
