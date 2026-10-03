@@ -1,1531 +1,769 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index bd9b7302..01646b50 100644
+index bd9b730..2157903 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
-@@ -758,6 +758,10 @@ jobs:
-           python3 scripts/edg_changes_mine.py verify-artifacts
-           python3 -m unittest discover -s tests/corpus -p 'test_*.py'
-           bash tests/regression/check_frontend_diagnostic_recovery.sh
-+          # E5 (EDG register): deep-nesting crash class -> clean bounded
-+          # error; deep-but-legal inputs keep compiling; in-budget nesting
-+          # evaluates correctly end to end.
-+          python3 scripts/check_deep_nesting_robustness.py
-           python3 scripts/test_differential_corpus_paths.py
-           bash tests/regression/check_loop_memset.sh
-           bash tests/regression/check_bool_pair_tail_jmp.sh
-diff --git a/scripts/check_deep_nesting_robustness.py b/scripts/check_deep_nesting_robustness.py
-new file mode 100755
-index 00000000..cbaff3b2
---- /dev/null
-+++ b/scripts/check_deep_nesting_robustness.py
-@@ -0,0 +1,252 @@
-+#!/usr/bin/env python3
-+"""Deep-nesting robustness gate (EDG transplant item E5).
+@@ -177,6 +177,13 @@ jobs:
+       - name: Loop-alignment contract gate (emitted assembly)
+         run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
+ 
++      # Nested same-tag record identity, differential against the host GCC.
++      # The runtime corpus cannot cover this: GCC rejects the offending program
++      # so there is no output to compare. TAG-ID-1 shipped as a miscompile with
++      # every corpus and unit test green, which is why it gets its own oracle.
++      - name: Record tag identity gate (nested same-tag structs)
++        run: env CCC=target/fastbuild/lccc bash tests/regression/check_record_tag_identity.sh
 +
-+Adversarially nested C expressions used to overflow the compiler's stack and
-+abort (rc=134): the recursive-descent expression parser re-enters the whole
-+precedence climb once per parenthesis level, and each of those frames carries
-+`Expr`-sized by-value temporaries plus the large locals of the primary/cast
-+functions.  Measured on the -O1 fastbuild, ~4800 nested-parenthesis levels
-+overflowed even the 64 MB compiler thread.  GCC 14 segfaults its cc1 on the
-+same input, so this class is a genuine robustness differentiator.
+       # The result artifact is retained already, but GitHub's public job view
+       # hides raw logs/artifacts from anonymous triage. Turn each result into a
+       # normal check annotation so the failing test and phase stay visible.
+diff --git a/backlog.md b/backlog.md
+index b405831..e176571 100644
+--- a/backlog.md
++++ b/backlog.md
+@@ -225,6 +225,41 @@ are not CI reds, which is why they are a list rather than a gate.
+ 
+ ## P0 — largest measured gaps
+ 
++### TAG-ID-1 · **FIXED 2026-10-03** — nested same-tag structs no longer alias; the miscompile is gone
 +
-+The parser now counts live expression-parse frames against a budget
-+(`Parser::EXPR_FRAME_BUDGET`) and degrades to a single clean
-+"expression nesting too deep" error instead of aborting; a Clang-style cap
-+on rendered diagnostics keeps the failure output bounded.
++`f(s)` for the reproducer below is now a hard error matching GCC 16.2, and no
++binary is produced. Pinned by
++[`tests/regression/check_record_tag_identity.sh`](tests/regression/check_record_tag_identity.sh),
++a 15-row differential against the host GCC, wired into `ci_local.sh --fast` and
++hosted CI (gate-parity green at 133 commands). Disabling the new check fails
++10 of the 15 rows, so the gate is not decorative.
 +
-+This gate pins the whole contract:
++Three defects, not one:
++1. `resolve_struct_or_union` keyed records by tag alone, so an inner
++   `struct S { int c; }` and an outer `struct S { char c; }` were the same
++   `CType`. Now a shadowing definition with non-corresponding members gets
++   `struct.S#N`; corresponding members (N3037) keep the shared key so valid C23
++   still compiles.
++2. Every tag→`CType` site rebuilt the key from the raw source tag, so the
++   distinct key never reached the type checker. A scoped `record_alias` map in
++   `TypeContext` (unwound by `pop_scope`) now resolves them in
++   `sema/type_checker.rs` and `sema/const_eval.rs`.
++3. `check_call_arguments` compared **only** arity and pointer/float mixing — it
++   never compared record types at all. `check_record_argument_compatibility`
++   now does, exempting anonymous records and `transparent_union` parameters.
++   This third gap is why the first two fixes alone changed nothing, and it is
++   the one worth remembering: a type-identity fix is inert if no comparison
++   consumes the identity.
 +
-+  1. crash-class inputs (5000 paren levels) exit 1 with exactly the budget
-+     diagnostic -- never an abort/segv, never a diagnostic flood (>256 KB);
-+  2. deep-but-legal shapes that have always compiled keep compiling
-+     (right-nested ternary, unary chains) -- the budget must not reject
-+     inputs that were safe before;
-+  3. an in-budget nested expression still evaluates CORRECTLY end to end
-+     (compile -> assemble -> run -> value check), so the budget path cannot
-+     silently truncate real code;
-+  4. the preprocessor's #if evaluator survives a flat 100k-term expression.
++Residual, asserted rather than hidden: `pos_n3037` under `-std=c17` is accepted
++by lccc and rejected by GCC. Corresponding members share a key, which is what
++C23 requires and is too permissive pre-C23; it cannot miscompile because
++corresponding members means identical layouts. Closing it needs `-std` threaded
++into sema (which has no notion of it today) plus a mode-gated N3037 relation —
++making keys always distinct without that relation would reject valid C23.
 +
-+The fixtures are generated at test time (they are trivial and reproducible;
-+committing 50 KB of repeated parentheses would be dead weight).
++Original report:
 +
-+Usage:
-+  scripts/check_deep_nesting_robustness.py [--lccc target/fastbuild/lccc]
-+                                           [--cc gcc]
-+  scripts/check_deep_nesting_robustness.py --selftest   # no compiler needed
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import os
-+import subprocess
-+import sys
-+import tempfile
-+from pathlib import Path
-+
-+BUDGET_MSG = "expression nesting too deep"
-+STDERR_CAP_BYTES = 256 * 1024
-+CRASH_CODES = {134, 137, 139}  # abort / OOM-kill / segv
-+
-+
-+# --------------------------------------------------------------------------
-+# Fixture generators.  Pure functions of the depth so the gate is
-+# reproducible; --selftest validates their invariants.
-+# --------------------------------------------------------------------------
-+
-+def gen_paren_add(depth: int) -> str:
-+    """The measured crash class: `((((1) + 0) + 0) ... )`."""
-+    e = "1"
-+    for _ in range(depth):
-+        e = f"({e}) + 0"
-+    return f"int x = {e};\n"
-+
-+
-+def gen_paren_pure(depth: int) -> str:
-+    """Pure parenthesis nesting: `((((1))))`."""
-+    e = "1"
-+    for _ in range(depth):
-+        e = f"({e})"
-+    return f"int x = {e};\n"
-+
-+
-+def gen_ternary(depth: int) -> str:
-+    """Right-nested conditional.  Cheap on the stack (the binary-operator
-+    chain unwinds before the then-arm recurses): compiled long before the
-+    budget existed and must keep compiling."""
-+    e = "1"
-+    for _ in range(depth):
-+        e = f"1 ? {e} : 2"
-+    return f"int x = {e};\n"
-+
-+
-+def gen_unary(depth: int) -> str:
-+    """`- - - - ... 1` — unary/cast self-recursion."""
-+    e = "1"
-+    for _ in range(depth):
-+        e = f"-{e}"
-+    return f"int x = {e};\n"
-+
-+
-+def gen_semantic(depth: int) -> str:
-+    """`((((1) + 1) + 1) ... )` at `depth` levels evaluates to depth + 1.
-+    Single parenthesis per level, so depth 1000 stays far inside the budget
-+    and exercises the full pipeline (sema, const-eval, lowering) on a deep
-+    AST."""
-+    e = "1"
-+    for _ in range(depth):
-+        e = f"({e}) + 1"
-+    return (
-+        "#include <stdio.h>\n"
-+        f"int x = {e};\n"
-+        'int main(void){printf("%d\\n", x);return 0;}\n'
-+    )
-+
-+
-+def gen_if_flat(terms: int) -> str:
-+    """Flat (non-nested) #if expression: must not be affected at all."""
-+    return f"#if ({'1' + ' + 1' * terms})\nint ok = 1;\n#endif\n"
-+
-+
-+# --------------------------------------------------------------------------
-+# Check machinery
-+# --------------------------------------------------------------------------
-+
-+def run_lccc(lccc: str, src: Path, out: Path, timeout: int) -> tuple[int, bytes]:
-+    proc = subprocess.run(
-+        [lccc, "-O0", "-S", "-o", str(out), str(src)],
-+        capture_output=True,
-+        timeout=timeout,
-+    )
-+    return proc.returncode, proc.stderr
-+
-+
-+def check_clean_budget_error(name: str, lccc: str, src_text: str, tmp: Path,
-+                             timeout: int) -> bool:
-+    src = tmp / f"{name}.c"
-+    src.write_text(src_text)
-+    try:
-+        rc, err = run_lccc(lccc, src, tmp / f"{name}.s", timeout)
-+    except subprocess.TimeoutExpired:
-+        print(f"  FAIL {name}: compiler hung (> {timeout}s)")
-+        return False
-+    if rc in CRASH_CODES:
-+        print(f"  FAIL {name}: crashed with rc={rc} (budget must degrade to an error)")
-+        return False
-+    if rc == 0:
-+        print(f"  FAIL {name}: accepted input beyond the nesting budget")
-+        return False
-+    if BUDGET_MSG.encode() not in err:
-+        print(f"  FAIL {name}: rc={rc} but no '{BUDGET_MSG}' diagnostic")
-+        return False
-+    if len(err) > STDERR_CAP_BYTES:
-+        print(f"  FAIL {name}: diagnostic flood ({len(err)} bytes > {STDERR_CAP_BYTES})")
-+        return False
-+    print(f"  ok   {name}: clean budget error (rc=1, {len(err)} B stderr)")
-+    return True
-+
-+
-+def check_compiles(name: str, lccc: str, src_text: str, tmp: Path,
-+                   timeout: int) -> bool:
-+    src = tmp / f"{name}.c"
-+    src.write_text(src_text)
-+    try:
-+        rc, err = run_lccc(lccc, src, tmp / f"{name}.s", timeout)
-+    except subprocess.TimeoutExpired:
-+        print(f"  FAIL {name}: compiler hung (> {timeout}s)")
-+        return False
-+    if rc != 0:
-+        first = err.decode(errors="replace").splitlines()[:2]
-+        print(f"  FAIL {name}: rc={rc} on a deep-but-legal input: {first}")
-+        return False
-+    print(f"  ok   {name}: deep-but-legal input still compiles")
-+    return True
-+
-+
-+def check_semantic(name: str, lccc: str, cc: str, depth: int, tmp: Path,
-+                   timeout: int) -> bool:
-+    src = tmp / f"{name}.c"
-+    src.write_text(gen_semantic(depth))
-+    asm = tmp / f"{name}.s"
-+    try:
-+        rc, err = run_lccc(lccc, src, asm, timeout)
-+    except subprocess.TimeoutExpired:
-+        print(f"  FAIL {name}: compiler hung (> {timeout}s)")
-+        return False
-+    if rc != 0:
-+        print(f"  FAIL {name}: in-budget nesting (depth {depth}) rejected: rc={rc}")
-+        return False
-+    binary = tmp / name
-+    link = subprocess.run([cc, str(asm), "-o", str(binary)], capture_output=True,
-+                          timeout=timeout)
-+    if link.returncode != 0:
-+        print(f"  FAIL {name}: host assembler/linker rejected lccc output: "
-+              f"{link.stderr.decode(errors='replace').splitlines()[:2]}")
-+        return False
-+    run = subprocess.run([str(binary)], capture_output=True, timeout=timeout)
-+    want = f"{depth + 1}\n"
-+    got = run.stdout.decode(errors="replace")
-+    if run.returncode != 0 or got != want:
-+        print(f"  FAIL {name}: wrong value: want {want!r} got {got!r} rc={run.returncode}")
-+        return False
-+    print(f"  ok   {name}: depth-{depth} nested initializer evaluates to {depth + 1}")
-+    return True
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-+    ap.add_argument("--lccc", default="target/fastbuild/lccc")
-+    ap.add_argument("--cc", default=os.environ.get("CC", "gcc"))
-+    ap.add_argument("--timeout", type=int, default=60)
-+    ap.add_argument("--selftest", action="store_true",
-+                    help="validate fixture invariants; no compiler needed")
-+    args = ap.parse_args()
-+
-+    if args.selftest:
-+        # Fixture invariants: the generators must produce exactly the shape
-+        # the budget analysis assumes (nesting counts, flatness).
-+        assert gen_paren_add(3) == "int x = (((1) + 0) + 0) + 0;\n"
-+        assert gen_paren_pure(3) == "int x = (((1)));\n"
-+        assert gen_ternary(2) == "int x = 1 ? 1 ? 1 : 2 : 2;\n"
-+        assert gen_unary(3) == "int x = ---1;\n"
-+        assert gen_if_flat(3) == "#if (1 + 1 + 1 + 1)\nint ok = 1;\n#endif\n"
-+        sem = gen_semantic(2)
-+        assert "int x = ((1) + 1) + 1;" in sem and 'printf("%d' in sem
-+        # Depth bookkeeping: paren shapes grow by one level per iteration.
-+        assert gen_paren_pure(500).count("(") == 500
-+        assert gen_paren_add(500).count("+ 0") == 500
-+        # The crash-class depth is far beyond the ~1300 measured ceiling.
-+        assert gen_paren_pure(5000).count("(") == 5000
-+        print("deep-nesting selftest: PASS")
-+        return 0
-+
-+    lccc = args.lccc
-+    if not Path(lccc).exists():
-+        print(f"FATAL: compiler not found: {lccc} (build scripts/build_lccc_fast.sh)")
-+        return 1
-+
-+    print("== deep-nesting robustness gate (E5: parser frame budget) ==")
-+    ok = True
-+    with tempfile.TemporaryDirectory(prefix="lccc_deepnest_") as td:
-+        tmp = Path(td)
-+        # 1. crash class -> clean bounded error, never an abort
-+        ok &= check_clean_budget_error("paren_add_5000", lccc, gen_paren_add(5000),
-+                                       tmp, args.timeout)
-+        ok &= check_clean_budget_error("paren_pure_5000", lccc, gen_paren_pure(5000),
-+                                       tmp, args.timeout)
-+        # 2. deep-but-legal shapes must keep compiling
-+        ok &= check_compiles("ternary_8000", lccc, gen_ternary(8000), tmp,
-+                             args.timeout)
-+        ok &= check_compiles("unary_5000", lccc, gen_unary(5000), tmp, args.timeout)
-+        # 3. in-budget nesting evaluates correctly end to end
-+        ok &= check_semantic("semantic_1000", lccc, args.cc, 1000, tmp,
-+                             args.timeout)
-+        # 4. flat #if expressions are untouched
-+        ok &= check_compiles("if_flat_100k", lccc, gen_if_flat(100_000), tmp,
-+                             args.timeout)
-+
-+    print("deep-nesting robustness: " + ("PASS" if ok else "FAIL"))
-+    return 0 if ok else 1
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
+ ### TAG-ID-1 · **NEW 2026-10-02** — nested same-tag structs share one type identity (miscompile)
+ 
+ A correctness defect, ranked above the codegen gaps below because it silently
 diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index 75fcfd4d..e7f17128 100755
+index 75fcfd4..9820dbb 100755
 --- a/scripts/ci_local.sh
 +++ b/scripts/ci_local.sh
-@@ -569,6 +569,13 @@ gate "corpus-runner-contracts" fast \
-     python3 -m unittest discover -s tests/corpus -p 'test_*.py'
- gate "frontend-diagnostic-recovery" fast \
-     bash tests/regression/check_frontend_diagnostic_recovery.sh
-+# E5 (EDG register): adversarially nested expressions used to overflow the
-+# 64 MB compiler thread and abort (rc=134; GCC 14 segfaults its cc1 on the
-+# same input). The parser now runs a frame budget and degrades to one clean
-+# bounded error; this gate pins crash-class rejection, deep-but-legal
-+# acceptance, and in-budget semantic correctness.
-+gate "deep-nesting-robustness" fast \
-+    python3 scripts/check_deep_nesting_robustness.py --lccc "$LCCC"
- gate "differential-corpus-paths" fast \
-     python3 scripts/test_differential_corpus_paths.py
+@@ -489,6 +489,14 @@ gate "linker-oracle-verdict" fast \
+ gate "regression-corpus-link" fast \
+     python3 tests/regression/run_regression.py --lccc "$LCCC" -j 2 --compile-only
  
-diff --git a/src/common/error.rs b/src/common/error.rs
-index c163f44d..fa94b18d 100644
---- a/src/common/error.rs
-+++ b/src/common/error.rs
-@@ -461,6 +461,19 @@ pub struct DiagnosticEngine {
-     /// Used to avoid repeating the same chain for consecutive errors in the
-     /// same included file (matching GCC behavior).
-     last_include_trace_file: Option<String>,
-+    /// Set once the rendered-error limit note has been emitted (see
-+    /// `render_error`); the count keeps growing afterwards, rendering stops.
-+    error_limit_noted: bool,
-+}
++# A nested same-tag record definition must not alias the outer one. The
++# regression corpus cannot see this class: it compares runtime output against
++# GCC, and GCC refuses to build the offending program at all, so the oracle
++# here is accept/reject. TAG-ID-1 -- it shipped as a miscompile (44 where the
++# answer is 300) with every corpus and unit test green.
++gate "record-tag-identity" fast \
++    env CCC="$LCCC" bash tests/regression/check_record_tag_identity.sh
 +
-+impl DiagnosticEngine {
-+    /// Clang-style cap on rendered errors per engine. One malformed input can
-+    /// trigger tens of thousands of cascading recovery errors; rendering every
-+    /// one of them (each with source snippets) blows up output and memory and
-+    /// buries the root cause. Errors keep COUNTING past the cap, so the
-+    /// translation unit is rejected exactly as before — only the printing
-+    /// stops (with a single "too many errors" note).
-+    pub const MAX_RENDERED_ERRORS: usize = 200;
+ gate "copy-alias-sizes" fast \
+     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
+ 
+diff --git a/src/common/types.rs b/src/common/types.rs
+index ae01829..680c3c9 100644
+--- a/src/common/types.rs
++++ b/src/common/types.rs
+@@ -1481,6 +1481,26 @@ pub fn align_up(offset: usize, align: usize) -> usize {
+     }
  }
  
- impl DiagnosticEngine {
-@@ -474,7 +487,23 @@ impl DiagnosticEngine {
-             source_manager: None,
-             use_color: ColorMode::Auto.use_color(),
-             last_include_trace_file: None,
-+            error_limit_noted: false,
++impl CType {
++    /// The user-visible tag of a record type key.
++    ///
++    /// Strips the internal `struct.`/`union.` prefix and the `#N` suffix that
++    /// marks a shadowing definition (C 6.7.2.3: an inner-scope `struct S` is a
++    /// distinct type from an outer `struct S`, so the two need distinct keys
++    /// while still printing identically). A C identifier cannot contain `#`, so
++    /// cutting there is unambiguous.
++    pub fn record_display_tag(key: &str) -> &str {
++        let without_prefix = key
++            .strip_prefix("union.")
++            .or_else(|| key.strip_prefix("struct."))
++            .unwrap_or(key);
++        match without_prefix.find('#') {
++            Some(i) => &without_prefix[..i],
++            None => without_prefix,
 +        }
 +    }
++}
 +
-+    /// Render an error-severity diagnostic subject to `MAX_RENDERED_ERRORS`.
-+    fn render_error(&mut self, diag: &Diagnostic) {
-+        if self.error_count < Self::MAX_RENDERED_ERRORS {
-+            self.render_diagnostic(diag);
-+        } else if !self.error_limit_noted {
-+            self.error_limit_noted = true;
-+            let note = Diagnostic::error(format!(
-+                "too many errors emitted; stopping diagnostic emission (limit {})",
-+                Self::MAX_RENDERED_ERRORS
-+            ));
-+            self.render_diagnostic(&note);
-         }
-+        self.error_count += 1;
-     }
- 
-     /// Set the warning configuration (parsed from CLI flags).
-@@ -526,8 +555,7 @@ impl DiagnosticEngine {
-                             fix_hint: diag.fix_hint.clone(),
-                             explicit_location: diag.explicit_location.clone(),
-                         };
--                        self.render_diagnostic(&promoted);
--                        self.error_count += 1;
-+                        self.render_error(&promoted);
-                         return;
-                     }
- 
-@@ -555,8 +583,7 @@ impl DiagnosticEngine {
-                             fix_hint: diag.fix_hint.clone(),
-                             explicit_location: diag.explicit_location.clone(),
-                         };
--                        self.render_diagnostic(&promoted);
--                        self.error_count += 1;
-+                        self.render_error(&promoted);
-                     } else {
-                         self.render_diagnostic(diag);
-                         self.warning_count += 1;
-@@ -564,8 +591,7 @@ impl DiagnosticEngine {
+ impl std::fmt::Display for CType {
+     /// Format a CType as its C-language type name (e.g., `int`, `unsigned long`,
+     /// `char *`, `void (*)(int, double)`). Used in compiler diagnostics to show
+@@ -1562,8 +1582,7 @@ impl std::fmt::Display for CType {
+                 write!(f, ")")
+             }
+             CType::Struct(name) => {
+-                // Strip the "struct." prefix if present for cleaner display
+-                let display_name = name.strip_prefix("struct.").unwrap_or(name);
++                let display_name = CType::record_display_tag(name);
+                 if display_name.starts_with("__anon_struct_") {
+                     write!(f, "struct <anonymous>")
+                 } else {
+@@ -1571,11 +1590,7 @@ impl std::fmt::Display for CType {
                  }
              }
-             Severity::Error => {
--                self.render_diagnostic(diag);
--                self.error_count += 1;
-+                self.render_error(diag);
+             CType::Union(name) => {
+-                // Strip the "union." or "struct." prefix if present
+-                let display_name = name
+-                    .strip_prefix("union.")
+-                    .or_else(|| name.strip_prefix("struct."))
+-                    .unwrap_or(name);
++                let display_name = CType::record_display_tag(name);
+                 if display_name.starts_with("__anon_struct_") {
+                     write!(f, "union <anonymous>")
+                 } else {
+diff --git a/src/frontend/sema/analysis.rs b/src/frontend/sema/analysis.rs
+index 311ae9d..5d42791 100644
+--- a/src/frontend/sema/analysis.rs
++++ b/src/frontend/sema/analysis.rs
+@@ -2056,10 +2056,65 @@ impl SemanticAnalyzer {
+         for (arg, (param_ty, _)) in args.iter().zip(params) {
+             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
+                 self.check_pointer_float_conversion(&arg_ty, param_ty, arg.span());
++                self.check_record_argument_compatibility(&arg_ty, param_ty, name, arg.span());
              }
-             Severity::Note => {
-                 self.render_diagnostic(diag);
-@@ -871,13 +897,44 @@ impl DiagnosticEngine {
-         let loc = sm.resolve_span(span);
-         let col = loc.column as usize;
+         }
+     }
  
-+        // Window overly long lines around the caret (generated/minified code
-+        // can put 10k+ characters on one line; dumping it buries the caret
-+        // and floods logs — the frame-budget reproducers hit exactly this).
-+        const SNIPPET_WINDOW: usize = 160;
-+        let n_chars = source_line.chars().count();
-+        let (shown, caret_pad, truncated_left): (String, usize, bool) = if n_chars <= SNIPPET_WINDOW
++    /// A by-value record argument must have a compatible record type.
++    ///
++    /// C 6.5.2.2p1 makes passing an incompatible struct or union a constraint
++    /// violation, but this call path only ever checked arity and pointer/float
++    /// mixing -- so a `struct S { int c; }` value passed where
++    /// `struct S { char c; }` was expected compiled silently and truncated at
++    /// runtime (`f(s)` returned 44 for `s.c == 300`, in
++    /// tests/bugs/nested_tag_struct_identity.c) while GCC 16.2 rejects it.
++    ///
++    /// Anonymous records are exempt exactly as in `check_assignment_
++    /// compatibility`, and so is a `transparent_union` parameter, which accepts
++    /// its members by ABI design.
++    fn check_record_argument_compatibility(
++        &self,
++        from: &CType,
++        to: &CType,
++        name: &str,
++        span: Span,
++    ) {
++        let (a, b) = match (from, to) {
++            (CType::Struct(a), CType::Struct(b)) | (CType::Union(a), CType::Union(b)) => (a, b),
++            _ => return,
++        };
++        if a == b || a.starts_with("__anon_") || b.starts_with("__anon_") {
++            return;
++        }
++        if matches!(to, CType::Union(_))
++            && self
++                .result
++                .type_context
++                .borrow_struct_layouts()
++                .get(&**b)
++                .is_some_and(|layout| layout.is_transparent_union)
 +        {
-+            (source_line.clone(), col, false)
++            return;
++        }
++        // Two records with the same tag but different definitions print
++        // identically, so say what actually distinguishes them rather than
++        // emitting "have 'struct S' but expected 'struct S'".
++        let (from_text, to_text) = (from.to_string(), to.to_string());
++        let message = if from_text == to_text {
++            format!(
++                "incompatible type for argument to '{}': '{}' here is a different type from the '{}' of the parameter, despite the shared tag",
++                name, from_text, to_text
++            )
 +        } else {
-+            let half = SNIPPET_WINDOW / 2;
-+            let start = col
-+                .saturating_sub(half)
-+                .min(n_chars.saturating_sub(SNIPPET_WINDOW));
-+            let end = (start + SNIPPET_WINDOW).min(n_chars);
-+            let window: String = source_line.chars().skip(start).take(end - start).collect();
-+            // Caret alignment: 1 leading space + 3 for the "..." prefix +
-+            // 0-based offset of the caret inside the window (columns are
-+            // 1-based, hence col-1).
-+            let pad = col.saturating_sub(start) + if start > 0 { 3 } else { 0 };
-+            let shown = format!(
-+                "{}{}{}",
-+                if start > 0 { "..." } else { "" },
-+                window,
-+                if end < n_chars { "..." } else { "" }
-+            );
-+            (shown, pad, start > 0)
++            format!(
++                "incompatible type for argument to '{}': have '{}' but expected '{}'",
++                name, from_text, to_text
++            )
 +        };
-+        let _ = truncated_left;
-+
-         // Print the source line with indentation
--        eprintln!(" {}", source_line);
-+        eprintln!(" {}", shown);
- 
-         // Build the caret line: spaces up to the column, then ^ with tildes
--        if col > 0 {
--            let padding = " ".repeat(col);
-+        if caret_pad > 0 {
-+            let padding = " ".repeat(caret_pad);
-             let span_len = (span.end.saturating_sub(span.start)) as usize;
-+            // Never draw the squiggle past the rendered window.
-+            let span_len = span_len.min(shown.len().saturating_sub(caret_pad));
-             let underline = if span_len > 1 {
-                 format!("^{}", "~".repeat(span_len - 1))
-             } else {
-diff --git a/src/frontend/parser/expressions.rs b/src/frontend/parser/expressions.rs
-index d4c0475c..de9393a2 100644
---- a/src/frontend/parser/expressions.rs
-+++ b/src/frontend/parser/expressions.rs
-@@ -159,6 +159,17 @@ impl Parser {
-     /// Parse a left-associative binary expression at the given precedence level.
-     /// This is the shared core that replaces 10 nearly-identical parsing functions.
-     fn parse_binary_expr(&mut self, level: PrecedenceLevel) -> Expr {
-+        let span = self.peek_span();
-+        if !self.enter_expr_frame(span) {
-+            return Expr::IntLiteral(0, span);
-+        }
-+        let r = self.parse_binary_expr_inner(level);
-+        self.exit_expr_frame();
-+        r
++        self.diagnostics.borrow_mut().error(message, span);
 +    }
 +
-+    #[inline(always)]
-+    fn parse_binary_expr_inner(&mut self, level: PrecedenceLevel) -> Expr {
-         let mut lhs = self.parse_next_tighter(level);
-         while let Some(op) = self.token_to_binop(self.peek(), level) {
-             let span = self.peek_span();
-@@ -171,6 +182,17 @@ impl Parser {
- 
-     /// Parse the next tighter precedence level.
-     fn parse_next_tighter(&mut self, level: PrecedenceLevel) -> Expr {
-+        let span = self.peek_span();
-+        if !self.enter_expr_frame(span) {
-+            return Expr::IntLiteral(0, span);
-+        }
-+        let r = self.parse_next_tighter_inner(level);
-+        self.exit_expr_frame();
-+        r
-+    }
+     fn check_assignment_compatibility(
+         &self,
+         from_ty: &CType,
+@@ -2465,6 +2520,28 @@ impl SemanticAnalyzer {
+ /// - struct/union: converts fields and computes layout
+ /// - enum: returns CType::Enum with name info (preserves enum identity)
+ /// - typeof: returns CType::Int (sema doesn't have full expr type resolution yet)
++/// Whether two record layouts have *corresponding* members: the N3037
++/// (C23 6.2.9) relation, reduced to what a computed layout can express.
++///
++/// Same record kind, same member count, and per member the same name, offset,
++/// type, and bit-field width and bit offset. Size and alignment follow from
++/// those, but are compared too so that any unexplained difference also counts
++/// as non-corresponding -- erring toward two distinct types, which is the safe
++/// direction.
++fn record_layouts_correspond(a: &StructLayout, b: &StructLayout) -> bool {
++    a.is_union == b.is_union
++        && a.size == b.size
++        && a.align == b.align
++        && a.fields.len() == b.fields.len()
++        && a.fields.iter().zip(&b.fields).all(|(x, y)| {
++            x.name == y.name
++                && x.offset == y.offset
++                && x.ty == y.ty
++                && x.bit_offset == y.bit_offset
++                && x.bit_width == y.bit_width
++        })
++}
 +
-+    #[inline(always)]
-+    fn parse_next_tighter_inner(&mut self, level: PrecedenceLevel) -> Expr {
-         match level {
-             PrecedenceLevel::LogicalOr => self.parse_binary_expr(PrecedenceLevel::LogicalAnd),
-             PrecedenceLevel::LogicalAnd => self.parse_binary_expr(PrecedenceLevel::BitwiseOr),
-@@ -188,6 +210,17 @@ impl Parser {
-     /// Parse a cast expression: (type-name)expr, compound literal (type-name){...},
-     /// or fall through to unary expression.
-     pub(super) fn parse_cast_expr(&mut self) -> Expr {
-+        let span = self.peek_span();
-+        if !self.enter_expr_frame(span) {
-+            return Expr::IntLiteral(0, span);
-+        }
-+        let r = self.parse_cast_expr_inner();
-+        self.exit_expr_frame();
-+        r
-+    }
-+
-+    #[inline(always)]
-+    fn parse_cast_expr_inner(&mut self) -> Expr {
-         if matches!(self.peek(), TokenKind::LParen) {
-             let save = self.pos;
-             let save_typedef = self.attrs.parsing_typedef();
-@@ -238,6 +271,17 @@ impl Parser {
-     }
- 
-     fn parse_unary_expr(&mut self) -> Expr {
-+        let span = self.peek_span();
-+        if !self.enter_expr_frame(span) {
-+            return Expr::IntLiteral(0, span);
-+        }
-+        let r = self.parse_unary_expr_inner();
-+        self.exit_expr_frame();
-+        r
-+    }
-+
-+    #[inline(always)]
-+    fn parse_unary_expr_inner(&mut self) -> Expr {
-         match self.peek() {
-             TokenKind::AmpAmp => {
-                 // GCC extension: &&label (address of label, for computed goto)
-@@ -401,8 +445,14 @@ impl Parser {
-     }
- 
-     fn parse_postfix_expr(&mut self) -> Expr {
-+        let span = self.peek_span();
-+        if !self.enter_expr_frame(span) {
-+            return Expr::IntLiteral(0, span);
-+        }
-         let expr = self.parse_primary_expr();
--        self.parse_postfix_ops(expr)
-+        let r = self.parse_postfix_ops(expr);
-+        self.exit_expr_frame();
-+        r
-     }
- 
-     /// Parse postfix operators ([], ., ->, ++, --, function call) applied to an initial expression.
-@@ -472,6 +522,17 @@ impl Parser {
-     }
- 
-     fn parse_primary_expr(&mut self) -> Expr {
-+        let span = self.peek_span();
-+        if !self.enter_expr_frame(span) {
-+            return Expr::IntLiteral(0, span);
-+        }
-+        let r = self.parse_primary_expr_inner();
-+        self.exit_expr_frame();
-+        r
-+    }
-+
-+    #[inline(always)]
-+    fn parse_primary_expr_inner(&mut self) -> Expr {
-         match self.peek() {
-             TokenKind::IntLiteral(val) => {
-                 let val = *val;
-diff --git a/src/frontend/parser/parse.rs b/src/frontend/parser/parse.rs
-index 218d3e40..e3f7493e 100644
---- a/src/frontend/parser/parse.rs
-+++ b/src/frontend/parser/parse.rs
-@@ -506,6 +506,12 @@ pub struct Parser {
-     pub(super) func_decl_no_instrument: FxHashSet<String>,
-     /// Count of parse errors encountered (invalid tokens at top level, etc.)
-     pub error_count: usize,
-+    /// Number of currently-live expression-parse frames (E5 hardening).
-+    /// Bounded by `EXPR_FRAME_BUDGET`; see `enter_expr_frame`.
-+    pub(super) expr_frame_depth: u32,
-+    /// Set once the frame-budget diagnostic has been emitted, so a single
-+    /// pathological nesting level produces exactly one error, not a flood.
-+    pub(super) expr_frame_diagnosed: bool,
-     /// Structured diagnostic engine for error/warning reporting with source snippets.
-     pub(super) diagnostics: DiagnosticEngine,
-     /// Map of enum constant names to their integer values.
-@@ -539,6 +545,8 @@ impl Parser {
-             pragma_default_visibility: None,
-             func_decl_no_instrument: FxHashSet::default(),
-             error_count: 0,
-+            expr_frame_depth: 0,
-+            expr_frame_diagnosed: false,
-             diagnostics: DiagnosticEngine::new(),
-             enum_constants: FxHashMap::default(),
-             unevaluable_enum_constants: FxHashSet::default(),
-@@ -565,6 +573,50 @@ impl Parser {
-         self.diagnostics.error(message, span);
-     }
- 
-+    /// Register one entry into the recursive expression-parse chain.
-+    ///
-+    /// WHY: every nesting level of a parenthesised expression re-enters the
-+    /// full precedence climb (`parse_expr` -> assignment -> conditional ->
-+    /// 10x binary/next-tighter -> cast -> unary -> postfix -> primary), and
-+    /// each of those frames carries `Expr`-sized by-value temporaries plus
-+    /// the big locals of `parse_primary_expr`/`parse_cast_expr`. Measured on
-+    /// the -O1 fastbuild, ~4800 nested-parenthesis levels overflow even the
-+    /// 64 MB compiler thread stack (a raw abort, rc=134; GCC 14 segfaults
-+    /// its cc1 on the same input). Left-associative chains do NOT recurse
-+    /// (they loop), so this bound bites only on genuinely deep nesting.
-+    ///
-+    /// The bound is on live parser frames, not source-nesting depth: real
-+    /// translation units (kernel, glibc, zlib-ng, expat, csmith output) stay
-+    /// orders of magnitude under it, while the adversarial class in
-+    /// `artifacts/repros/crash_synth_*` and beyond now degrades to a clean,
-+    /// GCC-compatible error instead of an abort.
-+    pub(super) const EXPR_FRAME_BUDGET: u32 = 32_768;
-+
-+    pub(super) fn enter_expr_frame(&mut self, span: Span) -> bool {
-+        if self.expr_frame_depth >= Self::EXPR_FRAME_BUDGET {
-+            if !self.expr_frame_diagnosed {
-+                self.expr_frame_diagnosed = true;
-+                self.error_count += 1;
-+                self.diagnostics.error(
-+                    format!(
-+                        "expression nesting too deep (exceeds {} parser frames)",
-+                        Self::EXPR_FRAME_BUDGET
-+                    ),
-+                    span,
-+                );
-+            }
-+            return false;
-+        }
-+        self.expr_frame_depth += 1;
-+        true
-+    }
-+
-+    #[inline]
-+    pub(super) fn exit_expr_frame(&mut self) {
-+        debug_assert!(self.expr_frame_depth > 0);
-+        self.expr_frame_depth = self.expr_frame_depth.saturating_sub(1);
-+    }
-+
-     /// Panic-mode recovery: skip until a synchronization point.
-     pub(super) fn sync_to(&mut self, stop: &[TokenKind]) {
-         while !matches!(self.peek(), TokenKind::Eof) {
-@@ -725,6 +777,12 @@ impl Parser {
-     pub fn parse(&mut self) -> TranslationUnit {
-         let mut decls = Vec::with_capacity(16);
-         while !self.at_eof() {
-+            // The expression frame-budget error is fatal for the TU; stop
-+            // parsing instead of cascading thousands of recovery errors over
-+            // the (now meaningless) token remainder.
-+            if self.expr_frame_diagnosed {
-+                break;
-+            }
-             if let Some(decl) = self.parse_external_decl() {
-                 decls.push(decl);
-             } else {
-@@ -841,6 +899,11 @@ impl Parser {
-             self.advance();
-             span
+ impl type_builder::TypeConvertContext for SemanticAnalyzer {
+     fn resolve_typedef(&self, name: &str) -> CType {
+         if let Some(resolved) = self.result.type_context.typedefs.get(name) {
+@@ -2490,20 +2567,17 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
+             .map(|f| self.convert_struct_fields(f))
+             .unwrap_or_default();
+         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
+-        let key = if let Some(tag) = name {
++        let base_key = if let Some(tag) = name {
+             format!("{}.{}", prefix, tag)
          } else {
-+            // The frame-budget diagnostic is fatal for the TU; do not cascade
-+            // thousands of "expected ')'" errors while the stub unwinds.
-+            if self.expr_frame_diagnosed {
-+                return self.peek_span();
-+            }
-             let span = self.peek_span();
-             let open_tok = match expected {
-                 TokenKind::RParen => "'('",
-@@ -874,6 +937,10 @@ impl Parser {
-             self.advance();
-             span
-         } else {
-+            // See expect_closing: one fatal budget error, no cascade.
-+            if self.expr_frame_diagnosed {
-+                return self.peek_span();
-+            }
-             let span = self.peek_span();
-             let diag = crate::common::error::Diagnostic::error(format!(
-                 "expected {} {} before {}",
-diff --git a/src/frontend/preprocessor/expr_eval.rs b/src/frontend/preprocessor/expr_eval.rs
-index b09a8519..3f0d639b 100644
---- a/src/frontend/preprocessor/expr_eval.rs
-+++ b/src/frontend/preprocessor/expr_eval.rs
-@@ -114,7 +114,7 @@ impl Preprocessor {
-     /// `__has_include` are NOT handled here: `defined` is only an operator
-     /// inside #if/#elif (a code-line `defined` is an ordinary identifier),
-     /// and __has_include's argument grammar (<...>) is directive-only.
--    pub(super) fn resolve_has_macros_in_code(&self, line: &str) -> String {
-+    pub(super) fn resolve_has_macros_in_code(&mut self, line: &str, diag_line: usize) -> String {
-         // Fast path: the overwhelming majority of lines have no __has_ token.
-         if !line.contains("__has_") {
-             return line.to_string();
-@@ -164,6 +164,10 @@ impl Preprocessor {
-                         self.skip_paren_arg_bytes(bytes, &mut i);
-                         result.push('0');
-                     }
-+                    "__has_warning" => {
-+                        let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
-+                        result.push_str(val);
-+                    }
-                     _ => result.push_str(ident),
+             let id = self.result.type_context.next_anon_struct_id();
+             format!("__anon_struct_{}", id)
+         };
+-        // Track whether this struct/union has been defined (has a body in the
+-        // AST, e.g. `struct X { ... }` or `struct X {}`), as opposed to just
+-        // forward-declared (`struct X;`). This distinction is needed for the
+-        // incomplete type check in analyze_declaration.
+-        if fields.is_some() {
+-            self.defined_structs.borrow_mut().insert(key.clone());
+-        }
+-        if !struct_fields.is_empty() {
++        // The layout is computed BEFORE the key is settled, because deciding
++        // whether this definition shadows a different one needs the members.
++        let defined_layout: Option<StructLayout> = if struct_fields.is_empty() {
++            None
++        } else {
+             let mut layout = if is_union {
+                 StructLayout::for_union_with_packing(
+                     &struct_fields,
+@@ -2526,6 +2600,58 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
+                     layout.size = (layout.size + mask) & !mask;
                  }
-                 continue;
-@@ -174,6 +178,59 @@ impl Preprocessor {
-         result
-     }
- 
-+    /// Clang's `__has_warning("-Wflag")` operator. Policy: a well-formed
-+    /// string-literal argument yields 1 (lccc accepts the guarded warning
-+    /// workaround), anything else 0, and the empty call yields the Clang
-+    /// diagnostic the corpus pins: `too few arguments`.
-+    fn resolve_has_warning_call_bytes(
-+        &mut self,
-+        bytes: &[u8],
-+        i: &mut usize,
-+        diag_line: usize,
-+    ) -> &'static str {
-+        let len = bytes.len();
-+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-+            *i += 1;
-+        }
-+        if *i >= len || bytes[*i] != b'(' {
-+            return "0";
-+        }
-+        *i += 1;
-+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-+            *i += 1;
-+        }
-+        if *i < len && bytes[*i] == b')' {
-+            *i += 1;
-+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
-+                file: self.current_file(),
-+                line: diag_line,
-+                col: 0,
-+                message: "too few arguments to function call, expected 1, have 0".to_string(),
-+            });
-+            return "0";
-+        }
-+        // Consume the argument (a string literal in well-formed use) and the
-+        // closing paren; the verdict is 1 for a well-formed call.
-+        let mut well_formed = false;
-+        if *i < len && bytes[*i] == b'"' {
-+            *i += 1;
-+            while *i < len && bytes[*i] != b'"' {
-+                *i += 1;
-+            }
-+            if *i < len {
-+                *i += 1;
-+                well_formed = true;
-+            }
-+        }
-+        while *i < len && bytes[*i] != b')' {
-+            *i += 1;
-+        }
-+        if *i < len {
-+            *i += 1;
-+        }
-+        if well_formed { "1" } else { "0" }
-+    }
-+
-     pub(super) fn resolve_defined_in_expr(&mut self, expr: &str) -> String {
-         let mut result = String::with_capacity(64);
-         let bytes = expr.as_bytes();
-@@ -235,6 +292,12 @@ impl Preprocessor {
-                 } else if ident == "__has_include_next" {
-                     let val = self.resolve_has_include_call_bytes(bytes, &mut i, true);
-                     result.push_str(val);
-+                } else if ident == "__has_embed" {
-+                    let val = self.resolve_has_embed_call_bytes(bytes, &mut i);
-+                    result.push_str(&val);
-+                } else if ident == "__has_warning" {
-+                    let val = self.resolve_has_warning_call_bytes(bytes, &mut i, 0);
-+                    result.push_str(val);
-                 } else {
-                     result.push_str(ident);
-                 }
-@@ -389,6 +452,39 @@ impl Preprocessor {
-         if found { "1" } else { "0" }
-     }
- 
-+    /// C23 `__has_embed(...)`: parse the balanced parenthesized argument
-+    /// (filename spec + optional embed parameters) and probe the resource.
-+    /// Yields the numeric `__STDC_EMBED_*` value: 0 not found / unsupported
-+    /// parameter, 1 found and non-empty, 2 found but empty.
-+    fn resolve_has_embed_call_bytes(&mut self, bytes: &[u8], i: &mut usize) -> String {
-+        let len = bytes.len();
-+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-+            *i += 1;
-+        }
-+        if *i >= len || bytes[*i] != b'(' {
-+            // Malformed operand; the #if evaluator treats it as absent.
-+            return "0".to_string();
-+        }
-+        *i += 1; // skip '('
-+        let start = *i;
-+        let mut depth = 1usize;
-+        while *i < len && depth > 0 {
-+            match bytes[*i] {
-+                b'(' => depth += 1,
-+                b')' => depth -= 1,
-+                _ => {}
-+            }
-+            if depth > 0 {
-+                *i += 1;
-+            }
-+        }
-+        let inner = bytes_to_str(bytes, start, *i);
-+        if *i < len {
-+            *i += 1; // skip ')'
-+        }
-+        (self.probe_embed(inner) as i64).to_string()
-+    }
-+
-     /// Skip a parenthesized argument (byte-oriented).
-     fn skip_paren_arg_bytes(&self, bytes: &[u8], i: &mut usize) {
-         let len = bytes.len();
-diff --git a/src/frontend/preprocessor/includes.rs b/src/frontend/preprocessor/includes.rs
-index f5bc464b..4aa75b3c 100644
---- a/src/frontend/preprocessor/includes.rs
-+++ b/src/frontend/preprocessor/includes.rs
-@@ -10,6 +10,41 @@ use super::pipeline::Preprocessor;
- /// Prevents infinite inclusion loops in files without `#pragma once`.
- const MAX_INCLUDE_DEPTH: usize = 200;
- 
-+/// C23 `__has_embed` result, matching the `__STDC_EMBED_*` macro values.
-+#[derive(Clone, Copy, PartialEq, Eq)]
-+pub(super) enum EmbedResult {
-+    /// `__STDC_EMBED_NOT_FOUND__`
-+    NotFound = 0,
-+    /// `__STDC_EMBED_FOUND__`
-+    Found = 1,
-+    /// `__STDC_EMBED_EMPTY__`
-+    Empty = 2,
-+}
-+
-+/// Parsed C23 `#embed` parameter sequence.
-+#[derive(Default)]
-+pub(super) struct EmbedParams {
-+    pub limit: Option<usize>,
-+    pub prefix: Option<String>,
-+    pub suffix: Option<String>,
-+    pub if_empty: Option<String>,
-+    /// Clang vendor extension `clang::offset(N)`: skip the first N bytes of
-+    /// the resource before `limit` applies. Recognized because the corpus is
-+    /// Clang-derived and the feature-detection tests probe it.
-+    pub offset: Option<usize>,
-+}
-+
-+/// Failure classes of `#embed`/`__has_embed` argument parsing. `#embed`
-+/// diagnoses all of them; `__has_embed` only diagnoses the syntax errors
-+/// (an UNKNOWN parameter is the standard feature-detection channel and must
-+/// stay silent, yielding `__STDC_EMBED_NOT_FOUND__`).
-+enum EmbedSpecError {
-+    NoFilename,
-+    UnknownParam(String),
-+    UnterminatedParam(String),
-+    InvalidLimit(String),
-+}
-+
- /// Compiler-reserved x86 intrinsic headers supplied with LCCC.  They need to
- /// win over a user-supplied GCC builtin include directory: modern GCC's
- /// `immintrin.h` unconditionally pulls AVX-512/_Float16 declarations that the
-@@ -637,6 +672,273 @@ impl Preprocessor {
-         }
-     }
- 
-+    // ====================================================================
-+    // C23 #embed / __has_embed (N3018) — binary resource inclusion.
-+    //
-+    // `#embed "file" [params]` is replaced by a comma-separated list of
-+    // integer byte values; `__has_embed(...)` probes the same search and
-+    // yields __STDC_EMBED_NOT_FOUND__/__STDC_EMBED_FOUND__/
-+    // __STDC_EMBED_EMPTY__ (0/1/2).  The resource search reuses the
-+    // #include machinery: quoted names search the including file's
-+    // directory first, chevron names only the include paths — exactly the
-+    // contract the corpus tests exercise.
-+    // ====================================================================
-+
-+    /// Parse the `<filename> [param(args)...]` tail shared by `#embed` and
-+    /// `__has_embed`. C23 forms (3)/(5): if the filename is not directly
-+    /// `"..."`/`<...>`, the tail undergoes macro replacement first
-+    /// (`#embed __FILE__ limit(2)`), then matching is retried.
-+    fn parse_embed_spec(
-+        &mut self,
-+        text: &str,
-+    ) -> Result<(String, bool, EmbedParams), EmbedSpecError> {
-+        // Match a string/chevron filename at the start of `s`.
-+        fn take_filename(s: &str) -> Option<(String, bool, usize)> {
-+            if let Some(rest) = s.strip_prefix('"') {
-+                let end = rest.find('"')?;
-+                Some((rest[..end].to_string(), false, end + 2))
-+            } else if let Some(rest) = s.strip_prefix('<') {
-+                let end = rest.find('>')?;
-+                Some((rest[..end].to_string(), true, end + 2))
-+            } else {
-+                None
-+            }
-+        }
-+
-+        let trimmed = text.trim_start();
-+        let (filename, is_system, after, source) = match take_filename(trimmed) {
-+            Some((f, sys, consumed)) => (f, sys, consumed, None),
-+            None => {
-+                let expanded = self.macros.expand_line(text);
-+                let trimmed = expanded.trim_start();
-+                match take_filename(trimmed) {
-+                    Some((f, sys, consumed)) => (f, sys, consumed, Some(trimmed.to_string())),
-+                    None => return Err(EmbedSpecError::NoFilename),
-+                }
-+            }
+             }
++            Some(layout)
 +        };
-+        let rest = match &source {
-+            Some(expanded) => &expanded[after..],
-+            None => &trimmed[after..],
-+        };
-+        let params = self.parse_embed_params(rest)?;
-+        Ok((filename, is_system, params))
-+    }
-+
-+    /// Parse the parameter sequence: `name(tokens)...` pairs with balanced
-+    /// parentheses. Failures are returned, not diagnosed: `#embed` turns
-+    /// every variant into an error, while `__has_embed` must silently yield
-+    /// __STDC_EMBED_NOT_FOUND__ for UNSUPPORTED parameters (that is how
-+    //  vendor extensions are feature-detected), only diagnosing true
-+    /// syntax errors.
-+    fn parse_embed_params(&mut self, mut rest: &str) -> Result<EmbedParams, EmbedSpecError> {
-+        let mut params = EmbedParams::default();
-+        loop {
-+            rest = rest.trim_start();
-+            if rest.is_empty() {
-+                return Ok(params);
-+            }
-+            // Parameter name: identifier, optionally vendor-qualified a::b.
-+            let name_len = {
-+                let mut n = 0;
-+                let b = rest.as_bytes();
-+                while n < b.len() && (b[n].is_ascii_alphanumeric() || b[n] == b'_') {
-+                    n += 1;
-+                }
-+                if n < b.len() && b[n] == b':' && n + 1 < b.len() && b[n + 1] == b':' {
-+                    n += 2;
-+                    while n < b.len() && (b[n].is_ascii_alphanumeric() || b[n] == b'_') {
-+                        n += 1;
-+                    }
-+                }
-+                n
-+            };
-+            if name_len == 0 {
-+                // Trailing garbage after the parameter sequence: stop
-+                // parsing rather than looping forever.
-+                return Ok(params);
-+            }
-+            let name = &rest[..name_len];
-+            rest = rest[name_len..].trim_start();
-+            // Balanced-paren argument, if present.
-+            let mut args = String::new();
-+            if let Some(stripped) = rest.strip_prefix('(') {
-+                let b = stripped.as_bytes();
-+                let mut depth = 1usize;
-+                let mut end = None;
-+                for (i, &c) in b.iter().enumerate() {
-+                    match c {
-+                        b'(' => depth += 1,
-+                        b')' => {
-+                            depth -= 1;
-+                            if depth == 0 {
-+                                end = Some(i);
-+                                break;
-+                            }
-+                        }
-+                        _ => {}
-+                    }
-+                }
-+                match end {
-+                    Some(i) => {
-+                        args = stripped[..i].to_string();
-+                        rest = &stripped[i + 1..];
-+                    }
-+                    None => {
-+                        return Err(EmbedSpecError::UnterminatedParam(name.to_string()));
-+                    }
-+                }
-+            }
-+            match name {
-+                "limit" => match args.trim().parse::<usize>() {
-+                    Ok(v) => params.limit = Some(v),
-+                    Err(_) => return Err(EmbedSpecError::InvalidLimit(args.trim().to_string())),
-+                },
-+                "prefix" => params.prefix = Some(args),
-+                "suffix" => params.suffix = Some(args),
-+                "if_empty" => params.if_empty = Some(args),
-+                "clang::offset" => match args.trim().parse::<usize>() {
-+                    Ok(v) => params.offset = Some(v),
-+                    Err(_) => return Err(EmbedSpecError::InvalidLimit(args.trim().to_string())),
-+                },
-+                _ => return Err(EmbedSpecError::UnknownParam(name.to_string())),
-+            }
-+        }
-+    }
-+
-+    fn embed_diagnose_spec_error(&mut self, e: &EmbedSpecError, line_num: usize, col: usize) {
-+        let message = match e {
-+            EmbedSpecError::NoFilename => "expected \"FILENAME\" or <FILENAME>".to_string(),
-+            EmbedSpecError::UnknownParam(n) => {
-+                format!("unknown embed preprocessor parameter '{}'", n)
-+            }
-+            EmbedSpecError::UnterminatedParam(n) => {
-+                format!("unterminated embed parameter '{}' argument", n)
-+            }
-+            EmbedSpecError::InvalidLimit(v) => format!("invalid embed limit '{}'", v),
-+        };
-+        self.errors.push(super::pipeline::PreprocessorDiagnostic {
-+            file: self.current_file(),
-+            line: line_num,
-+            col,
-+            message,
-+        });
-+    }
-+
-+    /// C23 `#embed`: expand to the comma-separated byte list (with
-+    /// prefix/suffix/if_empty applied). Returns the replacement text, or
-+    /// None after queueing a diagnostic.
-+    pub(super) fn expand_embed(
-+        &mut self,
-+        rest: &str,
-+        line_num: usize,
-+        col: usize,
-+    ) -> Option<String> {
-+        let spec = match self.parse_embed_spec(rest) {
-+            Ok(s) => s,
-+            Err(e) => {
-+                self.embed_diagnose_spec_error(&e, line_num, col);
-+                return None;
-+            }
-+        };
-+        let (filename, is_system, params) = spec;
-+        if filename.is_empty() {
-+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
-+                file: self.current_file(),
-+                line: line_num,
-+                col,
-+                message: "empty filename".to_string(),
-+            });
-+            return None;
-+        }
-+        let resolved = self.resolve_and_record_include_path(&filename, is_system);
-+        let Some(resolved) = resolved else {
-+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
-+                file: self.current_file(),
-+                line: line_num,
-+                col,
-+                message: format!("'{}' file not found", filename),
-+            });
-+            return None;
-+        };
-+        let bytes = match std::fs::read(&resolved) {
-+            Ok(b) => b,
-+            Err(_) => {
-+                self.errors.push(super::pipeline::PreprocessorDiagnostic {
-+                    file: self.current_file(),
-+                    line: line_num,
-+                    col,
-+                    message: format!("'{}' file not found", filename),
-+                });
-+                return None;
-+            }
-+        };
-+        // clang::offset(N) skips the first N bytes; limit bounds the count
-+        // of what remains.
-+        let skip = params.offset.unwrap_or(0).min(bytes.len());
-+        let remaining = &bytes[skip..];
-+        let take = match params.limit {
-+            Some(n) if n < remaining.len() => n,
-+            _ => remaining.len(),
-+        };
-+        if take == 0 {
-+            // Empty resource (or limit(0)): the if_empty token sequence,
-+            // which may itself be empty.
-+            return Some(params.if_empty.unwrap_or_default());
-+        }
-+        let mut out = String::new();
-+        if let Some(p) = &params.prefix {
-+            out.push_str(p);
-+        }
-+        let mut first = true;
-+        for &b in &remaining[..take] {
-+            if !first {
-+                out.push_str(", ");
-+            }
-+            first = false;
-+            out.push_str(&b.to_string());
-+        }
-+        if let Some(s) = &params.suffix {
-+            out.push_str(s);
-+        }
-+        Some(out)
-+    }
-+
-+    /// C23 `__has_embed`: probe without emitting tokens. Unsupported
-+    /// parameters yield NOT_FOUND silently (feature detection); genuine
-+    /// syntax errors diagnose and also yield NOT_FOUND.
-+    pub(super) fn probe_embed(&mut self, rest: &str) -> EmbedResult {
-+        let spec = match self.parse_embed_spec(rest) {
-+            Ok(s) => s,
-+            Err(EmbedSpecError::UnknownParam(_)) => return EmbedResult::NotFound,
-+            Err(e) => {
-+                self.embed_diagnose_spec_error(&e, 0, 0);
-+                return EmbedResult::NotFound;
-+            }
-+        };
-+        let (filename, is_system, params) = spec;
-+        if filename.is_empty() {
-+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
-+                file: self.current_file(),
-+                line: 0,
-+                col: 0,
-+                message: "empty filename".to_string(),
-+            });
-+            return EmbedResult::NotFound;
-+        }
-+        let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
-+            return EmbedResult::NotFound;
-+        };
-+        if params.limit == Some(0) {
-+            return EmbedResult::Empty;
-+        }
-+        match std::fs::metadata(&resolved) {
-+            Ok(md) if md.len() <= params.offset.unwrap_or(0) as u64 => EmbedResult::Empty,
-+            Ok(_) => EmbedResult::Found,
-+            Err(_) => EmbedResult::NotFound,
-+        }
-+    }
-+
-     /// Resolve an include path using #include_next semantics: search from the
-     /// next include path after the one containing the current file.
-     /// `current_file` is the full path to the file containing the #include_next.
-diff --git a/src/frontend/preprocessor/macro_defs.rs b/src/frontend/preprocessor/macro_defs.rs
-index b0347f9e..a973e9b0 100644
---- a/src/frontend/preprocessor/macro_defs.rs
-+++ b/src/frontend/preprocessor/macro_defs.rs
-@@ -193,6 +193,8 @@ impl MacroTable {
-             || name == "__has_extension"
-             || name == "__has_include"
-             || name == "__has_include_next"
-+            || name == "__has_embed"
-+            || name == "__has_warning"
-     }
- 
-     /// Iterate over all macro definitions.
-@@ -301,22 +303,80 @@ impl MacroTable {
-         // - 0x01 (BLUE_PAINT_MARKER): prevents re-expansion per C11 §6.10.3.4
-         // - 0x02/0x03 (PASTE_PROTECT_START/END): should already be consumed by
-         //   substitute_params, but strip defensively in case any leak through.
--        if result
--            .as_bytes()
--            .iter()
--            .any(|&b| b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END)
--        {
--            result.replace(
--                [
--                    BLUE_PAINT_MARKER as char,
--                    PASTE_PROTECT_START as char,
--                    PASTE_PROTECT_END as char,
--                ],
--                "",
--            )
--        } else {
--            result
-+        let result =
-+            if result.as_bytes().iter().any(|&b| {
-+                b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END
-+            }) {
-+                result.replace(
-+                    [
-+                        BLUE_PAINT_MARKER as char,
-+                        PASTE_PROTECT_START as char,
-+                        PASTE_PROTECT_END as char,
-+                    ],
-+                    "",
-+                )
-+            } else {
-+                result
-+            };
-+        self.rescan_pragma_operators(result, expanding)
-+    }
-+
-+    /// C99 §6.10.9 corner case: a `_Pragma` operator can come into existence
-+    /// only THROUGH expansion — `#define DO_PRAGMA _Pragma` followed by
-+    /// `DO_PRAGMA ("GCC dependency \"x\"")`. The first-pass handler saw the
-+    /// body `_Pragma` without its argument (the parens live in the outer
-+    /// text) and had to leave it alone. After the full line is expanded the
-+    /// operator and its argument sit adjacent, so rescan for `_Pragma`
-+    /// identifiers and run them through the same handler, which queues the
-+    /// pragma for the pipeline and removes the operator from the stream.
-+    /// Other macros are NOT re-expanded here: a second `expand_text` pass
-+    /// would resurrect blue-painted self-references.
-+    fn rescan_pragma_operators(&self, text: String, expanding: &mut FxHashSet<String>) -> String {
-+        if !text.contains("_Pragma") {
-+            return text;
-         }
-+        let bytes = text.as_bytes();
-+        let len = bytes.len();
-+        let mut out = String::with_capacity(text.len());
-+        let mut i = 0usize;
-+        while i < len {
-+            let c = bytes[i];
-+            if c == b'"' || c == b'\'' {
-+                // Copy string/char literals verbatim: `_Pragma` inside a
-+                // literal is ordinary text.
-+                let quote = c;
-+                let start = i;
-+                i += 1;
-+                while i < len && bytes[i] != quote {
-+                    if bytes[i] == b'\\' && i + 1 < len {
-+                        i += 1;
-+                    }
-+                    i += 1;
-+                }
-+                if i < len {
-+                    i += 1;
-+                }
-+                out.push_str(&text[start..i]);
-+                continue;
-+            }
-+            if is_ident_start_byte(c) {
-+                let start = i;
-+                i += 1;
-+                while i < len && is_ident_cont_byte(bytes[i]) {
-+                    i += 1;
-+                }
-+                let ident = bytes_to_str(bytes, start, i);
-+                if ident == "_Pragma" {
-+                    i = self.handle_pragma_operator(bytes, i, ident, &mut out, expanding);
++        // C 6.7.2.3: a record definition in an inner scope declares a NEW type,
++        // incompatible with any outer type of the same tag. lccc keyed records
++        // by tag alone, so an inner `struct S { int c; }` and an outer
++        // `struct S { char c; }` were the SAME CType -- no compatibility check
++        // could ever fire, and passing one where the other was expected was
++        // silent: `f(s)` returned 44 for `s.c == 300` (tests/bugs/
++        // nested_tag_struct_identity.c) where GCC 16.2 rejects the program.
++        // A shadowing definition therefore gets its own key. Members that
++        // correspond (the N3037 / C23 6.2.9 case) keep the shared key so valid
++        // C23 still compiles, and two layout-identical definitions cannot
++        // miscompile whichever way they are keyed.
++        let key = match (&defined_layout, name) {
++            (Some(new_layout), Some(_)) => {
++                let shadows_different = self
++                    .result
++                    .type_context
++                    .borrow_struct_layouts()
++                    .get(&base_key)
++                    // An empty layout is a forward declaration, which this
++                    // definition completes rather than shadows.
++                    .is_some_and(|prev| {
++                        !prev.fields.is_empty() && !record_layouts_correspond(prev, new_layout)
++                    });
++                if shadows_different {
++                    let id = self.result.type_context.next_struct_variant_id();
++                    let variant = format!("{}#{}", base_key, id);
++                    // While this scope lives, the tag denotes the variant, so
++                    // every tag->CType site resolves to the inner type.
++                    self.result
++                        .type_context
++                        .set_record_alias_from_ref(&base_key, &variant);
++                    variant
 +                } else {
-+                    out.push_str(ident);
-+                }
-+                continue;
-+            }
-+            out.push(c as char);
-+            i += 1;
-+        }
-+        out
-     }
- 
-     /// Append `expanded` text to `result`, inserting spaces as needed to prevent
-diff --git a/src/frontend/preprocessor/pipeline.rs b/src/frontend/preprocessor/pipeline.rs
-index c820b5ad..a57f9410 100644
---- a/src/frontend/preprocessor/pipeline.rs
-+++ b/src/frontend/preprocessor/pipeline.rs
-@@ -444,7 +444,7 @@ impl Preprocessor {
-                         );
-                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-                         self.drain_expansion_pragmas();
--                        let expanded = self.resolve_has_macros_in_code(&expanded);
-+                        let expanded = self.resolve_has_macros_in_code(&expanded, source_line_num);
-                         output.push_str(&expanded);
-                         output.push('\n');
-                         for _ in 1..pending_newlines {
-@@ -496,6 +496,17 @@ impl Preprocessor {
-                 // Regular line (or directive during include with pending line) -
-                 // expand macros, handling multi-line macro invocations
-                 let output_len_before = output.len();
-+                // C23 inline #embed: splice the byte-list expansion into the
-+                // line BEFORE macro expansion so prefix/suffix parameter
-+                // tokens participate in it like any other text.
-+                let spliced_line;
-+                let line: &str = match self.splice_inline_embed(line, source_line_num) {
-+                    Some(replaced) => {
-+                        spliced_line = replaced;
-+                        &spliced_line
-+                    }
-+                    None => line,
-+                };
-                 self.accumulate_and_expand(
-                     line,
-                     source_line_num,
-@@ -548,7 +559,7 @@ impl Preprocessor {
-             );
-             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-             self.drain_expansion_pragmas();
--            let expanded = self.resolve_has_macros_in_code(&expanded);
-+            let expanded = self.resolve_has_macros_in_code(&expanded, last_source_line_num);
-             output.push_str(&expanded);
-             output.push('\n');
-             // Collect macro expansion info for the flushed line
-@@ -682,7 +693,7 @@ impl Preprocessor {
-     }
- 
-     fn accumulate_and_expand(
--        &self,
-+        &mut self,
-         line: &str,
-         source_line_num: usize,
-         _line_start_abs: usize,
-@@ -719,7 +730,7 @@ impl Preprocessor {
-                     *pending_line = line.to_string();
-                     *pending_newlines = 1;
-                 } else {
--                    let expanded = self.resolve_has_macros_in_code(&expanded);
-+                    let expanded = self.resolve_has_macros_in_code(&expanded, source_line_num);
-                     output.push_str(&expanded);
-                     output.push('\n');
-                 }
-@@ -755,7 +766,7 @@ impl Preprocessor {
-                     {
-                         // Don't clear pending_line - keep accumulating
-                     } else {
--                        let expanded = self.resolve_has_macros_in_code(&expanded);
-+                        let expanded = self.resolve_has_macros_in_code(&expanded, source_line_num);
-                         output.push_str(&expanded);
-                         output.push('\n');
-                         for _ in 1..*pending_newlines {
-@@ -793,7 +804,7 @@ impl Preprocessor {
-                     {
-                         // Don't clear pending_line - keep accumulating
-                     } else {
--                        let expanded = self.resolve_has_macros_in_code(&expanded);
-+                        let expanded = self.resolve_has_macros_in_code(&expanded, source_line_num);
-                         output.push_str(&expanded);
-                         output.push('\n');
-                         for _ in 1..*pending_newlines {
-@@ -1040,7 +1051,9 @@ impl Preprocessor {
-             if content.is_empty() {
-                 continue;
-             }
--            self.handle_pragma(&content);
-+            // Queued _Pragma operators carry no line through the macro
-+            // machinery; diagnostics from them report line 0.
-+            self.handle_pragma(&content, 0, 0);
-         }
-     }
- 
-@@ -1104,13 +1117,23 @@ impl Preprocessor {
-                 // current file's directory in the include search list
-                 return self.handle_include_next(rest, line_num, col);
-             }
--            "define" => self.handle_define(rest),
-+            "embed" => {
-+                // C23 #embed: the directive line is replaced by the byte-list
-+                // token sequence.  The caller treats Some(_) as injected
-+                // content and appends the return line marker, so end the
-+                // expansion with a newline to keep the marker on its own line.
-+                return self.expand_embed(rest, line_num, col).map(|mut t| {
-+                    t.push('\n');
-+                    t
-+                });
-+            }
-+            "define" => self.handle_define(rest, line_num, col),
-             "undef" => self.handle_undef(rest),
-             "ifdef" => self.handle_ifdef(rest, false),
-             "ifndef" => self.handle_ifdef(rest, true),
-             "if" => self.handle_if(rest),
-             "pragma" => {
--                return self.handle_pragma(rest);
-+                return self.handle_pragma(rest, line_num, col);
-             }
-             "error" => {
-                 // Expand macros in error message
-@@ -1163,12 +1186,116 @@ impl Preprocessor {
-         None
-     }
- 
--    fn handle_define(&mut self, rest: &str) {
-+    /// C23 makes `#embed` the one directive that may appear MID line
-+    /// (`unsigned char d[] = {#embed "logo.bin"};`).  When the line holds
-+    /// such an occurrence, replace it (directive text runs to end of line)
-+    /// and hand the spliced line to the ordinary macro-expansion path.
-+    /// Returns None when the line has no inline `#embed`.
-+    fn splice_inline_embed(&mut self, line: &str, source_line_num: usize) -> Option<String> {
-+        // Fast path: no candidate text at all.
-+        if !line.contains("embed") {
-+            return None;
-+        }
-+        let bytes = line.as_bytes();
-+        let mut i = 0usize;
-+        let found = loop {
-+            if i >= bytes.len() {
-+                break None;
-+            }
-+            let c = bytes[i];
-+            if c == b'"' || c == b'\'' {
-+                // Skip string/char literals: "#embed" inside a literal is
-+                // ordinary text, not a directive.
-+                let quote = c;
-+                i += 1;
-+                while i < bytes.len() && bytes[i] != quote {
-+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
-+                        i += 1;
-+                    }
-+                    i += 1;
-+                }
-+                i += 1;
-+                continue;
-+            }
-+            if c == b'#' {
-+                let mut j = i + 1;
-+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-+                    j += 1;
-+                }
-+                if j + 5 <= bytes.len()
-+                    && &bytes[j..j + 5] == b"embed"
-+                    && (j + 5 == bytes.len()
-+                        || !(bytes[j + 5].is_ascii_alphanumeric() || bytes[j + 5] == b'_'))
-+                {
-+                    break Some((i, j + 5));
++                    base_key.clone()
 +                }
 +            }
-+            i += 1;
++            _ => base_key.clone(),
 +        };
-+        let (hash_pos, kw_end) = found?;
-+        let expansion = self.expand_embed(&line[kw_end..], source_line_num + 1, hash_pos + 1);
-+        let mut out = String::with_capacity(line.len());
-+        out.push_str(&line[..hash_pos]);
-+        if let Some(t) = expansion {
-+            out.push_str(&t);
++        // Track whether this struct/union has been defined (has a body in the
++        // AST, e.g. `struct X { ... }` or `struct X {}`), as opposed to just
++        // forward-declared (`struct X;`). This distinction is needed for the
++        // incomplete type check in analyze_declaration.
++        if fields.is_some() {
++            let mut defined = self.defined_structs.borrow_mut();
++            defined.insert(key.clone());
++            if key != base_key {
++                defined.insert(base_key.clone());
++            }
 +        }
-+        Some(out)
-+    }
-+
-+    fn handle_define(&mut self, rest: &str, line_num: usize, col: usize) {
-         if let Some(def) = parse_define(rest) {
-+            self.validate_macro_stringize(&def, line_num, col);
-             self.macros.define(def);
++        if let Some(layout) = defined_layout {
+             self.result
+                 .type_context
+                 .insert_struct_layout_scoped_from_ref(&key, layout);
+diff --git a/src/frontend/sema/const_eval.rs b/src/frontend/sema/const_eval.rs
+index a313b63..67287ad 100644
+--- a/src/frontend/sema/const_eval.rs
++++ b/src/frontend/sema/const_eval.rs
+@@ -1363,14 +1363,14 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
          }
-     }
- 
-+    /// C (and C++) constrain the `#` stringize operator: in a function-like
-+    /// macro it must be followed by one of the macro's parameters.  GCC
-+    /// diagnoses this at DEFINE time ("'#' is not followed by a macro
-+    /// parameter"), and the corpus pins exactly that — silently accepting it
-+    /// would let garbage bodies survive to expansion.
-+    fn validate_macro_stringize(&mut self, def: &MacroDef, line_num: usize, col: usize) {
-+        if !def.is_function_like {
-+            return;
-+        }
-+        let bytes = def.body.as_bytes();
-+        let len = bytes.len();
-+        let mut i = 0usize;
-+        while i < len {
-+            if bytes[i] != b'#' {
-+                i += 1;
-+                continue;
-+            }
-+            // '##' is token pasting, not stringize: skip both.
-+            if i + 1 < len && bytes[i + 1] == b'#' {
-+                i += 2;
-+                continue;
-+            }
-+            let mut j = i + 1;
-+            while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
-+                j += 1;
-+            }
-+            let start = j;
-+            while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-+                j += 1;
-+            }
-+            let operand = &def.body[start..j];
-+            let valid = !operand.is_empty()
-+                && (def.params.iter().any(|p| p == operand)
-+                    || (def.is_variadic && operand == "__VA_ARGS__"));
-+            if !valid {
-+                self.errors.push(PreprocessorDiagnostic {
-+                    file: self.current_file(),
-+                    line: line_num,
-+                    col,
-+                    message: "'#' is not followed by a macro parameter".to_string(),
-+                });
-+                return; // one diagnostic per definition, like GCC
-+            }
-+            i = j;
-+        }
-+    }
-+
-     fn handle_undef(&mut self, rest: &str) {
-         let name = rest.split_whitespace().next().unwrap_or("");
-         if !name.is_empty() {
-diff --git a/src/frontend/preprocessor/pragmas.rs b/src/frontend/preprocessor/pragmas.rs
-index 8c100425..9b2792ec 100644
---- a/src/frontend/preprocessor/pragmas.rs
-+++ b/src/frontend/preprocessor/pragmas.rs
-@@ -36,7 +36,12 @@ impl Preprocessor {
-         }
-     }
- 
--    pub(super) fn handle_pragma(&mut self, rest: &str) -> Option<String> {
-+    pub(super) fn handle_pragma(
-+        &mut self,
-+        rest: &str,
-+        line_num: usize,
-+        col: usize,
-+    ) -> Option<String> {
-         let rest = rest.trim();
-         if rest == "once" {
-             // Mark the current file as "include once".  Track both canonical
-@@ -90,12 +95,49 @@ impl Preprocessor {
-                 }
-                 return self.handle_pragma_gcc_visibility(vis_content.trim());
+         TypeSpecifier::Struct(tag, ..) => {
+             if let Some(tag) = tag {
+-                CType::Struct(format!("struct.{}", tag).into())
++                CType::Struct(types.resolve_record_key(&format!("struct.{}", tag)).into())
+             } else {
+                 CType::Int // anonymous struct without context
              }
-+            if let Some(dep_content) = gcc_content.strip_prefix("dependency") {
-+                self.handle_pragma_gcc_dependency(dep_content.trim(), line_num, col);
-+                return None;
-+            }
          }
- 
-         // Other pragmas (GCC, diagnostic, etc.) are silently ignored
-         None
-     }
- 
-+    /// Handle `#pragma GCC dependency FILENAME` (GCC extension).
+         TypeSpecifier::Union(tag, ..) => {
+             if let Some(tag) = tag {
+-                CType::Union(format!("union.{}", tag).into())
++                CType::Union(types.resolve_record_key(&format!("union.{}", tag)).into())
+             } else {
+                 CType::Int // anonymous union without context
+             }
+diff --git a/src/frontend/sema/type_checker.rs b/src/frontend/sema/type_checker.rs
+index 22dc2af..44507f0 100644
+--- a/src/frontend/sema/type_checker.rs
++++ b/src/frontend/sema/type_checker.rs
+@@ -702,7 +702,11 @@ impl<'a> ExprTypeChecker<'a> {
+                 reverse_sso,
+             ) => {
+                 if let Some(tag) = tag {
+-                    CType::Struct(format!("struct.{}", tag).into())
++                    CType::Struct(
++                        self.types
++                            .resolve_record_key(&format!("struct.{}", tag))
++                            .into(),
++                    )
+                 } else if let Some(fs) = fields {
+                     // Without a tag name but with fields, register the anonymous
+                     // struct layout so member access resolution works correctly
+@@ -730,7 +734,11 @@ impl<'a> ExprTypeChecker<'a> {
+                 reverse_sso,
+             ) => {
+                 if let Some(tag) = tag {
+-                    CType::Union(format!("union.{}", tag).into())
++                    CType::Union(
++                        self.types
++                            .resolve_record_key(&format!("union.{}", tag))
++                            .into(),
++                    )
+                 } else if let Some(fs) = fields {
+                     // Same as struct: register anonymous union layout for member access
+                     self.resolve_anon_struct_or_union(
+diff --git a/src/frontend/sema/type_context.rs b/src/frontend/sema/type_context.rs
+index 1b7b031..e29af4a 100644
+--- a/src/frontend/sema/type_context.rs
++++ b/src/frontend/sema/type_context.rs
+@@ -88,6 +88,10 @@ pub struct TypeScopeFrame {
+     /// Keys that were overwritten in `struct_layouts`: (key, previous_value).
+     /// Uses Rc<StructLayout> so saving/restoring is a cheap refcount bump.
+     pub struct_layouts_shadowed: Vec<(String, RcLayout)>,
++    /// Base record keys whose alias was newly inserted into `record_alias`.
++    pub record_alias_added: Vec<String>,
++    /// Base record keys whose alias was overwritten: (base, previous alias).
++    pub record_alias_shadowed: Vec<(String, String)>,
+     /// Keys newly inserted into `ctype_cache`.
+     pub ctype_cache_added: Vec<String>,
+     /// Keys that were overwritten in `ctype_cache`: (key, previous_value).
+@@ -108,6 +112,8 @@ impl TypeScopeFrame {
+             enums_added: Vec::new(),
+             struct_layouts_added: Vec::new(),
+             struct_layouts_shadowed: Vec::new(),
++            record_alias_added: Vec::new(),
++            record_alias_shadowed: Vec::new(),
+             ctype_cache_added: Vec::new(),
+             ctype_cache_shadowed: Vec::new(),
+             typedefs_added: Vec::new(),
+@@ -132,6 +138,12 @@ pub struct TypeContext {
+     /// that take &self (via the TypeConvertContext trait) may need to insert
+     /// forward-declaration layouts when encountering struct/union types.
+     pub struct_layouts: RefCell<FxHashMap<String, RcLayout>>,
++    /// Base record key -> the key currently denoting that tag.
 +    ///
-+    /// GCC semantics: the filename is NOT macro-expanded (a bare macro name
-+    /// is an error), the file is searched like a quoted/chevron include, and
-+    /// a missing file is a hard error. The content is only checked, not
-+    /// inserted. Clang matches this contract and the corpus pins both error
-+    /// shapes.
-+    fn handle_pragma_gcc_dependency(&mut self, content: &str, line_num: usize, col: usize) {
-+        let (filename, is_system) = if let Some(rest) = content.strip_prefix('"') {
-+            let end = rest.find('"').unwrap_or(rest.len());
-+            (rest[..end].to_string(), false)
-+        } else if let Some(rest) = content.strip_prefix('<') {
-+            let end = rest.find('>').unwrap_or(rest.len());
-+            (rest[..end].to_string(), true)
-+        } else {
-+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
-+                file: self.current_file(),
-+                line: line_num,
-+                col,
-+                message: "expected \"FILENAME\" or <FILENAME>".to_string(),
-+            });
-+            return;
-+        };
-+        if self.resolve_include_path(&filename, is_system).is_none() {
-+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
-+                file: self.current_file(),
-+                line: line_num,
-+                col,
-+                message: format!("'{}' file not found", filename),
-+            });
++    /// Only non-identity while an inner-scope definition shadows an outer one
++    /// (C 6.7.2.3): `struct.S` then denotes `struct.S#1` until the scope pops.
++    /// Scoped like `struct_layouts` so shadowing unwinds with the scope.
++    pub record_alias: RefCell<FxHashMap<String, String>>,
+     /// Enum constant values
+     pub enum_constants: FxHashMap<String, i64>,
+     /// Typedef mappings (name -> resolved CType)
+@@ -167,6 +179,8 @@ pub struct TypeContext {
+     /// Counter for anonymous struct/union CType keys generated from &self contexts.
+     /// Uses Cell for interior mutability since type_spec_to_ctype takes &self.
+     anon_ctype_counter: std::cell::Cell<u32>,
++    /// Counter for shadowing record definitions; see `next_struct_variant_id`.
++    struct_variant_counter: std::cell::Cell<u32>,
+ }
+ 
+ // We cannot directly implement `StructLayoutProvider` for `TypeContext` because
+@@ -179,6 +193,7 @@ impl TypeContext {
+     pub fn new() -> Self {
+         let mut tc = Self {
+             struct_layouts: RefCell::new(FxHashMap::default()),
++            record_alias: RefCell::new(FxHashMap::default()),
+             enum_constants: FxHashMap::default(),
+             typedefs: FxHashMap::default(),
+             typedef_alignments: FxHashMap::default(),
+@@ -191,6 +206,7 @@ impl TypeContext {
+             ctype_cache: RefCell::new(FxHashMap::default()),
+             scope_stack: RefCell::new(Vec::new()),
+             anon_ctype_counter: std::cell::Cell::new(0),
++            struct_variant_counter: std::cell::Cell::new(0),
+         };
+         tc.seed_builtin_typedefs();
+         tc
+@@ -406,6 +422,54 @@ impl TypeContext {
+         id
+     }
+ 
++    /// Next id for a *shadowing* record definition: a `struct S { ... }` inside
++    /// an inner scope when a different `struct S` is already visible.
++    ///
++    /// C 6.7.2.3 makes that a NEW type, incompatible with the outer one, so it
++    /// cannot share the outer one's type key. The id is used as a `#N` suffix
++    /// on the base key (`struct.S#1`); `CType::struct_display_tag` strips it for
++    /// diagnostics so users still see `struct S`.
++    pub fn next_struct_variant_id(&self) -> u32 {
++        let id = self.struct_variant_counter.get();
++        self.struct_variant_counter.set(id + 1);
++        id
++    }
++
++    /// Record that `base` is currently denoted by `active`, scoped so the
++    /// mapping disappears when the shadowing scope pops.
++    pub fn set_record_alias_from_ref(&self, base: &str, active: &str) {
++        let mut alias = self.record_alias.borrow_mut();
++        let mut stack = self.scope_stack.borrow_mut();
++        if let Some(frame) = stack.last_mut() {
++            match alias.get(base).cloned() {
++                Some(prev) => frame.record_alias_shadowed.push((base.to_string(), prev)),
++                None => frame.record_alias_added.push(base.to_string()),
++            }
++        }
++        alias.insert(base.to_string(), active.to_string());
++    }
++
++    /// The key that currently denotes record tag key `base`: the shadowing
++    /// variant while one is live, otherwise `base` itself.
++    ///
++    /// Every place that turns a source-level tag into a record `CType` must go
++    /// through this, or an inner-scope `struct S` value gets typed as the outer
++    /// `struct S` and the two become indistinguishable to the type checker.
++    ///
++    /// Returns a borrow, not an owned copy: the overwhelmingly common case is
++    /// "no shadowing in effect", and record type resolution happens for every
++    /// elaborated type in the translation unit, so cloning here would be a
++    /// pure waste.
++    pub fn resolve_record_key<'a>(&self, base: &'a str) -> std::borrow::Cow<'a, str> {
++        // Copy out under the guard: a Cow::Borrowed tied to the Ref guard would
++        // not outlive it. The common path still allocates nothing.
++        let active = self.record_alias.borrow().get(base).cloned();
++        match active {
++            Some(active) => std::borrow::Cow::Owned(active),
++            None => std::borrow::Cow::Borrowed(base),
 +        }
 +    }
 +
-     /// Handle #pragma GCC visibility push(hidden|default|protected|internal) / pop.
-     /// Emits synthetic tokens for the parser to track default visibility.
-     fn handle_pragma_gcc_visibility(&mut self, content: &str) -> Option<String> {
-diff --git a/src/frontend/preprocessor/predefined_macros.rs b/src/frontend/preprocessor/predefined_macros.rs
-index df9fff44..47fe8409 100644
---- a/src/frontend/preprocessor/predefined_macros.rs
-+++ b/src/frontend/preprocessor/predefined_macros.rs
-@@ -42,6 +42,13 @@ impl Preprocessor {
-             ("__STDC__", "1"),
-             ("__STDC_VERSION__", "201710L"), // C17
-             ("__STDC_HOSTED__", "1"),
-+            // C23 #embed result constants (N3018). Defined unconditionally,
-+            // matching lccc's permissive-extension dialect policy (#embed is
-+            // accepted in every -std= mode, like GNU default modes accept
-+            // newer-dialect features as extensions).
-+            ("__STDC_EMBED_NOT_FOUND__", "0"),
-+            ("__STDC_EMBED_FOUND__", "1"),
-+            ("__STDC_EMBED_EMPTY__", "2"),
-             // Platform
-             ("__linux__", "1"),
-             ("__linux", "1"),
-diff --git a/tests/corpus/clang-c/Preprocessor/e.txt b/tests/corpus/clang-c/Preprocessor/e.txt
-new file mode 100644
-index 00000000..4285ace4
+     /// Insert a struct layout from a &self context (interior mutability via RefCell).
+     pub fn insert_struct_layout_from_ref(&self, key: &str, layout: StructLayout) {
+         self.struct_layouts
+@@ -444,6 +508,15 @@ impl TypeContext {
+             for key in frame.struct_layouts_added {
+                 layouts.remove(&key);
+             }
++            {
++                let mut alias = self.record_alias.borrow_mut();
++                for key in frame.record_alias_added {
++                    alias.remove(&key);
++                }
++                for (key, val) in frame.record_alias_shadowed {
++                    alias.insert(key, val);
++                }
++            }
+             for (key, val) in frame.struct_layouts_shadowed {
+                 // Don't restore an empty forward-declaration layout over a full
+                 // definition.
+diff --git a/tests/bugs/nested_tag_struct_identity.c b/tests/bugs/nested_tag_struct_identity.c
+index 5986366..d56da2a 100644
+--- a/tests/bugs/nested_tag_struct_identity.c
++++ b/tests/bugs/nested_tag_struct_identity.c
+@@ -1,6 +1,36 @@
+ /* BUG: nested same-tag struct definitions share one type identity -> miscompile
+  *
+- * Status: OPEN (frontend/sema). Filed from the EDG Changes-distillation
++ * Status: FIXED (this tree). Now pinned by
++ * tests/regression/check_record_tag_identity.sh, a differential gate against
++ * the host GCC run from both ci_local.sh --fast and hosted CI.
++ *
++ * The fix, in three parts:
++ *   1. src/frontend/sema/analysis.rs resolve_struct_or_union() mints a distinct
++ *      key ("struct.S#1") for a definition that shadows a visible one with
++ *      NON-corresponding members, so the two are no longer the same CType.
++ *      Members that correspond (N3037 / C23 6.2.9) keep the shared key, so
++ *      valid C23 still compiles.
++ *   2. src/frontend/sema/type_context.rs keeps a scoped record_alias map
++ *      (base key -> key currently denoting the tag, unwound by pop_scope), and
++ *      every tag->CType site resolves through it: sema/type_checker.rs and
++ *      sema/const_eval.rs. Without this the variable was still typed as the
++ *      outer record and the distinct key never reached the checker.
++ *   3. check_call_arguments() previously compared ONLY arity and
++ *      pointer/float mixing -- it never compared record types at all, so even
++ *      distinct keys could not diagnose anything. check_record_argument_
++ *      compatibility() now does, exempting anonymous records and
++ *      transparent_union parameters.
++ *
++ * Residual, asserted by the gate so it cannot widen silently: pos_n3037 under
++ * -std=c17 is accepted by lccc and rejected by GCC. Two definitions with
++ * corresponding members share a key, which is what C23 wants and is too
++ * permissive pre-C23. It cannot miscompile -- corresponding members means
++ * identical layouts -- and closing it needs the C standard threaded into sema,
++ * which currently has no notion of -std.
++ *
++ * Original report follows.
++ *
++ * Originally filed from the EDG Changes-distillation
+  * campaign, entry "C23: New tag compatibility rules" (N3037), the highest
+  * scored C-relevant entry in docs/edg_changes_c_extract.md (*C-score +10*).
+  *
+diff --git a/tests/regression/check_record_tag_identity.sh b/tests/regression/check_record_tag_identity.sh
+new file mode 100755
+index 0000000..b517c28
 --- /dev/null
-+++ b/tests/corpus/clang-c/Preprocessor/e.txt
-@@ -0,0 +1,2 @@
-+/home/user/lccc/tests/corpus/clang-c/Preprocessor/embed_file_not_found_chevron.c:8:2: error: 'nfejfNejAKFe' file not found
-+ccc: error: 1 preprocessor error(s) in embed_file_not_found_chevron.c
++++ b/tests/regression/check_record_tag_identity.sh
+@@ -0,0 +1,215 @@
++#!/usr/bin/env bash
++# Record tag identity: a nested same-tag definition must not alias the outer one.
++#
++# WHY THIS EXISTS
++# ---------------
++# lccc keyed struct/union types by tag alone while struct layouts were
++# scope-aware, so an inner `struct S { int c; }` and an outer
++# `struct S { char c; }` were the SAME CType. No compatibility check could fire,
++# and the call path did not compare record types at all -- so the program below
++# compiled and printed 44 where the correct answer is 300, while GCC rejects it
++# outright:
++#
++#     struct S { char c; };
++#     unsigned f(struct S p) { return (unsigned)(unsigned char)p.c; }
++#     int main(void) { struct S { int c; } s = { 300 }; printf("%u\n", f(s)); }
++#
++# A regression corpus cannot catch this: it compares runtime output against
++# GCC, and GCC refuses to build the test at all. So the oracle here is
++# accept/reject, not output. Tracked as TAG-ID-1 in backlog.md.
++#
++# This gate is a differential against the host GCC, which is the point: the
++# expectations are not hand-written, they are read off the oracle at run time.
++# A row that lccc and GCC disagree on fails the gate.
++#
++# KNOWN DIVERGENCE (asserted, not hidden)
++# ---------------------------------------
++# One row is recorded as a known divergence and is verified to be *exactly*
++# that, so it cannot silently widen:
++#
++#   pos_n3037 @ -std=c17 : GCC rejects, lccc accepts.
++#
++# C 6.7.2.3 makes an inner-scope definition a new type incompatible with the
++# outer one, so GCC is right. lccc gives two definitions with *corresponding*
++# members the same key, which is what C23 (N3037) requires; pre-C23 it is too
++# permissive. It cannot miscompile -- corresponding members means identical
++# layouts, so the values are interchangeable in memory -- and closing it needs
++# the C standard threaded into sema (which currently has no notion of -std)
++# plus a mode-gated N3037 compatibility relation. Making keys always distinct
++# without that relation would reject valid C23, which is worse.
++
++set -uo pipefail
++
++CCC=${CCC:-target/fastbuild/lccc}
++GCC=${GCC:-gcc}
++WORK=$(mktemp -d)
++trap 'rm -rf "$WORK"' EXIT
++
++if [[ ! -x "$CCC" ]]; then
++    echo "check_record_tag_identity: FAIL: compiler not found at $CCC" >&2
++    exit 1
++fi
++if ! command -v "$GCC" >/dev/null 2>&1; then
++    echo "check_record_tag_identity: FAIL: no oracle ($GCC) -- this gate is" \
++         "meaningless without one and must not silently pass" >&2
++    exit 1
++fi
++
++fail=0
++declare -a RESULTS=()
++ok()   { RESULTS+=("ok   $*"); }
++bad()  { RESULTS+=("FAIL $*"); fail=1; }
++
++# write_case <name> <body>
++write_case() { printf '%s\n' "$2" > "$WORK/$1.c"; }
++
++# --- negative rows: members do NOT correspond, so both must reject -----------
++write_case neg_member_type '
++struct S { char c; };
++unsigned f(struct S p) { return (unsigned)(unsigned char)p.c; }
++int main(void) { struct S { int c; } s = { 300 }; return (int)f(s); }'
++
++write_case neg_member_name '
++struct S { int i; };
++void f(struct S p);
++void g(void) { struct S { int j; } s = { 42 }; f(s); }'
++
++write_case neg_member_count '
++struct S { int i; };
++void f(struct S p);
++void g(void) { struct S { int i; int k; } s = { 42, 1 }; f(s); }'
++
++write_case neg_bitfield_width '
++struct S { int b : 3; };
++void f(struct S p);
++void g(void) { struct S { int b : 5; } s = { 1 }; f(s); }'
++
++write_case neg_bitfield_signedness '
++struct S { signed int b : 3; };
++void f(struct S p);
++void g(void) { struct S { unsigned int b : 3; } s = { 1 }; f(s); }'
++
++# --- positive rows ----------------------------------------------------------
++# N3037: corresponding members. C23 accepts; pre-C23 the two are distinct.
++write_case pos_n3037 '
++struct S { int i; };
++void f(struct S p);
++void g(void) { struct S { int i; } s = { 42 }; f(s); }'
++
++# Ordinary same-type by-value passing, fully linked, with a checked result.
++write_case runtime_same_type '
++#include <stdio.h>
++struct P { int x, y; };
++static int sum(struct P p) { return p.x + p.y; }
++int main(void) { struct P q = { 20, 22 }; printf("%d\n", sum(q)); return 0; }'
++
++# An elaborated `struct S b;` AFTER an inner definition must denote the INNER
++# record, not the outer one -- this is the path where the type comes from the
++# tag alone rather than from a member list, so it exercises the alias map.
++write_case runtime_elaborated_after_inner '
++#include <stdio.h>
++struct S { char c; };
++int main(void) {
++    struct S { int c; } a = { 300 };
++    struct S b;
++    b.c = 12345;
++    printf("%d %d %zu\n", a.c, b.c, sizeof b);
++    return 0;
++}'
++
++# A nested definition that shadows with corresponding members, then is used
++# consistently inside its own scope: must build and run correctly.
++write_case runtime_nested_consistent '
++#include <stdio.h>
++struct Q { int v; };
++static int outer(struct Q q) { return q.v; }
++int main(void) {
++    struct Q { int v; } inner = { 7 };
++    printf("%d %d\n", inner.v, outer(inner));
++    return 0;
++}'
++
++verdict() { # verdict <compiler...> <file> -> accept|REJECT
++    if "$@" >/dev/null 2>&1; then echo accept; else echo REJECT; fi
++}
++
++compare_row() { # compare_row <case> <std>
++    local case=$1 std=$2 want got
++    want=$(verdict "$GCC" -std="$std" -fsyntax-only "$WORK/$case.c")
++    got=$(verdict "$CCC" -std="$std" -fsyntax-only "$WORK/$case.c")
++    if [[ "$want" == "$got" ]]; then
++        ok "$case @$std: both $want"
++    else
++        bad "$case @$std: gcc=$want lccc=$got"
++    fi
++}
++
++# Every negative row must match the oracle in both modes.
++for case in neg_member_type neg_member_name neg_member_count \
++            neg_bitfield_width neg_bitfield_signedness; do
++    compare_row "$case" c17
++    compare_row "$case" c23
++done
++
++# C23 N3037 must match the oracle.
++compare_row pos_n3037 c23
++
++# The one known divergence, pinned so it cannot widen unnoticed.
++pre=$(verdict "$GCC" -std=c17 -fsyntax-only "$WORK/pos_n3037.c")
++ours=$(verdict "$CCC" -std=c17 -fsyntax-only "$WORK/pos_n3037.c")
++if [[ "$pre" == REJECT && "$ours" == accept ]]; then
++    ok "pos_n3037 @c17: known divergence unchanged (gcc=REJECT lccc=accept; diagnostics only, layouts identical)"
++else
++    bad "pos_n3037 @c17: divergence changed shape (gcc=$pre lccc=$ours) -- update this gate deliberately"
++fi
++
++# Runtime rows: the value must be right, not merely accepted.
++if "$CCC" -std=c23 "$WORK/runtime_same_type.c" -o "$WORK/rt1" >/dev/null 2>&1; then
++    out=$("$WORK/rt1" 2>&1)
++    if [[ "$out" == "42" ]]; then ok "runtime_same_type: 42"; else
++        bad "runtime_same_type: printed '$out', expected 42"; fi
++else
++    bad "runtime_same_type: failed to build"
++fi
++
++if "$CCC" -std=c23 "$WORK/runtime_nested_consistent.c" -o "$WORK/rt2" >/dev/null 2>&1; then
++    out=$("$WORK/rt2" 2>&1)
++    if [[ "$out" == "7 7" ]]; then ok "runtime_nested_consistent: 7 7"; else
++        bad "runtime_nested_consistent: printed '$out', expected '7 7'"; fi
++else
++    bad "runtime_nested_consistent: failed to build"
++fi
++
++# The original miscompile must stay rejected, and must never produce a binary.
++cat > "$WORK/tagid1.c" <<'EOF'
++#include <stdio.h>
++struct S { char c; };
++unsigned f(struct S p) { return (unsigned)(unsigned char)p.c; }
++int main(void) { struct S { int c; } s = { 300 }; printf("%u\n", f(s)); return 0; }
++EOF
++if "$CCC" -std=c23 "$WORK/tagid1.c" -o "$WORK/tagid1" >/dev/null 2>&1; then
++    ran=$("$WORK/tagid1" 2>&1)
++    bad "TAG-ID-1 regressed: compiled and printed '$ran' (correct answer 300, gcc rejects)"
++else
++    ok "TAG-ID-1: rejected, no binary produced"
++fi
++
++if "$CCC" -std=c23 "$WORK/runtime_elaborated_after_inner.c" -o "$WORK/rt3" >/dev/null 2>&1; then
++    out=$("$WORK/rt3" 2>&1)
++    # GCC prints the same; the point is that `b` is the INNER 4-byte record.
++    want=$("$GCC" -std=c23 "$WORK/runtime_elaborated_after_inner.c" -o "$WORK/rt3g" >/dev/null 2>&1 && "$WORK/rt3g")
++    if [[ "$out" == "$want" && "$out" == "300 12345 4" ]]; then
++        ok "runtime_elaborated_after_inner: $out"
++    else
++        bad "runtime_elaborated_after_inner: lccc='$out' gcc='$want' expected='300 12345 4'"
++    fi
++else
++    bad "runtime_elaborated_after_inner: failed to build"
++fi
++
++for line in "${RESULTS[@]}"; do printf '%s\n' "$line"; done
++if (( fail != 0 )); then
++    echo "check_record_tag_identity: FAILED" >&2
++    exit 1
++fi
++echo "check_record_tag_identity: PASS (${#RESULTS[@]} rows vs $GCC oracle)"
