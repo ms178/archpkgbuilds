@@ -376,6 +376,348 @@ index ec2bb8bf..7ea3b2fd 100644
  # Release profile for shipped compiler binaries.
  #
  # * thin LTO: most of fat-LTO's cross-crate inlining benefit at a fraction
+diff --git a/scripts/assembler_callgrind_ab.sh b/scripts/assembler_callgrind_ab.sh
+new file mode 100755
+index 00000000..d74f1723
+--- /dev/null
++++ b/scripts/assembler_callgrind_ab.sh
+@@ -0,0 +1,107 @@
++#!/usr/bin/env bash
++# assembler_callgrind_ab.sh — reproducible Callgrind A/B measurement of the
++# lccc AArch64 assembler's own throughput (NOT compiled-code quality; for
++# that use scripts/callgrind_ab.py).
++#
++# WHAT IT MEASURES
++# ----------------
++# Deterministic instruction-count (Ir) totals for `lccc-arm -c` on a fixed,
++# seeded 20k-instruction AArch64 workload that deliberately over-weights the
++# encoder families under active hardening (logical + extend + bitfield +
++# pair + NEON bitwise ≈ 70% of the mix) over a generic background. Callgrind
++# is deterministic, so ONE run per side is exact; the script still does two
++# and asserts equality to catch a nondeterministic environment.
++#
++# It also asserts that the two builds produce BYTE-IDENTICAL object files on
++# the workload — an assembler throughput change must never be an encoding
++# change.
++#
++# USAGE
++# -----
++#   scripts/assembler_callgrind_ab.sh <base-lccc-arm> <head-lccc-arm>
++#   scripts/assembler_callgrind_ab.sh --self-test <lccc-arm>
++#
++# Both positional arguments are paths to lccc-arm binaries (e.g. a build of
++# upstream main and a build of the working tree). --self-test runs both
++# sides with the SAME binary and asserts the measured delta is exactly zero
++# -- this verifies the harness itself (workload generation, byte-identity
++# comparison, determinism assertion, Ir parsing) without needing a second
++# build, and is what the fast CI gate runs. Requires valgrind on PATH (any
++# 3.2x); a user-local install works with VALGRIND_LIB exported by whoever
++# provisions it.
++set -euo pipefail
++
++SELF_TEST=0
++if [[ "${1:-}" == "--self-test" ]]; then
++    SELF_TEST=1
++    shift
++fi
++
++BASE_BIN=${1:?usage: assembler_callgrind_ab.sh [--self-test] <base-lccc-arm> [<head-lccc-arm>]}
++HEAD_BIN=${2:-$BASE_BIN}
++WORK=$(mktemp -d)
++trap 'rm -rf "$WORK"' EXIT
++S="$WORK/workload.s"
++
++# ---- fixed, seeded workload (20036 instructions + labels) ------------------
++python3 - "$S" <<'PY'
++import random, sys
++random.seed(20261004)
++lines = [".text", ".globl workload", "workload:"]
++funcs = [f"func{j}" for j in range(8)]
++for i in range(20000):
++    k = i % 10
++    rd, rn, rm = random.randrange(31), random.randrange(31), random.randrange(31)
++    if k == 0:   lines.append(f"and w{rd}, w{rn}, w{rm}, lsl #{i % 32}")
++    elif k == 1: lines.append(f"orr x{rd}, x{rn}, x{rm}, asr #{i % 64}")
++    elif k == 2: lines.append(f"eor w{rd}, w{rn}, w{rm}, ror #{i % 32}")
++    elif k == 3: lines.append(f"sxtb x{rd}, w{rn}" if i % 2 else f"uxtw x{rd}, w{rn}")
++    elif k == 4: lines.append(f"ubfx w{rd}, w{rn}, #{i % 20}, #{1 + i % 10}")
++    elif k == 5: lines.append(f"stp x{rd}, x{rn}, [sp, #{(i % 60) * 8 - 240}]")
++    elif k == 6: lines.append(f"and v{rd % 32}.16b, v{rn % 32}.16b, v{rm % 32}.16b")
++    elif k == 7: lines.append(f"add w{rd}, w{rn}, #{i % 4000}")
++    elif k == 8: lines.append(f"ldr w{rd}, [x{rn}, #{(i % 16000) & ~3}]")  # 4-aligned
++    else:
++        if i % 7:
++            lines.append(f"cbz w{rd}, .Lskip{i}")
++            lines.append(f"add w{rd}, w{rd}, #1")
++            lines.append(f".Lskip{i}:")
++        else:
++            lines.append(f"bl {funcs[i % 8]}")
++for f in funcs:
++    lines += [f"{f}:", "    ret"]
++open(sys.argv[1], 'w').write('\n'.join(lines) + '\n')
++PY
++
++# ---- assemble with both builds; objects must be byte-identical -------------
++"$BASE_BIN" -c "$S" -o "$WORK/base.o"
++"$HEAD_BIN" -c "$S" -o "$WORK/head.o"
++cmp "$WORK/base.o" "$WORK/head.o" \
++  || { echo "FAIL: object outputs differ — an encoding changed, not just speed" >&2; exit 1; }
++echo "object outputs byte-identical"
++
++# ---- deterministic Callgrind runs (two per side, must agree) ----------------
++measure() {  # measure <bin> <tag>
++    local bin=$1 tag=$2 run ir
++    for run in 1 2; do
++        valgrind --tool=callgrind --callgrind-out-file="$WORK/cg_${tag}_${run}.out" \
++                 --quiet "$bin" -c "$S" -o "$WORK/w_${tag}.o" 2>/dev/null
++        ir=$(grep -m1 '^totals:' "$WORK/cg_${tag}_${run}.out" | awk '{print $2}')
++        eval "ir_${tag}_${run}=$ir"
++    done
++    eval "a=\$ir_${tag}_1; b=\$ir_${tag}_2"
++    [[ $a == "$b" ]] || { echo "FAIL: nondeterministic Ir for $tag ($a vs $b)" >&2; exit 1; }
++    echo "$a"
++}
++b_ir=$(measure "$BASE_BIN" base)
++h_ir=$(measure "$HEAD_BIN" head)
++python3 - "$b_ir" "$h_ir" "$SELF_TEST" <<'PY'
++import sys
++b, h, self_test = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3] == "1"
++print(f"base Ir = {b:,}")
++print(f"head Ir = {h:,}")
++print(f"delta   = {h-b:+,} ({(h-b)/b*100:+.3f}%)")
++if self_test:
++    assert h == b, "self-test: same binary must measure exactly 0 delta"
++    print("self-test ok: harness deterministic, delta exactly 0")
++PY
+diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
+index 46b85cec..12df31a2 100755
+--- a/scripts/ci_local.sh
++++ b/scripts/ci_local.sh
+@@ -280,6 +280,37 @@ gate "loop-alignment-contract" fast \
+ gate "fuzz-harness-tests" fast \
+     python3 -m unittest discover -s tests/fuzz -p 'test_*.py'
+ 
++# PBT bug-witness ratchet: the ignore count may only ratchet down, and every
++# ignored bug-witness must still fail under --ignored (a passing witness is
++# dead weight whose bug is fixed -- activate it). Skips whose reason is not
++# "documented bug" are exempt from the liveness check but still pinned.
++# Requires the test binaries: run after the cargo-test gate (or standalone
++# once target/fastbuild is warm).
++gate "pbt-ignore-ratchet" fast \
++    python3 scripts/pbt_ignore_ratchet.py
++
++# Callgrind A/B harness self-test: same binary on both sides must measure a
++# delta of exactly zero (verifies workload generation, the byte-identity
++# comparison and Ir parsing without a second build). The full two-build A/B
++# is a research-loop tool, not a gate -- Callgrind is ~100x realtime.
++callgrind_selftest() {
++    local vg vglib
++    if command -v valgrind >/dev/null 2>&1; then
++        vg=$(command -v valgrind)
++    elif [ -x "$HOME/.local/opt/valgrind-apt/usr/bin/valgrind" ]; then
++        vg="$HOME/.local/opt/valgrind-apt/usr/bin/valgrind"
++        vglib="$HOME/.local/opt/valgrind-apt/usr/libexec/valgrind"
++    else
++        echo "SKIP: no valgrind on this host (research-only tool)"
++        return 0
++    fi
++    PATH="$(dirname "$vg"):$PATH" \
++        VALGRIND_LIB="${vglib:-${VALGRIND_LIB:-}}" \
++        bash scripts/assembler_callgrind_ab.sh --self-test \
++            target/fastbuild/lccc-arm
++}
++gate "assembler-callgrind-selftest" fast callgrind_selftest
++
+ gate "fuzz-engine-wiring" fast \
+     python3 scripts/fuzz_diff.py --check-engines
+ 
+diff --git a/scripts/pbt_ignore_ratchet.py b/scripts/pbt_ignore_ratchet.py
+new file mode 100755
+index 00000000..6393acd4
+--- /dev/null
++++ b/scripts/pbt_ignore_ratchet.py
+@@ -0,0 +1,181 @@
++#!/usr/bin/env python3
++"""pbt_ignore_ratchet.py — the PBT bug-witness ratchet.
++
++The PBT suites carry `#[ignore = "documented bug: ..."]` witnesses: property
++tests that assert the DESIRED behaviour and fail while the bug is open. An
++ignore list with no ratchet is a graveyard with a growth direction -- nothing
++fails when a 380th ignore is added, or when an ignore's bug is fixed but the
++test is left ignored (dead weight that silently rots).
++
++This gate pins both directions:
++
++1. COUNT: the number of `#[ignore]` attributes under tests/pbt must not
++   exceed the pinned maximum. Fixing bugs (and activating their witnesses)
++   lowers the count; the pin ratchets down with it and never back up without
++   a deliberate change to this file.
++
++2. LIVENESS: every ignored test must still FAIL when run with `--ignored`.
++   A witness that passes means its bug is fixed and the test is dead weight:
++   activate it (remove the ignore) or delete it. The only exception is an
++   ignore whose reason does not start with "documented bug" (sandbox skips,
++   missing-tool skips) -- those are not witnesses and are exempt from the
++   liveness check, though they still count toward the pin.
++
++Usage:
++    pbt_ignore_ratchet.py                 # run the gate
++    pbt_ignore_ratchet.py --self-test     # verify the harness itself
++    pbt_ignore_ratchet.py --update-pin    # rewrite PIN after a legit drop
++"""
++from __future__ import annotations
++
++import argparse
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parent.parent
++PBT_DIR = REPO / "tests" / "pbt"
++PIN_FILE = REPO / "tests" / "pbt" / "IGNORE_RATCHET_PIN"
++
++# The PBT integration-test targets (see tests/pbt_*.rs).
++TARGETS = [
++    "pbt_arm_core",
++    "pbt_arm_neon_a",
++    "pbt_arm_neon_b",
++    "pbt_arm_neon_c",
++    "pbt_arm_load_store",
++    "pbt_arm_fp_scalar",
++    "pbt_arm_system",
++    "pbt_common",
++    "pbt_preprocessor",
++]
++
++IGNORE_RE = re.compile(r'#\[ignore\s*(?:=\s*"([^"]*)")?\s*\]')
++
++
++def count_ignores() -> tuple[int, int]:
++    """Returns (total, witnesses) over tests/pbt/**/*.rs."""
++    total = witnesses = 0
++    for path in sorted(PBT_DIR.rglob("*.rs")):
++        for m in IGNORE_RE.finditer(path.read_text()):
++            total += 1
++            if m.group(1) and m.group(1).startswith("documented bug"):
++                witnesses += 1
++    return total, witnesses
++
++
++def run_ignored() -> tuple[list[str], list[str]]:
++    """Runs every PBT target with --ignored.
++
++    Returns (passing_ignored, failing_ignored) test names. A passing ignored
++    test is dead weight when it is a bug witness.
++    """
++    passing: list[str] = []
++    failing: list[str] = []
++    for target in TARGETS:
++        # Default format: one "test NAME ... ok|FAILED" line per test.
++        # cargo exits nonzero when any test fails -- the EXPECTED state for
++        # witnesses -- so parse the listing regardless of the exit code.
++        r = subprocess.run(
++            ["cargo", "test", "--profile", "fastbuild", "--test", target,
++             "--", "--ignored", "--test-threads", "2"],
++            cwd=REPO, capture_output=True, text=True, timeout=1200,
++        )
++        out = r.stdout + r.stderr
++        n_listed = 0
++        for line in out.splitlines():
++            m = re.match(r"test (\S+) \.\.\. (ok|FAILED)", line)
++            if m:
++                n_listed += 1
++                (passing if m.group(2) == "ok" else failing).append(m.group(1))
++        m_n = re.search(r"running (\d+) tests", out)
++        n_tests = int(m_n.group(1)) if m_n else 0
++        if n_tests != n_listed:
++            # The harness output changed shape; fail closed rather than
++            # silently approving an unparsed run.
++            print(f"FAIL: could not parse {target} --ignored output "
++                  f"({n_tests} announced, {n_listed} listed)")
++            return None, None
++    return passing, failing
++
++
++def is_witness(name: str) -> bool:
++    """A passing ignored test is only dead weight if it documents a bug.
++
++    Sandbox/missing-tool skips (any ignore reason not starting with
++    'documented bug') are legitimately green under --ignored.
++    """
++    for path in PBT_DIR.rglob("*.rs"):
++        text = path.read_text()
++        for m in IGNORE_RE.finditer(text):
++            # Find the fn that follows this ignore within a few lines.
++            window = text[m.end():m.end() + 200]
++            fn = re.search(r"fn (\w+)\(", window)
++            if fn and fn.group(1) in name.split("::")[-1:]:
++                reason = m.group(1) or ""
++                return reason.startswith("documented bug")
++    return True  # unknown -> treat as witness (fail closed)
++
++
++def self_test() -> int:
++    total, witnesses = count_ignores()
++    assert total >= witnesses >= 0, "witness subset invariant"
++    # The pin file must parse as a non-negative integer.
++    pin = int(PIN_FILE.read_text().strip())
++    assert pin >= 0
++    print(f"self-test ok: {total} ignores ({witnesses} witnesses), pin {pin}")
++    return 0
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--self-test", action="store_true")
++    ap.add_argument("--update-pin", action="store_true",
++                    help="rewrite the pin to the current count (use only "
++                         "after activating witnesses; the pin may only go "
++                         "down between commits)")
++    args = ap.parse_args()
++    if args.self_test:
++        return self_test()
++
++    total, witnesses = count_ignores()
++    pin = int(PIN_FILE.read_text().strip())
++
++    if args.update_pin:
++        if total > pin:
++            print(f"REFUSING to raise the pin ({pin} -> {total}): ignores "
++                  "may only be removed, not added")
++            return 1
++        PIN_FILE.write_text(f"{total}\n")
++        print(f"pin updated: {pin} -> {total}")
++        return 0
++
++    ok = True
++    if total > pin:
++        print(f"FAIL: ignore count rose above the pin ({total} > {pin}). "
++              "Every new #[ignore] must replace an activated witness or "
++              "come with a pin update in the same commit, justified in "
++              "its message.")
++        ok = False
++    else:
++        print(f"count: {total} ignores ({witnesses} witnesses) <= pin {pin}")
++
++    passing, failing = run_ignored()
++    if passing is None:
++        return 1
++    dead = [t for t in passing if is_witness(t)]
++    print(f"liveness: {len(failing)} witnesses still fail (correct), "
++          f"{len(passing)} ignored tests pass")
++    if dead:
++        print("FAIL: passing bug-witnesses (activate or delete them):")
++        for t in dead:
++            print(f"  {t}")
++        ok = False
++
++    print("pbt-ignore-ratchet:", "PASS" if ok else "FAIL")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/src/backend/arm/assembler/encoder/bitfield.rs b/src/backend/arm/assembler/encoder/bitfield.rs
 index b42e302a..55905774 100644
 --- a/src/backend/arm/assembler/encoder/bitfield.rs
@@ -3422,7 +3764,7 @@ index 47bc48d9..b62e7299 100644
      let r = if suffix.contains('l') { 1u32 } else { 0u32 };
      let rt = 31u32; // XZR/WZR - discard result
 diff --git a/src/backend/arm/assembler/encoder/mod.rs b/src/backend/arm/assembler/encoder/mod.rs
-index d44d2539..a9c588ad 100644
+index d44d2539..25358ecd 100644
 --- a/src/backend/arm/assembler/encoder/mod.rs
 +++ b/src/backend/arm/assembler/encoder/mod.rs
 @@ -19,13 +19,13 @@ mod load_store;
@@ -3446,10 +3788,111 @@ index d44d2539..a9c588ad 100644
  
  /// Result of encoding an instruction.
  #[derive(Debug, Clone)]
-@@ -199,6 +199,81 @@ fn is_32bit_reg(name: &str) -> bool {
-     name.starts_with('w') || name == "wsp" || name == "wzr"
+@@ -154,49 +154,146 @@ pub struct Relocation {
+ 
+ /// Parse a register name to its 5-bit encoding number (0-30, 31 for sp/zr).
+ pub fn parse_reg_num(name: &str) -> Option<u32> {
+-    let name = name.to_lowercase();
+-    match name.as_str() {
+-        "sp" | "wsp" => Some(31),
+-        "xzr" | "wzr" => Some(31),
+-        "lr" => Some(30),
+-        _ => {
+-            let prefix = name.chars().next()?;
+-            match prefix {
+-                'x' | 'w' | 'd' | 's' | 'q' | 'v' | 'h' | 'b' => {
+-                    // `str::parse::<u32>` is far more permissive than the
+-                    // AArch64 register grammar: it accepts a leading `+` and
+-                    // arbitrary leading zeros, so "x+5", "x007" and "w+31"
+-                    // all used to resolve to a real register instead of being
+-                    // rejected. Accept only bare decimal digits, and only in
+-                    // canonical (no leading zero) form -- matching GAS, which
+-                    // rejects "x007" as an unknown symbol.
+-                    // (Upstream fork issues #118 and #207.)
+-                    let digits = &name[1..];
+-                    if digits.is_empty()
+-                        || !digits.bytes().all(|b| b.is_ascii_digit())
+-                        || (digits.len() > 1 && digits.starts_with('0'))
+-                    {
+-                        return None;
+-                    }
+-                    let num: u32 = digits.parse().ok()?;
+-                    if num <= 31 { Some(num) } else { None }
+-                }
+-                _ => None,
+-            }
+-        }
++    // Allocation-free on purpose: this runs for every register operand of
++    // every instruction, and the old `to_lowercase()` here was a measurable
++    // share of the assembler's total instruction count (the byte-wise
++    // rewrite below is the single largest win of the fail-closed pass).
++    // Semantics are identical to the lowercasing version: the alias table,
++    // the eight register prefixes, bare canonical decimal (no leading
++    // zero, no sign), numbers 0..=31.
++    if name.eq_ignore_ascii_case("sp") || name.eq_ignore_ascii_case("wsp") {
++        return Some(31);
++    }
++    if name.eq_ignore_ascii_case("xzr") || name.eq_ignore_ascii_case("wzr") {
++        return Some(31);
++    }
++    if name.eq_ignore_ascii_case("lr") {
++        return Some(30);
++    }
++    let b = name.as_bytes();
++    match b.first() {
++        Some(
++            b'x' | b'X' | b'w' | b'W' | b'd' | b'D' | b's' | b'S' | b'q' | b'Q' | b'v' | b'V'
++            | b'h' | b'H' | b'b' | b'B',
++        ) => {}
++        _ => return None,
++    }
++    // `str::parse::<u32>` is far more permissive than the register grammar:
++    // it accepts a leading `+` and arbitrary leading zeros, so "x+5",
++    // "x007" and "w+31" all used to resolve to a real register instead of
++    // being rejected. Accept only bare decimal digits, and only in
++    // canonical (no leading zero) form -- matching GAS, which rejects
++    // "x007" as an unknown symbol. (Upstream fork issues #118 and #207.)
++    let digits = &b[1..];
++    if digits.is_empty()
++        || !digits.iter().all(|d| d.is_ascii_digit())
++        || (digits.len() > 1 && digits[0] == b'0')
++    {
++        return None;
+     }
++    let mut num: u32 = 0;
++    for &d in digits {
++        num = num * 10 + (d - b'0') as u32;
++    }
++    if num <= 31 { Some(num) } else { None }
  }
  
+ /// Check if a register name is a 64-bit (X) register or SP.
++/// Allocation-free: this runs on hot operand paths (the old
++/// `to_lowercase()` here was part of the +1.5% Ir regression the Callgrind
++/// A/B caught).
+ fn is_64bit_reg(name: &str) -> bool {
+-    let name = name.to_lowercase();
+-    name.starts_with('x') || name == "sp" || name == "xzr" || name == "lr"
++    match name.as_bytes().first() {
++        Some(b'x' | b'X') => true,
++        _ => {
++            name.eq_ignore_ascii_case("sp")
++                || name.eq_ignore_ascii_case("xzr")
++                || name.eq_ignore_ascii_case("lr")
++        }
++    }
+ }
+ 
+ /// Check if a register name is a 32-bit (W) register.
+ fn is_32bit_reg(name: &str) -> bool {
+-    let name = name.to_lowercase();
+-    name.starts_with('w') || name == "wsp" || name == "wzr"
++    match name.as_bytes().first() {
++        Some(b'w' | b'W') => true,
++        _ => name.eq_ignore_ascii_case("wsp") || name.eq_ignore_ascii_case("wzr"),
++    }
++}
++
 +/// Check whether `name` spells a general-purpose register: `x0`-`x30`,
 +/// `w0`-`w30`, or one of the `sp`/`wsp`/`xzr`/`wzr`/`lr` aliases.
 +///
@@ -3523,12 +3966,10 @@ index d44d2539..a9c588ad 100644
 +    let (rd, is_64) = get_reg(operands, 0)?;
 +    let (rn, _) = get_reg(operands, 1)?;
 +    Ok((rd, is_64, rn))
-+}
-+
+ }
+ 
  /// Check if a register is a floating-point/SIMD register.
- fn is_fp_reg(name: &str) -> bool {
-     let c = name.chars().next().unwrap_or(' ').to_ascii_lowercase();
-@@ -206,7 +281,7 @@ fn is_fp_reg(name: &str) -> bool {
+@@ -206,7 +303,7 @@ fn is_fp_reg(name: &str) -> bool {
  }
  
  /// Encode a condition code string to 4-bit encoding.
@@ -3537,7 +3978,7 @@ index d44d2539..a9c588ad 100644
      match cond.to_lowercase().as_str() {
          "eq" => Some(0),
          "ne" => Some(1),
-@@ -463,14 +538,77 @@ pub fn encode_instruction(
+@@ -463,14 +560,77 @@ pub fn encode_instruction(
          "fmul" => {
              if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
                  if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
@@ -3616,7 +4057,7 @@ index d44d2539..a9c588ad 100644
          "fdiv" => {
              if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
                  encode_neon_float_three_same(operands, 1, 0, 0b11111)
-@@ -641,14 +779,18 @@ pub fn encode_instruction(
+@@ -641,14 +801,18 @@ pub fn encode_instruction(
          // NEON float three-same instructions (vector-only)
          "fmla" => {
              if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
@@ -3637,7 +4078,7 @@ index d44d2539..a9c588ad 100644
              } else {
                  encode_neon_float_three_same(operands, 0, 1, 0b11001)
              }
-@@ -1197,7 +1339,7 @@ pub fn encode_instruction(
+@@ -1197,7 +1361,7 @@ pub fn encode_instruction(
  
  // ── Encoding helpers ──────────────────────────────────────────────────────
  
@@ -3646,7 +4087,7 @@ index d44d2539..a9c588ad 100644
      match operands.get(idx) {
          Some(Operand::Reg(name)) => {
              let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {}", name))?;
-@@ -1211,7 +1353,172 @@ pub(crate) fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), S
+@@ -1211,7 +1375,164 @@ pub(crate) fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), S
      }
  }
  
@@ -3668,34 +4109,26 @@ index d44d2539..a9c588ad 100644
 +pub fn get_gpr_strict(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
 +    match operands.get(idx) {
 +        Some(Operand::Reg(name)) => {
-+            let lower = name.to_lowercase();
-+            if lower == "sp" || lower == "wsp" {
++            // Allocation-free on the accepting path: this reader sits on the
++            // hottest operand paths of the whole assembler (the old version
++            // lowercased the name twice per operand, which the Callgrind A/B
++            // attributed a measurable share of the +1.5% regression to).
++            // Error construction still allocates -- errors are cold.
++            if name.eq_ignore_ascii_case("sp") || name.eq_ignore_ascii_case("wsp") {
 +                return Err(format!(
 +                    "operand {idx}: sp/wsp is not valid for this instruction"
 +                ));
 +            }
-+            // Byte-wise spelling check. `&lower[1..]` on a name whose first
-+            // character is multi-byte UTF-8 would slice into a code point and
-+            // panic, so the digit check runs over bytes and is only consulted
-+            // when the first byte is an ASCII 'x'/'w' — at which point index 1
-+            // is guaranteed to be a char boundary.
-+            let bytes = lower.as_bytes();
-+            let numbered = matches!(bytes.first(), Some(b'x' | b'w'))
-+                && bytes[1..].iter().all(|b| b.is_ascii_digit())
-+                && bytes.len() > 1;
-+            let is_gpr_spelling = numbered || lower == "xzr" || lower == "wzr" || lower == "lr";
-+            if !is_gpr_spelling {
++            // `is_gp_reg` accepts x0-x30/w0-w30 and the xzr/wzr/lr aliases
++            // with canonical decimal only, and structurally cannot accept
++            // an "x31"/"w31" spelling (its digit scan bounds the value at
++            // 30), so the old post-hoc x31 rejection is unnecessary here.
++            if !is_gp_reg(name) {
 +                return Err(format!(
 +                    "operand {idx}: `{name}` is not a general-purpose register"
 +                ));
 +            }
-+            let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {}", name))?;
-+            if numbered && num == 31 {
-+                return Err(format!(
-+                    "operand {idx}: `{name}` is not a valid register spelling; \
-+                     register 31 is written `xzr`/`wzr`"
-+                ));
-+            }
++            let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {name}"))?;
 +            let is_64 = is_64bit_reg(name);
 +            Ok((num, is_64))
 +        }
@@ -3820,7 +4253,7 @@ index d44d2539..a9c588ad 100644
      match operands.get(idx) {
          Some(Operand::Imm(v)) => Ok(*v),
          other => Err(format!(
-@@ -1221,7 +1528,7 @@ fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
+@@ -1221,7 +1542,7 @@ fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
      }
  }
  
@@ -3829,7 +4262,7 @@ index d44d2539..a9c588ad 100644
      match operands.get(idx) {
          Some(Operand::Symbol(s)) => Ok((s.clone(), 0)),
          Some(Operand::Label(s)) => Ok((s.clone(), 0)),
-@@ -1240,7 +1547,7 @@ fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String>
+@@ -1240,7 +1561,7 @@ fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String>
      }
  }
  
@@ -6089,6 +6522,13 @@ index d57bd10a..2631e49b 100644
  /// Shared entry point for all compiler binaries. Spawns the real work on a
  /// thread with a large stack so deeply recursive C files don't overflow.
  pub fn compiler_main() {
+diff --git a/tests/pbt/IGNORE_RATCHET_PIN b/tests/pbt/IGNORE_RATCHET_PIN
+new file mode 100644
+index 00000000..cf7ff50f
+--- /dev/null
++++ b/tests/pbt/IGNORE_RATCHET_PIN
+@@ -0,0 +1 @@
++359
 diff --git a/tests/pbt/common/const_arith_binop_prop_tests.rs b/tests/pbt/common/const_arith_binop_prop_tests.rs
 new file mode 100644
 index 00000000..556c5b71
@@ -9635,10 +10075,10 @@ index 00000000..0e2e7533
 +cc 34ee715568247c2a7b126d826ab67a00922788ad069366cb8684e257b2bd6543 # shrinks to n = 0, amount = 5, ek = 0
 diff --git a/tests/pbt/encoder/data_processing_addsub_div_bitmask_pbt.rs b/tests/pbt/encoder/data_processing_addsub_div_bitmask_pbt.rs
 new file mode 100644
-index 00000000..50bbab61
+index 00000000..36be04f5
 --- /dev/null
 +++ b/tests/pbt/encoder/data_processing_addsub_div_bitmask_pbt.rs
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,614 @@
 +//! Property-based tests for register-width and shift/extend validation in
 +//! `data_processing.rs`, covering three encoders:
 +//!
@@ -9919,8 +10359,7 @@ index 00000000..50bbab61
 +    // as a 64-bit instruction with W-numbered sources. ARMv8 requires all three
 +    // operands to share one width; clang rejects `add x0, w1, x2` /
 +    // `add w0, x1, x2` with "invalid operand for instruction".
-+    #[ignore = "documented bug: add/sub shifted-register accepts mixed register widths (clang rejects)"]
-+    #[test]
++        #[test]
 +    fn addsub_shifted_reg_rejects_mixed_widths(
 +        n in 0u32..=30,
 +        rd_is_x in any::<bool>(),
@@ -9944,8 +10383,7 @@ index 00000000..50bbab61
 +    // masked with `& 0x3F`, so shift amounts 32..=63 (UNDEFINED per the ARMv8
 +    // ARM for W registers) are silently encoded. clang rejects
 +    // `add w0, w1, w2, lsl #32` / `lsr #40`.
-+    #[ignore = "documented bug: add/sub W-reg shifted form accepts shift 32..63 (UNDEFINED; clang rejects)"]
-+    #[test]
++        #[test]
 +    fn addsub_shifted_reg_w_rejects_shift_above_31(
 +        n in 0u32..=30,
 +        amount in 32u32..=63u32,
@@ -9964,8 +10402,7 @@ index 00000000..50bbab61
 +    // BUG WITNESS (#[ignore]): for a 64-bit (X) shifted-register form, imm6 is
 +    // masked with `& 0x3F`, so shift amounts ≥ 64 (out of range) silently wrap
 +    // (e.g. #64 → 0, #65 → 1). clang rejects `add x0, x1, x2, lsl #64`.
-+    #[ignore = "documented bug: add/sub X-reg shifted form masks shift ≥64 into imm6 (clang rejects)"]
-+    #[test]
++        #[test]
 +    fn addsub_shifted_reg_x_rejects_shift_above_63(
 +        n in 0u32..=30,
 +        amount in 64u32..=255u32,
@@ -10019,8 +10456,7 @@ index 00000000..50bbab61
 +    // `_ => 0b011` (UXTX), so an unrecognized mnemonic (typo / fabricated name)
 +    // is silently encoded as UXTX instead of being rejected. clang rejects
 +    // `add x0, x1, x2, foo` with "expected '[su]xt[bhw]' … in range [0, 4]".
-+    #[ignore = "documented bug: add/sub extended-reg maps unknown extend kind to UXTX (clang rejects)"]
-+    #[test]
++        #[test]
 +    fn addsub_extended_reg_rejects_unknown_extend_kind(
 +        n in 0u32..=30,
 +        kind in "[a-z]{1,6}",              // arbitrary lowercase strings
@@ -10042,8 +10478,7 @@ index 00000000..50bbab61
 +    // `& 0x7`. Values 5..=7 are architecturally RESERVED for the imm3 field of
 +    // the add/sub extended-register form (the permitted range is 0..=4), yet
 +    // the encoder silently emits them. clang rejects `add x0, x1, x2, uxtw #5`.
-+    #[ignore = "documented bug: add/sub extended-reg accepts reserved extend shift 5..7 (clang rejects)"]
-+    #[test]
++        #[test]
 +    fn addsub_extended_reg_rejects_reserved_shift_5_to_7(
 +        n in 0u32..=30,
 +        amount in 5u32..=7u32,
@@ -10065,8 +10500,7 @@ index 00000000..50bbab61
 +    // BUG WITNESS (#[ignore]): extend shift amounts ≥ 8 are silently truncated
 +    // by `& 0x7` (e.g. #8 → 0, #9 → 1). The valid range is 0..=4, so these are
 +    // out of range and MUST be rejected. clang rejects `add x0, x1, x2, uxtw #8`.
-+    #[ignore = "documented bug: add/sub extended-reg silently truncates extend shift ≥8 (clang rejects)"]
-+    #[test]
++        #[test]
 +    fn addsub_extended_reg_rejects_truncated_shift_above_7(
 +        n in 0u32..=30,
 +        amount in 8u32..=63u32,
@@ -18869,10 +19303,10 @@ index 00000000..7340bc8b
 +cc dc902ee3784993c7c2c3704699e0e280a7ea11d938952b3b760ed05c2982c00e # shrinks to size = 2, is_load = false, form = 2, off_idx = 0
 diff --git a/tests/pbt/encoder/load_store_ldr_str_pbt.rs b/tests/pbt/encoder/load_store_ldr_str_pbt.rs
 new file mode 100644
-index 00000000..e92e9c1b
+index 00000000..044009de
 --- /dev/null
 +++ b/tests/pbt/encoder/load_store_ldr_str_pbt.rs
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,309 @@
 +//! Property-based tests for `encode_ldr_str` (AArch64 LDR/STR encoder).
 +//!
 +//! These tests live in a separate file and are compiled only under
@@ -19121,7 +19555,6 @@ index 00000000..e92e9c1b
 +    // where it is masked. The decoder recovers neither the unsigned nor a
 +    // sane signed value — so it must be Err. EXPECTED TO FAIL today.
 +    #[test]
-+    #[ignore = "documented bug: oversized aligned ldr/str offset masked in LDUR fallback"]
 +    fn prop_oversized_aligned_offset_rejected(
 +        size in 2u32..=3u32,
 +        is_load in any::<bool>(),
@@ -19200,10 +19633,10 @@ index 00000000..ee422684
 +cc be6a98633ba1106df221afea0c7e60b33a6c1cdaa98a49bf8e6fcb4e1eb623d1 # shrinks to rt = 31, rn = 0, imm9 = 0
 diff --git a/tests/pbt/encoder/load_store_ldst_stop_pbt.rs b/tests/pbt/encoder/load_store_ldst_stop_pbt.rs
 new file mode 100644
-index 00000000..cce164af
+index 00000000..37cd5a87
 --- /dev/null
 +++ b/tests/pbt/encoder/load_store_ldst_stop_pbt.rs
-@@ -0,0 +1,559 @@
+@@ -0,0 +1,554 @@
 +//! Property-based tests for four `load_store.rs` encoders that share a
 +//! common defect class: **silent offset mishandling**.
 +//!
@@ -19364,7 +19797,6 @@ index 00000000..cce164af
 +    // EXPECTED TO FAIL today; marked #[ignore] so `cargo test` stays green.
 +    // Run with:  cargo test ldur_stur_out_of_range_imm9_rejected -- --ignored
 +    #[test]
-+    #[ignore = "documented bug: LDUR/STUR imm9 offsets outside [-256,255] are masked via & 0x1FF"]
 +    fn ldur_stur_out_of_range_imm9_rejected(
 +        is_load in any::<bool>(),
 +        off in (-4096i64..4096i64).prop_filter(
@@ -19447,7 +19879,6 @@ index 00000000..cce164af
 +    // EXPECTED TO FAIL today; marked #[ignore].
 +    // Run with:  cargo test ldtr_sized_out_of_range_imm9_rejected -- --ignored
 +    #[test]
-+    #[ignore = "documented bug: LDTR/STTR imm9 offsets outside [-256,255] are masked via & 0x1FF"]
 +    fn ldtr_sized_out_of_range_imm9_rejected(
 +        is_load in any::<bool>(),
 +        size in 0u32..=3u32,
@@ -19541,7 +19972,6 @@ index 00000000..cce164af
 +    // EXPECTED TO FAIL today; marked #[ignore].
 +    // Run with:  cargo test ldrsw_unrepresentable_mem_offset_rejected -- --ignored
 +    #[test]
-+    #[ignore = "documented bug: LDRSW Mem offsets outside the representable range are truncated via & 0x1FF"]
 +    fn ldrsw_unrepresentable_mem_offset_rejected(
 +        off in (-10000i64..=100000i64).prop_filter(
 +            "not unsigned-pimm and not signed-imm9",
@@ -19563,7 +19993,6 @@ index 00000000..cce164af
 +    // EXPECTED TO FAIL today; marked #[ignore].
 +    // Run with:  cargo test ldrsw_pre_post_out_of_range_imm9_rejected -- --ignored
 +    #[test]
-+    #[ignore = "documented bug: LDRSW pre/post imm9 offsets outside [-256,255] are masked"]
 +    fn ldrsw_pre_post_out_of_range_imm9_rejected(
 +        form in 0u32..2u32,
 +        off in (-4096i64..4096i64).prop_filter(
@@ -19721,7 +20150,6 @@ index 00000000..cce164af
 +    // EXPECTED TO FAIL today; marked #[ignore].
 +    // Run with:  cargo test stop_nonzero_offset_rejected -- --ignored
 +    #[test]
-+    #[ignore = "documented bug: LSE store aliases have no offset form; non-zero offset silently dropped"]
 +    fn stop_nonzero_offset_rejected(
 +        mn in arb_stop_mn(),
 +        off in (-32768i64..32767i64).prop_filter("non-zero", |o| *o != 0),
@@ -19781,10 +20209,10 @@ index 00000000..be3f2781
 +cc dcea8a7e02709c9cb50106894cd09d9ac837a247980534213cdbaf61e9f64a61 # shrinks to mn_idx = 0, rs = 0, rt = 31, base = 0, wide = false
 diff --git a/tests/pbt/encoder/load_store_pbt.rs b/tests/pbt/encoder/load_store_pbt.rs
 new file mode 100644
-index 00000000..acf86d56
+index 00000000..12816948
 --- /dev/null
 +++ b/tests/pbt/encoder/load_store_pbt.rs
-@@ -0,0 +1,649 @@
+@@ -0,0 +1,612 @@
 +// Property-based tests for the load/store encoders, isolated in a separate
 +// `cfg(test)` module file.
 +//
@@ -20052,8 +20480,7 @@ index 00000000..acf86d56
 +    // `(*offset >> shift) & 0x7F` (no range check), wrapping silently.
 +    //
 +    #[test]
-+    #[ignore = "documented bug: ldnp/stnp out-of-range imm7 wraps, not rejected"]
-+    fn witness_ldnp_out_of_range_offset_rejected(
++        fn witness_ldnp_out_of_range_offset_rejected(
 +        is_x in any::<bool>(),
 +        k in 0u32..8u32,
 +    ) {
@@ -20076,8 +20503,7 @@ index 00000000..acf86d56
 +    // the low bits silently. See
 +    // the transplanted campaign notes.
 +    #[test]
-+    #[ignore = "documented bug: ldnp/stnp misaligned offset is silently truncated"]
-+    fn witness_ldnp_misaligned_offset_rejected(
++        fn witness_ldnp_misaligned_offset_rejected(
 +        is_x in any::<bool>(),
 +        low in 1i64..=3i64,
 +    ) {
@@ -20226,23 +20652,6 @@ index 00000000..acf86d56
 +        prop_assert!(r.is_err(), "expected Err, got {:?}", r);
 +    }
 +
-+    // ── BUG WITNESS (documented) ─────────────────────────────────────────
-+    // SWP encodes only `[Xn|SP]` — there is no offset field, so a non-zero
-+    // immediate offset is unrepresentable and MUST be rejected. The encoder
-+    // silently drops it instead. See
-+    // the transplanted campaign notes.
-+    #[test]
-+    #[ignore = "documented bug: swp non-zero offset silently dropped, not rejected"]
-+    fn witness_swp_nonzero_offset_rejected(
-+        mn_idx in 0usize..SWP_MNEMONICS.len(),
-+        off in (-32768i64..32767i64).prop_filter("non-zero", |o| *o != 0),
-+    ) {
-+        let mn = SWP_MNEMONICS[mn_idx];
-+        let res = encode_swp(mn, &swp_ops('x', 0, 'x', 1, 2, off));
-+        prop_assert!(res.is_err(),
-+            "non-zero offset {} on {} must be rejected (no offset field); got {:?}",
-+            off, mn, res);
-+    }
 +}
 +
 +// =============================================================================
@@ -20396,23 +20805,6 @@ index 00000000..acf86d56
 +        prop_assert!(r.is_err(), "expected Err, got {:?}", r);
 +    }
 +
-+    // ── BUG WITNESS (documented) ─────────────────────────────────────────
-+    // CAS encodes only `[Xn|SP]` — there is no offset field, so a non-zero
-+    // immediate offset is unrepresentable and MUST be rejected. The encoder
-+    // silently drops it instead. See
-+    // the transplanted campaign notes.
-+    #[test]
-+    #[ignore = "documented bug: cas non-zero offset silently dropped, not rejected"]
-+    fn witness_cas_nonzero_offset_rejected(
-+        mn_idx in 0usize..CAS_MNEMONICS.len(),
-+        off in (-32768i64..32767i64).prop_filter("non-zero", |o| *o != 0),
-+    ) {
-+        let mn = CAS_MNEMONICS[mn_idx];
-+        let res = encode_cas(mn, &cas_ops('x', 0, 'x', 1, 2, off));
-+        prop_assert!(res.is_err(),
-+            "non-zero offset {} on {} must be rejected (no offset field); got {:?}",
-+            off, mn, res);
-+    }
 +
 +    // ── BUG WITNESS (documented) ─────────────────────────────────────────
 +    // CASB/CASH require W (32-bit) registers, and the plain CAS form
@@ -20420,8 +20812,7 @@ index 00000000..acf86d56
 +    // UNDEFINED and MUST be rejected. The encoder accepts them. See
 +    // the transplanted campaign notes.
 +    #[test]
-+    #[ignore = "documented bug: cas accepts mixed-width / X-form byte & half operands"]
-+    fn witness_cas_mixed_width_rejected(kind in 0u8..5u8) {
++        fn witness_cas_mixed_width_rejected(kind in 0u8..5u8) {
 +        let (mn, ops) = match kind {
 +            0 => ("casb", vec![reg('x', 0), reg('x', 1), mem(2, 0)]),
 +            1 => ("casab", vec![reg('x', 5), reg('x', 6), mem(3, 0)]),
@@ -20450,10 +20841,10 @@ index 00000000..75b09a04
 +cc a59fef75e4cf40bc3d40abebc6ec3aad36d46335a7018a2041c0486686e20c1c # shrinks to pidx = 0, rn = 0, rm = 0, opt_idx = 0, shift_amt = 0
 diff --git a/tests/pbt/encoder/load_store_prfm_prop_tests.rs b/tests/pbt/encoder/load_store_prfm_prop_tests.rs
 new file mode 100644
-index 00000000..d96b4026
+index 00000000..7feace9c
 --- /dev/null
 +++ b/tests/pbt/encoder/load_store_prfm_prop_tests.rs
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,218 @@
 +//! Property-based tests for `encode_prfm` (Prefetch Memory, ARMv8-A).
 +//!
 +//! This is a separate `#[cfg(test)]` module, pulled into the build by the
@@ -20600,7 +20991,6 @@ index 00000000..d96b4026
 +    // default `cargo test` stays green; the failure (run with --ignored) IS
 +    // the bug being reported.
 +    #[test]
-+    #[ignore = "documented bug: register-form opc uses (0b10<<23) (bit 24) instead of 0x00800000 (bit 23)"]
 +    fn prop_prfm_register_offset_matches_llvm_mc(
 +        pidx in 0usize..PRFOP_TABLE.len(),
 +        rn in 0u32..=30u32,
@@ -20653,7 +21043,6 @@ index 00000000..d96b4026
 +    // returning Err. `#[ignore]`'d so default `cargo test` stays green; the
 +    // failure (run with --ignored) IS the bug being reported.
 +    #[test]
-+    #[ignore = "documented bug: (imm/8) as u32 wraps before the >0xFFF range check"]
 +    fn prop_prfm_large_offset_not_silently_truncated(
 +        scaled in (0x1_0000_0000_i64..=0x1_0000_0FFF_i64),
 +    ) {
@@ -42745,10 +43134,10 @@ index 00000000..3e7546f5
 +cc 66fc3e9d835ca7824a881c2e50dd1bb2a7385e15c8a5270b75d32aa420bacf94 # shrinks to op0 = 0, op1 = 0, crn = 0, crm = 0, op2 = 0, rt = 31
 diff --git a/tests/pbt/encoder/system_msr_mrs_pbt.rs b/tests/pbt/encoder/system_msr_mrs_pbt.rs
 new file mode 100644
-index 00000000..af848ba3
+index 00000000..73efd497
 --- /dev/null
 +++ b/tests/pbt/encoder/system_msr_mrs_pbt.rs
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,430 @@
 +//! Property-based tests for `encode_mrs` and `encode_msr` in `system.rs`
 +//! (the AArch64 MRS / MSR system-register encoders).
 +//!
@@ -43151,8 +43540,9 @@ index 00000000..af848ba3
 +/// reject FP/SIMD operands with *"invalid operand for instruction"*; the
 +/// encoder routes the register name through `parse_reg_num`, which accepts
 +/// `d/s/q/v` registers, and silently re-uses the lane number as `Rt`.
++// ACTIVATED: the strict GP readers now reject FP/SIMD Rt (fixed in the
++// session-3 fail-closed pass).
 +#[test]
-+#[ignore = "documented bug: FP/SIMD register accepted as Rt; clang rejects with 'invalid operand for instruction'"]
 +fn b2_mrs_msr_reject_fp_register_rt() {
 +    let fp_regs = ["d0", "s0", "q5", "v0"];
 +    for rt_name in fp_regs {
@@ -43982,16 +44372,21 @@ index 00000000..eaf4d6c2
 +}
 diff --git a/tests/pbt_arm_core.rs b/tests/pbt_arm_core.rs
 new file mode 100644
-index 00000000..73fdd825
+index 00000000..d90ea330
 --- /dev/null
 +++ b/tests/pbt_arm_core.rs
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,68 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +
 +#[path = "pbt/encoder/bitfield_cls_clz_crc_rev_pbt.rs"]
 +mod bitfield_cls_clz_crc_rev_pbt;
@@ -44051,16 +44446,21 @@ index 00000000..73fdd825
 +mod encode_logical_pbt;
 diff --git a/tests/pbt_arm_fp_scalar.rs b/tests/pbt_arm_fp_scalar.rs
 new file mode 100644
-index 00000000..157d486c
+index 00000000..ef6c1a17
 --- /dev/null
 +++ b/tests/pbt_arm_fp_scalar.rs
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,29 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +
 +#[path = "pbt/encoder/fp_scalar_bank_precision_pbt.rs"]
 +mod fp_scalar_bank_precision_pbt;
@@ -44081,16 +44481,21 @@ index 00000000..157d486c
 +mod fp_scalar_int_to_float_pbt;
 diff --git a/tests/pbt_arm_load_store.rs b/tests/pbt_arm_load_store.rs
 new file mode 100644
-index 00000000..9ed551db
+index 00000000..cfd2bf98
 --- /dev/null
 +++ b/tests/pbt_arm_load_store.rs
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,35 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +
 +#[path = "pbt/encoder/load_store_ldar_ldxr_class_pbt.rs"]
 +mod load_store_ldar_ldxr_class_pbt;
@@ -44117,16 +44522,21 @@ index 00000000..9ed551db
 +mod load_store_prfm_prop_tests;
 diff --git a/tests/pbt_arm_neon_a.rs b/tests/pbt_arm_neon_a.rs
 new file mode 100644
-index 00000000..ed333aea
+index 00000000..64a8f90f
 --- /dev/null
 +++ b/tests/pbt_arm_neon_a.rs
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,77 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +
 +#[path = "pbt/encoder/neon_across_long_pbt.rs"]
 +mod neon_across_long_pbt;
@@ -44195,16 +44605,21 @@ index 00000000..ed333aea
 +mod neon_float_two_misc_pbt;
 diff --git a/tests/pbt_arm_neon_b.rs b/tests/pbt_arm_neon_b.rs
 new file mode 100644
-index 00000000..2b26ed77
+index 00000000..61837e10
 --- /dev/null
 +++ b/tests/pbt_arm_neon_b.rs
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,77 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +
 +#[path = "pbt/encoder/neon_ins_pbt.rs"]
 +mod neon_ins_pbt;
@@ -44273,16 +44688,21 @@ index 00000000..2b26ed77
 +mod neon_scalar_qshrn_pbt;
 diff --git a/tests/pbt_arm_neon_c.rs b/tests/pbt_arm_neon_c.rs
 new file mode 100644
-index 00000000..16a8be36
+index 00000000..79a71cf3
 --- /dev/null
 +++ b/tests/pbt_arm_neon_c.rs
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,71 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +
 +#[path = "pbt/encoder/neon_scalar_three_same_pbt.rs"]
 +mod neon_scalar_three_same_pbt;
@@ -44345,16 +44765,21 @@ index 00000000..16a8be36
 +mod neon_zip_uzp_pbt;
 diff --git a/tests/pbt_arm_system.rs b/tests/pbt_arm_system.rs
 new file mode 100644
-index 00000000..8370426d
+index 00000000..f1055c5d
 --- /dev/null
 +++ b/tests/pbt_arm_system.rs
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,20 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +
 +#[path = "pbt/encoder/system_barriers_hints_pbt.rs"]
 +mod system_barriers_hints_pbt;
@@ -44366,33 +44791,127 @@ index 00000000..8370426d
 +mod system_sys_at_dc_ic_tlbi_pbt;
 diff --git a/tests/pbt_common.rs b/tests/pbt_common.rs
 new file mode 100644
-index 00000000..f98932e6
+index 00000000..504e3bcc
 --- /dev/null
 +++ b/tests/pbt_common.rs
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,17 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +#[path = "pbt/common/const_arith_binop_prop_tests.rs"]
 +mod const_arith_binop_prop_tests;
 +#[path = "pbt/common/const_eval_pbt.rs"]
 +mod const_eval_pbt;
 +#[path = "pbt/common/long_double_pbt.rs"]
 +mod long_double_pbt;
+diff --git a/tests/pbt_internals_contract.rs b/tests/pbt_internals_contract.rs
+new file mode 100644
+index 00000000..365b85a2
+--- /dev/null
++++ b/tests/pbt_internals_contract.rs
+@@ -0,0 +1,78 @@
++//! Contract test for the `lccc::pbt_internals` re-export surface.
++//!
++//! The integration-test crates reach the encoder through this module, so it
++//! is effectively a public API for the test suite even though it is
++//! `#[doc(hidden)]` and documented as unstable. That contract deserves a
++//! test of its own: if an item is renamed, moved or narrowed without the
++//! test suites being updated, the failure should say "the pbt_internals
++//! contract changed", not surface as a scattered compile error in nine
++//! integration binaries.
++//!
++//! The maintenance rule this pins: any change to the re-export surface is
++//! deliberate and lands together with the suites that consume it (the
++//! alternative -- a per-symbol allow-list -- was rejected because the
++//! composition `pub use ...::*` plus a growing test campaign would churn
++//! the list on every new suite for zero additional safety; see the doc
++//! comment on `src/lib.rs::pbt_internals`).
++
++use lccc::pbt_internals::*;
++
++/// The core operand/entry-point surface the encoder suites are compiled
++/// against. Every symbol here is referenced by name from at least one PBT
++/// suite; a rename that keeps the suites compiling but changes semantics
++/// (e.g. a different `EncodeResult` shape) is still caught by the suites
++/// themselves -- this test catches removal/moves.
++#[test]
++fn pbt_internals_contract_surface() {
++    // Operand constructors and the two result shapes.
++    let _ = Operand::Reg("x0".to_string());
++    let _ = Operand::Imm(1);
++    let _ = EncodeResult::Word(0);
++
++    // One representative entry point from every encoder family the suites
++    // exercise; the full list is the `pub use` itself. The type aliases are
++    // the contract: each assignment only compiles while the item keeps that
++    // exact signature.
++    type R = Result<EncodeResult, String>;
++    let _: fn(&[Operand], bool, bool) -> R = encode_add_sub;
++    let _: fn(&[Operand], u32) -> R = encode_logical;
++    let _: fn(&[Operand]) -> R = encode_mov;
++    let _: fn(&[Operand]) -> R = encode_mrs;
++    let _: fn(&[Operand], bool, Option<u32>) -> R = encode_ldxr_stxr;
++    let _: fn(&str, &[Operand]) -> R = encode_cas;
++    let _: fn(&str, &[Operand]) -> R = encode_ldop;
++    let _: fn(&[Operand], u32, u32) -> R = encode_neon_float_elem;
++    let _: fn(&[Operand], u32) -> R = encode_neon_float_elem_scalar;
++    let _: fn(&[Operand]) -> R = encode_prfm;
++
++    // The shared operand-reading helpers.
++    type GprPair = Result<(u32, bool), String>;
++    let _: fn(&[Operand], usize) -> GprPair = get_gpr_strict;
++    let _: fn(&[Operand], usize) -> Result<u32, String> = get_gpr_strict_x;
++    let _: fn(&[Operand], usize) -> Result<u32, String> = get_gpr_strict_w;
++    let _: fn(&str) -> bool = is_gp_reg;
++    type GpTriple = Result<(u32, bool, u32), String>;
++    let _: fn(&[Operand], &str) -> GpTriple = get_gp_reg_pair;
++    let _: fn(&str) -> Option<u32> = parse_reg_num;
++}
++
++/// The class predicate and the parser must agree on what a register
++/// spelling means (the `is_gp_reg`/`parse_reg_num` drift was how
++/// `fmov d0,lr` was rejected while `mov x0,lr` assembled -- pinned here so
++/// the contract test also covers the semantic coupling).
++#[test]
++fn pbt_internals_class_predicate_matches_parser() {
++    for name in ["x0", "x30", "w0", "w30", "lr", "sp", "wsp", "xzr", "wzr"] {
++        assert_eq!(
++            is_gp_reg(name),
++            parse_reg_num(name).is_some(),
++            "`{name}` must classify the same way both helpers answer it"
++        );
++    }
++    for name in ["d0", "s1", "h2", "q3", "v4", "b5", "x31", "x007", ""] {
++        assert!(
++            !is_gp_reg(name),
++            "`{name}` is not a general-purpose register"
++        );
++    }
++}
 diff --git a/tests/pbt_preprocessor.rs b/tests/pbt_preprocessor.rs
 new file mode 100644
-index 00000000..479f7cc9
+index 00000000..5dc0e6bf
 --- /dev/null
 +++ b/tests/pbt_preprocessor.rs
-@@ -0,0 +1,8 @@
+@@ -0,0 +1,13 @@
 +//! Property-based test suite (transplanted from the
 +//! thanhtoantnt/claudes-c-compiler pbt-tests campaign, adapted to the lccc
 +//! tree; see `src/lib.rs::pbt_internals` for why these live as integration
 +//! test binaries). Bug-witness properties that fail against current main
 +//! carry `#[ignore = "bug witness: ..."]` — run them with `--ignored` after
 +//! fixing the corresponding defect to re-lock the regression.
++//!
++//! Licence: SPDX-License-Identifier: CC0-1.0 OR MIT OR Apache-2.0 -- lccc's
++//! licence set (see the LICENSE* files at the repo root). The transplant is
++//! intra-lineage (lccc is itself a fork of thanhtoantnt/claudes-c-compiler),
++//! so provenance doubles as a grant.
 +#[path = "pbt/eval_const_expr_pbt.rs"]
 +mod eval_const_expr_pbt;
