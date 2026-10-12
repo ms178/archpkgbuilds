@@ -1,1526 +1,1533 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index f318d5ab..aae8c2aa 100644
+index f318d5ab..7b55ab2c 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
-@@ -1163,6 +1163,7 @@ jobs:
-           bash tests/regression/check_loop_memset.sh
-           bash tests/regression/check_loop_store_motion.sh
-           bash tests/regression/check_const_trip_loop_inline.sh
-+          bash tests/regression/check_fp_recurrence.sh
-           bash tests/regression/check_bool_pair_tail_jmp.sh
-           bash tests/regression/check_bool_pair_prune.sh
-           bash tests/regression/check_demorgan_branch_split.sh
+@@ -593,6 +593,10 @@ jobs:
+         env:
+           CCC: target/fastbuild/lccc
+         run: bash tests/regression/check_seg_target_diagnostics.sh
++      - name: Run __seg_gs conversion parity check (44 shapes against gcc 14.2)
++        env:
++          CCC: target/fastbuild/lccc
++        run: bash tests/regression/check_seg_conversion_parity.sh
+ 
+       # Chroot bind() creates a file target for a file source.
+       - name: Run chroot bind regression
 diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index 2a0f8837..8c6e0323 100755
+index 2a0f8837..dc9e4001 100755
 --- a/scripts/ci_local.sh
 +++ b/scripts/ci_local.sh
-@@ -399,6 +399,9 @@ gate "loop-store-motion" fast \
- gate "const-trip-loop-inline" fast \
-     env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
+@@ -53,7 +53,7 @@
+ # the summary at the end so a long log cannot hide one.
+ set -u -o pipefail
  
-+gate "fp-recurrence-and-jump-thread" fast \
-+    env CCC=target/fastbuild/lccc bash tests/regression/check_fp_recurrence.sh
-+
- gate "bool-pair-tail-jmp-contract" fast \
-     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
+-cd "$(dirname "$0")/.."
++cd "$(dirname "$0")/.." || exit 1
+ export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+ export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+ export PATH="$CARGO_HOME/bin:$PATH"
+@@ -491,6 +491,10 @@ gate "seg-conv-diagnostics" fast \
  
-diff --git a/scripts/lccc_delivery.py b/scripts/lccc_delivery.py
-index 4cece759..16522ba1 100755
---- a/scripts/lccc_delivery.py
-+++ b/scripts/lccc_delivery.py
-@@ -183,7 +183,7 @@ def publish(patch: Path, workspace: Path, metadata: dict, *,
-                   'git apply --check ms178-1.patch\ngit apply ms178-1.patch\n```\n\n'
-                   f'Patch: **{identity.st_size:,} Bytes**  \nSHA-256: `{patch_sha}`\n\n'
-                   '`UNGATED` bedeutet Zwischenstand, **keine** bestandene Gesamt-CI. '
--                  'Der Stand wurde lokal mit `ci_local.sh --fast` geprüft; GitHub CI führt die übrigen Gates aus. '
-+                  'Ob und in welchem Umfang dieser Stand geprüft wurde, zeigt ausschließlich der oben angegebene Validierungsstatus. GitHub CI führt die übrigen Gates aus. '
-                   'Einzelne validierte Änderungen stehen im Snapshot-Ledger; '
-                   'der eingebettete Status wird nicht durch die Transportprüfung aufgewertet.\n').encode('utf-8')
-         fd, name = tempfile.mkstemp(prefix='.ms178-1.zip-', suffix='.tmp', dir=workspace)
-diff --git a/src/backend/x86/codegen/peephole/passes/jump_thread.rs b/src/backend/x86/codegen/peephole/passes/jump_thread.rs
-new file mode 100644
-index 00000000..b8fc5a3d
---- /dev/null
-+++ b/src/backend/x86/codegen/peephole/passes/jump_thread.rs
-@@ -0,0 +1,255 @@
-+//! Bypass empty direct-jump trampolines left by allocation and dead copies.
-+//!
-+//! Retarget edges, never remove/reorder code or labels. The skipped window
-+//! contains only labels, comments, deleted lines and one unconditional jump:
-+//! registers, memory and flags are unchanged. Keep function scope, inline asm,
-+//! pinned lines, every directive (including CFI and custom alignment padding),
-+//! short-only counter branches and cyclic/overlong chains fail-closed.
-+use super::super::types::*;
-+use crate::common::fx_hash::{FxHashMap, FxHashSet};
-+
-+fn local_label(s: &str) -> bool {
-+    s.strip_prefix(".LBB")
-+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
-+}
-+
-+fn label_text(s: &str) -> &str {
-+    s.split('#')
-+        .next()
-+        .unwrap_or("")
-+        .trim()
-+        .trim_end_matches(':')
-+}
-+
-+fn branch(s: &str) -> Option<(&str, &str)> {
-+    if !s.starts_with('j') {
-+        return None;
-+    }
-+    let mut fields = s.split('#').next()?.split_whitespace();
-+    let mnemonic = fields.next()?;
-+    let target = fields.next()?;
-+    // Reuse the shared opcode recognizer with a canonical separator;
-+    // LineKind's legacy fixed-space fast path does not classify jmp-tab.
-+    if (mnemonic != "jmp" && !is_conditional_jump(&format!("{mnemonic} ")))
-+        || fields.next().is_some()
-+        || !local_label(target)
-+        || matches!(mnemonic, "jcxz" | "jecxz" | "jrcxz")
-+    {
-+        return None;
-+    }
-+    Some((mnemonic, target))
-+}
-+
-+fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi: usize) -> bool {
-+    let mut labels = FxHashSet::default();
-+    for i in lo..hi {
-+        if infos[i].kind == LineKind::Label && !infos[i].pinned {
-+            let label = label_text(infos[i].trimmed(store.get(i)));
-+            if local_label(label) && !labels.insert(label.to_owned()) {
-+                return false; // Ambiguous label: never guess which definition.
-+            }
-+        }
-+    }
-+    let mut redirects = FxHashMap::default();
-+    let mut next: Option<String> = None;
-+    for i in (lo..hi).rev() {
-+        let info = infos[i];
-+        let s = info.trimmed(store.get(i));
-+        if info.pinned || info.kind == LineKind::InlineAsm {
-+            next = None;
-+            continue;
-+        }
-+        match info.kind {
-+            LineKind::Nop | LineKind::Empty => {}
-+            // Human comments emit no bytes. Keep assembler quarantine and
-+            // compiler-owned liveness/ABI markers opaque to this CFG rewrite.
-+            _ if s.starts_with('#') && s != "#APP" && s != "#NO_APP" && !s.contains("LCCC_") => {}
-+            LineKind::Label => {
-+                let label = label_text(s);
-+                if labels.contains(label) {
-+                    if let Some(target) = &next {
-+                        redirects.insert(label.to_owned(), target.clone());
-+                    }
-+                } else {
-+                    next = None;
-+                }
-+            }
-+            _ if branch(s).is_some_and(|(mnemonic, _)| mnemonic == "jmp") => {
-+                next = branch(s)
-+                    .and_then(|(_, target)| labels.contains(target).then(|| target.to_owned()));
-+            }
-+            _ => next = None,
-+        }
-+    }
-+    let mut resolved = FxHashMap::default();
-+    for (label, first) in &redirects {
-+        let mut seen = FxHashSet::default();
-+        seen.insert(label.as_str());
-+        let mut target = first.as_str();
-+        for _ in 0..64 {
-+            if !seen.insert(target) {
-+                break;
-+            }
-+            if let Some(next) = redirects.get(target) {
-+                target = next;
-+            } else {
-+                resolved.insert(label.clone(), target.to_owned());
-+                break;
-+            }
-+        }
-+    }
-+    let mut changed = false;
-+    for i in lo..hi {
-+        if infos[i].pinned
-+            || matches!(
-+                infos[i].kind,
-+                LineKind::Nop
-+                    | LineKind::Empty
-+                    | LineKind::Directive
-+                    | LineKind::Label
-+                    | LineKind::InlineAsm
-+            )
-+        {
-+            continue;
-+        }
-+        let s = infos[i].trimmed(store.get(i));
-+        let Some((mnemonic, target)) = branch(s) else {
-+            continue;
-+        };
-+        let Some(final_target) = resolved.get(target) else {
-+            continue;
-+        };
-+        let comment = s.find('#').map(|at| &s[at..]).unwrap_or("");
-+        let replacement = format!("    {mnemonic} {final_target} {comment}");
-+        replace_line(store, &mut infos[i], i, replacement);
-+        changed = true;
-+    }
-+    changed
-+}
-+
-+pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    let mut start = None;
-+    let mut changed = false;
-+    for i in 0..store.len() {
-+        // DIRECTIVE-LAW: selecting function-boundary markers, not skipping
-+        // directives in a motion window (all window directives are barriers).
-+        if infos[i].pinned || infos[i].kind != LineKind::Directive {
-+            continue;
-+        }
-+        let s = infos[i].trimmed(store.get(i));
-+        if s == ".cfi_startproc" {
-+            start = Some(i + 1);
-+        } else if s == ".cfi_endproc" {
-+            if let Some(lo) = start.take() {
-+                changed |= thread_function(store, infos, lo, i);
-+            }
-+        }
-+    }
-+    changed
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    fn apply(body: &str, pin: Option<&str>) -> (bool, String) {
-+        let mut store = LineStore::new(format!("f:\n.cfi_startproc\n{body}\n.cfi_endproc\n"));
-+        let mut infos: Vec<_> = (0..store.len())
-+            .map(|i| classify_line(store.get(i)))
-+            .collect();
-+        super::super::pin_inline_asm_regions(&store, &mut infos);
-+        if let Some(line) = pin {
-+            for (i, info) in infos.iter_mut().enumerate() {
-+                if store.get(i).trim() == line {
-+                    info.pinned = true;
-+                }
-+            }
-+        }
-+        let changed = run(&mut store, &mut infos);
-+        let text = (0..store.len())
-+            .map(|i| store.get(i))
-+            .collect::<Vec<_>>()
-+            .join("\n");
-+        assert!(!run(&mut store, &mut infos), "must reach a fixpoint");
-+        (changed, text)
-+    }
-+
-+    #[test]
-+    fn threads_chain_aliases_comments_and_keeps_every_label() {
-+        for ws in [" ", "\t", "  \t "] {
-+            let body = format!(
-+                "jne{ws}.LBB1 # edge\nret\n.LBB1:\n# harmless\n.LBB2: # alias\njmp{ws}.LBB3\n.LBB3:\njmp{ws}.LBB4\n.LBB4:\nadcq $0, %rax\nret"
-+            );
-+            let (changed, out) = apply(&body, None);
-+            assert!(changed, "separator {ws:?}: {out}");
-+            assert!(out.contains("jne .LBB4 # edge"), "{out}");
-+            for label in 1..=4 {
-+                assert!(out.contains(&format!(".LBB{label}:")));
-+            }
-+            assert!(out.contains("adcq $0, %rax")); // Incoming flags untouched.
-+        }
-+    }
-+
-+    #[test]
-+    fn refuses_effects_directives_and_pinned_trampolines() {
-+        for barrier in [
-+            "addq $1, %rax",
-+            "movq %rax, (%rdi)",
-+            "testl %eax, %eax",
-+            "call other",
-+            "endbr64",
-+            ".cfi_def_cfa_offset 16",
-+            ".p2align 4,0xcc",
-+            ".byte 0xcc",
-+            ".section .data",
-+            "#APP\nmovq %rax, %rbx\n#NO_APP",
-+            "#APP\njmp .LBB2\n#NO_APP",
-+        ] {
-+            let body = format!("jne .LBB1\nret\n.LBB1:\n{barrier}\njmp .LBB2\n.LBB2:\nret");
-+            assert!(!apply(&body, None).0, "crossed {barrier}");
-+        }
-+        let body = "jne .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\nret";
-+        assert!(!apply(body, Some("jmp .LBB2")).0);
-+        let (_, out) = apply(body, Some("jne .LBB1"));
-+        assert!(out.contains("jne .LBB1"));
-+    }
-+
-+    #[test]
-+    fn refuses_cycles_unknown_targets_indirect_and_short_only_branches() {
-+        for body in [
-+            "jne .LBB1\nret\n.LBB1:\njmp .LBB1",
-+            "jne .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\njmp .LBB1",
-+            "jne .LBB1\nret\n.LBB1:\njmp .LBB99",
-+            "jne .LBB1\nret\n.LBB1:\njmp *%rax",
-+            "jrcxz .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\nret",
-+            "jecxz .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\nret",
-+            "jcxz .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\nret",
-+        ] {
-+            assert!(!apply(body, None).0, "{body}");
-+        }
-+    }
-+
-+    #[test]
-+    fn refuses_overlong_chains_cross_function_edges_and_duplicate_labels() {
-+        let mut body = "jne .LBB0\nret\n".to_owned();
-+        for i in 0..66 {
-+            body += &format!(".LBB{i}:\njmp .LBB{}\n", i + 1);
-+        }
-+        body += ".LBB66:\nret";
-+        // Tail portions may shorten, but the over-budget entry is unchanged.
-+        let mut store = LineStore::new(format!(".cfi_startproc\n{body}\n.cfi_endproc"));
-+        let mut infos: Vec<_> = (0..store.len())
-+            .map(|i| classify_line(store.get(i)))
-+            .collect();
-+        run(&mut store, &mut infos);
-+        assert_eq!(store.get(1), "jne .LBB0");
-+        assert!(
-+            !apply(
-+                "jne .LBB1\nret\n.LBB1:\njmp .LBB2\n.cfi_endproc\ng:\n.cfi_startproc\n.LBB2:\nret",
-+                None
-+            )
-+            .0
-+        );
-+        assert!(!apply("jne .LBB1\n.LBB1:\njmp .LBB2\n.LBB1:\n.LBB2:\nret", None).0);
-+    }
-+}
-diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index fec1463d..282abe92 100644
---- a/src/backend/x86/codegen/peephole/passes/mod.rs
-+++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -35,6 +35,7 @@ mod fp_liveness;
- mod frame_compact;
- mod helpers;
- mod identical_blocks;
-+mod jump_thread;
- mod liveness;
- mod load_op_fuse;
- mod local_patterns;
-@@ -1754,6 +1755,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
-         identical_blocks::merge_identical_blocks(&mut store, &mut infos);
-     }
+ gate "seg-target-diagnostics" fast \
+     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_target_diagnostics.sh
++# Table-driven parity: 44 conversion shapes, each checked against gcc 14.2 and
++# lccc. Under CI a missing gcc fails the gate (tests/regression/lib/gcc_oracle.sh).
++gate "seg-conversion-parity" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
  
-+    // Dead copies can leave branch-only blocks after the IR CFG cleanup.
-+    // Retarget their direct edges while lines are still individually parsed.
-+    // Never delete labels: computed gotos and address identity stay intact.
-+    if !sk("jump_thread") {
-+        jump_thread::run(&mut store, &mut infos);
-+    }
-+
-     if let Some(s) = peephole_total {
-         eprintln!(
-             "[PEEPHOLE-TIME] total: {:.1} ms",
-diff --git a/src/passes/fp_double.rs b/src/passes/fp_double.rs
-new file mode 100644
-index 00000000..922154de
---- /dev/null
-+++ b/src/passes/fp_double.rs
-@@ -0,0 +1,192 @@
-+//! Scalar binary32/binary64 doubling without a constant register.
-+//!
-+//! Multiplication by positive two and adding a value to itself have the same
-+//! exact real result, hence the same rounding, signed zero and FP exceptions.
-+//! This is not reassociation. Restrict the pipeline to x86-64 SSE semantics;
-+//! x87 excess precision and other backends are deliberately outside its scope.
-+//! Keep multiply/add contraction opportunities, including through copy chains.
-+use crate::common::fx_hash::{FxHashMap, FxHashSet};
-+use crate::common::types::IrType;
-+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand};
-+
-+/// x*2 and x+x have identical IEEE binary32/binary64 results, signed zero,
-+/// rounding and exceptions. Leave potential multiply-add contractions alone.
-+pub(crate) fn run(func: &mut IrFunction) -> usize {
-+    let mut contraction_inputs = FxHashSet::default();
-+    for b in &func.blocks {
-+        for i in &b.instructions {
-+            if let Instruction::BinOp {
-+                op: IrBinOp::Add | IrBinOp::Sub,
-+                lhs,
-+                rhs,
-+                ty,
-+                ..
-+            } = i
-+                && matches!(ty, IrType::F32 | IrType::F64)
-+            {
-+                for op in [lhs, rhs] {
-+                    if let Operand::Value(v) = op {
-+                        contraction_inputs.insert(v.0);
-+                    }
-+                }
-+            }
-+        }
-+    }
-+    let copies: FxHashMap<_, _> = func
-+        .blocks
-+        .iter()
-+        .flat_map(|b| &b.instructions)
-+        .filter_map(|i| match i {
-+            Instruction::Copy {
-+                dest,
-+                src: Operand::Value(v),
-+            } => Some((dest.0, v.0)),
-+            _ => None,
-+        })
-+        .collect();
-+    let mut work: Vec<_> = contraction_inputs.iter().copied().collect();
-+    while let Some(v) = work.pop() {
-+        if let Some(&src) = copies.get(&v)
-+            && contraction_inputs.insert(src)
-+        {
-+            work.push(src);
-+        }
-+    }
-+    let mut changes = 0;
-+    for b in &mut func.blocks {
-+        for i in &mut b.instructions {
-+            let Instruction::BinOp {
-+                dest,
-+                op: IrBinOp::Mul,
-+                lhs,
-+                rhs,
-+                ty,
-+            } = i
-+            else {
-+                continue;
-+            };
-+            if contraction_inputs.contains(&dest.0) {
-+                continue;
-+            }
-+            let two = |op: Operand| {
-+                matches!(
-+                    (op, *ty),
-+                    (Operand::Const(IrConst::F32(2.0)), IrType::F32)
-+                        | (Operand::Const(IrConst::F64(2.0)), IrType::F64)
-+                )
-+            };
-+            let value = if two(*lhs) {
-+                *rhs
-+            } else if two(*rhs) {
-+                *lhs
-+            } else {
-+                continue;
-+            };
-+            *i = Instruction::BinOp {
-+                dest: *dest,
-+                op: IrBinOp::Add,
-+                lhs: value,
-+                rhs: value,
-+                ty: *ty,
-+            };
-+            changes += 1;
-+        }
-+    }
-+    changes
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator, Value};
-+    fn v(n: u32) -> Operand {
-+        Operand::Value(Value(n))
-+    }
-+    fn fixture(ty: IrType, constant: IrConst, left: bool) -> IrFunction {
-+        let mut f = IrFunction::new("double".into(), ty, vec![], false);
-+        let (lhs, rhs) = if left {
-+            (Operand::Const(constant), v(1))
-+        } else {
-+            (v(1), Operand::Const(constant))
-+        };
-+        f.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            source_spans: vec![],
-+            instructions: vec![
-+                Instruction::ParamRef {
-+                    dest: Value(1),
-+                    param_idx: 0,
-+                    ty,
-+                },
-+                Instruction::BinOp {
-+                    dest: Value(2),
-+                    op: IrBinOp::Mul,
-+                    lhs,
-+                    rhs,
-+                    ty,
-+                },
-+            ],
-+            terminator: Terminator::Return(Some(v(2))),
-+        });
-+        f
-+    }
-+    #[test]
-+    fn doubles_both_operand_orders_and_precisions_without_new_values() {
-+        for (ty, c) in [
-+            (IrType::F32, IrConst::F32(2.0)),
-+            (IrType::F64, IrConst::F64(2.0)),
-+        ] {
-+            for left in [false, true] {
-+                let mut f = fixture(ty, c, left);
-+                assert_eq!(run(&mut f), 1);
-+                assert!(matches!(f.blocks[0].instructions[1], Instruction::BinOp {
-+                    dest: Value(2), op: IrBinOp::Add, lhs, rhs, ty: t
-+                } if lhs == v(1) && rhs == v(1) && t == ty));
-+                assert_eq!(f.next_value_id, 0);
-+                assert_eq!(run(&mut f), 0);
-+            }
-+        }
-+    }
-+    #[test]
-+    fn preserves_contractions_through_arbitrarily_ordered_copy_chains() {
-+        for op in [IrBinOp::Add, IrBinOp::Sub] {
-+            for left in [false, true] {
-+                let mut f = fixture(IrType::F64, IrConst::F64(2.0), left);
-+                for n in 3..=35 {
-+                    f.blocks[0].instructions.push(Instruction::Copy {
-+                        dest: Value(n),
-+                        src: v(n - 1),
-+                    });
-+                }
-+                f.blocks[0].instructions.push(Instruction::BinOp {
-+                    dest: Value(36),
-+                    op,
-+                    lhs: v(35),
-+                    rhs: v(1),
-+                    ty: IrType::F64,
-+                });
-+                f.blocks[0].terminator = Terminator::Return(Some(v(36)));
-+                let before = format!("{f:?}");
-+                assert_eq!(run(&mut f), 0);
-+                assert_eq!(format!("{f:?}"), before);
-+            }
-+        }
-+    }
-+    #[test]
-+    fn refuses_non_two_wrong_carrier_width_integer_and_extended_precision() {
-+        for (ty, c) in [
-+            (IrType::F32, IrConst::F64(2.0)),
-+            (IrType::F64, IrConst::F32(2.0)),
-+            (IrType::F64, IrConst::F64(-2.0)),
-+            (IrType::F64, IrConst::F64(f64::NAN)),
-+            (IrType::F64, IrConst::F64(2.0000000000000004)),
-+            (IrType::I32, IrConst::I32(2)),
-+            (IrType::F128, IrConst::F64(2.0)),
-+        ] {
-+            let mut f = fixture(ty, c, false);
-+            let before = format!("{f:?}");
-+            assert_eq!(run(&mut f), 0);
-+            assert_eq!(format!("{f:?}"), before);
-+        }
-+    }
-+}
-diff --git a/src/passes/loop_square.rs b/src/passes/loop_square.rs
-new file mode 100644
-index 00000000..7172108e
---- /dev/null
-+++ b/src/passes/loop_square.rs
-@@ -0,0 +1,229 @@
-+//! Reuse an already-computed square across a loop backedge.
-+//!
-+//! A header p = phi(0, next) and body p*p need not recompute next*next
-+//! when that exact product already dominates the latch. The initial square
-+//! is +0 (including an initial -0); no arithmetic or memory access is
-+//! speculated into a zero-trip preheader. One extra recurrence per innermost
-+//! loop bounds register pressure and avoids defeating both sides of an FMA.
-+//!
-+//! Floating-environment-changing and unmodelled instructions reject a loop.
-+//! This is value reuse, not reassociation or a reconstruction of builtin FMA.
-+use super::loop_analysis::{self, DominanceChecker};
-+use crate::common::types::IrType;
-+use crate::ir::analysis::CfgAnalysis;
-+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
-+
-+fn square_zero(operand: Operand, ty: IrType) -> Option<Operand> {
-+    match (operand, ty) {
-+        (Operand::Const(IrConst::F32(x)), IrType::F32) if x == 0.0 => {
-+            Some(Operand::Const(IrConst::F32(0.0)))
-+        }
-+        (Operand::Const(IrConst::F64(x)), IrType::F64) if x == 0.0 => {
-+            Some(Operand::Const(IrConst::F64(0.0)))
-+        }
-+        _ => None,
-+    }
-+}
-+
-+fn stable_fp_environment(inst: &Instruction) -> bool {
-+    // Default-closed: in particular calls (even pure calls), asm, intrinsics
-+    // such as LDMXCSR, atomics and nonlocal transfers cannot cross the proof.
-+    matches!(
-+        inst,
-+        Instruction::Phi { .. }
-+            | Instruction::BinOp { .. }
-+            | Instruction::UnaryOp { .. }
-+            | Instruction::Cmp { .. }
-+            | Instruction::Cast { .. }
-+            | Instruction::Copy { .. }
-+            | Instruction::GetElementPtr { .. }
-+            | Instruction::GlobalAddr { .. }
-+            | Instruction::Load {
-+                volatile: false,
-+                ..
-+            }
-+            | Instruction::Store {
-+                volatile: false,
-+                ..
-+            }
-+    )
-+}
-+
-+pub(crate) fn run(func: &mut IrFunction) -> usize {
-+    // Cheap triage: most functions have no floating-point squares.
-+    if !func.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i,
-+        Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, ty: IrType::F32 | IrType::F64, .. } if lhs == rhs)) { return 0; }
-+    if func.blocks.is_empty() || !super::gvn::find_multi_def_values(func).is_empty() {
-+        return 0;
-+    }
-+    let cfg = CfgAnalysis::build(func);
-+    let dom = DominanceChecker::new(func.blocks.len(), &cfg.idom);
-+    let loops = loop_analysis::find_merged_natural_loops(
-+        func.blocks.len(),
-+        &cfg.preds,
-+        &cfg.succs,
-+        &cfg.idom,
-+    );
-+    // All plans are from one immutable SSA snapshot; distinct innermost
-+    // loops have disjoint bodies. Applying them changes no CFG edge.
-+    let mut plans = Vec::new();
-+    for lp in &loops {
-+        if loops
-+            .iter()
-+            .any(|other| other.header != lp.header && lp.contains(other.header))
-+        {
-+            continue;
-+        }
-+        let Some(pre) = lp.find_dedicated_preheader(&cfg.preds, &cfg.succs) else {
-+            continue;
-+        };
-+        let Some(latch) = lp.single_latch(&cfg.preds) else {
-+            continue;
-+        };
-+        // Reserve space for temporaries/invariants in the 16-register x86-64
-+        // SIMD file. This is a conservative profitability heuristic, not a
-+        // proof that the allocator cannot spill. Add at most one recurrence.
-+        if func.blocks[lp.header]
-+            .instructions
-+            .iter()
-+            .filter(|i| {
-+                matches!(
-+                    i,
-+                    Instruction::Phi {
-+                        ty: IrType::F32 | IrType::F64,
-+                        ..
-+                    }
-+                )
-+            })
-+            .count()
-+            >= 6
-+        {
-+            continue;
-+        }
-+        if lp.body.iter().any(|&b| {
-+            !dom.dominates(lp.header, b)
-+                || func.blocks[b]
-+                    .instructions
-+                    .iter()
-+                    .any(|i| !stable_fp_environment(i))
-+        }) {
-+            continue;
-+        }
-+        let pre_label = func.blocks[pre].label;
-+        let latch_label = func.blocks[latch].label;
-+        let mut body: Vec<usize> = lp.body.iter().copied().collect();
-+        body.sort_unstable();
-+        'one_per_loop: for &b in &body {
-+            // Save work on every backedge, not just a conditional side path.
-+            if !dom.dominates(b, latch) {
-+                continue;
-+            }
-+            for (ii, inst) in func.blocks[b].instructions.iter().enumerate() {
-+                let Instruction::BinOp {
-+                    dest,
-+                    op: IrBinOp::Mul,
-+                    lhs: Operand::Value(p),
-+                    rhs: Operand::Value(q),
-+                    ty,
-+                } = inst
-+                else {
-+                    continue;
-+                };
-+                if p != q || !matches!(ty, IrType::F32 | IrType::F64) {
-+                    continue;
-+                }
-+                let Some(Instruction::Phi {
-+                    incoming,
-+                    ty: phi_ty,
-+                    ..
-+                }) = func.blocks[lp.header]
-+                    .instructions
-+                    .iter()
-+                    .find(|i| matches!(i, Instruction::Phi { dest, .. } if dest == p))
-+                else {
-+                    continue;
-+                };
-+                if phi_ty != ty || incoming.len() != 2 {
-+                    continue;
-+                }
-+                let Some((initial, _)) = incoming.iter().find(|(_, from)| *from == pre_label)
-+                else {
-+                    continue;
-+                };
-+                let Some((next, _)) = incoming.iter().find(|(_, from)| *from == latch_label) else {
-+                    continue;
-+                };
-+                let Some(zero) = square_zero(*initial, *ty) else {
-+                    continue;
-+                };
-+                let Operand::Value(next) = next else { continue };
-+                for &nb in &body {
-+                    if !dom.dominates(nb, latch) {
-+                        continue;
-+                    }
-+                    let replacement = func.blocks[nb].instructions.iter().find_map(|i| match i {
-+                        Instruction::BinOp {
-+                            dest: d,
-+                            op: IrBinOp::Mul,
-+                            lhs: Operand::Value(a),
-+                            rhs: Operand::Value(c),
-+                            ty: t,
-+                        } if a == next && c == next && t == ty && d != dest => Some(*d),
-+                        _ => None,
-+                    });
-+                    if let Some(replacement) = replacement {
-+                        plans.push((
-+                            lp.header,
-+                            pre_label,
-+                            latch_label,
-+                            b,
-+                            ii,
-+                            *dest,
-+                            replacement,
-+                            zero,
-+                            *ty,
-+                        ));
-+                        break 'one_per_loop;
-+                    }
-+                }
-+            }
-+        }
-+    }
-+    if plans.is_empty() {
-+        return 0;
-+    }
-+    func.next_value_id = func.sound_next_value_id();
-+    // Rewrite the old instruction in place to a Copy before inserting any
-+    // phis, so header indices never become stale. Preserve original spans.
-+    let mut additions = Vec::new();
-+    for (header, pre, latch, b, ii, dest, replacement, zero, ty) in &plans {
-+        let carried = Value(func.next_value_id);
-+        func.next_value_id += 1;
-+        func.blocks[*b].instructions[*ii] = Instruction::Copy {
-+            dest: *dest,
-+            src: Operand::Value(carried),
-+        };
-+        additions.push((
-+            *header,
-+            Instruction::Phi {
-+                dest: carried,
-+                ty: *ty,
-+                incoming: vec![(*zero, *pre), (Operand::Value(*replacement), *latch)],
-+            },
-+        ));
-+    }
-+    for (header, phi) in additions {
-+        let b = &mut func.blocks[header];
-+        let tracked = !b.source_spans.is_empty();
-+        b.instructions.insert(0, phi);
-+        if tracked {
-+            b.source_spans
-+                .insert(0, crate::common::source::Span::dummy());
-+        }
-+    }
-+    plans.len()
-+}
-+
-+#[cfg(test)]
-+#[path = "loop_square_tests.rs"]
-+mod tests;
-diff --git a/src/passes/loop_square_tests.rs b/src/passes/loop_square_tests.rs
-new file mode 100644
-index 00000000..c8f19f16
---- /dev/null
-+++ b/src/passes/loop_square_tests.rs
-@@ -0,0 +1,330 @@
-+use super::*;
-+use crate::common::source::Span;
-+use crate::common::types::AddressSpace;
-+use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrCmpOp, IrModule, Terminator};
-+
-+fn v(n: u32) -> Operand {
-+    Operand::Value(Value(n))
-+}
-+fn number(ty: IrType, n: f64) -> Operand {
-+    Operand::Const(match ty {
-+        IrType::F32 => IrConst::F32(n as f32),
-+        _ => IrConst::F64(n),
-+    })
-+}
-+fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
-+    BasicBlock {
-+        label: BlockId(label),
-+        source_spans: vec![Span::dummy(); instructions.len()],
-+        instructions,
-+        terminator,
-+    }
-+}
-+fn branch(to: u32) -> Terminator {
-+    Terminator::Branch(BlockId(to))
-+}
-+fn cond(yes: u32, no: u32) -> Terminator {
-+    Terminator::CondBranch {
-+        cond: Operand::Const(IrConst::I32(1)),
-+        true_label: BlockId(yes),
-+        false_label: BlockId(no),
-+    }
-+}
-+fn mul(dest: u32, input: u32, ty: IrType) -> Instruction {
-+    Instruction::BinOp {
-+        dest: Value(dest),
-+        op: IrBinOp::Mul,
-+        lhs: v(input),
-+        rhs: v(input),
-+        ty,
-+    }
-+}
-+fn fixture(ty: IrType) -> IrFunction {
-+    let mut f = IrFunction::new("square".into(), ty, vec![], false);
-+    f.blocks = vec![
-+        block(
-+            0,
-+            vec![Instruction::Copy {
-+                dest: Value(500),
-+                src: Operand::Const(IrConst::I32(7)),
-+            }],
-+            branch(10),
-+        ),
-+        block(
-+            10,
-+            vec![Instruction::Phi {
-+                dest: Value(1),
-+                ty,
-+                incoming: vec![(number(ty, 0.0), BlockId(0)), (v(3), BlockId(30))],
-+            }],
-+            cond(20, 40),
-+        ),
-+        block(
-+            20,
-+            vec![
-+                mul(2, 1, ty),
-+                Instruction::BinOp {
-+                    dest: Value(3),
-+                    op: IrBinOp::Add,
-+                    lhs: v(2),
-+                    rhs: number(ty, 1.0),
-+                    ty,
-+                },
-+                mul(4, 3, ty),
-+                Instruction::Cmp {
-+                    dest: Value(5),
-+                    op: IrCmpOp::Slt,
-+                    lhs: v(4),
-+                    rhs: number(ty, 100.0),
-+                    ty,
-+                },
-+            ],
-+            Terminator::CondBranch {
-+                cond: v(5),
-+                true_label: BlockId(30),
-+                false_label: BlockId(40),
-+            },
-+        ),
-+        block(30, vec![], branch(10)),
-+        block(40, vec![], Terminator::Return(Some(v(1)))),
-+    ];
-+    f.next_label = 41;
-+    f.next_value_id = 2; // Deliberately stale; new IDs must exceed v500.
-+    f
-+}
-+fn verify(f: &IrFunction) {
-+    let mut problems = vec![];
-+    super::super::verify::verify_function(f, "loop_square_test", &mut problems);
-+    assert!(problems.is_empty(), "{problems:?}");
-+    let mut module = IrModule::new();
-+    module.functions.push(f.clone());
-+    super::super::validate_unique_defs(&module, "loop_square_test");
-+}
-+fn unchanged(mut f: IrFunction) {
-+    let before = format!("{f:?}");
-+    assert_eq!(run(&mut f), 0);
-+    assert_eq!(format!("{f:?}"), before);
-+}
-+
-+#[test]
-+fn carries_exact_positive_zero_for_both_signed_zero_seeds_and_precisions() {
-+    for ty in [IrType::F32, IrType::F64] {
-+        for seed in [0.0, -0.0] {
-+            for in_header in [false, true] {
-+                let mut f = fixture(ty);
-+                if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
-+                    incoming[0].0 = number(ty, seed);
-+                }
-+                if in_header {
-+                    let square = f.blocks[2].instructions.remove(0);
-+                    f.blocks[2].source_spans.remove(0);
-+                    f.blocks[1].instructions.push(square);
-+                    f.blocks[1].source_spans.push(Span::dummy());
-+                }
-+                // Repair only the deliberately stale watermark for the input
-+                // verifier, then make it stale again to exercise allocation.
-+                f.next_value_id = 501;
-+                verify(&f);
-+                f.next_value_id = 2;
-+                let pre = format!("{:?}", f.blocks[0]);
-+                assert_eq!(run(&mut f), 1);
-+                assert_eq!(f.next_value_id, 502);
-+                assert_eq!(format!("{:?}", f.blocks[0]), pre, "no entry speculation");
-+                match &f.blocks[1].instructions[0] {
-+                    Instruction::Phi {
-+                        dest: Value(501),
-+                        incoming,
-+                        ty: t,
-+                    } => {
-+                        assert_eq!(*t, ty);
-+                        assert_eq!(incoming[1], (v(4), BlockId(30)));
-+                        match incoming[0].0 {
-+                            Operand::Const(IrConst::F32(x)) => assert_eq!(x.to_bits(), 0),
-+                            Operand::Const(IrConst::F64(x)) => assert_eq!(x.to_bits(), 0),
-+                            other => panic!("unexpected seed {other:?}"),
-+                        }
-+                    }
-+                    other => panic!("unexpected header {other:?}"),
-+                }
-+                for b in &f.blocks {
-+                    assert!(
-+                        b.source_spans.is_empty() || b.source_spans.len() == b.instructions.len()
-+                    );
-+                }
-+                verify(&f);
-+                assert_eq!(run(&mut f), 0);
-+            }
-+        }
-+    }
-+}
-+
-+#[test]
-+fn rejects_unproved_initials_and_wrong_widths_or_operands() {
-+    for initial in [
-+        number(IrType::F64, 1.0),
-+        number(IrType::F64, f64::NAN),
-+        number(IrType::F64, f64::INFINITY),
-+        number(IrType::F64, f64::from_bits(1)),
-+        v(500),
-+        number(IrType::F32, 0.0),
-+    ] {
-+        let mut f = fixture(IrType::F64);
-+        if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
-+            incoming[0].0 = initial;
-+        }
-+        unchanged(f);
-+    }
-+    for which in 0..4 {
-+        let mut f = fixture(IrType::F64);
-+        match which {
-+            0 => {
-+                if let Instruction::Phi { ty, .. } = &mut f.blocks[1].instructions[0] {
-+                    *ty = IrType::F32;
-+                }
-+            }
-+            1 => {
-+                if let Instruction::BinOp { ty, .. } = &mut f.blocks[2].instructions[2] {
-+                    *ty = IrType::F32;
-+                }
-+            }
-+            2 => {
-+                if let Instruction::BinOp { rhs, .. } = &mut f.blocks[2].instructions[0] {
-+                    *rhs = v(3);
-+                }
-+            }
-+            _ => {
-+                if let Instruction::BinOp { rhs, .. } = &mut f.blocks[2].instructions[2] {
-+                    *rhs = v(1);
-+                }
-+            }
-+        }
-+        unchanged(f);
-+    }
-+}
-+
-+#[test]
-+fn rejects_calls_including_pure_calls_volatile_memory_and_intrinsics() {
-+    use crate::ir::intrinsics::IntrinsicOp;
-+    let barriers = vec![
-+        Instruction::Call {
-+            func: "fesetround".into(),
-+            info: CallInfo::default(),
-+        },
-+        Instruction::Call {
-+            func: "claimed_pure".into(),
-+            info: CallInfo {
-+                is_pure: true,
-+                is_const: true,
-+                ..CallInfo::default()
-+            },
-+        },
-+        Instruction::Load {
-+            dest: Value(80),
-+            ptr: Value(500),
-+            ty: IrType::F64,
-+            volatile: true,
-+            seg_override: AddressSpace::Default,
-+        },
-+        Instruction::Store {
-+            ptr: Value(500),
-+            val: number(IrType::F64, 1.0),
-+            ty: IrType::F64,
-+            volatile: true,
-+            seg_override: AddressSpace::Default,
-+        },
-+        Instruction::Intrinsic {
-+            dest: None,
-+            op: IntrinsicOp::Mfence,
-+            dest_ptr: None,
-+            args: vec![],
-+        },
-+        Instruction::InlineAsm {
-+            template: "ldmxcsr (%rax)".into(),
-+            outputs: vec![],
-+            inputs: vec![],
-+            clobbers: vec!["memory".into()],
-+            operand_types: vec![],
-+            goto_labels: vec![],
-+            input_symbols: vec![],
-+            seg_overrides: vec![],
-+        },
-+    ];
-+    for barrier in barriers {
-+        for at in [1, 2, 3] {
-+            let mut f = fixture(IrType::F64);
-+            f.blocks[at].instructions.push(barrier.clone());
-+            f.blocks[at].source_spans.clear();
-+            unchanged(f);
-+        }
-+    }
-+}
-+
-+#[test]
-+fn rejects_non_dominating_producer_or_old_square_and_multiple_latches() {
-+    // Producer is on only one predecessor of the latch.
-+    let mut f = fixture(IrType::F64);
-+    let producer = f.blocks[2].instructions.remove(2);
-+    f.blocks[2].instructions.pop(); // Remove its old compare consumer.
-+    f.blocks[2].source_spans.clear();
-+    f.blocks[2].terminator = cond(25, 30);
-+    f.blocks.insert(3, block(25, vec![producer], branch(30)));
-+    unchanged(f);
-+    // The old square is conditional; do not add unconditional carried pressure.
-+    let mut f = fixture(IrType::F64);
-+    let old = f.blocks[2].instructions.remove(0);
-+    f.blocks[2].source_spans.clear();
-+    if let Instruction::BinOp { lhs, .. } = &mut f.blocks[2].instructions[0] {
-+        *lhs = v(1);
-+    }
-+    f.blocks[1].terminator = cond(15, 20);
-+    f.blocks.insert(2, block(15, vec![old], branch(20)));
-+    unchanged(f);
-+    // A second backedge needs a separately proved producer value.
-+    let mut f = fixture(IrType::F64);
-+    f.blocks[2].terminator = cond(30, 10);
-+    if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
-+        incoming.push((v(3), BlockId(20)));
-+    }
-+    unchanged(f);
-+}
-+
-+#[test]
-+fn rejects_non_dedicated_entry_duplicate_defs_and_pressure() {
-+    let mut f = fixture(IrType::F64);
-+    f.blocks[0].terminator = cond(10, 40);
-+    unchanged(f);
-+    let mut f = fixture(IrType::F64);
-+    f.blocks[0].instructions.push(Instruction::Copy {
-+        dest: Value(3),
-+        src: number(IrType::F64, 0.0),
-+    });
-+    unchanged(f);
-+    let mut f = fixture(IrType::F64);
-+    for n in 10..15 {
-+        f.blocks[1].instructions.push(Instruction::Phi {
-+            dest: Value(n),
-+            ty: IrType::F64,
-+            incoming: vec![(number(IrType::F64, 0.0), BlockId(0)), (v(n), BlockId(30))],
-+        });
-+    }
-+    unchanged(f);
-+}
-+
-+#[test]
-+fn ignores_outer_loop_but_optimizes_the_innermost_loop() {
-+    let mut f = fixture(IrType::F64);
-+    f.blocks[0].terminator = branch(5);
-+    if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
-+        incoming[0].1 = BlockId(7);
-+    }
-+    f.blocks[1].terminator = cond(20, 35);
-+    if let Terminator::CondBranch { false_label, .. } = &mut f.blocks[2].terminator {
-+        *false_label = BlockId(35);
-+    }
-+    f.blocks[4].terminator = Terminator::Return(Some(number(IrType::F64, 0.0)));
-+    f.blocks.insert(1, block(5, vec![], cond(7, 40)));
-+    f.blocks.insert(2, block(7, vec![], branch(10)));
-+    f.blocks.push(block(35, vec![], branch(5)));
-+    assert_eq!(run(&mut f), 1);
-+    verify(&f);
-+}
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index d551dfd4..027a3d3b 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -32,6 +32,7 @@ pub(crate) mod expr_sink;
- pub(crate) mod fma_neg_peel;
- pub(crate) mod fortify_fold;
- pub(crate) mod fp_const_hoist;
-+pub(crate) mod fp_double;
- pub(crate) mod global_addr_cse;
- pub(crate) mod gvn;
- pub(crate) mod if_convert;
-@@ -54,6 +55,7 @@ pub(crate) mod loop_memory_promote;
- pub(crate) mod loop_memset;
- pub(crate) mod loop_preheader;
- pub(crate) mod loop_rotate;
-+pub(crate) mod loop_square;
- pub(crate) mod loop_unroll;
- pub(crate) mod narrow;
- pub(crate) mod outline_switch;
-@@ -2117,6 +2119,27 @@ pub(crate) fn run_passes(
-             total_changes_excl_dce += n;
-         }
+ gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
  
-+        // Predictive commoning of an existing floating-point square. Before
-+        // rotation/copy propagation, while the recurrence is explicit SSA.
-+        // Never speculate arithmetic on entry; x87 is deliberately excluded.
-+        if iter == 0
-+            && opt_level >= 2
-+            && !optimize_for_size
-+            && target == crate::backend::Target::X86_64
-+            && x86_isa.simd
-+            && !pass_disabled(&disabled, "loop_square")
-+        {
-+            let n = timed_pass!(
-+                "loop_square",
-+                run_on_visited(module, &dirty, &mut changed, loop_square::run)
-+            );
-+            total_changes += n;
-+            total_changes_excl_dce += n;
-+            if n > 0 {
-+                verify::verify_after_pass(module, "loop_square");
-+            }
-+        }
-+
-         // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
-         // widened phi flows through the rotated form and emits `addq`
-         // directly). Transforms "guard-at-top" loops into "test-at-bottom"
-@@ -2986,6 +3009,16 @@ pub(crate) fn run_passes(
-         module.for_each_function(dce::eliminate_dead_code);
-     }
- 
-+    // Run after the algebraic simplifiers and before constant hoisting,
-+    // so neither x+x canonicalization nor a hoisted 2.0 hides the fold.
-+    if target == crate::backend::Target::X86_64
-+        && x86_isa.simd
-+        && !pass_disabled(&disabled, "fp_double")
-+    {
-+        module.for_each_function(fp_double::run);
-+        verify::verify_after_pass(module, "fp_double");
-+    }
-+
-     // Hoist FP constants used in loop bodies into preheader Copies so they can
-     // stay in FP registers across the loop (AArch64 constant-pool literal loads
-     // otherwise sit in the loop's dependency path every iteration).
-diff --git a/src/passes/set_membership.rs b/src/passes/set_membership.rs
-index 8363d507..8a8fbfcc 100644
---- a/src/passes/set_membership.rs
-+++ b/src/passes/set_membership.rs
-@@ -27,7 +27,7 @@
- //!    consuming the Cmp value — `Eq` tails are maskable, others act as
- //!    skip terminators.
- //!
--//! Transformations (one per call; the driver's fixpoint loop iterates):
-+//! Transformations (one per analysis round; a bounded local fixpoint):
- //!
- //! 1. CASE-FOLD PAIR MERGE: two `Range` members `[a,b]` and `[a+32,b+32]`
- //!    with `(a & 32) == 0` and `a >> 5 == b >> 5` (so bit 5 is clear across
-@@ -418,6 +418,23 @@ fn parse_member(
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index dcf3ad95..4d4a36b4 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -292,6 +292,14 @@ fn can_seg_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
  }
  
- pub(crate) fn run_function(func: &mut IrFunction) -> usize {
-+    // Finish independent clusters before the driver's CFG/boolean cleanup
-+    // destroys their shared phi. A case-fold used to return immediately,
-+    // leaving the rest of an Expat-style classifier as separate branches.
-+    // Each round rebuilds predecessor/use maps after its single rewrite.
-+    // The cap bounds compile time; hitting it only misses optimizations.
-+    let mut total = 0;
-+    for _ in 0..32 {
-+        let n = fold_round(func);
-+        total += n;
-+        if n == 0 {
-+            break;
+ fn can_const_addr_fold_for(cg: &dyn ArchCodegen, info: &GepFoldInfo, seg: bool) -> bool {
++    // The displacement must be an x86 sign-extended 32-bit immediate for every
++    // fold, alloca bases included. This is the same predicate the emitters
++    // check (`i32::try_from`), so a fold this function accepts is one the
++    // emitter cannot refuse, and a refused emitter never falls back to a
++    // truncated displacement.
++    if !is_i32_disp(info.offset) {
++        return false;
++    }
+     // A/B gate: force the pre-session-25 alloca-only contract.
+     if env_flag_set("CCC_NO_REGBASE_FOLD") {
+         return cg.state_ref().is_alloca(info.base.0);
+@@ -7252,3 +7260,49 @@ mod remat_call_arg_tests {
+         assert!(!set.contains(&0));
+     }
+ }
++
++#[cfg(test)]
++mod seg_fold_displacement_tests {
++    use super::{foldable_const_disp, is_i32_disp};
++    use crate::ir::constants::IrConst;
++
++    /// Every fold site and emitter must agree on one displacement width:
++    /// `can_const_addr_fold_for` tests `is_i32_disp`, the emitters test
++    /// `i32::try_from`. A fold accepted by the decider must never be refused
++    /// by the emitter, so the two predicates are pinned at the boundaries.
++    #[test]
++    fn decider_and_emitter_agree_on_displacement_width() {
++        let edges = [
++            i64::from(i32::MIN) - 1,
++            i64::from(i32::MIN),
++            -1,
++            0,
++            i64::from(i32::MAX),
++            i64::from(i32::MAX) + 1,
++            i64::from(u32::MAX),
++            i64::MIN,
++            i64::MAX,
++        ];
++        for v in edges {
++            assert_eq!(
++                is_i32_disp(v),
++                i32::try_from(v).is_ok(),
++                "decider and emitter disagree at {v}"
++            );
 +        }
 +    }
-+    total
-+}
 +
-+fn fold_round(func: &mut IrFunction) -> usize {
-     if func.blocks.len() < 3 {
-         return 0;
-     }
-@@ -714,7 +731,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
-                 changes += 1;
-                 // One transformation per call: edges were rewired, so the
-                 // predecessor counts computed at entry are stale. The
--                // driver's fixpoint loop re-enters for the cluster step.
-+                // local fixpoint re-enters for the cluster step.
-                 return changes;
++    /// A segment fold of a constant too wide for a displacement is never built
++    /// into the fold map (`foldable_const_disp` refuses it), so the decider
++    /// never sees it.
++    #[test]
++    fn wide_constant_never_becomes_a_fold() {
++        let wide = IrConst::I64(i64::from(i32::MAX) + 1);
++        assert_eq!(foldable_const_disp(&wide, false), None);
++        let narrow = IrConst::I64(i64::from(i32::MAX));
++        assert_eq!(
++            foldable_const_disp(&narrow, false),
++            Some(i64::from(i32::MAX))
++        );
++    }
++}
+diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
+index 4f27b8d9..0bb8d43e 100644
+--- a/src/backend/x86/codegen/memory.rs
++++ b/src/backend/x86/codegen/memory.rs
+@@ -1257,6 +1257,13 @@ impl X86Codegen {
+         offset: i64,
+         ty: IrType,
+     ) {
++        // Invariant (see `can_const_addr_fold` in generation.rs): a folded
++        // default-space store always carries an i32 displacement. A wider one
++        // would be truncated by the encoder, so refuse it loudly here instead.
++        assert!(
++            i32::try_from(offset).is_ok(),
++            "folded store displacement {offset} exceeds i32; the fold decider must refuse it"
++        );
+         // PF-TLS-1: `tls_array[CONST] = v` folds into
+         // `movX %v, %fs:sym@TPOFF+N`.
+         if self.try_emit_tls_direct_store_impl(val, base, offset, ty) {
+@@ -1678,6 +1685,12 @@ impl X86Codegen {
+         offset: i64,
+         ty: IrType,
+     ) {
++        // Same invariant as the store twin: the fold decider admits only i32
++        // displacements, so a wider one here is a caller bug, not an input.
++        assert!(
++            i32::try_from(offset).is_ok(),
++            "folded load displacement {offset} exceeds i32; the fold decider must refuse it"
++        );
+         // PF-TLS-1: `v = tls_array[CONST]` folds into
+         // `movX %fs:sym@TPOFF+N, %dst`.
+         if self.try_emit_tls_direct_load_impl(dest, base, offset, ty) {
+@@ -4045,6 +4058,11 @@ impl X86Codegen {
+         if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+             return false;
+         }
++        // x86 displacements are sign-extended 32-bit, the same width the
++        // load twin and the fold decider require.
++        if i32::try_from(offset).is_err() {
++            return false;
++        }
+         let Some(base_reg) = self.seg_base_home(base) else {
+             return false;
+         };
+diff --git a/src/frontend/parser/types.rs b/src/frontend/parser/types.rs
+index c6237283..a299c148 100644
+--- a/src/frontend/parser/types.rs
++++ b/src/frontend/parser/types.rs
+@@ -1517,6 +1517,14 @@ impl Parser {
+         // Also handles nested function pointers: (*(*)(params))(params)
+         if matches!(self.peek(), TokenKind::LParen) {
+             let save = self.pos;
++            // A qualifier still pending here came from the base specifier
++            // (`long __seg_gs (*)[4]`): it names the storage the pointer
++            // addresses, so it belongs on the innermost pointer layer, exactly
++            // as a declaration's base qualifier does through
++            // `apply_declaration_address_space`. Star arms above have already
++            // taken their own qualifiers, so nothing is applied twice.
++            // Read, not taken: the slot stays with the declaration's snapshot.
++            let base_space = self.attrs.parsing_address_space;
+             if let Some(paren_decl) = self.try_parse_paren_abstract_declarator() {
+                 use super::declarators::ParenAbstractDecl;
+                 match paren_decl {
+@@ -1562,21 +1570,25 @@ impl Parser {
+                             for dim in outer_dims.into_iter().rev() {
+                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
+                             }
+-                            for _ in 0..ptr_depth {
+-                                result_type = TypeSpecifier::Pointer(
+-                                    Box::new(result_type),
+-                                    AddressSpace::Default,
+-                                );
++                            for level in 0..ptr_depth {
++                                let space = if level == 0 {
++                                    base_space
++                                } else {
++                                    AddressSpace::Default
++                                };
++                                result_type = TypeSpecifier::Pointer(Box::new(result_type), space);
+                             }
+                             for dim in inner_array_dims.into_iter().rev() {
+                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
+                             }
+                         } else {
+-                            for _ in 0..ptr_depth {
+-                                result_type = TypeSpecifier::Pointer(
+-                                    Box::new(result_type),
+-                                    AddressSpace::Default,
+-                                );
++                            for level in 0..ptr_depth {
++                                let space = if level == 0 {
++                                    base_space
++                                } else {
++                                    AddressSpace::Default
++                                };
++                                result_type = TypeSpecifier::Pointer(Box::new(result_type), space);
+                             }
+                         }
+                     }
+diff --git a/src/frontend/sema/analysis.rs b/src/frontend/sema/analysis.rs
+index b09c8862..cdd722a7 100644
+--- a/src/frontend/sema/analysis.rs
++++ b/src/frontend/sema/analysis.rs
+@@ -943,11 +943,12 @@ impl SemanticAnalyzer {
+                                 init_expr.span(),
+                             );
+                             let init_ty = self.conversion_source_ctype(init_expr, init_ty);
++                            let null_constant = self.is_void_null_pointer_constant(init_expr);
+                             self.check_address_space_conversion(
+                                 &init_ty,
+                                 &var_ty,
+                                 init_expr.span(),
+-                                matches!(init_expr, Expr::Cast(..)),
++                                null_constant,
+                             );
+                         }
+                     }
+@@ -1283,11 +1284,13 @@ impl SemanticAnalyzer {
+                         };
+                         if let Some(actual) = checker.infer_expr_ctype(expr) {
+                             let actual = self.conversion_source_ctype(expr, actual);
++                            let null_constant = self.is_void_null_pointer_constant(expr);
+                             self.check_assignment_compatibility(
+                                 &actual,
+                                 &expected,
+                                 *span,
+                                 matches!(expr, Expr::Cast(..)),
++                                null_constant,
+                             );
+                         }
+                     }
+@@ -1975,6 +1978,7 @@ impl SemanticAnalyzer {
+                 if *op == BinOp::Sub {
+                     self.check_pointer_subtraction_compat(lhs, rhs, *span);
+                 }
++                self.check_pointer_comparison_spaces(op, lhs, rhs, *span);
+             }
+             Expr::UnaryOp(_, operand, _) => {
+                 self.analyze_expr(operand);
+@@ -1996,11 +2000,13 @@ impl SemanticAnalyzer {
+                     (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
+                 {
+                     let rhs_ty = self.conversion_source_ctype(rhs, rhs_ty);
++                    let null_constant = self.is_void_null_pointer_constant(rhs);
+                     self.check_assignment_compatibility(
+                         &rhs_ty,
+                         &lhs_ty,
+                         *span,
+                         matches!(&**rhs, Expr::Cast(..)),
++                        null_constant,
+                     );
+                 }
+             }
+@@ -2312,13 +2318,15 @@ impl SemanticAnalyzer {
+                     index + 1,
+                     arg.span(),
+                 );
+-                self.check_pointer_argument_compatibility(
+-                    &arg_ty,
+-                    param_ty,
+-                    name,
+-                    index + 1,
+-                    arg.span(),
+-                );
++                if !self.is_void_null_pointer_constant(arg) {
++                    self.check_pointer_argument_compatibility(
++                        &arg_ty,
++                        param_ty,
++                        name,
++                        index + 1,
++                        arg.span(),
++                    );
++                }
              }
          }
-@@ -993,7 +1010,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
-         func.next_value_id = next_id;
-         changes += 1;
-         // One transformation per call: the appended block invalidated the
--        // label map. The driver's fixpoint loop re-enters for more chains.
-+        // label map. The local fixpoint re-enters for more chains.
-         return changes;
+     }
+@@ -2435,36 +2443,102 @@ impl SemanticAnalyzer {
+     /// spaces is a constraint violation. GCC 14.2 rejects `struct c __seg_gs
+     /// *p = generic_ptr;` and the reverse, and `long __seg_gs *g = &n;`, each
+     /// with "from pointer to non-enclosed address space"; lccc accepted all of
+-    /// them and then loaded or stored through the wrong segment. The argument
+-    /// path (`pointer_argument_compat`) already enforces the rule. An explicit
+-    /// cast is a deliberate conversion, and GCC only warns on it. `void *` gets
+-    /// no exemption: GCC 14.2 rejects `void *` <-> `__seg_gs` in both directions
+-    /// (return, argument and assignment alike).
++    /// them and then loaded or stored through the wrong segment.
++    ///
++    /// The check looks at the type the right-hand side has AFTER its cast, so
++    /// `gp = (int *)q` is judged on `int *` (rejected, as GCC does) and
++    /// `gp = (int __seg_gs *)q` on `int __seg_gs *` (accepted). The only
++    /// exemption is `null_constant`: a `void *` null pointer constant such as
++    /// `(void *)0` or `NULL`, which GCC accepts for any named pointer. `(int *)0`
++    /// is NOT exempt, matching GCC 14.2.
+     fn check_address_space_conversion(
+         &self,
+         from_ty: &CType,
+         to_ty: &CType,
+         span: Span,
+-        is_explicit_cast: bool,
++        null_constant: bool,
+     ) {
+-        if is_explicit_cast {
++        if null_constant {
+             return;
+         }
+-        if pointer_space_mismatch(from_ty, to_ty) {
+-            let (from_space, to_space) = match (from_ty, to_ty) {
+-                (CType::Pointer(_, f), CType::Pointer(_, t)) => (*f, *t),
+-                _ => (AddressSpace::Default, AddressSpace::Default),
+-            };
++        if let Some(layer) = first_space_mismatch(from_ty, to_ty) {
+             self.diagnostics.borrow_mut().error(
+                 format!(
+-                    "incompatible address space in pointer conversion: cannot convert pointer to '{}' memory to pointer to '{}' memory ('{}' to '{}')",
+-                    from_space, to_space, from_ty, to_ty
++                    "incompatible address space in pointer conversion: cannot convert pointer to '{}' memory to pointer to '{}' memory at pointer level {} ('{}' to '{}')",
++                    layer.from_space, layer.to_space, layer.depth, from_ty, to_ty
+                 ),
+                 span,
+             );
+         }
      }
  
-@@ -1289,6 +1306,31 @@ mod tests {
-             || c == b'.') as i64
-     }
- 
-+    #[test]
-+    fn one_pipeline_visit_finishes_case_fold_and_membership_cluster() {
-+        let mut f = expat_chain();
-+        assert_eq!(run_function(&mut f), 2);
-+        assert_eq!(run_function(&mut f), 0);
-+        let masks = f
-+            .blocks
-+            .iter()
-+            .flat_map(|b| &b.instructions)
-+            .filter(|i| {
-+                matches!(
-+                    i,
-+                    Instruction::BinOp {
-+                        op: IrBinOp::BitTest,
-+                        ..
-+                    }
-+                )
-+            })
-+            .count();
-+        assert_eq!(masks, 1);
-+        for x in 0..=255u8 {
-+            assert_eq!(eval(&f, x), reference(x), "byte {x}");
++    /// Is `expr` a null pointer constant of type `void *` (`(void *)0`,
++    /// `((void *)0)`, or `NULL` spelled that way)? GCC accepts exactly this
++    /// shape where a named-address-space pointer is expected. A bare integer
++    /// `0` never reaches the address-space check, since it is not a pointer.
++    fn is_void_null_pointer_constant(&self, expr: &Expr) -> bool {
++        let Expr::Cast(_, inner, _) = expr else {
++            return false;
++        };
++        let checker = super::type_checker::ExprTypeChecker {
++            symbols: &self.symbol_table,
++            types: &self.result.type_context,
++            functions: &self.result.functions,
++            expr_types: Some(&self.result.expr_types),
++        };
++        matches!(
++            checker.infer_expr_ctype(expr),
++            Some(CType::Pointer(ref pointee, AddressSpace::Default)) if **pointee == CType::Void
++        ) && self.eval_const_expr(inner) == Some(0)
++    }
++
++    /// `==`, `!=`, `<`, ... between pointers whose pointees live in different
++    /// named address spaces. GCC 14.2 errors with "comparison of pointers to
++    /// disjoint address spaces" (`gp == q`, `gp == fp`, `gp == arr`), and
++    /// accepts a null pointer constant on either side. Only the top-level
++    /// pointee space is compared, as in GCC: `int __seg_gs **` against
++    /// `int **` is accepted.
++    fn check_pointer_comparison_spaces(&self, op: &BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
++        if !matches!(
++            op,
++            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
++        ) {
++            return;
 +        }
-+    }
-+
-     #[test]
-     fn expat_chain_folds_to_fixpoint_and_stays_exact() {
-         let mut f = expat_chain();
-diff --git a/tests/corpus/test_delivery_contracts.py b/tests/corpus/test_delivery_contracts.py
-index ae379e83..119ca5cf 100755
---- a/tests/corpus/test_delivery_contracts.py
-+++ b/tests/corpus/test_delivery_contracts.py
-@@ -46,6 +46,18 @@ class DeliveryContracts(unittest.TestCase):
-         self.assertEqual(result['zip_sha256'], d.digest(self.old))
-         self.assertEqual(stat.S_IMODE(self.old.stat().st_mode), 0o644)
- 
-+    def test_readme_never_upgrades_an_ungated_or_partial_status(self):
-+        for status in ('UNGATED', 'ci_local-fast-PARTIAL-NOT-DELIVERABLE',
-+                       'ci_local-fast-PASS@debian-13'):
-+            d.publish(self.patch, self.root, dict(META, ci_gate=status))
-+            with zipfile.ZipFile(self.old) as z:
-+                text = z.read('README.md').decode('utf-8')
-+                self.assertIn(status, text)
-+                self.assertIn('ausschließlich', text)
-+                self.assertNotIn('Der Stand wurde lokal', text)
-+                self.assertEqual(z.read('README.md'),
-+                                 (self.root/'LCCC-DELIVERY.md').read_bytes())
-+
-     def test_deterministic_archive_for_identical_metadata(self):
-         self.publish(); first=self.old.read_bytes()
-         self.publish(); self.assertEqual(self.old.read_bytes(), first)
-diff --git a/tests/regression/check_fp_recurrence.sh b/tests/regression/check_fp_recurrence.sh
-new file mode 100644
-index 00000000..9f1b9e8e
---- /dev/null
-+++ b/tests/regression/check_fp_recurrence.sh
-@@ -0,0 +1,80 @@
-+#!/usr/bin/env bash
-+# Exact FP/FENV semantics and causal codegen contracts for recurrence reuse,
-+# doubling and late empty-branch threading. No fast-math assumptions.
-+set -euo pipefail
-+root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-+CCC=${CCC:-$root/target/fastbuild/lccc}
-+HOST_CC=${HOST_CC:-gcc}
-+work=$(mktemp -d)
-+trap 'rm -rf "$work"' EXIT
-+src="$root/tests/regression/fp_recurrence/cases.c"
-+# The host is an unoptimized execution control. GCC's optimized dynamic-FENV
-+# behavior is not the oracle; the fixture checks volatile arithmetic bitwise.
-+"$HOST_CC" -O0 -frounding-math -ffp-contract=off "$src" -lm -o "$work/ref"
-+"$work/ref" > "$work/expected"
-+for arch in x86-64 x86-64-v3; do
-+    for opt in 0 1 2 3; do
-+        CCC_VALIDATE_SSA=1 CCC_VERIFY_IR=abort "$CCC" -O"$opt" -march="$arch" \
-+            -ffp-contract=off "$src" -lm -o "$work/run"
-+        "$work/run" > "$work/actual"
-+        cmp "$work/expected" "$work/actual"
-+        echo "PASS exact FP bits/exceptions: $arch -O$opt"
-+    done
-+    for mode in on off; do
-+        disabled=""
-+        [[ $mode != off ]] || disabled="loop_square,fp_double"
-+        CCC_DISABLE_PASSES="$disabled" CCC_VALIDATE_SSA=1 CCC_VERIFY_IR=abort \
-+            "$CCC" -O2 -march="$arch" -ffp-contract=off -S "$src" -o "$work/$arch-$mode.s"
-+    done
-+done
-+"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$src" -o "$work/contract.s"
-+# x87 is deliberately outside the new FP passes' scope.
-+printf '%s\n' 'double twice(double x) { return 2.0*x; }' > "$work/i686.c"
-+"$CCC" -m32 -O2 -S "$work/i686.c" -o "$work/i686-on.s"
-+CCC_DISABLE_PASSES=loop_square,fp_double "$CCC" -m32 -O2 -S "$work/i686.c" -o "$work/i686-off.s"
-+cmp "$work/i686-on.s" "$work/i686-off.s"
-+# Use a shipped, branch-heavy workload to pin the post-allocation opportunity.
-+for mode in on off; do
-+    skip=""
-+    [[ $mode != off ]] || skip=jump_thread
-+    CCC_PEEPHOLE_SKIP="$skip" "$CCC" -O2 -march=x86-64-v3 -S \
-+        "$root/tests/benchmark/programs/expat_xml_scan.c" -o "$work/jump-$mode.s"
-+done
-+python3 - "$work" <<'PY'
-+import re, sys
-+from pathlib import Path
-+p = Path(sys.argv[1])
-+def body(file, name):
-+    text = (p / file).read_text()
-+    m = re.search(r'^'+re.escape(name)+r':\n(.*?)^\.size\s+'+re.escape(name)+r',', text, re.M | re.S)
-+    assert m, (file, name)
-+    return m.group(1)
-+def muls(text):
-+    return len(re.findall(r'^\s*v?mul(?:sd|ss)\s', text, re.M))
-+for arch in ('x86-64', 'x86-64-v3'):
-+    for name in ('twice64', 'twice32'):
-+        assert muls(body(f'{arch}-off.s', name)) == 1, (arch, name, 'control')
-+        assert muls(body(f'{arch}-on.s', name)) == 0, (arch, name, 'doubling')
-+    before = muls(body(f'{arch}-off.s', 'square_loop'))
-+    after = muls(body(f'{arch}-on.s', 'square_loop'))
-+    assert before >= 2 and after == before-1, (arch, before, after)
-+    assert muls(body(f'{arch}-on.s', 'changing_round')) == muls(body(f'{arch}-off.s', 'changing_round')), arch
-+for name in ('twice_plus', 'scaled_fma'):
-+    assert re.search(r'vfmadd\d*sd', body('contract.s', name)), name
-+
-+def redundant_edges(file):
-+    lines = (p / file).read_text().splitlines()
-+    labels = {s.strip()[:-1]: i for i, s in enumerate(lines) if re.fullmatch(r'\s*\.LBB\d+:', s)}
-+    redirects = set()
-+    for label, i in labels.items():
-+        for s in lines[i+1:]:
-+            s = s.strip()
-+            if not s or s.startswith('#') or re.fullmatch(r'\.LBB\d+:', s):
-+                continue
-+            if re.fullmatch(r'jmp\s+\.LBB\d+', s): redirects.add(label)
-+            break
-+    return sum(bool((m := re.fullmatch(r'\s*j\w+\s+(\.LBB\d+)\s*', s)) and m[1] in redirects) for s in lines)
-+assert redundant_edges('jump-off.s') > 0, 'missing negative control'
-+assert redundant_edges('jump-on.s') == 0, 'eligible empty trampoline survived'
-+print('PASS causal FP, contraction, x87 and jump-thread codegen contracts')
-+PY
-diff --git a/tests/regression/fp_recurrence/cases.c b/tests/regression/fp_recurrence/cases.c
-new file mode 100644
-index 00000000..5285be20
---- /dev/null
-+++ b/tests/regression/fp_recurrence/cases.c
-@@ -0,0 +1,164 @@
-+/* Exact IEEE results and sticky exceptions, not a tolerance comparison.
-+ * The volatile/call-based references cannot use either new optimization. */
-+#pragma STDC FENV_ACCESS ON
-+#include <fenv.h>
-+#include <stdint.h>
-+#include <stdio.h>
-+#include <string.h>
-+#if defined(__x86_64__)
-+#include <xmmintrin.h>
-+#endif
-+#define NI __attribute__((noinline))
-+
-+NI double twice64(double x) { return 2.0 * x; }
-+NI float twice32(float x) { return x * 2.0f; }
-+NI double twice_plus(double x, double y) { return x * 2.0 + y; }
-+NI double scaled_fma(double x, double y, double z) { return 2.0 * x * y + z; }
-+static NI double reference64(double x) { volatile double two = 2.0; return two * x; }
-+static NI float reference32(float x) { volatile float two = 2.0f; return x * two; }
-+static NI double square_reference(double x) { volatile double copy = x; return copy * x; }
-+
-+NI double square_loop(double c, int n) {
-+    double x = -0.0, sum = 0.0;
-+    for (int i = 0; i < n; ++i) {
-+        double old = x * x;
-+        x = old + c;
-+        double next = x * x;
-+        sum += old + next;
-+    }
-+    return sum + x;
-+}
-+static NI double reference_loop(double c, int n) {
-+    double x = -0.0, sum = 0.0;
-+    for (int i = 0; i < n; ++i) {
-+        double old = square_reference(x);
-+        x = old + c;
-+        double next = square_reference(x);
-+        sum += old + next;
-+    }
-+    return sum + x;
-+}
-+/* Dynamic environment changes forbid carrying a previously rounded square. */
-+NI double changing_round(double c, int n) {
-+    double x = 0.0, sum = 0.0;
-+    for (int i = 0; i < n; ++i) {
-+        fesetround(i & 1 ? FE_UPWARD : FE_DOWNWARD);
-+        double old = x * x;
-+        x = old + c;
-+        double next = x * x;
-+        sum += old + next;
-+    }
-+    return sum + x;
-+}
-+static NI double reference_changing(double c, int n) {
-+    double x = 0.0, sum = 0.0;
-+    for (int i = 0; i < n; ++i) {
-+        fesetround(i & 1 ? FE_UPWARD : FE_DOWNWARD);
-+        double old = square_reference(x);
-+        x = old + c;
-+        double next = square_reference(x);
-+        sum += old + next;
-+    }
-+    return sum + x;
-+}
-+static uint64_t bits64(double x) { uint64_t u; memcpy(&u, &x, sizeof u); return u; }
-+static uint32_t bits32(float x) { uint32_t u; memcpy(&u, &x, sizeof u); return u; }
-+static int check_double(uint64_t u) {
-+    double x; memcpy(&x, &u, sizeof x);
-+    feclearexcept(FE_ALL_EXCEPT);
-+    double expected = reference64(x);
-+    int ef = fetestexcept(FE_ALL_EXCEPT);
-+    feclearexcept(FE_ALL_EXCEPT);
-+    double actual = twice64(x);
-+    int af = fetestexcept(FE_ALL_EXCEPT);
-+    if (bits64(expected) != bits64(actual) || ef != af) {
-+        printf("double %llx: %llx/%x != %llx/%x\n", (unsigned long long)u,
-+            (unsigned long long)bits64(expected), ef, (unsigned long long)bits64(actual), af);
-+        return 1;
-+    }
-+    return 0;
-+}
-+static int check_float(uint32_t u) {
-+    float x; memcpy(&x, &u, sizeof x);
-+    feclearexcept(FE_ALL_EXCEPT);
-+    float expected = reference32(x);
-+    int ef = fetestexcept(FE_ALL_EXCEPT);
-+    feclearexcept(FE_ALL_EXCEPT);
-+    float actual = twice32(x);
-+    int af = fetestexcept(FE_ALL_EXCEPT);
-+    if (bits32(expected) != bits32(actual) || ef != af) {
-+        printf("float %x: %x/%x != %x/%x\n", u, bits32(expected), ef, bits32(actual), af);
-+        return 1;
-+    }
-+    return 0;
-+}
-+static int check_loop(double c, int n, int changing) {
-+    feclearexcept(FE_ALL_EXCEPT);
-+    double expected = changing ? reference_changing(c, n) : reference_loop(c, n);
-+    int ef = fetestexcept(FE_ALL_EXCEPT);
-+    feclearexcept(FE_ALL_EXCEPT);
-+    double actual = changing ? changing_round(c, n) : square_loop(c, n);
-+    int af = fetestexcept(FE_ALL_EXCEPT);
-+    if (bits64(expected) != bits64(actual) || ef != af) {
-+        printf("loop %d/%d: %llx/%x != %llx/%x\n", n, changing,
-+            (unsigned long long)bits64(expected), ef, (unsigned long long)bits64(actual), af);
-+        return 1;
-+    }
-+    return 0;
-+}
-+int main(void) {
-+    static const uint64_t special[] = {
-+        0, 0x8000000000000000ULL, 1, 0x8000000000000001ULL,
-+        0x000fffffffffffffULL, 0x800fffffffffffffULL,
-+        0x0010000000000000ULL, 0x8010000000000000ULL,
-+        0x3ff0000000000000ULL, 0xbff0000000000000ULL,
-+        0x7fefffffffffffffULL, 0xffefffffffffffffULL,
-+        0x7ff0000000000000ULL, 0xfff0000000000000ULL,
-+        0x7ff8000000000055ULL, 0xfff8000000000055ULL,
-+        0x7ff0000000000055ULL, 0xfff0000000000055ULL
-+    };
-+    static const uint32_t fspecial[] = {
-+        0, 0x80000000U, 1, 0x80000001U, 0x007fffffU, 0x807fffffU,
-+        0x00800000U, 0x80800000U, 0x3f800000U, 0xbf800000U,
-+        0x7f7fffffU, 0xff7fffffU, 0x7f800000U, 0xff800000U,
-+        0x7fc00055U, 0xffc00055U, 0x7f800055U, 0xff800055U
-+    };
-+    static const int modes[] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
-+    static const int trips[] = {0, 1, 2, 3, 7, 16, 32, 64};
-+    static const double seeds[] = {0.0, -0.0, 0.1, -0.1, 0.001, 1e-200, -1e-200, 1.0, -1.0, 1e200};
-+    fenv_t saved;
-+    if (fegetenv(&saved)) return 2;
-+#if defined(__x86_64__)
-+    unsigned csr = _mm_getcsr();
-+#endif
-+    for (unsigned m = 0; m < 4; ++m) {
-+        if (fesetround(modes[m])) return 2;
-+        for (unsigned flush = 0; flush < 4; ++flush) {
-+#if defined(__x86_64__)
-+            unsigned control = _mm_getcsr() & ~0x8040U;
-+            _mm_setcsr(control | ((flush & 1) ? 0x40U : 0) | ((flush & 2) ? 0x8000U : 0));
-+#endif
-+            for (unsigned j = 0; j < sizeof special / sizeof special[0]; ++j)
-+                if (check_double(special[j])) return 1;
-+            for (unsigned j = 0; j < sizeof fspecial / sizeof fspecial[0]; ++j)
-+                if (check_float(fspecial[j])) return 1;
-+            uint64_t state = 0x123456789abcdefULL;
-+            for (unsigned j = 0; j < 1024; ++j) {
-+                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
-+                if (check_double(state) || check_float((uint32_t)state)) return 1;
++        if self.is_void_null_pointer_constant(lhs) || self.is_void_null_pointer_constant(rhs) {
++            return;
++        }
++        let checker = super::type_checker::ExprTypeChecker {
++            symbols: &self.symbol_table,
++            types: &self.result.type_context,
++            functions: &self.result.functions,
++            expr_types: Some(&self.result.expr_types),
++        };
++        let (Some(lt), Some(rt)) = (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
++        else {
++            return;
++        };
++        // An array operand decays to a pointer to its element; a generic
++        // array is a pointer into the default space.
++        let decay = |ct: CType| match ct {
++            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
++            other => other,
++        };
++        let lt = decay(self.conversion_source_ctype(lhs, lt));
++        let rt = decay(self.conversion_source_ctype(rhs, rt));
++        if let (CType::Pointer(_, ls), CType::Pointer(_, rs)) = (&lt, &rt) {
++            if ls != rs {
++                self.diagnostics.borrow_mut().error(
++                    format!(
++                        "comparison of pointers to disjoint address spaces ('{}' and '{}')",
++                        lt, rt
++                    ),
++                    span,
++                );
 +            }
-+            for (unsigned j = 0; j < sizeof seeds / sizeof seeds[0]; ++j)
-+                for (unsigned k = 0; k < sizeof trips / sizeof trips[0]; ++k)
-+                    if (check_loop(seeds[j], trips[k], 0)) return 1;
 +        }
 +    }
-+    for (unsigned j = 0; j < sizeof seeds / sizeof seeds[0]; ++j)
-+        for (unsigned k = 0; k < sizeof trips / sizeof trips[0]; ++k)
-+            if (check_loop(seeds[j], trips[k], 1)) return 1;
-+    if (fesetenv(&saved)) return 2;
-+#if defined(__x86_64__)
-+    _mm_setcsr(csr);
-+#endif
-+    puts("fp recurrence: PASS");
-+    return 0;
++
+     /// The type an expression has for the implicit-conversion address-space
+     /// rule. An array in a named space decays to a pointer into that space,
+     /// wherever the array is written: an identifier
+@@ -2603,6 +2677,7 @@ impl SemanticAnalyzer {
+         to_ty: &CType,
+         span: Span,
+         is_explicit_cast: bool,
++        null_constant: bool,
+     ) {
+         self.check_pointer_float_conversion(from_ty, to_ty, span);
+         let incompatible = match (from_ty, to_ty) {
+@@ -2624,7 +2699,7 @@ impl SemanticAnalyzer {
+                 span,
+             );
+         }
+-        self.check_address_space_conversion(from_ty, to_ty, span, is_explicit_cast);
++        self.check_address_space_conversion(from_ty, to_ty, span, null_constant);
+         // GCC/clang suppress the incompatible-pointer-types diagnostic when the
+         // source is an EXPLICIT cast (C-style `(T*)expr`): the cast is an
+         // intentional conversion, so emitting a hard error here breaks
+@@ -3499,17 +3574,37 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
+     }
+ }
+ 
+-/// Does converting `from` to `to` change a named address space anywhere along
+-/// the pointer chain? Each pointer layer's space is the space of the memory it
+-/// addresses. Arrays are stepped over on both sides, so an array of
+-/// `__seg_gs` pointers keeps its inner space. The check recurses through
+-/// pointees, matching GCC's named-address-space rule for pointer conversions.
+-fn pointer_space_mismatch(from: &CType, to: &CType) -> bool {
+-    match (from, to) {
+-        (CType::Pointer(f, fs), CType::Pointer(t, ts)) => fs != ts || pointer_space_mismatch(f, t),
+-        (CType::Array(f, _), CType::Array(t, _)) => pointer_space_mismatch(f, t),
+-        _ => false,
++/// The first pointer layer, outermost first, whose named address space
++/// changes in a conversion from `from` to `to`. Each pointer layer's space is
++/// the space of the memory it addresses. Arrays are stepped over on both
++/// sides, so an array of `__seg_gs` pointers keeps its inner space. The
++/// diagnostic prints this layer's spaces, not the outermost ones.
++struct SpaceMismatch {
++    /// 1-based pointer level, counting the outermost pointer as level 1.
++    depth: usize,
++    from_space: AddressSpace,
++    to_space: AddressSpace,
 +}
++
++fn first_space_mismatch(from: &CType, to: &CType) -> Option<SpaceMismatch> {
++    fn walk(from: &CType, to: &CType, depth: usize) -> Option<SpaceMismatch> {
++        match (from, to) {
++            (CType::Pointer(f, fs), CType::Pointer(t, ts)) => {
++                if fs != ts {
++                    Some(SpaceMismatch {
++                        depth,
++                        from_space: *fs,
++                        to_space: *ts,
++                    })
++                } else {
++                    walk(f, t, depth + 1)
++                }
++            }
++            (CType::Array(f, _), CType::Array(t, _)) => walk(f, t, depth),
++            _ => None,
++        }
+     }
++    walk(from, to, 1)
+ }
+ 
+ #[cfg(test)]
+diff --git a/tests/corpus/test_seg_conv_gate.py b/tests/corpus/test_seg_conv_gate.py
+index 0b9d7c5a..67f515ae 100644
+--- a/tests/corpus/test_seg_conv_gate.py
++++ b/tests/corpus/test_seg_conv_gate.py
+@@ -12,8 +12,8 @@ import os, sys
+ from pathlib import Path
+ name = Path(sys.argv[0]).name
+ major = '13' if name == 'gcc' or name == 'gcc-13' else '14'
+-if '-dumpversion' in sys.argv:
+-    print(major); sys.exit(0)
++if '-dumpfullversion' in sys.argv:
++    print(major + '.2.0'); sys.exit(0)
+ if '--version' in sys.argv:
+     print('fake GCC ' + major); sys.exit(0)
+ src = next(Path(a).name for a in sys.argv[1:] if a.endswith('.c'))
+@@ -53,7 +53,7 @@ class SegmentConversionGateTests(unittest.TestCase):
+             with self.subTest(gcc=gcc):
+                 r = self.run_gate(GCC=gcc)
+                 self.assertNotEqual(r.returncode, 0)
+-                self.assertIn('requires GCC >= 14', r.stderr)
++                self.assertIn('requires GCC 14', r.stderr)
+ 
+     def test_both_compilers_must_pass_semantic_positive_control(self):
+         for compiler in ['BAD_CCC', 'BAD_GCC']:
+diff --git a/tests/corpus/test_select_compare_control.py b/tests/corpus/test_select_compare_control.py
+index 90d84a3d..07665084 100644
+--- a/tests/corpus/test_select_compare_control.py
++++ b/tests/corpus/test_select_compare_control.py
+@@ -14,6 +14,12 @@ ROOT = Path(__file__).resolve().parents[2]
+ MOCK = r'''#!/usr/bin/env python3
+ import json, os, pathlib, sys
+ args = sys.argv[1:]
++# The gate pins its oracle to GCC 14 by major version (tests/regression/lib/
++# gcc_oracle.sh), so the stub answers the version query like GCC does. The
++# query is not a compile, so it is not logged.
++if '-dumpfullversion' in args:
++    print(os.environ.get('MOCK_GCC_VERSION', '14.2.0'))
++    sys.exit(0)
+ with open(os.environ['MOCK_LOG'], 'a') as log:
+     log.write(json.dumps({'args': args, 'skip': os.environ.get('CCC_PEEPHOLE_SKIP', '')}) + '\n')
+ out = pathlib.Path(args[args.index('-o') + 1])
+@@ -33,7 +39,7 @@ else:
+ 
+ 
+ class SelectCompareControlTests(unittest.TestCase):
+-    def invoke(self, ignore=False):
++    def invoke(self, ignore=False, gcc_version=None):
+         with tempfile.TemporaryDirectory() as directory:
+             directory = Path(directory)
+             compiler = directory / 'compiler protocol stub'
+@@ -46,10 +52,13 @@ class SelectCompareControlTests(unittest.TestCase):
+             env.pop('MOCK_IGNORE_SKIP', None)
+             if ignore:
+                 env['MOCK_IGNORE_SKIP'] = '1'
++            if gcc_version is not None:
++                env['MOCK_GCC_VERSION'] = gcc_version
+             result = subprocess.run(
+                 ['bash', str(ROOT / 'tests/regression/check_select_from_compare.sh')],
+                 env=env, text=True, capture_output=True, timeout=30)
+-            return result, [json.loads(line) for line in log.read_text().splitlines()]
++            text = log.read_text() if log.exists() else ''
++            return result, [json.loads(line) for line in text.splitlines()]
+ 
+     def test_each_optimization_level_has_a_real_compile_time_control(self):
+         result, calls = self.invoke()
+@@ -62,6 +71,12 @@ class SelectCompareControlTests(unittest.TestCase):
+                   and any('ascii_case_fold.c' in a for a in c['args'])]
+         self.assertEqual(sorted(c['skip'] for c in shapes), ['', 'setcc_cmov'])
+ 
++    def test_gcc13_oracle_is_refused_before_any_compile(self):
++        result, calls = self.invoke(gcc_version='13.3.0')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn('the oracle is GCC 14', result.stdout + result.stderr)
++        self.assertEqual(calls, [])
++
+     def test_noop_kill_switch_cannot_pass(self):
+         result, _ = self.invoke(ignore=True)
+         self.assertNotEqual(result.returncode, 0)
+diff --git a/tests/regression/check_const_trip_loop_inline.sh b/tests/regression/check_const_trip_loop_inline.sh
+index 41700779..45535b56 100755
+--- a/tests/regression/check_const_trip_loop_inline.sh
++++ b/tests/regression/check_const_trip_loop_inline.sh
+@@ -21,7 +21,7 @@
+ # ============================================================================
+ set -euo pipefail
+ 
+-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+ CCC=${CCC:-$here/../../target/fastbuild/lccc}
+ [[ -x $CCC ]] || { echo "check_const_trip_loop_inline: lccc not found at $CCC" >&2; exit 1; }
+ 
+diff --git a/tests/regression/check_loop_store_motion.sh b/tests/regression/check_loop_store_motion.sh
+index 1b1d31d7..308021d5 100755
+--- a/tests/regression/check_loop_store_motion.sh
++++ b/tests/regression/check_loop_store_motion.sh
+@@ -30,16 +30,14 @@ if [ "$(uname -m)" != "x86_64" ] || [ "$(uname -s)" != "Linux" ]; then
+     echo "SKIP: loop store motion placement check needs x86-64 Linux assembly"
+     exit 0
+ fi
+-if ! command -v gcc >/dev/null 2>&1; then
+-    echo "FAIL: gcc is required as the oracle"
+-    exit 1
+-fi
++. tests/regression/lib/gcc_oracle.sh
++require_gcc_oracle "check_loop_store_motion" || exit 1
+ 
+ tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-loop-store-motion.XXXXXX")
+ trap 'rm -rf "$tmp"' EXIT
+ fail=0
+ 
+-gcc -O0 -w -o "$tmp/oracle" "$src"
++"$GCC_ORACLE_BIN" -O0 -w -o "$tmp/oracle" "$src"
+ "$tmp/oracle" > "$tmp/oracle.out"
+ 
+ for lvl in -O0 -O2; do
+diff --git a/tests/regression/check_memory_value_contracts.sh b/tests/regression/check_memory_value_contracts.sh
+index b842965a..1540b24e 100755
+--- a/tests/regression/check_memory_value_contracts.sh
++++ b/tests/regression/check_memory_value_contracts.sh
+@@ -2,7 +2,9 @@
+ set -Eeuo pipefail
+ cd "$(dirname "$0")/../.."
+ ccc=${CCC:-target/fastbuild/lccc}
+-ref=${CC_REF:-gcc}
++. tests/regression/lib/gcc_oracle.sh
++require_gcc_oracle "check_memory_value_contracts" || exit 1
++ref=${CC_REF:-$GCC_ORACLE_BIN}
+ td=$(mktemp -d)
+ trap 'rm -rf "$td"' EXIT
+ test=setup opt=none isa=native disabled=none phase=setup
+diff --git a/tests/regression/check_seg_cast_warning.sh b/tests/regression/check_seg_cast_warning.sh
+index 9af39365..d412e99e 100755
+--- a/tests/regression/check_seg_cast_warning.sh
++++ b/tests/regression/check_seg_cast_warning.sh
+@@ -12,6 +12,7 @@
+ #   line 4  __seg_gs -> __seg_gs         silent
+ #   line 5  generic -> `long *__seg_gs *` warns
+ #   line 6  void * -> void *             silent
++#   line 8  `q = (int *)gp` (__seg_gs)   warns (the cast-RHS shape of cast_rev.c)
+ #
+ # The runtime half checks sizeof and the unnamed-parameter and cast reads
+ # against the values GCC produces.
+@@ -28,14 +29,16 @@ void c(long __seg_fs *p) { long __seg_gs *z = (long __seg_gs *)p; (void)z; }
+ void d(long *__seg_gs *p) { long *__seg_gs *w = (long *__seg_gs *)p; (void)w; }
+ void e(long *p) { long *__seg_gs *w = (long *__seg_gs *)p; (void)w; }
+ void f(void *p) { void *q = (void *)p; (void)q; }
++int __seg_gs *gp; int *q;
++void g(void) { q = (int *)gp; }
+ C
+ 
+ fail=0
+ "$CCC" -O0 -c -o "$tmp/casts.o" "$src" 2> "$tmp/casts.err" || { echo "FAIL: casts.c rejected"; cat "$tmp/casts.err"; exit 1; }
+ warned=$(grep -c "warning: cast to" "$tmp/casts.err" || true)
+ lines=$( (grep "warning: cast to" "$tmp/casts.err" || true) | sed -E 's/^[^:]*:([0-9]+):.*/\1/' | tr '\n' ' ')
+-if [ "$warned" -ne 4 ] || [ "$lines" != "1 2 3 5 " ]; then
+-    echo "FAIL: expected 4 cast warnings on lines 1 2 3 5, got $warned on: $lines"
++if [ "$warned" -ne 5 ] || [ "$lines" != "1 2 3 5 8 " ]; then
++    echo "FAIL: expected 5 cast warnings on lines 1 2 3 5 8, got $warned on: $lines"
+     cat "$tmp/casts.err"
+     fail=1
+ fi
+@@ -71,4 +74,4 @@ fi
+ if [ "$fail" -ne 0 ]; then
+     exit 1
+ fi
+-echo "check_seg_cast_warning: PASSED (4 cast warnings on lines 1 2 3 5; 0 on 4 6; sizeof 8 8)"
++echo "check_seg_cast_warning: PASSED (5 cast warnings on lines 1 2 3 5 8; 0 on 4 6; sizeof 8 8)"
+diff --git a/tests/regression/check_seg_const_offset_fold.sh b/tests/regression/check_seg_const_offset_fold.sh
+index 9804c60a..6bdde326 100644
+--- a/tests/regression/check_seg_const_offset_fold.sh
++++ b/tests/regression/check_seg_const_offset_fold.sh
+@@ -37,7 +37,7 @@
+ set -euo pipefail
+ 
+ CCC=${CCC:-./target/fastbuild/lccc}
+-REPO=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+ tmp=${TMPDIR:-/tmp}/lccc-seg-const-offset-fold.$$
+ trap 'rm -rf "$tmp"' EXIT
+ mkdir -p "$tmp"
+@@ -129,64 +129,64 @@ expect acc_b  'addq %gs:8(%rdi)'   'ALU-fused per-CPU field read (add)'
+ reject acc_b  'movq %gs:'          'unfused segment load in an add consumer'
+ reject cmp_c3 'movq %gs:'          'unfused segment load in a compare consumer'
+ 
+-# Cross-check against GCC when it is available: same instruction count for the
+-# folded shape. gcc is an oracle here, never a dependency.
+-if command -v gcc >/dev/null 2>&1; then
+-    gcc -O2 -S -o "$tmp/fold_gcc.s" "$tmp/fold.c"
+-    count_body() { # count_body <file> <symbol>
+-        awk -v fn="^$1:" '
+-            $0 ~ fn { inb = 1; next }
+-            inb && /^\.size/ { exit }
+-            inb && /^[[:space:]]*\./ { next }
+-            inb && /^[[:space:]]*#/ { next }
+-            inb { n++ }
+-            END { print n + 0 }
+-        ' "$2"
+-    }
+-    # `cmp_c3` is deliberately absent here: its one extra instruction is the
+-    # boolean-materialisation tail (`sete %r9b; movzbl %r9b, %r9d; movl
+-    # %r9d, %eax` where GCC zeroes %eax and does `sete %al`), which the SAME
+-    # function shows without any segment override (`cmpq %rsi, 40(%rdi)`) —
+-    # it is a return-register coalescing gap, not a segment-fold gap.
+-    # docs/FOLLOWUP-2026-10-11-kernel-percpu-segment-fold.md §5.4 carries the
+-    # reproducer; the folded OPERAND of cmp_c3 is still pinned by the loop
+-    # below, so the segment half of the contract stays checked here.
+-    for fn in read_b read_c3 read_a acc_b; do
+-        ours=$(count_body "$fn" "$tmp/fold.s")
+-        theirs=$(count_body "$fn" "$tmp/fold_gcc.s")
+-        if [ "$ours" -gt "$theirs" ]; then
+-            echo "FAIL: $fn: lccc $ours instructions vs GCC $theirs" >&2
+-            fail=1
+-        fi
+-    done
+-    # Exact-operand cross-check: the segment operand GCC folds must be the
+-    # operand lccc emits, character for character.  Instruction counts alone
+-    # cannot see a wrong constant — this gate itself once expected +32 for a
+-    # +40 field (`c[3]` after `long a, b`), so the oracle compares the operand
+-    # text, not just the count.  GCC spells a zero displacement the same way
+-    # (`%gs:(%rdi)`), so all four shapes are compared.
+-    for fn in read_b read_c3 read_a fold_after_call read_d read_f acc_b cmp_c3; do
+-        want=$(awk -v fn="^$fn:" '
+-            $0 ~ fn { inb = 1; next }
+-            inb && /^\.size/ { exit }
+-            inb && /%gs:[^,)]*\(%r[a-z0-9]+\)/ {
+-                match($0, /%gs:[^,)]*\(%r[a-z0-9]+\)/)
+-                print substr($0, RSTART, RLENGTH)
+-                exit
+-            }
+-        ' "$tmp/fold_gcc.s")
+-        if [ -z "$want" ]; then
+-            # A vacuous oracle would silently pass: every shape listed here is
+-            # expected to make GCC emit a folded segment operand.
+-            echo "FAIL: $fn: GCC emitted no folded segment operand to compare against" >&2
+-            fail=1
+-        elif ! body_of "$fn" | grep -cF -- "$want" >/dev/null; then
+-            echo "FAIL: $fn: GCC folds '$want' but lccc emits:" >&2
+-            body_of "$fn" >&2
+-            fail=1
+-        fi
+-    done
+-fi
++# Cross-check against the GCC 14 oracle (required, see lib/gcc_oracle.sh): the
++# same instruction count and the same folded segment operand for each shape.
++. tests/regression/lib/gcc_oracle.sh
++require_gcc_oracle "check_seg_const_offset_fold" || exit 1
++"$GCC_ORACLE_BIN" -O2 -S -o "$tmp/fold_gcc.s" "$tmp/fold.c"
++count_body() { # count_body <file> <symbol>
++    awk -v fn="^$1:" '
++        $0 ~ fn { inb = 1; next }
++        inb && /^\.size/ { exit }
++        inb && /^[[:space:]]*\./ { next }
++        inb && /^[[:space:]]*#/ { next }
++        inb { n++ }
++        END { print n + 0 }
++    ' "$2"
++}
++# `cmp_c3` is deliberately absent here: its one extra instruction is the
++# boolean-materialisation tail (`sete %r9b; movzbl %r9b, %r9d; movl
++# %r9d, %eax` where GCC zeroes %eax and does `sete %al`), which the SAME
++# function shows without any segment override (`cmpq %rsi, 40(%rdi)`) —
++# it is a return-register coalescing gap, not a segment-fold gap.
++# docs/FOLLOWUP-2026-10-11-kernel-percpu-segment-fold.md §5.4 carries the
++# reproducer; the folded OPERAND of cmp_c3 is still pinned by the loop
++# below, so the segment half of the contract stays checked here.
++for fn in read_b read_c3 read_a acc_b; do
++    ours=$(count_body "$fn" "$tmp/fold.s")
++    theirs=$(count_body "$fn" "$tmp/fold_gcc.s")
++    if [ "$ours" -gt "$theirs" ]; then
++        echo "FAIL: $fn: lccc $ours instructions vs GCC $theirs" >&2
++        fail=1
++    fi
++done
++# Exact-operand cross-check: the segment operand GCC folds must be the
++# operand lccc emits, character for character.  Instruction counts alone
++# cannot see a wrong constant — this gate itself once expected +32 for a
++# +40 field (`c[3]` after `long a, b`), so the oracle compares the operand
++# text, not just the count.  GCC spells a zero displacement the same way
++# (`%gs:(%rdi)`), so all four shapes are compared.
++for fn in read_b read_c3 read_a fold_after_call read_d read_f acc_b cmp_c3; do
++    want=$(awk -v fn="^$fn:" '
++        $0 ~ fn { inb = 1; next }
++        inb && /^\.size/ { exit }
++        inb && /%gs:[^,)]*\(%r[a-z0-9]+\)/ {
++            match($0, /%gs:[^,)]*\(%r[a-z0-9]+\)/)
++            print substr($0, RSTART, RLENGTH)
++            exit
++        }
++    ' "$tmp/fold_gcc.s")
++    if [ -z "$want" ]; then
++        # A vacuous oracle would silently pass: every shape listed here is
++        # expected to make GCC emit a folded segment operand.
++        echo "FAIL: $fn: GCC emitted no folded segment operand to compare against" >&2
++        fail=1
++    elif ! body_of "$fn" | grep -cF -- "$want" >/dev/null; then
++        echo "FAIL: $fn: GCC folds '$want' but lccc emits:" >&2
++        body_of "$fn" >&2
++        fail=1
++    fi
++done
+ 
+ if [ "$fail" -ne 0 ]; then
+     echo "FAIL: segment constant-displacement fold gate" >&2
+diff --git a/tests/regression/check_seg_conv_diagnostics.sh b/tests/regression/check_seg_conv_diagnostics.sh
+index dabec502..2b478b0d 100755
+--- a/tests/regression/check_seg_conv_diagnostics.sh
++++ b/tests/regression/check_seg_conv_diagnostics.sh
+@@ -1,90 +1,94 @@
+ #!/usr/bin/env bash
+-# Named/generic pointer conversion verdicts. GCC 13 rejects two VALID static
+-# member-array initializers as nonconstant; use the GCC >= 14 oracle explicitly
+-# provisioned by CI, not the runner's unversioned gcc. Never skip the oracle.
++# Implicit conversions between named and generic pointers, through identifier
++# arrays, struct members of a __seg_gs object, subscripts of a __seg_gs array,
++# arguments, assignments, returns and initializers.
++#
++# Every fixture in tests/regression/seg_conv/ is compiled with $CCC and with the
++# GCC 14 oracle (see lib/gcc_oracle.sh). The file name is the expected verdict:
++#   neg_*.c  must be REJECTED, with an address-space diagnostic;
++#   pos_*.c  must be ACCEPTED.
++#
++# A verdict is only trusted from an ordinary compiler exit:
++#   exit 0  = accepted;
++#   exit 1  = rejected (the diagnostic-carrying error exit of both compilers);
++#   anything else (a signal such as 139, or any other status) = a FAILURE, never
++#   a rejection. A crash that happens to print an address-space message must not
++#   count as the right rejection.
++# A reject must also say why: its stderr needs an address-space diagnostic, so a
++# fixture rejected for an unrelated reason fails the gate even when the verdict
++# happens to match.
+ set -euo pipefail
+-export LC_ALL=C
+ CCC=${CCC:-./target/fastbuild/lccc}
+ dir=tests/regression/seg_conv
+ tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-seg-conv.XXXXXX")
+ trap 'rm -rf "$tmp"' EXIT
++# shellcheck source=tests/regression/lib/gcc_oracle.sh
++. tests/regression/lib/gcc_oracle.sh
++require_gcc_oracle "check_seg_conv_diagnostics" || exit 1
++gcc_oracle_positive_control "$CCC" "$tmp" || exit 1
++gcc_oracle_positive_control "$GCC_ORACLE_BIN" "$tmp" || exit 1
++echo "Conversion oracle: $(basename "$GCC_ORACLE_BIN") (two compilers, positive controls)"
+ 
+-if [[ -n ${GCC:-} ]]; then
+-    candidates=("$GCC")
+-else
+-    candidates=(gcc-14 gcc-15 gcc-16 gcc)
+-fi
+-GCC=''
+-for candidate in "${candidates[@]}"; do
+-    command -v "$candidate" >/dev/null 2>&1 || continue
+-    version=$("$candidate" -dumpversion 2>/dev/null) || continue
+-    major=${version%%.*}
+-    if [[ $major =~ ^[0-9]+$ ]] && (( major >= 14 )); then
+-        GCC=$candidate
+-        break
+-    fi
+-done
+-if [[ -z $GCC ]]; then
+-    echo "FAIL: conversion oracle requires GCC >= 14; install gcc-14 or set GCC (tried: ${candidates[*]})" >&2
+-    exit 1
+-fi
+-version=$("$GCC" --version)
+-echo "Conversion oracle: $GCC (${version%%$'\n'*})"
+-# Semantic positive control, not just a trivial TU: GCC 13's failure is in
+-# this exact constant-address form. A broken compiler/toolchain must not make
+-# negative fixtures look like valid rejections.
+-cat > "$tmp/control.c" <<'C'
+-struct S { long a[3]; };
+-extern struct S __seg_gs object;
+-long __seg_gs *p = object.a + 1;
+-C
+-for compiler in "$CCC" "$GCC"; do
+-    if ! "$compiler" -std=gnu11 -c "$tmp/control.c" -o "$tmp/control.o" >"$tmp/control.err" 2>&1; then
+-        echo "FAIL: $compiler failed the named-space positive control" >&2
+-        cat "$tmp/control.err" >&2
+-        exit 1
+-    fi
+-done
++# compile_verdict <compiler> <flags> <fixture> <log>
++# Prints accept|reject|crash:<rc> and leaves the diagnostics in <log>.
++compile_verdict() {
++    local rc
++    set +e
++    # shellcheck disable=SC2086  # <flags> is a deliberate word list
++    "$1" $2 -c -o "$tmp/verdict.o" "$3" >"$4" 2>&1
++    rc=$?
++    set -e
++    case "$rc" in
++        0) echo accept ;;
++        1) echo reject ;;
++        *) echo "crash:$rc" ;;
++    esac
++}
+ 
+ fail=0
+ shopt -s nullglob
+ files=("$dir"/neg_*.c "$dir"/pos_*.c)
+-if [[ ${#files[@]} -eq 0 ]]; then
++if [ "${#files[@]}" -eq 0 ]; then
+     echo "FAIL: no fixtures in $dir" >&2
+     exit 1
+ fi
+ for f in "${files[@]}"; do
+-    base=${f##*/}
++    base=$(basename "$f")
+     case "$base" in
+         neg_*) want=reject ;;
+         pos_*) want=accept ;;
+     esac
+-    for compiler in "$CCC" "$GCC"; do
+-        if "$compiler" -std=gnu11 -c -o "$tmp/x.o" "$f" >"$tmp/diagnostic" 2>&1; then
+-            got=accept
+-        else
+-            status=$?
+-            got=reject
+-            if [[ $status -ne 1 ]]; then
+-                echo "FAIL: $compiler failed abnormally on $base (status $status)" >&2
+-                cat "$tmp/diagnostic" >&2
+-                fail=1
+-                continue
+-            fi
+-        fi
+-        if [[ $got != "$want" ]]; then
+-            echo "FAIL: $compiler $got $base (expected $want)" >&2
+-            cat "$tmp/diagnostic" >&2
+-            fail=1
+-        elif [[ $want = reject ]] && ! grep -q -e 'address space' -e 'incompatible pointer type for argument' "$tmp/diagnostic"; then
+-            echo "FAIL: $compiler rejects $base without an address-space diagnostic" >&2
+-            cat "$tmp/diagnostic" >&2
+-            fail=1
+-        fi
+-    done
++    got=$(compile_verdict "$CCC" "" "$f" "$tmp/lccc.err")
++    if [ "$got" != "$want" ]; then
++        echo "FAIL: lccc $got $base (expected $want)" >&2
++        grep -m2 . "$tmp/lccc.err" >&2 || true
++        fail=1
++        continue
++    fi
++    # Assignment, initializer and return conversions say "incompatible address
++    # space"; an argument keeps the argument diagnostic (same rule as
++    # check_seg_named_decl_qualifier.sh).
++    if [ "$want" = reject ] && ! grep -q -e 'address space' -e 'incompatible pointer type for argument' "$tmp/lccc.err"; then
++        echo "FAIL: lccc rejects $base without an address-space diagnostic" >&2
++        grep -m2 . "$tmp/lccc.err" >&2 || true
++        fail=1
++        continue
++    fi
++    gg=$(compile_verdict "$GCC_ORACLE_BIN" "-w" "$f" "$tmp/gcc.err")
++    if [ "$gg" != "$want" ]; then
++        echo "FAIL: fixture $base expects $want but the GCC 14 oracle says $gg; fix the fixture" >&2
++        grep -m2 . "$tmp/gcc.err" >&2 || true
++        fail=1
++        continue
++    fi
++    if [ "$want" = reject ] && ! grep -q -e 'address space' -e 'incompatible pointer type' "$tmp/gcc.err"; then
++        echo "FAIL: the GCC 14 oracle rejects $base for a reason other than the address space" >&2
++        grep -m2 . "$tmp/gcc.err" >&2 || true
++        fail=1
++    fi
+ done
+-if [[ $fail -ne 0 ]]; then
+-    echo 'check_seg_conv_diagnostics: FAILED' >&2
++if [ "$fail" -ne 0 ]; then
++    echo "check_seg_conv_diagnostics: FAILED"
+     exit 1
+ fi
+-echo "check_seg_conv_diagnostics: PASSED (${#files[@]} files, two compilers, positive controls)"
++echo "check_seg_conv_diagnostics: PASSED (${#files[@]} files; two compilers, positive controls)"
+diff --git a/tests/regression/check_seg_conversion_parity.sh b/tests/regression/check_seg_conversion_parity.sh
+new file mode 100755
+index 00000000..8cfd4510
+--- /dev/null
++++ b/tests/regression/check_seg_conversion_parity.sh
+@@ -0,0 +1,100 @@
++#!/usr/bin/env bash
++# Table-driven parity gate for named-address-space conversions.
++#
++# Each row of tests/regression/seg_conv/parity_table.tsv is one conversion
++# shape (assignment, argument, return, initializer, comparison, struct,
++# pointee chain). The row's `expect` column is GCC 14's verdict, recorded
++# when the table was written; the gate re-checks all three:
++#   expect == gcc 14 (gcc -w)   the table itself has not drifted from GCC;
++#   expect == lccc                lccc agrees with the oracle on every shape.
++# Verdicts are accept/reject only. Diagnostic wording is not oracle-compared
++# (see the seg_conv README); a reject must carry an address-space,
++# disjoint-space or incompatible-pointer diagnostic so a reject for an
++# unrelated reason cannot pass.
++set -euo pipefail
++CCC=${CCC:-./target/fastbuild/lccc}
++table=tests/regression/seg_conv/parity_table.tsv
++. tests/regression/lib/gcc_oracle.sh
++require_gcc_oracle "check_seg_conversion_parity" || exit 1
++
++# exit_verdict <status> -> accept | reject | crash:<status>. Only the ordinary
++# exit codes are verdicts; a signal or abort is a failure, not a rejection.
++exit_verdict() {
++    case "$1" in
++        0) echo accept ;;
++        1) echo reject ;;
++        *) echo "crash:$1" ;;
++    esac
++}
++
++tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-seg-parity.XXXXXX")
++trap 'rm -rf "$tmp"' EXIT
++gcc_oracle_positive_control "$CCC" "$tmp" || exit 1
++gcc_oracle_positive_control "$GCC_ORACLE_BIN" "$tmp" || exit 1
++
++prelude='typedef int __seg_gs *gp_t;
++typedef int __seg_fs *fp_t;
++typedef struct s { int m; } s_t;
++int *q;
++gp_t gp, gq;
++fp_t fp;
++int arr[4];
++int __seg_gs *garr[4];
++struct s __seg_gs *sgp;
++struct s *sq;
++int __seg_gs **pp;
++int **qq;
++int __seg_gs **a;
++int **b;
++void take_gp(gp_t p);
++void take_q(int *p);
++void take_vp(void *p);'
++
++fail=0
++rows=0
++while IFS=$'\t' read -r id expect ctx body; do
++    case "$id" in ''|\#*) continue ;; esac
++    rows=$((rows + 1))
++    case "$ctx" in
++        stmt) fn="void fx(void) { $body }" ;;
++        ret)  fn="gp_t fx(void) { $body }" ;;
++        int)  fn="int fx(void) { $body }" ;;
++        *) echo "FAIL: $id: unknown ctx '$ctx'" >&2; fail=1; continue ;;
++    esac
++    f="$tmp/$id.c"
++    printf '%s\n%s\n' "$prelude" "$fn" > "$f"
++
++    set +e
++    lerr=$("$CCC" -c -o "$tmp/l.o" "$f" 2>&1)
++    lrc=$?
++    "$GCC_ORACLE_BIN" -w -std=gnu11 -c -o "$tmp/g.o" "$f" >/dev/null 2>&1
++    grc=$?
++    set -e
++    lverdict=$(exit_verdict "$lrc")
++    gverdict=$(exit_verdict "$grc")
++    if [ "$gverdict" != "$expect" ]; then
++        echo "FAIL: $id: table says $expect but the GCC 14 oracle says $gverdict; fix the table" >&2
++        fail=1
++    fi
++    if [ "$lverdict" != "$expect" ]; then
++        echo "FAIL: $id: lccc $lverdict, expected $expect" >&2
++        grep -m1 . <<<"$lerr" >&2 || true
++        fail=1
++        continue
++    fi
++    if [ "$expect" = reject ] && ! grep -q -e 'address space' -e 'disjoint' -e 'incompatible pointer type' <<<"$lerr"; then
++        echo "FAIL: $id: rejected without an address-space or pointer diagnostic" >&2
++        grep -m1 . <<<"$lerr" >&2 || true
++        fail=1
++    fi
++done < "$table"
++
++if [ "$rows" -lt 40 ]; then
++    echo "FAIL: parity table has $rows shapes; the contract is at least 40" >&2
++    fail=1
++fi
++if [ "$fail" -ne 0 ]; then
++    echo "check_seg_conversion_parity: FAILED"
++    exit 1
++fi
++echo "check_seg_conversion_parity: PASSED ($rows shapes, lccc == gcc 14)"
+diff --git a/tests/regression/check_seg_copy_sweep.sh b/tests/regression/check_seg_copy_sweep.sh
+index 6deb0f03..31882ec2 100755
+--- a/tests/regression/check_seg_copy_sweep.sh
++++ b/tests/regression/check_seg_copy_sweep.sh
+@@ -33,11 +33,9 @@ trap 'rm -rf "$tmp"' EXIT
+ python3 "$gen" "$tmp/sweep.c"
+ 
+ fail=0
+-if ! command -v gcc >/dev/null 2>&1; then
+-    echo "FAIL: gcc is required as the oracle for the sweep"
+-    exit 1
+-fi
+-gcc -O0 -w -o "$tmp/oracle" "$tmp/sweep.c"
++. tests/regression/lib/gcc_oracle.sh
++require_gcc_oracle "check_seg_copy_sweep" || exit 1
++"$GCC_ORACLE_BIN" -O0 -w -o "$tmp/oracle" "$tmp/sweep.c"
+ "$tmp/oracle" > "$tmp/oracle.out" 2>&1 || true
+ if [ "$(tail -n 1 "$tmp/oracle.out")" != "seg_copy_sweep PASSED (192 sizes)" ]; then
+     echo "FAIL: gcc -O0 oracle did not pass the sweep"
+diff --git a/tests/regression/check_seg_declarator_space.sh b/tests/regression/check_seg_declarator_space.sh
+index ec012ad5..d4936f72 100644
+--- a/tests/regression/check_seg_declarator_space.sh
++++ b/tests/regression/check_seg_declarator_space.sh
+@@ -18,8 +18,8 @@ CCC=${CCC:-./target/fastbuild/lccc}
+ dir=tests/regression/seg_decl
+ tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-seg-decl.XXXXXX")
+ trap 'rm -rf "$tmp"' EXIT
+-have_gcc=0
+-command -v gcc >/dev/null 2>&1 && have_gcc=1
++. tests/regression/lib/gcc_oracle.sh
++require_gcc_oracle "check_seg_declarator_space" || exit 1
+ fail=0
+ shopt -s nullglob
+ files=("$dir"/neg_*.c "$dir"/pos_*.c)
+@@ -49,19 +49,17 @@ for f in "${files[@]}"; do
+         fail=1
+         continue
+     fi
+-    if [ "$have_gcc" -eq 1 ]; then
+-        set +e
+-        gcc -std=gnu11 -c -o "$tmp/g.o" "$f" >/dev/null 2>&1
+-        grc=$?
+-        set -e
+-        if [ "$grc" -ne 0 ]; then gg=reject; else gg=accept; fi
+-        if [ "$gg" != "$want" ]; then
+-            echo "FAIL: fixture $base expects $want but gcc $gg; fix the fixture" >&2
+-            fail=1
+-            continue
+-        fi
++    set +e
++    "$GCC_ORACLE_BIN" -std=gnu11 -c -o "$tmp/g.o" "$f" >/dev/null 2>&1
++    grc=$?
++    set -e
++    if [ "$grc" -ne 0 ]; then gg=reject; else gg=accept; fi
++    if [ "$gg" != "$want" ]; then
++        echo "FAIL: fixture $base expects $want but gcc $gg; fix the fixture" >&2
++        fail=1
++        continue
+     fi
+-    echo "PASS: $base lccc $got$( [ "$have_gcc" -eq 1 ] && echo " (gcc $gg)")"
++    echo "PASS: $base lccc $got (gcc $gg)"
+ done
+ if [ "$fail" -ne 0 ]; then
+     echo "check_seg_declarator_space: FAILED" >&2
+diff --git a/tests/regression/check_seg_gs_runtime.sh b/tests/regression/check_seg_gs_runtime.sh
+index 4f7f0274..c0df13d0 100755
+--- a/tests/regression/check_seg_gs_runtime.sh
++++ b/tests/regression/check_seg_gs_runtime.sh
+@@ -17,6 +17,8 @@
+ # x86-64 GS base and arch_prctl(ARCH_SET_GS).
+ set -euo pipefail
+ CCC=${CCC:-./target/fastbuild/lccc}
++. tests/regression/lib/gcc_oracle.sh
++require_gcc_oracle "check_seg_gs_runtime" || exit 1
+ # Self-checking programs, each paired with the gcc optimisation level used as its
+ # oracle. Every program is built with $CCC at -O0, -O1 and -O2 and must print
+ # the PASSED line; when gcc is available its output must match the gcc build
+@@ -97,15 +99,12 @@ done
+ run_program() {
+ src=$1
+ oracle_opt=$2
+-ref=""
+-if command -v gcc >/dev/null 2>&1; then
+-    if ! gcc "$oracle_opt" -w -o "$tmp/ref" "$src"; then
+-        echo "FAIL: gcc $oracle_opt oracle failed to build $src" >&2
+-        fail=1
+-        return
+-    fi
+-    ref=$("$tmp/ref")
++if ! "$GCC_ORACLE_BIN" "$oracle_opt" -w -o "$tmp/ref" "$src"; then
++    echo "FAIL: gcc $oracle_opt oracle failed to build $src" >&2
++    fail=1
++    return
+ fi
++ref=$("$tmp/ref")
+ for opt in -O0 -O1 -O2 -O3; do
+     bin="$tmp/lccc$opt"
+     if ! "$CCC" "$opt" -o "$bin" "$src"; then
+diff --git a/tests/regression/check_select_from_compare.sh b/tests/regression/check_select_from_compare.sh
+index add49796..4c04937d 100755
+--- a/tests/regression/check_select_from_compare.sh
++++ b/tests/regression/check_select_from_compare.sh
+@@ -25,12 +25,14 @@
+ # ============================================================================
+ set -euo pipefail
+ 
+-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+-root=$(CDPATH= cd -- "$here/../.." && pwd)
++here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
++root=$(CDPATH='' cd -- "$here/../.." && pwd)
+ CCC=${CCC:-$root/target/fastbuild/lccc}
+-GCC=${GCC:-gcc}
+ [[ -x $CCC ]] || { echo "check_select_from_compare: lccc not found at $CCC" >&2; exit 1; }
+-command -v "$GCC" >/dev/null 2>&1 || { echo "check_select_from_compare: no gcc oracle" >&2; exit 1; }
++# shellcheck source=tests/regression/lib/gcc_oracle.sh
++. "$here/lib/gcc_oracle.sh"
++require_gcc_oracle "check_select_from_compare" || exit 1
++GCC=$GCC_ORACLE_BIN
+ 
+ corpus=$here/select_from_compare_fusion.c
+ bench=$root/tests/benchmark/programs/ascii_case_fold.c
+diff --git a/tests/regression/lib/gcc_oracle.sh b/tests/regression/lib/gcc_oracle.sh
+new file mode 100644
+index 00000000..24b02a6d
+--- /dev/null
++++ b/tests/regression/lib/gcc_oracle.sh
+@@ -0,0 +1,100 @@
++#!/usr/bin/env bash
++# Shared GCC-oracle policy for the named-address-space gates.
++#
++# The fixtures' verdicts were recorded against GCC 14.2, and that is the oracle
++# every seg gate compares against. The MAJOR VERSION is part of that contract:
++#   * GCC 13.3 (Ubuntu 24.04's default `gcc`, i.e. what `ubuntu-latest` runs)
++#     rejects `long __seg_gs *p = gobj.a;` as a non-constant initializer that
++#     GCC 14 accepts, and only warns on `qq = pp` for a pointee-chain space
++#     change that GCC 14 errors on. PR #803's Test Suite failed exactly this
++#     way: `gcc` on the runner was 13, the gate expected 14's verdict.
++#   * So a gate never runs against "whatever `gcc` is on PATH", and never
++#     against a newer GCC either: a later release may change a verdict, and the
++#     pin keeps the comparison reproducible.
++#
++# Resolution, in order:
++#   1. $GCC, if set. It must name an executable that reports major version 14,
++#      otherwise the gate fails (an explicit choice is never replaced).
++#   2. gcc-14 on PATH (the hosted workflow installs it explicitly).
++#   3. gcc on PATH, only if it reports major version 14.
++#
++# Policy when no GCC 14 oracle is found: FAIL, locally and under CI. A gate that
++# silently skipped its cross-check would print PASSED for a comparison that
++# never ran, so the absence is reported as the configuration error it is.
++#
++# Usage (from a gate script, run from the repository root):
++#   . tests/regression/lib/gcc_oracle.sh
++#   require_gcc_oracle "$gate_name" || exit 1
++#   gcc_oracle_positive_control "$CCC" "$tmp" || exit 1
++#   gcc_oracle_positive_control "$GCC_ORACLE_BIN" "$tmp" || exit 1
++#   "$GCC_ORACLE_BIN" -w -c -o "$tmp/g.o" fixture.c   # the oracle invocation
++#
++# Variables set by require_gcc_oracle (read by the sourcing gate):
++#   GCC_ORACLE_BIN  absolute path of the GCC 14 oracle binary
++#   GCC_ORACLE      always 1 after a successful require (kept for gates that
++#                   branch on it; a missing oracle now fails instead of 0)
++# shellcheck disable=SC2034  # both are consumed by the gates that source this file
++
++GCC_ORACLE_MAJOR=14
++
++# gcc_oracle_major <gcc-binary> -> the major version, or nothing.
++gcc_oracle_major() {
++    "$1" -dumpfullversion 2>/dev/null | cut -d. -f1
++}
++
++require_gcc_oracle() {
++    local gate=$1 cand bin major found=""
++    GCC_ORACLE=0
++    GCC_ORACLE_BIN=""
++    if [ -n "${GCC:-}" ]; then
++        # An explicit oracle that cannot be used is a configuration error,
++        # never a silent fallback to another compiler.
++        bin=$(command -v "$GCC" 2>/dev/null || true)
++        if [ -z "$bin" ]; then
++            echo "FAIL: $gate: GCC=$GCC is not an executable; the oracle is GCC $GCC_ORACLE_MAJOR (this gate requires GCC $GCC_ORACLE_MAJOR exactly)" >&2
++            return 1
++        fi
++        major=$(gcc_oracle_major "$bin")
++        if [ "$major" != "$GCC_ORACLE_MAJOR" ]; then
++            echo "FAIL: $gate: GCC=$GCC is GCC ${major:-?}; the oracle is GCC $GCC_ORACLE_MAJOR (this gate requires GCC $GCC_ORACLE_MAJOR exactly)" >&2
++            return 1
++        fi
++        GCC_ORACLE=1
++        GCC_ORACLE_BIN=$bin
++        return 0
++    fi
++    for cand in gcc-14 gcc; do
++        bin=$(command -v "$cand" 2>/dev/null || true)
++        [ -n "$bin" ] || continue
++        major=$(gcc_oracle_major "$bin")
++        if [ "$major" = "$GCC_ORACLE_MAJOR" ]; then
++            GCC_ORACLE=1
++            GCC_ORACLE_BIN=$bin
++            return 0
++        fi
++        found="${found:+$found, }$cand=GCC ${major:-?}"
++    done
++    echo "FAIL: $gate needs GCC $GCC_ORACLE_MAJOR as the verdict oracle; found: ${found:-none}." >&2
++    echo "      Install gcc-14 (apt install gcc-14), or set GCC=<path to gcc-14>." >&2
++    return 1
++}
++
++# gcc_oracle_positive_control <compiler> <tmpdir>
++# A named-space semantic positive control: the compiler must ACCEPT a valid
++# program that uses a __seg_gs object through a constant-address pointer. A
++# broken compiler or toolchain must not make the negative fixtures look like
++# valid rejections, so every compiler in a gate is checked this way first.
++gcc_oracle_positive_control() {
++    local compiler=$1 tmp=$2
++    cat > "$tmp/control.c" <<'C'
++struct S { long a[3]; };
++extern struct S __seg_gs object;
++long __seg_gs *p = object.a + 1;
++C
++    if ! "$compiler" -std=gnu11 -c "$tmp/control.c" -o "$tmp/control.o" >"$tmp/control.err" 2>&1; then
++        echo "FAIL: $compiler failed the named-space positive control" >&2
++        cat "$tmp/control.err" >&2
++        return 1
++    fi
++    return 0
++}
+diff --git a/tests/regression/seg_conv/README.md b/tests/regression/seg_conv/README.md
+new file mode 100644
+index 00000000..b936ed53
+--- /dev/null
++++ b/tests/regression/seg_conv/README.md
+@@ -0,0 +1,62 @@
++# Named address-space conversion fixtures and oracle policy
++
++This directory holds the conversion fixtures for `__seg_gs` / `__seg_fs`
++pointers. Each file is compiled by lccc and by GCC 14.2 with `gcc -w`, and the
++file name is the expected verdict: `neg_*` must be rejected, `pos_*` accepted.
++
++**The oracle is GCC 14, by major version.** The verdicts were recorded against
++GCC 14.2. GCC 13.3, the default `gcc` on `ubuntu-latest`, disagrees on three
++fixtures (`pos_member_of_seg_obj.c`, `pos_member_plus_seg.c`,
++`neg_pointee_chain.c`), so every seg gate resolves the oracle through
++`tests/regression/lib/gcc_oracle.sh` and never runs a bare `gcc`.
++
++## What is oracle-compared
++
++- **Accept / reject** for every fixture and every row of `parity_table.tsv`.
++  lccc, the table, and GCC 14.2 must agree. A table that drifts from GCC fails
++  the gate (`check_seg_conversion_parity.sh`).
++- **Error versus warning class.** A shape GCC 14.2 errors on is an lccc error,
++  and a shape GCC only warns on is an lccc warning that still accepts. Example:
++  `q = (int *)gp` with `gp` in `__seg_gs`, a cast to a generic pointer from a
++  disjoint space. GCC 14.2 warns with `cast to generic address space pointer
++  from disjoint '__seg_gs' address space pointer`, and lccc emits the same
++  warning. `check_seg_cast_warning.sh` checks the class without `-w`. The
++  fixture gates compile with `-w`, so they check accept/reject only.
++
++## What is NOT oracle-compared
++
++- **Diagnostic wording.** lccc's messages name the types and the pointer level
++  (for example `at pointer level 2`), which GCC's do not. A reject must carry
++  an address-space, disjoint-space, or incompatible-pointer diagnostic, so a
++  reject for an unrelated reason cannot pass, but the text itself is lccc's
++  own and is not matched against GCC's.
++
++## Null pointer constants
++
++Only `(void *)0` (and `((void *)0)`, which is the same expression after parse)
++is exempt from the named-space check. This matches GCC 14.2: `(void *)0`,
++`0`, and `NULL` are accepted for a `__seg_gs` pointer; `(int *)0` and
++`(char *)0` are rejected.
++
++## Casts on the right-hand side
++
++A cast is judged by the type it produces, not exempted wholesale. `gp = (int
++*)q` is rejected because the cast result is generic, and
++`gp = (int __seg_gs *)q` is accepted because the cast names the segment.
++
++## Comparisons
++
++`==`, `!=`, `<`, `<=`, `>`, `>=` between pointers in different top-level
++pointee spaces are errors, with a null pointer constant exempt on either side.
++Only the top-level pointee space is compared, which matches GCC 14.2:
++`int __seg_gs **` against `int **` is accepted.
++
++## Running the gates
++
++The oracle resolves in this order: `$GCC` if set, then `gcc-14`, then `gcc` if
++it reports major version 14. An explicit `$GCC` of another major version is a
++failure. A missing GCC 14 is a failure everywhere, locally and under CI: a gate
++never prints PASSED for a cross-check that did not run. The conversion gates
++(`check_seg_conv_diagnostics.sh`, `check_seg_conversion_parity.sh`) run the
++named-space positive control on both compilers before any fixture, and invoke
++the resolved `$GCC_ORACLE_BIN`. See `tests/regression/lib/gcc_oracle.sh`.
+diff --git a/tests/regression/seg_conv/neg_assign_cast_generic_rhs.c b/tests/regression/seg_conv/neg_assign_cast_generic_rhs.c
+new file mode 100644
+index 00000000..b8cf3291
+--- /dev/null
++++ b/tests/regression/seg_conv/neg_assign_cast_generic_rhs.c
+@@ -0,0 +1,5 @@
++/* A cast to a generic pointer does not make a generic value legal in a __seg_gs slot. */
++typedef int __seg_gs *gp_t;
++int *q;
++gp_t gp;
++void f(void) { gp = (int *)q; }
+diff --git a/tests/regression/seg_conv/neg_assign_cast_void_const.c b/tests/regression/seg_conv/neg_assign_cast_void_const.c
+new file mode 100644
+index 00000000..abdc3e32
+--- /dev/null
++++ b/tests/regression/seg_conv/neg_assign_cast_void_const.c
+@@ -0,0 +1,4 @@
++/* (void *)1 is not a null pointer constant: GCC 14.2 rejects it on assignment. */
++typedef int __seg_gs *gp_t;
++gp_t gp;
++void f(void) { gp = (void *)1; }
+diff --git a/tests/regression/seg_conv/neg_cmp_array_generic.c b/tests/regression/seg_conv/neg_cmp_array_generic.c
+new file mode 100644
+index 00000000..4efd27ad
+--- /dev/null
++++ b/tests/regression/seg_conv/neg_cmp_array_generic.c
+@@ -0,0 +1,5 @@
++/* A generic array decays to a generic pointer: disjoint from a __seg_gs pointer. */
++typedef int __seg_gs *gp_t;
++gp_t gp;
++int arr[4];
++int f(void) { return gp == arr; }
+diff --git a/tests/regression/seg_conv/neg_cmp_disjoint.c b/tests/regression/seg_conv/neg_cmp_disjoint.c
+new file mode 100644
+index 00000000..01151372
+--- /dev/null
++++ b/tests/regression/seg_conv/neg_cmp_disjoint.c
+@@ -0,0 +1,5 @@
++/* GCC 14.2: comparison of pointers to disjoint address spaces. */
++int *q;
++typedef int __seg_gs *gp_t;
++gp_t gp;
++int f(void) { return gp == q; }
+diff --git a/tests/regression/seg_conv/neg_null_char_cast_arg.c b/tests/regression/seg_conv/neg_null_char_cast_arg.c
+new file mode 100644
+index 00000000..db5b3f9a
+--- /dev/null
++++ b/tests/regression/seg_conv/neg_null_char_cast_arg.c
+@@ -0,0 +1,4 @@
++/* (char *)0 is not the void * exemption: GCC 14.2 rejects it as an argument. */
++typedef int __seg_gs *gp_t;
++void take(gp_t p);
++void f(void) { take((char *)0); }
+diff --git a/tests/regression/seg_conv/neg_null_int_cast_arg.c b/tests/regression/seg_conv/neg_null_int_cast_arg.c
+new file mode 100644
+index 00000000..813bbfdc
+--- /dev/null
++++ b/tests/regression/seg_conv/neg_null_int_cast_arg.c
+@@ -0,0 +1,4 @@
++/* (int *)0 is not the void * exemption: GCC 14.2 rejects it as an argument. */
++typedef int __seg_gs *gp_t;
++void take(gp_t p);
++void f(void) { take((int *)0); }
+diff --git a/tests/regression/seg_conv/neg_pointee_chain.c b/tests/regression/seg_conv/neg_pointee_chain.c
+new file mode 100644
+index 00000000..c57b7719
+--- /dev/null
++++ b/tests/regression/seg_conv/neg_pointee_chain.c
+@@ -0,0 +1,4 @@
++/* A pointer-to-pointer whose inner layer changes space: GCC 14.2 errors even with -w. */
++int __seg_gs **pp;
++int **qq;
++void f(void) { qq = pp; }
+diff --git a/tests/regression/seg_conv/parity_table.tsv b/tests/regression/seg_conv/parity_table.tsv
+new file mode 100644
+index 00000000..84655496
+--- /dev/null
++++ b/tests/regression/seg_conv/parity_table.tsv
+@@ -0,0 +1,48 @@
++# Conversion-shape parity table: compared against GCC 14.2 (gcc -w) and lccc.
++# Columns: id<TAB>expect<TAB>ctx<TAB>body. expect is the GCC 14.2 verdict (accept|reject).
++# ctx: stmt = body in a void function, ret = body in a function returning
++# gp_t, int = body in a function returning int. Prelude: check_seg_conversion_parity.sh.
++assign_gs_to_gs	accept	stmt	gq = gp;
++assign_gen_to_gs	reject	stmt	gp = q;
++assign_gs_to_gen	reject	stmt	q = gp;
++assign_null_void	accept	stmt	gp = (void *)0;
++assign_null_int	reject	stmt	gp = (int *)0;
++assign_null_zero	accept	stmt	gp = 0;
++assign_void_nonzero	reject	stmt	gp = (void *)q;
++assign_cast_to_seg	accept	stmt	gp = (int __seg_gs *)q;
++assign_cast_gs_to_gen	accept	stmt	q = (int *)gp;
++assign_cast_fs_to_gs	reject	stmt	gp = (int __seg_fs *)gp;
++assign_arith_gs	accept	stmt	gp = gp + 1;
++assign_cast_long	accept	stmt	long l = (long)gp; (void)l;
++arg_gen_to_gs	reject	stmt	take_gp(q);
++arg_gs_to_gs	accept	stmt	take_gp(gp);
++arg_null_void	accept	stmt	take_gp((void *)0);
++arg_null_int	reject	stmt	take_gp((int *)0);
++arg_null_zero	accept	stmt	take_gp(0);
++arg_cast_gen	reject	stmt	take_gp((int *)q);
++arg_cast_to_seg	accept	stmt	take_gp((int __seg_gs *)q);
++arg_void_nonzero	reject	stmt	take_gp((void *)q);
++arg_gs_to_void	reject	stmt	take_vp(gp);
++arg_gs_to_gen	reject	stmt	take_q(gp);
++ret_null_void	accept	ret	return (void *)0;
++ret_null_int	reject	ret	return (int *)0;
++ret_gen	reject	ret	return q;
++ret_gs	accept	ret	return gp;
++init_gen	reject	stmt	gp_t x = q; (void)x;
++init_null_void	accept	stmt	gp_t x = (void *)0; (void)x;
++init_cast_to_seg	accept	stmt	gp_t x = (int __seg_gs *)q; (void)x;
++init_cast_gen	reject	stmt	gp_t x = (int *)gq; (void)x;
++cmp_gs_gs	accept	int	return gp == gq;
++cmp_gs_gen	reject	int	return gp == q;
++cmp_null_void	accept	int	return gp == (void *)0;
++cmp_null_zero	accept	int	return gp == 0;
++cmp_gs_fs	reject	int	return gp == fp;
++cmp_gs_garr_elem	accept	int	return gp == garr[0];
++cmp_gs_gen_array	reject	int	return gp == arr;
++cmp_struct_gs_gen	reject	int	return sgp == sq;
++assign_struct_gen	reject	stmt	sgp = sq;
++assign_struct_cast	accept	stmt	sgp = (struct s __seg_gs *)sq;
++assign_struct_null	accept	stmt	sgp = (void *)0;
++pp_assign_pointee	reject	stmt	qq = pp;
++pp_cmp_top_only	accept	int	return a == b;
++init_array_null	accept	stmt	gp_t tab[2] = { (void *)0, gp }; (void)tab;
+diff --git a/tests/regression/seg_conv/pos_assign_cast_to_segtype.c b/tests/regression/seg_conv/pos_assign_cast_to_segtype.c
+new file mode 100644
+index 00000000..d75d84e1
+--- /dev/null
++++ b/tests/regression/seg_conv/pos_assign_cast_to_segtype.c
+@@ -0,0 +1,5 @@
++/* The cast names the segment, so the right-hand side already has the right space. */
++typedef int __seg_gs *gp_t;
++int *q;
++gp_t gp;
++void f(void) { gp = (int __seg_gs *)q; }
+diff --git a/tests/regression/seg_conv/pos_cast_ptr_to_array_seg.c b/tests/regression/seg_conv/pos_cast_ptr_to_array_seg.c
+new file mode 100644
+index 00000000..a8b0eda5
+--- /dev/null
++++ b/tests/regression/seg_conv/pos_cast_ptr_to_array_seg.c
+@@ -0,0 +1,3 @@
++/* The cast's base qualifier names the array the pointer addresses. */
++long __seg_gs (*pa)[4];
++void f(long *x) { pa = (long __seg_gs (*)[4])x; }
+diff --git a/tests/regression/seg_conv/pos_cmp_nested_generic_top.c b/tests/regression/seg_conv/pos_cmp_nested_generic_top.c
+new file mode 100644
+index 00000000..7e0e9293
+--- /dev/null
++++ b/tests/regression/seg_conv/pos_cmp_nested_generic_top.c
+@@ -0,0 +1,4 @@
++/* Only the top-level pointee space is compared: int __seg_gs ** vs int ** is accepted. */
++int __seg_gs **a;
++int **b;
++int f(void) { return a == b; }
+diff --git a/tests/regression/seg_conv/pos_cmp_null.c b/tests/regression/seg_conv/pos_cmp_null.c
+new file mode 100644
+index 00000000..b1fba9a6
+--- /dev/null
++++ b/tests/regression/seg_conv/pos_cmp_null.c
+@@ -0,0 +1,4 @@
++/* A void * null pointer constant compares with any named pointer. */
++typedef int __seg_gs *gp_t;
++gp_t gp;
++int f(void) { return gp == (void *)0 || gp != ((void *)0); }
+diff --git a/tests/regression/seg_conv/pos_null_arg_void_cast.c b/tests/regression/seg_conv/pos_null_arg_void_cast.c
+new file mode 100644
+index 00000000..52bcca1b
+--- /dev/null
++++ b/tests/regression/seg_conv/pos_null_arg_void_cast.c
+@@ -0,0 +1,4 @@
++/* GCC 14.2 accepts a void * null pointer constant for a __seg_gs parameter. */
++typedef int __seg_gs *gp_t;
++void take(gp_t p);
++void f(void) { take((void *)0); take(((void *)0)); }
+diff --git a/tests/regression/seg_conv/pos_null_assign_void_cast.c b/tests/regression/seg_conv/pos_null_assign_void_cast.c
+new file mode 100644
+index 00000000..f5ba8fc8
+--- /dev/null
++++ b/tests/regression/seg_conv/pos_null_assign_void_cast.c
+@@ -0,0 +1,5 @@
++/* GCC 14.2 accepts a void * null pointer constant assigned or initialised. */
++typedef int __seg_gs *gp_t;
++gp_t gp;
++gp_t gi = (void *)0;
++void f(void) { gp = (void *)0; }
+diff --git a/tests/regression/seg_conv/pos_null_ret_void_cast.c b/tests/regression/seg_conv/pos_null_ret_void_cast.c
+new file mode 100644
+index 00000000..f07af443
+--- /dev/null
++++ b/tests/regression/seg_conv/pos_null_ret_void_cast.c
+@@ -0,0 +1,3 @@
++/* GCC 14.2 accepts a void * null pointer constant returned as __seg_gs. */
++typedef int __seg_gs *gp_t;
++gp_t f(void) { return (void *)0; }
