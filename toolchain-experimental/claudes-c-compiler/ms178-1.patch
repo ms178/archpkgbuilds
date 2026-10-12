@@ -1,991 +1,1526 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index ed9d1895..556aa7f2 100644
+index f318d5ab..aae8c2aa 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
-@@ -1161,6 +1161,7 @@ jobs:
-           python3 scripts/test_differential_corpus_paths.py
+@@ -1163,6 +1163,7 @@ jobs:
            bash tests/regression/check_loop_memset.sh
            bash tests/regression/check_loop_store_motion.sh
-+          bash tests/regression/check_const_trip_loop_inline.sh
+           bash tests/regression/check_const_trip_loop_inline.sh
++          bash tests/regression/check_fp_recurrence.sh
            bash tests/regression/check_bool_pair_tail_jmp.sh
            bash tests/regression/check_bool_pair_prune.sh
            bash tests/regression/check_demorgan_branch_split.sh
 diff --git a/scripts/ci_local.sh b/scripts/ci_local.sh
-index b4c95640..97f5e560 100755
+index 2a0f8837..8c6e0323 100755
 --- a/scripts/ci_local.sh
 +++ b/scripts/ci_local.sh
-@@ -396,6 +396,9 @@ gate "loop-memset-decisions" fast \
- gate "loop-store-motion" fast \
-     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_store_motion.sh
+@@ -399,6 +399,9 @@ gate "loop-store-motion" fast \
+ gate "const-trip-loop-inline" fast \
+     env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
  
-+gate "const-trip-loop-inline" fast \
-+    env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
++gate "fp-recurrence-and-jump-thread" fast \
++    env CCC=target/fastbuild/lccc bash tests/regression/check_fp_recurrence.sh
 +
  gate "bool-pair-tail-jmp-contract" fast \
      env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
  
-diff --git a/src/passes/inline.rs b/src/passes/inline.rs
-index f668b734..1fe71edc 100644
---- a/src/passes/inline.rs
-+++ b/src/passes/inline.rs
-@@ -70,6 +70,32 @@ const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
- /// body keeps the outlined copy, so `inst*(sites-1)` undercounts by `inst`),
- /// and a corpus census proving the 3rd site fires nowhere it loses.
- const MAX_STATIC_LOOP_INLINE_CALLS: usize = 2;
-+/// Constant-trip loop helper tier. A plain static helper whose loop exit is
-+/// compared against a parameter may be cloned at every call site that passes
-+/// a constant in `MIN_CONST_TRIP_COUNT..=MAX_CONST_TRIP_COUNT` for that
-+/// parameter, provided the body fits the tier's own size window below. Every
-+/// other call keeps the general limits above, and `always_inline` or gnu_inline
-+/// bodies never enter the tier.
-+///
-+/// Measured shape: expat's `sip_round(H, 2|4)` (139 IR instructions, 7 sites,
-+/// two of them inside the `sip24_update` loop). GCC 16.2, Clang 23.1 and ICX
-+/// all inline every site. LCCC kept four SipHash state words in memory across
-+/// rounds and ran 25% more Callgrind instructions (198.9M vs 159.3M) than the
-+/// inlined form.
-+///
-+/// The lower bound: with zero or one iteration no state crosses an iteration
-+/// boundary, so the clone only adds setup code. `reference(1)` in
-+/// tests/regression/loop_rotate_pressure_gate.c measured +146 Callgrind
-+/// instructions when it was cloned at its single-iteration site.
-+///
-+/// The upper bound covers the measured SipHash counts (2 and 4) with one
-+/// doubling of headroom. It was not tuned beyond that. Raising it needs a
-+/// Callgrind screen with scripts/callgrind_corpus.py first.
-+const MIN_CONST_TRIP_COUNT: i64 = 2;
-+const MAX_CONST_TRIP_COUNT: i64 = 8;
-+/// Size window for a constant-trip clone, per copy.
-+const MAX_CONST_TRIP_INLINE_INSTRUCTIONS: usize = 160;
-+const MAX_CONST_TRIP_INLINE_BLOCKS: usize = 16;
- /// At -Os, larger loop bodies stay out of enclosing loops even when inlining
- /// their final call site would remove the standalone copy. LCCC's current
- /// register allocator spills the merged nest heavily (zlib-ng Adler-32).
-@@ -386,6 +412,18 @@ fn select_inline_site(
-     let budget_exhausted = always_inline_budget_remaining == 0;
-     for site in call_sites {
-         let callee_data = &callee_map[&site.callee_name];
-+        // Constant-trip-only bodies are restricted to qualifying sites in
-+        // both passes (see the second pass for the size_optimized rationale).
-+        let const_trip_admitted = callee_data.const_trip_only
-+            && !size_optimized
-+            && const_trip_site_arg(
-+                callee_data.loop_bound_params,
-+                &callee_data.param_struct_sizes,
-+                &site.args,
-+            );
-+        if callee_data.const_trip_only && !const_trip_admitted {
-+            continue;
-+        }
-         // Never use ordinary inlining for a recursive callee. A clone still
-         // contains the recursive call, so fixed-point cloning only inflates
-         // the caller and does not remove call overhead. Dedicated recursion
-@@ -417,14 +455,15 @@ fn select_inline_site(
-                 site.pgo_force,
-                 size_optimized,
-             )
--            || nested_loop_multisite_static_should_stay_outlined(
--                callee_data,
--                callee_inst_count,
--                loop_blocks.contains(&site.block_idx),
--                caller_has_section,
--                site.pgo_force,
--                size_optimized,
--            )
-+            || (!const_trip_admitted
-+                && nested_loop_multisite_static_should_stay_outlined(
-+                    callee_data,
-+                    callee_inst_count,
-+                    loop_blocks.contains(&site.block_idx),
-+                    caller_has_section,
-+                    site.pgo_force,
-+                    size_optimized,
-+                ))
-             || repeated_small_loop_clone_should_stay_outlined(
-                 callee_data,
-                 callee_inst_count,
-@@ -498,6 +537,21 @@ fn select_inline_site(
-     for site in call_sites {
-         let callee_data = &callee_map[&site.callee_name];
-         let call_is_in_loop = loop_blocks.contains(&site.block_idx);
-+        // Constant-trip tier: a body admitted only by that tier is cloned only
-+        // at a site that passes a small constant for a loop-bound parameter.
-+        // The tier is disabled at -Os, where a loop-body clone is a size cost
-+        // with no measured benefit. The multi-site loop guard below is
-+        // exempted only for this admitted case; every other callee keeps it.
-+        let const_trip_admitted = callee_data.const_trip_only
-+            && !size_optimized
-+            && const_trip_site_arg(
-+                callee_data.loop_bound_params,
-+                &callee_data.param_struct_sizes,
-+                &site.args,
-+            );
-+        if callee_data.const_trip_only && !const_trip_admitted {
-+            continue;
-+        }
-         let callee_inst_count: usize = callee_data
-             .blocks
-             .iter()
-@@ -511,14 +565,15 @@ fn select_inline_site(
-                 site.pgo_force,
-                 size_optimized,
-             )
--            || nested_loop_multisite_static_should_stay_outlined(
--                callee_data,
--                callee_inst_count,
--                loop_blocks.contains(&site.block_idx),
--                caller_has_section,
--                site.pgo_force,
--                size_optimized,
--            )
-+            || (!const_trip_admitted
-+                && nested_loop_multisite_static_should_stay_outlined(
-+                    callee_data,
-+                    callee_inst_count,
-+                    loop_blocks.contains(&site.block_idx),
-+                    caller_has_section,
-+                    site.pgo_force,
-+                    size_optimized,
-+                ))
-             || repeated_small_loop_clone_should_stay_outlined(
-                 callee_data,
-                 callee_inst_count,
-@@ -605,9 +660,15 @@ fn select_inline_site(
-             let in_loop = loop_blocks.contains(&site.block_idx);
-             let size_cap_exempt = callee_data.is_single_call_site_static
-                 && callee_data.size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST;
-+            // A constant-trip clone (see MAX_CONST_TRIP_COUNT) is bounded by
-+            // the per-caller budget and the hard/absolute caps below. The soft
-+            // cap would otherwise veto the second clone in a caller, as in
-+            // expat's sip24_final, where the 4-round site follows a 2-round
-+            // clone and needs the caller to grow past 200 instructions.
-             if caller_too_large
-                 && !callee_data.is_always_inline
-                 && !size_cap_exempt
-+                && !const_trip_admitted
-                 && !(in_loop
-                     && !callee_data.has_loops
-                     && callee_inst_count <= MAX_INLINE_INSTRUCTIONS)
-@@ -1973,6 +2034,12 @@ struct CalleeData {
-     /// Module-wide direct calls (including a redirected asm label) observed
-     /// before inlining.  Multi-site wrappers duplicate their descendants.
-     direct_call_count: usize,
-+    /// Parameters that bound a loop exit (see `loop_bound_param_mask`).
-+    loop_bound_params: u64,
-+    /// Admitted only by the constant-trip tier: the body fails the general
-+    /// static-loop limits, so ordinary sites must not clone it. Such a callee
-+    /// is selected only at a call site with a qualifying constant argument.
-+    const_trip_only: bool,
-     /// Whether recursively expanding ordinary eligible callees reaches a loop.
-     /// A tiny wrapper can otherwise conceal a large loop nest from the raw
-     /// tiny/small threshold used by the fixed-point inliner.
-@@ -2101,6 +2168,124 @@ fn fits_static_loop_inline_limits(
-     small || bounded_clone
- }
- 
-+/// Bit mask of parameters (index < 64) that bound the exit test of a natural
-+/// loop: the parameter's entry value, through plain copies, is an operand of
-+/// the compare feeding a loop-exiting conditional branch. A parameter that is
-+/// reassigned inside the loop reaches the compare through a phi, so it is not
-+/// counted and the tier cannot admit it.
-+fn loop_bound_param_mask(func: &IrFunction) -> u64 {
-+    if func.blocks.is_empty() {
-+        return 0;
-+    }
-+    let mut param_of: FxHashMap<Value, usize> = FxHashMap::default();
-+    let mut copy_src: FxHashMap<Value, Value> = FxHashMap::default();
-+    let mut cmp_operands: FxHashMap<Value, (Operand, Operand)> = FxHashMap::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            match inst {
-+                Instruction::ParamRef {
-+                    dest, param_idx, ..
-+                } => {
-+                    param_of.insert(*dest, *param_idx);
-+                }
-+                Instruction::Copy {
-+                    dest,
-+                    src: Operand::Value(src),
-+                } => {
-+                    copy_src.insert(*dest, *src);
-+                }
-+                Instruction::Cmp { dest, lhs, rhs, .. } => {
-+                    cmp_operands.insert(*dest, (lhs.clone(), rhs.clone()));
-+                }
-+                _ => {}
-+            }
-+        }
-+    }
-+    // Follow copy chains to their root, bounded so a cyclic copy (not expected
-+    // in SSA, but cheap to defend against) cannot loop forever.
-+    let root = |mut v: Value| -> Value {
-+        for _ in 0..8 {
-+            match copy_src.get(&v) {
-+                Some(&s) => v = s,
-+                None => break,
-+            }
-+        }
-+        v
-+    };
-+    let param_of_operand = |op: &Operand| -> Option<usize> {
-+        match op {
-+            Operand::Value(v) => param_of.get(&root(*v)).copied(),
-+            Operand::Const(_) => None,
-+        }
-+    };
+diff --git a/scripts/lccc_delivery.py b/scripts/lccc_delivery.py
+index 4cece759..16522ba1 100755
+--- a/scripts/lccc_delivery.py
++++ b/scripts/lccc_delivery.py
+@@ -183,7 +183,7 @@ def publish(patch: Path, workspace: Path, metadata: dict, *,
+                   'git apply --check ms178-1.patch\ngit apply ms178-1.patch\n```\n\n'
+                   f'Patch: **{identity.st_size:,} Bytes**  \nSHA-256: `{patch_sha}`\n\n'
+                   '`UNGATED` bedeutet Zwischenstand, **keine** bestandene Gesamt-CI. '
+-                  'Der Stand wurde lokal mit `ci_local.sh --fast` geprüft; GitHub CI führt die übrigen Gates aus. '
++                  'Ob und in welchem Umfang dieser Stand geprüft wurde, zeigt ausschließlich der oben angegebene Validierungsstatus. GitHub CI führt die übrigen Gates aus. '
+                   'Einzelne validierte Änderungen stehen im Snapshot-Ledger; '
+                   'der eingebettete Status wird nicht durch die Transportprüfung aufgewertet.\n').encode('utf-8')
+         fd, name = tempfile.mkstemp(prefix='.ms178-1.zip-', suffix='.tmp', dir=workspace)
+diff --git a/src/backend/x86/codegen/peephole/passes/jump_thread.rs b/src/backend/x86/codegen/peephole/passes/jump_thread.rs
+new file mode 100644
+index 00000000..b8fc5a3d
+--- /dev/null
++++ b/src/backend/x86/codegen/peephole/passes/jump_thread.rs
+@@ -0,0 +1,255 @@
++//! Bypass empty direct-jump trampolines left by allocation and dead copies.
++//!
++//! Retarget edges, never remove/reorder code or labels. The skipped window
++//! contains only labels, comments, deleted lines and one unconditional jump:
++//! registers, memory and flags are unchanged. Keep function scope, inline asm,
++//! pinned lines, every directive (including CFI and custom alignment padding),
++//! short-only counter branches and cyclic/overlong chains fail-closed.
++use super::super::types::*;
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
 +
-+    let label_index: FxHashMap<BlockId, usize> = func
++fn local_label(s: &str) -> bool {
++    s.strip_prefix(".LBB")
++        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
++}
++
++fn label_text(s: &str) -> &str {
++    s.split('#')
++        .next()
++        .unwrap_or("")
++        .trim()
++        .trim_end_matches(':')
++}
++
++fn branch(s: &str) -> Option<(&str, &str)> {
++    if !s.starts_with('j') {
++        return None;
++    }
++    let mut fields = s.split('#').next()?.split_whitespace();
++    let mnemonic = fields.next()?;
++    let target = fields.next()?;
++    // Reuse the shared opcode recognizer with a canonical separator;
++    // LineKind's legacy fixed-space fast path does not classify jmp-tab.
++    if (mnemonic != "jmp" && !is_conditional_jump(&format!("{mnemonic} ")))
++        || fields.next().is_some()
++        || !local_label(target)
++        || matches!(mnemonic, "jcxz" | "jecxz" | "jrcxz")
++    {
++        return None;
++    }
++    Some((mnemonic, target))
++}
++
++fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi: usize) -> bool {
++    let mut labels = FxHashSet::default();
++    for i in lo..hi {
++        if infos[i].kind == LineKind::Label && !infos[i].pinned {
++            let label = label_text(infos[i].trimmed(store.get(i)));
++            if local_label(label) && !labels.insert(label.to_owned()) {
++                return false; // Ambiguous label: never guess which definition.
++            }
++        }
++    }
++    let mut redirects = FxHashMap::default();
++    let mut next: Option<String> = None;
++    for i in (lo..hi).rev() {
++        let info = infos[i];
++        let s = info.trimmed(store.get(i));
++        if info.pinned || info.kind == LineKind::InlineAsm {
++            next = None;
++            continue;
++        }
++        match info.kind {
++            LineKind::Nop | LineKind::Empty => {}
++            // Human comments emit no bytes. Keep assembler quarantine and
++            // compiler-owned liveness/ABI markers opaque to this CFG rewrite.
++            _ if s.starts_with('#') && s != "#APP" && s != "#NO_APP" && !s.contains("LCCC_") => {}
++            LineKind::Label => {
++                let label = label_text(s);
++                if labels.contains(label) {
++                    if let Some(target) = &next {
++                        redirects.insert(label.to_owned(), target.clone());
++                    }
++                } else {
++                    next = None;
++                }
++            }
++            _ if branch(s).is_some_and(|(mnemonic, _)| mnemonic == "jmp") => {
++                next = branch(s)
++                    .and_then(|(_, target)| labels.contains(target).then(|| target.to_owned()));
++            }
++            _ => next = None,
++        }
++    }
++    let mut resolved = FxHashMap::default();
++    for (label, first) in &redirects {
++        let mut seen = FxHashSet::default();
++        seen.insert(label.as_str());
++        let mut target = first.as_str();
++        for _ in 0..64 {
++            if !seen.insert(target) {
++                break;
++            }
++            if let Some(next) = redirects.get(target) {
++                target = next;
++            } else {
++                resolved.insert(label.clone(), target.to_owned());
++                break;
++            }
++        }
++    }
++    let mut changed = false;
++    for i in lo..hi {
++        if infos[i].pinned
++            || matches!(
++                infos[i].kind,
++                LineKind::Nop
++                    | LineKind::Empty
++                    | LineKind::Directive
++                    | LineKind::Label
++                    | LineKind::InlineAsm
++            )
++        {
++            continue;
++        }
++        let s = infos[i].trimmed(store.get(i));
++        let Some((mnemonic, target)) = branch(s) else {
++            continue;
++        };
++        let Some(final_target) = resolved.get(target) else {
++            continue;
++        };
++        let comment = s.find('#').map(|at| &s[at..]).unwrap_or("");
++        let replacement = format!("    {mnemonic} {final_target} {comment}");
++        replace_line(store, &mut infos[i], i, replacement);
++        changed = true;
++    }
++    changed
++}
++
++pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let mut start = None;
++    let mut changed = false;
++    for i in 0..store.len() {
++        // DIRECTIVE-LAW: selecting function-boundary markers, not skipping
++        // directives in a motion window (all window directives are barriers).
++        if infos[i].pinned || infos[i].kind != LineKind::Directive {
++            continue;
++        }
++        let s = infos[i].trimmed(store.get(i));
++        if s == ".cfi_startproc" {
++            start = Some(i + 1);
++        } else if s == ".cfi_endproc" {
++            if let Some(lo) = start.take() {
++                changed |= thread_function(store, infos, lo, i);
++            }
++        }
++    }
++    changed
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn apply(body: &str, pin: Option<&str>) -> (bool, String) {
++        let mut store = LineStore::new(format!("f:\n.cfi_startproc\n{body}\n.cfi_endproc\n"));
++        let mut infos: Vec<_> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        super::super::pin_inline_asm_regions(&store, &mut infos);
++        if let Some(line) = pin {
++            for (i, info) in infos.iter_mut().enumerate() {
++                if store.get(i).trim() == line {
++                    info.pinned = true;
++                }
++            }
++        }
++        let changed = run(&mut store, &mut infos);
++        let text = (0..store.len())
++            .map(|i| store.get(i))
++            .collect::<Vec<_>>()
++            .join("\n");
++        assert!(!run(&mut store, &mut infos), "must reach a fixpoint");
++        (changed, text)
++    }
++
++    #[test]
++    fn threads_chain_aliases_comments_and_keeps_every_label() {
++        for ws in [" ", "\t", "  \t "] {
++            let body = format!(
++                "jne{ws}.LBB1 # edge\nret\n.LBB1:\n# harmless\n.LBB2: # alias\njmp{ws}.LBB3\n.LBB3:\njmp{ws}.LBB4\n.LBB4:\nadcq $0, %rax\nret"
++            );
++            let (changed, out) = apply(&body, None);
++            assert!(changed, "separator {ws:?}: {out}");
++            assert!(out.contains("jne .LBB4 # edge"), "{out}");
++            for label in 1..=4 {
++                assert!(out.contains(&format!(".LBB{label}:")));
++            }
++            assert!(out.contains("adcq $0, %rax")); // Incoming flags untouched.
++        }
++    }
++
++    #[test]
++    fn refuses_effects_directives_and_pinned_trampolines() {
++        for barrier in [
++            "addq $1, %rax",
++            "movq %rax, (%rdi)",
++            "testl %eax, %eax",
++            "call other",
++            "endbr64",
++            ".cfi_def_cfa_offset 16",
++            ".p2align 4,0xcc",
++            ".byte 0xcc",
++            ".section .data",
++            "#APP\nmovq %rax, %rbx\n#NO_APP",
++            "#APP\njmp .LBB2\n#NO_APP",
++        ] {
++            let body = format!("jne .LBB1\nret\n.LBB1:\n{barrier}\njmp .LBB2\n.LBB2:\nret");
++            assert!(!apply(&body, None).0, "crossed {barrier}");
++        }
++        let body = "jne .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\nret";
++        assert!(!apply(body, Some("jmp .LBB2")).0);
++        let (_, out) = apply(body, Some("jne .LBB1"));
++        assert!(out.contains("jne .LBB1"));
++    }
++
++    #[test]
++    fn refuses_cycles_unknown_targets_indirect_and_short_only_branches() {
++        for body in [
++            "jne .LBB1\nret\n.LBB1:\njmp .LBB1",
++            "jne .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\njmp .LBB1",
++            "jne .LBB1\nret\n.LBB1:\njmp .LBB99",
++            "jne .LBB1\nret\n.LBB1:\njmp *%rax",
++            "jrcxz .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\nret",
++            "jecxz .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\nret",
++            "jcxz .LBB1\nret\n.LBB1:\njmp .LBB2\n.LBB2:\nret",
++        ] {
++            assert!(!apply(body, None).0, "{body}");
++        }
++    }
++
++    #[test]
++    fn refuses_overlong_chains_cross_function_edges_and_duplicate_labels() {
++        let mut body = "jne .LBB0\nret\n".to_owned();
++        for i in 0..66 {
++            body += &format!(".LBB{i}:\njmp .LBB{}\n", i + 1);
++        }
++        body += ".LBB66:\nret";
++        // Tail portions may shorten, but the over-budget entry is unchanged.
++        let mut store = LineStore::new(format!(".cfi_startproc\n{body}\n.cfi_endproc"));
++        let mut infos: Vec<_> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        run(&mut store, &mut infos);
++        assert_eq!(store.get(1), "jne .LBB0");
++        assert!(
++            !apply(
++                "jne .LBB1\nret\n.LBB1:\njmp .LBB2\n.cfi_endproc\ng:\n.cfi_startproc\n.LBB2:\nret",
++                None
++            )
++            .0
++        );
++        assert!(!apply("jne .LBB1\n.LBB1:\njmp .LBB2\n.LBB1:\n.LBB2:\nret", None).0);
++    }
++}
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index fec1463d..282abe92 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -35,6 +35,7 @@ mod fp_liveness;
+ mod frame_compact;
+ mod helpers;
+ mod identical_blocks;
++mod jump_thread;
+ mod liveness;
+ mod load_op_fuse;
+ mod local_patterns;
+@@ -1754,6 +1755,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+         identical_blocks::merge_identical_blocks(&mut store, &mut infos);
+     }
+ 
++    // Dead copies can leave branch-only blocks after the IR CFG cleanup.
++    // Retarget their direct edges while lines are still individually parsed.
++    // Never delete labels: computed gotos and address identity stay intact.
++    if !sk("jump_thread") {
++        jump_thread::run(&mut store, &mut infos);
++    }
++
+     if let Some(s) = peephole_total {
+         eprintln!(
+             "[PEEPHOLE-TIME] total: {:.1} ms",
+diff --git a/src/passes/fp_double.rs b/src/passes/fp_double.rs
+new file mode 100644
+index 00000000..922154de
+--- /dev/null
++++ b/src/passes/fp_double.rs
+@@ -0,0 +1,192 @@
++//! Scalar binary32/binary64 doubling without a constant register.
++//!
++//! Multiplication by positive two and adding a value to itself have the same
++//! exact real result, hence the same rounding, signed zero and FP exceptions.
++//! This is not reassociation. Restrict the pipeline to x86-64 SSE semantics;
++//! x87 excess precision and other backends are deliberately outside its scope.
++//! Keep multiply/add contraction opportunities, including through copy chains.
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
++use crate::common::types::IrType;
++use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand};
++
++/// x*2 and x+x have identical IEEE binary32/binary64 results, signed zero,
++/// rounding and exceptions. Leave potential multiply-add contractions alone.
++pub(crate) fn run(func: &mut IrFunction) -> usize {
++    let mut contraction_inputs = FxHashSet::default();
++    for b in &func.blocks {
++        for i in &b.instructions {
++            if let Instruction::BinOp {
++                op: IrBinOp::Add | IrBinOp::Sub,
++                lhs,
++                rhs,
++                ty,
++                ..
++            } = i
++                && matches!(ty, IrType::F32 | IrType::F64)
++            {
++                for op in [lhs, rhs] {
++                    if let Operand::Value(v) = op {
++                        contraction_inputs.insert(v.0);
++                    }
++                }
++            }
++        }
++    }
++    let copies: FxHashMap<_, _> = func
 +        .blocks
 +        .iter()
-+        .enumerate()
-+        .map(|(i, b)| (b.label, i))
++        .flat_map(|b| &b.instructions)
++        .filter_map(|i| match i {
++            Instruction::Copy {
++                dest,
++                src: Operand::Value(v),
++            } => Some((dest.0, v.0)),
++            _ => None,
++        })
 +        .collect();
-+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
-+    let loops =
-+        loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
-+
-+    let mut mask = 0u64;
-+    for lp in &loops {
-+        for &bi in &lp.body {
-+            let Terminator::CondBranch {
-+                cond: Operand::Value(cond),
-+                true_label,
-+                false_label,
-+            } = &func.blocks[bi].terminator
++    let mut work: Vec<_> = contraction_inputs.iter().copied().collect();
++    while let Some(v) = work.pop() {
++        if let Some(&src) = copies.get(&v)
++            && contraction_inputs.insert(src)
++        {
++            work.push(src);
++        }
++    }
++    let mut changes = 0;
++    for b in &mut func.blocks {
++        for i in &mut b.instructions {
++            let Instruction::BinOp {
++                dest,
++                op: IrBinOp::Mul,
++                lhs,
++                rhs,
++                ty,
++            } = i
 +            else {
 +                continue;
 +            };
-+            let exits = [true_label, false_label]
-+                .iter()
-+                .any(|l| label_index.get(l).is_some_and(|&j| !lp.body.contains(&j)));
-+            if !exits {
++            if contraction_inputs.contains(&dest.0) {
 +                continue;
 +            }
-+            let Some((lhs, rhs)) = cmp_operands.get(&root(*cond)) else {
++            let two = |op: Operand| {
++                matches!(
++                    (op, *ty),
++                    (Operand::Const(IrConst::F32(2.0)), IrType::F32)
++                        | (Operand::Const(IrConst::F64(2.0)), IrType::F64)
++                )
++            };
++            let value = if two(*lhs) {
++                *rhs
++            } else if two(*rhs) {
++                *lhs
++            } else {
 +                continue;
 +            };
-+            for idx in [param_of_operand(lhs), param_of_operand(rhs)]
-+                .into_iter()
-+                .flatten()
-+            {
-+                if idx < 64 {
-+                    mask |= 1u64 << idx;
++            *i = Instruction::BinOp {
++                dest: *dest,
++                op: IrBinOp::Add,
++                lhs: value,
++                rhs: value,
++                ty: *ty,
++            };
++            changes += 1;
++        }
++    }
++    changes
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::ir::reexports::{BasicBlock, BlockId, Terminator, Value};
++    fn v(n: u32) -> Operand {
++        Operand::Value(Value(n))
++    }
++    fn fixture(ty: IrType, constant: IrConst, left: bool) -> IrFunction {
++        let mut f = IrFunction::new("double".into(), ty, vec![], false);
++        let (lhs, rhs) = if left {
++            (Operand::Const(constant), v(1))
++        } else {
++            (v(1), Operand::Const(constant))
++        };
++        f.blocks.push(BasicBlock {
++            label: BlockId(0),
++            source_spans: vec![],
++            instructions: vec![
++                Instruction::ParamRef {
++                    dest: Value(1),
++                    param_idx: 0,
++                    ty,
++                },
++                Instruction::BinOp {
++                    dest: Value(2),
++                    op: IrBinOp::Mul,
++                    lhs,
++                    rhs,
++                    ty,
++                },
++            ],
++            terminator: Terminator::Return(Some(v(2))),
++        });
++        f
++    }
++    #[test]
++    fn doubles_both_operand_orders_and_precisions_without_new_values() {
++        for (ty, c) in [
++            (IrType::F32, IrConst::F32(2.0)),
++            (IrType::F64, IrConst::F64(2.0)),
++        ] {
++            for left in [false, true] {
++                let mut f = fixture(ty, c, left);
++                assert_eq!(run(&mut f), 1);
++                assert!(matches!(f.blocks[0].instructions[1], Instruction::BinOp {
++                    dest: Value(2), op: IrBinOp::Add, lhs, rhs, ty: t
++                } if lhs == v(1) && rhs == v(1) && t == ty));
++                assert_eq!(f.next_value_id, 0);
++                assert_eq!(run(&mut f), 0);
++            }
++        }
++    }
++    #[test]
++    fn preserves_contractions_through_arbitrarily_ordered_copy_chains() {
++        for op in [IrBinOp::Add, IrBinOp::Sub] {
++            for left in [false, true] {
++                let mut f = fixture(IrType::F64, IrConst::F64(2.0), left);
++                for n in 3..=35 {
++                    f.blocks[0].instructions.push(Instruction::Copy {
++                        dest: Value(n),
++                        src: v(n - 1),
++                    });
++                }
++                f.blocks[0].instructions.push(Instruction::BinOp {
++                    dest: Value(36),
++                    op,
++                    lhs: v(35),
++                    rhs: v(1),
++                    ty: IrType::F64,
++                });
++                f.blocks[0].terminator = Terminator::Return(Some(v(36)));
++                let before = format!("{f:?}");
++                assert_eq!(run(&mut f), 0);
++                assert_eq!(format!("{f:?}"), before);
++            }
++        }
++    }
++    #[test]
++    fn refuses_non_two_wrong_carrier_width_integer_and_extended_precision() {
++        for (ty, c) in [
++            (IrType::F32, IrConst::F64(2.0)),
++            (IrType::F64, IrConst::F32(2.0)),
++            (IrType::F64, IrConst::F64(-2.0)),
++            (IrType::F64, IrConst::F64(f64::NAN)),
++            (IrType::F64, IrConst::F64(2.0000000000000004)),
++            (IrType::I32, IrConst::I32(2)),
++            (IrType::F128, IrConst::F64(2.0)),
++        ] {
++            let mut f = fixture(ty, c, false);
++            let before = format!("{f:?}");
++            assert_eq!(run(&mut f), 0);
++            assert_eq!(format!("{f:?}"), before);
++        }
++    }
++}
+diff --git a/src/passes/loop_square.rs b/src/passes/loop_square.rs
+new file mode 100644
+index 00000000..7172108e
+--- /dev/null
++++ b/src/passes/loop_square.rs
+@@ -0,0 +1,229 @@
++//! Reuse an already-computed square across a loop backedge.
++//!
++//! A header p = phi(0, next) and body p*p need not recompute next*next
++//! when that exact product already dominates the latch. The initial square
++//! is +0 (including an initial -0); no arithmetic or memory access is
++//! speculated into a zero-trip preheader. One extra recurrence per innermost
++//! loop bounds register pressure and avoids defeating both sides of an FMA.
++//!
++//! Floating-environment-changing and unmodelled instructions reject a loop.
++//! This is value reuse, not reassociation or a reconstruction of builtin FMA.
++use super::loop_analysis::{self, DominanceChecker};
++use crate::common::types::IrType;
++use crate::ir::analysis::CfgAnalysis;
++use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
++
++fn square_zero(operand: Operand, ty: IrType) -> Option<Operand> {
++    match (operand, ty) {
++        (Operand::Const(IrConst::F32(x)), IrType::F32) if x == 0.0 => {
++            Some(Operand::Const(IrConst::F32(0.0)))
++        }
++        (Operand::Const(IrConst::F64(x)), IrType::F64) if x == 0.0 => {
++            Some(Operand::Const(IrConst::F64(0.0)))
++        }
++        _ => None,
++    }
++}
++
++fn stable_fp_environment(inst: &Instruction) -> bool {
++    // Default-closed: in particular calls (even pure calls), asm, intrinsics
++    // such as LDMXCSR, atomics and nonlocal transfers cannot cross the proof.
++    matches!(
++        inst,
++        Instruction::Phi { .. }
++            | Instruction::BinOp { .. }
++            | Instruction::UnaryOp { .. }
++            | Instruction::Cmp { .. }
++            | Instruction::Cast { .. }
++            | Instruction::Copy { .. }
++            | Instruction::GetElementPtr { .. }
++            | Instruction::GlobalAddr { .. }
++            | Instruction::Load {
++                volatile: false,
++                ..
++            }
++            | Instruction::Store {
++                volatile: false,
++                ..
++            }
++    )
++}
++
++pub(crate) fn run(func: &mut IrFunction) -> usize {
++    // Cheap triage: most functions have no floating-point squares.
++    if !func.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i,
++        Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, ty: IrType::F32 | IrType::F64, .. } if lhs == rhs)) { return 0; }
++    if func.blocks.is_empty() || !super::gvn::find_multi_def_values(func).is_empty() {
++        return 0;
++    }
++    let cfg = CfgAnalysis::build(func);
++    let dom = DominanceChecker::new(func.blocks.len(), &cfg.idom);
++    let loops = loop_analysis::find_merged_natural_loops(
++        func.blocks.len(),
++        &cfg.preds,
++        &cfg.succs,
++        &cfg.idom,
++    );
++    // All plans are from one immutable SSA snapshot; distinct innermost
++    // loops have disjoint bodies. Applying them changes no CFG edge.
++    let mut plans = Vec::new();
++    for lp in &loops {
++        if loops
++            .iter()
++            .any(|other| other.header != lp.header && lp.contains(other.header))
++        {
++            continue;
++        }
++        let Some(pre) = lp.find_dedicated_preheader(&cfg.preds, &cfg.succs) else {
++            continue;
++        };
++        let Some(latch) = lp.single_latch(&cfg.preds) else {
++            continue;
++        };
++        // Reserve space for temporaries/invariants in the 16-register x86-64
++        // SIMD file. This is a conservative profitability heuristic, not a
++        // proof that the allocator cannot spill. Add at most one recurrence.
++        if func.blocks[lp.header]
++            .instructions
++            .iter()
++            .filter(|i| {
++                matches!(
++                    i,
++                    Instruction::Phi {
++                        ty: IrType::F32 | IrType::F64,
++                        ..
++                    }
++                )
++            })
++            .count()
++            >= 6
++        {
++            continue;
++        }
++        if lp.body.iter().any(|&b| {
++            !dom.dominates(lp.header, b)
++                || func.blocks[b]
++                    .instructions
++                    .iter()
++                    .any(|i| !stable_fp_environment(i))
++        }) {
++            continue;
++        }
++        let pre_label = func.blocks[pre].label;
++        let latch_label = func.blocks[latch].label;
++        let mut body: Vec<usize> = lp.body.iter().copied().collect();
++        body.sort_unstable();
++        'one_per_loop: for &b in &body {
++            // Save work on every backedge, not just a conditional side path.
++            if !dom.dominates(b, latch) {
++                continue;
++            }
++            for (ii, inst) in func.blocks[b].instructions.iter().enumerate() {
++                let Instruction::BinOp {
++                    dest,
++                    op: IrBinOp::Mul,
++                    lhs: Operand::Value(p),
++                    rhs: Operand::Value(q),
++                    ty,
++                } = inst
++                else {
++                    continue;
++                };
++                if p != q || !matches!(ty, IrType::F32 | IrType::F64) {
++                    continue;
++                }
++                let Some(Instruction::Phi {
++                    incoming,
++                    ty: phi_ty,
++                    ..
++                }) = func.blocks[lp.header]
++                    .instructions
++                    .iter()
++                    .find(|i| matches!(i, Instruction::Phi { dest, .. } if dest == p))
++                else {
++                    continue;
++                };
++                if phi_ty != ty || incoming.len() != 2 {
++                    continue;
++                }
++                let Some((initial, _)) = incoming.iter().find(|(_, from)| *from == pre_label)
++                else {
++                    continue;
++                };
++                let Some((next, _)) = incoming.iter().find(|(_, from)| *from == latch_label) else {
++                    continue;
++                };
++                let Some(zero) = square_zero(*initial, *ty) else {
++                    continue;
++                };
++                let Operand::Value(next) = next else { continue };
++                for &nb in &body {
++                    if !dom.dominates(nb, latch) {
++                        continue;
++                    }
++                    let replacement = func.blocks[nb].instructions.iter().find_map(|i| match i {
++                        Instruction::BinOp {
++                            dest: d,
++                            op: IrBinOp::Mul,
++                            lhs: Operand::Value(a),
++                            rhs: Operand::Value(c),
++                            ty: t,
++                        } if a == next && c == next && t == ty && d != dest => Some(*d),
++                        _ => None,
++                    });
++                    if let Some(replacement) = replacement {
++                        plans.push((
++                            lp.header,
++                            pre_label,
++                            latch_label,
++                            b,
++                            ii,
++                            *dest,
++                            replacement,
++                            zero,
++                            *ty,
++                        ));
++                        break 'one_per_loop;
++                    }
 +                }
 +            }
 +        }
 +    }
-+    mask
-+}
-+
-+/// True when a call passes a small compile-time constant for a parameter that
-+/// bounds a loop exit of `callee`. Such a site is a constant-trip clone
-+/// candidate; the constant bounds the loop regardless of the other arguments.
-+/// Struct-by-value parameters are never scalar constants and are excluded.
-+fn const_trip_site_arg(
-+    loop_bound_params: u64,
-+    param_struct_sizes: &[Option<usize>],
-+    args: &[Operand],
-+) -> bool {
-+    if loop_bound_params == 0 {
-+        return false;
++    if plans.is_empty() {
++        return 0;
 +    }
-+    args.iter().take(64).enumerate().any(|(i, arg)| {
-+        loop_bound_params & (1u64 << i) != 0
-+            && param_struct_sizes.get(i).is_some_and(Option::is_none)
-+            && match arg {
-+                Operand::Const(c) => c
-+                    .to_i64()
-+                    .is_some_and(|v| (MIN_CONST_TRIP_COUNT..=MAX_CONST_TRIP_COUNT).contains(&v)),
-+                Operand::Value(_) => false,
-+            }
-+    })
-+}
-+
- fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
-     let mut counts = FxHashMap::default();
-     for function in &module.functions {
-@@ -2326,6 +2511,27 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
-         } else {
-             MAX_INLINE_BLOCKS_NO_LOOPS
-         };
-+        // Constant-trip tier (see MAX_CONST_TRIP_COUNT): a plain static loop
-+        // helper whose loop exit is bounded by a parameter may be cloned at a
-+        // site that passes a small constant for that parameter. The mask is
-+        // computed only for candidates inside the size window, so the common
-+        // path pays no analysis cost.
-+        // `always_inline` and gnu_inline bodies keep their own admission path:
-+        // they must be inlined at every site, so they never become
-+        // constant-trip-only.
-+        let loop_bound_params = if func.is_static
-+            && !func.is_inline
-+            && !func.is_always_inline
-+            && !func.is_gnu_inline_def
-+            && has_loops
-+            && inst_count_for_static <= MAX_CONST_TRIP_INLINE_INSTRUCTIONS
-+            && func.blocks.len() <= MAX_CONST_TRIP_INLINE_BLOCKS
-+        {
-+            loop_bound_param_mask(func)
-+        } else {
-+            0
++    func.next_value_id = func.sound_next_value_id();
++    // Rewrite the old instruction in place to a Copy before inserting any
++    // phis, so header indices never become stale. Preserve original spans.
++    let mut additions = Vec::new();
++    for (header, pre, latch, b, ii, dest, replacement, zero, ty) in &plans {
++        let carried = Value(func.next_value_id);
++        func.next_value_id += 1;
++        func.blocks[*b].instructions[*ii] = Instruction::Copy {
++            dest: *dest,
++            src: Operand::Value(carried),
 +        };
-+        let const_trip_candidate = loop_bound_params != 0;
-         // Medium static callees up to MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
-         // instructions are admitted, including small loop CFGs. This exposes
-         // aggregate-return helpers such as make_group to scalar cleanup. The
-@@ -2379,6 +2585,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
-             && !is_trivially_empty
-             && !is_small_static
-             && !is_medium_static
-+            && !const_trip_candidate
-             && !fits_single_call_site_static
-             // An external-linkage `inline` definition is still an inlining
-             // candidate; linkage controls out-of-line emission, not whether
-@@ -2463,7 +2670,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
-         // sip_round (~85 instr, one loop) are otherwise marked
-         // exceeds_normal_limits and excluded from ordinary callers, leaving
-         // their state in memory. The per-caller budget bounds the growth.
--        let fits_normal = fits_normal_inline_limits(
-+        let fits_general_normal = fits_normal_inline_limits(
-             inst_count,
-             func.blocks.len(),
-             func.is_static,
-@@ -2480,6 +2687,16 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
-             // not exist (glibc rtld __bsearch). Dedicated caps: big enough
-             // for glibc's header bodies, still bounded.
-             || (func.is_gnu_inline_def && inst_count <= 128 && func.blocks.len() <= 16);
-+        // A body admitted only by the constant-trip tier is not a general
-+        // normal-limit callee: selection restricts it to qualifying sites.
-+        // Its general admission must be ignored here. The medium-static path
-+        // in `fits_normal_inline_limits` would otherwise admit it at every
-+        // site, which the early skip gate never intended for loop helpers.
-+        let const_trip_only = const_trip_candidate
-+            && !is_medium_static
-+            && !is_small_static
-+            && !fits_single_call_site_static;
-+        let fits_normal = const_trip_only || fits_general_normal;
-         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
-             && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
-         // Single-call-site statics were already size-checked above against
-@@ -2588,6 +2805,8 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
-                     && !is_always_inline
-                     && !func.is_gnu_inline_def,
-                 direct_call_count: total_calls,
-+                loop_bound_params,
-+                const_trip_only,
-                 has_inlineable_loop_descendant: false,
-                 has_inlined_calls: func.has_inlined_calls,
-                 // Any static callee with a single call site is dead after
-@@ -4603,6 +4822,8 @@ mod inline_limit_tests {
-             is_gnu_inline_def: false,
-             is_plain_static: true,
-             direct_call_count: 2,
-+            loop_bound_params: 0,
-+            const_trip_only: false,
-             has_inlineable_loop_descendant: false,
-             has_inlined_calls: false,
-             is_single_call_site_static: false,
-@@ -5187,3 +5408,235 @@ mod phase0_drain_tests {
-         );
-     }
- }
++        additions.push((
++            *header,
++            Instruction::Phi {
++                dest: carried,
++                ty: *ty,
++                incoming: vec![(*zero, *pre), (Operand::Value(*replacement), *latch)],
++            },
++        ));
++    }
++    for (header, phi) in additions {
++        let b = &mut func.blocks[header];
++        let tracked = !b.source_spans.is_empty();
++        b.instructions.insert(0, phi);
++        if tracked {
++            b.source_spans
++                .insert(0, crate::common::source::Span::dummy());
++        }
++    }
++    plans.len()
++}
 +
 +#[cfg(test)]
-+mod const_trip_tests {
-+    use super::*;
-+    use crate::common::types::IrType;
-+    use crate::ir::ops::IrCmpOp;
-+    use crate::ir::reexports::{BasicBlock, Instruction, Terminator};
++#[path = "loop_square_tests.rs"]
++mod tests;
+diff --git a/src/passes/loop_square_tests.rs b/src/passes/loop_square_tests.rs
+new file mode 100644
+index 00000000..c8f19f16
+--- /dev/null
++++ b/src/passes/loop_square_tests.rs
+@@ -0,0 +1,330 @@
++use super::*;
++use crate::common::source::Span;
++use crate::common::types::AddressSpace;
++use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrCmpOp, IrModule, Terminator};
 +
-+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
-+        BasicBlock {
-+            label: BlockId(label),
-+            instructions,
-+            terminator,
-+            source_spans: Vec::new(),
-+        }
++fn v(n: u32) -> Operand {
++    Operand::Value(Value(n))
++}
++fn number(ty: IrType, n: f64) -> Operand {
++    Operand::Const(match ty {
++        IrType::F32 => IrConst::F32(n as f32),
++        _ => IrConst::F64(n),
++    })
++}
++fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
++    BasicBlock {
++        label: BlockId(label),
++        source_spans: vec![Span::dummy(); instructions.len()],
++        instructions,
++        terminator,
 +    }
-+
-+    fn function(blocks: Vec<BasicBlock>) -> IrFunction {
-+        IrFunction {
-+            name: "callee".into(),
-+            return_type: IrType::Void,
-+            params: vec![],
-+            blocks,
-+            is_variadic: false,
-+            is_declaration: false,
-+            is_static: true,
-+            is_inline: false,
-+            is_always_inline: false,
-+            is_noinline: false,
-+            next_value_id: 16,
-+            fp_expr_tags: Default::default(),
-+            next_label: 8,
-+            section: None,
-+            visibility: None,
-+            is_weak: false,
-+            is_used: false,
-+            has_inlined_calls: false,
-+            param_alloca_values: vec![],
-+            uses_sret: false,
-+            is_fastcall: false,
-+            regparm: None,
-+            is_naked: false,
-+            no_instrument: false,
-+            global_init_label_blocks: vec![],
-+            ret_eightbyte_classes: vec![],
-+            ret_is_f128_sse: false,
-+            is_gnu_inline_def: false,
-+            loop_promoted_f64_values: Vec::new(),
-+        }
++}
++fn branch(to: u32) -> Terminator {
++    Terminator::Branch(BlockId(to))
++}
++fn cond(yes: u32, no: u32) -> Terminator {
++    Terminator::CondBranch {
++        cond: Operand::Const(IrConst::I32(1)),
++        true_label: BlockId(yes),
++        false_label: BlockId(no),
 +    }
-+
-+    fn param_ref(dest: u32, param_idx: usize) -> Instruction {
-+        Instruction::ParamRef {
-+            dest: Value(dest),
-+            param_idx,
-+            ty: IrType::I32,
-+        }
++}
++fn mul(dest: u32, input: u32, ty: IrType) -> Instruction {
++    Instruction::BinOp {
++        dest: Value(dest),
++        op: IrBinOp::Mul,
++        lhs: v(input),
++        rhs: v(input),
++        ty,
 +    }
-+
-+    /// `i < bound` with a constant lhs, so only `bound` can be a parameter.
-+    fn compare_const_lt(dest: u32, bound: Value) -> Instruction {
-+        Instruction::Cmp {
-+            dest: Value(dest),
-+            op: IrCmpOp::Slt,
-+            lhs: Operand::Const(IrConst::I32(0)),
-+            rhs: Operand::Value(bound),
-+            ty: IrType::I32,
-+        }
-+    }
-+
-+    /// entry(0) reads the parameter, header(1) exits to block 3 on
-+    /// `0 < bound`, and the body(2) branches back to the header.
-+    fn counted_loop(header_bound: Value, entry: Vec<Instruction>) -> IrFunction {
-+        function(vec![
-+            block(0, entry, Terminator::Branch(BlockId(1))),
-+            block(
-+                1,
-+                vec![compare_const_lt(3, header_bound)],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(3)),
-+                    true_label: BlockId(2),
-+                    false_label: BlockId(3),
-+                },
-+            ),
-+            block(2, vec![], Terminator::Branch(BlockId(1))),
-+            block(3, vec![], Terminator::Return(None)),
-+        ])
-+    }
-+
-+    #[test]
-+    fn mask_marks_parameter_bounding_a_loop_exit() {
-+        let f = counted_loop(Value(1), vec![param_ref(1, 1)]);
-+        assert_eq!(loop_bound_param_mask(&f), 0b10);
-+    }
-+
-+    #[test]
-+    fn mask_follows_copies_to_the_parameter() {
-+        let f = counted_loop(
-+            Value(5),
++}
++fn fixture(ty: IrType) -> IrFunction {
++    let mut f = IrFunction::new("square".into(), ty, vec![], false);
++    f.blocks = vec![
++        block(
++            0,
++            vec![Instruction::Copy {
++                dest: Value(500),
++                src: Operand::Const(IrConst::I32(7)),
++            }],
++            branch(10),
++        ),
++        block(
++            10,
++            vec![Instruction::Phi {
++                dest: Value(1),
++                ty,
++                incoming: vec![(number(ty, 0.0), BlockId(0)), (v(3), BlockId(30))],
++            }],
++            cond(20, 40),
++        ),
++        block(
++            20,
 +            vec![
-+                param_ref(1, 1),
-+                Instruction::Copy {
-+                    dest: Value(4),
-+                    src: Operand::Value(Value(1)),
++                mul(2, 1, ty),
++                Instruction::BinOp {
++                    dest: Value(3),
++                    op: IrBinOp::Add,
++                    lhs: v(2),
++                    rhs: number(ty, 1.0),
++                    ty,
 +                },
-+                Instruction::Copy {
++                mul(4, 3, ty),
++                Instruction::Cmp {
 +                    dest: Value(5),
-+                    src: Operand::Value(Value(4)),
++                    op: IrCmpOp::Slt,
++                    lhs: v(4),
++                    rhs: number(ty, 100.0),
++                    ty,
 +                },
 +            ],
-+        );
-+        assert_eq!(loop_bound_param_mask(&f), 0b10);
-+    }
++            Terminator::CondBranch {
++                cond: v(5),
++                true_label: BlockId(30),
++                false_label: BlockId(40),
++            },
++        ),
++        block(30, vec![], branch(10)),
++        block(40, vec![], Terminator::Return(Some(v(1)))),
++    ];
++    f.next_label = 41;
++    f.next_value_id = 2; // Deliberately stale; new IDs must exceed v500.
++    f
++}
++fn verify(f: &IrFunction) {
++    let mut problems = vec![];
++    super::super::verify::verify_function(f, "loop_square_test", &mut problems);
++    assert!(problems.is_empty(), "{problems:?}");
++    let mut module = IrModule::new();
++    module.functions.push(f.clone());
++    super::super::validate_unique_defs(&module, "loop_square_test");
++}
++fn unchanged(mut f: IrFunction) {
++    let before = format!("{f:?}");
++    assert_eq!(run(&mut f), 0);
++    assert_eq!(format!("{f:?}"), before);
++}
 +
-+    #[test]
-+    fn mask_ignores_comparisons_outside_any_loop() {
-+        let f = function(vec![
-+            block(
-+                0,
-+                vec![param_ref(1, 0), compare_const_lt(2, Value(1))],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(2)),
-+                    true_label: BlockId(1),
-+                    false_label: BlockId(2),
-+                },
-+            ),
-+            block(1, vec![], Terminator::Return(None)),
-+            block(2, vec![], Terminator::Return(None)),
-+        ]);
-+        assert_eq!(loop_bound_param_mask(&f), 0);
-+    }
-+
-+    #[test]
-+    fn mask_ignores_loops_without_an_exit_edge() {
-+        // header(1) branches to block 2 or back to itself; both successors
-+        // stay inside the loop body, so no compare is a loop exit.
-+        let f = function(vec![
-+            block(0, vec![param_ref(1, 1)], Terminator::Branch(BlockId(1))),
-+            block(
-+                1,
-+                vec![compare_const_lt(3, Value(1))],
-+                Terminator::CondBranch {
-+                    cond: Operand::Value(Value(3)),
-+                    true_label: BlockId(2),
-+                    false_label: BlockId(2),
-+                },
-+            ),
-+            block(2, vec![], Terminator::Branch(BlockId(1))),
-+        ]);
-+        assert_eq!(loop_bound_param_mask(&f), 0);
-+    }
-+
-+    #[test]
-+    fn mask_ignores_bounds_that_are_not_a_parameter() {
-+        // The bound is an undefined value here, standing in for a phi or an
-+        // arithmetic result. Such a bound is not proven to be the parameter.
-+        let f = counted_loop(Value(9), vec![param_ref(1, 1)]);
-+        assert_eq!(loop_bound_param_mask(&f), 0);
-+    }
-+
-+    fn c32(v: i32) -> Operand {
-+        Operand::Const(IrConst::I32(v))
-+    }
-+
-+    #[test]
-+    fn site_accepts_constant_trip_counts_from_two_to_eight() {
-+        let sizes = [None, None];
-+        for v in 2..=8 {
-+            assert!(const_trip_site_arg(
-+                0b10,
-+                &sizes,
-+                &[Operand::Value(Value(1)), c32(v)]
-+            ));
++#[test]
++fn carries_exact_positive_zero_for_both_signed_zero_seeds_and_precisions() {
++    for ty in [IrType::F32, IrType::F64] {
++        for seed in [0.0, -0.0] {
++            for in_header in [false, true] {
++                let mut f = fixture(ty);
++                if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
++                    incoming[0].0 = number(ty, seed);
++                }
++                if in_header {
++                    let square = f.blocks[2].instructions.remove(0);
++                    f.blocks[2].source_spans.remove(0);
++                    f.blocks[1].instructions.push(square);
++                    f.blocks[1].source_spans.push(Span::dummy());
++                }
++                // Repair only the deliberately stale watermark for the input
++                // verifier, then make it stale again to exercise allocation.
++                f.next_value_id = 501;
++                verify(&f);
++                f.next_value_id = 2;
++                let pre = format!("{:?}", f.blocks[0]);
++                assert_eq!(run(&mut f), 1);
++                assert_eq!(f.next_value_id, 502);
++                assert_eq!(format!("{:?}", f.blocks[0]), pre, "no entry speculation");
++                match &f.blocks[1].instructions[0] {
++                    Instruction::Phi {
++                        dest: Value(501),
++                        incoming,
++                        ty: t,
++                    } => {
++                        assert_eq!(*t, ty);
++                        assert_eq!(incoming[1], (v(4), BlockId(30)));
++                        match incoming[0].0 {
++                            Operand::Const(IrConst::F32(x)) => assert_eq!(x.to_bits(), 0),
++                            Operand::Const(IrConst::F64(x)) => assert_eq!(x.to_bits(), 0),
++                            other => panic!("unexpected seed {other:?}"),
++                        }
++                    }
++                    other => panic!("unexpected header {other:?}"),
++                }
++                for b in &f.blocks {
++                    assert!(
++                        b.source_spans.is_empty() || b.source_spans.len() == b.instructions.len()
++                    );
++                }
++                verify(&f);
++                assert_eq!(run(&mut f), 0);
++            }
 +        }
-+    }
-+
-+    #[test]
-+    fn site_rejects_trip_counts_outside_the_range() {
-+        let sizes = [None, None];
-+        for v in [-1, 0, 1, 9, 4096] {
-+            assert!(
-+                !const_trip_site_arg(0b10, &sizes, &[Operand::Value(Value(1)), c32(v)]),
-+                "trip {v}"
-+            );
-+        }
-+    }
-+
-+    #[test]
-+    fn site_rejects_non_constant_and_unmarked_arguments() {
-+        let sizes = [None, None];
-+        // A value argument is never a known constant, even if it is one in practice.
-+        assert!(!const_trip_site_arg(
-+            0b10,
-+            &sizes,
-+            &[Operand::Value(Value(1)), Operand::Value(Value(2))]
-+        ));
-+        // The constant is at index 0, but only index 1 bounds a loop.
-+        assert!(!const_trip_site_arg(
-+            0b10,
-+            &sizes,
-+            &[c32(4), Operand::Value(Value(2))]
-+        ));
-+        // No loop-bound parameter at all.
-+        assert!(!const_trip_site_arg(
-+            0,
-+            &sizes,
-+            &[Operand::Value(Value(1)), c32(4)]
-+        ));
-+    }
-+
-+    #[test]
-+    fn site_rejects_struct_by_value_bound_parameter() {
-+        // A struct-by-value parameter is never passed as a scalar constant.
-+        let sizes = [None, Some(8)];
-+        assert!(!const_trip_site_arg(
-+            0b10,
-+            &sizes,
-+            &[Operand::Value(Value(1)), c32(4)]
-+        ));
-+    }
-+
-+    #[test]
-+    fn site_accepts_wide_integer_constants_in_range() {
-+        let sizes = [None, None];
-+        let arg = Operand::Const(IrConst::I64(4));
-+        assert!(const_trip_site_arg(
-+            0b10,
-+            &sizes,
-+            &[Operand::Value(Value(1)), arg]
-+        ));
 +    }
 +}
-diff --git a/tests/regression/check_const_trip_loop_inline.sh b/tests/regression/check_const_trip_loop_inline.sh
-new file mode 100755
-index 00000000..41700779
++
++#[test]
++fn rejects_unproved_initials_and_wrong_widths_or_operands() {
++    for initial in [
++        number(IrType::F64, 1.0),
++        number(IrType::F64, f64::NAN),
++        number(IrType::F64, f64::INFINITY),
++        number(IrType::F64, f64::from_bits(1)),
++        v(500),
++        number(IrType::F32, 0.0),
++    ] {
++        let mut f = fixture(IrType::F64);
++        if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
++            incoming[0].0 = initial;
++        }
++        unchanged(f);
++    }
++    for which in 0..4 {
++        let mut f = fixture(IrType::F64);
++        match which {
++            0 => {
++                if let Instruction::Phi { ty, .. } = &mut f.blocks[1].instructions[0] {
++                    *ty = IrType::F32;
++                }
++            }
++            1 => {
++                if let Instruction::BinOp { ty, .. } = &mut f.blocks[2].instructions[2] {
++                    *ty = IrType::F32;
++                }
++            }
++            2 => {
++                if let Instruction::BinOp { rhs, .. } = &mut f.blocks[2].instructions[0] {
++                    *rhs = v(3);
++                }
++            }
++            _ => {
++                if let Instruction::BinOp { rhs, .. } = &mut f.blocks[2].instructions[2] {
++                    *rhs = v(1);
++                }
++            }
++        }
++        unchanged(f);
++    }
++}
++
++#[test]
++fn rejects_calls_including_pure_calls_volatile_memory_and_intrinsics() {
++    use crate::ir::intrinsics::IntrinsicOp;
++    let barriers = vec![
++        Instruction::Call {
++            func: "fesetround".into(),
++            info: CallInfo::default(),
++        },
++        Instruction::Call {
++            func: "claimed_pure".into(),
++            info: CallInfo {
++                is_pure: true,
++                is_const: true,
++                ..CallInfo::default()
++            },
++        },
++        Instruction::Load {
++            dest: Value(80),
++            ptr: Value(500),
++            ty: IrType::F64,
++            volatile: true,
++            seg_override: AddressSpace::Default,
++        },
++        Instruction::Store {
++            ptr: Value(500),
++            val: number(IrType::F64, 1.0),
++            ty: IrType::F64,
++            volatile: true,
++            seg_override: AddressSpace::Default,
++        },
++        Instruction::Intrinsic {
++            dest: None,
++            op: IntrinsicOp::Mfence,
++            dest_ptr: None,
++            args: vec![],
++        },
++        Instruction::InlineAsm {
++            template: "ldmxcsr (%rax)".into(),
++            outputs: vec![],
++            inputs: vec![],
++            clobbers: vec!["memory".into()],
++            operand_types: vec![],
++            goto_labels: vec![],
++            input_symbols: vec![],
++            seg_overrides: vec![],
++        },
++    ];
++    for barrier in barriers {
++        for at in [1, 2, 3] {
++            let mut f = fixture(IrType::F64);
++            f.blocks[at].instructions.push(barrier.clone());
++            f.blocks[at].source_spans.clear();
++            unchanged(f);
++        }
++    }
++}
++
++#[test]
++fn rejects_non_dominating_producer_or_old_square_and_multiple_latches() {
++    // Producer is on only one predecessor of the latch.
++    let mut f = fixture(IrType::F64);
++    let producer = f.blocks[2].instructions.remove(2);
++    f.blocks[2].instructions.pop(); // Remove its old compare consumer.
++    f.blocks[2].source_spans.clear();
++    f.blocks[2].terminator = cond(25, 30);
++    f.blocks.insert(3, block(25, vec![producer], branch(30)));
++    unchanged(f);
++    // The old square is conditional; do not add unconditional carried pressure.
++    let mut f = fixture(IrType::F64);
++    let old = f.blocks[2].instructions.remove(0);
++    f.blocks[2].source_spans.clear();
++    if let Instruction::BinOp { lhs, .. } = &mut f.blocks[2].instructions[0] {
++        *lhs = v(1);
++    }
++    f.blocks[1].terminator = cond(15, 20);
++    f.blocks.insert(2, block(15, vec![old], branch(20)));
++    unchanged(f);
++    // A second backedge needs a separately proved producer value.
++    let mut f = fixture(IrType::F64);
++    f.blocks[2].terminator = cond(30, 10);
++    if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
++        incoming.push((v(3), BlockId(20)));
++    }
++    unchanged(f);
++}
++
++#[test]
++fn rejects_non_dedicated_entry_duplicate_defs_and_pressure() {
++    let mut f = fixture(IrType::F64);
++    f.blocks[0].terminator = cond(10, 40);
++    unchanged(f);
++    let mut f = fixture(IrType::F64);
++    f.blocks[0].instructions.push(Instruction::Copy {
++        dest: Value(3),
++        src: number(IrType::F64, 0.0),
++    });
++    unchanged(f);
++    let mut f = fixture(IrType::F64);
++    for n in 10..15 {
++        f.blocks[1].instructions.push(Instruction::Phi {
++            dest: Value(n),
++            ty: IrType::F64,
++            incoming: vec![(number(IrType::F64, 0.0), BlockId(0)), (v(n), BlockId(30))],
++        });
++    }
++    unchanged(f);
++}
++
++#[test]
++fn ignores_outer_loop_but_optimizes_the_innermost_loop() {
++    let mut f = fixture(IrType::F64);
++    f.blocks[0].terminator = branch(5);
++    if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
++        incoming[0].1 = BlockId(7);
++    }
++    f.blocks[1].terminator = cond(20, 35);
++    if let Terminator::CondBranch { false_label, .. } = &mut f.blocks[2].terminator {
++        *false_label = BlockId(35);
++    }
++    f.blocks[4].terminator = Terminator::Return(Some(number(IrType::F64, 0.0)));
++    f.blocks.insert(1, block(5, vec![], cond(7, 40)));
++    f.blocks.insert(2, block(7, vec![], branch(10)));
++    f.blocks.push(block(35, vec![], branch(5)));
++    assert_eq!(run(&mut f), 1);
++    verify(&f);
++}
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index d551dfd4..027a3d3b 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -32,6 +32,7 @@ pub(crate) mod expr_sink;
+ pub(crate) mod fma_neg_peel;
+ pub(crate) mod fortify_fold;
+ pub(crate) mod fp_const_hoist;
++pub(crate) mod fp_double;
+ pub(crate) mod global_addr_cse;
+ pub(crate) mod gvn;
+ pub(crate) mod if_convert;
+@@ -54,6 +55,7 @@ pub(crate) mod loop_memory_promote;
+ pub(crate) mod loop_memset;
+ pub(crate) mod loop_preheader;
+ pub(crate) mod loop_rotate;
++pub(crate) mod loop_square;
+ pub(crate) mod loop_unroll;
+ pub(crate) mod narrow;
+ pub(crate) mod outline_switch;
+@@ -2117,6 +2119,27 @@ pub(crate) fn run_passes(
+             total_changes_excl_dce += n;
+         }
+ 
++        // Predictive commoning of an existing floating-point square. Before
++        // rotation/copy propagation, while the recurrence is explicit SSA.
++        // Never speculate arithmetic on entry; x87 is deliberately excluded.
++        if iter == 0
++            && opt_level >= 2
++            && !optimize_for_size
++            && target == crate::backend::Target::X86_64
++            && x86_isa.simd
++            && !pass_disabled(&disabled, "loop_square")
++        {
++            let n = timed_pass!(
++                "loop_square",
++                run_on_visited(module, &dirty, &mut changed, loop_square::run)
++            );
++            total_changes += n;
++            total_changes_excl_dce += n;
++            if n > 0 {
++                verify::verify_after_pass(module, "loop_square");
++            }
++        }
++
+         // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
+         // widened phi flows through the rotated form and emits `addq`
+         // directly). Transforms "guard-at-top" loops into "test-at-bottom"
+@@ -2986,6 +3009,16 @@ pub(crate) fn run_passes(
+         module.for_each_function(dce::eliminate_dead_code);
+     }
+ 
++    // Run after the algebraic simplifiers and before constant hoisting,
++    // so neither x+x canonicalization nor a hoisted 2.0 hides the fold.
++    if target == crate::backend::Target::X86_64
++        && x86_isa.simd
++        && !pass_disabled(&disabled, "fp_double")
++    {
++        module.for_each_function(fp_double::run);
++        verify::verify_after_pass(module, "fp_double");
++    }
++
+     // Hoist FP constants used in loop bodies into preheader Copies so they can
+     // stay in FP registers across the loop (AArch64 constant-pool literal loads
+     // otherwise sit in the loop's dependency path every iteration).
+diff --git a/src/passes/set_membership.rs b/src/passes/set_membership.rs
+index 8363d507..8a8fbfcc 100644
+--- a/src/passes/set_membership.rs
++++ b/src/passes/set_membership.rs
+@@ -27,7 +27,7 @@
+ //!    consuming the Cmp value — `Eq` tails are maskable, others act as
+ //!    skip terminators.
+ //!
+-//! Transformations (one per call; the driver's fixpoint loop iterates):
++//! Transformations (one per analysis round; a bounded local fixpoint):
+ //!
+ //! 1. CASE-FOLD PAIR MERGE: two `Range` members `[a,b]` and `[a+32,b+32]`
+ //!    with `(a & 32) == 0` and `a >> 5 == b >> 5` (so bit 5 is clear across
+@@ -418,6 +418,23 @@ fn parse_member(
+ }
+ 
+ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
++    // Finish independent clusters before the driver's CFG/boolean cleanup
++    // destroys their shared phi. A case-fold used to return immediately,
++    // leaving the rest of an Expat-style classifier as separate branches.
++    // Each round rebuilds predecessor/use maps after its single rewrite.
++    // The cap bounds compile time; hitting it only misses optimizations.
++    let mut total = 0;
++    for _ in 0..32 {
++        let n = fold_round(func);
++        total += n;
++        if n == 0 {
++            break;
++        }
++    }
++    total
++}
++
++fn fold_round(func: &mut IrFunction) -> usize {
+     if func.blocks.len() < 3 {
+         return 0;
+     }
+@@ -714,7 +731,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+                 changes += 1;
+                 // One transformation per call: edges were rewired, so the
+                 // predecessor counts computed at entry are stale. The
+-                // driver's fixpoint loop re-enters for the cluster step.
++                // local fixpoint re-enters for the cluster step.
+                 return changes;
+             }
+         }
+@@ -993,7 +1010,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+         func.next_value_id = next_id;
+         changes += 1;
+         // One transformation per call: the appended block invalidated the
+-        // label map. The driver's fixpoint loop re-enters for more chains.
++        // label map. The local fixpoint re-enters for more chains.
+         return changes;
+     }
+ 
+@@ -1289,6 +1306,31 @@ mod tests {
+             || c == b'.') as i64
+     }
+ 
++    #[test]
++    fn one_pipeline_visit_finishes_case_fold_and_membership_cluster() {
++        let mut f = expat_chain();
++        assert_eq!(run_function(&mut f), 2);
++        assert_eq!(run_function(&mut f), 0);
++        let masks = f
++            .blocks
++            .iter()
++            .flat_map(|b| &b.instructions)
++            .filter(|i| {
++                matches!(
++                    i,
++                    Instruction::BinOp {
++                        op: IrBinOp::BitTest,
++                        ..
++                    }
++                )
++            })
++            .count();
++        assert_eq!(masks, 1);
++        for x in 0..=255u8 {
++            assert_eq!(eval(&f, x), reference(x), "byte {x}");
++        }
++    }
++
+     #[test]
+     fn expat_chain_folds_to_fixpoint_and_stays_exact() {
+         let mut f = expat_chain();
+diff --git a/tests/corpus/test_delivery_contracts.py b/tests/corpus/test_delivery_contracts.py
+index ae379e83..119ca5cf 100755
+--- a/tests/corpus/test_delivery_contracts.py
++++ b/tests/corpus/test_delivery_contracts.py
+@@ -46,6 +46,18 @@ class DeliveryContracts(unittest.TestCase):
+         self.assertEqual(result['zip_sha256'], d.digest(self.old))
+         self.assertEqual(stat.S_IMODE(self.old.stat().st_mode), 0o644)
+ 
++    def test_readme_never_upgrades_an_ungated_or_partial_status(self):
++        for status in ('UNGATED', 'ci_local-fast-PARTIAL-NOT-DELIVERABLE',
++                       'ci_local-fast-PASS@debian-13'):
++            d.publish(self.patch, self.root, dict(META, ci_gate=status))
++            with zipfile.ZipFile(self.old) as z:
++                text = z.read('README.md').decode('utf-8')
++                self.assertIn(status, text)
++                self.assertIn('ausschließlich', text)
++                self.assertNotIn('Der Stand wurde lokal', text)
++                self.assertEqual(z.read('README.md'),
++                                 (self.root/'LCCC-DELIVERY.md').read_bytes())
++
+     def test_deterministic_archive_for_identical_metadata(self):
+         self.publish(); first=self.old.read_bytes()
+         self.publish(); self.assertEqual(self.old.read_bytes(), first)
+diff --git a/tests/regression/check_fp_recurrence.sh b/tests/regression/check_fp_recurrence.sh
+new file mode 100644
+index 00000000..9f1b9e8e
 --- /dev/null
-+++ b/tests/regression/check_const_trip_loop_inline.sh
-@@ -0,0 +1,126 @@
++++ b/tests/regression/check_fp_recurrence.sh
+@@ -0,0 +1,80 @@
 +#!/usr/bin/env bash
-+# ============================================================================
-+# check_const_trip_loop_inline.sh — pin the constant-trip loop-helper decision.
-+#
-+# `const_trip_loop_inline.c` pins run-time RESULTS. This script pins the
-+# compile-time DECISION, which a run-and-compare test cannot see:
-+#
-+#   A loop helper whose exit is bounded by a parameter (expat's sip_round
-+#   shape, 137 IR instructions) is cloned at a call site that passes a
-+#   constant 2..8 for that parameter. Its state then stays in registers
-+#   across rounds. Measured on the SipHash benchmark: 198.9M -> 159.3M
-+#   Callgrind instructions, against 140.6M for GCC 14.2 (which also inlines
-+#   every site).
-+#
-+# Assertions (x86-64 -O2 -march=x86-64-v3 -fwrapv):
-+#   1. constant trips 2, 4 (inside a loop) and 8: the helper call is gone
-+#   2. trips 0, 1, 9, and a non-constant trip: the call remains
-+#   3. at -Os the tier is disabled, so a constant-trip call remains
-+#   4. an always_inline twin is NOT restricted to constants: at a
-+#      non-constant site its call is still inlined
-+# ============================================================================
++# Exact FP/FENV semantics and causal codegen contracts for recurrence reuse,
++# doubling and late empty-branch threading. No fast-math assumptions.
 +set -euo pipefail
-+
-+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-+CCC=${CCC:-$here/../../target/fastbuild/lccc}
-+[[ -x $CCC ]] || { echo "check_const_trip_loop_inline: lccc not found at $CCC" >&2; exit 1; }
-+
++root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++CCC=${CCC:-$root/target/fastbuild/lccc}
++HOST_CC=${HOST_CC:-gcc}
 +work=$(mktemp -d)
 +trap 'rm -rf "$work"' EXIT
++src="$root/tests/regression/fp_recurrence/cases.c"
++# The host is an unoptimized execution control. GCC's optimized dynamic-FENV
++# behavior is not the oracle; the fixture checks volatile arithmetic bitwise.
++"$HOST_CC" -O0 -frounding-math -ffp-contract=off "$src" -lm -o "$work/ref"
++"$work/ref" > "$work/expected"
++for arch in x86-64 x86-64-v3; do
++    for opt in 0 1 2 3; do
++        CCC_VALIDATE_SSA=1 CCC_VERIFY_IR=abort "$CCC" -O"$opt" -march="$arch" \
++            -ffp-contract=off "$src" -lm -o "$work/run"
++        "$work/run" > "$work/actual"
++        cmp "$work/expected" "$work/actual"
++        echo "PASS exact FP bits/exceptions: $arch -O$opt"
++    done
++    for mode in on off; do
++        disabled=""
++        [[ $mode != off ]] || disabled="loop_square,fp_double"
++        CCC_DISABLE_PASSES="$disabled" CCC_VALIDATE_SSA=1 CCC_VERIFY_IR=abort \
++            "$CCC" -O2 -march="$arch" -ffp-contract=off -S "$src" -o "$work/$arch-$mode.s"
++    done
++done
++"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$src" -o "$work/contract.s"
++# x87 is deliberately outside the new FP passes' scope.
++printf '%s\n' 'double twice(double x) { return 2.0*x; }' > "$work/i686.c"
++"$CCC" -m32 -O2 -S "$work/i686.c" -o "$work/i686-on.s"
++CCC_DISABLE_PASSES=loop_square,fp_double "$CCC" -m32 -O2 -S "$work/i686.c" -o "$work/i686-off.s"
++cmp "$work/i686-on.s" "$work/i686-off.s"
++# Use a shipped, branch-heavy workload to pin the post-allocation opportunity.
++for mode in on off; do
++    skip=""
++    [[ $mode != off ]] || skip=jump_thread
++    CCC_PEEPHOLE_SKIP="$skip" "$CCC" -O2 -march=x86-64-v3 -S \
++        "$root/tests/benchmark/programs/expat_xml_scan.c" -o "$work/jump-$mode.s"
++done
++python3 - "$work" <<'PY'
++import re, sys
++from pathlib import Path
++p = Path(sys.argv[1])
++def body(file, name):
++    text = (p / file).read_text()
++    m = re.search(r'^'+re.escape(name)+r':\n(.*?)^\.size\s+'+re.escape(name)+r',', text, re.M | re.S)
++    assert m, (file, name)
++    return m.group(1)
++def muls(text):
++    return len(re.findall(r'^\s*v?mul(?:sd|ss)\s', text, re.M))
++for arch in ('x86-64', 'x86-64-v3'):
++    for name in ('twice64', 'twice32'):
++        assert muls(body(f'{arch}-off.s', name)) == 1, (arch, name, 'control')
++        assert muls(body(f'{arch}-on.s', name)) == 0, (arch, name, 'doubling')
++    before = muls(body(f'{arch}-off.s', 'square_loop'))
++    after = muls(body(f'{arch}-on.s', 'square_loop'))
++    assert before >= 2 and after == before-1, (arch, before, after)
++    assert muls(body(f'{arch}-on.s', 'changing_round')) == muls(body(f'{arch}-off.s', 'changing_round')), arch
++for name in ('twice_plus', 'scaled_fma'):
++    assert re.search(r'vfmadd\d*sd', body('contract.s', name)), name
 +
-+# One TU for the admitted shapes and one for the refused shapes, so a change
-+# to one cannot mask the other. Both helpers are the sip_round body.
-+body='
-+static void round_ct(struct st *s, const int rounds)
-+{
-+    for (int i = 0; i < rounds; i++) {
-+        s->a += s->b; s->b = (s->b << 13) | (s->b >> 51); s->b ^= s->a;
-+        s->a = (s->a << 32) | (s->a >> 32);
-+        s->c += s->d; s->d = (s->d << 16) | (s->d >> 48); s->d ^= s->c;
-+        s->a += s->d; s->d = (s->d << 21) | (s->d >> 43); s->d ^= s->a;
-+        s->c += s->b; s->b = (s->b << 17) | (s->b >> 47); s->b ^= s->c;
-+        s->c = (s->c << 32) | (s->c >> 32);
-+    }
-+}
-+'
-+admitted="$work/admitted.c"
-+refused="$work/refused.c"
-+{
-+  echo '#include <stdint.h>'
-+  echo 'struct st { uint64_t a, b, c, d; };'
-+  echo "$body"
-+  cat <<'EOF'
-+__attribute__((noinline)) void site_two(struct st *s) { round_ct(s, 2); }
-+__attribute__((noinline)) void site_four_in_loop(struct st *s)
-+{
-+    for (int k = 0; k < 3; k++)
-+        round_ct(s, 4);
-+}
-+__attribute__((noinline)) void site_eight(struct st *s) { round_ct(s, 8); }
-+EOF
-+} > "$admitted"
-+{
-+  echo '#include <stdint.h>'
-+  echo 'struct st { uint64_t a, b, c, d; };'
-+  echo "$body"
-+  cat <<'EOF'
-+__attribute__((noinline)) void site_zero(struct st *s) { round_ct(s, 0); }
-+__attribute__((noinline)) void site_one(struct st *s) { round_ct(s, 1); }
-+__attribute__((noinline)) void site_nine(struct st *s) { round_ct(s, 9); }
-+__attribute__((noinline)) void site_variable(struct st *s, int n) { round_ct(s, n); }
-+EOF
-+  # always_inline twin of the same body, called at a non-constant site.
-+  ai_body=${body//round_ct/ai_round}
-+  attr='__attribute__((always_inline)) static void'
-+  echo "${ai_body/static void/$attr}"
-+  echo '__attribute__((noinline)) void site_always_variable(struct st *s, int n) { ai_round(s, n); }'
-+} > "$refused"
-+
-+# Print one function's body: from its label up to its .size directive.
-+extract() { # extract <asm> <fn>
-+  awk -v fn="$2" '
-+    $0 == fn ":" { on = 1; next }
-+    on && $1 == ".size" && $2 == fn "," { exit }
-+    on { print }' "$1"
-+}
-+
-+# Count direct calls to <callee> in one function's body.
-+calls_to() { # calls_to <asm> <fn> <callee>
-+  extract "$1" "$2" | grep -c "^[[:space:]]*call[[:space:]]\+$3[[:space:]]*$" || true
-+}
-+
-+fail=0
-+expect_calls() { # expect_calls <asm> <fn> <callee> <count> <label>
-+  local got
-+  got=$(calls_to "$1" "$2" "$3")
-+  if [[ $got != "$4" ]]; then
-+    echo "FAIL $5: $2 has $got call(s) to $3, expected $4" >&2
-+    fail=1
-+  else
-+    echo "ok   $5: $2 has $got call(s) to $3"
-+  fi
-+}
-+
-+O2="$work/admitted.s"
-+"$CCC" -O2 -march=x86-64-v3 -fwrapv -S -o "$O2" "$admitted"
-+expect_calls "$O2" site_two round_ct 0 "constant trip 2"
-+expect_calls "$O2" site_four_in_loop round_ct 0 "constant trip 4 in a loop"
-+expect_calls "$O2" site_eight round_ct 0 "constant trip 8"
-+
-+R2="$work/refused.s"
-+"$CCC" -O2 -march=x86-64-v3 -fwrapv -S -o "$R2" "$refused"
-+expect_calls "$R2" site_zero round_ct 1 "trip 0 is refused"
-+expect_calls "$R2" site_one round_ct 1 "trip 1 is refused"
-+expect_calls "$R2" site_nine round_ct 1 "trip 9 is refused"
-+expect_calls "$R2" site_variable round_ct 1 "non-constant trip is refused"
-+expect_calls "$R2" site_always_variable ai_round 0 "always_inline at a non-constant site is cloned"
-+
-+OS="$work/admitted_os.s"
-+"$CCC" -Os -march=x86-64-v3 -fwrapv -S -o "$OS" "$admitted"
-+expect_calls "$OS" site_two round_ct 1 "-Os keeps the tier disabled (trip 2)"
-+
-+if [[ $fail -ne 0 ]]; then
-+  echo "check_const_trip_loop_inline: FAILED" >&2
-+  exit 1
-+fi
-+echo "check_const_trip_loop_inline: all assertions hold"
-diff --git a/tests/regression/const_trip_loop_inline.c b/tests/regression/const_trip_loop_inline.c
++def redundant_edges(file):
++    lines = (p / file).read_text().splitlines()
++    labels = {s.strip()[:-1]: i for i, s in enumerate(lines) if re.fullmatch(r'\s*\.LBB\d+:', s)}
++    redirects = set()
++    for label, i in labels.items():
++        for s in lines[i+1:]:
++            s = s.strip()
++            if not s or s.startswith('#') or re.fullmatch(r'\.LBB\d+:', s):
++                continue
++            if re.fullmatch(r'jmp\s+\.LBB\d+', s): redirects.add(label)
++            break
++    return sum(bool((m := re.fullmatch(r'\s*j\w+\s+(\.LBB\d+)\s*', s)) and m[1] in redirects) for s in lines)
++assert redundant_edges('jump-off.s') > 0, 'missing negative control'
++assert redundant_edges('jump-on.s') == 0, 'eligible empty trampoline survived'
++print('PASS causal FP, contraction, x87 and jump-thread codegen contracts')
++PY
+diff --git a/tests/regression/fp_recurrence/cases.c b/tests/regression/fp_recurrence/cases.c
 new file mode 100644
-index 00000000..f49a4c07
+index 00000000..5285be20
 --- /dev/null
-+++ b/tests/regression/const_trip_loop_inline.c
-@@ -0,0 +1,231 @@
-+/*
-+ * Constant-trip loop-helper inlining: run-time semantics.
-+ *
-+ * `mix_rounds` has the SipHash `sip_round` shape: a loop whose exit compares
-+ * a parameter, and four state words updated through a pointer. Its body is
-+ * about 137 IR instructions, so the general static-loop cap (128 instructions,
-+ * two call sites) never admits it. The constant-trip tier admits it at call
-+ * sites that pass a constant 2..8 for the bounding parameter.
-+ *
-+ * This file pins the RESULT of every path the tier can take or must refuse:
-+ *   - constant trips inside and outside loops (inlined),
-+ *   - constants outside 2..8 (must stay calls: 0, 1, 9),
-+ *   - a non-constant trip count (stays a call),
-+ *   - an inclusive bound (`<=`, an off-by-one hazard),
-+ *   - a bound that the body reassigns before the loop,
-+ *   - an address-taken helper (its out-of-line body must survive).
-+ *
-+ * The expected values were computed with GCC 14 at -O0 (no inlining, no
-+ * optimization), so the oracle shares no code with the compiler under test.
-+ * The assembly-shape half of the contract is in
-+ * check_const_trip_loop_inline.sh.
-+ */
++++ b/tests/regression/fp_recurrence/cases.c
+@@ -0,0 +1,164 @@
++/* Exact IEEE results and sticky exceptions, not a tolerance comparison.
++ * The volatile/call-based references cannot use either new optimization. */
++#pragma STDC FENV_ACCESS ON
++#include <fenv.h>
 +#include <stdint.h>
 +#include <stdio.h>
++#include <string.h>
++#if defined(__x86_64__)
++#include <xmmintrin.h>
++#endif
++#define NI __attribute__((noinline))
 +
-+struct st {
-+    uint64_t a, b, c, d;
-+};
++NI double twice64(double x) { return 2.0 * x; }
++NI float twice32(float x) { return x * 2.0f; }
++NI double twice_plus(double x, double y) { return x * 2.0 + y; }
++NI double scaled_fma(double x, double y, double z) { return 2.0 * x * y + z; }
++static NI double reference64(double x) { volatile double two = 2.0; return two * x; }
++static NI float reference32(float x) { volatile float two = 2.0f; return x * two; }
++static NI double square_reference(double x) { volatile double copy = x; return copy * x; }
 +
-+#define ROTL(x, r) (((x) << (r)) | ((x) >> (64 - (r))))
-+
-+static void mix_rounds(struct st *s, const int rounds)
-+{
-+    for (int i = 0; i < rounds; i++) {
-+        s->a += s->b;
-+        s->b = ROTL(s->b, 13);
-+        s->b ^= s->a;
-+        s->a = ROTL(s->a, 32);
-+        s->c += s->d;
-+        s->d = ROTL(s->d, 16);
-+        s->d ^= s->c;
-+        s->a += s->d;
-+        s->d = ROTL(s->d, 21);
-+        s->d ^= s->a;
-+        s->c += s->b;
-+        s->b = ROTL(s->b, 17);
-+        s->b ^= s->c;
-+        s->c = ROTL(s->c, 32);
++NI double square_loop(double c, int n) {
++    double x = -0.0, sum = 0.0;
++    for (int i = 0; i < n; ++i) {
++        double old = x * x;
++        x = old + c;
++        double next = x * x;
++        sum += old + next;
 +    }
++    return sum + x;
 +}
-+
-+/* Same body with an inclusive bound: runs rounds + 1 times. */
-+static void mix_rounds_le(struct st *s, const int rounds)
-+{
-+    for (int i = 0; i <= rounds; i++) {
-+        s->a += s->b;
-+        s->b = ROTL(s->b, 13);
-+        s->b ^= s->a;
-+        s->a = ROTL(s->a, 32);
-+        s->c += s->d;
-+        s->d = ROTL(s->d, 16);
-+        s->d ^= s->c;
-+        s->a += s->d;
-+        s->d = ROTL(s->d, 21);
-+        s->d ^= s->a;
-+        s->c += s->b;
-+        s->b = ROTL(s->b, 17);
-+        s->b ^= s->c;
-+        s->c = ROTL(s->c, 32);
++static NI double reference_loop(double c, int n) {
++    double x = -0.0, sum = 0.0;
++    for (int i = 0; i < n; ++i) {
++        double old = square_reference(x);
++        x = old + c;
++        double next = square_reference(x);
++        sum += old + next;
 +    }
++    return sum + x;
 +}
-+
-+/* The bound is reassigned before the loop, so the exit compares a derived
-+ * value, not the incoming parameter. */
-+static void scale_rounds(struct st *s, int rounds)
-+{
-+    rounds = rounds * 2;
-+    for (int i = 0; i < rounds; i++) {
-+        s->a += s->b;
-+        s->b = ROTL(s->b, 13);
-+        s->b ^= s->a;
-+        s->a = ROTL(s->a, 32);
-+        s->c += s->d;
-+        s->d = ROTL(s->d, 16);
-+        s->d ^= s->c;
-+        s->a += s->d;
-+        s->d = ROTL(s->d, 21);
-+        s->d ^= s->a;
-+        s->c += s->b;
-+        s->b = ROTL(s->b, 17);
-+        s->b ^= s->c;
-+        s->c = ROTL(s->c, 32);
++/* Dynamic environment changes forbid carrying a previously rounded square. */
++NI double changing_round(double c, int n) {
++    double x = 0.0, sum = 0.0;
++    for (int i = 0; i < n; ++i) {
++        fesetround(i & 1 ? FE_UPWARD : FE_DOWNWARD);
++        double old = x * x;
++        x = old + c;
++        double next = x * x;
++        sum += old + next;
 +    }
++    return sum + x;
 +}
-+
-+/* The callers are noinline so each stays a small function of its own. If
-+ * they were inlined into main, main would exceed the 500-instruction caller
-+ * hard cap and the constant-trip clones would never be exercised here. */
-+
-+/* Address-taken: the out-of-line body must still exist and be correct. */
-+static void (*volatile mix_rounds_ptr)(struct st *, const int) = mix_rounds;
-+
-+__attribute__((noinline)) static uint64_t const_sites(struct st *s)
-+{
-+    mix_rounds(s, 2);
-+    for (int k = 0; k < 3; k++)
-+        mix_rounds(s, 4); /* constant site inside a caller loop */
-+    mix_rounds(s, 8);
-+    return s->a ^ s->d;
-+}
-+
-+__attribute__((noinline)) static uint64_t out_of_range_sites(struct st *s)
-+{
-+    mix_rounds(s, 0);
-+    mix_rounds(s, 1);
-+    mix_rounds(s, 9);
-+    return s->a ^ s->d;
-+}
-+
-+/* Alone in its caller, so the caller budget (350 instructions) admits the
-+ * clone and the largest admitted constant, 8, is actually exercised. */
-+__attribute__((noinline)) static uint64_t eight_site(struct st *s)
-+{
-+    mix_rounds(s, 8);
-+    return s->a ^ s->d;
-+}
-+
-+__attribute__((noinline)) static uint64_t variable_site(struct st *s, int n)
-+{
-+    mix_rounds(s, n);
-+    return s->a ^ s->d;
-+}
-+
-+__attribute__((noinline)) static uint64_t le_site(struct st *s)
-+{
-+    mix_rounds_le(s, 2);
-+    return s->a ^ s->d;
-+}
-+
-+__attribute__((noinline)) static uint64_t scaled_site(struct st *s)
-+{
-+    scale_rounds(s, 2);
-+    return s->a ^ s->d;
-+}
-+
-+__attribute__((noinline)) static uint64_t pointer_site(struct st *s)
-+{
-+    mix_rounds_ptr(s, 3);
-+    return s->a ^ s->d;
-+}
-+
-+static void seed(struct st *s, uint64_t k)
-+{
-+    s->a = 0x736f6d6570736575ULL ^ k;
-+    s->b = 0x646f72616e646f6dULL ^ (k * 3);
-+    s->c = 0x6c7967656e657261ULL ^ (k * 5);
-+    s->d = 0x7465646279746573ULL ^ (k * 7);
-+}
-+
-+static int failures;
-+
-+static void check(const char *name, uint64_t got, uint64_t want)
-+{
-+    if (got != want) {
-+        printf("FAIL %s: got %016llx want %016llx\n", name,
-+               (unsigned long long)got, (unsigned long long)want);
-+        failures++;
++static NI double reference_changing(double c, int n) {
++    double x = 0.0, sum = 0.0;
++    for (int i = 0; i < n; ++i) {
++        fesetround(i & 1 ? FE_UPWARD : FE_DOWNWARD);
++        double old = square_reference(x);
++        x = old + c;
++        double next = square_reference(x);
++        sum += old + next;
 +    }
++    return sum + x;
 +}
-+
-+/* always_inline is honoured at a NON-constant site. The constant-trip tier
-+ * never admits always_inline bodies, so the clone must come from the normal
-+ * always_inline path, not from a constant argument. */
-+__attribute__((always_inline)) static void ai_mix(struct st *s, const int rounds)
-+{
-+    for (int i = 0; i < rounds; i++) {
-+        s->a += s->b;
-+        s->b = ROTL(s->b, 13);
-+        s->b ^= s->a;
-+        s->a = ROTL(s->a, 32);
-+        s->c += s->d;
-+        s->d = ROTL(s->d, 16);
-+        s->d ^= s->c;
-+        s->a += s->d;
-+        s->d = ROTL(s->d, 21);
-+        s->d ^= s->a;
-+        s->c += s->b;
-+        s->b = ROTL(s->b, 17);
-+        s->b ^= s->c;
-+        s->c = ROTL(s->c, 32);
-+    }
-+}
-+
-+__attribute__((noinline)) static uint64_t always_variable_site(struct st *s, int n)
-+{
-+    ai_mix(s, n);
-+    return s->a ^ s->d;
-+}
-+
-+int main(void)
-+{
-+    struct st s;
-+
-+    seed(&s, 1);
-+    check("const_sites", const_sites(&s), UINT64_C(0xbc9d2f5364edb528));
-+    seed(&s, 2);
-+    check("out_of_range_sites", out_of_range_sites(&s), UINT64_C(0x49503734e6b59436));
-+    seed(&s, 3);
-+    check("variable_site(0)", variable_site(&s, 0), UINT64_C(0x070a090709070010));
-+    seed(&s, 4);
-+    check("variable_site(3)", variable_site(&s, 3), UINT64_C(0xc2063bfb56760121));
-+    seed(&s, 5);
-+    check("variable_site(-1)", variable_site(&s, -1), UINT64_C(0x070a090709070020));
-+    seed(&s, 6);
-+    check("le_site", le_site(&s), UINT64_C(0x7383ce76694830d2));
-+    seed(&s, 7);
-+    check("scaled_site", scaled_site(&s), UINT64_C(0x202f1cdb2b90c7c4));
-+    seed(&s, 8);
-+    check("pointer_site", pointer_site(&s), UINT64_C(0x030cfc30b617f289));
-+    seed(&s, 9);
-+    check("eight_site", eight_site(&s), UINT64_C(0xbf0888c527e9dd23));
-+    seed(&s, 10);
-+    check("always_variable_site", always_variable_site(&s, 5), UINT64_C(0xea63d0e16a578eee));
-+
-+    if (failures) {
-+        printf("%d failure(s)\n", failures);
++static uint64_t bits64(double x) { uint64_t u; memcpy(&u, &x, sizeof u); return u; }
++static uint32_t bits32(float x) { uint32_t u; memcpy(&u, &x, sizeof u); return u; }
++static int check_double(uint64_t u) {
++    double x; memcpy(&x, &u, sizeof x);
++    feclearexcept(FE_ALL_EXCEPT);
++    double expected = reference64(x);
++    int ef = fetestexcept(FE_ALL_EXCEPT);
++    feclearexcept(FE_ALL_EXCEPT);
++    double actual = twice64(x);
++    int af = fetestexcept(FE_ALL_EXCEPT);
++    if (bits64(expected) != bits64(actual) || ef != af) {
++        printf("double %llx: %llx/%x != %llx/%x\n", (unsigned long long)u,
++            (unsigned long long)bits64(expected), ef, (unsigned long long)bits64(actual), af);
 +        return 1;
 +    }
-+    puts("ok");
++    return 0;
++}
++static int check_float(uint32_t u) {
++    float x; memcpy(&x, &u, sizeof x);
++    feclearexcept(FE_ALL_EXCEPT);
++    float expected = reference32(x);
++    int ef = fetestexcept(FE_ALL_EXCEPT);
++    feclearexcept(FE_ALL_EXCEPT);
++    float actual = twice32(x);
++    int af = fetestexcept(FE_ALL_EXCEPT);
++    if (bits32(expected) != bits32(actual) || ef != af) {
++        printf("float %x: %x/%x != %x/%x\n", u, bits32(expected), ef, bits32(actual), af);
++        return 1;
++    }
++    return 0;
++}
++static int check_loop(double c, int n, int changing) {
++    feclearexcept(FE_ALL_EXCEPT);
++    double expected = changing ? reference_changing(c, n) : reference_loop(c, n);
++    int ef = fetestexcept(FE_ALL_EXCEPT);
++    feclearexcept(FE_ALL_EXCEPT);
++    double actual = changing ? changing_round(c, n) : square_loop(c, n);
++    int af = fetestexcept(FE_ALL_EXCEPT);
++    if (bits64(expected) != bits64(actual) || ef != af) {
++        printf("loop %d/%d: %llx/%x != %llx/%x\n", n, changing,
++            (unsigned long long)bits64(expected), ef, (unsigned long long)bits64(actual), af);
++        return 1;
++    }
++    return 0;
++}
++int main(void) {
++    static const uint64_t special[] = {
++        0, 0x8000000000000000ULL, 1, 0x8000000000000001ULL,
++        0x000fffffffffffffULL, 0x800fffffffffffffULL,
++        0x0010000000000000ULL, 0x8010000000000000ULL,
++        0x3ff0000000000000ULL, 0xbff0000000000000ULL,
++        0x7fefffffffffffffULL, 0xffefffffffffffffULL,
++        0x7ff0000000000000ULL, 0xfff0000000000000ULL,
++        0x7ff8000000000055ULL, 0xfff8000000000055ULL,
++        0x7ff0000000000055ULL, 0xfff0000000000055ULL
++    };
++    static const uint32_t fspecial[] = {
++        0, 0x80000000U, 1, 0x80000001U, 0x007fffffU, 0x807fffffU,
++        0x00800000U, 0x80800000U, 0x3f800000U, 0xbf800000U,
++        0x7f7fffffU, 0xff7fffffU, 0x7f800000U, 0xff800000U,
++        0x7fc00055U, 0xffc00055U, 0x7f800055U, 0xff800055U
++    };
++    static const int modes[] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
++    static const int trips[] = {0, 1, 2, 3, 7, 16, 32, 64};
++    static const double seeds[] = {0.0, -0.0, 0.1, -0.1, 0.001, 1e-200, -1e-200, 1.0, -1.0, 1e200};
++    fenv_t saved;
++    if (fegetenv(&saved)) return 2;
++#if defined(__x86_64__)
++    unsigned csr = _mm_getcsr();
++#endif
++    for (unsigned m = 0; m < 4; ++m) {
++        if (fesetround(modes[m])) return 2;
++        for (unsigned flush = 0; flush < 4; ++flush) {
++#if defined(__x86_64__)
++            unsigned control = _mm_getcsr() & ~0x8040U;
++            _mm_setcsr(control | ((flush & 1) ? 0x40U : 0) | ((flush & 2) ? 0x8000U : 0));
++#endif
++            for (unsigned j = 0; j < sizeof special / sizeof special[0]; ++j)
++                if (check_double(special[j])) return 1;
++            for (unsigned j = 0; j < sizeof fspecial / sizeof fspecial[0]; ++j)
++                if (check_float(fspecial[j])) return 1;
++            uint64_t state = 0x123456789abcdefULL;
++            for (unsigned j = 0; j < 1024; ++j) {
++                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
++                if (check_double(state) || check_float((uint32_t)state)) return 1;
++            }
++            for (unsigned j = 0; j < sizeof seeds / sizeof seeds[0]; ++j)
++                for (unsigned k = 0; k < sizeof trips / sizeof trips[0]; ++k)
++                    if (check_loop(seeds[j], trips[k], 0)) return 1;
++        }
++    }
++    for (unsigned j = 0; j < sizeof seeds / sizeof seeds[0]; ++j)
++        for (unsigned k = 0; k < sizeof trips / sizeof trips[0]; ++k)
++            if (check_loop(seeds[j], trips[k], 1)) return 1;
++    if (fesetenv(&saved)) return 2;
++#if defined(__x86_64__)
++    _mm_setcsr(csr);
++#endif
++    puts("fp recurrence: PASS");
 +    return 0;
 +}
