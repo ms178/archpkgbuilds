@@ -1,252 +1,379 @@
-diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
---- a/src/passes/bit_idioms.rs
-+++ b/src/passes/bit_idioms.rs
-@@ -2748,7 +2748,7 @@
-                 }
-                 Instruction::BinOp {
-                     dest,
--                    op: IrBinOp::Or,
-+                    op: IrBinOp::Or | IrBinOp::Xor,
-                     ty,
-                     ..
-                 } if matches!(*ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64) => {
-@@ -2789,6 +2789,27 @@
-                             continue;
-                         }
-                     }
-+                    if let Some(src) = bytes::bswap(Operand::Value(dest), ty, &defs) {
-+                        let replacement = Instruction::UnaryOp {
-+                            dest,
-+                            op: IrUnaryOp::Bswap,
-+                            src,
-+                            ty,
-+                        };
-+                        // Later producer-repurposing rules consume these maps.
-+                        // Keep direct read counts exact after replacing the consumer.
-+                        block.instructions[index].for_each_used_value(|v| {
-+                            use_counts[v as usize] -= 1;
-+                        });
-+                        replacement.for_each_used_value(|v| {
-+                            use_counts[v as usize] += 1;
-+                        });
-+                        defs[dest.0 as usize] = Some(replacement.clone());
-+                        block.instructions[index] = replacement;
-+                        changes += 1;
-+                        index += 1;
-+                        continue;
-+                    }
-                     if max_rotate_bits > 0
-                         && let Some((value, amount, is_left)) =
-                             match_rotate(Operand::Value(dest), max_rotate_bits, &defs)
-@@ -5341,3 +5362,6 @@
+diff --git a/engineering/journal/2026-10-21-dual-layout-metric-parallel.md b/engineering/journal/2026-10-21-dual-layout-metric-parallel.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..88d24e041ea36539e0b0e31bec4cedb3f203c47b
+--- /dev/null
++++ b/engineering/journal/2026-10-21-dual-layout-metric-parallel.md
+@@ -0,0 +1,80 @@
++# Dual-layout metric peepholes: parallel evaluation
++
++Base: `91bbcda81fbcb9750298f9869fb5b990d9d819f5` (2026-10-21).
++
++## Problem
++
++At `-O1`, static-chain dual-layout exploration emits the chain and original
++orders and runs the full x86 text peephole on each before choosing the smaller
++result. The candidates are independent, but they were evaluated serially. This
++is part of MS-20's measured compile-time hotspot; changing to a raw instruction
++count is not valid because `zstd_count` reverses its preferred order only after
++the peephole.
++
++## Change and boundaries
++
++`ArchCodegen::peephole_pair_for_metric` preserves a serial default. x86-64
++overrides it with a helper that evaluates one candidate on a scoped worker and
++the other on the caller. It falls back to serial evaluation below 8 KiB of
++combined input or when the process has only one available hardware thread.
++There is never more than one worker, and candidate order and panic propagation
++are explicit. Whole-file peephole ordering, candidate scoring, generated
++assembly, and all non-x86 backends are unchanged.
++
++A mutation-sensitive unit test uses distinct, above-threshold candidates and
++requires each paired result to be byte-identical to its corresponding serial
++result; swapping, dropping, or incompletely processing either result fails.
++
++## Evidence
++
++Immutable compilers:
++
++- serial base SHA-256: `2de6c10362532a250fb8ae3dcf7b1072ce3d318341e8c5fa6cecbf1a3d18cf4c`
++- candidate SHA-256: recorded in `/home/user/dualmetric/runtime-final.json`
++- source: `tests/benchmark/programs/expat_siphash24.c`
++- command: `lccc -O1 -S SOURCE -o OUTPUT`
++
++Thirty randomized, interleaved measured pairs after five warm-up pairs produced
++a median candidate/base wall-time ratio of **0.8703** (12.97% lower); the
++20,000-resample bootstrap 95% interval is **[0.8554, 0.8879]**. Median times
++were 233.21 ms and 269.96 ms. Every exit status was zero and every pair's
++assembly SHA-256 matched. Raw rounds and immutable hashes are in
++`/home/user/dualmetric/runtime-final.json`.
++
++Callgrind is a work/correctness control, not the runtime claim: serial
++`2,508,510,808 Ir`, candidate `2,510,751,375 Ir` (+0.089%, thread-management
++overhead). The resulting assembly is byte-identical (SHA-256
++`ed46e8e31686eaafdce889d9149c2a30708085680d4ab637901b56ff6642efb6`).
++Profiles are `/home/user/dualmetric/{serial,parallel-final}.callgrind`.
++
++As a wider output-identity control, 66 independently compilable benchmark
++translation units were compiled at `-O1 -S`; candidate output had **0 byte
++differences** from the serial base. The candidate hashes and empty diff are in
++`/home/user/dualmetric/final-corpus.sha256` and
++`/home/user/dualmetric/final-corpus.diff`.
++
++This is a bounded compile-latency improvement, not a generated-code runtime or
++Callgrind-work reduction claim.
++
++## Integration note
++
++The fresh `91bbcda8` base already exceeded four committed audit-census values
++(`panic_sites` 834→835, functions over 300 lines 229→230, knob literals
++511→512, undocumented knobs 279→280). A clean detached base reproduces those
++exact deltas. This change adds none of those classes (the worker propagates a
++panic payload without adding `expect`/`unwrap`); the baseline is reconciled to
++the pre-existing current-tree counts so the ratchet can enforce no further
++growth.
++
++The same base had also grown the benchmark registry from 46 to 48 entries
++without updating three corpus contract fixtures. Their cardinality controls are
++updated to 48 (47 after one deliberately ineligible row). A stale integer-batch
++shape check required a strict instruction-count reduction even though a later
++peephole had shortened the disabled control to a tie; it now checks the actual
++policy invariant (the enabled arm removes `not`, never grows, and all runtime/
++side-effect controls still pass).
++
++Final local integration: `scripts/ci_local.sh --fast` reported **366 passed,
++0 failed, 6 intended fast-mode skips**. The focused closures were PR824
++boundaries 369/369, strict-packed nine 9,108-comparison runs, corpus contracts
++808 tests, linker suite 304/304, rustfmt, strict Clippy, and audit census green.
+diff --git a/scripts/audit_census_baseline.json b/scripts/audit_census_baseline.json
+index 602bab922e9512b6a5c4fe3161d9b0d239cdaf54..3a9fa9a4a984e0f47c9bca54e4eae11173c1cb9f 100644
+--- a/scripts/audit_census_baseline.json
++++ b/scripts/audit_census_baseline.json
+@@ -1,11 +1,11 @@
+ {
+   "fns_over_1000": 27,
+-  "fns_over_300": 229,
++  "fns_over_300": 230,
+   "fns_over_500": 94,
+   "ignored_tests": 10,
+-  "knob_literals": 511,
+-  "knobs_undocumented": 279,
+-  "panic_sites": 834,
++  "knob_literals": 512,
++  "knobs_undocumented": 280,
++  "panic_sites": 835,
+   "panic_sites_hot": 105,
+   "unsafe_sites": 25
+ }
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index 761ca4e2bd2623ee27201dcc549ad267f1b78f12..6d0e825865b84b843a80daa978a1f41912343aaf 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -4332,8 +4332,7 @@ fn emit_functions_and_sections(
+                 crate::backend::state::EXPLORATORY_EMISSION
+                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                 generate_function(cg, attr_align, func, source_mgr, file_table);
+-                let chain_peep = cg.peephole_for_metric(cg.state_ref().out.buf[mark..].to_string());
+-                let chain_count = crate::passes::block_layout::count_instruction_lines(&chain_peep);
++                let chain_raw = cg.state_ref().out.buf[mark..].to_string();
+                 cg.state().out.buf.truncate(mark);
+                 // Rebuild the pre-chain order: perm[j] is the ORIGINAL
+                 // position of the block now at position j, so
+@@ -4352,11 +4351,13 @@ fn emit_functions_and_sections(
+                         .map(|b| b.expect("permutation covers every block"))
+                         .collect();
+                     generate_function(cg, attr_align, &alt, source_mgr, file_table);
+-                    let orig_peep =
+-                        cg.peephole_for_metric(cg.state_ref().out.buf[mark..].to_string());
++                    let orig_raw = cg.state_ref().out.buf[mark..].to_string();
++                    cg.state().out.buf.truncate(mark);
++                    let (chain_peep, orig_peep) = cg.peephole_pair_for_metric(chain_raw, orig_raw);
++                    let chain_count =
++                        crate::passes::block_layout::count_instruction_lines(&chain_peep);
+                     let orig_count =
+                         crate::passes::block_layout::count_instruction_lines(&orig_peep);
+-                    cg.state().out.buf.truncate(mark);
+                     crate::backend::state::EXPLORATORY_EMISSION
+                         .store(false, std::sync::atomic::Ordering::Relaxed);
+                     // Emit the measured winner for real: debug traces fire
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index fa77176c98a75e5d4f243ad10162914b3db61f04..04d945e436b8bdcb8fd64a664d3d519dd15d9454 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -2415,6 +2415,16 @@ pub trait ArchCodegen {
+         text
+     }
  
- #[path = "bit_idioms_batch6.rs"]
- mod batch6;
++    /// Optimize both dual-layout candidates. Backends may override this to
++    /// evaluate the independent candidates concurrently; the default keeps
++    /// the historical serial behavior.
++    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
++        (
++            self.peephole_for_metric(first),
++            self.peephole_for_metric(second),
++        )
++    }
 +
-+#[path = "bit_idioms_bytes.rs"]
-+mod bytes;
-diff --git a/src/passes/bit_idioms_bytes.rs b/src/passes/bit_idioms_bytes.rs
-new file mode 100644
---- /dev/null
-+++ b/src/passes/bit_idioms_bytes.rs
-@@ -0,0 +1,128 @@
-+//! Exact byte provenance for portable 32/64-bit byte-swap networks.
-+//!
-+//! Each lane is either zero or one unchanged byte of a single SSA source.
-+//! Logical byte shifts, whole-byte masks and compatible OR/XOR merges preserve
-+//! that invariant. A final reversed permutation is therefore exactly Bswap.
-+//! No arithmetic shifts, narrowing casts, memory operations or producers are
-+//! changed. Fixed arrays and per-candidate walk/depth budgets bound compile cost.
-+use super::*;
+     /// Emit a conditional select: dest = cond != 0 ? true_val : false_val.
+     ///
+     /// Default implementation uses a branch-based sequence. Backends can override
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index f8907a9ca2d99a9b7eadc787d12efb04ef704106..a23a2943b11803f97066ae2349479b9b833388e3 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -8728,6 +8728,15 @@ impl ArchCodegen for X86Codegen {
+         )
+     }
+ 
++    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
++        crate::backend::x86::codegen::peephole::peephole_optimize_pair_with_config(
++            first,
++            second,
++            self.state_ref().ra_config.as_ref(),
++            self.optimize_for_size,
++        )
++    }
 +
-+struct Bytes<'a> {
-+    defs: &'a [Option<Instruction>],
-+    source: Option<Operand>,
-+    width: usize,
-+    visits: u16,
-+}
+     fn emit_branch_nonzero(&mut self, label: &str) {
+         self.state.emit("    testq %rax, %rax");
+         self.state.out.emit_jcc_label("    jne", label);
+diff --git a/src/backend/x86/codegen/peephole/mod.rs b/src/backend/x86/codegen/peephole/mod.rs
+index d2e7d70d9a80bebe5abf72846aa3cd37614a4269..869231cfdcd484a98493b32b86dd8c0b2a83b5dd 100644
+--- a/src/backend/x86/codegen/peephole/mod.rs
++++ b/src/backend/x86/codegen/peephole/mod.rs
+@@ -23,7 +23,9 @@
+ mod passes;
+ mod types;
+ 
+-pub(crate) use passes::{peephole_optimize, peephole_optimize_with_config};
++pub(crate) use passes::{
++    peephole_optimize, peephole_optimize_pair_with_config, peephole_optimize_with_config,
++};
+ 
+ /// Lower the opaque TLS-descriptor pseudo after optimization. During the
+ /// peephole it must be an unknown `%rax`-transforming instruction, not a normal
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index aed521c97c385676023bfbca5db6964b78cca236..46191de378b274d282dfcf022ccccdd1f2e398a4 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -495,6 +495,38 @@ pub(crate) fn peephole_optimize_with_config(
+     out
+ }
+ 
++/// Optimize two independent dual-layout candidates concurrently when there is
++/// enough work and more than one host thread is available.  The metric inputs
++/// are temporary function fragments, so this does not affect whole-file
++/// peephole ordering or emitted assembly.
++pub(crate) fn peephole_optimize_pair_with_config(
++    first: String,
++    second: String,
++    ra_config: &RaConfig,
++    optimize_for_size: bool,
++) -> (String, String) {
++    const MIN_PARALLEL_BYTES: usize = 8 * 1024;
++    let enough_work = first.len().saturating_add(second.len()) >= MIN_PARALLEL_BYTES;
++    let has_parallelism = std::thread::available_parallelism().is_ok_and(|n| n.get() > 1);
++    if !enough_work || !has_parallelism {
++        return (
++            peephole_optimize_with_config(first, ra_config, optimize_for_size),
++            peephole_optimize_with_config(second, ra_config, optimize_for_size),
++        );
++    }
 +
-+impl Bytes<'_> {
-+    fn walk(&mut self, value: Operand, depth: u8) -> Option<[u8; 8]> {
-+        self.visits = self.visits.checked_sub(1)?;
-+        if depth == 0 {
-+            return None;
-+        }
-+        if let Some(c) = const_in_ring(value, self.width * 8) {
-+            return (c == 0).then_some([0; 8]);
-+        }
-+        let Operand::Value(v) = value else {
-+            return None;
++    std::thread::scope(|scope| {
++        let first_handle =
++            scope.spawn(|| peephole_optimize_with_config(first, ra_config, optimize_for_size));
++        let second_result = peephole_optimize_with_config(second, ra_config, optimize_for_size);
++        let first_result = match first_handle.join() {
++            Ok(result) => result,
++            Err(payload) => std::panic::resume_unwind(payload),
 +        };
-+        let definition = self.defs.get(v.0 as usize)?.as_ref();
-+        if let Some(Instruction::Copy { src, .. }) = definition {
-+            return self.walk(*src, depth - 1);
-+        }
-+        if let Some(Instruction::BinOp {
-+            op, lhs, rhs, ty, ..
-+        }) = definition
-+        {
-+            // Do not interpret a different ring as this word's byte network.
-+            if !ty.is_integer() || ty.size() != self.width {
-+                return None;
-+            }
-+            let (op, lhs, rhs) = (*op, *lhs, *rhs);
-+            match op {
-+                IrBinOp::Shl | IrBinOp::LShr => {
-+                    let Operand::Const(count) = rhs else {
-+                        return None;
-+                    };
-+                    let shift = count.to_i128()?;
-+                    if !(0..(self.width * 8) as i128).contains(&shift) || shift % 8 != 0 {
-+                        return None;
-+                    }
-+                    let input = self.walk(lhs, depth - 1)?;
-+                    let amount = shift as usize / 8;
-+                    let mut output = [0; 8];
-+                    if op == IrBinOp::Shl {
-+                        output[amount..self.width].copy_from_slice(&input[..self.width - amount]);
-+                    } else {
-+                        output[..self.width - amount].copy_from_slice(&input[amount..self.width]);
-+                    }
-+                    return Some(output);
-+                }
-+                IrBinOp::And => {
-+                    let (input, mask) = if let Some(c) = const_in_ring(rhs, self.width * 8) {
-+                        (lhs, c)
-+                    } else {
-+                        (rhs, const_in_ring(lhs, self.width * 8)?)
-+                    };
-+                    let mut bytes = self.walk(input, depth - 1)?;
-+                    for (i, byte) in bytes[..self.width].iter_mut().enumerate() {
-+                        match (mask >> (i * 8)) & 255 {
-+                            0 => *byte = 0,
-+                            255 => {}
-+                            _ => return None,
-+                        }
-+                    }
-+                    return Some(bytes);
-+                }
-+                IrBinOp::Or | IrBinOp::Xor => {
-+                    let mut a = self.walk(lhs, depth - 1)?;
-+                    let b = self.walk(rhs, depth - 1)?;
-+                    for i in 0..self.width {
-+                        match (a[i], b[i]) {
-+                            (0, byte) => a[i] = byte,
-+                            (_, 0) => {}
-+                            (x, y) if op == IrBinOp::Or && x == y => {}
-+                            _ => return None,
-+                        }
-+                    }
-+                    return Some(a);
-+                }
-+                _ => {}
-+            }
-+        }
-+        // A cast or other computation can be the opaque input, but is never
-+        // peeled: independently extended/truncated values are distinct sources.
-+        match self.source {
-+            None => self.source = Some(value),
-+            Some(source) if source == value => {}
-+            _ => return None,
-+        }
-+        let mut identity = [0; 8];
-+        for (i, byte) in identity[..self.width].iter_mut().enumerate() {
-+            *byte = i as u8 + 1;
-+        }
-+        Some(identity)
-+    }
++        (first_result, second_result)
++    })
 +}
 +
-+pub(super) fn bswap(value: Operand, ty: IrType, defs: &[Option<Instruction>]) -> Option<Operand> {
-+    if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
-+        return None;
+ /// Delete GP pure writes whose value is provably dead, to a local fixpoint:
+ /// retiring one relay can expose the next in an `mov A,B; mov B,C; ...` chain
+ /// (each proof sees the reads the previous deletion removed).  Shared by the
+@@ -2005,6 +2037,29 @@ fn in_function(body: &[&str]) -> String {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn dual_layout_pair_is_byte_identical_to_serial_metrics() {
++        fn candidate(name: &str, immediate: i32) -> String {
++            let mut text = format!(".text\n{name}:\n.cfi_startproc\n    movl ${immediate}, %eax\n");
++            // Cross the production parallel threshold. Keeping the candidates
++            // observably distinct also catches swapped pair results.
++            for _ in 0..1200 {
++                text.push_str("    nop\n");
++            }
++            text.push_str("    ret\n.cfi_endproc\n");
++            text
++        }
++
++        let config = RaConfig::default();
++        let first = candidate("first", 17);
++        let second = candidate("second", 29);
++        let expected_first = peephole_optimize_with_config(first.clone(), &config, false);
++        let expected_second = peephole_optimize_with_config(second.clone(), &config, false);
++        let actual = peephole_optimize_pair_with_config(first, second, &config, false);
++        assert_eq!(actual.0, expected_first);
++        assert_eq!(actual.1, expected_second);
 +    }
-+    let mut bytes = Bytes {
-+        defs,
-+        source: None,
-+        width: ty.size(),
-+        visits: 128,
-+    };
-+    let permutation = bytes.walk(value, 24)?;
-+    if permutation[..bytes.width]
-+        .iter()
-+        .enumerate()
-+        .all(|(i, &byte)| byte as usize == bytes.width - i)
-+    {
-+        bytes.source
-+    } else {
-+        None
-+    }
-+}
-diff --git a/tests/regression/portable_bswap_networks.c b/tests/regression/portable_bswap_networks.c
-new file mode 100644
---- /dev/null
-+++ b/tests/regression/portable_bswap_networks.c
-@@ -0,0 +1,67 @@
-+typedef unsigned long long U64;
-+__attribute__((noinline)) U64 bytes64(U64 x) {
-+    return ((x & 0x00000000000000ffULL) << 56) |
-+           ((x & 0x000000000000ff00ULL) << 40) |
-+           ((x & 0x0000000000ff0000ULL) << 24) |
-+           ((x & 0x00000000ff000000ULL) << 8) |
-+           ((x & 0x000000ff00000000ULL) >> 8) |
-+           ((x & 0x0000ff0000000000ULL) >> 24) |
-+           ((x & 0x00ff000000000000ULL) >> 40) |
-+           ((x & 0xff00000000000000ULL) >> 56);
-+}
-+__attribute__((noinline)) U64 xor64(U64 x) {
-+    return ((x & 0x00000000000000ffULL) << 56) ^
-+           ((x & 0x000000000000ff00ULL) << 40) ^
-+           ((x & 0x0000000000ff0000ULL) << 24) ^
-+           ((x & 0x00000000ff000000ULL) << 8) ^
-+           ((x & 0x000000ff00000000ULL) >> 8) ^
-+           ((x & 0x0000ff0000000000ULL) >> 24) ^
-+           ((x & 0x00ff000000000000ULL) >> 40) ^
-+           ((x & 0xff00000000000000ULL) >> 56);
-+}
-+__attribute__((noinline)) U64 stages64(U64 x) {
-+ x = ((x >> 8) & 0x00ff00ff00ff00ffULL) | ((x & 0x00ff00ff00ff00ffULL) << 8);
-+ x = ((x >> 16) & 0x0000ffff0000ffffULL) | ((x & 0x0000ffff0000ffffULL) << 16);
-+ return (x >> 32) | (x << 32);
-+}
-+__attribute__((noinline)) unsigned bytes32(unsigned x) {
-+ return ((x & 255U) << 24) | ((x & 65280U) << 8) |
-+        ((x & 16711680U) >> 8) | ((x & 4278190080U) >> 24);
-+}
-+__attribute__((noinline)) unsigned stages32(unsigned x) {
-+ x = ((x >> 8) & 0x00ff00ffU) | ((x & 0x00ff00ffU) << 8);
-+ return (x >> 16) | (x << 16);
-+}
-+/* Not a permutation: one input byte is deliberately absent. */
-+__attribute__((noinline)) U64 missing_byte(U64 x) {
-+ return ((x & 0xffULL) << 56) | ((x & 0xff00ULL) << 40) |
-+        ((x & 0xff0000ULL) << 24) | ((x & 0xff000000ULL) << 8) |
-+        ((x & 0xff00000000ULL) >> 8) | ((x & 0xff0000000000ULL) >> 24) |
-+        ((x & 0xff00000000000000ULL) >> 56);
-+}
-+#ifndef BYTE_SWAP_KERNELS_ONLY
-+extern int puts(const char *);
-+static U64 reference(U64 x, unsigned bytes) {
-+ U64 result=0;
-+ for (unsigned i=0;i<bytes;++i) { result=(result<<8)|(x&255); x>>=8; }
-+ return result;
-+}
-+static int check(U64 x) {
-+ U64 want=reference(x,8);
-+ unsigned narrow=(unsigned)reference((unsigned)x,4);
-+ return bytes64(x)!=want || xor64(x)!=want || stages64(x)!=want || bytes32((unsigned)x)!=narrow ||
-+        stages32((unsigned)x)!=narrow || missing_byte(x)!=(want & ~(255ULL<<8));
-+}
-+int main(void) {
-+ for(unsigned lane=0;lane<8;++lane)
-+  for(unsigned byte=0;byte<256;++byte)
-+   if(check((U64)byte<<(8*lane))) return 1;
-+ U64 x=0x123456789abcdef0ULL;
-+ for(unsigned i=0;i<65536;++i) {
-+  x^=x<<13; x^=x>>7; x^=x<<17;
-+  if(check(x)) return 2;
-+ }
-+ puts("portable byte-swap networks: PASS (67584 inputs, six functions)");
-+ return 0;
-+}
-+#endif
++
+     #[test]
+     fn test_never_read_store_eliminated_in_six_push_nofp_function() {
+         // No-FP functions push rbp as an ordinary callee-saved register, so
+diff --git a/tests/corpus/test_compiler_comparison_reports.py b/tests/corpus/test_compiler_comparison_reports.py
+index e0e4171c84fd4c3b2b779bbe676d82ea45e96c00..9dc559b0a58aebb96032e43e7e4f40b8b9af934a 100644
+--- a/tests/corpus/test_compiler_comparison_reports.py
++++ b/tests/corpus/test_compiler_comparison_reports.py
+@@ -48,7 +48,7 @@ def report():
+ class ComparisonReport(unittest.TestCase):
+     def test_full_correct_registry_is_required_and_never_deduplicated(self):
+         data = report()
+-        self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 46)
++        self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 48)
+         for mutate in [lambda rows: rows.pop(), lambda rows: rows.append(copy.deepcopy(rows[0])),
+                        lambda rows: rows[0].update(name='unknown')]:
+             bad = copy.deepcopy(data)
+@@ -60,8 +60,8 @@ class ComparisonReport(unittest.TestCase):
+         data = report()
+         data['benchmarks'][0]['runtime']['lccc']['wall']['median'] = .001
+         result = summary.summarize(data)
+-        self.assertEqual(result['comparisons']['prior']['correct'], 46)
+-        self.assertEqual(result['comparisons']['prior']['timing_eligible'], 45)
++        self.assertEqual(result['comparisons']['prior']['correct'], 48)
++        self.assertEqual(result['comparisons']['prior']['timing_eligible'], 47)
+         self.assertFalse(result['rows'][0]['ratios']['prior']['eligible'])
+ 
+     def test_wrong_failed_unstable_and_short_arms_are_not_performance_evidence(self):
+@@ -76,7 +76,7 @@ class ComparisonReport(unittest.TestCase):
+         ]:
+             data = report()
+             mutate(data['benchmarks'][0])
+-            self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 45)
++            self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 47)
+ 
+     def test_raw_warmups_and_samples_override_cached_success_flags(self):
+         for location, arm, observation in [
+@@ -91,7 +91,7 @@ class ComparisonReport(unittest.TestCase):
+                 data = report()
+                 data['benchmarks'][0].setdefault(location, {}).setdefault(arm, []).append(observation)
+                 result = summary.summarize(data)
+-                self.assertEqual(result['comparisons']['prior']['timing_eligible'], 45)
++                self.assertEqual(result['comparisons']['prior']['timing_eligible'], 47)
+                 self.assertFalse(result['rows'][0]['correct']['prior'])
+ 
+     def test_codegen_counts_preserve_aliases_and_name_stack_references_truthfully(self):
+diff --git a/tests/corpus/test_compiler_evidence_publication.py b/tests/corpus/test_compiler_evidence_publication.py
+index b0b8c377d71657e278176d819b0f8c30af03b3d9..b2e695eacf73067b62ff1b3d38c01e426e611a87 100644
+--- a/tests/corpus/test_compiler_evidence_publication.py
++++ b/tests/corpus/test_compiler_evidence_publication.py
+@@ -75,7 +75,7 @@ def semantic_report(root):
+ 
+ 
+ class EvidencePublication(unittest.TestCase):
+-    def test_all_46_native_rows_and_five_arms_fit_a_single_step(self):
++    def test_all_48_native_rows_and_five_arms_fit_a_single_step(self):
+         with tempfile.TemporaryDirectory() as temp:
+             root = Path(temp)
+             write(root / 'native.json', native_report())
+@@ -84,7 +84,7 @@ class EvidencePublication(unittest.TestCase):
+             rows = [row for title, data in notices if title.startswith('compiler comparison rows')
+                     for row in data]
+             self.assertEqual({row['name'] for row in rows}, {case.name for case in summary.bench.BENCHMARKS})
+-            self.assertEqual(len(rows), 46)
++            self.assertEqual(len(rows), 48)
+             self.assertEqual(len(rows[0]['ratios']), 4)
+             self.assertEqual(len(rows[0]['ratios']['pr835']), len(summary.COMPACT_RATIO_COLUMNS))
+ 
+@@ -104,7 +104,7 @@ class EvidencePublication(unittest.TestCase):
+             self.assertIs(notices[0][1]['timing_claim'], False)
+             rows = [row for title, data in notices if title.startswith('compiler comparison rows')
+                     for row in data]
+-            self.assertEqual(len(rows), 46)
++            self.assertEqual(len(rows), 48)
+             self.assertTrue(all(set(row) == {'name', 'correct'} for row in rows))
+ 
+     def test_all_65_semantic_failure_rows_survive_without_failing_good_required_arms(self):
+@@ -156,7 +156,7 @@ class EvidencePublication(unittest.TestCase):
+                 self.assertEqual(status, 0, output)
+                 self.assertTrue(notices[0][1]['full_registry_valid'])
+                 rows = [row for _, data in notices[1:] for row in data]
+-                self.assertEqual(len(rows), 46)
++                self.assertEqual(len(rows), 48)
+                 self.assertEqual({row['name'] for row in rows}, set(names))
+ 
+     def test_missing_sections_and_partial_instrumentation_never_succeed(self):
+diff --git a/tests/corpus/test_named_benchmark_candidates.py b/tests/corpus/test_named_benchmark_candidates.py
+index f9606c08d24fe9bfdfcd333d7fc0f864bc52bdc8..8418562ce027b353108c80ceb9f57eef532717a3 100644
+--- a/tests/corpus/test_named_benchmark_candidates.py
++++ b/tests/corpus/test_named_benchmark_candidates.py
+@@ -71,7 +71,7 @@ class NamedCandidates(unittest.TestCase):
+ 
+     def test_registry_keeps_distinct_macro_sized_shapes(self):
+         registry = {item.name: item for item in bench.BENCHMARKS}
+-        self.assertEqual(len(registry), 46)
++        self.assertEqual(len(registry), 48)
+         for left, right in [('linux_find_bit', 'linux_find_bit_scaled'),
+                             ('lz4_compress', 'lz4_match_extend')]:
+             self.assertEqual(bench.source_for(registry[left]), bench.source_for(registry[right]))
+diff --git a/tests/regression/check_llvm_missed_integer_batch.py b/tests/regression/check_llvm_missed_integer_batch.py
+index 8787b5ac0c9186cebea08cfcc712fe1438f6b058..15e9234df80038c185183a268b62c06e0f5bf3a4 100644
+--- a/tests/regression/check_llvm_missed_integer_batch.py
++++ b/tests/regression/check_llvm_missed_integer_batch.py
+@@ -102,6 +102,13 @@ def main():
+                 if name == "lshr_full":
+                     if len(yes) > len(no) or any(re.match(r"shr", x) for x in yes):
+                         raise ValueError(f"{name}: threshold fold absent or regressed")
++                elif name == "not_mask":
++                    # A later flag peephole now shortens the disabled control
++                    # to the same count. Keep the policy witness structural:
++                    # bit_idioms must remove the dependent `not`, and must not
++                    # grow the sequence.
++                    if len(yes) > len(no) or any(re.match(r"not", x) for x in yes):
++                        raise ValueError(f"{name}: not-mask fold absent or regressed")
+                 elif len(yes) >= len(no):
+                     raise ValueError(
+                         f"{name}: missing per-rule policy witness {yes} vs {no}"
