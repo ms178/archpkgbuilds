@@ -1,1088 +1,252 @@
-From 067bf735df1a2d1cfc549909c6846f5287b185c1 Mon Sep 17 00:00:00 2001
-From: lccc-bot <lccc-bot@users.noreply.github.com>
-Date: Wed, 21 Oct 2026 10:45:01 +0000
-Subject: [PATCH] Fix decimal32-arm-width IVSR regression, add
- iv_widen/peephole tests, and drop load_op_fuse extraction
-
-Cross-Target IVSR & AArch64 Indexed Store Folding
-- Commit 3dbed46e2 enabled unconditional affine recognition for Shl in
-  iv_strength_reduce::find_derived_exprs, which rewrote a[i + 1] ((i + 1) << 2)
-  in tests/regression/decimal32_indexed_fold_arm.c into a constant-offset
-  sibling GEP across bl __bid_addsd3 and broke the decimal32-arm-width CI gate
-  (no folded str w0, [x23, x19, lsl #2]).
-- Gate Shl find_affine on (shift > 3 || !gep_uses_by_index.contains_key(&dest.0))
-  without consulting compare_recurrence::enabled(): non-GEP shifts and wide GEP
-  shifts (shift > 3, stride >= 16) are recognized on every target, while
-  hardware-scalable GEP shifts (shift <= 3, stride in {1, 2, 4, 8}) stay in
-  indexed form so AArch64 ([xB, xI, lsl #1..3]) and x86 SIB fold them directly
-  into the memory instruction.
-- Add affine_shift_recognizes_scalar_and_wide_gep_while_preserving_sib_gep in
-  iv_strength_reduce.rs.
-
-Unit Tests for iv_widen, narrow_copy_fold, and relay_and_lea
-- iv_widen: add wide_pointer_add_load_store_and_gep_base_widen_when_exact_and_refuse_when_inexact
-  covering both exact pointer-Add + Load/Store/GEP-base widening and the
-  IVW-RANGE-1 exposed-latch refusal.
-- narrow_copy_fold_tests: add upper32_zero_promotes_32bit_copy_and_base_read_rewrites_copy_site
-  covering upper32_zero_at 32->64 copy promotion and copy-site collapse when
-  the base register is read before the copy.
-- relay_and_lea: extend rmw_window_tests to cover the 2-RMW window (MAX_RMWS = 2)
-  and destination-family-read refusal.
-
-Audit Census Ratchet & Cleanup
-- Revert the non-behavioural function extraction in load_op_fuse.rs while
-  unifying accumulator binary/divrem arms in x86/codegen/alu.rs and simplifying
-  preference selection in regalloc.rs, ratcheting fns_over_1000 (28 -> 27),
-  holding fns_over_300 at 230, and reducing panic_sites (848 -> 834).
----
- scripts/audit_census_baseline.json            |   6 +-
- src/backend/arm/codegen/intrinsics.rs         |  45 ++--
- src/backend/regalloc.rs                       |  39 ++--
- src/backend/x86/codegen/alu.rs                |  84 +++----
- .../codegen/peephole/passes/load_op_fuse.rs   | 207 +++++++++---------
- .../peephole/passes/narrow_copy_fold.rs       |   6 +-
- .../peephole/passes/narrow_copy_fold_tests.rs |  33 +++
- .../codegen/peephole/passes/relay_and_lea.rs  |  55 ++++-
- src/passes/if_convert.rs                      |  10 +-
- src/passes/iv_strength_reduce.rs              | 140 +++++++++++-
- src/passes/iv_widen.rs                        | 126 +++++++++++
- src/passes/set_membership.rs                  |  32 +--
- 12 files changed, 523 insertions(+), 260 deletions(-)
-
-diff --git a/scripts/audit_census_baseline.json b/scripts/audit_census_baseline.json
-index a7ff8c624..6e5db4851 100644
---- a/scripts/audit_census_baseline.json
-+++ b/scripts/audit_census_baseline.json
-@@ -1,11 +1,11 @@
- {
--  "fns_over_1000": 28,
-+  "fns_over_1000": 27,
-   "fns_over_300": 230,
-   "fns_over_500": 94,
-   "ignored_tests": 10,
-   "knob_literals": 511,
--  "knobs_undocumented": 280,
--  "panic_sites": 848,
-+  "knobs_undocumented": 279,
-+  "panic_sites": 834,
-   "panic_sites_hot": 105,
-   "unsafe_sites": 25
- }
-diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
-index 86694f8d3..a5c9a100e 100644
---- a/src/backend/arm/codegen/intrinsics.rs
-+++ b/src/backend/arm/codegen/intrinsics.rs
-@@ -156,24 +156,18 @@ impl ArmCodegen {
-     ///
-     /// A constant 0 offset keeps the fast path (base register used as-is).
-     fn vec_addr_from_args(&mut self, base: &Operand, offset: Option<&Operand>) -> String {
--        use crate::ir::reexports::IrConst;
--        let zero_off = match offset {
--            None => true,
--            Some(Operand::Const(c)) => c.to_i64() == Some(0),
--            _ => false,
--        };
-         let base_phys = self.operand_reg(base).filter(|r| !is_arm_fp_phys(*r));
--        if zero_off {
-+        let Some(off) = offset.filter(|o| !matches!(o, Operand::Const(c) if c.to_i64() == Some(0)))
-+        else {
-             if let Some(r) = base_phys {
-                 return callee_saved_name(r).to_string();
-             }
-             self.operand_to_x0(base);
-             self.state.emit("    mov x10, x0");
-             return "x10".to_string();
--        }
-+        };
-         // Non-zero offset: x10 = base + offset. x10 is the designated
-         // scratch for address formation in this backend (never allocated).
--        let off = offset.expect("checked above");
-         match (
-             base_phys,
-             self.operand_reg(off).filter(|r| !is_arm_fp_phys(*r)),
-@@ -453,30 +447,18 @@ impl ArmCodegen {
-                     self.store_float_reg(d, IrType::F32, "s0");
+diff --git a/src/passes/bit_idioms.rs b/src/passes/bit_idioms.rs
+--- a/src/passes/bit_idioms.rs
++++ b/src/passes/bit_idioms.rs
+@@ -2748,7 +2748,7 @@
                  }
-             }
--            IntrinsicOp::FmaScalarF64Signed(np, na) => {
-+            IntrinsicOp::FmaScalarF64Signed(np, na) | IntrinsicOp::FmaScalarF32Signed(np, na) => {
-                 // fma(-a, b, -c) & friends after the IR negation peel: the
-                 // shared signed hook owns the AArch64 family table (note the
-                 // ISA quirk: `sub` negates the PRODUCT, `n` the ADDEND).
--                self.emit_fused_fma_signed_impl(
--                    &args[0],
--                    &args[1],
--                    &args[2],
--                    &dest.unwrap(),
--                    IrType::F64,
--                    *np,
--                    *na,
--                );
--            }
--            IntrinsicOp::FmaScalarF32Signed(np, na) => {
--                self.emit_fused_fma_signed_impl(
--                    &args[0],
--                    &args[1],
--                    &args[2],
--                    &dest.unwrap(),
--                    IrType::F32,
--                    *np,
--                    *na,
--                );
-+                if let Some(d) = dest {
-+                    let ty = if matches!(op, IntrinsicOp::FmaScalarF64Signed(..)) {
-+                        IrType::F64
-+                    } else {
-+                        IrType::F32
-+                    };
-+                    self.emit_fused_fma_signed_impl(&args[0], &args[1], &args[2], &d, ty, *np, *na);
-+                }
-             }
-             IntrinsicOp::CopysignF64 => {
-                 // result = |x| with y's sign bit: pure integer bit ops on
-@@ -999,12 +981,11 @@ impl ArmCodegen {
-             | IntrinsicOp::VecStoreI32x4
-             | IntrinsicOp::VecStoreI64x2 => {
-                 // Store one 128-bit vector to dest_ptr.
--                if dest_ptr.is_some() {
-+                if let &Some(ptr) = dest_ptr {
-                     let src = self.load_vector_value_128(&args[0], "q0");
-                     let addr = if args.len() >= 3 {
-                         self.vec_addr_from_args(&args[1], args.get(2))
-                     } else {
--                        let ptr = dest_ptr.unwrap();
-                         let base_phys = self
-                             .operand_reg(&Operand::Value(ptr))
-                             .filter(|r| !is_arm_fp_phys(*r));
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 27a0a91ac..f88b66ca0 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -6455,7 +6455,7 @@ fn synthetic_vec_intervals(
-     for (block_index, block) in func.blocks.iter().enumerate() {
-         let block_start = point;
-         for inst in &block.instructions {
--            let end = point.checked_add(1).expect("IR program-point overflow");
-+            let end = point.saturating_add(1);
-             let mut read_values: FxHashSet<u32> = FxHashSet::default();
-             let mut written_value: Option<u32> = None;
-             match inst {
-@@ -6512,7 +6512,7 @@ fn synthetic_vec_intervals(
-             }
-             point = end;
-         }
--        let terminator_end = point.checked_add(1).expect("IR program-point overflow");
-+        let terminator_end = point.saturating_add(1);
-         for_each_operand_in_terminator(&block.terminator, |operand| {
-             let Operand::Value(value) = operand else {
-                 return;
-@@ -7211,23 +7211,20 @@ fn allocate_vector_registers_destructive(
-     let mut assigned_map: FxHashMap<u32, PhysReg> = FxHashMap::default();
-     for v in order {
-         let pieces = &coverage[&v];
-+        let fits = |rn: u8| {
-+            held.get(&rn)
-+                .is_none_or(|h| sse_chain_pieces_fit(h, pieces))
-+        };
-         // Prefer the proven-dead first operand's register when it fits:
-         // the preference failing the overlap test (segment overhang past
-         // the proven death) is the automatic veto — the destination then
-         // takes another free register instead of tripping a repair
-         // eviction later.
--        let mut preference: Option<u8> = None;
--        if let Some(&a0) = death_from.get(&v) {
--            if let Some(&reg) = assigned_map.get(&a0) {
--                let fits = held
--                    .get(&reg.0)
--                    .map(|h| sse_chain_pieces_fit(h, pieces))
--                    .unwrap_or(true);
--                if fits {
--                    preference = Some(reg.0);
--                }
--            }
--        }
-+        let preference = death_from
-+            .get(&v)
-+            .and_then(|a0| assigned_map.get(a0))
-+            .map(|r| r.0)
-+            .filter(|&rn| fits(rn));
-         // Pending-handoff reservation: a handoff source whose target is not
-         // yet assigned reserves its register.  A value without a usable
-         // preference takes another free register when one fits, so an
-@@ -7238,18 +7235,13 @@ fn allocate_vector_registers_destructive(
-         let mut reserved: FxHashSet<u8> = FxHashSet::default();
-         if preference.is_none() {
-             for (&d, &a0) in death_from.iter() {
--                if !assigned_map.contains_key(&d) {
--                    if let Some(&reg) = assigned_map.get(&a0) {
--                        reserved.insert(reg.0);
--                    }
-+                if !assigned_map.contains_key(&d)
-+                    && let Some(&reg) = assigned_map.get(&a0)
-+                {
-+                    reserved.insert(reg.0);
-                 }
-             }
-         }
--        let fits = |rn: u8| {
--            held.get(&rn)
--                .map(|h| sse_chain_pieces_fit(h, pieces))
--                .unwrap_or(true)
--        };
-         let chosen = if let Some(rn) = preference {
-             pool.iter().find(|r| r.0 == rn).copied()
-         } else {
-@@ -15851,6 +15843,7 @@ mod phi_chain_shape_tests {
-         // those ARE empty chains -- reachability, not topology, decides.
-         assert_eq!(single_pred_chain(&preds, 0, 1), Some(Vec::new()));
-         assert_eq!(single_pred_chain(&preds, 0, 2), Some(Vec::new()));
-+        assert_eq!(single_pred_chain(&preds, 1, 2), None);
- 
-         // Back edge: 0 -> 1 -> 2 -> 1. The walk stops at block 1 because the
-         // back edge gives it two predecessors (the `mids.contains` guard is
-diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
-index 5afb6a89f..b4a111d67 100644
---- a/src/backend/x86/codegen/alu.rs
-+++ b/src/backend/x86/codegen/alu.rs
-@@ -1812,12 +1812,19 @@ impl X86Codegen {
-         self.operand_to_rcx(rhs);
- 
-         match op {
--            IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul => {
-+            IrBinOp::Add
-+            | IrBinOp::Sub
-+            | IrBinOp::Mul
-+            | IrBinOp::And
-+            | IrBinOp::Or
-+            | IrBinOp::Xor => {
-                 let mnem = match op {
-                     IrBinOp::Add => "add",
-                     IrBinOp::Sub => "sub",
-                     IrBinOp::Mul => "imul",
--                    _ => unreachable!("unexpected i64 binop: {:?}", op),
-+                    IrBinOp::And => "and",
-+                    IrBinOp::Or => "or",
-+                    _ => "xor",
-                 };
-                 if use_32bit {
-                     self.state
-@@ -1827,61 +1834,28 @@ impl X86Codegen {
-                         .emit_fmt(format_args!("    {}q %rcx, %rax", mnem));
-                 }
-             }
--            IrBinOp::SDiv => {
-+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
-+                let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
-+                let is_rem = matches!(op, IrBinOp::SRem | IrBinOp::URem);
-                 if use_32bit {
--                    self.state.emit("    cltd");
--                    self.state.emit("    idivl %ecx");
--                } else {
--                    self.emit_div64(true);
--                }
--            }
--            IrBinOp::UDiv => {
--                if use_32bit {
--                    self.state.emit("    xorl %edx, %edx");
--                    self.state.emit("    divl %ecx");
--                } else {
--                    self.emit_div64(false);
--                }
--            }
--            IrBinOp::SRem => {
--                if use_32bit {
--                    self.state.emit("    cltd");
--                    self.state.emit("    idivl %ecx");
--                    self.state.emit("    movl %edx, %eax");
--                } else {
--                    self.emit_div64(true);
--                    self.state.emit("    movq %rdx, %rax");
--                }
--            }
--            IrBinOp::URem => {
--                if use_32bit {
--                    self.state.emit("    xorl %edx, %edx");
--                    self.state.emit("    divl %ecx");
--                    self.state.emit("    movl %edx, %eax");
--                } else {
--                    self.emit_div64(false);
--                    self.state.emit("    movq %rdx, %rax");
--                }
--            }
--            IrBinOp::And => {
--                if use_32bit {
--                    self.state.emit("    andl %ecx, %eax");
--                } else {
--                    self.state.emit("    andq %rcx, %rax");
--                }
--            }
--            IrBinOp::Or => {
--                if use_32bit {
--                    self.state.emit("    orl %ecx, %eax");
--                } else {
--                    self.state.emit("    orq %rcx, %rax");
--                }
--            }
--            IrBinOp::Xor => {
--                if use_32bit {
--                    self.state.emit("    xorl %ecx, %eax");
-+                    self.state.emit(if signed {
-+                        "    cltd"
-+                    } else {
-+                        "    xorl %edx, %edx"
-+                    });
-+                    self.state.emit(if signed {
-+                        "    idivl %ecx"
-+                    } else {
-+                        "    divl %ecx"
-+                    });
-+                    if is_rem {
-+                        self.state.emit("    movl %edx, %eax");
+                 Instruction::BinOp {
+                     dest,
+-                    op: IrBinOp::Or,
++                    op: IrBinOp::Or | IrBinOp::Xor,
+                     ty,
+                     ..
+                 } if matches!(*ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64) => {
+@@ -2789,6 +2789,27 @@
+                             continue;
+                         }
+                     }
++                    if let Some(src) = bytes::bswap(Operand::Value(dest), ty, &defs) {
++                        let replacement = Instruction::UnaryOp {
++                            dest,
++                            op: IrUnaryOp::Bswap,
++                            src,
++                            ty,
++                        };
++                        // Later producer-repurposing rules consume these maps.
++                        // Keep direct read counts exact after replacing the consumer.
++                        block.instructions[index].for_each_used_value(|v| {
++                            use_counts[v as usize] -= 1;
++                        });
++                        replacement.for_each_used_value(|v| {
++                            use_counts[v as usize] += 1;
++                        });
++                        defs[dest.0 as usize] = Some(replacement.clone());
++                        block.instructions[index] = replacement;
++                        changes += 1;
++                        index += 1;
++                        continue;
 +                    }
-                 } else {
--                    self.state.emit("    xorq %rcx, %rax");
-+                    self.emit_div64(signed);
-+                    if is_rem {
-+                        self.state.emit("    movq %rdx, %rax");
-+                    }
-                 }
-             }
-             IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
-diff --git a/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs b/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
-index d622a104e..aa9aef032 100644
---- a/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
-+++ b/src/backend/x86/codegen/peephole/passes/load_op_fuse.rs
-@@ -878,123 +878,112 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo])
-         }
+                     if max_rotate_bits > 0
+                         && let Some((value, amount, is_left)) =
+                             match_rotate(Operand::Value(dest), max_rotate_bits, &defs)
+@@ -5341,3 +5362,6 @@
  
-         // ── copy-bridged commutative form: mov %T, %B ... OP %C, %B ────────
--        if let Some(span_end) = try_fuse_copy_bridged_load(
--            store, infos, &mut lv, i, j, len, &cons, mem, load_q, t_fam, addr,
--        ) {
--            changed = true;
--            i = span_end + 1;
-+        let Some((copy_q, csrc, b_fam)) = parse_reg_copy(&cons) else {
-+            i += 1;
-+            continue;
+ #[path = "bit_idioms_batch6.rs"]
+ mod batch6;
++
++#[path = "bit_idioms_bytes.rs"]
++mod bytes;
+diff --git a/src/passes/bit_idioms_bytes.rs b/src/passes/bit_idioms_bytes.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passes/bit_idioms_bytes.rs
+@@ -0,0 +1,128 @@
++//! Exact byte provenance for portable 32/64-bit byte-swap networks.
++//!
++//! Each lane is either zero or one unchanged byte of a single SSA source.
++//! Logical byte shifts, whole-byte masks and compatible OR/XOR merges preserve
++//! that invariant. A final reversed permutation is therefore exactly Bswap.
++//! No arithmetic shifts, narrowing casts, memory operations or producers are
++//! changed. Fixed arrays and per-candidate walk/depth budgets bound compile cost.
++use super::*;
++
++struct Bytes<'a> {
++    defs: &'a [Option<Instruction>],
++    source: Option<Operand>,
++    width: usize,
++    visits: u16,
++}
++
++impl Bytes<'_> {
++    fn walk(&mut self, value: Operand, depth: u8) -> Option<[u8; 8]> {
++        self.visits = self.visits.checked_sub(1)?;
++        if depth == 0 {
++            return None;
++        }
++        if let Some(c) = const_in_ring(value, self.width * 8) {
++            return (c == 0).then_some([0; 8]);
++        }
++        let Operand::Value(v) = value else {
++            return None;
 +        };
-+        // A movl copy of a movq load would truncate; a movq copy of a movl
-+        // load is the zero-extension the load already performed.
-+        if csrc != t_fam || b_fam == t_fam || (load_q && !copy_q) {
-+            i += 1;
-             continue;
-         }
--        i += 1;
--    }
--    changed
--}
--
--/// Fuse copy-bridged commutative load `mov MEM, %T ... mov %T, %B ... OP %C, %B`
--/// into `mov %C, %B; OP MEM, %B`, returning `Some(k)` on rewrite.
--#[allow(clippy::too_many_arguments)]
--fn try_fuse_copy_bridged_load(
--    store: &mut LineStore,
--    infos: &mut [LineInfo],
--    lv: &mut FileLiveness,
--    i: usize,
--    j: usize,
--    len: usize,
--    cons: &str,
--    mem: &str,
--    load_q: bool,
--    t_fam: RegId,
--    addr: u16,
--) -> Option<usize> {
--    let (copy_q, csrc, b_fam) = parse_reg_copy(cons)?;
--    // A movl copy of a movq load would truncate; a movq copy of a movl
--    // load is the zero-extension the load already performed.
--    if csrc != t_fam || b_fam == t_fam || (load_q && !copy_q) {
--        return None;
--    }
--    let t_bit = 1u16 << t_fam;
--    let b_bit = 1u16 << b_fam;
--    // Find the consumer of B: first line mentioning B after the copy.
--    let mut k = next_insn(store, infos, j + 1, len);
--    let mut op_line = None;
--    let mut gap2 = 0usize;
--    while k < len {
--        let info = &infos[k];
--        if !is_window_kind(info.kind) || info.pinned {
--            break;
--        }
--        if info.reg_refs & b_bit != 0 {
--            op_line = Some(k);
--            break;
-+        let b_bit = 1u16 << b_fam;
-+        // Find the consumer of B: first line mentioning B after the copy.
-+        let mut k = next_insn(store, infos, j + 1, len);
-+        let mut op_line = None;
-+        let mut gap2 = 0usize;
-+        while k < len {
-+            let info = &infos[k];
-+            if !is_window_kind(info.kind) || info.pinned {
-+                break;
-+            }
-+            if info.reg_refs & b_bit != 0 {
-+                op_line = Some(k);
-+                break;
-+            }
-+            if info.reg_refs & t_bit != 0 {
-+                break;
-+            }
-+            let t = info.trimmed(store.get(k));
-+            if accesses_memory(t, info) {
-+                break;
-+            }
-+            let wr = may_write_families(t, info);
-+            if wr == ALL_GPR || wr & (t_bit | b_bit | addr) != 0 {
-+                break;
-+            }
-+            gap2 += 1;
-+            if gap2 > MAX_GAP {
-+                break;
-+            }
-+            k = next_insn(store, infos, k + 1, len);
-         }
--        if info.reg_refs & t_bit != 0 {
--            break;
-+        let Some(k) = op_line else {
-+            i += 1;
-+            continue;
-+        };
-+        // The copy-bridged form moves the load's memory operand to a LATER
-+        // line, so the same distance argument as the direct form applies (see
-+        // the segmented-operand guard above): with any instruction between the
-+        // copy and the op, that instruction could rebase the segment.  The
-+        // copy itself is a validated register-to-register mov and cannot.
-+        if gap2 != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
-+            i += 1;
-+            continue;
-         }
--        let t = info.trimmed(store.get(k));
--        if accesses_memory(t, info) {
--            break;
-+        let op_text = infos[k].trimmed(store.get(k)).to_string();
-+        let Some((op, op_q, c_fam, dst)) = parse_reg_reg_alu(&op_text) else {
-+            i += 1;
-+            continue;
-+        };
-+        if op_q != load_q
-+            || dst != b_fam
-+            || c_fam == b_fam
-+            || c_fam == t_fam
-+            || !COMMUTATIVE_OPS.contains(&op)
-+            // The replacement is TWO instructions: `mov C, B` (at j) followed
-+            // by `op mem, B` (at k), and the folded memory operand's address
-+            // is evaluated at k. If B is one of the address families the copy
-+            // writes an address input BEFORE the op reads it (e.g. an index
-+            // `(base,%rdx,4)` with B=%rdx staged by `mov %r11d, %edx`) — a
-+            // miscompile. Bail: the copy-bridged shape stays untouched.
-+            || (b_bit & addr) != 0
++        let definition = self.defs.get(v.0 as usize)?.as_ref();
++        if let Some(Instruction::Copy { src, .. }) = definition {
++            return self.walk(*src, depth - 1);
++        }
++        if let Some(Instruction::BinOp {
++            op, lhs, rhs, ty, ..
++        }) = definition
 +        {
-+            i += 1;
-+            continue;
-         }
--        let wr = may_write_families(t, info);
--        if wr == ALL_GPR || wr & (t_bit | b_bit | addr) != 0 {
--            break;
-+        // C must hold the same value at the copy as at the op (nothing in
-+        // (j, k) writes it), and T must be dead once the copy is gone.
-+        let Some(w2) = scan_window(store, infos, j, k) else {
-+            i += 1;
-+            continue;
-+        };
-+        let c_bit = 1u16 << c_fam;
-+        if w2.written & (c_bit | b_bit | t_bit | addr) != 0 || w2.mentioned & (t_bit | b_bit) != 0 {
-+            i += 1;
-+            continue;
-         }
--        gap2 += 1;
--        if gap2 > MAX_GAP {
--            break;
-+        if lv.live_after(j, t_fam) != Some(false) {
-+            i += 1;
-+            continue;
-         }
--        k = next_insn(store, infos, k + 1, len);
--    }
--    let k = op_line?;
--    // The copy-bridged form moves the load's memory operand to a LATER
--    // line, so the same distance argument as the direct form applies (see
--    // the segmented-operand guard above): with any instruction between the
--    // copy and the op, that instruction could rebase the segment.  The
--    // copy itself is a validated register-to-register mov and cannot.
--    if gap2 != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
--        return None;
--    }
--    let op_text = infos[k].trimmed(store.get(k)).to_string();
--    let (op, op_q, c_fam, dst) = parse_reg_reg_alu(&op_text)?;
--    if op_q != load_q
--        || dst != b_fam
--        || c_fam == b_fam
--        || c_fam == t_fam
--        || !COMMUTATIVE_OPS.contains(&op)
--        // The replacement is TWO instructions: `mov C, B` (at j) followed
--        // by `op mem, B` (at k), and the folded memory operand's address
--        // is evaluated at k. If B is one of the address families the copy
--        // writes an address input BEFORE the op reads it (e.g. an index
--        // `(base,%rdx,4)` with B=%rdx staged by `mov %r11d, %edx`) — a
--        // miscompile. Bail: the copy-bridged shape stays untouched.
--        || (b_bit & addr) != 0
--    {
--        return None;
--    }
--    // C must hold the same value at the copy as at the op (nothing in
--    // (j, k) writes it), and T must be dead once the copy is gone.
--    let w2 = scan_window(store, infos, j, k)?;
--    let c_bit = 1u16 << c_fam;
--    if w2.written & (c_bit | b_bit | t_bit | addr) != 0 || w2.mentioned & (t_bit | b_bit) != 0 {
--        return None;
--    }
--    if lv.live_after(j, t_fam) != Some(false) {
--        return None;
-+        let copy_line = format!(
-+            "    mov{suffix} {}, {}",
-+            REG_NAMES[width][c_fam as usize], REG_NAMES[width][b_fam as usize]
-+        );
-+        let op_new = format!(
-+            "    {op}{suffix} {mem}, {}",
-+            REG_NAMES[width][b_fam as usize]
-+        );
-+        mark_nop(&mut infos[i]);
-+        replace_line(store, &mut infos[j], j, copy_line);
-+        replace_line(store, &mut infos[k], k, op_new);
-+        lv.refresh_span(store, infos, i, k);
-+        changed = true;
-+        i = k + 1;
-     }
--    let suffix = if load_q { "q" } else { "l" };
--    let width = if load_q { 0 } else { 1 };
--    let copy_line = format!(
--        "    mov{suffix} {}, {}",
--        REG_NAMES[width][c_fam as usize], REG_NAMES[width][b_fam as usize]
--    );
--    let op_new = format!(
--        "    {op}{suffix} {mem}, {}",
--        REG_NAMES[width][b_fam as usize]
--    );
--    mark_nop(&mut infos[i]);
--    replace_line(store, &mut infos[j], j, copy_line);
--    replace_line(store, &mut infos[k], k, op_new);
--    lv.refresh_span(store, infos, i, k);
--    Some(k)
-+    changed
- }
- 
- // ── in-place recurrence update ───────────────────────────────────────────────
-diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
-index 0669162f0..30a6f240a 100644
---- a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
-+++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
-@@ -978,11 +978,7 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
-         // with no uses at all, dead right after the copy).
-         let mut all_uses: Vec<usize> = pre_uses;
-         all_uses.extend_from_slice(&uses);
--        let dead_at = if all_uses.is_empty() {
--            c
--        } else {
--            *all_uses.last().unwrap()
--        };
-+        let dead_at = all_uses.last().copied().unwrap_or(c);
-         if lv.live_after(dead_at, t_fam) != Some(false) {
-             continue;
-         }
-diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
-index cadc87a0b..b9bc55a7e 100644
---- a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
-+++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
-@@ -868,4 +868,37 @@ mod copyback_producer_tests {
-         // Register-to-register copies belong to fold_register_copies.
-         assert!(parse_copyback_producer("movq %rax, %r10").is_none());
-     }
-+
-+    #[test]
-+    fn upper32_zero_promotes_32bit_copy_and_base_read_rewrites_copy_site() {
-+        // 1. A 32-bit producer (`movl (%rdi), %eax`) zeroes bits 32..63 of
-+        //    `%rax`, so a subsequent `movl %eax, %ecx` can be treated as W64
-+        //    and forwarded into a 64-bit use `(,%rcx,4)`.
-+        let out = super::run(&super::f(concat!(
-+            "    movl (%rdi), %eax\n",
-+            "    movl %eax, %ecx\n",
-+            "    movl (%rsi,%rcx,4), %eax\n",
-+            "    ret"
-+        )));
-+        assert!(
-+            out.contains("(%rsi,%rax,4)") && !out.contains("movl %eax, %ecx"),
-+            "32-bit zero-extending producer must allow W64 index forwarding:\n{out}"
-+        );
-+
-+        // 2. When `%rax` is read between `leaq 4(%rax), %r10` and the copy-back
-+        //    `movq %r10, %rax` (with `%rax` live out at `ret`), the copy site
-+        //    itself is rewritten to `leaq 4(%rax), %rax` and the earlier `leaq`
-+        //    is dropped.
-+        let out = super::run(&super::f(concat!(
-+            "    leaq 4(%rax), %r10\n",
-+            "    movl (%rax), %ecx\n",
-+            "    movl %ecx, (%rsi)\n",
-+            "    movq %r10, %rax\n",
-+            "    ret"
-+        )));
-+        assert!(
-+            out.contains("leaq 4(%rax), %rax") && !out.contains("%r10"),
-+            "copyback with intermediate base read must collapse at the copy site:\n{out}"
-+        );
++            // Do not interpret a different ring as this word's byte network.
++            if !ty.is_integer() || ty.size() != self.width {
++                return None;
++            }
++            let (op, lhs, rhs) = (*op, *lhs, *rhs);
++            match op {
++                IrBinOp::Shl | IrBinOp::LShr => {
++                    let Operand::Const(count) = rhs else {
++                        return None;
++                    };
++                    let shift = count.to_i128()?;
++                    if !(0..(self.width * 8) as i128).contains(&shift) || shift % 8 != 0 {
++                        return None;
++                    }
++                    let input = self.walk(lhs, depth - 1)?;
++                    let amount = shift as usize / 8;
++                    let mut output = [0; 8];
++                    if op == IrBinOp::Shl {
++                        output[amount..self.width].copy_from_slice(&input[..self.width - amount]);
++                    } else {
++                        output[..self.width - amount].copy_from_slice(&input[amount..self.width]);
++                    }
++                    return Some(output);
++                }
++                IrBinOp::And => {
++                    let (input, mask) = if let Some(c) = const_in_ring(rhs, self.width * 8) {
++                        (lhs, c)
++                    } else {
++                        (rhs, const_in_ring(lhs, self.width * 8)?)
++                    };
++                    let mut bytes = self.walk(input, depth - 1)?;
++                    for (i, byte) in bytes[..self.width].iter_mut().enumerate() {
++                        match (mask >> (i * 8)) & 255 {
++                            0 => *byte = 0,
++                            255 => {}
++                            _ => return None,
++                        }
++                    }
++                    return Some(bytes);
++                }
++                IrBinOp::Or | IrBinOp::Xor => {
++                    let mut a = self.walk(lhs, depth - 1)?;
++                    let b = self.walk(rhs, depth - 1)?;
++                    for i in 0..self.width {
++                        match (a[i], b[i]) {
++                            (0, byte) => a[i] = byte,
++                            (_, 0) => {}
++                            (x, y) if op == IrBinOp::Or && x == y => {}
++                            _ => return None,
++                        }
++                    }
++                    return Some(a);
++                }
++                _ => {}
++            }
++        }
++        // A cast or other computation can be the opaque input, but is never
++        // peeled: independently extended/truncated values are distinct sources.
++        match self.source {
++            None => self.source = Some(value),
++            Some(source) if source == value => {}
++            _ => return None,
++        }
++        let mut identity = [0; 8];
++        for (i, byte) in identity[..self.width].iter_mut().enumerate() {
++            *byte = i as u8 + 1;
++        }
++        Some(identity)
 +    }
- }
-diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-index 30c53aac0..1cb02b0a7 100644
---- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-+++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-@@ -7198,7 +7198,7 @@ mod tests {
- #[cfg(test)]
- mod rmw_window_tests {
-     /// Run the pass alone over `body`; return the emitted program (every
--    /// non-NOP line, trimmed) and whether any line was removed.
-+    /// non-NOP line, trimmed) and how many lines were removed.
-     fn run(body: &str) -> (Vec<String>, usize) {
-         let asm = format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
-         let mut store = super::LineStore::new(asm);
-@@ -7242,6 +7242,32 @@ mod rmw_window_tests {
-             "the producer and its RMW must move to the copy destination and the copy must go"
-         );
-         assert_eq!(removed, 1, "exactly the copy must be removed");
++}
 +
-+        // Two-RMW window (`MAX_RMWS = 2`) also retargets both RMWs and drops the copy.
-+        let (emitted2, removed2) = run(concat!(
-+            "    movl (%rdi), %r9d\n",
-+            "    addl $1, %r9d\n",
-+            "    xorl $3, %r9d\n",
-+            "    movl %r9d, %r10d\n",
-+            "    movl %r10d, (%rsi)\n",
-+            "    ret",
-+        ));
-+        assert_eq!(
-+            emitted2,
-+            vec![
-+                ".text",
-+                "f:",
-+                ".cfi_startproc",
-+                "movl (%rdi), %r10d",
-+                "addl $1, %r10d",
-+                "xorl $3, %r10d",
-+                "movl %r10d, (%rsi)",
-+                "ret",
-+                ".cfi_endproc",
-+            ],
-+            "both RMWs in the 2-RMW window must retarget onto %r10d"
-+        );
-+        assert_eq!(removed2, 1, "exactly the copy must be removed");
-     }
- 
-     #[test]
-@@ -7271,5 +7297,32 @@ mod rmw_window_tests {
-             "a width-mismatched RMW chain must leave every line in place"
-         );
-         assert_eq!(removed, 0, "nothing may be removed when the rule refuses");
-+
-+        // RMW reading the copy destination family (`%r10d`) must also refuse,
-+        // otherwise retargeting the load into `%r10d` would clobber `%r10d`
-+        // before `addl %r10d, %r9d` reads it.
-+        let (emitted_alias, removed_alias) = run(concat!(
-+            "    movl (%rdi), %r9d\n",
-+            "    addl %r10d, %r9d\n",
-+            "    movl %r9d, %r10d\n",
-+            "    movl %r10d, (%rsi)\n",
-+            "    ret",
-+        ));
-+        assert_eq!(
-+            emitted_alias,
-+            vec![
-+                ".text",
-+                "f:",
-+                ".cfi_startproc",
-+                "movl (%rdi), %r9d",
-+                "addl %r10d, %r9d",
-+                "movl %r9d, %r10d",
-+                "movl %r10d, (%rsi)",
-+                "ret",
-+                ".cfi_endproc",
-+            ],
-+            "an RMW reading the copy destination family must leave every line in place"
-+        );
-+        assert_eq!(removed_alias, 0);
-     }
- }
-diff --git a/src/passes/if_convert.rs b/src/passes/if_convert.rs
-index 8ceb7296b..0c707d156 100644
---- a/src/passes/if_convert.rs
-+++ b/src/passes/if_convert.rs
-@@ -1717,13 +1717,9 @@ fn apply_shared_arm_dup(func: &mut IrFunction, plan: &SharedArmDup) -> bool {
- 
-     // Extend M's phis: the S'-edge carries the S-edge's value, with values
-     // internal to S mapped to the clone's dests.
--    if let Terminator::Branch(m_label) = s_term {
--        let m_idx = func
--            .blocks
--            .iter()
--            .position(|b| b.label == m_label)
--            .expect("merge block exists");
--        let m_block = &mut func.blocks[m_idx];
-+    if let Terminator::Branch(m_label) = s_term
-+        && let Some(m_block) = func.blocks.iter_mut().find(|b| b.label == m_label)
++pub(super) fn bswap(value: Operand, ty: IrType, defs: &[Option<Instruction>]) -> Option<Operand> {
++    if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
++        return None;
++    }
++    let mut bytes = Bytes {
++        defs,
++        source: None,
++        width: ty.size(),
++        visits: 128,
++    };
++    let permutation = bytes.walk(value, 24)?;
++    if permutation[..bytes.width]
++        .iter()
++        .enumerate()
++        .all(|(i, &byte)| byte as usize == bytes.width - i)
 +    {
-         for inst in &mut m_block.instructions {
-             if let Instruction::Phi { incoming, .. } = inst {
-                 if let Some(pos) = incoming.iter().position(|(_, l)| *l == s_label) {
-diff --git a/src/passes/iv_strength_reduce.rs b/src/passes/iv_strength_reduce.rs
-index 6f8aa35e4..710eb2f72 100644
---- a/src/passes/iv_strength_reduce.rs
-+++ b/src/passes/iv_strength_reduce.rs
-@@ -1694,15 +1694,22 @@ fn find_derived_exprs(
-                     };
-                     if let Some(idx) = find_iv(v.0) {
-                         (*dest, *ty, idx, 1i64 << shift, 0)
--                    } else if let Some((idx, k)) = find_affine(v.0, *ty) {
--                        // `x << k` and `x * 2^k` are the SAME value shape, so
--                        // the affine arm here must stay identical to the
--                        // Mul-by-constant arm above. Gating it on a
--                        // target-specific compare-recurrence knob silently
--                        // deleted affine-shift recognition on every non-x86
--                        // target (the knob defaults to false and is only
--                        // enabled for x86-64); a value-shape question must
--                        // never be answered by a codegen policy switch.
-+                    } else if (shift > 3 || !gep_uses_by_index.contains_key(&dest.0))
-+                        && let Some((idx, k)) = find_affine(v.0, *ty)
-+                    {
-+                        // Hardware scaled-index addressing folds `shift <= 3`
-+                        // (`stride` in {1, 2, 4, 8}) directly into the memory
-+                        // instruction (`[xB, xI, lsl #1..3]` on AArch64, SIB on
-+                        // x86), matching the `Add(v, v)` (`stride == 2`) arm
-+                        // below which likewise omits `find_affine`. Rewriting a
-+                        // `shift <= 3` affine GEP offset such as `a[i + 1]` in
-+                        // `tests/regression/decimal32_indexed_fold_arm.c` into
-+                        // a constant-offset sibling GEP breaks indexed-store
-+                        // folding across calls (`str w0, [x23, x19, lsl #2]`).
-+                        // Shifts beyond hardware index scale (`shift > 3`,
-+                        // `stride >= 16`) and non-GEP scalar shifts (such as
-+                        // `((i + 1) << k) >= limit` in `search_scaled_bound_wrap.c`)
-+                        // are recognized on every target.
-                         (*dest, *ty, idx, 1i64 << shift, k)
-                     } else {
-                         continue;
-@@ -5990,4 +5997,119 @@ mod dominance_snapshot_contract {
-         f.blocks.push(f.blocks[1].clone());
-         assert!(!ivsr_cfg_unchanged(&f, &cfg));
-     }
-+
-+    #[test]
-+    fn affine_shift_recognizes_scalar_and_wide_gep_while_preserving_sib_gep() {
-+        use crate::ir::reexports::IrCmpOp;
-+        // Disable `compare_recurrence` to prove that `find_derived_exprs` does
-+        // not depend on any target-specific compare-recurrence switch.
-+        super::set_compare_recurrence_enabled(false);
-+
-+        let build_loop = |shift: i64, use_as_gep: bool| -> IrFunction {
-+            let mut f = IrFunction::new("affine_shl".into(), IrType::U64, vec![], false);
-+            // B0 preheader
-+            f.blocks.push(BasicBlock {
-+                label: BlockId(0),
-+                instructions: vec![Instruction::GlobalAddr {
-+                    dest: Value(0),
-+                    name: "arr".into(),
-+                }],
-+                terminator: Terminator::Branch(BlockId(1)),
-+                source_spans: vec![],
-+            });
-+            // B1 header: i = phi(0, i_next); i_next = i + 1; off = i_next << shift
-+            let consumer = if use_as_gep {
-+                Instruction::GetElementPtr {
-+                    dest: Value(4),
-+                    base: Value(0),
-+                    offset: Operand::Value(Value(3)),
-+                    ty: IrType::I8,
-+                }
-+            } else {
-+                Instruction::Cmp {
-+                    dest: Value(4),
-+                    op: IrCmpOp::Ult,
-+                    lhs: Operand::Value(Value(3)),
-+                    rhs: Operand::Const(IrConst::I64(1024)),
-+                    ty: IrType::U64,
-+                }
-+            };
-+            f.blocks.push(BasicBlock {
-+                label: BlockId(1),
-+                instructions: vec![
-+                    Instruction::Phi {
-+                        dest: Value(1),
-+                        ty: IrType::U64,
-+                        incoming: vec![
-+                            (Operand::Const(IrConst::I64(0)), BlockId(0)),
-+                            (Operand::Value(Value(2)), BlockId(1)),
-+                        ],
-+                    },
-+                    Instruction::BinOp {
-+                        dest: Value(2),
-+                        op: IrBinOp::Add,
-+                        lhs: Operand::Value(Value(1)),
-+                        rhs: Operand::Const(IrConst::I64(1)),
-+                        ty: IrType::U64,
-+                    },
-+                    Instruction::BinOp {
-+                        dest: Value(3),
-+                        op: IrBinOp::Shl,
-+                        lhs: Operand::Value(Value(2)),
-+                        rhs: Operand::Const(IrConst::I64(shift)),
-+                        ty: IrType::U64,
-+                    },
-+                    consumer,
-+                    Instruction::Cmp {
-+                        dest: Value(5),
-+                        op: IrCmpOp::Ult,
-+                        lhs: Operand::Value(Value(2)),
-+                        rhs: Operand::Const(IrConst::I64(64)),
-+                        ty: IrType::U64,
-+                    },
-+                ],
-+                terminator: Terminator::CondBranch {
-+                    cond: Operand::Value(Value(5)),
-+                    true_label: BlockId(1),
-+                    false_label: BlockId(2),
-+                },
-+                source_spans: vec![],
-+            });
-+            f.blocks.push(BasicBlock {
-+                label: BlockId(2),
-+                instructions: vec![],
-+                terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
-+                source_spans: vec![],
-+            });
-+            f.next_value_id = 6;
-+            f
-+        };
-+
-+        let inspect = |f: &IrFunction| -> Vec<(i64, i64)> {
-+            let cfg = analysis::CfgAnalysis::build(f);
-+            let loops = loop_analysis::find_natural_loops(
-+                cfg.num_blocks,
-+                &cfg.preds,
-+                &cfg.succs,
-+                &cfg.idom,
-+            );
-+            let lp = &loops[0];
-+            let back = vec![1usize];
-+            let ivs = find_basic_ivs(f, lp.header, &lp.body, 0, &back);
-+            find_derived_exprs(f, &ivs, &lp.body, false, lp, &back)
-+                .into_iter()
-+                .map(|d| (d.stride, d.add_offset))
-+                .collect()
-+        };
-+
-+        // 1. Non-GEP scalar shift `(i + 1) << 2` is recognized at shift <= 3
-+        //    even with `compare_recurrence` disabled.
-+        assert_eq!(inspect(&build_loop(2, false)), vec![(4, 1)]);
-+        // 2. Wide GEP shift `(i + 1) << 4` (stride 16, beyond hardware SIB/lsl
-+        //    scale) is recognized for GEP uses across all targets.
-+        assert_eq!(inspect(&build_loop(4, true)), vec![(16, 1)]);
-+        // 3. Hardware scaled-index GEP shift `(i + 1) << 2` (stride 4) is left
-+        //    for backend indexed folding (`[xB, xI, lsl #2]` / SIB).
-+        assert!(inspect(&build_loop(2, true)).is_empty());
++        bytes.source
++    } else {
++        None
 +    }
- }
-diff --git a/src/passes/iv_widen.rs b/src/passes/iv_widen.rs
-index 72490e697..77f6d0658 100644
---- a/src/passes/iv_widen.rs
-+++ b/src/passes/iv_widen.rs
-@@ -8200,4 +8200,130 @@ mod tests {
-             }
-         }
-     }
-+
-+    #[test]
-+    fn wide_pointer_add_load_store_and_gep_base_widen_when_exact_and_refuse_when_inexact() {
-+        let header_cmp = || {
-+            Some(Instruction::Cmp {
-+                dest: Value(2),
-+                op: IrCmpOp::Ult,
-+                lhs: Operand::Value(Value(1)),
-+                rhs: Operand::Const(IrConst::I32(64)),
-+                ty: IrType::U32,
-+            })
-+        };
-+        // 1. Exact wide address chain `addr = Add(arr, zext(i))` consumed by
-+        //    Load, Store, GEP-base and wide 64-bit integer Store value: must
-+        //    widen the U32 IV to U64 and pass SSA verification.
-+        let exact_body = vec![
-+            Instruction::Cast {
-+                dest: Value(10),
-+                src: Operand::Value(Value(1)),
-+                from_ty: IrType::U32,
-+                to_ty: IrType::U64,
-+            },
-+            Instruction::BinOp {
-+                dest: Value(11),
-+                op: IrBinOp::Add,
-+                lhs: Operand::Value(Value(50)),
-+                rhs: Operand::Value(Value(10)),
-+                ty: IrType::U64,
-+            },
-+            Instruction::Load {
-+                dest: Value(12),
-+                ptr: Value(11),
-+                ty: IrType::U8,
-+                volatile: false,
-+                seg_override: AddressSpace::Default,
-+            },
-+            Instruction::Store {
-+                val: Operand::Value(Value(12)),
-+                ptr: Value(11),
-+                ty: IrType::U8,
-+                volatile: false,
-+                seg_override: AddressSpace::Default,
-+            },
-+            Instruction::GetElementPtr {
-+                dest: Value(13),
-+                base: Value(11),
-+                offset: Operand::Const(IrConst::I64(4)),
-+                ty: IrType::I8,
-+            },
-+            Instruction::Store {
-+                val: Operand::Value(Value(10)),
-+                ptr: Value(13),
-+                ty: IrType::U64,
-+                volatile: false,
-+                seg_override: AddressSpace::Default,
-+            },
-+        ];
-+        let mut func = counting_loop(
-+            "wide_ptr_add_exact",
-+            IrType::U32,
-+            IrBinOp::Add,
-+            exact_body,
-+            header_cmp(),
-+        );
-+        check(&mut func, 1);
-+
-+        // 2. IVW-RANGE-1 negative control: if a narrow wrapping Add precedes
-+        //    the U32->U64 cast under a runtime bound (so `intercept` is active
-+        //    and `cur_exact` is false), Load/Store/GEP-base on `Add(arr, w)`
-+        //    must refuse to widen.
-+        let inexact_body = vec![
-+            Instruction::BinOp {
-+                dest: Value(9),
-+                op: IrBinOp::Add,
-+                lhs: Operand::Value(Value(1)),
-+                rhs: Operand::Const(IrConst::I32(100)),
-+                ty: IrType::U32,
-+            },
-+            Instruction::Cast {
-+                dest: Value(10),
-+                src: Operand::Value(Value(9)),
-+                from_ty: IrType::U32,
-+                to_ty: IrType::U64,
-+            },
-+            Instruction::BinOp {
-+                dest: Value(11),
-+                op: IrBinOp::Add,
-+                lhs: Operand::Value(Value(50)),
-+                rhs: Operand::Value(Value(10)),
-+                ty: IrType::U64,
-+            },
-+            Instruction::Load {
-+                dest: Value(12),
-+                ptr: Value(11),
-+                ty: IrType::U8,
-+                volatile: false,
-+                seg_override: AddressSpace::Default,
-+            },
-+        ];
-+        let mut inexact = counting_loop(
-+            "wide_ptr_add_inexact",
-+            IrType::U32,
-+            IrBinOp::Add,
-+            inexact_body,
-+            None,
-+        );
-+        // Runtime bound in preheader (Value(60)) so range is full-domain and
-+        // `intercept` is active.
-+        inexact.blocks[0].instructions.push(Instruction::Copy {
-+            dest: Value(60),
-+            src: Operand::Const(IrConst::I32(64)),
-+        });
-+        inexact.blocks[1].instructions.push(Instruction::Cmp {
-+            dest: Value(2),
-+            op: IrCmpOp::Ult,
-+            lhs: Operand::Value(Value(1)),
-+            rhs: Operand::Value(Value(60)),
-+            ty: IrType::U32,
-+        });
-+        inexact.blocks[1].terminator = Terminator::CondBranch {
-+            cond: Operand::Value(Value(2)),
-+            true_label: BlockId(2),
-+            false_label: BlockId(4),
-+        };
-+        check(&mut inexact, 0);
-+    }
- }
-diff --git a/src/passes/set_membership.rs b/src/passes/set_membership.rs
-index f8711b57b..1d7a946b3 100644
---- a/src/passes/set_membership.rs
-+++ b/src/passes/set_membership.rs
-@@ -603,8 +603,9 @@ fn fold_round(func: &mut IrFunction) -> usize {
-         // ── Walk the chain, continuing over Skip members ──
-         let mut chain: Vec<Member> = vec![first];
-         loop {
--            let last = chain.last().unwrap();
--            let Some(miss) = last.miss else { break };
-+            let Some(miss) = chain.last().and_then(|last| last.miss) else {
-+                break;
-+            };
-             let Some(&next_idx) = label_to_idx.get(&miss.0) else {
-                 break;
-             };
-@@ -802,7 +803,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
-             .map(|(i, _)| i)
-             .collect();
-         if maskable.len() < 3 {
--            bi = chain.last().unwrap().bi + 1;
-+            bi = chain.last().map_or(bi + 1, |m| m.bi + 1);
-             continue;
-         }
-         let bounds = |k: Kind| -> (i64, i64) {
-@@ -828,21 +829,20 @@ fn fold_round(func: &mut IrFunction) -> usize {
-                 best = inside;
-             }
-         }
--        if best.len() < 3 {
--            bi = chain.last().unwrap().bi + 1;
-+        let (Some(lo), Some(hi)) = (
-+            best.iter()
-+                .filter(|_| best.len() >= 3)
-+                .map(|&i| bounds(chain[i].kind).0)
-+                .min(),
-+            best.iter()
-+                .filter(|_| best.len() >= 3)
-+                .map(|&i| bounds(chain[i].kind).1)
-+                .max(),
-+        ) else {
-+            bi = chain.last().map_or(bi + 1, |m| m.bi + 1);
-             continue;
--        }
-+        };
-         let absorbed = best;
--        let lo = absorbed
--            .iter()
--            .map(|&i| bounds(chain[i].kind).0)
--            .min()
--            .unwrap();
--        let hi = absorbed
--            .iter()
--            .map(|&i| bounds(chain[i].kind).1)
--            .max()
--            .unwrap();
-         let span = hi - lo;
-         let mut mask: u64 = 0;
-         for &i in &absorbed {
--- 
-2.47.3
-
++}
+diff --git a/tests/regression/portable_bswap_networks.c b/tests/regression/portable_bswap_networks.c
+new file mode 100644
+--- /dev/null
++++ b/tests/regression/portable_bswap_networks.c
+@@ -0,0 +1,67 @@
++typedef unsigned long long U64;
++__attribute__((noinline)) U64 bytes64(U64 x) {
++    return ((x & 0x00000000000000ffULL) << 56) |
++           ((x & 0x000000000000ff00ULL) << 40) |
++           ((x & 0x0000000000ff0000ULL) << 24) |
++           ((x & 0x00000000ff000000ULL) << 8) |
++           ((x & 0x000000ff00000000ULL) >> 8) |
++           ((x & 0x0000ff0000000000ULL) >> 24) |
++           ((x & 0x00ff000000000000ULL) >> 40) |
++           ((x & 0xff00000000000000ULL) >> 56);
++}
++__attribute__((noinline)) U64 xor64(U64 x) {
++    return ((x & 0x00000000000000ffULL) << 56) ^
++           ((x & 0x000000000000ff00ULL) << 40) ^
++           ((x & 0x0000000000ff0000ULL) << 24) ^
++           ((x & 0x00000000ff000000ULL) << 8) ^
++           ((x & 0x000000ff00000000ULL) >> 8) ^
++           ((x & 0x0000ff0000000000ULL) >> 24) ^
++           ((x & 0x00ff000000000000ULL) >> 40) ^
++           ((x & 0xff00000000000000ULL) >> 56);
++}
++__attribute__((noinline)) U64 stages64(U64 x) {
++ x = ((x >> 8) & 0x00ff00ff00ff00ffULL) | ((x & 0x00ff00ff00ff00ffULL) << 8);
++ x = ((x >> 16) & 0x0000ffff0000ffffULL) | ((x & 0x0000ffff0000ffffULL) << 16);
++ return (x >> 32) | (x << 32);
++}
++__attribute__((noinline)) unsigned bytes32(unsigned x) {
++ return ((x & 255U) << 24) | ((x & 65280U) << 8) |
++        ((x & 16711680U) >> 8) | ((x & 4278190080U) >> 24);
++}
++__attribute__((noinline)) unsigned stages32(unsigned x) {
++ x = ((x >> 8) & 0x00ff00ffU) | ((x & 0x00ff00ffU) << 8);
++ return (x >> 16) | (x << 16);
++}
++/* Not a permutation: one input byte is deliberately absent. */
++__attribute__((noinline)) U64 missing_byte(U64 x) {
++ return ((x & 0xffULL) << 56) | ((x & 0xff00ULL) << 40) |
++        ((x & 0xff0000ULL) << 24) | ((x & 0xff000000ULL) << 8) |
++        ((x & 0xff00000000ULL) >> 8) | ((x & 0xff0000000000ULL) >> 24) |
++        ((x & 0xff00000000000000ULL) >> 56);
++}
++#ifndef BYTE_SWAP_KERNELS_ONLY
++extern int puts(const char *);
++static U64 reference(U64 x, unsigned bytes) {
++ U64 result=0;
++ for (unsigned i=0;i<bytes;++i) { result=(result<<8)|(x&255); x>>=8; }
++ return result;
++}
++static int check(U64 x) {
++ U64 want=reference(x,8);
++ unsigned narrow=(unsigned)reference((unsigned)x,4);
++ return bytes64(x)!=want || xor64(x)!=want || stages64(x)!=want || bytes32((unsigned)x)!=narrow ||
++        stages32((unsigned)x)!=narrow || missing_byte(x)!=(want & ~(255ULL<<8));
++}
++int main(void) {
++ for(unsigned lane=0;lane<8;++lane)
++  for(unsigned byte=0;byte<256;++byte)
++   if(check((U64)byte<<(8*lane))) return 1;
++ U64 x=0x123456789abcdef0ULL;
++ for(unsigned i=0;i<65536;++i) {
++  x^=x<<13; x^=x>>7; x^=x<<17;
++  if(check(x)) return 2;
++ }
++ puts("portable byte-swap networks: PASS (67584 inputs, six functions)");
++ return 0;
++}
++#endif
