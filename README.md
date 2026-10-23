@@ -3,3 +3,11 @@
 This repository contains a couple of customized PKGBUILDs for Arch Linux and custom patches that aim to maximize performance on my hardware. Some are heavily modified and might only be usable on CPUs which are compatible with recent CPU architectures. This repository is first and foremost focused for my personal use. It is also meant to demonstrate some ideas for further refinements and performance optimizations which could trickle down to the official PKGBUILDS and upstream projects eventually. These PKGBUILDS used to produce working binaries at the time they were uploaded. Nevertheless, Arch is a rolling release and some might carry outdated versions or patches with them. Please take a look at the PKGBUILD first to make sure they fit your personal needs. Be aware that a lot of packages are targeting the head of a development branch, it can happen that you end up with an unusable package even though everything went smoothly at first. Be prepared to get back to a safe state and use them at your own risk. I also cannot guarantee that they work everywhere and at any future point in time. I'll try to keep them up to date as long as I use them myself. I cannot make any promises for timely future updates though.
 
 ***WARNING: Be aware that the toolchain packages, the Kernel and my used compiler flags deliberatly favor performance over security. You might want to change some options/compiler flags for your machine.***
+
+## Maintenance safeguards
+
+The collection has repository-local static validation, a byte-sensitive PGO/BOLT
+lock, and changed-package Arch preflight tooling.  See
+[`maintenance/README.md`](maintenance/README.md) before updating a recipe.
+The maintenance scope is `packages/**`; the toolchain directories are excluded
+until explicitly scheduled.
