@@ -95,13 +95,24 @@ index bff4b8132..68ea6045d 100644
          bash tests/regression/check_verify_ir_clean.sh
          python3 scripts/audit_census.py --check
 diff --git a/docs/PERFORMANCE-BACKLOG.md b/docs/PERFORMANCE-BACKLOG.md
-index ec43af179..62fa65270 100644
+index ec43af179..1238819ec 100644
 --- a/docs/PERFORMANCE-BACKLOG.md
 +++ b/docs/PERFORMANCE-BACKLOG.md
-@@ -4,6 +4,34 @@ Keep unimplemented opportunities here only when a reproducible workload or
+@@ -4,6 +4,45 @@ Keep unimplemented opportunities here only when a reproducible workload or
  assembly witness exists. Move completed work to its change review with measured
  results; do not turn unmeasured expectations into claims.
  
++## Split-latch diamond coalescing: exact witness closed
++
++The load-before-if/latch-copy case in `zlib_ng_slide_hash` is implemented and
++measured in [the S81 review](../engineering/FOLLOWUP-2026-10-30-phi-latch-diamond.md):
++S81/S80 is **0.9774543992** (CI95 [0.9719785956, 0.9790335418]) and
++S81/GCC is **0.8503659416** (CI95 [0.8418807346, 0.8571916937]) over 11
++output-checked batched rounds. Callgrind removes exactly one move per hash
++insert. Clang and ICX remain faster, so this is not a best-oracle result.
++Full diamonds and arbitrary multi-arm regions remain rejected; do not treat
++this exact proof as permission for broader coalescing or IV replacement.
++
 +## Unsigned saturating subtract: scalar work closed, extensions still proof-gated
 +
 +The exact late scalar matcher, x86-64 CMOV lowering, baseline-i686
@@ -762,6 +773,258 @@ index 000000000..aff2853d1
 +5. **Continue the larger generated-code backlog.** The SQLite/glibc/zlib-ng,
 +   register-allocation, whole-workload, and real-PMU tasks in the performance
 +   backlog remain open. This single kernel improvement does not close them.
+diff --git a/engineering/FOLLOWUP-2026-10-30-phi-latch-diamond.md b/engineering/FOLLOWUP-2026-10-30-phi-latch-diamond.md
+new file mode 100644
+index 000000000..5e7c5a4e4
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-10-30-phi-latch-diamond.md
+@@ -0,0 +1,114 @@
++# Split-latch diamond phi coalescing (S81)
++
++## Finding and root cause
++
++`zng_insert_string_batch` in `zlib_ng_slide_hash` carried `match_head` in a
++second register even though its latch value was exactly the already loaded
++`h`:
++
++```text
++body:   h = load(head[hm])
++        if (h != idx) { store arm } else { skip arm }
++latch:  match_head = h
++```
++
++S80 emitted `movq %r12,%r11` on every iteration. The destructive-update
++coalescer already had the required old-phi, folded-address, source-use and
++liveness checks, but its shape gate admitted only a same-block update or a
++single-predecessor chain. This direct-edge-plus-middle-arm diamond was refused
++before those proofs ran.
++
++This was not an IVSR, unrolling, or benchmark-name problem. In particular,
++UNIVSR's refusal is intentional here: the 16-bit `idx` recurrence can wrap and
++is not a sound general replacement for the independent pointer recurrence.
++
++## Surgical change
++
++`phi_update_region` is now the single shape definition consumed by both the
++coalescing legality gate and the caller-saved-clobber window. It accepts:
++
++1. the existing same-block and bounded single-predecessor-chain forms; and
++2. exactly `source -> {middle, latch}`, `middle -> latch`, with two source
++   successors, two latch predecessors, one middle predecessor and one middle
++   successor.
++
++A full two-middle-arm diamond, any outside predecessor, any extra successor,
++or a more general CFG is rejected. The region is ordered source-to-latch and
++retains the existing loop-depth policy.
++
++All established safety proofs remain mandatory after shape recognition:
++no old-phi read or deferred/folded old-phi address read in the update window,
++no unsafe source use elsewhere, no source-home redefinition, no source use
++before the latch copy, and no unsupported multi-def source. The apply phase
++still revalidates the actual definitions and register interference.
++
++The clobber walker now visits the middle arm even when the direct
++source-to-latch edge exists. A call on either arm therefore prevents a
++caller-saved inheritance; a proven callee-saved home remains eligible.
++
++## Regression coverage
++
++Rust tests cover the pure graph contract, the positive load/store/latch case,
++an old-phi read in the middle arm, a call in that arm, an outside-predecessor
++refusal and a full-diamond refusal. Results:
++
++- 22/22 diamond-focused tests passed;
++- 153/153 `backend::regalloc::` tests passed;
++- the pre-existing IPA dual-classifier regression remained 1/1;
++- rustfmt and `git diff --check` passed (Clippy receipt is recorded in the S81
++  validation manifest).
++
++`tests/regression/phi_coalesce_split_latch_diamond.c` adds execution coverage
++for zero-trip, both if arms, an old-phi read, and a middle-arm call. GCC, S80
++and S81 passed at O1/O2/O3 on x86-64 and i686. The separate S81 cross drivers
++also passed against GCC with identical stdout and exit status at O1/O2/O3 on
++AArch64 and RISC-V under QEMU, plus the standalone i686 driver. The official
++strict AArch64 single-case runner passed 1/1.
++
++## Measured result
++
++The measured objects were produced by direct `-O2 -fwrapv
++-ffp-contract=off -c` compilation. `benchmark_native_batched.py` retained
++whole-object identity checks, fresh child state, randomized arm order and
++stdout verification for every repetition. Eleven retained rounds used 165
++iterations per batch. Direct paired S81/reference results on Slide were:
++
++| comparison | median ratio | exploratory CI95 |
++| --- | ---: | ---: |
++| S81 / S80 | **0.9774543992** | [0.9719785956, 0.9790335418] |
++| S81 / GCC 16.2 | **0.8503659416** | [0.8418807346, 0.8571916937] |
++| S81 / Clang 23.1.4 | 1.1366987837 | [1.1300630362, 1.1403342361] |
++| S81 / ICX 2026.2 | 1.0868121245 | [1.0847186377, 1.0907520313] |
++
++Thus S81 is about 2.25% faster than S80 and 14.96% faster than GCC on this
++workload. It does **not** beat Clang or ICX there; no best-oracle claim is
++made. A short default-PASSES run was deliberately not used as acceptance
++because its confidence interval crossed one.
++
++Callgrind on the original (non-batched) executables measured 17,887,610 Ir for
++S80 and 17,592,706 Ir for S81: 294,904 fewer instructions, exactly one removed
++move for each of the 32,760 + 512*512 hash-insert iterations. This simulated
++count supports the mechanism; it is not substituted for the native timing.
++
++On `byte_load_reassembly`, `sqlite_vdbe_serial` and `linux_list_sort`, the
++S80/S81 measured objects and linked binaries were byte-identical. The harness
++therefore shared their samples rather than inventing timing deltas.
++
++## Object inspection and remaining debt
++
++GDB disassembly confirms the latch move is gone and the rest of the hot loop
++is unchanged apart from register renaming. `objtool --stackval` with
++`SRCARCH=x86` reported the same pre-existing BP/frame-pointer warnings on S80
++and S81 (the insert offset moved by five bytes), not a new warning class.
++`pahole` accepted the `-g` object but emitted no type records; that is not
++presented as structural type evidence.
++
++This closes only the exact split-latch diamond witness. It does not justify
++arbitrary multi-arm coalescing, countdown-IV replacement, broader UNIVSR, or
++loop-carried spill relaxation. Those remain separate proof-and-measurement
++tasks. The remaining Slide gap to Clang/ICX and the SQLite/List-Sort gaps are
++still open.
++
++Validation receipts are retained under
++`/home/user/artifacts/S81-phi-latch-diamond-validated/` and the raw benchmark
++runs under `/home/user/artifacts/S78-rebased-performance/`.
+diff --git a/engineering/FOLLOWUP-2026-10-30-review-hardening.md b/engineering/FOLLOWUP-2026-10-30-review-hardening.md
+new file mode 100644
+index 000000000..a8f06787a
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-10-30-review-hardening.md
+@@ -0,0 +1,126 @@
++# S82 — lokaler CI-Blocker und Review-Hardening (2026-10-30)
++
++Dieser Kandidat bleibt Main `0ff1d3f12a75ce83f491088f0ec27526f03d6db9` plus
++die zuvor validierte S81-Arbeit. Die Review-Punkte wurden am Code geprüft,
++nicht als vorgefertigte Tatsachen übernommen. Die rote GitHub-Meldung wurde
++ausschließlich lokal reproduziert und korrigiert; kein GitHub-Lauf diente als
++Ersatz für lokale Tests.
++
++## F1: Census und transaktionale Strided-Emission
++
++Der exakte Blocker war `python3 scripts/audit_census.py --check`:
++`panic_sites 924 -> 933` und `fns_over_500 97 -> 98`. Die Baseline wurde
++nicht erhöht. Der Reducer verwendet nun `Option` vom Intrinsic-Mapping bis zur
++Transformation. Ungültige Loads, Operationen, Shift-Formen, Konstanten und
++interne Pattern-Indices verweigern die gesamte Umwandlung. Planung,
++Preheader-, Body- und Reduce-Puffer sind vor der ersten IR-Mutation fertig;
++auch die beiden Scalar-Header-Phi-Ziele werden vor dem Commit validiert.
++Die bisherige Compact-Load-Panik und der Konstanten-Fallback auf null wurden
++im selben Pfad entfernt. Die Phasen sind getrennt (`transform` unter 100
++Zeilen), und direkte interne Refusal-Tests prüfen unveränderte Blöcke und
++Fresh-ID-Zähler.
++
++## F2: Klassifikationen ohne semantische Superliste
++
++Nicht jede ähnliche Intrinsic-Liste beschreibt denselben Vertrag.
++`may_read_memory`, `produces_vector_value`, `vector_result_width`, die
++Alias-Footprints und Vec-SSA-/Raw-Reader-Mengen bleiben deshalb getrennt.
++Eine Zusammenfassung zu einer Speicher- oder SIMD-Superliste wäre falsch.
++
++Zwei echte Duplikate wurden dagegen zusammengeführt:
++
++* Die RA-Hilfe verwendet zentrale `vector_result_width`-Metadaten und nur
++  noch die expliziten scalar-result `HorizontalAdd*`-Ausnahmen. Ihre alte
++  Handliste hatte bereits den AVX2-Strided-Load vermisst. Ein Test enthält
++  die vollständige frühere Menge, alle drei Strided-Loads sowie Store- und
++  Scalar-Negativkontrollen. Dadurch bleibt jeder alte positive Fall erhalten,
++  während neue zentrale SIMD-Resultate nicht erneut vergessen werden können.
++  Die Aufnahme weiterer zentral klassifizierter SIMD-Produzenten ist
++  ausdrücklich intendiert und als solche getestet: Sie verstärkt nur die
++  Schutzbedingung um den explizit opt-in Scalar-FP-Stack-Experimentierschalter;
++  die Default-RA-Konfiguration aktiviert diesen Sonderweg nicht.
++* Core- und allocating MachInst-Last-Write-Klassifikator konsumieren denselben
++  Iterator für implizite Writes. Reihenfolge und Typed-Return-Tie-Break sind
++  unverändert. Bestehende Call-/IPA-Tests und ein Division/Raw-Paritätstest
++  prüfen beide Konsumenten.
++
++## F3: Downcount, Scans und Source-Spans
++
++Der Downcount-Guard wird als Ein-Instruction-Slice gematcht und nach allen
++Beweisen mit seinen Spans geleert; `guard_cmp = 0` ist entfallen. Die
++Definitionen von `iv` und `next` werden zunächst nur in ihren kleinen
++Preheader-/Latch-Blöcken bestimmt und müssen dort jeweils eindeutig sein. Der
++ohnehin notwendige globale Validierungsscan weist jede weitere Definition
++außerhalb dieser Stellen sowie unzulässige Uses zurück. Dadurch entfallen
++beide separaten vollständigen IR-Definitionscans, ohne ein großes
++DefUse-Album zu erzeugen. CFG-Daten werden nicht über eine Mutation hinweg
++wiederverwendet. Refusal-Tests umfassen Live-outs, ungültige Rekurrenzen und
++zusätzliche `iv`-/`next`-Definitionen im Preheader, Latch und Exit.
++
++Beim Strided-Preheader werden für neu angehängte Instruktionen Dummy-Spans
++ergänzt, wenn das Array vorher exakt parallel war. Nicht-Debug-Blöcke bleiben
++spanlos. Ein positiver Transformationstest prüft die Parallelität nach dem
++Commit; der Downcount-Test prüft das Entfernen des letzten Guard-Spans.
++
++## F4: orthogonale bereits enthaltene Änderungen
++
++Diese Punkte bleiben einzeln abgegrenzt und werden nicht als
++Vektorisierungsarbeit ausgegeben:
++
++* **ILP32-Predefines / Compatibility:** `LONG_MAX`, `SIZE_MAX`,
++  `INTPTR_MAX` und ihre übrigen unpräfixierten Geschwister gehören zu
++  `<limits.h>` beziehungsweise `<stdint.h>`, nicht zu den Compiler-Predefines.
++  GCC exportiert sie weder unter LP64 noch ILP32. Das Entfernen korrigiert
++  diese Bare-Use-Inkompatibilität; die `__…__`-Konstanten bleiben erhalten,
++  und die libc-Header liefern weiterhin die üblichen Makros. Es gibt keine
++  ABI-Änderung. `check_macro_parity.sh` verbietet die unpräfixierten Namen
++  ausdrücklich in beiden Datenmodellen.
++* **Cross-Linker-Diagnose:** AArch64/RISC-V emittieren die betreffenden
++  DT_FLAGS/DT_FLAGS_1-Bits nicht. `-z origin`, `nodelete` und verwandte
++  Optionen werden deshalb sichtbar als ignoriert gemeldet statt still
++  akzeptiert; `--fatal-warnings` behält seine normale Bedeutung. Implementierte
++  Optionen wie die geprüften Gegenkontrollen bleiben warnfrei.
++* **Intrinsic-Diagnosen:** Die ARM-/i686-Formatstrings geben jetzt den
++  tatsächlichen Opcode statt eines literalen `{op:?}` aus. Tests prüfen Name
++  und Fehlen des Formatlochs.
++* **RCX-Cache und RA:** Der generische RCX-Loader invalidiert einen alten
++  Secondary-Cache-Anspruch, weil er den neuen Wert nicht parkt. Die
++  S81-Diamant- und IPA-Regeln bleiben separat dokumentiert; S82 ändert nur
++  die oben beschriebenen gemeinsamen Klassifikatoren.
++
++## F5: Tests, Alias-Spannen und ISA-/Optimierungsmatrix
++
++Die Diamant-Testform verwendet benannte Struct-Felder statt positionaler
++Booleans. Die X4-Alias-Spannen wurden gegen den Emitter geprüft und bleiben
++unverändert: exakt zwei DWORDs bei `+0`/`+8` haben das konservative Intervall
++12 Bytes; der Compact-Load liest zwei volle 16-Byte-Hälften und benötigt 32
++Bytes. Eine kleinere Compact-Spanne wäre falsch.
++
++Die fokussierten Strided- und Saturating-Subtract-Gates umfassen jetzt O1 und
++Os auf x86-64 und x86-64-v3. Da der dedizierte Reducer absichtlich O2+ und
++nicht size-optimiert ist, verlangen diese Level korrekte Fallback-Ausgabe,
++keine erzwungene Vektorform. GNU `as --64 -march=generic64` prüft die
++SSE2-Assemblys als unabhängige ISA-Instanz; der O2-Gate behält zusätzlich die
++Guard-Page-/Watchpoint- und GCC-Differentialtests.
++
++## Validierung und Ergebnisgrenzen
++
++Der exakte Endstand wurde mit O1-`fastbuild`, exakt `-j2` und `-D warnings`
++für Host und Cross-Treiber gebaut. Clippy über Bibliothek und Tests ist nach
++einer `unwrap_or_default`-Bereinigung warnfrei. Die aktuelle Testbinary
++bestätigt 111/111 gezielt ausgewählte Tests; ein Lauf mit null selektierten
++Tests gilt nicht als Gate. Strided/Saturating (O1/O2/Os, SSE2/AVX2, GAS und
++Watchpoints), Downcount, Macro-Parität und das affine Kontrollmodell sind
++ebenso grün wie Census und Scanner-Selftest. Der Census bleibt bei 917/924
++Panic-Sites, 97/97 Funktionen über 500 Zeilen und ohne gewachsene Metrik.
++
++Neun Cross- und 18 Host-/m32-Assemblyvergleiche gegen S81 sind byteidentisch.
++AArch64, RISC-V und i686 bestehen zusätzlich alle neun statischen
++O1/O2/O3-Laufzeitdifferentiale gegen GCC. Der Downcount-Stress weist bei
++beiden Compilern 48/48 Admissions und byteidentische Assembly auf. Neun
++verzahnte Compile-Time-Paare ergaben im Endlauf S82/S81 = 0,985 (Wall) und
++0,982 (CPU), nach einem Vorlauf von 1,007; die Richtungsumkehr bei einem etwa
++0,15-Sekunden-Probe zeigt die Messrausch-Grenze. Daraus wird kein
++Compile-Time- oder sonstiger Performancegewinn behauptet. Die Beleglast für
++die Scan-Reduktion liegt auf der direkt prüfbaren Entfernung der zwei
++Ganzfunktionsdurchläufe und den semantischen Refusal-Tests.
 diff --git a/scripts/README.md b/scripts/README.md
 index 00edc0324..28b362377 100644
 --- a/scripts/README.md
@@ -1641,10 +1904,41 @@ index 3c41914a5..2a410e757 100644
      /// version") so both the plain and the `-Wl,` spelling must parse —
      /// it is recorded, not enforced (see the field docs).
 diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 744a1f17c..aaa87627b 100644
+index 744a1f17c..04a8dea8a 100644
 --- a/src/backend/regalloc.rs
 +++ b/src/backend/regalloc.rs
-@@ -7811,6 +7811,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
+@@ -4715,7 +4715,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+     // One CFG for the whole candidate loop: the caller-saved window check
+     // needs the predecessor sets, and deriving them inside the check turned
+     // a linear scan into O(candidates x (V+E)) on every function.
+-    let mut cfg_preds: Option<analysis::FlatAdj> = None;
++    let mut cfg: Option<(analysis::FlatAdj, analysis::FlatAdj)> = None;
+     for candidate in &phi_coalesce {
+         let src_has_other_consumers = uses_excluding(
+             func,
+@@ -4723,11 +4723,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+             candidate.block_idx,
+             candidate.copy_idx,
+         ) > 0;
+-        let preds = cfg_preds.get_or_insert_with(|| {
+-            let labels = analysis::build_label_map(func);
+-            analysis::build_cfg(func, &labels).0
+-        });
+-        if !phi_window_clobbers_caller_saved(func, candidate, preds) && !src_has_other_consumers {
++        let (preds, succs) = {
++            let (preds, succs) = cfg.get_or_insert_with(|| {
++                let labels = analysis::build_label_map(func);
++                analysis::build_cfg(func, &labels)
++            });
++            (&*preds, &*succs)
++        };
++        if !phi_window_clobbers_caller_saved(func, candidate, preds, succs)
++            && !src_has_other_consumers
++        {
+             if config.ra_config.debug_phi_coalesce {
+                 eprintln!(
+                     "[PHI_COALESCE] fn={} HOMELESS src=v{} (dest=v{} block={} copy_idx={})",
+@@ -7811,6 +7816,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                  | O::VecLoadI32x4
                  | O::VecLoadI32x8
                  | O::VecLoadStrided2I32x8
@@ -1653,7 +1947,7 @@ index 744a1f17c..aaa87627b 100644
                  | O::VecLoadI32x4Pair
                  | O::VecPackI32x4Pair
                  | O::VecLoadI8x32
-@@ -9389,7 +9391,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
+@@ -9389,7 +9396,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
              // stays register-homed (no per-iter stack round-trip, which made
              // the vectorized find_max SLOWER than scalar).
              O::VecBroadcastI32x8 | O::VecMaxI32x8 | O::VecMinI32x8 => Some(5),
@@ -1667,7 +1961,7 @@ index 744a1f17c..aaa87627b 100644
              // HALF-WIDE dword-pair endpoints: the value web is the
              // I32x4 family (the intermediate ops ARE the I32x4
              // intrinsics), so the load/store/gather endpoints join
-@@ -10580,6 +10587,8 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
+@@ -10580,6 +10592,8 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
          | O::VecOrI64x4
          | O::VecXorI64x4 => Some(3),
          O::VecLoadI32x4
@@ -1676,6 +1970,487 @@ index 744a1f17c..aaa87627b 100644
          | O::VecSubI32x4
          | O::VecAddI32x4
          | O::VecMulI32x4
+@@ -12626,24 +12640,6 @@ fn source_home_survives_dest_redefs_in(
+     true
+ }
+ 
+-fn terminator_targets_label(term: &Terminator, label: crate::ir::reexports::BlockId) -> bool {
+-    match term {
+-        Terminator::Branch(target) => *target == label,
+-        Terminator::CondBranch {
+-            true_label,
+-            false_label,
+-            ..
+-        } => *true_label == label || *false_label == label,
+-        Terminator::Switch { cases, default, .. } => {
+-            *default == label || cases.iter().any(|&(_, t)| t == label)
+-        }
+-        Terminator::IndirectBranch {
+-            possible_targets, ..
+-        } => possible_targets.contains(&label),
+-        Terminator::Return(_) | Terminator::Unreachable => false,
+-    }
+-}
+-
+ /// Longest single-predecessor chain (in intermediate blocks) that the phi
+ /// coalescer will reason through. Both the liveness gate and the
+ /// caller-saved-clobber window use this one bound: a longer reach on one
+@@ -12687,16 +12683,78 @@ fn single_pred_chain(
+     None
+ }
+ 
+-/// [`single_pred_chain`] plus the loop-depth admissibility policy: every
++/// Blocks between a destructive update and its latch copy.
++///
++/// Besides a single-predecessor chain, accept the precise split-latch
++/// diamond `source -> {middle, copy}`, `middle -> copy`.  The source defines
++/// the incoming value before the branch; both arms then converge on the
++/// latch copy.  This is the shape of `last = load(...); if (...) store(last)`
++/// followed by `phi = last`.  The direct source-to-copy edge is essential:
++/// a full two-arm diamond has a second, uninspected middle block and stays
++/// rejected.  Exact predecessor/successor counts prevent an outside path
++/// from bypassing the source definition or entering the inspected window.
++///
++/// The caller-saved window and the liveness gate deliberately consume this
++/// ONE shape function.  In particular, the direct edge must not cause the
++/// clobber check to skip the middle arm.
++fn phi_update_region(
++    preds: &analysis::FlatAdj,
++    succs: &analysis::FlatAdj,
++    source_block: usize,
++    copy_block: usize,
++) -> Option<Vec<usize>> {
++    if let Some(mids) = single_pred_chain(preds, source_block, copy_block) {
++        return Some(mids);
++    }
++    if source_block == copy_block || succs.len(source_block) != 2 {
++        return None;
++    }
++
++    let mut direct = false;
++    let mut middle = None;
++    for &s in succs.row(source_block) {
++        let s = s as usize;
++        if s == copy_block {
++            if std::mem::replace(&mut direct, true) {
++                return None;
++            }
++        } else if middle.replace(s).is_some() {
++            return None;
++        }
++    }
++    if !direct {
++        return None;
++    }
++    let middle = middle?;
++    if middle == source_block {
++        return None;
++    }
++
++    let copy_preds = preds.row(copy_block);
++    if copy_preds.len() != 2
++        || !copy_preds.iter().any(|&p| p as usize == source_block)
++        || !copy_preds.iter().any(|&p| p as usize == middle)
++        || preds.len(middle) != 1
++        || preds.row(middle)[0] as usize != source_block
++        || succs.len(middle) != 1
++        || succs.row(middle)[0] as usize != copy_block
++    {
++        return None;
++    }
++    Some(vec![middle])
++}
++
++/// [`phi_update_region`] plus the loop-depth admissibility policy: every
+ /// intermediate block must sit at least as deep as the copy block, so the
+ /// source is born on the same loop-carried path rather than in a preheader.
+-fn single_pred_chain_blocks(
++fn phi_update_region_blocks(
+     preds: &analysis::FlatAdj,
++    succs: &analysis::FlatAdj,
+     liveness: &LivenessResult,
+     source_block: usize,
+     copy_block: usize,
+ ) -> Option<Vec<usize>> {
+-    let mids = single_pred_chain(preds, source_block, copy_block)?;
++    let mids = phi_update_region(preds, succs, source_block, copy_block)?;
+     let min_depth = liveness
+         .block_loop_depth
+         .get(copy_block)
+@@ -12712,18 +12770,18 @@ fn single_pred_chain_blocks(
+ }
+ 
+ /// True iff a caller-saved instruction can execute between the source's
+-/// definition and the latch copy on *every* path the coalescer reasons
+-/// about: the source block's tail, the sole single-predecessor chain of
+-/// intermediate blocks (`single_pred_chain`, the same shape the liveness
+-/// gate admits), and the copy block's prefix.
++/// definition and the latch copy on *any* path the coalescer reasons about:
++/// the source block's tail, every intermediate block in [`phi_update_region`]
++/// (the same shape the liveness gate admits), and the copy block's prefix.
+ ///
+-/// `preds` is the CFG the caller already has. Rebuilding it per candidate
+-/// here made this check O(candidates x (V+E)) on every function's register
+-/// allocation; the caller now builds one CFG for the whole candidate loop.
++/// `preds`/`succs` are the CFG the caller already has. Rebuilding either per
++/// candidate made this check O(candidates x (V+E)) on every function's
++/// register allocation; callers build one CFG for the whole candidate loop.
+ fn phi_window_clobbers_caller_saved(
+     func: &IrFunction,
+     cand: &PhiCoalesceCandidate,
+     preds: &analysis::FlatAdj,
++    succs: &analysis::FlatAdj,
+ ) -> bool {
+     let Some(copy_block) = func.blocks.get(cand.block_idx) else {
+         return false;
+@@ -12751,12 +12809,10 @@ fn phi_window_clobbers_caller_saved(
+         {
+             return true;
+         }
+-        // The direct-edge case needs no walk: the source tail above already
+-        // covers every instruction on that path. When the edge is absent,
+-        // every intermediate block of the chain is in the window.
+-        if !terminator_targets_label(&src_block.terminator, copy_block.label)
+-            && let Some(mids) = single_pred_chain(preds, cand.source_block_idx, cand.block_idx)
+-        {
++        // Walk the region even when source -> copy is a direct edge: the
++        // split-latch diamond has that edge AND a middle arm whose calls are
++        // just as destructive as calls on the direct path.
++        if let Some(mids) = phi_update_region(preds, succs, cand.source_block_idx, cand.block_idx) {
+             return mids.iter().any(|&m| {
+                 func.blocks[m]
+                     .instructions
+@@ -12987,13 +13043,14 @@ fn apply_phi_coalesce_assignments_with_config(
+             }
+         }
+ 
+-        let preds = &cfg
+-            .get_or_insert_with(|| {
++        let (preds, succs) = {
++            let (preds, succs) = cfg.get_or_insert_with(|| {
+                 let label_to_idx = analysis::build_label_map(func);
+                 analysis::build_cfg(func, &label_to_idx)
+-            })
+-            .0;
+-        if phi_window_clobbers_caller_saved(func, candidate, preds)
++            });
++            (&*preds, &*succs)
++        };
++        if phi_window_clobbers_caller_saved(func, candidate, preds, succs)
+             && !callee_saved.iter().any(|r| r.0 == reg.0)
+         {
+             if ra_config.debug_phi_coalesce {
+@@ -13755,18 +13812,18 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
+             // observed after the source's definition along ANY path out of
+             // the source block, not merely along the latch.
+             let mid_blocks = if !same_block {
+-                single_pred_chain_blocks(&preds, liveness, source_block, block_idx)
++                phi_update_region_blocks(&preds, &succs, liveness, source_block, block_idx)
+             } else {
+                 None
+             };
+-            let pred_is_unique = mid_blocks.is_some();
++            let pred_region_ok = mid_blocks.is_some();
+             let mid_blocks = mid_blocks.unwrap_or_default();
+             // Part 2 proves its predecessor structure in `detect_part2_chain`
+             // (`u`'s block is a pred of the copy block and every other pred
+             // carries the passthrough), so it bypasses this gate; the
+             // single-def path keeps it unchanged.
+             let part2_pred_ok = part2.is_some();
+-            if !part2_pred_ok && !(same_block && source_def_idx < copy_idx || pred_is_unique) {
++            if !part2_pred_ok && !(same_block && source_def_idx < copy_idx || pred_region_ok) {
+                 if debug {
+                     eprintln!(
+                         "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): def block/index {}:{} cannot feed copy {}:{}",
+@@ -15478,9 +15535,9 @@ mod phi_coalesce_tests {
+             source_def_idx: 0,
+             copy_idx: 2,
+         };
+-        let (preds, _) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
++        let (preds, succs) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
+         assert!(
+-            phi_window_clobbers_caller_saved(&func, &cand, &preds),
++            phi_window_clobbers_caller_saved(&func, &cand, &preds, &succs),
+             "strtol in the (def, copy) window must be a caller-saved clobber"
+         );
+ 
+@@ -15891,9 +15948,9 @@ mod phi_coalesce_tests {
+             source_def_idx: 0,
+             copy_idx: 0,
+         };
+-        let (preds, _) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
++        let (preds, succs) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
+         assert!(
+-            !phi_window_clobbers_caller_saved(&func, &cand, &preds),
++            !phi_window_clobbers_caller_saved(&func, &cand, &preds, &succs),
+             "precondition: the call sits in the exit block, outside the (def, copy) window"
+         );
+ 
+@@ -19139,6 +19196,178 @@ mod scalar_lane_class_tests {
+             "expected (10, 11) phi coalesce across 2-hop latch chain, got {cands:?}"
+         );
+     }
++
++    #[derive(Default)]
++    struct SplitLatchDiamondShape {
++        old_phi_read: bool,
++        middle_call: bool,
++    }
++
++    fn split_latch_diamond(shape: SplitLatchDiamondShape) -> IrFunction {
++        let SplitLatchDiamondShape {
++            old_phi_read,
++            middle_call,
++        } = shape;
++        use crate::common::types::AddressSpace;
++        use crate::ir::reexports::IrCmpOp;
++        let block = |label: u32, instructions, terminator| BasicBlock {
++            label: BlockId(label),
++            instructions,
++            terminator,
++            source_spans: vec![],
++        };
++        let mut middle = vec![Instruction::Store {
++            val: Operand::Value(Value(11)),
++            ptr: Value(40),
++            ty: IrType::U32,
++            seg_override: AddressSpace::Default,
++            volatile: false,
++        }];
++        if old_phi_read {
++            middle.push(Instruction::Store {
++                val: Operand::Value(Value(10)),
++                ptr: Value(40),
++                ty: IrType::U32,
++                seg_override: AddressSpace::Default,
++                volatile: false,
++            });
++        }
++        if middle_call {
++            middle.push(Instruction::Call {
++                func: "strtol".into(),
++                info: crate::ir::reexports::CallInfo::default(),
++            });
++        }
++        let mut f = IrFunction::new("split_latch_diamond".into(), IrType::U32, vec![], false);
++        f.blocks.push(block(
++            0,
++            vec![
++                Instruction::Copy {
++                    dest: Value(10),
++                    src: Operand::Const(IrConst::I32(0)),
++                },
++                Instruction::Copy {
++                    dest: Value(30),
++                    src: Operand::Const(IrConst::I32(4)),
++                },
++                Instruction::GlobalAddr {
++                    dest: Value(40),
++                    name: "diamond_data".into(),
++                },
++            ],
++            Terminator::Branch(BlockId(1)),
++        ));
++        f.blocks.push(block(
++            1,
++            vec![
++                Instruction::Load {
++                    dest: Value(11),
++                    ptr: Value(40),
++                    ty: IrType::U32,
++                    seg_override: AddressSpace::Default,
++                    volatile: false,
++                },
++                Instruction::Cmp {
++                    dest: Value(12),
++                    op: IrCmpOp::Ne,
++                    lhs: Operand::Value(Value(11)),
++                    rhs: Operand::Const(IrConst::I32(0)),
++                    ty: IrType::U32,
++                },
++            ],
++            Terminator::CondBranch {
++                cond: Operand::Value(Value(12)),
++                true_label: BlockId(2),
++                false_label: BlockId(3),
++            },
++        ));
++        f.blocks
++            .push(block(2, middle, Terminator::Branch(BlockId(3))));
++        f.blocks.push(block(
++            3,
++            vec![
++                Instruction::Copy {
++                    dest: Value(10),
++                    src: Operand::Value(Value(11)),
++                },
++                Instruction::BinOp {
++                    dest: Value(31),
++                    op: IrBinOp::Sub,
++                    lhs: Operand::Value(Value(30)),
++                    rhs: Operand::Const(IrConst::I32(1)),
++                    ty: IrType::U32,
++                },
++                Instruction::Copy {
++                    dest: Value(30),
++                    src: Operand::Value(Value(31)),
++                },
++                Instruction::Cmp {
++                    dest: Value(32),
++                    op: IrCmpOp::Ne,
++                    lhs: Operand::Value(Value(31)),
++                    rhs: Operand::Const(IrConst::I32(0)),
++                    ty: IrType::U32,
++                },
++            ],
++            Terminator::CondBranch {
++                cond: Operand::Value(Value(32)),
++                true_label: BlockId(1),
++                false_label: BlockId(4),
++            },
++        ));
++        f.blocks.push(block(
++            4,
++            vec![],
++            Terminator::Return(Some(Operand::Value(Value(10)))),
++        ));
++        f.next_value_id = 41;
++        f
++    }
++
++    #[test]
++    fn phi_coalesce_admits_split_latch_if_diamond() {
++        let f = split_latch_diamond(SplitLatchDiamondShape::default());
++        let liveness = compute_live_intervals(&f);
++        let cands = detect_phi_coalesce_groups(&f, &liveness);
++        assert!(
++            cands
++                .iter()
++                .any(|c| c.phi_dest == 10 && c.backedge_src == 11),
++            "load before the if must feed the joined latch copy: {cands:?}"
++        );
++    }
++
++    #[test]
++    fn phi_coalesce_diamond_guards_old_phi_and_middle_calls() {
++        let f = split_latch_diamond(SplitLatchDiamondShape {
++            old_phi_read: true,
++            ..SplitLatchDiamondShape::default()
++        });
++        let liveness = compute_live_intervals(&f);
++        let cands = detect_phi_coalesce_groups(&f, &liveness);
++        assert!(
++            !cands
++                .iter()
++                .any(|c| c.phi_dest == 10 && c.backedge_src == 11),
++            "the middle arm reads the OLD phi and must block coalescing: {cands:?}"
++        );
++
++        let f = split_latch_diamond(SplitLatchDiamondShape {
++            middle_call: true,
++            ..SplitLatchDiamondShape::default()
++        });
++        let liveness = compute_live_intervals(&f);
++        let cands = detect_phi_coalesce_groups(&f, &liveness);
++        let cand = cands
++            .iter()
++            .find(|c| c.phi_dest == 10 && c.backedge_src == 11)
++            .expect("call does not remove the candidate; it constrains its home");
++        let (preds, succs) = analysis::build_cfg(&f, &analysis::build_label_map(&f));
++        assert!(
++            phi_window_clobbers_caller_saved(&f, cand, &preds, &succs),
++            "a call on the middle arm is inside the destructive-update window"
++        );
++    }
+ }
+ 
+ /// Tests for the single definition of the phi-coalescer's chain shape.
+@@ -19171,8 +19400,39 @@ mod phi_chain_shape_tests {
+         f
+     }
+ 
++    fn cfg_of(f: &IrFunction) -> (analysis::FlatAdj, analysis::FlatAdj) {
++        analysis::build_cfg(f, &analysis::build_label_map(f))
++    }
++
+     fn preds_of(f: &IrFunction) -> analysis::FlatAdj {
+-        analysis::build_cfg(f, &analysis::build_label_map(f)).0
++        cfg_of(f).0
++    }
++
++    fn latch_diamond() -> IrFunction {
++        let mut f = IrFunction::new("latch_diamond".into(), IrType::U64, vec![], false);
++        f.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Const(IrConst::I32(1)),
++                true_label: BlockId(1),
++                false_label: BlockId(2),
++            },
++            source_spans: vec![],
++        });
++        f.blocks.push(BasicBlock {
++            label: BlockId(1),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: vec![],
++        });
++        f.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![],
++            terminator: Terminator::Return(None),
++            source_spans: vec![],
++        });
++        f
+     }
+ 
+     #[test]
+@@ -19183,6 +19443,27 @@ mod phi_chain_shape_tests {
+         assert_eq!(single_pred_chain(&preds, 1, 2), Some(Vec::new()));
+     }
+ 
++    #[test]
++    fn split_latch_diamond_is_one_update_region() {
++        let f = latch_diamond();
++        let (preds, succs) = cfg_of(&f);
++        assert_eq!(single_pred_chain(&preds, 0, 2), None);
++        assert_eq!(phi_update_region(&preds, &succs, 0, 2), Some(vec![1]));
++    }
++
++    #[test]
++    fn split_latch_diamond_rejects_an_outside_predecessor() {
++        let mut f = latch_diamond();
++        f.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(2)),
++            source_spans: vec![],
++        });
++        let (preds, succs) = cfg_of(&f);
++        assert_eq!(phi_update_region(&preds, &succs, 0, 2), None);
++    }
++
+     #[test]
+     fn intermediate_blocks_are_ordered_source_to_copy() {
+         let f = line(6);
+@@ -19234,11 +19515,14 @@ mod phi_chain_shape_tests {
+             terminator: Terminator::Return(None),
+             source_spans: vec![],
+         });
+-        let preds = preds_of(&f);
++        let (preds, succs) = cfg_of(&f);
+         assert_eq!(preds.len(3), 2, "precondition: block 3 is a join");
+-        // No chain may END at a join: block 3 has two predecessors.
++        // No chain may END at a join: block 3 has two predecessors. The
++        // split-latch exception also refuses this FULL diamond because the
++        // source has no direct edge to the join and block 2 is uninspected.
+         assert_eq!(single_pred_chain(&preds, 1, 3), None);
+         assert_eq!(single_pred_chain(&preds, 0, 3), None);
++        assert_eq!(phi_update_region(&preds, &succs, 0, 3), None);
+         // The diamond arms are still directly reachable from the entry, so
+         // those ARE empty chains -- reachability, not topology, decides.
+         assert_eq!(single_pred_chain(&preds, 0, 1), Some(Vec::new()));
 diff --git a/src/backend/riscv/codegen/intrinsics.rs b/src/backend/riscv/codegen/intrinsics.rs
 index 57f3ea411..7eace67e9 100644
 --- a/src/backend/riscv/codegen/intrinsics.rs
@@ -1820,6 +2595,195 @@ index a6181e469..64c116c76 100644
              O::VecLoadF32x4,
              O::VecLoadF32x8,
              O::VecLoadI8x32,
+diff --git a/src/backend/stack_layout/regalloc_helpers.rs b/src/backend/stack_layout/regalloc_helpers.rs
+index eaac8de6c..0c9c1c227 100644
+--- a/src/backend/stack_layout/regalloc_helpers.rs
++++ b/src/backend/stack_layout/regalloc_helpers.rs
+@@ -195,6 +195,28 @@ pub fn run_regalloc_and_merge_clobbers_ex(
+     )
+ }
+ 
++/// Whether an intrinsic participates in the SIMD location pipeline. Central
++/// result metadata covers every vector producer, including newly added load
++/// forms. Horizontal reductions are the explicit exception: their result is
++/// scalar, but their SIMD inputs still require the same location machinery.
++fn has_vector_location_contract(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
++    use crate::ir::intrinsics::IntrinsicOp as O;
++    op.vector_result_width().is_some()
++        || matches!(
++            op,
++            O::VecHorizontalAddF64x4
++                | O::VecHorizontalAddF64x2
++                | O::VecHorizontalAddI32x8
++                | O::VecHorizontalAddI32x4
++                | O::VecHorizontalAddF32x8
++                | O::VecHorizontalAddF32x4
++                | O::HorizontalAddF64x4
++                | O::HorizontalAddF64x2
++                | O::HorizontalAddI32x8
++                | O::HorizontalAddI32x4
++        )
++}
++
+ /// [`run_regalloc_and_merge_clobbers_ex`] plus the x86-64 IPA-RA inputs:
+ /// `ipa_regs` (caller-saved registers every call of `func` preserves, see
+ /// `RegAllocConfig::ipa_regs`) and, on return, `ipa_used` (those the
+@@ -247,65 +269,7 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
+             let Instruction::Intrinsic { op, .. } = inst else {
+                 return false;
+             };
+-            use crate::ir::intrinsics::IntrinsicOp;
+-            matches!(
+-                op,
+-                IntrinsicOp::VecZeroF64x4
+-                    | IntrinsicOp::VecZeroF64x2
+-                    | IntrinsicOp::VecZeroI32x8
+-                    | IntrinsicOp::VecZeroI32x4
+-                    | IntrinsicOp::VecZeroF32x8
+-                    | IntrinsicOp::VecZeroF32x4
+-                    | IntrinsicOp::VecLoadF64x4
+-                    | IntrinsicOp::VecLoadF64x2
+-                    | IntrinsicOp::VecLoadI32x8
+-                    | IntrinsicOp::VecLoadI32x4
+-                    | IntrinsicOp::VecLoadI8x32
+-                    | IntrinsicOp::VecLoadI16x16
+-                    | IntrinsicOp::VecLoadF32x8
+-                    | IntrinsicOp::VecLoadF32x4
+-                    | IntrinsicOp::VecAddF64x4
+-                    | IntrinsicOp::VecAddF64x2
+-                    | IntrinsicOp::VecAddI32x8
+-                    | IntrinsicOp::VecAddI32x4
+-                    | IntrinsicOp::VecAddI8x32
+-                    | IntrinsicOp::VecMulI32x8
+-                    | IntrinsicOp::VecMulI32x4
+-                    | IntrinsicOp::VecZeroI64x2
+-                    | IntrinsicOp::VecLoadI64x2
+-                    | IntrinsicOp::VecLoadI32x4Pair
+-                    | IntrinsicOp::VecPackI32x4Pair
+-                    | IntrinsicOp::VecAddI64x2
+-                    | IntrinsicOp::VecMulI64x2
+-                    | IntrinsicOp::VecAddF32x8
+-                    | IntrinsicOp::VecAddF32x4
+-                    | IntrinsicOp::VecMulF64x4
+-                    | IntrinsicOp::VecMulF64x2
+-                    | IntrinsicOp::VecMulF32x8
+-                    | IntrinsicOp::VecMulF32x4
+-                    | IntrinsicOp::VecFmaF64x4
+-                    | IntrinsicOp::VecFmaF32x8
+-                    | IntrinsicOp::VecHorizontalAddF64x4
+-                    | IntrinsicOp::VecHorizontalAddF64x2
+-                    | IntrinsicOp::VecHorizontalAddI32x8
+-                    | IntrinsicOp::VecHorizontalAddI32x4
+-                    | IntrinsicOp::VecHorizontalAddF32x8
+-                    | IntrinsicOp::VecHorizontalAddF32x4
+-                    | IntrinsicOp::LoadF64x4
+-                    | IntrinsicOp::LoadF64x2
+-                    | IntrinsicOp::LoadI32x8
+-                    | IntrinsicOp::LoadI32x4
+-                    | IntrinsicOp::AddF64x4
+-                    | IntrinsicOp::AddF64x2
+-                    | IntrinsicOp::MulF64x4
+-                    | IntrinsicOp::MulF64x2
+-                    | IntrinsicOp::AddI32x8
+-                    | IntrinsicOp::AddI32x4
+-                    | IntrinsicOp::HorizontalAddF64x4
+-                    | IntrinsicOp::HorizontalAddF64x2
+-                    | IntrinsicOp::HorizontalAddI32x8
+-                    | IntrinsicOp::HorizontalAddI32x4
+-            )
++            has_vector_location_contract(op)
+         })
+     });
+     // The mature accumulator backend has a complete stack path for scalar FP,
+@@ -837,3 +801,88 @@ mod static_chain_reservation_tests {
+         assert_eq!(it, pool);
+     }
+ }
++
++#[cfg(test)]
++mod vector_location_contract_tests {
++    use super::has_vector_location_contract;
++    use crate::ir::intrinsics::IntrinsicOp as O;
++
++    /// Preserve every member of the former hand-maintained list while the
++    /// production predicate moves to central result metadata. The three
++    /// strided forms are the newly covered regression cases; stores and a
++    /// genuine scalar operation are negative controls.
++    #[test]
++    fn central_classifier_preserves_old_set_and_covers_strided_loads() {
++        let former_and_strided = [
++            O::VecZeroF64x4,
++            O::VecZeroF64x2,
++            O::VecZeroI32x8,
++            O::VecZeroI32x4,
++            O::VecZeroF32x8,
++            O::VecZeroF32x4,
++            O::VecLoadF64x4,
++            O::VecLoadF64x2,
++            O::VecLoadI32x8,
++            O::VecLoadI32x4,
++            O::VecLoadStrided2I32x8,
++            O::VecLoadStrided2I32x4,
++            O::VecLoadStrided2CompactI32x4,
++            O::VecLoadI8x32,
++            O::VecLoadI16x16,
++            O::VecLoadF32x8,
++            O::VecLoadF32x4,
++            O::VecAddF64x4,
++            O::VecAddF64x2,
++            O::VecAddI32x8,
++            O::VecAddI32x4,
++            O::VecAddI8x32,
++            O::VecMulI32x8,
++            O::VecMulI32x4,
++            O::VecZeroI64x2,
++            O::VecLoadI64x2,
++            O::VecLoadI32x4Pair,
++            O::VecPackI32x4Pair,
++            O::VecAddI64x2,
++            O::VecMulI64x2,
++            O::VecAddF32x8,
++            O::VecAddF32x4,
++            O::VecMulF64x4,
++            O::VecMulF64x2,
++            O::VecMulF32x8,
++            O::VecMulF32x4,
++            O::VecFmaF64x4,
++            O::VecFmaF32x8,
++            O::VecHorizontalAddF64x4,
++            O::VecHorizontalAddF64x2,
++            O::VecHorizontalAddI32x8,
++            O::VecHorizontalAddI32x4,
++            O::VecHorizontalAddF32x8,
++            O::VecHorizontalAddF32x4,
++            O::LoadF64x4,
++            O::LoadF64x2,
++            O::LoadI32x8,
++            O::LoadI32x4,
++            O::AddF64x4,
++            O::AddF64x2,
++            O::MulF64x4,
++            O::MulF64x2,
++            O::AddI32x8,
++            O::AddI32x4,
++            O::HorizontalAddF64x4,
++            O::HorizontalAddF64x2,
++            O::HorizontalAddI32x8,
++            O::HorizontalAddI32x4,
++        ];
++        for op in former_and_strided {
++            assert!(has_vector_location_contract(&op), "lost {op:?}");
++        }
++        // Central metadata intentionally also covers SIMD producers that the
++        // old incomplete list omitted. This only strengthens the guard around
++        // the explicitly enabled scalar-FP stack experiment; the default RA
++        // configuration does not consult that experiment's opt-in flag.
++        assert!(has_vector_location_contract(&O::VecSubI32x4));
++        assert!(!has_vector_location_contract(&O::VecStoreI32x4));
++        assert!(!has_vector_location_contract(&O::VecStoreI64x2));
++        assert!(!has_vector_location_contract(&O::SqrtF64));
++    }
++}
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
 index 983bcd7af..a21991cf2 100644
 --- a/src/backend/x86/codegen/emit.rs
@@ -2138,10 +3102,10 @@ index dc8c94684..9350746d6 100644
 +    }
  }
 diff --git a/src/backend/x86/codegen/machinst_alloc.rs b/src/backend/x86/codegen/machinst_alloc.rs
-index 85b947ac3..29175bce4 100644
+index 85b947ac3..415f56482 100644
 --- a/src/backend/x86/codegen/machinst_alloc.rs
 +++ b/src/backend/x86/codegen/machinst_alloc.rs
-@@ -896,6 +896,29 @@ pub(crate) enum WindowWriteKind {
+@@ -896,6 +896,64 @@ pub(crate) enum WindowWriteKind {
      ScratchOrClobber,
  }
  
@@ -2168,43 +3132,127 @@ index 85b947ac3..29175bce4 100644
 +    preserved
 +}
 +
++/// Architecture-implied writes shared by the core and allocating last-write
++/// classifiers. Callback order is part of the contract: a typed return move
++/// follows the call clobbers, so the allocating path's same-index overwrite
++/// and the core path's explicit Precolor tie-break both retain the return.
++fn for_each_implicit_write(inst: &MachInst, mut record: impl FnMut(u8, WindowWriteKind)) {
++    match inst {
++        MachInst::Cqto { .. } | MachInst::Div { .. } => {
++            record(0, WindowWriteKind::ScratchOrClobber);
++            record(16, WindowWriteKind::ScratchOrClobber);
++        }
++        MachInst::XorRdx => record(16, WindowWriteKind::ScratchOrClobber),
++        MachInst::Raw(text) => {
++            let mut written = Vec::new();
++            raw_written_regs(text, &mut written);
++            for r in written {
++                record(r, WindowWriteKind::ScratchOrClobber);
++            }
++        }
++        MachInst::Call { .. } | MachInst::CallTyped { .. } => {
++            let preserved = call_preserved_homes(inst);
++            for r in [14u8, 15, 16, 12, 13, 10, 11] {
++                if !preserved.contains(&r) {
++                    record(r, WindowWriteKind::ScratchOrClobber);
++                }
++            }
++            if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
++                if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
++                    record(p.0, WindowWriteKind::Precolor);
++                }
++            }
++        }
++        _ => {}
++    }
++}
++
  /// Per-register LAST-write classification for a window that contains no
  /// allocated vregs: every destination-position register write is a
  /// pre-colored definition, and only the architecture-implied writes
-@@ -945,9 +968,9 @@ pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, Windo
-                 // SysV integer caller-clobber set (rax is not a home; the
-                 // six argument registers and r10/r11 are). CallTyped's
-                 // embedded save/restore pair PRESERVES every register in
+@@ -925,55 +983,11 @@ pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, Windo
+                 record(p.0, idx, WindowWriteKind::Precolor, &mut last);
+             }
+         }
+-        // Implicit writes beyond destination positions.
+-        match inst {
+-            MachInst::Cqto { .. } | MachInst::Div { .. } => {
+-                record(0, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+-                record(16, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+-            }
+-            MachInst::XorRdx => {
+-                record(16, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+-            }
+-            MachInst::Raw(text) => {
+-                let mut written: Vec<u8> = Vec::new();
+-                raw_written_regs(text, &mut written);
+-                for r in written {
+-                    record(r, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+-                }
+-            }
+-            MachInst::Call { .. } | MachInst::CallTyped { .. } => {
+-                // SysV integer caller-clobber set (rax is not a home; the
+-                // six argument registers and r10/r11 are). CallTyped's
+-                // embedded save/restore pair PRESERVES every register in
 -                // `caller_saves` across the call — the pre-call state
 -                // remains the register's truth for those, so no event is
 -                // recorded for them (kernel calculate_imbalance: a saved
-+                // `caller_saves` and `ipa_keep` across the call — the
-+                // pre-call state remains the register's truth for those, so
-+                // no event is recorded for them (kernel calculate_imbalance: a saved
-                 // r11 would otherwise be misclassified as clobbered and
-                 // poison a sound alias read downstream).  CallTyped's
-                 // embedded ret-move targets its own dst AFTER the call —
-@@ -955,14 +978,9 @@ pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, Windo
-                 // positions, so classify the ret home as a Precolor write
-                 // at this index explicitly (recorded after the clobbers,
-                 // and the equal-index rule prefers Precolor).
+-                // r11 would otherwise be misclassified as clobbered and
+-                // poison a sound alias read downstream).  CallTyped's
+-                // embedded ret-move targets its own dst AFTER the call —
+-                // the dst-position scan above only sees operand
+-                // positions, so classify the ret home as a Precolor write
+-                // at this index explicitly (recorded after the clobbers,
+-                // and the equal-index rule prefers Precolor).
 -                let saved: FxHashSet<u8> = match inst {
 -                    MachInst::CallTyped { caller_saves, .. } => {
 -                        caller_saves.iter().map(|(p, _)| p.0).collect()
 -                    }
 -                    _ => FxHashSet::default(),
 -                };
-+                let preserved = call_preserved_homes(inst);
-                 for r in [14u8, 15, 16, 12, 13, 10, 11] {
+-                for r in [14u8, 15, 16, 12, 13, 10, 11] {
 -                    if !saved.contains(&r) {
-+                    if !preserved.contains(&r) {
-                         record(r, idx, WindowWriteKind::ScratchOrClobber, &mut last);
-                     }
-                 }
-@@ -1364,18 +1382,14 @@ pub(crate) fn allocate_window(
-                 }
-             }
-             MachInst::Call { .. } | MachInst::CallTyped { .. } => {
+-                        record(r, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+-                    }
+-                }
+-                if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
+-                    if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
+-                        record(p.0, idx, WindowWriteKind::Precolor, &mut last);
+-                    }
+-                }
+-            }
+-            _ => {}
+-        }
++        // Implicit writes beyond destination positions use the SAME event
++        // stream as the allocating classifier below.
++        for_each_implicit_write(inst, |r, kind| {
++            record(r, idx, kind, &mut last);
++        });
+     }
+     last.into_iter().map(|(r, (_, k))| (r, k)).collect()
+ }
+@@ -1346,47 +1360,11 @@ pub(crate) fn allocate_window(
+         if !is_core {
+             continue;
+         }
+-        // Implicit writes (same law as the core classifier).
+-        match inst {
+-            MachInst::Cqto { .. } | MachInst::Div { .. } => {
+-                for r in [0u8, 16] {
+-                    last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
+-                }
+-            }
+-            MachInst::XorRdx => {
+-                last.insert(16, (fi, WindowWriteKind::ScratchOrClobber));
+-            }
+-            MachInst::Raw(text) => {
+-                let mut written: Vec<u8> = Vec::new();
+-                raw_written_regs(text, &mut written);
+-                for r in written {
+-                    last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
+-                }
+-            }
+-            MachInst::Call { .. } | MachInst::CallTyped { .. } => {
 -                // Same save-aware law as the core classifier: registers in
 -                // CallTyped's caller_saves are preserved by the embedded
 -                // restore — their pre-call state stays true, so they keep
@@ -2215,19 +3263,28 @@ index 85b947ac3..29175bce4 100644
 -                    }
 -                    _ => FxHashSet::default(),
 -                };
-+                // Same save/IPA-aware law as the core classifier: registers
-+                // in caller_saves are preserved by the embedded restore and
-+                // ipa_keep registers by the verified callee — their pre-call
-+                // state stays true, so they keep whatever event preceded the
-+                // call.
-+                let preserved = call_preserved_homes(inst);
-                 for r in [14u8, 15, 16, 12, 13, 10, 11] {
+-                for r in [14u8, 15, 16, 12, 13, 10, 11] {
 -                    if !saved.contains(&r) {
-+                    if !preserved.contains(&r) {
-                         last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
-                     }
-                 }
-@@ -2481,4 +2495,40 @@ mod tests {
+-                        last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
+-                    }
+-                }
+-                if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
+-                    if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
+-                        last.insert(p.0, (fi, WindowWriteKind::Precolor));
+-                    }
+-                }
+-            }
+-            _ => {}
+-        }
++        // Shared with the core classifier; insertion order is significant
++        // for same-index call clobbers followed by a typed return move.
++        for_each_implicit_write(inst, |r, kind| {
++            last.insert(r, (fi, kind));
++        });
+     }
+     let writes = last.into_iter().map(|(r, (_, k))| (r, k)).collect();
+     let vreg_writers: FxHashMap<u8, u32> = vreg_last
+@@ -2481,4 +2459,99 @@ mod tests {
              "core relay dsts must not be tagged as inserted vreg writes, got: {vreg_writers:?}"
          );
      }
@@ -2251,10 +3308,15 @@ index 85b947ac3..29175bce4 100644
 +        assert!(preserved.contains(&13), "saved/restored r9 must survive");
 +        assert!(!preserved.contains(&14), "rdi remains caller-clobbered");
 +
-+        let writes = window_last_writes_core(&[
++        let insts = vec![
 +            MachInst::Mov {
 +                src: MachOperand::Imm(7),
 +                dst: MachOperand::Reg(phys(12)),
++                size: OpSize::S64,
++            },
++            MachInst::Mov {
++                src: MachOperand::Imm(8),
++                dst: MachOperand::Reg(phys(13)),
 +                size: OpSize::S64,
 +            },
 +            MachInst::Mov {
@@ -2263,9 +3325,63 @@ index 85b947ac3..29175bce4 100644
 +                size: OpSize::S64,
 +            },
 +            call,
-+        ]);
++        ];
++        let writes = window_last_writes_core(&insts);
 +        assert_eq!(writes.get(&12), Some(&WindowWriteKind::Precolor));
++        assert_eq!(writes.get(&13), Some(&WindowWriteKind::Precolor));
 +        assert_eq!(writes.get(&14), Some(&WindowWriteKind::ScratchOrClobber));
++
++        // Exercise the allocating classifier too. This is the path that used
++        // to poison the still-live IPA home and trip the emitter's fail-closed
++        // stale-home check even though the core-only helper was correct.
++        let (slots, types, uses, busy) = base_maps();
++        let empty = FxHashSet::default();
++        let ctx = WindowCtx {
++            slots: &slots,
++            small_slots: &empty,
++            types: &types,
++            total_uses: &uses,
++            alloca_values: &empty,
++            reg_busy: &busy,
++            window_span: (0, 15),
++        };
++        let (_out, allocated_writes, _vreg_writers) =
++            allocate_window(insts, &ctx).expect("a fully pre-colored call window must allocate");
++        assert_eq!(allocated_writes.get(&12), Some(&WindowWriteKind::Precolor));
++        assert_eq!(allocated_writes.get(&13), Some(&WindowWriteKind::Precolor));
++        assert_eq!(
++            allocated_writes.get(&14),
++            Some(&WindowWriteKind::ScratchOrClobber)
++        );
++    }
++
++    #[test]
++    fn implicit_write_classifiers_agree_on_division_and_raw() {
++        let insts = vec![
++            MachInst::Cqto { size: OpSize::S64 },
++            MachInst::Div {
++                divisor: MachOperand::Reg(phys(1)),
++                signed: true,
++                size: OpSize::S64,
++            },
++            MachInst::XorRdx,
++            MachInst::Raw("movq %r8, %r9".to_string()),
++        ];
++        let expected = window_last_writes_core(&insts);
++        let (slots, types, uses, busy) = base_maps();
++        let empty = FxHashSet::default();
++        let ctx = WindowCtx {
++            slots: &slots,
++            small_slots: &empty,
++            types: &types,
++            total_uses: &uses,
++            alloca_values: &empty,
++            reg_busy: &busy,
++            window_span: (0, 15),
++        };
++        let (_out, actual, _vreg_writers) = allocate_window(insts, &ctx)
++            .expect("a fully pre-colored implicit-write window must allocate");
++        assert_eq!(actual, expected);
 +    }
  }
 diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
@@ -2837,7 +3953,7 @@ index 6bfce7f16..243cf8842 100644
      #[test]
      fn overflow_fails_closed() {
 diff --git a/src/passes/loop_invert.rs b/src/passes/loop_invert.rs
-index 9e9349dd2..6053f8a08 100644
+index 9e9349dd2..713839f65 100644
 --- a/src/passes/loop_invert.rs
 +++ b/src/passes/loop_invert.rs
 @@ -70,8 +70,10 @@
@@ -2919,7 +4035,7 @@ index 9e9349dd2..6053f8a08 100644
          rotated += 1;
          if rotated > 64 {
              break; // pathological input guard
-@@ -761,6 +782,243 @@ fn fold_value_bound_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool
+@@ -761,6 +782,237 @@ fn fold_value_bound_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool
      true
  }
  
@@ -2960,7 +4076,7 @@ index 9e9349dd2..6053f8a08 100644
 +        } if true_label == body && false_label == exit => c,
 +        _ => return false,
 +    };
-+    if guard_cond == latch_cond || func.blocks[h].instructions.len() != 1 {
++    if guard_cond == latch_cond {
 +        return false;
 +    }
 +
@@ -2994,8 +4110,10 @@ index 9e9349dd2..6053f8a08 100644
 +            _ => None,
 +        }
 +    }
-+    let guard_cmp = 0;
-+    let Some((iv, limit_const, ty)) = cmp_shape(&func.blocks[h].instructions[0], guard_cond) else {
++    let [guard_inst] = func.blocks[h].instructions.as_slice() else {
++        return false;
++    };
++    let Some((iv, limit_const, ty)) = cmp_shape(guard_inst, guard_cond) else {
 +        return false;
 +    };
 +    let Some(latch_cmp) = func.blocks[t]
@@ -3023,24 +4141,22 @@ index 9e9349dd2..6053f8a08 100644
 +        return false;
 +    }
 +
-+    let mut iv_defs = Vec::new();
-+    for (bi, block) in func.blocks.iter().enumerate() {
-+        for (ii, inst) in block.instructions.iter().enumerate() {
-+            if inst.dest() == Some(iv) {
-+                iv_defs.push((bi, ii));
-+            }
-+        }
++    // Both recurrence definitions must be unique in their small home blocks.
++    // The global validation scan below rejects definitions anywhere else, so
++    // collecting either definition set with another full-function walk would
++    // duplicate work without strengthening the proof.
++    fn sole_def(insts: &[Instruction], value: Value) -> Option<usize> {
++        let mut defs = insts
++            .iter()
++            .enumerate()
++            .filter_map(|(ii, inst)| (inst.dest() == Some(value)).then_some(ii));
++        let def = defs.next()?;
++        defs.next().is_none().then_some(def)
 +    }
-+    if iv_defs.len() != 2 {
-+        return false;
-+    }
-+    let Some(&(pre_bi, init)) = iv_defs.iter().find(|(bi, _)| *bi == p) else {
-+        return false;
-+    };
-+    if pre_bi != p {
-+        return false;
-+    }
-+    let Some(&(_, copy)) = iv_defs.iter().find(|(bi, _)| *bi == t) else {
++    let (Some(init), Some(copy)) = (
++        sole_def(&func.blocks[p].instructions, iv),
++        sole_def(&func.blocks[t].instructions, iv),
++    ) else {
 +        return false;
 +    };
 +    if !matches!(
@@ -3063,18 +4179,10 @@ index 9e9349dd2..6053f8a08 100644
 +        return false;
 +    }
 +
-+    let mut next_defs = Vec::new();
-+    for (bi, block) in func.blocks.iter().enumerate() {
-+        for (ii, inst) in block.instructions.iter().enumerate() {
-+            if inst.dest() == Some(next) {
-+                next_defs.push((bi, ii));
-+            }
-+        }
-+    }
-+    if next_defs.len() != 1 || next_defs[0].0 != t {
++    // `next` has the same single-home-block contract as `iv`.
++    let Some(update) = sole_def(&func.blocks[t].instructions, next) else {
 +        return false;
-+    }
-+    let update = next_defs[0].1;
++    };
 +    if !matches!(
 +        func.blocks[t].instructions[update],
 +        Instruction::BinOp {
@@ -3090,27 +4198,29 @@ index 9e9349dd2..6053f8a08 100644
 +        return false;
 +    }
 +
-+    // No semantic use may survive outside the three recurrence sites.  This
-+    // also rejects live-out values, asm outputs, hidden pointer uses and a
-+    // second condition consuming either compare result.
++    // No unapproved definition or semantic use may survive outside the
++    // recurrence sites. This also rejects live-out values, asm outputs,
++    // hidden pointer uses and a second condition consuming either compare.
 +    for (bi, block) in func.blocks.iter().enumerate() {
 +        for (ii, inst) in block.instructions.iter().enumerate() {
 +            let site = (bi, ii);
 +            let mut valid = true;
++            // The header was matched as a one-instruction slice above, so
++            // `bi == h` is the guard site; no magic instruction index is
++            // needed here or during removal.
++            if (inst.dest() == Some(iv) && site != (p, init) && site != (t, copy))
++                || (inst.dest() == Some(next) && site != (t, update))
++            {
++                valid = false;
++            }
 +            inst.for_each_used_value(|v| {
-+                if v == iv.0
-+                    && site != (h, guard_cmp)
-+                    && site != (t, update)
-+                    && site != (t, latch_cmp)
-+                {
++                if v == iv.0 && bi != h && site != (t, update) && site != (t, latch_cmp) {
 +                    valid = false;
 +                }
 +                if v == next.0 && site != (t, copy) {
 +                    valid = false;
 +                }
-+                if (v == guard_cond.0 && site != (h, guard_cmp))
-+                    || (v == latch_cond.0 && site != (t, latch_cmp))
-+                {
++                if (v == guard_cond.0 && bi != h) || (v == latch_cond.0 && site != (t, latch_cmp)) {
 +                    valid = false;
 +                }
 +            });
@@ -3139,10 +4249,10 @@ index 9e9349dd2..6053f8a08 100644
 +        src: Operand::Const(limit_const),
 +    };
 +    let guard = &mut func.blocks[h];
-+    if guard.source_spans.len() == guard.instructions.len() {
-+        guard.source_spans.remove(guard_cmp);
-+    }
-+    guard.instructions.remove(guard_cmp);
++    guard.instructions.clear();
++    // The matched guard is now empty, so this is the only parallel span
++    // representation whether debug tracking was enabled or not.
++    guard.source_spans.clear();
 +    func.blocks[h].terminator = Terminator::Branch(body);
 +    if let Instruction::BinOp { op, .. } = &mut func.blocks[t].instructions[update] {
 +        *op = IrBinOp::Sub;
@@ -3163,7 +4273,7 @@ index 9e9349dd2..6053f8a08 100644
  fn set_dest(inst: &mut Instruction, new: Value) {
      macro_rules! d {
          ($($v:ident),+ $(,)?) => {
-@@ -853,6 +1111,223 @@ mod tests {
+@@ -853,6 +1105,270 @@ mod tests {
          f
      }
  
@@ -3247,8 +4357,12 @@ index 9e9349dd2..6053f8a08 100644
 +    #[test]
 +    fn dead_constant_trip_loop_downcounts_and_removes_guard() {
 +        let mut f = dead_counted_loop(8, IrType::U32);
++        f.blocks[1]
++            .source_spans
++            .push(crate::common::source::Span::dummy());
 +        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
 +        assert_downcounted(&f, 8, IrType::U32);
++        assert!(f.blocks[1].source_spans.is_empty());
 +    }
 +
 +    #[test]
@@ -3344,10 +4458,53 @@ index 9e9349dd2..6053f8a08 100644
 +            }
 +        }
 +
++        let mut duplicate_next = dead_counted_loop(8, IrType::U32);
++        duplicate_next.blocks[0]
++            .instructions
++            .push(Instruction::Copy {
++                dest: Value(26),
++                src: Operand::Const(IrConst::from_i64(0, IrType::U32)),
++            });
++
++        let mut duplicate_next_in_latch = dead_counted_loop(8, IrType::U32);
++        duplicate_next_in_latch.blocks[2].instructions.insert(
++            1,
++            Instruction::Copy {
++                dest: Value(26),
++                src: Operand::Const(IrConst::from_i64(0, IrType::U32)),
++            },
++        );
++
++        let mut duplicate_iv_in_preheader = dead_counted_loop(8, IrType::U32);
++        duplicate_iv_in_preheader.blocks[0]
++            .instructions
++            .push(Instruction::Copy {
++                dest: Value(20),
++                src: Operand::Const(IrConst::from_i64(0, IrType::U32)),
++            });
++
++        let mut duplicate_iv_in_exit = dead_counted_loop(8, IrType::U32);
++        duplicate_iv_in_exit.blocks[3]
++            .instructions
++            .push(Instruction::Copy {
++                dest: Value(20),
++                src: Operand::Const(IrConst::from_i64(0, IrType::U32)),
++            });
++
 +        for (name, mut f) in [
 +            ("signed", signed),
 +            ("step two", step_two),
 +            ("variable limit", variable_limit),
++            ("duplicate next definition", duplicate_next),
++            (
++                "duplicate next definition in latch",
++                duplicate_next_in_latch,
++            ),
++            (
++                "duplicate iv definition in preheader",
++                duplicate_iv_in_preheader,
++            ),
++            ("duplicate iv definition in exit", duplicate_iv_in_exit),
 +        ] {
 +            assert_eq!(
 +                invert_loops_with(&mut f, LoopInvertConfig::testing()),
@@ -3905,7 +5062,7 @@ index 59a6b84cd..1fd07024d 100644
      }
      let mut total = 0usize;
 diff --git a/src/passes/vectorize_strided_i32_reduce.rs b/src/passes/vectorize_strided_i32_reduce.rs
-index 817291288..00b9a0bc9 100644
+index 817291288..35762684e 100644
 --- a/src/passes/vectorize_strided_i32_reduce.rs
 +++ b/src/passes/vectorize_strided_i32_reduce.rs
 @@ -1,4 +1,4 @@
@@ -3937,6 +5094,15 @@ index 817291288..00b9a0bc9 100644
  //!
  //! ### Exact-access and guard-page contract
  //!
+@@ -200,7 +202,7 @@ pub(super) fn try_transform(
+     let Some(pattern) = analyze(func, loop_info, cfg, symbol_facts) else {
+         return 0;
+     };
+-    transform(func, &pattern)
++    transform(func, &pattern).unwrap_or_default()
+ }
+ 
+ /// Whether one wide `needed`-byte load from `base` can only touch memory the
 @@ -224,14 +226,18 @@ fn wide_load_proven(
      if proves_private_stack_object(func, base) {
          return alloca_extent_at_least(func, base, needed);
@@ -4023,7 +5189,7 @@ index 817291288..00b9a0bc9 100644
              },
              _ => return None,
          }
-@@ -972,7 +1009,98 @@ fn analyze(
+@@ -972,12 +1009,106 @@ fn analyze(
      })
  }
  
@@ -4052,17 +5218,18 @@ index 817291288..00b9a0bc9 100644
 +        }
 +    }
 +
-+    fn load(self, contiguous: bool) -> IntrinsicOp {
-+        match (self, contiguous) {
++    fn load(self, contiguous: bool) -> Option<IntrinsicOp> {
++        let op = match (self, contiguous) {
 +            (Self::X4, true) => IntrinsicOp::VecLoadI32x4,
 +            (Self::X4, false) => IntrinsicOp::VecLoadStrided2I32x4,
 +            (Self::X4Compact, true) => IntrinsicOp::VecLoadStrided2CompactI32x4,
-+            (Self::X4Compact, false) => {
-+                unreachable!("compact strided load requires the contiguous-window proof")
-+            }
++            // A compact load consumes the gap bytes. Without the contiguous
++            // window proof there is no legal compact operation to emit.
++            (Self::X4Compact, false) => return None,
 +            (Self::X8, true) => IntrinsicOp::VecLoadI32x8,
 +            (Self::X8, false) => IntrinsicOp::VecLoadStrided2I32x8,
-+        }
++        };
++        Some(op)
 +    }
 +
 +    fn broadcast(self) -> IntrinsicOp {
@@ -4079,8 +5246,8 @@ index 817291288..00b9a0bc9 100644
 +        }
 +    }
 +
-+    fn bin_op(self, op: IrBinOp) -> IntrinsicOp {
-+        match (self, op) {
++    fn bin_op(self, op: IrBinOp) -> Option<IntrinsicOp> {
++        let intrinsic = match (self, op) {
 +            (Self::X4 | Self::X4Compact, IrBinOp::Add) => IntrinsicOp::VecAddI32x4,
 +            (Self::X4 | Self::X4Compact, IrBinOp::Sub) => IntrinsicOp::VecSubI32x4,
 +            (Self::X4 | Self::X4Compact, IrBinOp::Mul) => IntrinsicOp::VecMulI32x4,
@@ -4093,20 +5260,22 @@ index 817291288..00b9a0bc9 100644
 +            (Self::X8, IrBinOp::And) => IntrinsicOp::VecAndI32x8,
 +            (Self::X8, IrBinOp::Or) => IntrinsicOp::VecOrI32x8,
 +            (Self::X8, IrBinOp::Xor) => IntrinsicOp::VecXorI32x8,
-+            _ => unreachable!("validated strided lane operation"),
-+        }
++            _ => return None,
++        };
++        Some(intrinsic)
 +    }
 +
-+    fn shift_op(self, op: IrBinOp) -> IntrinsicOp {
-+        match (self, op) {
++    fn shift_op(self, op: IrBinOp) -> Option<IntrinsicOp> {
++        let intrinsic = match (self, op) {
 +            (Self::X4 | Self::X4Compact, IrBinOp::Shl) => IntrinsicOp::VecShlI32x4,
 +            (Self::X4 | Self::X4Compact, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x4,
 +            (Self::X4 | Self::X4Compact, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x4,
 +            (Self::X8, IrBinOp::Shl) => IntrinsicOp::VecShlI32x8,
 +            (Self::X8, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x8,
 +            (Self::X8, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x8,
-+            _ => unreachable!("validated constant strided shift"),
-+        }
++            _ => return None,
++        };
++        Some(intrinsic)
 +    }
 +
 +    fn horizontal_add(self) -> IntrinsicOp {
@@ -4122,7 +5291,32 @@ index 817291288..00b9a0bc9 100644
      load_bases: &'a [Value],
      wide_load_proven: &'a [bool],
      byte_iv: Value,
-@@ -1004,11 +1132,7 @@ impl EmitCtx<'_> {
+     byte_disp: i64,
+-    vec_iv: Value,
++    vec_iv: Option<Value>,
+     bcast_cache: Vec<(Operand, Value)>,
+     preheader_insts: Vec<Instruction>,
+     body_insts: Vec<Instruction>,
+@@ -991,62 +1122,52 @@ impl EmitCtx<'_> {
+         v
+     }
+ 
+-    fn emit(&mut self, expr: &StridedExpr) -> Value {
++    /// Emit one expression into temporary block buffers. `None` refuses the
++    /// whole transform; the caller has not mutated the input function yet.
++    fn emit(&mut self, expr: &StridedExpr) -> Option<Value> {
+         match expr {
+             StridedExpr::LoadEven32(idx) => {
++                let base = *self.load_bases.get(*idx)?;
++                let contiguous = *self.wide_load_proven.get(*idx)?;
+                 let dest = self.fresh();
+-                let mut args = vec![
+-                    Operand::Value(self.load_bases[*idx]),
+-                    Operand::Value(self.byte_iv),
+-                ];
++                let mut args = vec![Operand::Value(base), Operand::Value(self.byte_iv)];
+                 if self.byte_disp != 0 {
+                     args.push(Operand::Const(IrConst::I64(self.byte_disp)));
                  }
                  self.body_insts.push(Instruction::Intrinsic {
                      dest: Some(dest),
@@ -4131,11 +5325,26 @@ index 817291288..00b9a0bc9 100644
 -                    } else {
 -                        IntrinsicOp::VecLoadStrided2I32x8
 -                    },
-+                    op: self.width.load(self.wide_load_proven[*idx]),
++                    op: self.width.load(contiguous)?,
                      dest_ptr: None,
                      args,
                  });
-@@ -1028,7 +1152,7 @@ impl EmitCtx<'_> {
+-                dest
++                Some(dest)
+             }
+             StridedExpr::IvLow32 => self.vec_iv,
+             StridedExpr::Invariant(op) => {
+                 if let Some(&(_, cached)) = self.bcast_cache.iter().find(|(k, _)| k == op) {
+-                    return cached;
++                    return Some(cached);
+                 }
+                 let bcast_src = match op {
+-                    Operand::Const(c) => {
+-                        Operand::Const(IrConst::I32(c.to_i64().unwrap_or(0) as i32))
+-                    }
++                    Operand::Const(c) => Operand::Const(IrConst::I32(c.to_i64()? as i32)),
+                     Operand::Value(v) => Operand::Value(*v),
+                 };
                  let dest = self.fresh();
                  self.preheader_insts.push(Instruction::Intrinsic {
                      dest: Some(dest),
@@ -4144,24 +5353,36 @@ index 817291288..00b9a0bc9 100644
                      dest_ptr: None,
                      args: vec![bcast_src],
                  });
-@@ -1041,12 +1165,7 @@ impl EmitCtx<'_> {
+                 self.bcast_cache.push((op.clone(), dest));
+-                dest
++                Some(dest)
+             }
+             StridedExpr::BinOp(op, l, r) => {
+-                let lv = self.emit(l);
++                let lv = self.emit(l)?;
+                 if matches!(op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
                      let StridedExpr::Invariant(sh_op) = r.as_ref() else {
-                         unreachable!("validated constant shift")
-                     };
+-                        unreachable!("validated constant shift")
+-                    };
 -                    let vec_op = match op {
 -                        IrBinOp::Shl => IntrinsicOp::VecShlI32x8,
 -                        IrBinOp::LShr => IntrinsicOp::VecLShrI32x8,
 -                        IrBinOp::AShr => IntrinsicOp::VecAShrI32x8,
 -                        _ => unreachable!(),
--                    };
-+                    let vec_op = self.width.shift_op(*op);
++                        return None;
+                     };
++                    let vec_op = self.width.shift_op(*op)?;
                      let dest = self.fresh();
                      self.body_insts.push(Instruction::Intrinsic {
                          dest: Some(dest),
-@@ -1057,15 +1176,7 @@ impl EmitCtx<'_> {
-                     return dest;
+@@ -1054,18 +1175,10 @@ impl EmitCtx<'_> {
+                         dest_ptr: None,
+                         args: vec![Operand::Value(lv), sh_op.clone()],
+                     });
+-                    return dest;
++                    return Some(dest);
                  }
-                 let rv = self.emit(r);
+-                let rv = self.emit(r);
 -                let vec_op = match op {
 -                    IrBinOp::Add => IntrinsicOp::VecAddI32x8,
 -                    IrBinOp::Sub => IntrinsicOp::VecSubI32x8,
@@ -4171,88 +5392,197 @@ index 817291288..00b9a0bc9 100644
 -                    IrBinOp::Xor => IntrinsicOp::VecXorI32x8,
 -                    _ => unreachable!(),
 -                };
-+                let vec_op = self.width.bin_op(*op);
++                let rv = self.emit(r)?;
++                let vec_op = self.width.bin_op(*op)?;
                  let dest = self.fresh();
                  self.body_insts.push(Instruction::Intrinsic {
                      dest: Some(dest),
-@@ -1080,15 +1191,36 @@ impl EmitCtx<'_> {
+@@ -1073,28 +1186,55 @@ impl EmitCtx<'_> {
+                     dest_ptr: None,
+                     args: vec![Operand::Value(lv), Operand::Value(rv)],
+                 });
+-                dest
++                Some(dest)
+             }
+         }
+     }
  }
  
- fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+-fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
 -    // Two independent accumulator chains when there are enough vectors to
 -    // keep both `vpaddd` pipelines busy.
 -    let unroll: u64 = if p.safe_vecs >= 8 { 4 } else { 1 };
 -    let vec_turns = p.safe_vecs / unroll;
-+    let width = if x86_avx2_available() && !sse2_forced() {
-+        StridedWidth::X8
-+    } else if p.wide_load_proven.iter().all(|&proven| proven) {
-+        // Every stream can read its full 32-byte window: compact two XMM
-+        // halves into four real lanes instead of carrying zero odd lanes.
-+        StridedWidth::X4Compact
-+    } else {
-+        // One unknown stream is enough to keep the whole expression on the
-+        // exact-access representation; mixing lane meanings is not valid.
-+        StridedWidth::X4
-+    };
-+    let vector_bytes = width.vector_bytes();
-+    let safe_vecs = width.safe_vecs(p.safe_vecs);
-+    // Preserve the proven AVX2 schedule exactly. SSE2 uses the same two
-+    // independent accumulator chains, but only two XMM copies per turn:
-+    // four copies were measured as a substantial regression.
-+    let unroll: u64 = if safe_vecs >= 8 {
-+        match width {
-+            StridedWidth::X4 | StridedWidth::X4Compact => 2,
-+            StridedWidth::X8 => 4,
-+        }
-+    } else {
-+        1
-+    };
-+    let vec_turns = safe_vecs / unroll;
-     if vec_turns == 0 {
-         return 0;
-     }
+-    if vec_turns == 0 {
+-        return 0;
+-    }
 -    let step_bytes = (unroll * VECTOR_BYTES) as i64;
 -    let total_vec_bytes = (vec_turns * unroll * VECTOR_BYTES) as i64;
-+    let step_bytes = (unroll * vector_bytes) as i64;
-+    let total_vec_bytes = (vec_turns * unroll * vector_bytes) as i64;
-     // Decline *before* any mutation: every rewrite below assumes this constant
-     // is representable in the IV's own type.
-     let Some(rem_iv_const) = resume_offset_const(p.iv_ty, total_vec_bytes) else {
-@@ -1104,6 +1236,10 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+-    // Decline *before* any mutation: every rewrite below assumes this constant
+-    // is representable in the IV's own type.
+-    let Some(rem_iv_const) = resume_offset_const(p.iv_ty, total_vec_bytes) else {
+-        return 0;
+-    };
+-    let needs_iv_vec = {
++struct VectorSchedule {
++    width: StridedWidth,
++    vector_bytes: u64,
++    unroll: u64,
++    step_bytes: i64,
++    total_vec_bytes: i64,
++    needs_iv_vec: bool,
++    multi_iv: bool,
++}
++
++impl VectorSchedule {
++    fn new(p: &StridedI32ReducePattern) -> Option<Self> {
++        let width = if x86_avx2_available() && !sse2_forced() {
++            StridedWidth::X8
++        } else if p.wide_load_proven.iter().all(|&proven| proven) {
++            // Every stream can read its full 32-byte window: compact two XMM
++            // halves into four real lanes instead of carrying zero odd lanes.
++            StridedWidth::X4Compact
++        } else {
++            // One unknown stream is enough to keep the whole expression on the
++            // exact-access representation; mixing lane meanings is not valid.
++            StridedWidth::X4
++        };
++        let vector_bytes = width.vector_bytes();
++        let safe_vecs = width.safe_vecs(p.safe_vecs);
++        // Preserve the proven AVX2 schedule exactly. SSE2 uses the same two
++        // independent accumulator chains, but only two XMM copies per turn:
++        // four copies were measured as a substantial regression.
++        let unroll: u64 = if safe_vecs >= 8 {
++            match width {
++                StridedWidth::X4 | StridedWidth::X4Compact => 2,
++                StridedWidth::X8 => 4,
++            }
++        } else {
++            1
++        };
++        let vec_turns = safe_vecs / unroll;
++        if vec_turns == 0 {
++            return None;
++        }
++        let step_bytes = i64::try_from(unroll.checked_mul(vector_bytes)?).ok()?;
++        let total_vec_bytes =
++            i64::try_from(vec_turns.checked_mul(unroll)?.checked_mul(vector_bytes)?).ok()?;
+         fn uses_iv(e: &StridedExpr) -> bool {
+             match e {
+                 StridedExpr::IvLow32 => true,
+@@ -1102,57 +1242,88 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+                 StridedExpr::BinOp(_, l, r) => uses_iv(l) || uses_iv(r),
+             }
          }
-         uses_iv(&p.expr)
-     };
-+    // Two compact XMM streams can carry adjacent IV vectors directly. This
-+    // replaces the second stream's per-turn register copy + offset add with
-+    // one in-place step, while consuming the offset constant's old register.
-+    let multi_iv = width == StridedWidth::X4Compact && unroll == 2 && needs_iv_vec;
+-        uses_iv(&p.expr)
+-    };
++        let needs_iv_vec = uses_iv(&p.expr);
++        // Two compact XMM streams can carry adjacent IV vectors directly. This
++        // replaces the second stream's per-turn register copy + offset add with
++        // one in-place step, while consuming the offset constant's old register.
++        let multi_iv = width == StridedWidth::X4Compact && unroll == 2 && needs_iv_vec;
++        Some(Self {
++            width,
++            vector_bytes,
++            unroll,
++            step_bytes,
++            total_vec_bytes,
++            needs_iv_vec,
++            multi_iv,
++        })
++    }
++}
  
-     let mut next_val = func.next_value_id;
+-    let mut next_val = func.next_value_id;
++#[derive(Clone, Copy)]
++struct VectorPhi {
++    init: Value,
++    phi: Value,
++    next: Value,
++}
++
++struct IvPlan {
++    main: VectorPhi,
++    step: Value,
++    offsets: Vec<Value>,
++    extra: Vec<VectorPhi>,
++}
++
++struct PreheaderPlan {
++    acc0: VectorPhi,
++    acc1: Option<VectorPhi>,
++    iv: Option<IvPlan>,
++    ones_tbl: Option<Value>,
++    byte_iv_phi: Value,
++    byte_iv_next: Value,
++    vec_cmp_dest: Value,
++    instructions: Vec<Instruction>,
++}
++
++fn build_preheader(schedule: &VectorSchedule, next_value: &mut u32) -> Option<PreheaderPlan> {
++    let width = schedule.width;
++    let mut next_val = *next_value;
      let mut fresh = || {
-@@ -1132,18 +1268,18 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+         let v = Value(next_val);
+         next_val += 1;
+         v
+     };
+-    let mut next_lbl = func.next_label.max(
+-        func.blocks
+-            .iter()
+-            .map(|b| b.label.0)
+-            .max()
+-            .unwrap_or(0)
+-            .saturating_add(1),
+-    );
+-    let vec_header_label = BlockId(next_lbl);
+-    next_lbl += 1;
+-    let vec_body_label = BlockId(next_lbl);
+-    next_lbl += 1;
+-    let vec_reduce_label = BlockId(next_lbl);
+-    next_lbl += 1;
+-
+-    let preheader_label = func.blocks[p.preheader_idx].label;
+-    let mut preheader_insts = Vec::new();
++    let mut instructions = Vec::new();
+ 
      let acc0_init = fresh();
-     preheader_insts.push(Instruction::Intrinsic {
+-    preheader_insts.push(Instruction::Intrinsic {
++    instructions.push(Instruction::Intrinsic {
          dest: Some(acc0_init),
 -        op: IntrinsicOp::VecZeroI32x8,
 +        op: width.zero(),
          dest_ptr: None,
          args: vec![],
      });
-     let acc0_phi = fresh();
-     let acc0_next = fresh();
- 
+-    let acc0_phi = fresh();
+-    let acc0_next = fresh();
+-
 -    let (acc1_init, acc1_phi, acc1_next) = if unroll == 4 {
-+    let (acc1_init, acc1_phi, acc1_next) = if unroll > 1 {
++    let acc0 = VectorPhi {
++        init: acc0_init,
++        phi: fresh(),
++        next: fresh(),
++    };
++    let acc1 = if schedule.unroll > 1 {
          let init = fresh();
-         preheader_insts.push(Instruction::Intrinsic {
+-        preheader_insts.push(Instruction::Intrinsic {
++        instructions.push(Instruction::Intrinsic {
              dest: Some(init),
 -            op: IntrinsicOp::VecZeroI32x8,
 +            op: width.zero(),
              dest_ptr: None,
              args: vec![],
          });
-@@ -1152,7 +1288,7 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
-         (None, None, None)
+-        (Some(init), Some(fresh()), Some(fresh()))
++        Some(VectorPhi {
++            init,
++            phi: fresh(),
++            next: fresh(),
++        })
+     } else {
+-        (None, None, None)
++        None
      };
  
 -    let ones_tbl = {
@@ -4260,7 +5590,15 @@ index 817291288..00b9a0bc9 100644
          let tbl = fresh();
          // 16 i16 lanes `[1, 0, 1, 0, ..., 1, 0]` so `vpmaddwd(tbl, ones_tbl)`
          // zero/sign-extends the 8 even i16 lanes of `tbl` into i32x8 class 5.
-@@ -1170,57 +1306,106 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+@@ -1163,303 +1334,548 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+                 bytes.push(Operand::Const(IrConst::I8(b as i8)));
+             }
+         }
+-        preheader_insts.push(Instruction::Intrinsic {
++        instructions.push(Instruction::Intrinsic {
+             dest: Some(tbl),
+             op: IntrinsicOp::VecConstI8x32,
+             dest_ptr: None,
              args: bytes,
          });
          tbl
@@ -4278,8 +5616,7 @@ index 817291288..00b9a0bc9 100644
 -        for v in lane_i16 {
 -            for b in v.to_le_bytes() {
 -                init_bytes.push(Operand::Const(IrConst::I8(b as i8)));
-+    let (iv_vec_init, iv_vec_phi, iv_vec_next, iv_step_vec, iv_off_vecs, iv_extra) = if needs_iv_vec
-+    {
++    let iv = if schedule.needs_iv_vec {
 +        let init = if width == StridedWidth::X8 {
 +            let raw_tbl = fresh();
 +            // 16 i16 lanes `[0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0]` ->
@@ -4307,18 +5644,22 @@ index 817291288..00b9a0bc9 100644
 -            dest_ptr: None,
 -            args: vec![Operand::Value(raw_tbl), Operand::Value(ones_tbl)],
 -        });
-+            preheader_insts.push(Instruction::Intrinsic {
+-        let step_v = fresh();
+-        preheader_insts.push(Instruction::Intrinsic {
+-            dest: Some(step_v),
+-            op: IntrinsicOp::VecBroadcastI32x8,
++            instructions.push(Instruction::Intrinsic {
 +                dest: Some(raw_tbl),
 +                op: IntrinsicOp::VecConstI8x32,
 +                dest_ptr: None,
 +                args: init_bytes,
 +            });
 +            let init = fresh();
-+            preheader_insts.push(Instruction::Intrinsic {
++            instructions.push(Instruction::Intrinsic {
 +                dest: Some(init),
 +                op: IntrinsicOp::VecMaddwdI16x16,
 +                dest_ptr: None,
-+                args: vec![Operand::Value(raw_tbl), Operand::Value(ones_tbl.unwrap())],
++                args: vec![Operand::Value(raw_tbl), Operand::Value(ones_tbl?)],
 +            });
 +            init
 +        } else {
@@ -4328,7 +5669,7 @@ index 817291288..00b9a0bc9 100644
 +            } else {
 +                [0, 0, 8, 0]
 +            };
-+            preheader_insts.push(Instruction::Intrinsic {
++            instructions.push(Instruction::Intrinsic {
 +                dest: Some(init),
 +                op: IntrinsicOp::VecPackI32x4,
 +                dest_ptr: None,
@@ -4339,15 +5680,15 @@ index 817291288..00b9a0bc9 100644
 +            });
 +            init
 +        };
-         let step_v = fresh();
-         preheader_insts.push(Instruction::Intrinsic {
-             dest: Some(step_v),
--            op: IntrinsicOp::VecBroadcastI32x8,
++        let step = fresh();
++        instructions.push(Instruction::Intrinsic {
++            dest: Some(step),
 +            op: width.broadcast(),
              dest_ptr: None,
-             args: vec![Operand::Const(IrConst::I32(step_bytes as i32))],
+-            args: vec![Operand::Const(IrConst::I32(step_bytes as i32))],
++            args: vec![Operand::Const(IrConst::I32(schedule.step_bytes as i32))],
          });
-         let mut offs = Vec::new();
+-        let mut offs = Vec::new();
 -        if unroll == 4 {
 -            for copy_idx in 1..4i32 {
 -                let ov = fresh();
@@ -4358,13 +5699,14 @@ index 817291288..00b9a0bc9 100644
 -                    args: vec![Operand::Const(IrConst::I32(copy_idx * 32))],
 -                });
 -                offs.push(ov);
++        let mut offsets = Vec::new();
 +        let mut extra = Vec::new();
-+        if unroll > 1 {
-+            for copy_idx in 1..unroll as i32 {
-+                let byte_offset = copy_idx * vector_bytes as i32;
-+                if multi_iv {
++        if schedule.unroll > 1 {
++            for copy_idx in 1..schedule.unroll as i32 {
++                let byte_offset = copy_idx * schedule.vector_bytes as i32;
++                if schedule.multi_iv {
 +                    let init = fresh();
-+                    preheader_insts.push(Instruction::Intrinsic {
++                    instructions.push(Instruction::Intrinsic {
 +                        dest: Some(init),
 +                        op: IntrinsicOp::VecPackI32x4,
 +                        dest_ptr: None,
@@ -4378,76 +5720,178 @@ index 817291288..00b9a0bc9 100644
 +                        .map(|v| Operand::Const(IrConst::I32(v)))
 +                        .collect(),
 +                    });
-+                    extra.push((init, fresh(), fresh()));
++                    extra.push(VectorPhi {
++                        init,
++                        phi: fresh(),
++                        next: fresh(),
++                    });
 +                } else {
 +                    let ov = fresh();
-+                    preheader_insts.push(Instruction::Intrinsic {
++                    instructions.push(Instruction::Intrinsic {
 +                        dest: Some(ov),
 +                        op: width.broadcast(),
 +                        dest_ptr: None,
 +                        args: vec![Operand::Const(IrConst::I32(byte_offset))],
 +                    });
-+                    offs.push(ov);
++                    offsets.push(ov);
 +                }
              }
          }
 -        (Some(init), Some(fresh()), Some(fresh()), Some(step_v), offs)
-+        (
-+            Some(init),
-+            Some(fresh()),
-+            Some(fresh()),
-+            Some(step_v),
-+            offs,
++        let main = VectorPhi {
++            init,
++            phi: fresh(),
++            next: fresh(),
++        };
++        Some(IvPlan {
++            main,
++            step,
++            offsets,
 +            extra,
-+        )
++        })
      } else {
 -        (None, None, None, None, Vec::new())
-+        (None, None, None, None, Vec::new(), Vec::new())
++        None
      };
  
      let byte_iv_phi = fresh();
-@@ -1228,6 +1413,7 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+     let byte_iv_next = fresh();
      let vec_cmp_dest = fresh();
++    *next_value = next_val;
++    Some(PreheaderPlan {
++        acc0,
++        acc1,
++        iv,
++        ones_tbl,
++        byte_iv_phi,
++        byte_iv_next,
++        vec_cmp_dest,
++        instructions,
++    })
++}
  
-     let mut ctx = EmitCtx {
-+        width,
-         load_bases: &p.load_bases,
-         wide_load_proven: &p.wide_load_proven,
-         byte_iv: byte_iv_phi,
-@@ -1239,18 +1425,24 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
-         next_val,
+-    let mut ctx = EmitCtx {
+-        load_bases: &p.load_bases,
+-        wide_load_proven: &p.wide_load_proven,
+-        byte_iv: byte_iv_phi,
+-        byte_disp: 0,
+-        vec_iv: iv_vec_phi.unwrap_or(Value(0)),
+-        bcast_cache: Vec::new(),
+-        preheader_insts,
+-        body_insts: Vec::new(),
+-        next_val,
++fn emit_vector_body(
++    ctx: &mut EmitCtx<'_>,
++    p: &StridedI32ReducePattern,
++    schedule: &VectorSchedule,
++    plan: &PreheaderPlan,
++) -> Option<()> {
++    let width = schedule.width;
++    let iv = if schedule.needs_iv_vec {
++        Some(plan.iv.as_ref()?)
++    } else {
++        None
++    };
++    let acc1 = if schedule.unroll > 1 {
++        Some(plan.acc1.as_ref()?)
++    } else {
++        None
      };
  
 -    if unroll == 4 {
 -        let mut copy_vals = Vec::with_capacity(4);
 -        for copy_idx in 0..4usize {
 -            ctx.byte_disp = (copy_idx as i64) * 32;
-+    if unroll > 1 {
-+        let mut copy_vals = Vec::with_capacity(unroll as usize);
-+        for copy_idx in 0..unroll as usize {
-+            ctx.byte_disp = (copy_idx as i64) * vector_bytes as i64;
-             if needs_iv_vec {
+-            if needs_iv_vec {
 -                if copy_idx == 0 {
-+                if multi_iv {
-+                    ctx.vec_iv = if copy_idx == 0 {
-+                        iv_vec_phi.unwrap()
+-                    ctx.vec_iv = iv_vec_phi.unwrap();
++    if schedule.unroll > 1 {
++        let mut copy_vals = Vec::with_capacity(schedule.unroll as usize);
++        for copy_idx in 0..schedule.unroll as usize {
++            ctx.byte_disp = (copy_idx as i64) * schedule.vector_bytes as i64;
++            if let Some(iv) = iv {
++                if schedule.multi_iv {
++                    let selected = if copy_idx == 0 {
++                        iv.main.phi
 +                    } else {
-+                        iv_extra[copy_idx - 1].1
++                        iv.extra.get(copy_idx - 1)?.phi
 +                    };
++                    ctx.vec_iv = Some(selected);
 +                } else if copy_idx == 0 {
-                     ctx.vec_iv = iv_vec_phi.unwrap();
++                    ctx.vec_iv = Some(iv.main.phi);
                  } else {
                      let cur_iv = ctx.fresh();
                      ctx.body_insts.push(Instruction::Intrinsic {
                          dest: Some(cur_iv),
 -                        op: IntrinsicOp::VecAddI32x8,
-+                        op: width.bin_op(IrBinOp::Add),
++                        op: width.bin_op(IrBinOp::Add)?,
                          dest_ptr: None,
                          args: vec![
-                             Operand::Value(iv_vec_phi.unwrap()),
-@@ -1262,51 +1454,81 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+-                            Operand::Value(iv_vec_phi.unwrap()),
+-                            Operand::Value(iv_off_vecs[copy_idx - 1]),
++                            Operand::Value(iv.main.phi),
++                            Operand::Value(*iv.offsets.get(copy_idx - 1)?),
+                         ],
+                     });
+-                    ctx.vec_iv = cur_iv;
++                    ctx.vec_iv = Some(cur_iv);
+                 }
              }
-             copy_vals.push(ctx.emit(&p.expr));
+-            copy_vals.push(ctx.emit(&p.expr));
++            copy_vals.push(ctx.emit(&p.expr)?);
++        }
++        match schedule.unroll {
++            4 => {
++                let [v0, v1, v2, v3] = copy_vals.as_slice() else {
++                    return None;
++                };
++                let acc1 = acc1?;
++                let sum02 = ctx.fresh();
++                ctx.body_insts.push(Instruction::Intrinsic {
++                    dest: Some(sum02),
++                    op: width.bin_op(IrBinOp::Add)?,
++                    dest_ptr: None,
++                    args: vec![Operand::Value(plan.acc0.phi), Operand::Value(*v0)],
++                });
++                ctx.body_insts.push(Instruction::Intrinsic {
++                    dest: Some(plan.acc0.next),
++                    op: width.bin_op(IrBinOp::Add)?,
++                    dest_ptr: None,
++                    args: vec![Operand::Value(sum02), Operand::Value(*v2)],
++                });
++                let sum13 = ctx.fresh();
++                ctx.body_insts.push(Instruction::Intrinsic {
++                    dest: Some(sum13),
++                    op: width.bin_op(IrBinOp::Add)?,
++                    dest_ptr: None,
++                    args: vec![Operand::Value(acc1.phi), Operand::Value(*v1)],
++                });
++                ctx.body_insts.push(Instruction::Intrinsic {
++                    dest: Some(acc1.next),
++                    op: width.bin_op(IrBinOp::Add)?,
++                    dest_ptr: None,
++                    args: vec![Operand::Value(sum13), Operand::Value(*v3)],
++                });
++            }
++            2 => {
++                let [v0, v1] = copy_vals.as_slice() else {
++                    return None;
++                };
++                let acc1 = acc1?;
++                ctx.body_insts.push(Instruction::Intrinsic {
++                    dest: Some(plan.acc0.next),
++                    op: width.bin_op(IrBinOp::Add)?,
++                    dest_ptr: None,
++                    args: vec![Operand::Value(plan.acc0.phi), Operand::Value(*v0)],
++                });
++                ctx.body_insts.push(Instruction::Intrinsic {
++                    dest: Some(acc1.next),
++                    op: width.bin_op(IrBinOp::Add)?,
++                    dest_ptr: None,
++                    args: vec![Operand::Value(acc1.phi), Operand::Value(*v1)],
++                });
++            }
++            _ => return None,
          }
 -        let sum02 = ctx.fresh();
 -        ctx.body_insts.push(Instruction::Intrinsic {
@@ -4478,126 +5922,171 @@ index 817291288..00b9a0bc9 100644
 -            dest_ptr: None,
 -            args: vec![Operand::Value(sum13), Operand::Value(copy_vals[3])],
 -        });
-+        if unroll == 4 {
-+            let sum02 = ctx.fresh();
-+            ctx.body_insts.push(Instruction::Intrinsic {
-+                dest: Some(sum02),
-+                op: width.bin_op(IrBinOp::Add),
-+                dest_ptr: None,
-+                args: vec![Operand::Value(acc0_phi), Operand::Value(copy_vals[0])],
-+            });
-+            ctx.body_insts.push(Instruction::Intrinsic {
-+                dest: Some(acc0_next),
-+                op: width.bin_op(IrBinOp::Add),
-+                dest_ptr: None,
-+                args: vec![Operand::Value(sum02), Operand::Value(copy_vals[2])],
-+            });
-+            let sum13 = ctx.fresh();
-+            ctx.body_insts.push(Instruction::Intrinsic {
-+                dest: Some(sum13),
-+                op: width.bin_op(IrBinOp::Add),
-+                dest_ptr: None,
-+                args: vec![
-+                    Operand::Value(acc1_phi.unwrap()),
-+                    Operand::Value(copy_vals[1]),
-+                ],
-+            });
-+            ctx.body_insts.push(Instruction::Intrinsic {
-+                dest: Some(acc1_next.unwrap()),
-+                op: width.bin_op(IrBinOp::Add),
-+                dest_ptr: None,
-+                args: vec![Operand::Value(sum13), Operand::Value(copy_vals[3])],
-+            });
-+        } else {
-+            ctx.body_insts.push(Instruction::Intrinsic {
-+                dest: Some(acc0_next),
-+                op: width.bin_op(IrBinOp::Add),
-+                dest_ptr: None,
-+                args: vec![Operand::Value(acc0_phi), Operand::Value(copy_vals[0])],
-+            });
-+            ctx.body_insts.push(Instruction::Intrinsic {
-+                dest: Some(acc1_next.unwrap()),
-+                op: width.bin_op(IrBinOp::Add),
-+                dest_ptr: None,
-+                args: vec![
-+                    Operand::Value(acc1_phi.unwrap()),
-+                    Operand::Value(copy_vals[1]),
-+                ],
-+            });
-+        }
      } else {
          ctx.byte_disp = 0;
-         let v0 = ctx.emit(&p.expr);
+-        let v0 = ctx.emit(&p.expr);
++        let v0 = ctx.emit(&p.expr)?;
          ctx.body_insts.push(Instruction::Intrinsic {
-             dest: Some(acc0_next),
+-            dest: Some(acc0_next),
 -            op: IntrinsicOp::VecAddI32x8,
-+            op: width.bin_op(IrBinOp::Add),
++            dest: Some(plan.acc0.next),
++            op: width.bin_op(IrBinOp::Add)?,
              dest_ptr: None,
-             args: vec![Operand::Value(acc0_phi), Operand::Value(v0)],
+-            args: vec![Operand::Value(acc0_phi), Operand::Value(v0)],
++            args: vec![Operand::Value(plan.acc0.phi), Operand::Value(v0)],
          });
      }
  
 -    if let (Some(iv_phi_v), Some(iv_next_v), Some(step_v)) = (iv_vec_phi, iv_vec_next, iv_step_vec)
-+    if multi_iv {
-+        for (phi, next) in std::iter::once((iv_vec_phi.unwrap(), iv_vec_next.unwrap()))
-+            .chain(iv_extra.iter().map(|&(_, phi, next)| (phi, next)))
+-    {
++    if schedule.multi_iv {
++        let iv = iv?;
++        for (phi, next) in std::iter::once((iv.main.phi, iv.main.next))
++            .chain(iv.extra.iter().map(|entry| (entry.phi, entry.next)))
 +        {
 +            ctx.body_insts.push(Instruction::Intrinsic {
 +                dest: Some(next),
-+                op: width.bin_op(IrBinOp::Add),
++                op: width.bin_op(IrBinOp::Add)?,
 +                dest_ptr: None,
-+                args: vec![Operand::Value(phi), Operand::Value(iv_step_vec.unwrap())],
++                args: vec![Operand::Value(phi), Operand::Value(iv.step)],
 +            });
 +        }
-+    } else if let (Some(iv_phi_v), Some(iv_next_v), Some(step_v)) =
-+        (iv_vec_phi, iv_vec_next, iv_step_vec)
-     {
++    } else if let Some(iv) = iv {
          ctx.body_insts.push(Instruction::Intrinsic {
-             dest: Some(iv_next_v),
+-            dest: Some(iv_next_v),
 -            op: IntrinsicOp::VecAddI32x8,
-+            op: width.bin_op(IrBinOp::Add),
++            dest: Some(iv.main.next),
++            op: width.bin_op(IrBinOp::Add)?,
              dest_ptr: None,
-             args: vec![Operand::Value(iv_phi_v), Operand::Value(step_v)],
-         });
-@@ -1357,6 +1579,16 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
-             ],
+-            args: vec![Operand::Value(iv_phi_v), Operand::Value(step_v)],
++            args: vec![Operand::Value(iv.main.phi), Operand::Value(iv.step)],
          });
      }
-+    for &(init, phi, next) in &iv_extra {
-+        header_insts.push(Instruction::Phi {
-+            dest: phi,
-+            ty: IrType::I32,
-+            incoming: vec![
-+                (Operand::Value(init), preheader_label),
-+                (Operand::Value(next), vec_body_label),
-+            ],
-+        });
-+    }
-     header_insts.push(Instruction::Cmp {
-         dest: vec_cmp_dest,
-         op: IrCmpOp::Ult,
-@@ -1365,14 +1597,15 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+     ctx.body_insts.push(Instruction::BinOp {
+-        dest: byte_iv_next,
++        dest: plan.byte_iv_next,
+         op: IrBinOp::Add,
+-        lhs: Operand::Value(byte_iv_phi),
+-        rhs: Operand::Const(IrConst::I64(step_bytes)),
++        lhs: Operand::Value(plan.byte_iv_phi),
++        rhs: Operand::Const(IrConst::I64(schedule.step_bytes)),
          ty: IrType::U64,
      });
++    Some(())
++}
+ 
+-    let mut header_insts = vec![
++fn vector_phi(phi: VectorPhi, preheader: BlockId, body: BlockId) -> Instruction {
++    Instruction::Phi {
++        dest: phi.phi,
++        ty: IrType::I32,
++        incoming: vec![
++            (Operand::Value(phi.init), preheader),
++            (Operand::Value(phi.next), body),
++        ],
++    }
++}
++
++fn build_vector_header(
++    schedule: &VectorSchedule,
++    plan: &PreheaderPlan,
++    preheader_label: BlockId,
++    vec_body_label: BlockId,
++) -> Vec<Instruction> {
++    let mut instructions = vec![
+         Instruction::Phi {
+-            dest: byte_iv_phi,
++            dest: plan.byte_iv_phi,
+             ty: IrType::U64,
+             incoming: vec![
+                 (Operand::Const(IrConst::I64(0)), preheader_label),
+-                (Operand::Value(byte_iv_next), vec_body_label),
+-            ],
+-        },
+-        Instruction::Phi {
+-            dest: acc0_phi,
+-            ty: IrType::I32,
+-            incoming: vec![
+-                (Operand::Value(acc0_init), preheader_label),
+-                (Operand::Value(acc0_next), vec_body_label),
++                (Operand::Value(plan.byte_iv_next), vec_body_label),
+             ],
+         },
++        vector_phi(plan.acc0, preheader_label, vec_body_label),
+     ];
+-    if let (Some(init), Some(phi), Some(next)) = (acc1_init, acc1_phi, acc1_next) {
+-        header_insts.push(Instruction::Phi {
+-            dest: phi,
+-            ty: IrType::I32,
+-            incoming: vec![
+-                (Operand::Value(init), preheader_label),
+-                (Operand::Value(next), vec_body_label),
+-            ],
+-        });
++    if let Some(acc1) = plan.acc1 {
++        instructions.push(vector_phi(acc1, preheader_label, vec_body_label));
+     }
+-    if let (Some(init), Some(phi), Some(next)) = (iv_vec_init, iv_vec_phi, iv_vec_next) {
+-        header_insts.push(Instruction::Phi {
+-            dest: phi,
+-            ty: IrType::I32,
+-            incoming: vec![
+-                (Operand::Value(init), preheader_label),
+-                (Operand::Value(next), vec_body_label),
+-            ],
+-        });
++    if let Some(iv) = &plan.iv {
++        instructions.push(vector_phi(iv.main, preheader_label, vec_body_label));
++        for &entry in &iv.extra {
++            instructions.push(vector_phi(entry, preheader_label, vec_body_label));
++        }
+     }
+-    header_insts.push(Instruction::Cmp {
+-        dest: vec_cmp_dest,
++    instructions.push(Instruction::Cmp {
++        dest: plan.vec_cmp_dest,
+         op: IrCmpOp::Ult,
+-        lhs: Operand::Value(byte_iv_phi),
+-        rhs: Operand::Const(IrConst::I64(total_vec_bytes)),
++        lhs: Operand::Value(plan.byte_iv_phi),
++        rhs: Operand::Const(IrConst::I64(schedule.total_vec_bytes)),
+         ty: IrType::U64,
+     });
++    instructions
++}
  
 -    // Reduce block: sum accumulators, mask even lanes 0,2,4,6, horizontal add,
 -    // add `acc_init`, and hand off to the scalar header at `total_vec_bytes`.
-+    // Reduce block: sum accumulators, mask only an even-lane representation,
-+    // horizontally add, add `acc_init`, and hand off to the scalar header at
-+    // `total_vec_bytes`.
-     let mut reduce_insts = Vec::new();
-     let merged_acc = if let Some(acc1_v) = acc1_phi {
-         let m = ctx.fresh();
-         reduce_insts.push(Instruction::Intrinsic {
-             dest: Some(m),
+-    let mut reduce_insts = Vec::new();
+-    let merged_acc = if let Some(acc1_v) = acc1_phi {
+-        let m = ctx.fresh();
+-        reduce_insts.push(Instruction::Intrinsic {
+-            dest: Some(m),
 -            op: IntrinsicOp::VecAddI32x8,
-+            op: width.bin_op(IrBinOp::Add),
++fn emit_reduce(
++    ctx: &mut EmitCtx<'_>,
++    p: &StridedI32ReducePattern,
++    schedule: &VectorSchedule,
++    plan: &PreheaderPlan,
++) -> Option<(Vec<Instruction>, Value)> {
++    // Sum accumulators, mask only an even-lane representation, horizontally
++    // add, add `acc_init`, and hand off to the scalar header.
++    let width = schedule.width;
++    let mut instructions = Vec::new();
++    let merged_acc = if let Some(acc1) = plan.acc1 {
++        let merged = ctx.fresh();
++        instructions.push(Instruction::Intrinsic {
++            dest: Some(merged),
++            op: width.bin_op(IrBinOp::Add)?,
              dest_ptr: None,
-             args: vec![Operand::Value(acc0_phi), Operand::Value(acc1_v)],
+-            args: vec![Operand::Value(acc0_phi), Operand::Value(acc1_v)],
++            args: vec![Operand::Value(plan.acc0.phi), Operand::Value(acc1.phi)],
          });
-@@ -1380,38 +1613,65 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+-        m
++        merged
      } else {
-         acc0_phi
+-        acc0_phi
++        plan.acc0.phi
      };
 -    let mask_tbl = ctx.fresh();
 -    let mask_i16: [i16; 16] = [-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0];
@@ -4605,17 +6094,38 @@ index 817291288..00b9a0bc9 100644
 -    for v in mask_i16 {
 -        for b in v.to_le_bytes() {
 -            mask_bytes.push(Operand::Const(IrConst::I8(b as i8)));
-+    let masked_acc = if width == StridedWidth::X4Compact {
-+        // All four lanes are real strided elements; no odd-lane mask exists.
-+        merged_acc
-+    } else if width == StridedWidth::X8 {
-+        let mask_tbl = ctx.fresh();
-+        let mask_i16: [i16; 16] = [-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0];
-+        let mut mask_bytes = Vec::with_capacity(32);
-+        for v in mask_i16 {
-+            for b in v.to_le_bytes() {
-+                mask_bytes.push(Operand::Const(IrConst::I8(b as i8)));
++    let masked_acc = match width {
++        StridedWidth::X4Compact => merged_acc,
++        StridedWidth::X8 => {
++            let mask_tbl = ctx.fresh();
++            let mask_i16: [i16; 16] = [-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0];
++            let mut mask_bytes = Vec::with_capacity(32);
++            for v in mask_i16 {
++                for b in v.to_le_bytes() {
++                    mask_bytes.push(Operand::Const(IrConst::I8(b as i8)));
++                }
 +            }
++            instructions.push(Instruction::Intrinsic {
++                dest: Some(mask_tbl),
++                op: IntrinsicOp::VecConstI8x32,
++                dest_ptr: None,
++                args: mask_bytes,
++            });
++            let even_mask = ctx.fresh();
++            instructions.push(Instruction::Intrinsic {
++                dest: Some(even_mask),
++                op: IntrinsicOp::VecMaddwdI16x16,
++                dest_ptr: None,
++                args: vec![Operand::Value(mask_tbl), Operand::Value(plan.ones_tbl?)],
++            });
++            let masked = ctx.fresh();
++            instructions.push(Instruction::Intrinsic {
++                dest: Some(masked),
++                op: width.bin_op(IrBinOp::And)?,
++                dest_ptr: None,
++                args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
++            });
++            masked
          }
 -    }
 -    reduce_insts.push(Instruction::Intrinsic {
@@ -4638,58 +6148,212 @@ index 817291288..00b9a0bc9 100644
 -        dest_ptr: None,
 -        args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
 -    });
-+        reduce_insts.push(Instruction::Intrinsic {
-+            dest: Some(mask_tbl),
-+            op: IntrinsicOp::VecConstI8x32,
-+            dest_ptr: None,
-+            args: mask_bytes,
-+        });
-+        let even_mask = ctx.fresh();
-+        reduce_insts.push(Instruction::Intrinsic {
-+            dest: Some(even_mask),
-+            op: IntrinsicOp::VecMaddwdI16x16,
-+            dest_ptr: None,
-+            args: vec![Operand::Value(mask_tbl), Operand::Value(ones_tbl.unwrap())],
-+        });
-+        let masked_acc = ctx.fresh();
-+        reduce_insts.push(Instruction::Intrinsic {
-+            dest: Some(masked_acc),
-+            op: width.bin_op(IrBinOp::And),
-+            dest_ptr: None,
-+            args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
-+        });
-+        masked_acc
-+    } else {
-+        let even_mask = ctx.fresh();
-+        reduce_insts.push(Instruction::Intrinsic {
-+            dest: Some(even_mask),
-+            op: IntrinsicOp::VecPackI32x4,
-+            dest_ptr: None,
-+            args: vec![
-+                Operand::Const(IrConst::I32(-1)),
-+                Operand::Const(IrConst::I32(0)),
-+                Operand::Const(IrConst::I32(-1)),
-+                Operand::Const(IrConst::I32(0)),
-+            ],
-+        });
-+        let masked_acc = ctx.fresh();
-+        reduce_insts.push(Instruction::Intrinsic {
-+            dest: Some(masked_acc),
-+            op: width.bin_op(IrBinOp::And),
-+            dest_ptr: None,
-+            args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
-+        });
-+        masked_acc
++        StridedWidth::X4 => {
++            let even_mask = ctx.fresh();
++            instructions.push(Instruction::Intrinsic {
++                dest: Some(even_mask),
++                op: IntrinsicOp::VecPackI32x4,
++                dest_ptr: None,
++                args: vec![
++                    Operand::Const(IrConst::I32(-1)),
++                    Operand::Const(IrConst::I32(0)),
++                    Operand::Const(IrConst::I32(-1)),
++                    Operand::Const(IrConst::I32(0)),
++                ],
++            });
++            let masked = ctx.fresh();
++            instructions.push(Instruction::Intrinsic {
++                dest: Some(masked),
++                op: width.bin_op(IrBinOp::And)?,
++                dest_ptr: None,
++                args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
++            });
++            masked
++        }
 +    };
      let hsum = ctx.fresh();
-     reduce_insts.push(Instruction::Intrinsic {
+-    reduce_insts.push(Instruction::Intrinsic {
++    instructions.push(Instruction::Intrinsic {
          dest: Some(hsum),
 -        op: IntrinsicOp::VecHorizontalAddI32x8,
 +        op: width.horizontal_add(),
          dest_ptr: None,
          args: vec![Operand::Value(masked_acc)],
      });
-@@ -1491,13 +1751,18 @@ mod tests {
+     let combined_acc = ctx.fresh();
+-    reduce_insts.push(Instruction::BinOp {
++    instructions.push(Instruction::BinOp {
+         dest: combined_acc,
+         op: IrBinOp::Add,
+         lhs: p.acc_init.clone(),
+         rhs: Operand::Value(hsum),
+         ty: p.acc_ty,
+     });
++    Some((instructions, combined_acc))
++}
+ 
+-    let scalar_header_label = func.blocks[p.header_idx].label;
+-    for inst in &mut func.blocks[p.header_idx].instructions {
+-        if let Instruction::Phi { dest, incoming, .. } = inst {
+-            if *dest == p.iv_phi {
+-                for (val, lbl) in incoming.iter_mut() {
+-                    if *lbl == preheader_label {
+-                        *val = Operand::Const(rem_iv_const);
+-                        *lbl = vec_reduce_label;
+-                    }
+-                }
+-            } else if *dest == p.acc_phi {
+-                for (val, lbl) in incoming.iter_mut() {
+-                    if *lbl == preheader_label {
+-                        *val = Operand::Value(combined_acc);
+-                        *lbl = vec_reduce_label;
+-                    }
+-                }
++/// Validate both scalar incoming edges before performing the first mutation.
++/// A malformed internally supplied pattern therefore cannot leave half of the
++/// scalar header retargeted.
++fn retarget_scalar_header(
++    func: &mut IrFunction,
++    p: &StridedI32ReducePattern,
++    preheader_label: BlockId,
++    vec_reduce_label: BlockId,
++    rem_iv_const: IrConst,
++    combined_acc: Value,
++) -> Option<()> {
++    let header = func.blocks.get_mut(p.header_idx)?;
++    let mut iv_seen = false;
++    let mut acc_seen = false;
++    for inst in &header.instructions {
++        let Instruction::Phi { dest, incoming, .. } = inst else {
++            continue;
++        };
++        let target = if *dest == p.iv_phi {
++            &mut iv_seen
++        } else if *dest == p.acc_phi {
++            &mut acc_seen
++        } else {
++            continue;
++        };
++        if *target || !incoming.iter().any(|(_, label)| *label == preheader_label) {
++            return None;
++        }
++        *target = true;
++    }
++    if !iv_seen || !acc_seen {
++        return None;
++    }
++
++    for inst in &mut header.instructions {
++        let Instruction::Phi { dest, incoming, .. } = inst else {
++            continue;
++        };
++        let replacement = if *dest == p.iv_phi {
++            Operand::Const(rem_iv_const)
++        } else if *dest == p.acc_phi {
++            Operand::Value(combined_acc)
++        } else {
++            continue;
++        };
++        for (value, label) in incoming {
++            if *label == preheader_label {
++                *value = replacement;
++                *label = vec_reduce_label;
+             }
+         }
+     }
++    Some(())
++}
+ 
++fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> Option<usize> {
++    let schedule = VectorSchedule::new(p)?;
++    // Decline before any mutation: every rewrite below assumes this constant
++    // is representable in the IV's own type.
++    let rem_iv_const = resume_offset_const(p.iv_ty, schedule.total_vec_bytes)?;
++    let preheader_label = func.blocks.get(p.preheader_idx)?.label;
++    let scalar_header_label = func.blocks.get(p.header_idx)?.label;
++
++    let mut next_lbl = func.next_label.max(
++        func.blocks
++            .iter()
++            .map(|b| b.label.0)
++            .max()
++            .unwrap_or(0)
++            .saturating_add(1),
++    );
++    let vec_header_label = BlockId(next_lbl);
++    next_lbl += 1;
++    let vec_body_label = BlockId(next_lbl);
++    next_lbl += 1;
++    let vec_reduce_label = BlockId(next_lbl);
++    next_lbl += 1;
++
++    let mut next_val = func.next_value_id;
++    let mut plan = build_preheader(&schedule, &mut next_val)?;
++    let mut ctx = EmitCtx {
++        width: schedule.width,
++        load_bases: &p.load_bases,
++        wide_load_proven: &p.wide_load_proven,
++        byte_iv: plan.byte_iv_phi,
++        byte_disp: 0,
++        vec_iv: plan.iv.as_ref().map(|iv| iv.main.phi),
++        bcast_cache: Vec::new(),
++        preheader_insts: std::mem::take(&mut plan.instructions),
++        body_insts: Vec::new(),
++        next_val,
++    };
++    emit_vector_body(&mut ctx, p, &schedule, &plan)?;
++    let header_insts = build_vector_header(&schedule, &plan, preheader_label, vec_body_label);
++    let (reduce_insts, combined_acc) = emit_reduce(&mut ctx, p, &schedule, &plan)?;
++
++    // This is the commit point. Every operation above is fail-closed and uses
++    // temporary buffers, so refusal leaves the scalar function byte-for-byte
++    // unchanged, including its fresh-ID counters.
++    retarget_scalar_header(
++        func,
++        p,
++        preheader_label,
++        vec_reduce_label,
++        rem_iv_const,
++        combined_acc,
++    )?;
+     let preheader_insts = std::mem::take(&mut ctx.preheader_insts);
+     let body_insts = std::mem::take(&mut ctx.body_insts);
+     let final_next_val = ctx.next_val;
+-
+-    func.blocks[p.preheader_idx]
+-        .instructions
+-        .extend(preheader_insts);
+-    func.blocks[p.preheader_idx].terminator = Terminator::Branch(vec_header_label);
++    let preheader = &mut func.blocks[p.preheader_idx];
++    if preheader.source_spans.len() == preheader.instructions.len() {
++        preheader.source_spans.extend(std::iter::repeat_n(
++            crate::common::source::Span::dummy(),
++            preheader_insts.len(),
++        ));
++    }
++    preheader.instructions.extend(preheader_insts);
++    preheader.terminator = Terminator::Branch(vec_header_label);
+ 
+     let change_count = header_insts.len() + body_insts.len() + reduce_insts.len();
+     func.blocks.push(BasicBlock {
+         label: vec_header_label,
+         instructions: header_insts,
+         terminator: Terminator::CondBranch {
+-            cond: Operand::Value(vec_cmp_dest),
++            cond: Operand::Value(plan.vec_cmp_dest),
+             true_label: vec_body_label,
+             false_label: vec_reduce_label,
+         },
+@@ -1479,7 +1895,7 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+     });
+     func.next_value_id = final_next_val;
+     func.next_label = next_lbl;
+-    change_count
++    Some(change_count)
+ }
+ 
+ #[cfg(test)]
+@@ -1491,13 +1907,18 @@ mod tests {
      #[test]
      fn exact_load_groups_never_add_a_scalar_iteration() {
          for scalar_trips in MIN_SCALAR_TRIPS..=200_000 {
@@ -4715,7 +6379,7 @@ index 817291288..00b9a0bc9 100644
                  }
              }
          }
-@@ -1558,8 +1823,11 @@ mod tests {
+@@ -1558,8 +1979,11 @@ mod tests {
          let mut redirected = facts(&[("arr", 4096)]);
          redirected.aliased_names.insert("arr".to_string());
          assert!(!wide_load_proven(&f, Value(0), 128, &redirected));
@@ -4729,7 +6393,7 @@ index 817291288..00b9a0bc9 100644
          f.blocks[0].instructions.push(Instruction::GetElementPtr {
              dest: Value(1),
              base: Value(0),
-@@ -1572,12 +1840,61 @@ mod tests {
+@@ -1572,38 +1996,206 @@ mod tests {
              128,
              &facts(&[("arr", 4096)])
          ));
@@ -4792,7 +6456,16 @@ index 817291288..00b9a0bc9 100644
                  load_bases: &[Value(0)],
                  wide_load_proven: &[private],
                  byte_iv: Value(1),
-@@ -1592,14 +1909,15 @@ mod tests {
+                 byte_disp: 32,
+-                vec_iv: Value(2),
++                vec_iv: Some(Value(2)),
+                 bcast_cache: vec![],
+                 preheader_insts: vec![],
+                 body_insts: vec![],
+                 next_val: 3,
+             };
+-            ctx.emit(&StridedExpr::LoadEven32(0));
++            assert!(ctx.emit(&StridedExpr::LoadEven32(0)).is_some());
              let Instruction::Intrinsic { op, args, .. } = &ctx.body_insts[0] else {
                  panic!("expected vector load");
              };
@@ -4805,17 +6478,139 @@ index 817291288..00b9a0bc9 100644
 -                }
 -            );
 +            let expected = match (width, private) {
-+                (StridedWidth::X8, true) => IntrinsicOp::VecLoadI32x8,
-+                (StridedWidth::X8, false) => IntrinsicOp::VecLoadStrided2I32x8,
-+                (StridedWidth::X4, true) => IntrinsicOp::VecLoadI32x4,
-+                (StridedWidth::X4, false) => IntrinsicOp::VecLoadStrided2I32x4,
-+                (StridedWidth::X4Compact, true) => IntrinsicOp::VecLoadStrided2CompactI32x4,
-+                (StridedWidth::X4Compact, false) => unreachable!("tested above only with proof"),
++                (StridedWidth::X8, true) => Some(IntrinsicOp::VecLoadI32x8),
++                (StridedWidth::X8, false) => Some(IntrinsicOp::VecLoadStrided2I32x8),
++                (StridedWidth::X4, true) => Some(IntrinsicOp::VecLoadI32x4),
++                (StridedWidth::X4, false) => Some(IntrinsicOp::VecLoadStrided2I32x4),
++                (StridedWidth::X4Compact, true) => Some(IntrinsicOp::VecLoadStrided2CompactI32x4),
++                (StridedWidth::X4Compact, false) => None,
 +            };
-+            assert_eq!(*op, expected, "{width:?} private={private}");
++            assert_eq!(Some(*op), expected, "{width:?} private={private}");
              assert_eq!(args[2], Operand::Const(IrConst::I64(32)));
          }
      }
+ 
++    #[test]
++    fn unsupported_intrinsic_forms_are_refused() {
++        for width in [StridedWidth::X4, StridedWidth::X4Compact, StridedWidth::X8] {
++            assert!(width.bin_op(IrBinOp::SDiv).is_none(), "{width:?}");
++            assert!(width.shift_op(IrBinOp::Add).is_none(), "{width:?}");
++        }
++        assert!(StridedWidth::X4Compact.load(false).is_none());
++    }
++
++    fn emission_test_function() -> IrFunction {
++        let mut func = IrFunction::new("emit".into(), IrType::I32, vec![], false);
++        func.next_value_id = 100;
++        func.next_label = 3;
++        func.blocks = vec![
++            BasicBlock {
++                label: BlockId(0),
++                instructions: vec![],
++                terminator: Terminator::Branch(BlockId(1)),
++                source_spans: vec![],
++            },
++            BasicBlock {
++                label: BlockId(1),
++                instructions: vec![
++                    Instruction::Phi {
++                        dest: Value(1),
++                        ty: IrType::I64,
++                        incoming: vec![
++                            (Operand::Const(IrConst::I64(0)), BlockId(0)),
++                            (Operand::Value(Value(90)), BlockId(2)),
++                        ],
++                    },
++                    Instruction::Phi {
++                        dest: Value(2),
++                        ty: IrType::I32,
++                        incoming: vec![
++                            (Operand::Const(IrConst::I32(0)), BlockId(0)),
++                            (Operand::Value(Value(91)), BlockId(2)),
++                        ],
++                    },
++                ],
++                terminator: Terminator::Return(None),
++                source_spans: vec![],
++            },
++            BasicBlock {
++                label: BlockId(2),
++                instructions: vec![],
++                terminator: Terminator::Branch(BlockId(1)),
++                source_spans: vec![],
++            },
++        ];
++        func
++    }
++
++    fn emission_test_pattern(expr: StridedExpr) -> StridedI32ReducePattern {
++        StridedI32ReducePattern {
++            preheader_idx: 0,
++            header_idx: 1,
++            body_idx: 2,
++            iv_phi: Value(1),
++            iv_ty: IrType::I64,
++            acc_phi: Value(2),
++            acc_ty: IrType::I32,
++            acc_init: Operand::Const(IrConst::I32(0)),
++            safe_vecs: 8,
++            load_bases: vec![Value(3)],
++            wide_load_proven: vec![false],
++            expr,
++        }
++    }
++
++    /// Internal pattern corruption must not turn a formerly validated
++    /// assumption into a panic or a half-rewritten function. These cases are
++    /// deliberately below `analyze`: they test the emitter's own fail-closed
++    /// contract on every host, independently of the admitted source syntax.
++    #[test]
++    fn invalid_emission_forms_are_transactional() {
++        let load = || StridedExpr::LoadEven32(0);
++        let one = || StridedExpr::Invariant(Operand::Const(IrConst::I32(1)));
++        let cases = [
++            StridedExpr::BinOp(IrBinOp::SDiv, Box::new(load()), Box::new(one())),
++            StridedExpr::BinOp(IrBinOp::Shl, Box::new(load()), Box::new(load())),
++            StridedExpr::LoadEven32(1),
++        ];
++
++        for expr in cases {
++            let mut func = emission_test_function();
++            let pattern = emission_test_pattern(expr);
++            let before = func.clone();
++            assert_eq!(transform(&mut func, &pattern), None);
++            assert_eq!(func.next_value_id, before.next_value_id);
++            assert_eq!(func.next_label, before.next_label);
++            assert_eq!(format!("{:?}", func.blocks), format!("{:?}", before.blocks));
++        }
++    }
++
++    #[test]
++    fn successful_emission_keeps_preheader_source_spans_parallel() {
++        let mut func = emission_test_function();
++        func.blocks[0].instructions.push(Instruction::Copy {
++            dest: Value(80),
++            src: Operand::Const(IrConst::I64(0)),
++        });
++        func.blocks[0]
++            .source_spans
++            .push(crate::common::source::Span::dummy());
++        let expr = StridedExpr::BinOp(
++            IrBinOp::Xor,
++            Box::new(StridedExpr::LoadEven32(0)),
++            Box::new(StridedExpr::IvLow32),
++        );
++        let pattern = emission_test_pattern(expr);
++        assert!(transform(&mut func, &pattern).is_some());
++        assert_eq!(func.blocks.len(), 6);
++        let preheader = &func.blocks[0];
++        assert!(preheader.instructions.len() > 1);
++        assert_eq!(preheader.source_spans.len(), preheader.instructions.len());
++    }
++
+     /// The tightened admission must never hand back a trip count whose final
+     /// `iv + 8` leaves the IV type: that loop is either UB in the source or a
+     /// wrap in the IR, and a trip count derived from it is a fiction.
 diff --git a/tests/regression/check_affine_loop_fold.sh b/tests/regression/check_affine_loop_fold.sh
 index f9c245645..78b67bd7e 100755
 --- a/tests/regression/check_affine_loop_fold.sh
@@ -5255,10 +7050,10 @@ index ef7d0750c..c8d3e123d
          fi
      done
 diff --git a/tests/regression/check_vector_remainder_codegen.sh b/tests/regression/check_vector_remainder_codegen.sh
-index 7921621c9..d5fc33f7f 100755
+index 7921621c9..5596f3f94 100755
 --- a/tests/regression/check_vector_remainder_codegen.sh
 +++ b/tests/regression/check_vector_remainder_codegen.sh
-@@ -52,13 +52,59 @@ timeout 30 "$tmp/watch" || fail "strided exact-access watchpoint" "gap was read
+@@ -52,13 +52,86 @@ timeout 30 "$tmp/watch" || fail "strided exact-access watchpoint" "gap was read
  if ! grep -q 'vpinsrd' "$tmp/watch-kernel.s"; then
      fail "strided exact-access watchpoint" "kernel did not take the packed exact-load path"
  fi
@@ -5280,8 +7075,35 @@ index 7921621c9..d5fc33f7f 100755
 +    fail "strided i32 SSE2 reduction arithmetic" \
 +        "output differs from GCC (lccc: $actual_out / gcc: $expected_out)"
 +fi
++
++# The dedicated pre-unroll reducer is intentionally O2+ and disabled for
++# size. O1/Os therefore pin correct scalar-fallback behavior, not a packed
++# shape. Exercise both x86 ISA modes and let GAS enforce the baseline SSE2
++# ceiling instead of maintaining an incomplete opcode denylist here.
++for opt in -O1 -Os; do
++    for arch in x86-64 x86-64-v3; do
++        tag="${opt#-}-${arch}"
++        level_flags=("$opt" "-march=$arch" -ffast-math -ffp-contract=fast)
++        "$CCC" "${level_flags[@]}" -S "$strided_src" -o "$tmp/strided-$tag.s"
++        if [[ $arch == x86-64 ]]; then
++            "${AS:-as}" --64 -march=generic64 "$tmp/strided-$tag.s" \
++                -o "$tmp/strided-$tag-gas.o" \
++                || fail "strided $tag baseline ISA" "GAS rejected a non-SSE2 instruction"
++        fi
++        "$CCC" "${level_flags[@]}" "$strided_src" -o "$tmp/strided-$tag"
++        actual_out=$(timeout 60 "$tmp/strided-$tag")
++        if [[ $actual_out != "$expected_out" ]]; then
++            fail "strided i32 $tag arithmetic" \
++                "output differs from GCC (lccc: $actual_out / gcc: $expected_out)"
++        fi
++    done
++done
++"${AS:-as}" --64 -march=generic64 "$tmp/strided-sse2.s" -o "$tmp/strided-sse2-gas.o" \
++    || fail "strided O2 SSE2 baseline ISA" "GAS rejected a non-SSE2 instruction"
 +"$CCC" "${sse2_flags[@]}" -c "$dir/fixtures/strided_exact/kernel.c" -o "$tmp/watch-kernel-sse2.o"
 +"$CCC" "${sse2_flags[@]}" -S "$dir/fixtures/strided_exact/kernel.c" -o "$tmp/watch-kernel-sse2.s"
++"${AS:-as}" --64 -march=generic64 "$tmp/watch-kernel-sse2.s" -o "$tmp/watch-kernel-sse2-gas.o" \
++    || fail "strided O2 SSE2 watch kernel ISA" "GAS rejected a non-SSE2 instruction"
 +${GCC_BIN:-gcc} -O2 "$dir/fixtures/strided_exact/watch_driver.c" "$tmp/watch-kernel-sse2.o" \
 +    -o "$tmp/watch-sse2"
 +timeout 30 "$tmp/watch-sse2" || fail "strided SSE2 exact-access watchpoint" \
@@ -5319,7 +7141,7 @@ index 7921621c9..d5fc33f7f 100755
      match = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text)
      if not match:
          raise SystemExit(f"{name}: missing assembly body")
-@@ -76,7 +122,7 @@ for name in ("sum_global_full", "sum_dynamic_tail", "sum_dynamic_full"):
+@@ -76,7 +149,7 @@ for name in ("sum_global_full", "sum_dynamic_tail", "sum_dynamic_full"):
      if not packed.search(body):
          reject("no packed dword arithmetic in the reduction loop "
                 "(a scalar fallback cannot be the vectorized transform)")
@@ -5329,10 +7151,53 @@ index 7921621c9..d5fc33f7f 100755
          # defined size the reducer proves (`ModuleSymbolFacts::global_min_bytes`),
          # so its loads widen to full 32-byte vectors: legal (every byte read is
 diff --git a/tests/regression/check_vectorize_saturating_subtract.sh b/tests/regression/check_vectorize_saturating_subtract.sh
-index c51dd8dd3..fa69ac68c 100755
+index c51dd8dd3..76d266893 100755
 --- a/tests/regression/check_vectorize_saturating_subtract.sh
 +++ b/tests/regression/check_vectorize_saturating_subtract.sh
-@@ -58,6 +58,13 @@ for fn in ("slide_w_ge", "slide_w_gt"):
+@@ -13,11 +13,11 @@ src="$dir/vectorize_saturating_subtract.c"
+ tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-subsat.XXXXXX")
+ trap 'rm -rf "$tmp"' EXIT
+ 
+-"$CCC" -O2 -S "$src" -o "$tmp/lccc.s"
++"$CCC" -O2 -march=x86-64 -S "$src" -o "$tmp/lccc.s"
+ # The AVX2 path reaches the same fold through the min/max form
+ # (`vpmaxuw` + `vpsubw` -> `vpsubusw`), so both widths are gated.
+ "$CCC" -O2 -march=x86-64-v3 -S "$src" -o "$tmp/lccc-v3.s"
+-"$CCC" -O2 -o "$tmp/lccc" "$src"
++"$CCC" -O2 -march=x86-64 -o "$tmp/lccc" "$src"
+ "$tmp/lccc" > "$tmp/lccc.out"
+ 
+ if command -v "$REF" >/dev/null 2>&1; then
+@@ -32,6 +32,28 @@ else
+     echo "note: $REF not found; skipping the differential half" >&2
+ fi
+ 
++# O1 and size optimization exercise the scalar/fallback pipeline. Compare
++# their complete output with the already validated O2 result and use GAS as
++# the authoritative baseline-ISA oracle at every level.
++for opt in -O1 -Os; do
++    for arch in x86-64 x86-64-v3; do
++        tag="${opt#-}-${arch}"
++        "$CCC" "$opt" "-march=$arch" -S "$src" -o "$tmp/lccc-$tag.s"
++        if [[ $arch == x86-64 ]]; then
++            "${AS:-as}" --64 -march=generic64 "$tmp/lccc-$tag.s" \
++                -o "$tmp/lccc-$tag-gas.o"
++        fi
++        "$CCC" "$opt" "-march=$arch" -o "$tmp/lccc-$tag" "$src"
++        "$tmp/lccc-$tag" > "$tmp/lccc-$tag.out"
++        if ! cmp -s "$tmp/lccc.out" "$tmp/lccc-$tag.out"; then
++            echo "FAIL: $opt $arch result differs from the validated O2 output" >&2
++            diff -u "$tmp/lccc.out" "$tmp/lccc-$tag.out" >&2 || true
++            exit 1
++        fi
++    done
++done
++"${AS:-as}" --64 -march=generic64 "$tmp/lccc.s" -o "$tmp/lccc-gas.o"
++
+ python3 - "$tmp/lccc.s" "$tmp/lccc-v3.s" <<'PY'
+ import re
+ import sys
+@@ -58,6 +80,13 @@ for fn in ("slide_w_ge", "slide_w_gt"):
          if "pcmpgtw" in b or "pmaxuw" in b:
              raise SystemExit(
                  f"{fn} ({label}): still expands the saturating subtract")
@@ -5346,6 +7211,102 @@ index c51dd8dd3..fa69ac68c 100755
  
  # Byte lanes never reach the map emitter today (a byte map is admitted only
  # for 0/1 reduction trees), so this one is a correctness-only fixture: the
+diff --git a/tests/regression/phi_coalesce_split_latch_diamond.c b/tests/regression/phi_coalesce_split_latch_diamond.c
+new file mode 100644
+index 000000000..1fbb34946
+--- /dev/null
++++ b/tests/regression/phi_coalesce_split_latch_diamond.c
+@@ -0,0 +1,90 @@
++/* Destructive phi coalescing across a split-latch if diamond.
++ *
++ * The incoming value is loaded before the if; both the store and skip arms
++ * then reach the latch copy `last = h`.  Cover zero-trip, both arms, an old
++ * phi read on the middle arm (which must refuse coalescing), and a call in
++ * that arm (which constrains the register home).  Differential vs GCC.
++ */
++#include <stdlib.h>
++
++static const unsigned input[9] = { 0, 3, 8, 5, 2, 7, 1, 4, 9 };
++static unsigned observed;
++
++__attribute__((noinline)) static void observe(unsigned x)
++{
++    observed = observed * 33U + x;
++}
++
++__attribute__((noinline)) static unsigned plain_diamond(const unsigned *src,
++                                                        unsigned *dst,
++                                                        unsigned n)
++{
++    unsigned last = 0;
++    for (unsigned i = 0; i < n; ++i) {
++        unsigned h = src[i];
++        if (h & 1U)
++            *dst += h;
++        last = h;
++    }
++    return last;
++}
++
++__attribute__((noinline)) static unsigned old_phi_read(const unsigned *src,
++                                                       unsigned *dst,
++                                                       unsigned n)
++{
++    unsigned last = 0;
++    for (unsigned i = 0; i < n; ++i) {
++        unsigned h = src[i];
++        if (h & 1U)
++            *dst += last;
++        last = h;
++    }
++    return last;
++}
++
++__attribute__((noinline)) static unsigned call_in_middle(const unsigned *src,
++                                                         unsigned *dst,
++                                                         unsigned n)
++{
++    unsigned last = 0;
++    for (unsigned i = 0; i < n; ++i) {
++        unsigned h = src[i];
++        if (h & 1U) {
++            *dst += h;
++            observe(h);
++        }
++        last = h;
++    }
++    return last;
++}
++
++int main(void)
++{
++    for (unsigned n = 0; n <= 9; ++n) {
++        unsigned expected_last = n == 0 ? 0 : input[n - 1];
++        unsigned expected_plain = 0, expected_old = 0, expected_observed = 1;
++        unsigned previous = 0;
++        for (unsigned i = 0; i < n; ++i) {
++            if (input[i] & 1U) {
++                expected_plain += input[i];
++                expected_old += previous;
++                expected_observed = expected_observed * 33U + input[i];
++            }
++            previous = input[i];
++        }
++
++        unsigned dst = 0;
++        if (plain_diamond(input, &dst, n) != expected_last || dst != expected_plain)
++            abort();
++        dst = 0;
++        if (old_phi_read(input, &dst, n) != expected_last || dst != expected_old)
++            abort();
++        dst = 0;
++        observed = 1;
++        if (call_in_middle(input, &dst, n) != expected_last || dst != expected_plain
++            || observed != expected_observed)
++            abort();
++    }
++    return 0;
++}
 diff --git a/tests/regression/vec_u16_saturating_sub.c b/tests/regression/vec_u16_saturating_sub.c
 index 2eefc6396..c354faacf 100644
 --- a/tests/regression/vec_u16_saturating_sub.c
