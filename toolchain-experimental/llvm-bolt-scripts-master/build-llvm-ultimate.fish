@@ -1,6 +1,6 @@
 #!/usr/bin/env fish
 
-# build-llvm-ultimate.v26.fish
+# build-llvm-ultimate.v26-no-clangir.fish
 # Integrated i386 PGO runtime support: native fish, no external repair helpers.
 # Linux x86-64 default: BUILD_I386_PROFILE_RUNTIME=1, I386_PROFILE_JOBS=4.
 # Arch prerequisite: multilib enabled, lib32-glibc, lib32-gcc-libs, gcc.
@@ -521,7 +521,9 @@ set -g LTO_PGO_MISMATCH_LINKER_FLAGS
 # Common CMake switches for all LLVM configures. Keep this list conservative:
 # every variable here is declared by LLVM's top-level CMake, so it must not
 # create "manually-specified variables were not used" warnings.
+# ClangIR is disabled in every LLVM/Clang stage (not runtime-only configures).
 set -g LLVM_COMMON_DISABLE_CMAKE_ARGS \
+    -DCLANG_ENABLE_CIR=OFF \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_INCLUDE_BENCHMARKS=OFF \
     -DLLVM_BUILD_BENCHMARKS=OFF \
@@ -912,12 +914,12 @@ if test -d llvm-project
 end
 git clone --filter=blob:none --depth=1 https://github.com/llvm/llvm-project.git || die "Clone failed"
 cd llvm-project || die "cd llvm-project failed"
-# v4 patch contexts are pinned to this exact official LLVM revision.
-set -g LLVM_REBASE_COMMIT 02bd47db9d3c4313fe1b5054ed8a1a081f1b7f78 #fd63167bbd7f0193f21129abe49604b98f777cdc
+# v3 patch contexts are pinned to this exact official LLVM revision.
+set -g LLVM_REBASE_COMMIT f6b8a7b7fc61406017cd5364a383c81d6560bbae
 if test (git rev-parse HEAD) != "$LLVM_REBASE_COMMIT"
-    git fetch --depth=1 origin "$LLVM_REBASE_COMMIT"; or die "Could not fetch the v4 LLVM base"
+    git fetch --depth=1 origin "$LLVM_REBASE_COMMIT"; or die "Could not fetch the v3 LLVM base"
 end
-git checkout --detach "$LLVM_REBASE_COMMIT"; or die "Could not select the v4 LLVM base"
+git checkout --detach "$LLVM_REBASE_COMMIT"; or die "Could not select the v3 LLVM base"
 
 log "Using pristine upstream lld CMake configuration (complete lld; no ELF-only sed mutation)."
 
@@ -1066,6 +1068,15 @@ function configure_clean
         die "cmake configure failed for $bdir (full log: $cmake_log)"
     end
     assert_clean_cmake_log "$cmake_log" "$bdir"
+    # Every main LLVM configure must prove CIR stayed disabled even if an
+    # argument or stale cache attempted to re-enable it. Runtime-only CMake
+    # projects do not define this option and must not receive an unused -D.
+    if contains -- "$LLVM_SRC/llvm" $argv
+        if not grep -qx 'CLANG_ENABLE_CIR:BOOL=OFF' "$bdir/CMakeCache.txt"
+            die "ClangIR must be disabled: missing CLANG_ENABLE_CIR:BOOL=OFF in $bdir/CMakeCache.txt"
+        end
+        log "ClangIR disabled and verified for $bdir"
+    end
 end
 
 # Native fish implementation: no companion repair script is required.
