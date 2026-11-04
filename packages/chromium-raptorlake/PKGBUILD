@@ -168,6 +168,55 @@ _google_api_key=no
 
 # Reject context drift before changing a file. GNU patch's exit status alone
 # does not reject offsets; inspect both the dry run and actual application.
+# ── Cross-language ThinLTO probe (rustc <-> clang/lld) ──────────────────────
+# LLVM's alias-scope *domain* metadata changed format inside the 24 series:
+#   LLVM <= 22  : domain = distinct !{!self}            or {!self, !"name"}
+#                 Verifier: "domain must have one or two operands"
+#   LLVM >= 24  : domain = distinct !{!self, i1, !"name"}
+#                 Verifier: "domain must have two or three operands"
+# A rustc and a clang from different sides of that change cannot share ThinLTO
+# bitcode: the newer side emits a domain the older side's verifier rejects, and
+# the build dies mid-link with "LLVM ERROR: Broken module found". Version
+# *strings* do not capture this (both can say "24"), so we measure it: build a
+# tiny rust staticlib as bitcode and link it with a tiny C++ TU through lld.
+#   0 = compatible (full cross-language LTO is safe -> fastest build)
+#   2 = rustc failed, 3 = c++ failed, 4 = LTO link failed (any -> incompatible)
+_rust_cxx_lto_probe() {
+  local _dir=$1 _rustc=$2 _cxx=$3 rc
+  rm -rf "$_dir"
+  mkdir -p "$_dir" || return 1
+  cat > "$_dir/lib.rs" <<'RUSTEOF'
+#[no_mangle]
+pub extern "C" fn probe_sum(n: i32) -> i32 {
+    let v: Vec<i32> = (0..n).collect();
+    v.iter().sum()
+}
+RUSTEOF
+  cat > "$_dir/main.cc" <<'CCEOF'
+extern "C" int probe_sum(int);
+int main() { return probe_sum(4) == 6 ? 0 : 1; }
+CCEOF
+  (
+    cd "$_dir" || exit 1
+    "$_rustc" --edition 2021 -C opt-level=3 -C lto=thin -C linker-plugin-lto \
+      --crate-type=staticlib --crate-name raptorlake_ltoprobe lib.rs \
+      -o libraptorlake_ltoprobe.a >rustc.log 2>&1 || exit 2
+    # rustc tags its objects x86_64-unknown-linux-gnu; match it so llvm's
+    # "linking two modules of different target triples" warning stays silent.
+    "$_cxx" -O3 -flto=thin -std=c++17 --target=x86_64-unknown-linux-gnu \
+      -c main.cc -o main.o >cc.log 2>&1 || exit 3
+    "$_cxx" -flto=thin -fuse-ld=lld --target=x86_64-unknown-linux-gnu \
+      main.o libraptorlake_ltoprobe.a -o raptorlake_ltoprobe \
+      -lpthread -ldl >link.log 2>&1 || exit 4
+    ./raptorlake_ltoprobe >run.log 2>&1 || exit 5
+    # rustc packs std's bitcode into the staticlib (~50 MB); the binary has
+    # already proven the point, so do not leave that behind.
+    rm -f libraptorlake_ltoprobe.a main.o
+  )
+  rc=$?
+  return $rc
+}
+
 _apply_patch_strict() {
   local _patch=$1 _log
   _log=$(mktemp "$srcdir/.patch-check.XXXXXX") || return 1
@@ -628,21 +677,59 @@ PYEOF
     warning "  If the build fails on libclang_rt.builtins, install 'compiler-rt' or check your toolchain."
   fi
 
-  # ── Rust <-> Clang cross-language ThinLTO compatibility guard ──────────────
-  # rustc embeds its own LLVM; if its major differs from the custom clang's,
-  # cross-language ThinLTO (toolchain_supports_rust_thin_lto) can fail with an
-  # LLVM bitcode mismatch at link. Detect and only enable rust-thinlto when the
-  # majors match; otherwise fall back to plain rust codegen (safe, still fast).
-  local _rustc_llvm _rust_thinlto
-  local _rustc="$PWD/third_party/rust-toolchain/bin/rustc"
+  # ── Rust: exactly one rustc, the Chromium-pinned one ──────────────────────
+  # prepare() installed the pinned toolchain into third_party/rust-toolchain,
+  # but GN and ninja resolve `rustc` from PATH, so the distro toolchain (kept in
+  # makedepends only to supply rustfmt for the bindgen CLI) was silently doing
+  # the Rust half of the build. Two LLVM trees in one build is what produced
+  #   LLVM ERROR: Broken module found
+  #   domain must have one or two operands
+  # at edge ~4639: that message is LLVM <=22's alias-scope domain verifier,
+  # rejecting LLVM >=24 metadata (see _rust_cxx_lto_probe above). Pin the pinned
+  # rustc for every child process, and prove the pairing before generating
+  # 58k edges instead of discovering it 4.6k edges in.
+  local _rust_root="$PWD/third_party/rust-toolchain" _rustc _rustc_llvm _clang_llvm
+  local _rust_thinlto=false
+  _rustc="$_rust_root/bin/rustc"
+  [[ -x $_rustc ]] || {
+    error "Chromium-pinned rustc missing at $_rustc (did prepare() run update_rust.py?)"
+    return 1
+  }
+  export RUSTC="$_rustc"
+  export PATH="$_rust_root/bin:$PATH"
   _rustc_llvm=$("$_rustc" --version --verbose 2>/dev/null \
-                | sed -nE 's/.*LLVM version: ([0-9]+).*/\1/p')
-  if [[ -n $_rustc_llvm && $_rustc_llvm == "$_clang_version" ]]; then
+                | sed -nE 's/.*LLVM version: ([0-9]+\.?[0-9]*).*/\1/p')
+  _clang_llvm=$("$_clang" --version | sed -nE 's/.*LLVM version: ([0-9]+\.?[0-9]*).*/\1/p')
+  [[ -n $_clang_llvm ]] || _clang_llvm=$_clang_version
+  msg2 "rustc: $("$_rustc" --version 2>/dev/null)  (LLVM ${_rustc_llvm:-?})"
+  msg2 "clang: $("$_clang" --version | head -1)  (LLVM ${_clang_llvm:-?})"
+
+  # Probe, don't guess: can these two LLVM trees share ThinLTO bitcode?
+  msg2 "Probing rustc <-> clang cross-language ThinLTO compatibility..."
+  if _rust_cxx_lto_probe "$srcdir/.rust-lto-probe" "$_rustc" "$_clangxx"; then
     _rust_thinlto=true
-    msg2 "rustc LLVM ($_rustc_llvm) matches clang ($_clang_version): enabling Rust cross-LTO."
+    msg2 "  probe passed: enabling Rust cross-language LTO (full ThinLTO)."
+    rm -rf "$srcdir/.rust-lto-probe"
   else
+    local _probe_rc=$?
     _rust_thinlto=false
-    warning "rustc LLVM (${_rustc_llvm:-?}) != clang ($_clang_version): disabling Rust cross-LTO to avoid bitcode mismatch."
+    warning "rustc(LLVM ${_rustc_llvm:-?}) and clang(LLVM ${_clang_llvm:-?}) cannot share ThinLTO"
+    warning "  bitcode (probe exit $_probe_rc). Disabling Rust cross-LTO; Rust is still"
+    warning "  compiled with -Copt-level=3 to native objects, so this costs little speed."
+    warning "  Probe logs (kept for diagnosis): $srcdir/.rust-lto-probe/*.log"
+    local _logf
+    for _logf in rustc.log cc.log link.log; do
+      [[ -s $srcdir/.rust-lto-probe/$_logf ]] || continue
+      warning "  --- $_logf ---"
+      sed -n '1,20p' "$srcdir/.rust-lto-probe/$_logf" | while IFS= read -r _line; do
+        warning "  | $_line"
+      done
+    done
+    if grep -q "domain must have one or two operands" \
+         "$srcdir/.rust-lto-probe/link.log" 2>/dev/null; then
+      warning "  diagnosed: LLVM alias-scope domain format mismatch (<=22 vs >=24)."
+      warning "  Rust cross-LTO is OFF for this build, so the link cannot hit it."
+    fi
   fi
 
   local _bindgen _bindgen_root
@@ -865,6 +952,38 @@ if bad:
     sys.exit(f"bindgen graph audit: {len(bad)} action(s) do not use {expected}")
 print(f"  bindgen graph audit: {len(hits)} action reference(s) use {expected}")
 PYEOF
+
+  # Audit the generated graph for the one path that aborted the last build: rust
+  # bitcode reaching lld while cross-language LTO is disabled. When cross-LTO is
+  # off, no rust module may carry -Clinker-plugin-lto, otherwise the <=22
+  # verifier aborts thousands of edges in.
+  python3 - "$_rust_thinlto" <<'AUDITEOF'
+import os, sys
+enable = sys.argv[1] == "true"
+needle = "linker-plugin-lto"
+hits = 0
+for base, _, files in os.walk("out/Release"):
+    for name in files:
+        if not (name.endswith(".ninja") or "rustflags" in name):
+            continue
+        try:
+            with open(os.path.join(base, name), encoding="utf-8",
+                      errors="replace") as fh:
+                hits += fh.read().count(needle)
+        except OSError:
+            pass
+if enable:
+    if not hits:
+        print("  rust LTO audit: cross-LTO enabled but no bitcode edges found?")
+    else:
+        print(f"  rust LTO audit: {hits} rust-bitcode edge(s), cross-LTO enabled")
+else:
+    if hits:
+        sys.exit(f"rust LTO audit: {hits} edge(s) still hand rust bitcode to lld "
+                 "while cross-LTO is disabled; the LLVM <=22 domain verifier "
+                 "would abort the link")
+    print("  rust LTO audit: no rust bitcode reaches lld (safe path)")
+AUDITEOF
 
   msg2 "Building chrome, chrome_sandbox, chromedriver (long)..."
   local _ninja_jobs=()
