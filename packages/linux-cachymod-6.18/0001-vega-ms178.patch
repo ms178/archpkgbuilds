@@ -1,4 +1,4 @@
-From 0a23a8a14808ecf50adb9f3c6e225631ce73bf59 Mon Sep 17 00:00:00 2001
+From be808769730952a3c2008b28f3a5b287db88c035 Mon Sep 17 00:00:00 2001
 From: Rebase Bot <rebase@localhost>
 Date: Sat, 3 Oct 2026 22:57:04 +0000
 Subject: [PATCH] 0001-vega-ms178.patch
@@ -10,11 +10,13 @@ Subject: [PATCH] 0001-vega-ms178.patch
  drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c     |   85 +-
  drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c       | 1104 ++++++++++----
  drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c        |  130 +-
- drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c       |  179 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h        |   12 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c       |  186 +--
  drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h       |  118 +-
  drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c       |  825 ++++++-----
  drivers/gpu/drm/amd/amdgpu/amdgpu_object.c    |  576 ++++----
  drivers/gpu/drm/amd/amdgpu/amdgpu_object.h    |  184 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h      |   40 +-
  drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c     |   58 +-
  drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c      |   55 +-
  drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c       |  458 +++---
@@ -30,7 +32,7 @@ Subject: [PATCH] 0001-vega-ms178.patch
  drivers/gpu/drm/drm_syncobj.c                 |  160 ++-
  drivers/gpu/drm/ttm/ttm_bo_vm.c               |  544 +++++--
  include/drm/ttm/ttm_bo.h                      |   28 +-
- 26 files changed, 4999 insertions(+), 3198 deletions(-)
+ 28 files changed, 5050 insertions(+), 3206 deletions(-)
 
 diff --git a/drivers/gpu/buddy.c b/drivers/gpu/buddy.c
 index bf5920bd2258039f259040c4880ce4592ac0849c..40e12320cdacd644b728220f210bc4d54e134630 100644
@@ -3826,15 +3828,42 @@ index 623a2ae3a10cd84911211d6d26da0250e7aea7e2..bfa50b3118597502f37b0569498d19bb
  
  	amdgpu_ring_ib_end(ring);
  	/* Save the wptr associated with this fence.
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+index f58b6be7fccc0cd5839d349210fe8f197e36e13f..5e20d78ce2c6a3e8e723007fae6e0571bfb340ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+@@ -67,12 +67,18 @@ struct amdgpu_ih_ring {
+ 
+ 	bool                    enabled;
+ 	unsigned		rptr;
+-	struct amdgpu_ih_regs	ih_regs;
+-
+ 	/* For waiting on IH processing at checkpoint. */
+ 	wait_queue_head_t wait_process;
++	/*
++	 * Per-IV state written from IH interrupt context.  Grouped with
++	 * rptr/enabled/wait_process above so every amdgpu_ih_process()
++	 * iteration - including the wake_up_all() lock - dirties a single
++	 * cacheline instead of straddling into the tail of the struct
++	 * (processed_timestamp/overflow used to sit at ~144/152).
++	 */
+ 	uint64_t		processed_timestamp;
+-	bool overflow;
++	bool			overflow;
++	struct amdgpu_ih_regs	ih_regs;
+ };
+ 
+ /* return true if time stamp t2 is after t1 with 48bit wrap around */
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
-index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81ec0d5dab 100644
+index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..72ccf950f43b1b20b5b8736df2a1f8412fe2f8d6 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
-@@ -44,10 +44,12 @@
+@@ -44,10 +44,13 @@
  
  #include <linux/irq.h>
  #include <linux/pci.h>
 +#include <linux/pm_runtime.h>
++#include <linux/prefetch.h>
  
  #include <drm/drm_vblank.h>
  #include <drm/amdgpu_drm.h>
@@ -3843,7 +3872,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  #include "amdgpu.h"
  #include "amdgpu_ih.h"
  #include "atom.h"
-@@ -56,8 +58,6 @@
+@@ -56,8 +59,6 @@
  #include "amdgpu_amdkfd.h"
  #include "amdgpu_ras.h"
  
@@ -3852,7 +3881,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  #ifdef CONFIG_DRM_AMD_DC
  #include "amdgpu_dm_irq.h"
  #endif
-@@ -129,19 +129,26 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
+@@ -129,19 +130,26 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
  
  	spin_lock_irqsave(&adev->irq.lock, irqflags);
  	for (i = 0; i < AMDGPU_IRQ_CLIENTID_MAX; ++i) {
@@ -3866,11 +3895,11 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
 -			struct amdgpu_irq_src *src = adev->irq.client[i].sources[j];
 +			struct amdgpu_irq_src *src = sources[j];
 +			const struct amdgpu_irq_src_funcs *funcs;
-+
-+			if (!src)
-+				continue;
  
 -			if (!src || !src->funcs->set || !src->num_types)
++			if (!src)
++				continue;
++
 +			funcs = src->funcs;
 +			if (!funcs || !funcs->set || !src->num_types)
  				continue;
@@ -3885,7 +3914,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  					dev_err(adev->dev,
  						"error disabling interrupt (%d)\n",
  						r);
-@@ -164,10 +171,12 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
+@@ -164,10 +172,12 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
   */
  static irqreturn_t amdgpu_irq_handler(int irq, void *arg)
  {
@@ -3899,7 +3928,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  	ret = amdgpu_ih_process(adev, &adev->irq.ih);
  	if (ret == IRQ_HANDLED)
  		pm_runtime_mark_last_busy(dev->dev);
-@@ -235,27 +244,23 @@ static void amdgpu_irq_handle_ih_soft(struct work_struct *work)
+@@ -235,27 +245,23 @@ static void amdgpu_irq_handle_ih_soft(struct work_struct *work)
   */
  static bool amdgpu_msi_ok(struct amdgpu_device *adev)
  {
@@ -3933,7 +3962,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  }
  
  /**
-@@ -274,13 +279,10 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
+@@ -274,13 +280,10 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
  	unsigned int irq, flags;
  	int r;
  
@@ -3949,7 +3978,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  
  	/* we only need one vector */
  	r = pci_alloc_irq_vectors(adev->pdev, 1, 1, flags);
-@@ -298,14 +300,13 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
+@@ -298,14 +301,13 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
  	INIT_WORK(&adev->irq.ih2_work, amdgpu_irq_handle_ih2);
  	INIT_WORK(&adev->irq.ih_soft_work, amdgpu_irq_handle_ih_soft);
  
@@ -3967,7 +3996,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  			adev_to_drm(adev));
  	if (r)
  		goto free_vectors;
-@@ -320,7 +321,6 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
+@@ -320,7 +322,6 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
  free_vectors:
  	if (adev->irq.msi_enabled)
  		pci_free_irq_vectors(adev->pdev);
@@ -3975,7 +4004,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  	adev->irq.msi_enabled = false;
  	return r;
  }
-@@ -354,11 +354,13 @@ void amdgpu_irq_fini_sw(struct amdgpu_device *adev)
+@@ -354,11 +355,13 @@ void amdgpu_irq_fini_sw(struct amdgpu_device *adev)
  	unsigned int i, j;
  
  	for (i = 0; i < AMDGPU_IRQ_CLIENTID_MAX; ++i) {
@@ -3991,7 +4020,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  
  			if (!src)
  				continue;
-@@ -366,7 +368,7 @@ void amdgpu_irq_fini_sw(struct amdgpu_device *adev)
+@@ -366,7 +369,7 @@ void amdgpu_irq_fini_sw(struct amdgpu_device *adev)
  			kfree(src->enabled_types);
  			src->enabled_types = NULL;
  		}
@@ -4000,7 +4029,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  		adev->irq.client[i].sources = NULL;
  	}
  }
-@@ -406,7 +408,7 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev,
+@@ -406,7 +409,7 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev,
  			return -ENOMEM;
  	}
  
@@ -4009,7 +4038,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  		return -EINVAL;
  
  	if (source->num_types && !source->enabled_types) {
-@@ -437,18 +439,14 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+@@ -437,18 +440,24 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
  {
  	u32 ring_index = ih->rptr >> 2;
  	struct amdgpu_iv_entry entry;
@@ -4023,15 +4052,23 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  	entry.ih = ih;
 -	entry.iv_entry = (const uint32_t *)&ih->ring[ring_index];
 -
--	/*
++	entry.iv_entry = (const u32 *)&ih->ring[ring_index];
+ 	/*
 -	 * timestamp is not supported on some legacy SOCs (cik, cz, iceland,
 -	 * si and tonga), so initialize timestamp and timestamp_src to 0
--	 */
-+	entry.iv_entry = (const u32 *)&ih->ring[ring_index];
++	 * IVs are 32 bytes each and the IH ring is DMA'd by the GPU (on x86
++	 * those writes land in the LLC via DDIO).  Prefetch the next IV one
++	 * 32-byte entry ahead so its LLC-to-L1 transfer overlaps with
++	 * decoding and dispatching the current one instead of stalling the
++	 * next iteration's first load.  Reuses the iv_entry address (no mask
++	 * arithmetic): a prefetch hint cannot fault, so at ring wrap this
++	 * harmlessly touches 32 bytes past the end of the buffer.
+ 	 */
++	prefetch(entry.iv_entry + 8);
  	entry.timestamp = 0;
  	entry.timestamp_src = 0;
  
-@@ -459,37 +457,46 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+@@ -459,37 +468,46 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
  	client_id = entry.client_id;
  	src_id = entry.src_id;
  
@@ -4094,7 +4131,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  	if (!handled)
  		amdgpu_amdkfd_interrupt(adev, entry.iv_entry);
  
-@@ -525,7 +532,7 @@ void amdgpu_irq_delegate(struct amdgpu_device *adev,
+@@ -525,7 +543,7 @@ void amdgpu_irq_delegate(struct amdgpu_device *adev,
   * Updates interrupt state for the specific source (all ASICs).
   */
  int amdgpu_irq_update(struct amdgpu_device *adev,
@@ -4103,7 +4140,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  {
  	unsigned long irqflags;
  	enum amdgpu_interrupt_state state;
-@@ -533,13 +540,8 @@ int amdgpu_irq_update(struct amdgpu_device *adev,
+@@ -533,13 +551,8 @@ int amdgpu_irq_update(struct amdgpu_device *adev,
  
  	spin_lock_irqsave(&adev->irq.lock, irqflags);
  
@@ -4119,7 +4156,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  
  	r = src->funcs->set(adev, src, type, state);
  	spin_unlock_irqrestore(&adev->irq.lock, irqflags);
-@@ -562,16 +564,24 @@ void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
+@@ -562,16 +575,24 @@ void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
  		amdgpu_restore_msix(adev);
  
  	for (i = 0; i < AMDGPU_IRQ_CLIENTID_MAX; ++i) {
@@ -4148,7 +4185,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  		}
  	}
  }
-@@ -591,13 +601,13 @@ void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
+@@ -591,13 +612,13 @@ void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
  int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
  		   unsigned int type)
  {
@@ -4165,7 +4202,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  		return -EINVAL;
  
  	if (atomic_inc_return(&src->enabled_types[type]) == 1)
-@@ -613,7 +623,7 @@ int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+@@ -613,7 +634,7 @@ int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
   * @src: interrupt source pointer
   * @type: type of interrupt
   *
@@ -4174,7 +4211,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
   *
   * Returns:
   * 0 on success or error code otherwise
-@@ -621,17 +631,16 @@ int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+@@ -621,17 +642,16 @@ int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
  int amdgpu_irq_put(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
  		   unsigned int type)
  {
@@ -4195,7 +4232,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  		return -EINVAL;
  
  	if (WARN_ON(!amdgpu_irq_enabled(adev, src, type)))
-@@ -671,18 +680,16 @@ bool amdgpu_irq_enabled(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+@@ -671,18 +691,16 @@ bool amdgpu_irq_enabled(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
  	return !!atomic_read(&src->enabled_types[type]);
  }
  
@@ -4216,7 +4253,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  static struct irq_chip amdgpu_irq_chip = {
  	.name = "amdgpu-ih",
  	.irq_mask = amdgpu_irq_mask,
-@@ -705,15 +712,15 @@ static struct irq_chip amdgpu_irq_chip = {
+@@ -705,15 +723,15 @@ static struct irq_chip amdgpu_irq_chip = {
  static int amdgpu_irqdomain_map(struct irq_domain *d,
  				unsigned int irq, irq_hw_number_t hwirq)
  {
@@ -4235,7 +4272,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  static const struct irq_domain_ops amdgpu_hw_irqdomain_ops = {
  	.map = amdgpu_irqdomain_map,
  };
-@@ -732,7 +739,8 @@ static const struct irq_domain_ops amdgpu_hw_irqdomain_ops = {
+@@ -732,7 +750,8 @@ static const struct irq_domain_ops amdgpu_hw_irqdomain_ops = {
  int amdgpu_irq_add_domain(struct amdgpu_device *adev)
  {
  	adev->irq.domain = irq_domain_create_linear(NULL, AMDGPU_MAX_IRQ_SRC_ID,
@@ -4245,7 +4282,7 @@ index ccc378233bc5a90acaf360a691a6a0d0f4c6c943..82c25ecc68c83084d942f6450effcb81
  	if (!adev->irq.domain) {
  		dev_err(adev->dev, "GPU irq add domain failed\n");
  		return -ENODEV;
-@@ -770,7 +778,8 @@ void amdgpu_irq_remove_domain(struct amdgpu_device *adev)
+@@ -770,7 +789,8 @@ void amdgpu_irq_remove_domain(struct amdgpu_device *adev)
   * Returns:
   * Linux IRQ
   */
@@ -7769,6 +7806,78 @@ index 52c2d1731aabf6bd20d90fb05cae23cbc5dfb513..88a64bb6314dbcc3594c98bed8c89dbe
  
 -
  #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 2024aa6d231d852e51a981e373c8a37c7aabc65c..b157ec70d8ab2576d5bf0ab4b9f5b6f4df9c369b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -24,6 +24,8 @@
+ #ifndef __AMDGPU_RING_H__
+ #define __AMDGPU_RING_H__
+ 
++#include <linux/cache.h>
++
+ #include <drm/amdgpu_drm.h>
+ #include <drm/gpu_scheduler.h>
+ #include <drm/drm_print.h>
+@@ -113,19 +115,35 @@ struct amdgpu_sched {
+  * Fences.
+  */
+ struct amdgpu_fence_driver {
++	/*
++	 * Submission/init side: gpu_addr/cpu_addr are read by both sides but
++	 * only written at init; sync_seq is written under the ring emission
++	 * lock by amdgpu_fence_emit().  num_fences_mask/fences/irq_src/
++	 * irq_type/initialized are read-mostly after init.  Keeping these
++	 * off the IRQ-written cacheline below stops fence emission and fence
++	 * signaling (IH interrupt context, thousands per second under game
++	 * load) from ping-ponging the same line.
++	 */
+ 	uint64_t			gpu_addr;
+ 	uint32_t			*cpu_addr;
+ 	/* sync_seq is protected by ring emission lock */
+ 	uint32_t			sync_seq;
+-	atomic_t			last_seq;
+-	u64				signalled_wptr;
+-	bool				initialized;
++	unsigned			num_fences_mask;
++	struct dma_fence		**fences;
+ 	struct amdgpu_irq_src		*irq_src;
+ 	unsigned			irq_type;
+-	struct timer_list		fallback_timer;
+-	unsigned			num_fences_mask;
++	bool				initialized;
++
++	/*
++	 * IRQ side: last_seq (cmpxchg), signalled_wptr and fallback_timer
++	 * are written by amdgpu_fence_process() from interrupt context;
++	 * lock is taken there and by emission, so it belongs with the IRQ
++	 * group to keep emission's sync_seq write out of that line.
++	 */
++	atomic_t			last_seq ____cacheline_aligned_in_smp;
++	u64				signalled_wptr;
+ 	spinlock_t			lock;
+-	struct dma_fence		**fences;
++	struct timer_list		fallback_timer;
+ };
+ 
+ /*
+@@ -300,7 +318,15 @@ struct amdgpu_ring_funcs {
+ struct amdgpu_ring {
+ 	struct amdgpu_device		*adev;
+ 	const struct amdgpu_ring_funcs	*funcs;
+-	struct amdgpu_fence_driver	fence_drv;
++	/*
++	 * Aligned so the submission-side and IRQ-side halves of fence_drv
++	 * land on distinct physical cachelines (the inner
++	 * ____cacheline_aligned_in_smp on last_seq is relative to this
++	 * member).  This also makes struct amdgpu_ring 64-byte aligned, so
++	 * the embedded scheduler and the submission-hot wptr/count_dw group
++	 * keep stable absolute line placement.
++	 */
++	struct amdgpu_fence_driver	fence_drv ____cacheline_aligned_in_smp;
+ 	struct drm_gpu_scheduler	sched;
+ 
+ 	struct amdgpu_bo	*ring_obj;
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
 index 341beec595375ccdc3c8d26e5b447ad5d152da17..45db0b2d11dd85538548e950d39f58b82fbf9d89 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c
