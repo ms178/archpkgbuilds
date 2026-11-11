@@ -11559,10 +11559,10 @@ index e27b8fe4e..4cfd6aad8 100644
          // Empty / one atom / many atoms, with and without an offset.  The old
 diff --git a/src/passes/index_hoist.rs b/src/passes/index_hoist.rs
 new file mode 100644
-index 000000000..6d56245ae
+index 000000000..3ea76a69d
 --- /dev/null
 +++ b/src/passes/index_hoist.rs
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,721 @@
 +//! Hoist the loop-invariant addend of an array index into the base pointer.
 +//!
 +//! # Why
@@ -11649,8 +11649,9 @@ index 000000000..6d56245ae
 +//!   once per iteration of *that* loop).
 +//! * The sign extension or the scale has another reader: the old chain
 +//!   would stay and the loop would gain work instead of losing it.
-+//! * More than [`MAX_BASES_PER_LOOP`] distinct hoisted bases in one loop:
-+//!   every one is a pointer that stays live across the loop.
++//! * The loop would need more than [`MAX_BASES_PER_LOOP`] hoisted bases
++//!   *and* more of them than the bases and addends they replace: every one
++//!   is a pointer that stays live across the loop (see [`within_budget`]).
 +//! * A constant addend (`a[j + 1]`): the widener's closure and the backend's
 +//!   displacement folding already handle it without a second base.
 +//!
@@ -11673,10 +11674,9 @@ index 000000000..6d56245ae
 +};
 +use crate::passes::use_def::UseDefInfo;
 +
-+/// Most hoisted bases one loop may receive.  Each is a pointer that stays
-+/// live across the whole loop; a loop that needs more private bases than
-+/// this is short of registers before the pass adds another.  The first
-+/// bases in program order are taken and the rest keep their original form.
++/// Hoisted bases a loop may always receive.  Each is a pointer that stays
++/// live across the whole loop.  Beyond this number the loop is rewritten
++/// only when the split cannot cost a register -- see [`within_budget`].
 +const MAX_BASES_PER_LOOP: usize = 6;
 +
 +/// Rounds per function.  A second round catches a base that the first round
@@ -11687,8 +11687,11 @@ index 000000000..6d56245ae
 +/// Run the pass on one function.  Returns the number of addresses rewritten.
 +pub(crate) fn run(func: &mut IrFunction) -> usize {
 +    let mut total = 0;
++    // Hoisted bases granted so far, per loop header.  Block indices are
++    // stable across rounds: the pass creates and removes no block.
++    let mut granted: FxHashMap<usize, usize> = FxHashMap::default();
 +    for _ in 0..MAX_ROUNDS {
-+        let rewritten = run_round(func);
++        let rewritten = run_round(func, &mut granted);
 +        if rewritten == 0 {
 +            break;
 +        }
@@ -11786,6 +11789,12 @@ index 000000000..6d56245ae
 +    candidates: Vec<Candidate>,
 +}
 +
++/// The distinct hoisted bases a set of candidates needs.
++fn distinct_bases(candidates: &[Candidate]) -> usize {
++    let keys: FxHashSet<BaseKey> = candidates.iter().map(Candidate::base_key).collect();
++    keys.len()
++}
++
 +/// What the analysis of one loop may ask about a value.
 +struct LoopView<'a> {
 +    func: &'a IrFunction,
@@ -11824,12 +11833,15 @@ index 000000000..6d56245ae
 +    fn hoistable(&self, v: Value) -> bool {
 +        let def = self.uses.def_of(v.0);
 +        if def.is_parameter() {
-+            return true;
++            // `param_types` holds the parameters of the entry block, which
++            // dominates every block a loop analysis can reach.
++            return self.param_types.contains_key(&v.0);
 +        }
 +        match def.block() {
 +            Some(b) => {
 +                let b = b as usize;
-+                !self.body.contains(&b) && (b == self.preheader || self.dom.dominates(b, self.preheader))
++                !self.body.contains(&b)
++                    && (b == self.preheader || self.dom.dominates(b, self.preheader))
 +            }
 +            None => false,
 +        }
@@ -11945,6 +11957,7 @@ index 000000000..6d56245ae
 +    view: &LoopView<'_>,
 +    blocks: &[usize],
 +    claimed: &FxHashSet<(usize, usize)>,
++    granted: usize,
 +) -> Vec<Candidate> {
 +    let mut found = Vec::new();
 +    for &block in blocks {
@@ -11973,7 +11986,9 @@ index 000000000..6d56245ae
 +        }
 +    }
 +    drop_unprofitable(view.uses, &mut found);
-+    cap_bases(&mut found);
++    if !within_budget(&found, granted) {
++        found.clear();
++    }
 +    found
 +}
 +
@@ -12009,36 +12024,44 @@ index 000000000..6d56245ae
 +    }
 +}
 +
-+/// Enforce [`MAX_BASES_PER_LOOP`]: the first distinct hoisted bases in
-+/// program order stay, every candidate that would need another one goes.
-+fn cap_bases(found: &mut Vec<Candidate>) {
-+    let mut bases: Vec<BaseKey> = Vec::new();
-+    found.retain(|c| {
-+        let key = c.base_key();
-+        if bases.contains(&key) {
-+            return true;
-+        }
-+        if bases.len() == MAX_BASES_PER_LOOP {
-+            return false;
-+        }
-+        bases.push(key);
-+        true
-+    });
++/// Whether the loop can afford the hoisted bases its candidates need, given
++/// the `granted` ones it received in earlier rounds.
++///
++/// The split replaces the values the addresses keep live across the loop --
++/// each original base and each invariant addend -- by one hoisted base per
++/// distinct (base, addend, shape).  It is accepted when
++///
++/// * the hoisted bases are no more numerous than the bases and addends they
++///   replace (seven arrays indexed by one `off + j` trade eight live values
++///   for seven), or
++/// * the loop ends up with at most [`MAX_BASES_PER_LOOP`] of them.
++///
++/// Otherwise the whole loop is left alone.  Rewriting only some of its
++/// accesses is the worst outcome: the hoisted bases, the original bases and
++/// the addends would all stay live.
++fn within_budget(found: &[Candidate], granted: usize) -> bool {
++    let hoisted = distinct_bases(found);
++    if granted + hoisted <= MAX_BASES_PER_LOOP {
++        return true;
++    }
++    let bases: FxHashSet<Value> = found.iter().map(|c| c.base).collect();
++    let addends: FxHashSet<Value> = found.iter().map(|c| c.shape.invariant).collect();
++    hoisted <= bases.len() + addends.len()
 +}
 +
 +/// One round over every loop of the function, innermost first.
-+fn run_round(func: &mut IrFunction) -> usize {
++fn run_round(func: &mut IrFunction, granted: &mut FxHashMap<usize, usize>) -> usize {
 +    if func.blocks.len() < 2 {
 +        return 0;
 +    }
-+    let plans = plan_function(func);
++    let plans = plan_function(func, granted);
 +    if plans.is_empty() {
 +        return 0;
 +    }
 +    apply(func, plans)
 +}
 +
-+fn plan_function(func: &IrFunction) -> Vec<LoopPlan> {
++fn plan_function(func: &IrFunction, granted: &mut FxHashMap<usize, usize>) -> Vec<LoopPlan> {
 +    let cfg = CfgAnalysis::build(func);
 +    let raw = find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
 +    if raw.is_empty() {
@@ -12050,10 +12073,11 @@ index 000000000..6d56245ae
 +    loops.sort_by_key(|lp| (lp.body.len(), lp.header));
 +    let uses = UseDefInfo::build(func);
 +    let dom = DominanceChecker::new(cfg.num_blocks, &cfg.idom);
-+    let param_types: FxHashMap<u32, IrType> = func
-+        .blocks
++    // Parameters are materialized in the entry block; one found anywhere
++    // else is not treated as available in a preheader.
++    let param_types: FxHashMap<u32, IrType> = func.blocks[0]
++        .instructions
 +        .iter()
-+        .flat_map(|b| &b.instructions)
 +        .filter_map(|inst| match inst {
 +            Instruction::ParamRef { dest, ty, .. } => Some((dest.0, *ty)),
 +            _ => None,
@@ -12076,10 +12100,12 @@ index 000000000..6d56245ae
 +        };
 +        let mut blocks: Vec<usize> = lp.body.iter().copied().collect();
 +        blocks.sort_unstable();
-+        let candidates = plan_loop(&view, &blocks, &claimed);
++        let already = granted.get(&lp.header).copied().unwrap_or(0);
++        let candidates = plan_loop(&view, &blocks, &claimed, already);
 +        if candidates.is_empty() {
 +            continue;
 +        }
++        *granted.entry(lp.header).or_default() += distinct_bases(&candidates);
 +        claimed.extend(candidates.iter().map(|c| (c.block, c.index)));
 +        plans.push(LoopPlan {
 +            preheader,
@@ -12258,6 +12284,914 @@ index 000000000..6d56245ae
 +#[cfg(test)]
 +#[path = "index_hoist_tests.rs"]
 +mod tests;
+diff --git a/src/passes/index_hoist_tests.rs b/src/passes/index_hoist_tests.rs
+new file mode 100644
+index 000000000..a3e2e3158
+--- /dev/null
++++ b/src/passes/index_hoist_tests.rs
+@@ -0,0 +1,902 @@
++//! Tests for the invariant-index hoist.
++//!
++//! Every rewrite is checked twice: structurally (what moved where), and by
++//! translation validation -- the function is executed before and after on a
++//! small reference interpreter and must make the same stores to the same
++//! addresses, for inputs that include negative indices and zero-trip loops.
++//! The interpreter panics on a value read before its definition, so a
++//! hoisted operand that does not dominate the preheader fails the test even
++//! if the verifier misses it.
++
++use super::*;
++use crate::common::types::AddressSpace;
++use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, IrConst, Terminator};
++
++const BASE: u32 = 0;
++const INV: u32 = 1;
++const N: u32 = 2;
++const J: u32 = 3;
++const J_NEXT: u32 = 4;
++const TEST: u32 = 5;
++const BASE2: u32 = 6;
++
++fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
++    BasicBlock {
++        label: BlockId(label),
++        instructions,
++        terminator,
++        source_spans: Vec::new(),
++        source_inline_ids: Vec::new(),
++    }
++}
++
++fn val(id: u32) -> Operand {
++    Operand::Value(Value(id))
++}
++
++fn int(ty: IrType, value: i64) -> Operand {
++    Operand::Const(match ty {
++        IrType::I32 | IrType::U32 => IrConst::I32(value as i32),
++        _ => IrConst::I64(value),
++    })
++}
++
++fn binop(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType) -> Instruction {
++    Instruction::BinOp {
++        dest: Value(dest),
++        op,
++        lhs,
++        rhs,
++        ty,
++    }
++}
++
++fn cast(dest: u32, src: u32, from_ty: IrType, to_ty: IrType) -> Instruction {
++    Instruction::Cast {
++        dest: Value(dest),
++        src: val(src),
++        from_ty,
++        to_ty,
++    }
++}
++
++fn gep(dest: u32, base: u32, offset: u32) -> Instruction {
++    Instruction::GetElementPtr {
++        dest: Value(dest),
++        base: Value(base),
++        offset: val(offset),
++        ty: IrType::I64,
++    }
++}
++
++fn store(value: Operand, ptr: u32) -> Instruction {
++    Instruction::Store {
++        val: value,
++        ptr: Value(ptr),
++        ty: IrType::I64,
++        seg_override: AddressSpace::Default,
++        volatile: false,
++    }
++}
++
++/// A counted loop over `j` in `[0, n)`:
++///
++/// ```text
++///   B0: base, inv, n, base2 = params                 -> B1
++///   B1: j = phi [0, B0], [j', B2];  j < n ?          -> B2 : B3
++///   B2: body;  j' = j + 1                            -> B1
++///   B3: return
++/// ```
++fn counted_loop(index_ty: IrType, body: Vec<Instruction>) -> IrFunction {
++    let param = |dest: u32, index: usize, ty: IrType| Instruction::ParamRef {
++        dest: Value(dest),
++        param_idx: index,
++        ty,
++    };
++    let mut body = body;
++    body.push(binop(
++        J_NEXT,
++        IrBinOp::Add,
++        val(J),
++        int(index_ty, 1),
++        index_ty,
++    ));
++    let mut func = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
++    func.blocks = vec![
++        block(
++            0,
++            vec![
++                param(BASE, 0, IrType::Ptr),
++                param(INV, 1, index_ty),
++                param(N, 2, index_ty),
++                param(BASE2, 3, IrType::Ptr),
++            ],
++            Terminator::Branch(BlockId(1)),
++        ),
++        block(
++            1,
++            vec![
++                Instruction::Phi {
++                    dest: Value(J),
++                    ty: index_ty,
++                    incoming: vec![(int(index_ty, 0), BlockId(0)), (val(J_NEXT), BlockId(2))],
++                },
++                Instruction::Cmp {
++                    dest: Value(TEST),
++                    op: IrCmpOp::Slt,
++                    lhs: val(J),
++                    rhs: val(N),
++                    ty: index_ty,
++                },
++            ],
++            Terminator::CondBranch {
++                cond: val(TEST),
++                true_label: BlockId(2),
++                false_label: BlockId(3),
++            },
++        ),
++        block(2, body, Terminator::Branch(BlockId(1))),
++        block(3, Vec::new(), Terminator::Return(None)),
++    ];
++    func.next_value_id = 100;
++    func.next_label = 4;
++    func
++}
++
++/// `base[inv + j] = j` with a 32-bit signed index: the shape of the header.
++fn int_index_body() -> Vec<Instruction> {
++    vec![
++        binop(10, IrBinOp::Add, val(INV), val(J), IrType::I32),
++        cast(11, 10, IrType::I32, IrType::I64),
++        binop(12, IrBinOp::Shl, val(11), int(IrType::I64, 3), IrType::I64),
++        gep(13, BASE, 12),
++        store(val(J), 13),
++    ]
++}
++
++// ---------------------------------------------------------------------------
++// Reference interpreter
++// ---------------------------------------------------------------------------
++
++fn width(ty: IrType) -> u32 {
++    match ty {
++        IrType::I8 | IrType::U8 => 8,
++        IrType::I16 | IrType::U16 => 16,
++        IrType::I32 | IrType::U32 => 32,
++        _ => 64,
++    }
++}
++
++fn wrap(value: u64, ty: IrType) -> u64 {
++    match width(ty) {
++        64 => value,
++        bits => value & ((1u64 << bits) - 1),
++    }
++}
++
++fn sign_extend(value: u64, ty: IrType) -> u64 {
++    let shift = 64 - width(ty);
++    (((value << shift) as i64) >> shift) as u64
++}
++
++fn read(values: &FxHashMap<u32, u64>, operand: &Operand) -> u64 {
++    match operand {
++        Operand::Value(v) => *values
++            .get(&v.0)
++            .unwrap_or_else(|| panic!("value {} read before its definition", v.0)),
++        Operand::Const(c) => c.to_i64().expect("integer constant") as u64,
++    }
++}
++
++/// Every store the function makes, as `(address, value)` in execution order.
++fn stores(func: &IrFunction, params: &[u64]) -> Vec<(u64, u64)> {
++    let index_of = |label: BlockId| {
++        func.blocks
++            .iter()
++            .position(|b| b.label == label)
++            .expect("branch target exists")
++    };
++    let mut values: FxHashMap<u32, u64> = FxHashMap::default();
++    let mut trace = Vec::new();
++    let mut current = 0;
++    let mut previous = BlockId(u32::MAX);
++    for _ in 0..100_000 {
++        let block = &func.blocks[current];
++        // Phis read their inputs simultaneously on entry.
++        let entering: Vec<(u32, u64)> = block
++            .instructions
++            .iter()
++            .filter_map(|inst| match inst {
++                Instruction::Phi { dest, ty, incoming } => {
++                    let (operand, _) = incoming
++                        .iter()
++                        .find(|(_, from)| *from == previous)
++                        .expect("phi has an input for the edge taken");
++                    Some((dest.0, wrap(read(&values, operand), *ty)))
++                }
++                _ => None,
++            })
++            .collect();
++        values.extend(entering);
++        for inst in &block.instructions {
++            match inst {
++                Instruction::Phi { .. } => {}
++                Instruction::ParamRef {
++                    dest,
++                    param_idx,
++                    ty,
++                } => {
++                    // Parameters past the sample are further array bases.
++                    let value = params
++                        .get(*param_idx)
++                        .copied()
++                        .unwrap_or(0x7200_0000_0000 + ((*param_idx as u64) << 36));
++                    values.insert(dest.0, wrap(value, *ty));
++                }
++                Instruction::Copy { dest, src } => {
++                    let v = read(&values, src);
++                    values.insert(dest.0, v);
++                }
++                Instruction::Cast {
++                    dest,
++                    src,
++                    from_ty,
++                    to_ty,
++                } => {
++                    let v = wrap(read(&values, src), *from_ty);
++                    let extended = if from_ty.is_signed() {
++                        sign_extend(v, *from_ty)
++                    } else {
++                        v
++                    };
++                    values.insert(dest.0, wrap(extended, *to_ty));
++                }
++                Instruction::BinOp {
++                    dest,
++                    op,
++                    lhs,
++                    rhs,
++                    ty,
++                } => {
++                    let (a, b) = (read(&values, lhs), read(&values, rhs));
++                    let result = match op {
++                        IrBinOp::Add => a.wrapping_add(b),
++                        IrBinOp::Sub => a.wrapping_sub(b),
++                        IrBinOp::Mul => a.wrapping_mul(b),
++                        IrBinOp::Shl => a.wrapping_shl(b as u32),
++                        other => panic!("interpreter has no {other:?}"),
++                    };
++                    values.insert(dest.0, wrap(result, *ty));
++                }
++                Instruction::Cmp {
++                    dest,
++                    op: IrCmpOp::Slt,
++                    lhs,
++                    rhs,
++                    ty,
++                } => {
++                    let a = sign_extend(wrap(read(&values, lhs), *ty), *ty) as i64;
++                    let b = sign_extend(wrap(read(&values, rhs), *ty), *ty) as i64;
++                    values.insert(dest.0, u64::from(a < b));
++                }
++                Instruction::GetElementPtr {
++                    dest, base, offset, ..
++                } => {
++                    let address =
++                        read(&values, &Operand::Value(*base)).wrapping_add(read(&values, offset));
++                    values.insert(dest.0, address);
++                }
++                Instruction::Store { val, ptr, .. } => {
++                    trace.push((read(&values, &Operand::Value(*ptr)), read(&values, val)));
++                }
++                other => panic!("interpreter has no {other:?}"),
++            }
++        }
++        previous = block.label;
++        current = match &block.terminator {
++            Terminator::Return(_) => return trace,
++            Terminator::Branch(target) => index_of(*target),
++            Terminator::CondBranch {
++                cond,
++                true_label,
++                false_label,
++            } => index_of(if read(&values, cond) != 0 {
++                *true_label
++            } else {
++                *false_label
++            }),
++            other => panic!("interpreter has no {other:?}"),
++        };
++    }
++    panic!("no return within the step budget");
++}
++
++/// Parameter sets `(base, inv, n, base2)`: positive and negative invariant
++/// parts, a zero-trip loop, and sums near the top of the `int` range that
++/// stay inside it (the signed form is only defined there).
++fn samples() -> Vec<[u64; 4]> {
++    let base = 0x7000_0000_0000u64;
++    let base2 = 0x7100_0000_0000u64;
++    [
++        (0i64, 5i64),
++        (7, 5),
++        (-3, 6),
++        (-1000, 3),
++        (123_456, 0),
++        (i64::from(i32::MAX) - 8, 8),
++        (i64::from(i32::MIN), 4),
++    ]
++    .into_iter()
++    .map(|(inv, n)| [base, inv as u64, n as u64, base2])
++    .collect()
++}
++
++fn assert_verifies(func: &IrFunction) {
++    let mut violations = Vec::new();
++    crate::passes::verify::verify_function(func, "index_hoist_test", &mut violations);
++    assert!(violations.is_empty(), "verifier: {violations:?}");
++}
++
++/// Run the pass, require `expected` rewrites, a clean verifier and the same
++/// stores as before on every sample.
++fn check(func: &mut IrFunction, expected: usize) {
++    let before: Vec<_> = samples().iter().map(|p| stores(func, p)).collect();
++    assert_verifies(func);
++    let rewritten = run(func);
++    assert_eq!(rewritten, expected, "number of rewritten addresses");
++    assert_verifies(func);
++    for (params, before) in samples().iter().zip(&before) {
++        assert_eq!(
++            &stores(func, params),
++            before,
++            "stores differ for parameters {params:?}"
++        );
++    }
++    // A second run finds nothing left to split.
++    assert_eq!(run(func), 0, "the pass must be idempotent");
++}
++
++fn count(block: &BasicBlock, pred: impl Fn(&Instruction) -> bool) -> usize {
++    block.instructions.iter().filter(|i| pred(i)).count()
++}
++
++fn is_gep(inst: &Instruction) -> bool {
++    matches!(inst, Instruction::GetElementPtr { .. })
++}
++
++fn is_add_of(inst: &Instruction, a: u32, b: u32) -> bool {
++    matches!(
++        inst,
++        Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(x), rhs: Operand::Value(y), .. }
++            if (x.0, y.0) == (a, b) || (x.0, y.0) == (b, a)
++    )
++}
++
++// ---------------------------------------------------------------------------
++// What is rewritten
++// ---------------------------------------------------------------------------
++
++#[test]
++fn signed_int_sum_is_split() {
++    let mut func = counted_loop(IrType::I32, int_index_body());
++    check(&mut func, 1);
++
++    // Preheader: sext inv, scale, hoisted base -- after the parameters.
++    let pre = &func.blocks[0].instructions;
++    assert_eq!(pre.len(), 7, "{pre:?}");
++    assert!(matches!(
++        &pre[4],
++        Instruction::Cast { src: Operand::Value(v), from_ty: IrType::I32, to_ty: IrType::I64, .. }
++            if v.0 == INV
++    ));
++    assert!(matches!(
++        &pre[5],
++        Instruction::BinOp {
++            op: IrBinOp::Shl,
++            rhs: Operand::Const(_),
++            ty: IrType::I64,
++            ..
++        }
++    ));
++    let hoisted = match &pre[6] {
++        Instruction::GetElementPtr {
++            dest,
++            base,
++            ty: IrType::I64,
++            ..
++        } if base.0 == BASE => *dest,
++        other => panic!("expected the hoisted base, got {other:?}"),
++    };
++
++    // Body: the access is indexed by the counter alone, off the hoisted
++    // base; the sum, its extension and its scale are gone.
++    let body = &func.blocks[2];
++    assert_eq!(count(body, |i| is_add_of(i, INV, J)), 0, "the sum must die");
++    assert!(body.instructions.iter().any(|i| matches!(
++        i,
++        Instruction::Cast { src: Operand::Value(v), from_ty: IrType::I32, .. } if v.0 == J
++    )));
++    assert!(
++        body.instructions
++            .iter()
++            .any(|i| matches!(i, Instruction::GetElementPtr { base, .. } if *base == hoisted))
++    );
++    assert_eq!(body.instructions.len(), 5, "{:?}", body.instructions);
++}
++
++#[test]
++fn operand_order_of_the_sum_does_not_matter() {
++    let mut body = int_index_body();
++    body[0] = binop(10, IrBinOp::Add, val(J), val(INV), IrType::I32);
++    let mut func = counted_loop(IrType::I32, body);
++    check(&mut func, 1);
++}
++
++#[test]
++fn pointer_width_sum_is_split_without_a_cast() {
++    for ty in [IrType::I64, IrType::U64] {
++        let body = vec![
++            binop(10, IrBinOp::Add, val(INV), val(J), ty),
++            binop(12, IrBinOp::Shl, val(10), int(IrType::I64, 3), ty),
++            gep(13, BASE, 12),
++            store(val(J), 13),
++        ];
++        let mut func = counted_loop(IrType::I64, body);
++        check(&mut func, 1);
++        assert_eq!(
++            count(&func.blocks[0], |i| matches!(i, Instruction::Cast { .. })),
++            0
++        );
++        assert_eq!(count(&func.blocks[0], is_gep), 1);
++    }
++}
++
++#[test]
++fn unscaled_and_multiplied_indices_are_split() {
++    // A byte array: no scale at all.
++    let body = vec![
++        binop(10, IrBinOp::Add, val(INV), val(J), IrType::I32),
++        cast(11, 10, IrType::I32, IrType::I64),
++        gep(13, BASE, 11),
++        store(val(J), 13),
++    ];
++    check(&mut counted_loop(IrType::I32, body), 1);
++
++    // A 24-byte element: `mul`, with the constant on either side.
++    for const_first in [false, true] {
++        let (lhs, rhs) = if const_first {
++            (int(IrType::I64, 24), val(11))
++        } else {
++            (val(11), int(IrType::I64, 24))
++        };
++        let body = vec![
++            binop(10, IrBinOp::Add, val(INV), val(J), IrType::I32),
++            cast(11, 10, IrType::I32, IrType::I64),
++            binop(12, IrBinOp::Mul, lhs, rhs, IrType::I64),
++            gep(13, BASE, 12),
++            store(val(J), 13),
++        ];
++        let mut func = counted_loop(IrType::I32, body);
++        check(&mut func, 1);
++        assert_eq!(
++            count(&func.blocks[0], |i| matches!(
++                i,
++                Instruction::BinOp {
++                    op: IrBinOp::Mul,
++                    ..
++                }
++            )),
++            1,
++            "the invariant half is scaled in the preheader"
++        );
++    }
++}
++
++#[test]
++fn sum_with_another_reader_survives_and_the_access_is_still_split() {
++    let mut body = int_index_body();
++    // The sum is also stored as a value: it keeps a reader of its own.
++    body.push(cast(21, 10, IrType::I32, IrType::I64));
++    body.push(store(val(21), BASE2));
++    let mut func = counted_loop(IrType::I32, body);
++    check(&mut func, 1);
++    assert_eq!(
++        count(&func.blocks[2], |i| is_add_of(i, INV, J)),
++        1,
++        "a sum that is still read must stay"
++    );
++}
++
++#[test]
++fn two_arrays_share_one_index_and_get_one_base_each() {
++    // a[inv + j] and b[inv + j] through ONE extension and ONE scale: both
++    // readers of each are rewritten, so the chain still dies.
++    let body = vec![
++        binop(10, IrBinOp::Add, val(INV), val(J), IrType::I32),
++        cast(11, 10, IrType::I32, IrType::I64),
++        binop(12, IrBinOp::Shl, val(11), int(IrType::I64, 3), IrType::I64),
++        gep(13, BASE, 12),
++        store(val(J), 13),
++        gep(14, BASE2, 12),
++        store(val(N), 14),
++    ];
++    let mut func = counted_loop(IrType::I32, body);
++    check(&mut func, 2);
++    assert_eq!(
++        count(&func.blocks[0], is_gep),
++        2,
++        "one hoisted base per array"
++    );
++    let body = &func.blocks[2];
++    assert_eq!(count(body, |i| is_add_of(i, INV, J)), 0);
++    assert_eq!(
++        count(body, |i| matches!(i, Instruction::Cast { .. })),
++        1,
++        "the variant index is built once and shared within the block"
++    );
++}
++
++#[test]
++fn same_array_and_addend_share_one_hoisted_base() {
++    // Two separate chains for the same `base[inv + j]`.
++    let mut body = int_index_body();
++    body.extend([
++        binop(20, IrBinOp::Add, val(INV), val(J), IrType::I32),
++        cast(21, 20, IrType::I32, IrType::I64),
++        binop(22, IrBinOp::Shl, val(21), int(IrType::I64, 3), IrType::I64),
++        gep(23, BASE, 22),
++        store(val(N), 23),
++    ]);
++    let mut func = counted_loop(IrType::I32, body);
++    check(&mut func, 2);
++    assert_eq!(count(&func.blocks[0], is_gep), 1);
++}
++
++/// One access per scale: `count` different hoisted bases off ONE array and
++/// ONE addend.
++fn one_array_many_scales(count: u32) -> Vec<Instruction> {
++    let mut body = Vec::new();
++    for k in 0..count {
++        let v = 20 + k * 10;
++        body.extend([
++            binop(v, IrBinOp::Add, val(INV), val(J), IrType::I32),
++            cast(v + 1, v, IrType::I32, IrType::I64),
++            binop(
++                v + 2,
++                IrBinOp::Mul,
++                val(v + 1),
++                int(IrType::I64, 8 * (i64::from(k) + 1)),
++                IrType::I64,
++            ),
++            gep(v + 3, BASE, v + 2),
++            store(val(J), v + 3),
++        ]);
++    }
++    body
++}
++
++#[test]
++fn budget_of_hoisted_bases_is_all_or_nothing() {
++    // Exactly the budget: every access is split.
++    let at_budget = MAX_BASES_PER_LOOP as u32;
++    let mut func = counted_loop(IrType::I32, one_array_many_scales(at_budget));
++    check(&mut func, MAX_BASES_PER_LOOP);
++    assert_eq!(count(&func.blocks[0], is_gep), MAX_BASES_PER_LOOP);
++
++    // One more, and they would replace only two live values (the array and
++    // the addend): the loop is left alone entirely, not half rewritten.
++    let mut func = counted_loop(IrType::I32, one_array_many_scales(at_budget + 1));
++    check_untouched(&mut func);
++}
++
++#[test]
++fn many_arrays_with_one_addend_are_all_split() {
++    // Eight arrays indexed by one `inv + j`: eight hoisted bases replace
++    // eight bases and one addend, so the budget does not apply.
++    const ARRAYS: u32 = 8;
++    let mut body = vec![
++        binop(10, IrBinOp::Add, val(INV), val(J), IrType::I32),
++        cast(11, 10, IrType::I32, IrType::I64),
++        binop(12, IrBinOp::Shl, val(11), int(IrType::I64, 3), IrType::I64),
++    ];
++    for k in 0..ARRAYS {
++        body.push(gep(60 + k, 40 + k, 12));
++        body.push(store(val(J), 60 + k));
++    }
++    let mut func = counted_loop(IrType::I32, body);
++    for k in 0..ARRAYS {
++        func.blocks[0].instructions.push(Instruction::ParamRef {
++            dest: Value(40 + k),
++            param_idx: 4 + k as usize,
++            ty: IrType::Ptr,
++        });
++    }
++    assert!(ARRAYS as usize > MAX_BASES_PER_LOOP);
++    check(&mut func, ARRAYS as usize);
++    assert_eq!(count(&func.blocks[0], is_gep), ARRAYS as usize);
++    assert_eq!(count(&func.blocks[2], |i| is_add_of(i, INV, J)), 0);
++}
++
++/// `for i { for j { base[i + j] = j } }`: the inner loop's invariant part is
++/// the outer counter, and the hoisted base lands in the inner preheader --
++/// inside the outer loop, once per outer iteration.
++#[test]
++fn nested_loop_hoists_into_the_inner_preheader() {
++    const I: u32 = 30;
++    const I_NEXT: u32 = 31;
++    const OUTER_TEST: u32 = 32;
++    let param = |dest: u32, index: usize, ty: IrType| Instruction::ParamRef {
++        dest: Value(dest),
++        param_idx: index,
++        ty,
++    };
++    let mut func = IrFunction::new("nested".to_string(), IrType::I32, vec![], false);
++    func.blocks = vec![
++        block(
++            0,
++            vec![
++                param(BASE, 0, IrType::Ptr),
++                param(INV, 1, IrType::I32),
++                param(N, 2, IrType::I32),
++                param(BASE2, 3, IrType::Ptr),
++            ],
++            Terminator::Branch(BlockId(1)),
++        ),
++        // Outer header.
++        block(
++            1,
++            vec![
++                Instruction::Phi {
++                    dest: Value(I),
++                    ty: IrType::I32,
++                    incoming: vec![(int(IrType::I32, 0), BlockId(0)), (val(I_NEXT), BlockId(5))],
++                },
++                Instruction::Cmp {
++                    dest: Value(OUTER_TEST),
++                    op: IrCmpOp::Slt,
++                    lhs: val(I),
++                    rhs: val(N),
++                    ty: IrType::I32,
++                },
++            ],
++            Terminator::CondBranch {
++                cond: val(OUTER_TEST),
++                true_label: BlockId(2),
++                false_label: BlockId(6),
++            },
++        ),
++        // Inner preheader.
++        block(2, Vec::new(), Terminator::Branch(BlockId(3))),
++        // Inner header.
++        block(
++            3,
++            vec![
++                Instruction::Phi {
++                    dest: Value(J),
++                    ty: IrType::I32,
++                    incoming: vec![(int(IrType::I32, 0), BlockId(2)), (val(J_NEXT), BlockId(4))],
++                },
++                Instruction::Cmp {
++                    dest: Value(TEST),
++                    op: IrCmpOp::Slt,
++                    lhs: val(J),
++                    rhs: val(N),
++                    ty: IrType::I32,
++                },
++            ],
++            Terminator::CondBranch {
++                cond: val(TEST),
++                true_label: BlockId(4),
++                false_label: BlockId(5),
++            },
++        ),
++        // Inner body.
++        block(
++            4,
++            vec![
++                binop(10, IrBinOp::Add, val(I), val(J), IrType::I32),
++                cast(11, 10, IrType::I32, IrType::I64),
++                binop(12, IrBinOp::Shl, val(11), int(IrType::I64, 3), IrType::I64),
++                gep(13, BASE, 12),
++                store(val(J), 13),
++                binop(
++                    J_NEXT,
++                    IrBinOp::Add,
++                    val(J),
++                    int(IrType::I32, 1),
++                    IrType::I32,
++                ),
++            ],
++            Terminator::Branch(BlockId(3)),
++        ),
++        // Outer latch.
++        block(
++            5,
++            vec![binop(
++                I_NEXT,
++                IrBinOp::Add,
++                val(I),
++                int(IrType::I32, 1),
++                IrType::I32,
++            )],
++            Terminator::Branch(BlockId(1)),
++        ),
++        block(6, Vec::new(), Terminator::Return(None)),
++    ];
++    func.next_value_id = 100;
++    func.next_label = 7;
++    check(&mut func, 1);
++    assert_eq!(count(&func.blocks[2], is_gep), 1, "inner preheader");
++    assert_eq!(count(&func.blocks[0], is_gep), 0, "not the function entry");
++    assert_eq!(count(&func.blocks[4], |i| is_add_of(i, I, J)), 0);
++}
++
++// ---------------------------------------------------------------------------
++// What is left alone
++// ---------------------------------------------------------------------------
++
++/// Run the pass and require that it changed nothing at all.
++fn check_untouched(func: &mut IrFunction) {
++    let before = format!("{:?}", func.blocks);
++    assert_eq!(run(func), 0);
++    assert_eq!(before, format!("{:?}", func.blocks));
++}
++
++#[test]
++fn wrapv_declines_the_int_sum_but_not_the_pointer_width_sum() {
++    let mut func = counted_loop(IrType::I32, int_index_body());
++    func.pass_policy.wrap_signed_overflow = true;
++    check_untouched(&mut func);
++
++    let body = vec![
++        binop(10, IrBinOp::Add, val(INV), val(J), IrType::I64),
++        binop(12, IrBinOp::Shl, val(10), int(IrType::I64, 3), IrType::I64),
++        gep(13, BASE, 12),
++        store(val(J), 13),
++    ];
++    let mut func = counted_loop(IrType::I64, body);
++    func.pass_policy.wrap_signed_overflow = true;
++    check(&mut func, 1);
++}
++
++#[test]
++fn unsigned_int_sum_is_never_split() {
++    // `unsigned` wraps by definition: zext(a + b) != zext(a) + zext(b).
++    let body = vec![
++        binop(10, IrBinOp::Add, val(INV), val(J), IrType::U32),
++        cast(11, 10, IrType::U32, IrType::I64),
++        binop(12, IrBinOp::Shl, val(11), int(IrType::I64, 3), IrType::I64),
++        gep(13, BASE, 12),
++        store(val(J), 13),
++    ];
++    check_untouched(&mut counted_loop(IrType::U32, body));
++}
++
++#[test]
++fn int_sum_computed_in_the_unsigned_ring_is_never_split() {
++    // `(int)((unsigned)inv + (unsigned)j)`: the reinterpretation back to
++    // `int` sits between the sum and the extension, and the sum wraps.
++    let body = vec![
++        binop(10, IrBinOp::Add, val(INV), val(J), IrType::U32),
++        cast(9, 10, IrType::U32, IrType::I32),
++        cast(11, 9, IrType::I32, IrType::I64),
++        binop(12, IrBinOp::Shl, val(11), int(IrType::I64, 3), IrType::I64),
++        gep(13, BASE, 12),
++        store(val(J), 13),
++    ];
++    check_untouched(&mut counted_loop(IrType::I32, body));
++}
++
++#[test]
++fn extension_or_scale_with_another_reader_is_left_alone() {
++    // The extended sum is also stored.
++    let mut body = int_index_body();
++    body.push(store(val(11), BASE2));
++    check_untouched(&mut counted_loop(IrType::I32, body));
++
++    // The scaled sum is also stored.
++    let mut body = int_index_body();
++    body.push(store(val(12), BASE2));
++    check_untouched(&mut counted_loop(IrType::I32, body));
++}
++
++#[test]
++fn constant_addend_is_left_to_the_widener() {
++    let mut body = int_index_body();
++    body[0] = binop(10, IrBinOp::Add, val(J), int(IrType::I32, 1), IrType::I32);
++    check_untouched(&mut counted_loop(IrType::I32, body));
++}
++
++#[test]
++fn two_variant_or_two_invariant_addends_are_left_alone() {
++    let mut body = int_index_body();
++    body[0] = binop(10, IrBinOp::Add, val(J), val(J), IrType::I32);
++    check_untouched(&mut counted_loop(IrType::I32, body));
++
++    let mut body = int_index_body();
++    body[0] = binop(10, IrBinOp::Add, val(INV), val(N), IrType::I32);
++    check_untouched(&mut counted_loop(IrType::I32, body));
++}
++
++#[test]
++fn base_defined_in_the_loop_is_left_alone() {
++    let mut body = int_index_body();
++    // The array base is recomputed every iteration.
++    body.insert(0, gep(9, BASE2, J));
++    body[4] = gep(13, 9, 12);
++    check_untouched(&mut counted_loop(IrType::I32, body));
++}
++
++#[test]
++fn subtraction_and_variable_scale_are_left_alone() {
++    let mut body = int_index_body();
++    body[0] = binop(10, IrBinOp::Sub, val(INV), val(J), IrType::I32);
++    check_untouched(&mut counted_loop(IrType::I32, body));
++
++    let mut body = int_index_body();
++    body[2] = binop(12, IrBinOp::Mul, val(11), val(11), IrType::I64);
++    check_untouched(&mut counted_loop(IrType::I32, body));
++}
++
++#[test]
++fn loop_without_a_unique_outside_predecessor_is_left_alone() {
++    // A second way into the header: B0 branches to B1 or to a new B4 that
++    // also jumps to B1, so no single block can hold the hoisted code.
++    let mut func = counted_loop(IrType::I32, int_index_body());
++    func.blocks[0].terminator = Terminator::CondBranch {
++        cond: val(N),
++        true_label: BlockId(1),
++        false_label: BlockId(4),
++    };
++    func.blocks
++        .push(block(4, Vec::new(), Terminator::Branch(BlockId(1))));
++    func.next_label = 5;
++    for inst in &mut func.blocks[1].instructions {
++        if let Instruction::Phi { incoming, .. } = inst {
++            incoming.push((int(IrType::I32, 0), BlockId(4)));
++        }
++    }
++    assert_verifies(&func);
++    check_untouched(&mut func);
++}
++
++#[test]
++fn function_without_a_loop_is_left_alone() {
++    let mut func = IrFunction::new("straight".to_string(), IrType::I32, vec![], false);
++    func.blocks = vec![
++        block(
++            0,
++            vec![
++                Instruction::ParamRef {
++                    dest: Value(BASE),
++                    param_idx: 0,
++                    ty: IrType::Ptr,
++                },
++                Instruction::ParamRef {
++                    dest: Value(INV),
++                    param_idx: 1,
++                    ty: IrType::I32,
++                },
++                Instruction::ParamRef {
++                    dest: Value(N),
++                    param_idx: 2,
++                    ty: IrType::I32,
++                },
++            ],
++            Terminator::Branch(BlockId(1)),
++        ),
++        block(
++            1,
++            vec![
++                binop(10, IrBinOp::Add, val(INV), val(N), IrType::I32),
++                cast(11, 10, IrType::I32, IrType::I64),
++                gep(13, BASE, 11),
++                store(val(N), 13),
++            ],
++            Terminator::Return(None),
++        ),
++    ];
++    func.next_value_id = 100;
++    func.next_label = 2;
++    check_untouched(&mut func);
++}
 diff --git a/src/passes/inline.rs b/src/passes/inline.rs
 index 2a390d22a..f2f97f768 100644
 --- a/src/passes/inline.rs
@@ -12314,6 +13248,136 @@ index 921a771f3..736661c8a 100644
          is_sret: false,
          calling_convention: crate::common::types::CallingConvention::Default,
          is_fastcall: false,
+diff --git a/src/passes/iv_widen.rs b/src/passes/iv_widen.rs
+index 7f11de531..51d06e916 100644
+--- a/src/passes/iv_widen.rs
++++ b/src/passes/iv_widen.rs
+@@ -1818,8 +1818,23 @@ fn analyze_iv(
+                     // arithmetic) stay in the narrow loop, which is where they
+                     // were lowered and where they are known-correct.
+                     let to_within_wide_domain = to_ty.size() <= wide_ty.size();
++                    // "Widening" is relative to the value being read, not to
++                    // the narrow phi. `cur` may be a WIDE chain value -- the
++                    // 64-bit sum in `(int)((long)a + (long)i)` -- and for it
++                    // an I64 -> I32 cast is a truncation whose wrap the
++                    // source defines (C17 6.3.1.3p3: implementation-defined,
++                    // modulo 2^32 here as in GCC; it is not the undefined
++                    // overflow theorem 2 rests on). Dropping that cast and
++                    // aliasing its readers to the 64-bit sum stored
++                    // 2147483649 where the program computes -2147483647,
++                    // at -O2 and -O3
++                    // (`tests/regression/explicit_narrowing_wraps.c`). The
++                    // 8 -> 2 and 8 -> 1 truncations always took the
++                    // `NarrowCast` path below; 8 -> 4 now joins them.
++                    let extends_operand = to_ty.size() >= from_ty.size();
+                     if to_is_int
+                         && to_ty.size() >= 4
++                        && extends_operand
+                         && to_within_wide_domain
+                         && *to_ty != IrType::Ptr
+                         && same_sign
+@@ -8507,4 +8522,101 @@ mod tests {
+         );
+         check(&mut f, 1);
+     }
++
++    /// `p[i] = (int)((long)a + (long)i)`: the wide sum is a chain value of
++    /// the widened counter, and its truncation to `int` wraps by definition
++    /// (C17 6.3.1.3p3). The truncation and its re-extension must survive --
++    /// the pass used to file the I64 -> I32 cast as a *widening* cast, drop
++    /// it and store the unwrapped 64-bit sum (wrong code at -O2 on
++    /// `tests/regression/explicit_narrowing_wraps.c`).
++    #[test]
++    fn truncation_of_a_wide_chain_value_is_retained() {
++        for (op, other) in [
++            (IrBinOp::Add, Operand::Value(Value(60))),
++            (IrBinOp::Mul, Operand::Const(IrConst::I64(0x4000_0000))),
++            (IrBinOp::Shl, Operand::Const(IrConst::I64(30))),
++        ] {
++            let body = vec![
++                Instruction::Cast {
++                    dest: Value(10),
++                    src: Operand::Value(Value(1)),
++                    from_ty: IrType::I32,
++                    to_ty: IrType::I64,
++                },
++                Instruction::BinOp {
++                    dest: Value(11),
++                    op: IrBinOp::Shl,
++                    lhs: Operand::Value(Value(10)),
++                    rhs: Operand::Const(IrConst::I64(3)),
++                    ty: IrType::I64,
++                },
++                gep_inst(12, 11, IrType::I64),
++                // The wide chain: (long)i `op` other.
++                Instruction::BinOp {
++                    dest: Value(13),
++                    op,
++                    lhs: Operand::Value(Value(10)),
++                    rhs: other,
++                    ty: IrType::I64,
++                },
++                // (int) of it, then the implicit conversion back to long.
++                Instruction::Cast {
++                    dest: Value(14),
++                    src: Operand::Value(Value(13)),
++                    from_ty: IrType::I64,
++                    to_ty: IrType::I32,
++                },
++                Instruction::Cast {
++                    dest: Value(15),
++                    src: Operand::Value(Value(14)),
++                    from_ty: IrType::I32,
++                    to_ty: IrType::I64,
++                },
++                Instruction::Store {
++                    volatile: false,
++                    val: Operand::Value(Value(15)),
++                    ptr: Value(12),
++                    ty: IrType::I64,
++                    seg_override: AddressSpace::Default,
++                },
++            ];
++            let mut func = counting_loop("chain_trunc", IrType::I32, IrBinOp::Add, body, None);
++            // The loop-invariant addend `(long)a`, defined in the preheader.
++            func.blocks[0].instructions.push(Instruction::Copy {
++                dest: Value(60),
++                src: Operand::Const(IrConst::I64(0x7fff_fffe)),
++            });
++            check(&mut func, 1);
++            let body = &func.blocks[2].instructions;
++            let truncation = body.iter().find_map(|i| match i {
++                Instruction::Cast {
++                    dest,
++                    src: Operand::Value(src),
++                    from_ty: IrType::I64,
++                    to_ty: IrType::I32,
++                } if src.0 == 13 => Some(*dest),
++                _ => None,
++            });
++            let truncation = truncation
++                .unwrap_or_else(|| panic!("{op:?}: the I64 -> I32 truncation was dropped"));
++            let extension = body.iter().find_map(|i| match i {
++                Instruction::Cast {
++                    dest,
++                    src: Operand::Value(src),
++                    from_ty: IrType::I32,
++                    to_ty: IrType::I64,
++                } if *src == truncation => Some(*dest),
++                _ => None,
++            });
++            let extension =
++                extension.unwrap_or_else(|| panic!("{op:?}: the re-extension was dropped"));
++            assert!(
++                body.iter().any(|i| matches!(
++                    i,
++                    Instruction::Store { val: Operand::Value(v), .. } if *v == extension
++                )),
++                "{op:?}: the store must read the wrapped value, not the 64-bit chain"
++            );
++        }
++    }
+ }
 diff --git a/src/passes/loop_idiom.rs b/src/passes/loop_idiom.rs
 index 5c780751f..b799e35f3 100644
 --- a/src/passes/loop_idiom.rs
@@ -12359,18 +13423,20 @@ index b10b9e9ad..5dbf86bf6 100644
              },
          });
 diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 909e76922..08fc446e7 100644
+index 909e76922..b70b1d8f8 100644
 --- a/src/passes/mod.rs
 +++ b/src/passes/mod.rs
-@@ -44,6 +44,7 @@ pub(crate) mod fp_const_hoist;
+@@ -44,7 +44,9 @@ pub(crate) mod fp_const_hoist;
  pub(crate) mod fp_double;
  pub(crate) mod global_addr_cse;
  pub(crate) mod gvn;
 +pub(crate) mod i128_split;
  pub(crate) mod if_convert;
++mod index_hoist;
  pub(crate) mod inline;
  pub(crate) mod instrument;
-@@ -957,7 +958,8 @@ fn run_inline_phase(
+ pub(crate) mod int_const_hoist;
+@@ -957,7 +959,8 @@ fn run_inline_phase(
      // them inlineable). GVN never rewrites param-alloca loads (see gvn.rs),
      // so the inliner's store-into-param-alloca argument passing stays intact.
      // Keep parameter allocas until after inlining.
@@ -12380,7 +13446,7 @@ index 909e76922..08fc446e7 100644
          crate::ir::mem2reg::promote_allocas(module);
      }
      iphase_dump!("mem2reg");
-@@ -967,6 +969,22 @@ fn run_inline_phase(
+@@ -967,6 +970,22 @@ fn run_inline_phase(
      iphase_dump!("canonicalize-copyprop");
      simplify::run(module);
      iphase_dump!("canonicalize-simplify");
@@ -12403,7 +13469,7 @@ index 909e76922..08fc446e7 100644
      // Expose byte-decoding helpers' real cost before inlining and before GVN
      // gives their byte loads multiple users. The established late run remains
      // for chains exposed by later simplification. This is the SAME checked
-@@ -1077,6 +1095,13 @@ fn run_inline_phase(
+@@ -1077,6 +1096,13 @@ fn run_inline_phase(
          }
      }
  
@@ -12417,7 +13483,7 @@ index 909e76922..08fc446e7 100644
      if !std::env::var("CCC_NO_MEM2REG_PARAMS").is_ok() {
          crate::ir::mem2reg::promote_allocas_with_params(module);
      }
-@@ -1186,6 +1211,14 @@ pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
+@@ -1186,6 +1212,14 @@ pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
      })
  }
  
@@ -12432,7 +13498,7 @@ index 909e76922..08fc446e7 100644
  /// True when an inline-asm constraint can only name memory, an immediate or a
  /// literal — never a register.
  ///
-@@ -2116,6 +2149,15 @@ pub(crate) fn run_passes(
+@@ -2116,6 +2150,15 @@ pub(crate) fn run_passes(
              simplify::run_with_config(module, true);
          }
          o1_checkpoint!("simplify");
@@ -12448,7 +13514,7 @@ index 909e76922..08fc446e7 100644
          // Inlining at -O1: GCC's -O1 tier inlines always_inline and
          // extern-inline functions plus called-once/small static helpers, and
          // several torture cases depend on the resulting constant propagation
-@@ -2131,6 +2173,10 @@ pub(crate) fn run_passes(
+@@ -2131,6 +2174,10 @@ pub(crate) fn run_passes(
              inline::run(module);
          }
          o1_checkpoint!("inline");
@@ -12459,7 +13525,41 @@ index 909e76922..08fc446e7 100644
          // Post-inline parameter promotion: with the inliner done, param
          // allocas can become SSA values. Constants passed through inlined
          // calls (20010119-1: a = 10) become visible to the propagation
-@@ -4521,6 +4567,7 @@ pub(crate) fn run_passes(
+@@ -2575,6 +2622,33 @@ pub(crate) fn run_passes(
+             total_changes_excl_dce += n;
+         }
+ 
++        // Phase 2-idx: invariant index hoisting -- iter 0, ahead of every
++        // loop transform. `a[inv + j]` becomes `(a + inv)[j]` with the
++        // invariant half in the preheader, so the unroller, the vectorizer,
++        // the idiom recognisers and `iv_widen` all see a plain indexed
++        // access instead of a sum they decline (see `index_hoist.rs`).
++        // x86-64, -O2+, not -Os/-Oz. Pass name for CCC_DISABLE_PASSES:
++        // "index_hoist".
++        if iter == 0
++            && opt_level >= 2
++            && !optimize_for_size
++            && target == crate::backend::Target::X86_64
++            && !pass_disabled(&disabled, "index_hoist")
++        {
++            let n = timed_pass!(
++                "index_hoist",
++                run_on_visited(module, &dirty, &mut changed, |f| {
++                    let n = index_hoist::run(f);
++                    if n > 0 {
++                        verify::verify_after_func_pass(f, "index_hoist");
++                    }
++                    n
++                })
++            );
++            total_changes += n;
++            total_changes_excl_dce += n;
++        }
++
+         // Observe quotient/remainder consumers before materializing magic
+         // multipliers. The same bit_idioms disable policy covers both entries.
+         if !pass_disabled(&disabled, "bit_idioms") {
+@@ -4521,6 +4595,7 @@ pub(crate) fn run_passes(
      // Runs before `fuse_vector_loads` so that pass sees the shortened chains.
      if !pass_disabled(&disabled, "vechomefwd") {
          vector_temp_promotion::forward_vector_homes(module);
@@ -12467,6 +13567,593 @@ index 909e76922..08fc446e7 100644
      }
  
      // Phase 11b': Collapse the 16/32-byte aggregate-load -> VecLoad ->
+diff --git a/src/passes/narrow.rs b/src/passes/narrow.rs
+index 303db12e6..0ab234575 100644
+--- a/src/passes/narrow.rs
++++ b/src/passes/narrow.rs
+@@ -27,6 +27,44 @@
+ //! Similarly, comparisons (Cmp) where both operands are widened from
+ //! the same type can be narrowed, since sign/zero extension preserves
+ //! the ordering of values.
++//!
++//! # The ring a narrowed operation lands in
++//!
++//! "The low bits are identical" is a statement about bits. It does not say
++//! which *ring* the narrowed operation belongs to, and in this IR the ring
++//! is the type: an `Add`/`Sub`/`Mul`/`Shl` typed `I32` is a C `int`
++//! operation, whose overflow is undefined, and `iv_widen`, the strength
++//! reducer and the x86-64 address peeler (`scale_ring_is_linear`) all use
++//! that -- `sext(x + 1) == sext(x) + 1` -- without a range proof.
++//!
++//! The pattern this pass narrows is the opposite case. The frontend lowers
++//! `int` arithmetic directly in `I32`; a 64-bit operation whose result is
++//! truncated to 32 bits reaches this pass only from source that asked for
++//! it, `(int)((long)a + 1L)` or `r += some_long`, and there the truncation
++//! WRAPS: C17 6.3.1.3p3 makes the conversion implementation-defined, and
++//! this compiler follows GCC in reducing modulo 2^N. Rewriting it to
++//! `Add I32` laundered a defined wrap into undefined overflow, and
++//! `p[(int)((long)a + 1L)]` was compiled to `movslq %esi, %rsi;
++//! movsbl 1(%rdi,%rsi)` -- the wrong element for `a == INT_MAX`
++//! (`tests/regression/explicit_narrowing_wraps.c`).
++//!
++//! So a wrap-sensitive operation with a signed target is narrowed into the
++//! UNSIGNED ring of the same width, in the shape the frontend itself emits
++//! for `(int)((unsigned)a + 1u)`:
++//!
++//! ```text
++//!   %w = Cast %x, I32 -> I64           %w = Cast %x, I32 -> U32
++//!   %r = Add  %w, 1 : I64       ==>    %r = Add  %w, 1 : U32
++//!   %n = Cast %r, I64 -> I32           %n = Cast %r, U32 -> I32
++//! ```
++//!
++//! Three instructions are retyped where they stand; none is created, moved
++//! or rewired, so every reader still sees a value of the type it declares.
++//! The generated code is the same `addl`/`leal`. When the widening cast has
++//! another reader the pattern is left 64-bit, which is also correct.
++//! Bitwise operations and right shifts cannot overflow and keep the signed
++//! type. Under `-fwrapv` the signed ring wraps by policy and nothing
++//! changes.
+ 
+ use crate::common::types::IrType;
+ use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand};
+@@ -46,6 +84,82 @@ struct BinOpDef {
+     rhs: Operand,
+ }
+ 
++/// True when narrowing `op` to the signed type `target` would turn a wrap
++/// the source defines into an overflow the optimizer may assume away (see
++/// "The ring a narrowed operation lands in" in the module header).
++fn narrowing_leaves_wrapping_ring(op: IrBinOp, target: IrType, wrap_signed_overflow: bool) -> bool {
++    !wrap_signed_overflow
++        && target.is_signed()
++        && matches!(
++            op,
++            IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Shl
++        )
++}
++
++/// One `Cast(BinOp(widen(x), widen(y)))` island that Phase 4 retypes into
++/// the unsigned ring in place.
++struct WrappingIsland {
++    /// The 64-bit operation, its operands after constant narrowing.
++    binop: u32,
++    lhs: Operand,
++    rhs: Operand,
++    /// The widening casts feeding it; each has no other reader.
++    widens: [Option<u32>; 2],
++    /// The unsigned type of the target's width.
++    ring: IrType,
++}
++
++/// Plan the island for the narrowing cast `binop -> target`, or `None` when
++/// an operand is neither a constant nor a widening cast, from an integer of
++/// the target's width, that only this operation reads.
++fn plan_wrapping_island(
++    binop: u32,
++    info: &BinOpDef,
++    target: IrType,
++    widen_map: &[Option<CastInfo>],
++    use_counts: &[u32],
++    asm_pinned: &[bool],
++) -> Option<WrappingIsland> {
++    let ring = target.to_unsigned();
++    // A shift count is a value, not a ring element: only a constant count
++    // (already proven in range by the caller) is carried over.
++    if info.op == IrBinOp::Shl && !matches!(info.rhs, Operand::Const(_)) {
++        return None;
++    }
++    let reads = |v: u32| {
++        [&info.lhs, &info.rhs]
++            .into_iter()
++            .filter(|op| matches!(op, Operand::Value(x) if x.0 == v))
++            .count() as u32
++    };
++    let mut widens = [None, None];
++    let mut operands = [info.lhs, info.rhs];
++    for (slot, operand) in operands.iter_mut().enumerate() {
++        match *operand {
++            Operand::Const(c) => *operand = Operand::Const(try_narrow_const(&c, ring)?),
++            Operand::Value(v) => {
++                let id = v.0 as usize;
++                let from = widen_map.get(id)?.as_ref()?.from_ty;
++                if !from.is_integer()
++                    || from.size() != target.size()
++                    || use_counts.get(id).copied() != Some(reads(v.0))
++                    || asm_pinned.get(id).copied().unwrap_or(false)
++                {
++                    return None;
++                }
++                widens[slot] = Some(v.0);
++            }
++        }
++    }
++    Some(WrappingIsland {
++        binop,
++        lhs: operands[0],
++        rhs: operands[1],
++        widens,
++        ring,
++    })
++}
++
+ /// Narrow operations in a single function.
+ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
+     // Early exit: the pass can only do work if the function contains I64/U64
+@@ -216,7 +330,7 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
+         func,
+         &binop_map,
+         &use_counts,
+-        &widen_map,
++        &mut widen_map,
+         &mut narrowed_map,
+         &asm_pinned,
+     );
+@@ -272,6 +386,7 @@ fn narrow_through_stores(
+         return 0;
+     }
+     let max_id = narrowed_map.len() - 1;
++    let wrap_signed_overflow = func.pass_policy.wrap_signed_overflow;
+ 
+     // Value -> narrow type for Load instructions.
+     let mut load_type_map: Vec<Option<IrType>> = vec![None; max_id + 1];
+@@ -339,6 +454,16 @@ fn narrow_through_stores(
+                         continue;
+                     }
+                     if let Some(t) = store_narrow_target(op, lhs, rhs, &ntype, &load_type_map) {
++                        // A stored `(long)a + 1` wraps when the store
++                        // truncates it. Retyping the operation `I32` in
++                        // place would put it in the ring whose overflow is
++                        // undefined, and the value reaches extending readers
++                        // through store-to-load forwarding. The in-place
++                        // rewrite cannot add the casts the unsigned ring
++                        // needs, so the chain stays 64-bit.
++                        if narrowing_leaves_wrapping_ring(*op, t, wrap_signed_overflow) {
++                            continue;
++                        }
+                         ntype[id] = Some(t);
+                         changed = true;
+                     }
+@@ -632,12 +757,16 @@ fn narrow_binops_with_cast(
+     func: &mut IrFunction,
+     binop_map: &[Option<BinOpDef>],
+     use_counts: &[u32],
+-    widen_map: &[Option<CastInfo>],
++    widen_map: &mut [Option<CastInfo>],
+     narrowed_map: &mut [Option<IrType>],
+     asm_pinned: &[bool],
+ ) -> usize {
+     let max_id = narrowed_map.len() - 1;
+     let mut changes = 0;
++    let wrap_signed_overflow = func.pass_policy.wrap_signed_overflow;
++    // Islands retyped into the unsigned ring: the narrowing cast is retyped
++    // in the walk below, the operation and its widening casts afterwards.
++    let mut islands: Vec<WrappingIsland> = Vec::new();
+ 
+     for block in &mut func.blocks {
+         for inst in &mut block.instructions {
+@@ -776,6 +905,29 @@ fn narrow_binops_with_cast(
+                     continue;
+                 }
+ 
++                if narrowing_leaves_wrapping_ring(binop_info.op, *to_ty, wrap_signed_overflow) {
++                    // The truncation wraps by definition; keep the wrap in a
++                    // ring that says so. No island, no narrowing: the 64-bit
++                    // form is already correct.
++                    if let Some(island) = plan_wrapping_island(
++                        src_val.0,
++                        &binop_info,
++                        *to_ty,
++                        widen_map,
++                        use_counts,
++                        asm_pinned,
++                    ) {
++                        *from_ty = island.ring;
++                        islands.push(island);
++                        changes += 1;
++                        let dest_id = dest.0 as usize;
++                        if dest_id <= max_id {
++                            narrowed_map[dest_id] = Some(*to_ty);
++                        }
++                    }
++                    continue;
++                }
++
+                 let narrow_lhs =
+                     try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
+                 let narrow_rhs = match &shift_rhs_override {
+@@ -807,6 +959,44 @@ fn narrow_binops_with_cast(
+         }
+     }
+ 
++    if islands.is_empty() {
++        return changes;
++    }
++    // Retype each island's operation and widening casts where they stand.
++    // A retyped cast no longer widens, so it leaves `widen_map` before the
++    // later phases consult it.
++    let mut binops: Vec<Option<usize>> = vec![None; max_id + 1];
++    let mut rings: Vec<Option<IrType>> = vec![None; max_id + 1];
++    for (index, island) in islands.iter().enumerate() {
++        binops[island.binop as usize] = Some(index);
++        for cast in island.widens.into_iter().flatten() {
++            rings[cast as usize] = Some(island.ring);
++            widen_map[cast as usize] = None;
++        }
++    }
++    for block in &mut func.blocks {
++        for inst in &mut block.instructions {
++            match inst {
++                Instruction::BinOp {
++                    dest, lhs, rhs, ty, ..
++                } => {
++                    if let Some(index) = binops.get(dest.0 as usize).copied().flatten() {
++                        let island = &islands[index];
++                        *lhs = island.lhs;
++                        *rhs = island.rhs;
++                        *ty = island.ring;
++                    }
++                }
++                Instruction::Cast { dest, to_ty, .. } => {
++                    if let Some(ring) = rings.get(dest.0 as usize).copied().flatten() {
++                        *to_ty = ring;
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++
+     changes
+ }
+ 
+@@ -1193,60 +1383,301 @@ mod tests {
+         func
+     }
+ 
+-    #[test]
+-    fn test_narrow_add_i32() {
+-        // %1 = Cast %0, I32->I64     (widen)
+-        // %2 = BinOp Add %1, I64(5), I64   (add in I64)
+-        // %3 = Cast %2, I64->I32     (narrow)
+-        // => Should become:
+-        // %3 = BinOp Add %0, I32(5), I32
+-        let mut func = make_func_with_blocks(vec![BasicBlock {
++    /// `%1 = widen %0; %2 = %1 <op> rhs : I64; %3 = Cast %2, I64 -> to_ty`.
++    fn widen_op_narrow(from_ty: IrType, op: IrBinOp, rhs: Operand, to_ty: IrType) -> IrFunction {
++        make_func_with_blocks(vec![BasicBlock {
+             label: BlockId(0),
+             instructions: vec![
+                 Instruction::Cast {
+                     dest: Value(1),
+                     src: Operand::Value(Value(0)),
+-                    from_ty: IrType::I32,
++                    from_ty,
+                     to_ty: IrType::I64,
+                 },
+                 Instruction::BinOp {
+                     dest: Value(2),
+-                    op: IrBinOp::Add,
++                    op,
+                     lhs: Operand::Value(Value(1)),
+-                    rhs: Operand::Const(IrConst::I64(5)),
++                    rhs,
+                     ty: IrType::I64,
+                 },
+                 Instruction::Cast {
+                     dest: Value(3),
+                     src: Operand::Value(Value(2)),
+                     from_ty: IrType::I64,
+-                    to_ty: IrType::I32,
++                    to_ty,
+                 },
+             ],
+             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+             source_spans: Vec::new(),
+             source_inline_ids: Vec::new(),
+-        }]);
++        }])
++    }
+ 
+-        let changes = narrow_function(&mut func);
+-        assert!(changes > 0, "Should narrow the add");
++    /// The island `Cast I32->U32; <op> U32; Cast U32->I32`, every instruction
++    /// where it stood, the constant narrowed into the ring.
++    fn assert_unsigned_island(func: &IrFunction, op: IrBinOp, constant: i64) {
++        let insts = &func.blocks[0].instructions;
++        assert_eq!(insts.len(), 3, "nothing is created or removed: {insts:?}");
++        assert!(
++            matches!(
++                &insts[0],
++                Instruction::Cast {
++                    dest: Value(1),
++                    src: Operand::Value(Value(0)),
++                    from_ty: IrType::I32,
++                    to_ty: IrType::U32,
++                }
++            ),
++            "the widening cast becomes the reinterpretation: {:?}",
++            insts[0]
++        );
++        match &insts[1] {
++            Instruction::BinOp {
++                dest: Value(2),
++                op: found,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Const(c),
++                ty: IrType::U32,
++            } => {
++                assert_eq!(*found, op);
++                assert_eq!(c.to_i64(), Some(constant));
++            }
++            other => panic!("expected {op:?} in U32 over the retyped cast, got {other:?}"),
++        }
++        assert!(
++            matches!(
++                &insts[2],
++                Instruction::Cast {
++                    dest: Value(3),
++                    src: Operand::Value(Value(2)),
++                    from_ty: IrType::U32,
++                    to_ty: IrType::I32,
++                }
++            ),
++            "the truncation becomes the reinterpretation: {:?}",
++            insts[2]
++        );
++    }
+ 
+-        // The last instruction should now be a BinOp in I32
+-        let last = &func.blocks[0].instructions[2];
+-        match last {
++    /// `(int)((long)x + 5)` wraps by definition. It narrows to 32 bits, but
++    /// into the unsigned ring: an `Add I32` would be a C `int` addition whose
++    /// overflow later passes assume away (wrong code at -O2,
++    /// `tests/regression/explicit_narrowing_wraps.c`).
++    #[test]
++    fn wrapping_signed_narrowing_lands_in_the_unsigned_ring() {
++        for (op, constant) in [
++            (IrBinOp::Add, 5),
++            (IrBinOp::Sub, 5),
++            (IrBinOp::Mul, 0x4000_0000),
++            (IrBinOp::Shl, 30),
++        ] {
++            let mut func = widen_op_narrow(
++                IrType::I32,
++                op,
++                Operand::Const(IrConst::I64(constant)),
++                IrType::I32,
++            );
++            assert!(narrow_function(&mut func) > 0, "{op:?} should narrow");
++            assert_unsigned_island(&func, op, constant);
++            let signed_arithmetic = func.blocks[0].instructions.iter().any(|i| {
++                matches!(
++                    i,
++                    Instruction::BinOp {
++                        ty: IrType::I32,
++                        ..
++                    }
++                )
++            });
++            assert!(
++                !signed_arithmetic,
++                "{op:?}: no operation may enter the I32 ring"
++            );
++            // Idempotent: the island is 32-bit and is not matched again.
++            assert_eq!(narrow_function(&mut func), 0);
++        }
++    }
++
++    /// Operations that cannot overflow keep the signed type and the compact
++    /// single-instruction form.
++    #[test]
++    fn overflow_free_signed_narrowing_keeps_the_signed_type() {
++        for op in [IrBinOp::And, IrBinOp::Or, IrBinOp::Xor] {
++            let mut func = widen_op_narrow(
++                IrType::I32,
++                op,
++                Operand::Const(IrConst::I64(5)),
++                IrType::I32,
++            );
++            assert!(narrow_function(&mut func) > 0);
++            assert!(
++                matches!(
++                    &func.blocks[0].instructions[2],
++                    Instruction::BinOp {
++                        dest: Value(3),
++                        lhs: Operand::Value(Value(0)),
++                        rhs: Operand::Const(IrConst::I32(5)),
++                        ty: IrType::I32,
++                        ..
++                    }
++                ),
++                "{op:?}: {:?}",
++                func.blocks[0].instructions[2]
++            );
++        }
++    }
++
++    /// An unsigned target was always in the wrapping ring: unchanged.
++    #[test]
++    fn unsigned_narrowing_is_unchanged() {
++        let mut func = widen_op_narrow(
++            IrType::U32,
++            IrBinOp::Add,
++            Operand::Const(IrConst::I64(5)),
++            IrType::U32,
++        );
++        assert!(narrow_function(&mut func) > 0);
++        assert!(matches!(
++            &func.blocks[0].instructions[2],
++            Instruction::BinOp {
++                op: IrBinOp::Add,
++                dest: Value(3),
++                lhs: Operand::Value(Value(0)),
++                ty: IrType::U32,
++                ..
++            }
++        ));
++    }
++
++    /// Under `-fwrapv` the signed ring wraps by policy, every reader gates
++    /// on that policy, and the compact `Add I32` form stays.
++    #[test]
++    fn wrapv_keeps_the_signed_single_instruction_form() {
++        let mut func = widen_op_narrow(
++            IrType::I32,
++            IrBinOp::Add,
++            Operand::Const(IrConst::I64(5)),
++            IrType::I32,
++        );
++        func.pass_policy.wrap_signed_overflow = true;
++        assert!(narrow_function(&mut func) > 0);
++        assert!(matches!(
++            &func.blocks[0].instructions[2],
+             Instruction::BinOp {
+                 op: IrBinOp::Add,
++                dest: Value(3),
++                lhs: Operand::Value(Value(0)),
++                rhs: Operand::Const(IrConst::I32(5)),
+                 ty: IrType::I32,
+-                lhs,
+-                rhs,
++            }
++        ));
++    }
++
++    /// The widening cast has a second reader: it cannot be retyped, and the
++    /// island is not built by mixing a signed operand into an unsigned
++    /// operation. The 64-bit form is already correct and stays.
++    #[test]
++    fn shared_widening_cast_leaves_the_pattern_wide() {
++        let mut func = widen_op_narrow(
++            IrType::I32,
++            IrBinOp::Add,
++            Operand::Const(IrConst::I64(5)),
++            IrType::I32,
++        );
++        let block = &mut func.blocks[0];
++        block.instructions.push(Instruction::BinOp {
++            dest: Value(4),
++            op: IrBinOp::LShr,
++            lhs: Operand::Value(Value(1)),
++            rhs: Operand::Const(IrConst::I64(40)),
++            ty: IrType::I64,
++        });
++        block.terminator = Terminator::Return(Some(Operand::Value(Value(4))));
++        let before = format!("{:?}", func.blocks[0].instructions);
++        narrow_function(&mut func);
++        assert_eq!(before, format!("{:?}", func.blocks[0].instructions));
++    }
++
++    /// `x + x` reads one widening cast twice; both reads belong to the
++    /// island, so it still narrows.
++    #[test]
++    fn island_accepts_one_cast_read_twice() {
++        let mut func = widen_op_narrow(
++            IrType::I32,
++            IrBinOp::Add,
++            Operand::Value(Value(1)),
++            IrType::I32,
++        );
++        assert!(narrow_function(&mut func) > 0);
++        let insts = &func.blocks[0].instructions;
++        assert!(matches!(
++            &insts[0],
++            Instruction::Cast {
++                to_ty: IrType::U32,
+                 ..
+-            } => {
+-                // LHS should be the original %0 (unwrapped from the widening cast)
+-                assert!(matches!(lhs, Operand::Value(Value(0))));
+-                // RHS should be I32(5) (narrowed constant)
+-                assert!(matches!(rhs, Operand::Const(IrConst::I32(5))));
+             }
+-            other => panic!("Expected narrowed BinOp Add I32, got {:?}", other),
++        ));
++        assert!(matches!(
++            &insts[1],
++            Instruction::BinOp {
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Value(Value(1)),
++                ty: IrType::U32,
++                ..
++            }
++        ));
++        assert!(matches!(
++            &insts[2],
++            Instruction::Cast {
++                from_ty: IrType::U32,
++                to_ty: IrType::I32,
++                ..
++            }
++        ));
++    }
++
++    /// Phase 6: `*p = (long)x + 5` stored as `int`. The in-place retype
++    /// would create an `Add I32` that store-to-load forwarding hands to
++    /// extending readers; the signed chain stays 64-bit, the unsigned one
++    /// still narrows.
++    #[test]
++    fn stored_wrapping_chain_narrows_only_in_the_unsigned_ring() {
++        for (ty, narrows) in [(IrType::I32, false), (IrType::U32, true)] {
++            let mut func = make_func_with_blocks(vec![BasicBlock {
++                label: BlockId(0),
++                instructions: vec![
++                    Instruction::Cast {
++                        dest: Value(1),
++                        src: Operand::Value(Value(0)),
++                        from_ty: ty,
++                        to_ty: IrType::I64,
++                    },
++                    Instruction::BinOp {
++                        dest: Value(2),
++                        op: IrBinOp::Add,
++                        lhs: Operand::Value(Value(1)),
++                        rhs: Operand::Const(IrConst::I64(5)),
++                        ty: IrType::I64,
++                    },
++                    Instruction::Store {
++                        val: Operand::Value(Value(2)),
++                        ptr: Value(9),
++                        ty,
++                        seg_override: crate::common::types::AddressSpace::Default,
++                        volatile: false,
++                    },
++                ],
++                terminator: Terminator::Return(None),
++                source_spans: Vec::new(),
++                source_inline_ids: Vec::new(),
++            }]);
++            narrow_function(&mut func);
++            let found = match &func.blocks[0].instructions[1] {
++                Instruction::BinOp { ty, .. } => *ty,
++                other => panic!("the addition disappeared: {other:?}"),
++            };
++            let expected = if narrows { IrType::U32 } else { IrType::I64 };
++            assert_eq!(found, expected, "stored {ty:?} chain");
+         }
+     }
+ 
 diff --git a/src/passes/outline_switch.rs b/src/passes/outline_switch.rs
 index 130898cfd..03a995899 100644
 --- a/src/passes/outline_switch.rs
